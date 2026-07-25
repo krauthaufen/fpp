@@ -75,6 +75,44 @@ let projectTests =
                 ]
             Expect.isEmpty (ws.Diagnostics "b.fpp") "Num expands to int"
         }
+        test "an open shadows an earlier let" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module Lib\nlet size = \"large\"\n"
+                    "b.fpp", "module App\nlet size = 1\nopen Lib\nlet r = size\n"
+                ]
+            let hover = ws.HoverAt "b.fpp" ("module App\nlet size = 1\nopen Lib\nlet ".Length)
+            Expect.equal hover (Some "let `r` : string") "Lib.size shadows the earlier local let"
+        }
+        test "a later let shadows an open" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module Lib\nlet size = \"large\"\n"
+                    "b.fpp", "module App\nopen Lib\nlet size = 1\nlet r = size\n"
+                ]
+            let hover = ws.HoverAt "b.fpp" ("module App\nopen Lib\nlet size = 1\nlet ".Length)
+            Expect.equal hover (Some "let `r` : int") "the local let wins after the open"
+        }
+        test "the last open wins among candidates" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module LibA\nlet pick = \"a\"\n"
+                    "b.fpp", "module LibB\nlet pick = 1\n"
+                    "c.fpp", "module App\nopen LibA\nopen LibB\nlet r = pick\n"
+                ]
+            let hover = ws.HoverAt "c.fpp" ("module App\nopen LibA\nopen LibB\nlet ".Length)
+            Expect.equal hover (Some "let `r` : int") "LibB (opened last) wins"
+        }
+        test "qualified paths prefer the last open too" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module LibA\nmodule Sub =\n    let foo = \"a\"\n"
+                    "b.fpp", "module LibB\nmodule Sub =\n    let foo = 1\n"
+                    "c.fpp", "module App\nopen LibA\nopen LibB\nlet r = Sub.foo\n"
+                ]
+            let hover = ws.HoverAt "c.fpp" ("module App\nopen LibA\nopen LibB\nlet ".Length)
+            Expect.equal hover (Some "let `r` : int") "LibB.Sub.foo wins for the qualified use"
+        }
         test "edit invalidates the project check" {
             let ws =
                 wsWith [

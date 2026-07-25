@@ -37,3 +37,6 @@ let dictTryFind (d : Dict<'k, 'v>) (k : 'k) : 'v option =
     match d.TryGetValue k with
     | true, v -> Some v
     | _ -> None
+
+let dictPairs (d : Dict<'k, 'v>) : ('k * 'v) list =
+    [ for kv in d -> kv.Key, kv.Value ]

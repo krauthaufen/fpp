@@ -73,15 +73,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         vecAdd exports (full, d)
         dictSet ownExports full d
 
-    /// Bases to try when qualifying a name: the enclosing module path and all
-    /// its prefixes, every `open`, and the empty base.
+    /// Bases to try when qualifying a name. F# shadowing: the LAST `open`
+    /// wins among competing candidates, so opens are consulted in reverse
+    /// declaration order, before the enclosing module path and its prefixes.
     let bases () : string list =
         let rec prefixes (p : string) : string list =
             if p = "" then [ "" ]
             else
                 let i = p.LastIndexOf '.'
                 if i < 0 then [ p; "" ] else p :: prefixes (substr p 0 i)
-        prefixes modulePath @ vecToList opens @ [ "" ]
+        List.rev (vecToList opens) @ prefixes modulePath @ [ "" ]
 
     let findQualified (dotted : string) : Definition option =
         bases ()
@@ -457,8 +458,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     n.Children
                     |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t.Text | _ -> None)
                     |> String.concat "."
-                if dotted <> "" then vecAdd opens dotted
-                env
+                if dotted = "" then env
+                else
+                    vecAdd opens dotted
+                    // F# temporal shadowing: an `open` injects the module's
+                    // direct exports into the environment AT THIS POINT —
+                    // shadowing earlier lets and earlier opens; later lets
+                    // shadow these in turn.
+                    let prefix = dotted + "."
+                    let inject (e : Env) (tbl : Dict<string, Definition>) : Env =
+                        let mutable acc = e
+                        for full, d in dictPairs tbl do
+                            if full.StartsWith prefix then
+                                let rest = substr full (strLen prefix) (strLen full - strLen prefix)
+                                if not (rest.Contains ".") then
+                                    acc <- Map.add rest d acc
+                        acc
+                    inject (inject env imports) ownExports
             | AttributeList | TyParams -> env
             | _ -> local (fun () -> walkExpr env g) |> ignore; env
 

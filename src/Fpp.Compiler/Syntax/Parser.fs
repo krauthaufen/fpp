@@ -552,7 +552,9 @@ let parse (src : string) : ParseResult =
                     vecAdd acc (s.Bump ())
                     vecAdd acc (parseExpr fcol)
             else s.Diag "expected 'in' or '=' in for loop"
-            if s.IsKw "do" then vecAdd acc (s.Bump ()) else s.Diag "expected 'do'"
+            // `do body` or comprehension arrow `-> expr`
+            if s.IsKw "do" || s.IsOp "->" then vecAdd acc (s.Bump ())
+            else s.Diag "expected 'do'"
             if canStartExpr () || s.IsKw "let" || s.IsKw "yield" then vecAdd acc (parseBlock fcol)
             Green.node ForExpr (vecToList acc)
         elif s.IsKw "while" then

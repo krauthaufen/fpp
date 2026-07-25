@@ -12,6 +12,19 @@ subset during bootstrap).
 
 ## What is kept from F# unchanged
 
+### Shadowing (explicit requirement)
+
+F#'s shadowing semantics survive **in full**. The name environment is
+temporal: whatever entered scope last wins.
+
+- `let` bindings shadow earlier bindings of the same name, always.
+- `open` injects the opened module's exports into the environment *at that
+  point* — shadowing earlier `let`s and earlier `open`s; later `let`s shadow
+  the opened names in turn.
+- When a (possibly qualified) reference like `A.B.Foo` has multiple
+  candidates through different opens, the **last** `open` wins.
+
+
 - Syntax, offside rule, modules, `let` bindings, DUs, records, structs,
   pattern matching, active patterns.
 - The whole overload / static member / extension member zoo. Overload
