@@ -17,12 +17,13 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - [~] Error-tolerant parser: modules, `let`, expressions, DUs, records,
       matches, offside rule — core done incl. GADT cases, `>>` splitting,
       recovery; classes/members/CEs still parse as tolerated ErrorNode soup
-- [ ] Query engine core (Salsa-style: memoized queries, dependency tracking,
-      invalidation on edit)
-- [ ] LSP server v0 as first query-engine client: diagnostics (syntax),
-      document outline, formatting stub
+- [x] Query engine core (Salsa-style: memoized queries, dependency tracking,
+      invalidation on edit, early cutoff)
+- [x] LSP server v0 as first query-engine client: diagnostics (syntax),
+      document outline (`src/Fpp.Lsp`); `fpp check` CLI as second client
 - Exit: open a `.fpp` file in an editor, see live syntax errors; parser
-  round-trips the whole compiler's own source
+  round-trips the whole compiler's own source — REACHED (editor wiring
+  is a client-side config away: `dotnet run --project src/Fpp.Lsp`)
 
 ## Stage 2 — Names & types (the long one)
 - [ ] Name resolution (modules, opens, shadowing) as queries

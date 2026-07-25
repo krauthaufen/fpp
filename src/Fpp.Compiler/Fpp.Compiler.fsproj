@@ -12,6 +12,8 @@
     <Compile Include="Syntax/Lexer.fs" />
     <Compile Include="Syntax/Tree.fs" />
     <Compile Include="Syntax/Parser.fs" />
+    <Compile Include="Query.fs" />
+    <Compile Include="Workspace.fs" />
   </ItemGroup>
 
 </Project>

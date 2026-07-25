@@ -26,3 +26,14 @@ let inline vecAdd (v : Vec<'a>) (x : 'a) : unit = v.Add x
 let inline vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit = v.Insert(i, x)
 let inline vecToList (v : Vec<'a>) : 'a list = List.ofSeq v
 let vecOfList (xs : 'a list) : Vec<'a> = Vec<'a>(xs)
+
+/// Mutable hash map — used only by the query engine.
+type Dict<'k, 'v> = System.Collections.Generic.Dictionary<'k, 'v>
+
+let inline dictNew<'k, 'v when 'k : equality> () : Dict<'k, 'v> = Dict<'k, 'v>()
+let inline dictSet (d : Dict<'k, 'v>) (k : 'k) (v : 'v) : unit = d.[k] <- v
+
+let dictTryFind (d : Dict<'k, 'v>) (k : 'k) : 'v option =
+    match d.TryGetValue k with
+    | true, v -> Some v
+    | _ -> None

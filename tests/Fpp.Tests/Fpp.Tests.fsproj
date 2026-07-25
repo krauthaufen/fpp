@@ -8,6 +8,8 @@
   <ItemGroup>
     <Compile Include="LexerTests.fs" />
     <Compile Include="ParserTests.fs" />
+    <Compile Include="QueryTests.fs" />
+    <Compile Include="WorkspaceTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -17,6 +19,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Fpp.Compiler/Fpp.Compiler.fsproj" />
+    <ProjectReference Include="../../src/Fpp.Lsp/Fpp.Lsp.fsproj" />
   </ItemGroup>
 
 </Project>

@@ -1,6 +1,8 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Fpp.Cli/Fpp.Cli.fsproj" />
     <Project Path="src/Fpp.Compiler/Fpp.Compiler.fsproj" />
+    <Project Path="src/Fpp.Lsp/Fpp.Lsp.fsproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Fpp.Tests/Fpp.Tests.fsproj" />
