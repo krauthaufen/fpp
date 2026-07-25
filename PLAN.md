@@ -11,11 +11,12 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       diff stdout (activates end of Stage 4)
 
 ## Stage 1 — Lexer, lossless trees, LSP shell
-- [~] Trivia-preserving lexer for the F# subset (round-trip property:
+- [x] Trivia-preserving lexer for the F# subset (round-trip property:
       concat of token texts == input, byte-for-byte)
-- [ ] Green/red lossless syntax tree infrastructure
-- [ ] Error-tolerant parser: modules, `let`, expressions, DUs, records,
-      matches, offside rule
+- [x] Green/red lossless syntax tree infrastructure
+- [~] Error-tolerant parser: modules, `let`, expressions, DUs, records,
+      matches, offside rule — core done incl. GADT cases, `>>` splitting,
+      recovery; classes/members/CEs still parse as tolerated ErrorNode soup
 - [ ] Query engine core (Salsa-style: memoized queries, dependency tracking,
       invalidation on edit)
 - [ ] LSP server v0 as first query-engine client: diagnostics (syntax),

@@ -14,3 +14,15 @@ let inline isAsciiLetter (c : char) : bool = (c >= 'a' && c <= 'z') || (c >= 'A'
 let isLetter (c : char) : bool = isAsciiLetter c || System.Char.IsLetter c
 
 let stringOfChars (cs : char list) : string = System.String(List.toArray cs)
+
+/// Growable vector — the only mutable collection the compiler uses.
+type Vec<'a> = System.Collections.Generic.List<'a>
+
+let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
+let inline vecLen (v : Vec<'a>) : int = v.Count
+let inline vecGet (v : Vec<'a>) (i : int) : 'a = v.[i]
+let inline vecSet (v : Vec<'a>) (i : int) (x : 'a) : unit = v.[i] <- x
+let inline vecAdd (v : Vec<'a>) (x : 'a) : unit = v.Add x
+let inline vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit = v.Insert(i, x)
+let inline vecToList (v : Vec<'a>) : 'a list = List.ofSeq v
+let vecOfList (xs : 'a list) : Vec<'a> = Vec<'a>(xs)

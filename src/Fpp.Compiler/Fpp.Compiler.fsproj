@@ -10,6 +10,8 @@
     <Compile Include="Prelude.fs" />
     <Compile Include="Syntax/Tokens.fs" />
     <Compile Include="Syntax/Lexer.fs" />
+    <Compile Include="Syntax/Tree.fs" />
+    <Compile Include="Syntax/Parser.fs" />
   </ItemGroup>
 
 </Project>
