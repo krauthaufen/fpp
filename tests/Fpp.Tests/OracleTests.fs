@@ -93,6 +93,12 @@ let oracleTests =
             "    s"
             "let b = print (countFor ())"
         ]
+        oracle "string concatenation" [
+            "let greet name ="
+            "    \"Hello, \" + name + \"!\""
+            "let a = print (greet \"F++\")"
+            "let b = print (1 + 2 + 3)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

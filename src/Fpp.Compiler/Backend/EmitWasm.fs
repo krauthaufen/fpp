@@ -237,7 +237,7 @@ let emit (decls : Decl list) : EmitResult =
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)
             (match op with
-             | "+" -> intWat ("(i32.add " + ia () + " " + ib () + ")")
+             | "+" -> "(call $addv " + recur a + " " + recur b + ")"
              | "-" -> intWat ("(i32.sub " + ia () + " " + ib () + ")")
              | "*" -> intWat ("(i32.mul " + ia () + " " + ib () + ")")
              | "/" -> intWat ("(i32.div_s " + ia () + " " + ib () + ")")
@@ -583,6 +583,24 @@ let emit (decls : Decl list) : EmitResult =
         (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
         (call $append (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a))) (local.get $b))))
       (else (local.get $b))))
+  (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
+    (local $r (ref $str)) (local $i i32) (local $la i32)
+    (local.set $la (array.len (local.get $a)))
+    (local.set $r (array.new_default $str (i32.add (local.get $la) (array.len (local.get $b)))))
+    (block $d1 (loop $l1
+      (br_if $d1 (i32.ge_u (local.get $i) (local.get $la)))
+      (array.set $str (local.get $r) (local.get $i) (array.get_u $str (local.get $a) (local.get $i)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l1)))
+    (local.set $i (i32.const 0))
+    (block $d2 (loop $l2
+      (br_if $d2 (i32.ge_u (local.get $i) (array.len (local.get $b))))
+      (array.set $str (local.get $r) (i32.add (local.get $la) (local.get $i)) (array.get_u $str (local.get $b) (local.get $i)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l2)))
+    (local.get $r))
+  (func $addv (param $a anyref) (param $b anyref) (result anyref)
+    (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
+      (then (return (call $strcat (ref.cast (ref $str) (local.get $a)) (ref.cast (ref $str) (local.get $b))))))
+    (call $ofi (i32.add (call $toi (local.get $a)) (call $toi (local.get $b)))))
   (func $ofi (param $n i32) (result anyref)
     (if (result anyref) (i32.eq (local.get $n) (i32.shr_s (i32.shl (local.get $n) (i32.const 1)) (i32.const 1)))
       (then (ref.i31 (local.get $n)))
