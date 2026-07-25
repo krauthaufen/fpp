@@ -27,6 +27,19 @@ let emit (decls : Decl list) : EmitResult =
 
     // struct records store fields UNBOXED by kind; plain records stay anyref
     let kindOfField (isStruct : bool) (k : string) = if isStruct then k else "r"
+    // flat-array element classification: primitive kind or a struct name
+    let primKindOf (tyName : string) : string =
+        match tyName with
+        | "int" | "bool" | "char" -> "i"
+        | "float" -> "f"
+        | "float32" -> "s"
+        | "int64" -> "l"
+        | _ -> ""
+    let structRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, true) -> Some (n, fs) | _ -> None)
+    let isStructName (n : string) = structRecords |> List.exists (fun (rn, _) -> rn = n)
+    let parrOf (k : string) = "$parr_" + k
+    let boxOfKind (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
+    let unboxOfKind (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
     // field name -> (record, index, kind); F# shadowing: last declaration wins
     let fieldIndex = dictNew<string, string * int * string> ()
     for rn, fs, st in records do
@@ -108,9 +121,11 @@ let emit (decls : Decl list) : EmitResult =
         | EField (r, _) -> scanExpr r
         | EWhile (c, b) -> scanExpr c; scanExpr b
         | EAssign (_, e) -> scanExpr e
-        | EArray xs -> List.iter scanExpr xs
-        | EIndex (a, i) -> scanExpr a; scanExpr i
-        | EIndexSet (a, i, v) -> scanExpr a; scanExpr i; scanExpr v
+        | EArray (_, xs) -> List.iter scanExpr xs
+        | EIndex (_, a, i) -> scanExpr a; scanExpr i
+        | EIndexSet (_, a, i, v) -> scanExpr a; scanExpr i; scanExpr v
+        | EArrayLen (_, a) -> scanExpr a
+        | EArrayCreate (_, n, v) -> scanExpr n; scanExpr v
         | ETry (b, cs) ->
             scanExpr b
             for p, g, e in cs do
@@ -227,8 +242,9 @@ let emit (decls : Decl list) : EmitResult =
         | EUnknown n ->
             vecAdd errors ("unknown name reaches emission: " + n)
             "(ref.i31 (i32.const 0))"
-        | EApp (EField (EUnknown "Array", "create"), [ n; v ]) ->
-            "(array.new $arr " + recur v + " " + unwrapI32 (recur n) + ")"
+        | EApp (EField (EUnknown "Array", "create"), [ _; _ ]) ->
+            vecAdd errors "Array.create needs a statically known element type"
+            "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "length"), [ a ]) ->
             "(call $lenv " + recur a + ")"
         | EApp (EUnknown "print", [ a ]) ->
@@ -418,13 +434,101 @@ let emit (decls : Decl list) : EmitResult =
                  | None ->
                      vecAdd errors ("assignment to unknown " + v.Name)
                      "(ref.i31 (i32.const 0))")
-        | EArray xs ->
-            "(array.new_fixed $arr " + string xs.Length + " " + String.concat " " (List.map recur xs) + ")"
-        | EIndex (a, i) ->
-            "(call $indexv " + recur a + " " + unwrapI32 (recur i) + ")"
-        | EIndexSet (a, i, v) ->
-            "(block (result anyref) (array.set $arr (ref.cast (ref $arr) " + recur a + ") "
-            + unwrapI32 (recur i) + " " + recur v + ") (ref.i31 (i32.const 0)))"
+        | EArray (elemName, xs) ->
+            let pk = primKindOf elemName
+            if pk <> "" then
+                let vals = xs |> List.map (fun x -> "(call " + unboxOfKind pk + " " + recur x + ")")
+                "(array.new_fixed " + parrOf pk + " " + string xs.Length + " " + String.concat " " vals + ")"
+            elif isStructName elemName then
+                // SoA: element temps evaluated once (during the first field
+                // array), then per-field extraction into typed arrays
+                let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = elemName then Some fs else None)
+                let elemLocals = xs |> List.map (fun _ -> newLocal "sa")
+                let fieldArr (fi : int) (k : string) =
+                    let elemT = match k with "f" | "s" | "l" | "i" -> parrOf k | _ -> "$arr"
+                    let ops =
+                        List.zip elemLocals xs
+                        |> List.map (fun (l, x) ->
+                            let v = "(struct.get $r_" + elemName + " " + string fi + " (ref.cast (ref $r_" + elemName + ") (local.get " + l + ")))"
+                            if fi = 0 then
+                                "(block (result " + (match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | "i" -> "i32" | _ -> "anyref") + ") (local.set " + l + " " + recur x + ") " + v + ")"
+                            else v)
+                    "(array.new_fixed " + elemT + " " + string xs.Length + " " + String.concat " " ops + ")"
+                let arrs = fs |> List.mapi (fun fi (_, k) -> fieldArr fi k)
+                "(struct.new $sarr_" + elemName + " " + String.concat " " arrs + ")"
+            else
+                "(array.new_fixed $arr " + string xs.Length + " " + String.concat " " (List.map recur xs) + ")"
+        | EIndex (nm, a, i) ->
+            let pk = primKindOf nm
+            if nm = "string" then
+                "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
+            elif pk <> "" then
+                "(call " + boxOfKind pk + " (array.get " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") " + unwrapI32 (recur i) + "))"
+            elif isStructName nm then
+                let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
+                let al = newLocal "ia"
+                let il = newLocal "ii"
+                let idx = "(call $toi (local.get " + il + "))"
+                let getF fi (k : string) =
+                    let src = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") (local.get " + al + ")))"
+                    match k with
+                    | "f" | "s" | "l" | "i" -> "(array.get " + parrOf k + " " + src + " " + idx + ")"
+                    | _ -> "(array.get $arr " + src + " " + idx + ")"
+                "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) "
+                + "(struct.new $r_" + nm + " " + (fs |> List.mapi (fun fi (_, k) -> getF fi k) |> String.concat " ") + "))"
+            else
+                vecAdd errors "array read needs a statically known element type (specialization pending)"
+                "(ref.i31 (i32.const 0))"
+        | EIndexSet (nm, a, i, v) ->
+            let pk = primKindOf nm
+            if pk <> "" then
+                "(block (result anyref) (array.set " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") "
+                + unwrapI32 (recur i) + " (call " + unboxOfKind pk + " " + recur v + ")) (ref.i31 (i32.const 0)))"
+            elif isStructName nm then
+                let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
+                let al = newLocal "sa"
+                let il = newLocal "si"
+                let vl = newLocal "sv"
+                let setF fi (k : string) =
+                    let dst = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") (local.get " + al + ")))"
+                    let fv = "(struct.get $r_" + nm + " " + string fi + " (ref.cast (ref $r_" + nm + ") (local.get " + vl + ")))"
+                    match k with
+                    | "f" | "s" | "l" | "i" -> "(array.set " + parrOf k + " " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
+                    | _ -> "(array.set $arr " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
+                "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) (local.set " + vl + " " + recur v + ") "
+                + (fs |> List.mapi (fun fi (_, k) -> setF fi k) |> String.concat " ") + " (ref.i31 (i32.const 0)))"
+            else
+                vecAdd errors "array write needs a statically known element type (specialization pending)"
+                "(ref.i31 (i32.const 0))"
+        | EArrayLen (nm, a) ->
+            let pk = primKindOf nm
+            if nm = "string" then
+                "(call $ofi (array.len (ref.cast (ref $str) " + recur a + ")))"
+            elif pk <> "" then
+                "(call $ofi (array.len (ref.cast (ref " + parrOf pk + ") " + recur a + ")))"
+            elif isStructName nm then
+                "(call $ofi (array.len (struct.get $sarr_" + nm + " 0 (ref.cast (ref $sarr_" + nm + ") " + recur a + "))))"
+            else
+                vecAdd errors "length needs a statically known element type"
+                "(ref.i31 (i32.const 0))"
+        | EArrayCreate (nm, n, v) ->
+            let pk = primKindOf nm
+            if pk <> "" then
+                "(array.new " + parrOf pk + " (call " + unboxOfKind pk + " " + recur v + ") " + unwrapI32 (recur n) + ")"
+            elif isStructName nm then
+                let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
+                let nl = newLocal "cn"
+                let vl = newLocal "cv"
+                let mk fi (k : string) =
+                    let fv = "(struct.get $r_" + nm + " " + string fi + " (ref.cast (ref $r_" + nm + ") (local.get " + vl + ")))"
+                    match k with
+                    | "f" | "s" | "l" | "i" -> "(array.new " + parrOf k + " " + fv + " (call $toi (local.get " + nl + ")))"
+                    | _ -> "(array.new $arr " + fv + " (call $toi (local.get " + nl + ")))"
+                "(block (result anyref) (local.set " + nl + " (call $ofi " + unwrapI32 (recur n) + ")) (local.set " + vl + " " + recur v + ") "
+                + "(struct.new $sarr_" + nm + " " + (fs |> List.mapi (fun fi (_, k) -> mk fi k) |> String.concat " ") + "))"
+            else
+                vecAdd errors "Array.create needs a statically known element type"
+                "(ref.i31 (i32.const 0))"
         | ETry (body, cases) ->
             let cases =
                 cases
@@ -582,9 +686,11 @@ let emit (decls : Decl list) : EmitResult =
             | EField (r, _) -> walk r
             | EWhile (c, b) -> walk c; walk b
             | EAssign (v, e) -> noteFree (v.Path, v.Offset); walk e
-            | EArray xs -> List.iter walk xs
-            | EIndex (a, i) -> walk a; walk i
-            | EIndexSet (a, i, v) -> walk a; walk i; walk v
+            | EArray (_, xs) -> List.iter walk xs
+            | EIndex (_, a, i) -> walk a; walk i
+            | EIndexSet (_, a, i, v) -> walk a; walk i; walk v
+            | EArrayLen (_, a) -> walk a
+            | EArrayCreate (_, n, v) -> walk n; walk v
             | ETry (b, cs) ->
                 walk b
                 for p, g, e in cs do
@@ -631,6 +737,10 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $boxf (struct (field f64)))"
     line "  (type $boxi (struct (field i32)))"
     line "  (type $arr (array (mut anyref)))"
+    line "  (type $parr_i (array (mut i32)))"
+    line "  (type $parr_f (array (mut f64)))"
+    line "  (type $parr_s (array (mut f32)))"
+    line "  (type $parr_l (array (mut i64)))"
     line "  (type $boxl (struct (field i64)))"
     line "  (type $boxs (struct (field f32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
@@ -654,6 +764,12 @@ let emit (decls : Decl list) : EmitResult =
             | _ -> "(field anyref)"
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
         line ("  (type $r_" + rn + " (struct " + fields + "))")
+    for rn, fs in structRecords do
+        let fa (k : string) =
+            match k with
+            | "f" | "s" | "l" | "i" -> "(field (ref " + parrOf k + "))"
+            | _ -> "(field (ref $arr))"
+        line ("  (type $sarr_" + rn + " (struct " + (fs |> List.map (fun (_, k) -> fa k) |> String.concat " ") + "))")
     for _, cs in unions do
         for cn, a in cs do
             let fields = List.replicate (max a 0) "(field anyref)" |> String.concat " "
@@ -752,14 +868,6 @@ let emit (decls : Decl list) : EmitResult =
         (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
         (call $append (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a))) (local.get $b))))
       (else (local.get $b))))
-  (func $indexv (param $v anyref) (param $i i32) (result anyref)
-    (if (ref.test (ref $str) (local.get $v))
-      (then (return (ref.i31 (array.get_u $str (ref.cast (ref $str) (local.get $v)) (local.get $i))))))
-    (array.get $arr (ref.cast (ref $arr) (local.get $v)) (local.get $i)))
-  (func $lenv (param $v anyref) (result anyref)
-    (if (ref.test (ref $str) (local.get $v))
-      (then (return (call $ofi (array.len (ref.cast (ref $str) (local.get $v)))))))
-    (call $ofi (array.len (ref.cast (ref $arr) (local.get $v)))))
   (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
     (local $r (ref $str)) (local $i i32) (local $la i32)
     (local.set $la (array.len (local.get $a)))

@@ -42,9 +42,11 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
             for _, g, e in cs do
                 (match g with Some g -> scan g | None -> ())
                 scan e
-        | EArray xs -> List.iter scan xs
-        | EIndex (a, i) -> scan a; scan i
-        | EIndexSet (a, i, v) -> scan a; scan i; scan v
+        | EArray (_, xs) -> List.iter scan xs
+        | EIndex (_, a, i) -> scan a; scan i
+        | EIndexSet (_, a, i, v) -> scan a; scan i; scan v
+        | EArrayLen (_, a) -> scan a
+        | EArrayCreate (_, n, v) -> scan n; scan v
         | _ -> ()
     // roots: value initializers (program effects)
     for d in decls do

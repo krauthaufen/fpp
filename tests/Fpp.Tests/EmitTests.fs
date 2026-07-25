@@ -26,6 +26,40 @@ let private runProgram (src : string) : string =
     out
 
 [<Tests>]
+let noBoxGate =
+    testList "representation gate" [
+        test "vectors and primitive arrays are flat — no generic arrays, no dispatchers" {
+            // THE INVARIANT (user requirement): structs and primitives are
+            // never boxed into generic arrays; there is no runtime dispatch.
+            // This gate fails if either ever creeps back for typed programs.
+            let ws = Workspace()
+            ws.SetFileText "g.fpp"
+                (String.concat "
+" [
+                    "module G"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |]"
+                    "let more = Array.create 8 { X = 0.0; Y = 0.0 }"
+                    "let ints = [| 1; 2; 3 |]"
+                    "let go ="
+                    "    let mutable s = 0.0"
+                    "    for i in 0 .. pts.Length - 1 do"
+                    "        s <- s + pts.[i].X"
+                    "    print s"
+                    "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "emits"
+            Expect.stringContains wat "$sarr_V2d" "V2d arrays are SoA-flat"
+            Expect.stringContains wat "array.new_fixed $parr_i" "int arrays are flat i32"
+            Expect.isFalse (wat.Contains "array.new_fixed $arr ") "no generic array construction"
+            Expect.isFalse (wat.Contains "$indexv") "no dispatching reader"
+            Expect.isFalse (wat.Contains "$setv") "no dispatching writer"
+            Expect.isFalse (wat.Contains "$creatv") "no dispatching allocator"
+        }
+    ]
+
+[<Tests>]
 let emitTests =
     testList "wasm end-to-end" [
         test "hello and factorial" {

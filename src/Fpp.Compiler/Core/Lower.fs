@@ -16,7 +16,8 @@ type private LetShape =
     | DestructureLet of Pat * Expr * Expr option
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
-          (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>) : LowerResult =
+          (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
+          (arrKinds : Dict<int, string>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -163,8 +164,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: args ->
                      let f = lowerExpr (GNode head)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
-                     (match f with
-                      | ECtor (cn, cs, []) when not (List.isEmpty loweredArgs) -> ECtor (cn, cs, loweredArgs)
+                     (match f, loweredArgs with
+                      | EVar (bv, _), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
+                          let nm =
+                              match dictTryFind arrKinds (offsetOf n) with
+                              | Some x -> x
+                              | None -> ""
+                          EArrayCreate (nm, cn, cv)
+                      | EField (EUnknown "Array", "create"), [ cn; cv ] ->
+                          let nm =
+                              match dictTryFind arrKinds (offsetOf n) with
+                              | Some x -> x
+                              | None -> ""
+                          EArrayCreate (nm, cn, cv)
+                      | ECtor (cn, cs, []), _ when not (List.isEmpty loweredArgs) -> ECtor (cn, cs, loweredArgs)
                       | _ -> EApp (f, loweredArgs))
                  | [] -> note (offsetOf n) "empty application")
             | BinaryExpr ->
@@ -174,7 +187,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | "<-" ->
                           (match lowerExpr (GNode l) with
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
-                           | EIndex (a, i) -> EIndexSet (a, i, lowerExpr (GNode r))
+                           | EIndex (nm, a, i) -> EIndexSet (nm, a, i, lowerExpr (GNode r))
                            | _ -> note (offsetOf n) "assignment target")
                       | "|>" -> EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
@@ -298,7 +311,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> None)
                 ERecord ("?", fields)   // type name filled by lint/emission from inference if needed
             | ArrayExpr ->
-                EArray (nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m)))
+                let elemName =
+                    match dictTryFind arrKinds (offsetOf n) with
+                    | Some nm -> nm
+                    | None -> ""
+                EArray (elemName, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m)))
             | DotExpr when (match nodesOf n with [ _; ix ] -> ix.NodeKind = ListExpr | _ -> false) ->
                 // index access: a.[i]
                 (match nodesOf n with
@@ -306,10 +323,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let idx =
                          nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind)
                          |> List.map (fun m -> lowerExpr (GNode m))
+                     let nm =
+                         match dictTryFind arrKinds (offsetOf n) with
+                         | Some x -> x
+                         | None -> ""
                      (match idx with
-                      | [ i ] -> EIndex (lowerExpr (GNode lhs), i)
+                      | [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")
                  | _ -> note (offsetOf n) "index shape")
+            | DotExpr when
+                (Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                 |> Option.map (fun t -> t.Text) = Some "Length")
+                && (dictTryFind arrKinds (offsetOf n)).IsSome ->
+                (match nodesOf n |> List.tryHead with
+                 | Some lhs -> EArrayLen ((dictTryFind arrKinds (offsetOf n)).Value, lowerExpr (GNode lhs))
+                 | None -> note (offsetOf n) "length shape")
             | DotExpr ->
                 (match nodesOf n |> List.tryHead, Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some lhs, Some name ->

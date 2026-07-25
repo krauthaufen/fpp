@@ -205,19 +205,26 @@ let lint (decls : Decl list) : string list =
                 (match guard with Some g -> unifyC "try guard" (exprType g) tBool | None -> ())
                 unifyC "try result" (exprType body) result
             result
-        | EArray xs ->
+        | EArray (_, xs) ->
             let elem = st.Fresh ()
             for x in xs do unifyC "array element" (exprType x) elem
             TCon ("array", [ elem ])
-        | EIndex (a, i) ->
+        | EIndex (_, a, i) ->
             exprType a |> ignore
             unifyC "index" (exprType i) tInt
             st.Fresh ()
-        | EIndexSet (a, i, v) ->
+        | EIndexSet (_, a, i, v) ->
             exprType a |> ignore
             unifyC "index" (exprType i) tInt
             exprType v |> ignore
             tUnit
+        | EArrayLen (_, a) ->
+            exprType a |> ignore
+            tInt
+        | EArrayCreate (_, n, v) ->
+            unifyC "create length" (exprType n) tInt
+            exprType v |> ignore
+            st.Fresh ()
 
     for d in decls do
         match d with

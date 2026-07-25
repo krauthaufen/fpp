@@ -52,9 +52,11 @@ type Expr =
     | EWhile of Expr * Expr
     | EAssign of VarId * Expr
     | ETry of Expr * (Pat * Expr option * Expr) list
-    | EArray of Expr list
-    | EIndex of Expr * Expr
-    | EIndexSet of Expr * Expr * Expr
+    | EArray of string * Expr list
+    | EIndex of string * Expr * Expr
+    | EIndexSet of string * Expr * Expr * Expr
+    | EArrayLen of string * Expr
+    | EArrayCreate of string * Expr * Expr
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -101,9 +103,11 @@ let rec printExpr (e : Expr) : string =
     | EWhile (c, b) -> "(while " + printExpr c + " do " + printExpr b + ")"
     | ETry (b, cs) ->
         "(try " + printExpr b + " with " + String.concat " | " (cs |> List.map (fun (p, _, e) -> printPat p + " -> " + printExpr e)) + ")"
-    | EArray xs -> "[|" + String.concat "; " (List.map printExpr xs) + "|]"
-    | EIndex (a, i) -> printExpr a + ".[" + printExpr i + "]"
-    | EIndexSet (a, i, v) -> printExpr a + ".[" + printExpr i + "] <- " + printExpr v
+    | EArray (_, xs) -> "[|" + String.concat "; " (List.map printExpr xs) + "|]"
+    | EIndex (_, a, i) -> printExpr a + ".[" + printExpr i + "]"
+    | EIndexSet (_, a, i, v) -> printExpr a + ".[" + printExpr i + "] <- " + printExpr v
+    | EArrayLen (_, a) -> printExpr a + ".Length"
+    | EArrayCreate (_, n, v) -> "(Array.create " + printExpr n + " " + printExpr v + ")"
     | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
 
 and printPat (p : Pat) : string =

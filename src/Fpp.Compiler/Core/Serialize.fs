@@ -141,9 +141,11 @@ let rec private encExpr (e : Expr) : Sx =
                 L [ encPat p
                     (match g with Some g -> L [ A "g"; encExpr g ] | None -> L [ A "n" ])
                     encExpr e ])))
-    | EArray xs -> L (A "ey" :: List.map encExpr xs)
-    | EIndex (a, i) -> L [ A "ex"; encExpr a; encExpr i ]
-    | EIndexSet (a, i, v) -> L [ A "ez"; encExpr a; encExpr i; encExpr v ]
+    | EArray (nm, xs) -> L (A "ey" :: S nm :: List.map encExpr xs)
+    | EIndex (nm, a, i) -> L [ A "ex"; S nm; encExpr a; encExpr i ]
+    | EIndexSet (nm, a, i, v) -> L [ A "ez"; S nm; encExpr a; encExpr i; encExpr v ]
+    | EArrayLen (nm, a) -> L [ A "eL"; S nm; encExpr a ]
+    | EArrayCreate (nm, n, v) -> L [ A "eC"; S nm; encExpr n; encExpr v ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -261,9 +263,11 @@ let rec private decExpr (x : Sx) : Expr =
                       let guard = match g with L [ A "g"; ge ] -> Some (decExpr ge) | _ -> None
                       Some (decPat p, guard, decExpr e)
                   | _ -> None))
-    | L (A "ey" :: xs) -> EArray (List.map decExpr xs)
-    | L [ A "ex"; a; i ] -> EIndex (decExpr a, decExpr i)
-    | L [ A "ez"; a; i; v ] -> EIndexSet (decExpr a, decExpr i, decExpr v)
+    | L (A "ey" :: S nm :: xs) -> EArray (nm, List.map decExpr xs)
+    | L [ A "ex"; S nm; a; i ] -> EIndex (nm, decExpr a, decExpr i)
+    | L [ A "ez"; S nm; a; i; v ] -> EIndexSet (nm, decExpr a, decExpr i, decExpr v)
+    | L [ A "eL"; S nm; a ] -> EArrayLen (nm, decExpr a)
+    | L [ A "eC"; S nm; n; v ] -> EArrayCreate (nm, decExpr n, decExpr v)
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =

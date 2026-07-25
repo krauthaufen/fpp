@@ -21,7 +21,9 @@ type InferResult =
       DefTypes : (int * int * string) list
       /// operator token offset -> resolved kind: "f"=float "s"=float32
       /// "l"=int64 "t"=string ""=int/other — drives typed prim emission
-      OpKinds : (int * string) list }
+      OpKinds : (int * string) list
+      /// array-site offset -> element type name (for flat struct arrays)
+      ArrKinds : (int * string) list }
 
 type FieldInfo =
     { TypeName : string
@@ -43,6 +45,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
+    let arrKindsRaw = vecNew<int * Type> ()
     let defSchemes = dictNew<int, Scheme> ()
     let defTypes = vecNew<int * int * Type> ()
 
@@ -368,6 +371,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              let res = st.Fresh ()
                              unifyAt off funTy (TFun (argTy, res))
                              funTy <- res
+                     vecAdd arrKindsRaw (off, funTy)
                      funTy
                  | [] -> st.Fresh ())
             | BinaryExpr ->
@@ -545,8 +549,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for m in nodesOf n do
                     if m.NodeKind = ListExpr then exprType (GNode m) |> ignore
                 (match lhsTy |> Option.map prune with
-                 | Some (TCon ("array", [ e ])) -> e
-                 | Some (TCon ("string", [])) -> tChar
+                 | Some (TCon ("array", [ e ])) ->
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t -> vecAdd arrKindsRaw (t.Offset, e)
+                      | None -> ())
+                     e
+                 | Some (TCon ("string", [])) ->
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t -> vecAdd arrKindsRaw (t.Offset, tString)
+                      | None -> ())
+                     tChar
                  | _ -> st.Fresh ())
             | DotExpr ->
                 let lastIdent =
@@ -563,7 +575,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match nodesOf n |> List.tryHead with
                          | Some lhs -> Some (exprType (GNode lhs))
                          | None -> None
-                     (match lhsTy, lastIdent with
+                     (match lhsTy |> Option.map prune, lastIdent with
+                      | Some (TCon ("array", [ e ])), Some nm when nm.Text = "Length" ->
+                          (match Green.tokens (GNode n) |> List.tryHead with
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, e)
+                           | None -> ())
+                          tInt
+                      | Some (TCon ("string", [])), Some nm when nm.Text = "Length" ->
+                          (match Green.tokens (GNode n) |> List.tryHead with
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, tString)
+                           | None -> ())
+                          tInt
+                      | _ ->
+                     match lhsTy, lastIdent with
                       | Some lt, Some name ->
                           (match prune lt with
                            | TCon (tn, args) ->
@@ -636,6 +660,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     if isExprish m.NodeKind then
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
                         unifyAt off (exprType (GNode m)) elem
+                (match Green.tokens (GNode n) |> List.tryHead with
+                 | Some t -> vecAdd arrKindsRaw (t.Offset, elem)
+                 | None -> ())
                 TCon ("array", [ elem ])
             | BraceExpr -> st.Fresh ()
             | ErrorNode -> st.Fresh ()
@@ -893,4 +920,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       OpKinds =
         vecToList opKindsRaw
         |> List.map (fun (off, ty) -> off, kindOf ty)
-        |> List.filter (fun (_, k) -> k <> "") }
+        |> List.filter (fun (_, k) -> k <> "")
+      ArrKinds =
+        vecToList arrKindsRaw
+        |> List.choose (fun (off, ty) ->
+            match prune ty with
+            | TCon ("array", [ e ]) ->
+                (match prune e with
+                 | TCon (n, []) -> Some (off, n)
+                 | _ -> None)
+            | TCon (n, []) -> Some (off, n)
+            | _ -> None) }

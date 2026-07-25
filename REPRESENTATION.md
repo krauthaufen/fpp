@@ -1,5 +1,16 @@
 # F++ — Value Representation
 
+**NORMATIVE INVARIANT (user requirement, gate-tested):** structs and
+primitives are NEVER boxed unless mathematically unavoidable (tier-3:
+polymorphic recursion / first-class polymorphism), and flat layouts are the
+ONLY layouts — no runtime representation dispatch. Vector types (V2d etc.)
+are the primary workload; `V2d[]` is SoA-flat (one typed field-array per
+field), `int[]`/`float[]`/... are typed scalar arrays, and generic array
+access without a statically known element type is a compile-time error
+until specialization serves it. The remaining transient boxing at the
+expression layer (locals/temporaries) is scheduled for deletion via typed
+emission — see Stage 4.5.
+
 How values are laid out at runtime, per backend. The core constraint (from
 DESIGN.md): GADTs force polymorphic recursion, so whole-program
 monomorphization is off the table — there must always be a **uniform

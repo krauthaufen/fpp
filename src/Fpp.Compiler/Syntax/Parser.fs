@@ -113,10 +113,12 @@ let private infixPrec (text : string) : int =
         | '+' | '-' -> 7
         | ':' -> if text = "::" then 6 else 0
         | '^' | '@' -> 5
+        // F# spec: = < > | & $ ! ops share ONE left-assoc level
+        // (except && and || which sit below it)
         | '=' | '<' | '>' | '$' -> 4
         | '!' -> if strLen text > 1 then 4 else 0
-        | '&' -> 3
-        | '|' -> 2
+        | '&' -> if text = "&&" then 3 else 4
+        | '|' -> if text = "||" then 2 else 4
         | _ -> 0
 
 let private rightAssoc (text : string) : bool =
