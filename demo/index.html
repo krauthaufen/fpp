@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>F++ demo</title>
+<style>
+  body { background:#0d1117; color:#c9d1d9; font-family:ui-monospace,monospace; padding:2rem; }
+  h1 { color:#58a6ff; font-size:1.2rem; }
+  pre { background:#161b22; padding:1rem; border-radius:8px; border:1px solid #30363d; }
+  .js { color:#d29922 } 
+</style>
+<h1>F++ &rarr; wasm-GC, JS interop via extern</h1>
+<pre id="out">loading…</pre>
+<script type="module">
+const out = document.getElementById("out");
+let text = "";
+const decoder = new TextDecoder();
+let mem;
+
+// WASI shim: F++'s `print` writes UTF-8 iovecs; route them into the page.
+const wasi_snapshot_preview1 = {
+  fd_write(fd, iovs, iovcnt, nwritten) {
+    const dv = new DataView(mem.buffer);
+    let written = 0;
+    for (let i = 0; i < iovcnt; i++) {
+      const ptr = dv.getUint32(iovs + i * 8, true);
+      const len = dv.getUint32(iovs + i * 8 + 4, true);
+      text += decoder.decode(new Uint8Array(mem.buffer, ptr, len));
+      written += len;
+    }
+    dv.setUint32(nwritten, written, true);
+    return 0;
+  }
+};
+
+// F++ `extern let jsRandom : int -> int` binds to plain JS:
+const env = { jsRandom: n => Math.floor(Math.random() * n) };
+
+const { instance } = await WebAssembly.instantiateStreaming(
+  fetch("demo.wasm"), { wasi_snapshot_preview1, env });
+mem = instance.exports.memory;
+instance.exports._start();
+out.textContent = text;
+out.insertAdjacentHTML("beforeend",
+  "\n<span class=js>jsRandom lives in JS; everything above it ran in F++.</span>");
+</script>
