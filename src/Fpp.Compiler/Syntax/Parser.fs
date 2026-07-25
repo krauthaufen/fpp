@@ -471,6 +471,7 @@ let parse (src : string) : ParseResult =
                 | Ident -> scan (k + 1) depth
                 | Comma -> scan (k + 1) depth
                 | LBracket | RBracket -> scan (k + 1) depth   // int[]
+                | LParen | RParen -> scan (k + 1) depth       // (string * int) list
                 | _ -> false
         scan 1 1
 

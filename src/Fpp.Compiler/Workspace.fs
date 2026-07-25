@@ -132,6 +132,15 @@ type ProjectResults =
 type Workspace() =
     let db = Db()
     do db.SetInput "project" "" (box ([] : string list))
+    do db.SetInput "libs" "" (box ([] : (string * string) list))
+
+    /// Register a fat-IR library (.fppir contents) for linking.
+    member this.AddLibrary (name : string) (text : string) : unit =
+        let libs = unbox<(string * string) list> (db.GetInput "libs" "")
+        db.SetInput "libs" "" (box (libs @ [ name, text ]))
+
+    member private _.Libraries : (string * string) list =
+        unbox<(string * string) list> (db.GetInput "libs" "")
 
     member _.Db = db
 
@@ -169,6 +178,11 @@ type Workspace() =
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
             Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields |> ignore
+            // linked libraries: exports feed the resolver, schemes feed inference
+            for _, text in this.Libraries do
+                let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
+                for full, d in exps do dictSet imports full d
+                for k, sch in schs do dictSet schemes k sch
             for path in this.ProjectFiles do
                 let p = this.ParseFile path
                 let b = Analysis.Resolve.resolve path imports p.Root
@@ -232,10 +246,38 @@ type Workspace() =
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
+        // linked library declarations join the program before emission
+        let libDecls = vecNew<Fpp.Core.Ir.Decl> ()
+        for _, text in this.Libraries do
+            let _, _, ds = Fpp.Core.Serialize.decodeLib text
+            for d in ds do vecAdd libDecls d
         if vecLen errs > 0 then "", vecToList errs
         else
-            let res = Fpp.Backend.EmitWasm.emit (vecToList allDecls)
+            let program = vecToList libDecls @ vecToList allDecls
+            let linked = Fpp.Core.Link.deadCodeEliminate program
+            let res = Fpp.Backend.EmitWasm.emit linked
             res.Wat, res.Errors
+
+    /// Produce a fat-IR library from the current project files.
+    member this.BuildLibrary () : string * string list =
+        let r = this.ProjectCheck ()
+        let errs = vecNew<string> ()
+        let decls = vecNew<Fpp.Core.Ir.Decl> ()
+        let exports = vecNew<string * Analysis.Resolve.Definition> ()
+        for path in this.ProjectFiles do
+            for d in this.Diagnostics path do
+                vecAdd errs (path + ": " + d.Message)
+            match dictTryFind r.Files path with
+            | Some (b, _) ->
+                for e in b.Exports do vecAdd exports e
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes
+                for d in low.Decls do vecAdd decls d
+            | None -> ()
+        let schemes =
+            dictPairs r.Schemes
+            |> List.filter (fun (k, _) -> not (k.StartsWith "(builtin)"))
+        if vecLen errs > 0 then "", vecToList errs
+        else Fpp.Core.Serialize.encodeLib (vecToList exports) schemes (vecToList decls), []
 
     /// Lower a file to typed core (Stage 3). Runs on top of the project check.
     member this.LowerFile (path : string) : Core.Ir.LowerResult =

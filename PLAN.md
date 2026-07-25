@@ -89,11 +89,18 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - [ ] More F# surface area end-to-end: while/for loops, mutables, arrays,
       exceptions (try/with parse + raise/failwith semantics), string ops,
       printf-family formatting, CE bodies (structured, not soup)
-- [ ] Linker: fat-IR library format (serialize Core.Ir), demand-closure
-      instantiation fixpoint, tier-1 struct specialization, symbol dedup
-      (see REPRESENTATION.md tiers)
-- [ ] C FFI: extern declarations, wasm component/host imports on wasm,
-      direct C ABI on native; blittable struct passing rules
+- [~] Linker: fat-IR .fppir format DONE (Core/Serialize.fs s-expr:
+      exports + schemes + decls), `fpp lib -o x.fppir` + `fpp build`
+      accepting .fppir DONE (cross-lib resolution, typing, direct calls),
+      demand-closure DCE at link DONE (Core/Link.fs). Open: tier-1
+      instantiation stamping (needs per-use instantiation types recorded
+      in Infer), symbol dedup across libs
+- [ ] C FFI (user vision: SEAMLESS — include a header / link a .so, done):
+      Zig-@cImport model — libclang-parsed headers materialize extern
+      declarations at compile time (fits the plugin architecture: a
+      binding generator IS a declaration-emitting plugin); C++ via
+      extern "C" boundaries only (full C++ interop is a non-goal v1);
+      wasm: host imports; native: direct C ABI, blittable structs
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood

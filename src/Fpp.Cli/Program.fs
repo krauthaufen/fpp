@@ -17,9 +17,25 @@ let private check (files : string list) : int =
             printfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message
     if errors = 0 then 0 else 1
 
-let private build (out : string) (files : string list) : int =
+let private buildLib (out : string) (files : string list) : int =
     let ws = Workspace()
     for f in files do
+        ws.SetFileText f (System.IO.File.ReadAllText f)
+    let lib, errors = ws.BuildLibrary ()
+    if not (List.isEmpty errors) then
+        for e in errors do eprintfn "error: %s" e
+        1
+    else
+        System.IO.File.WriteAllText(out, lib)
+        0
+
+let private build (out : string) (files : string list) : int =
+    let ws = Workspace()
+    let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
+    let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
+    for l in libs do
+        ws.AddLibrary l (System.IO.File.ReadAllText l)
+    for f in srcs do
         ws.SetFileText f (System.IO.File.ReadAllText f)
     let wat, errors = ws.EmitProgram ()
     if not (List.isEmpty errors) then
@@ -34,6 +50,7 @@ let main argv =
     match List.ofArray argv with
     | "check" :: files when not (List.isEmpty files) -> check files
     | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build out files
+    | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
     | _ ->
         eprintfn "usage: fpp check <file>... | fpp build -o out.wat <file>..."
         2

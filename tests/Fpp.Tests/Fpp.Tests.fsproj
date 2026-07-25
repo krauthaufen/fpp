@@ -16,6 +16,7 @@
     <Compile Include="LowerTests.fs" />
     <Compile Include="EmitTests.fs" />
     <Compile Include="OracleTests.fs" />
+    <Compile Include="LinkTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
