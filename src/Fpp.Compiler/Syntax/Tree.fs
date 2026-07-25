@@ -41,6 +41,7 @@ type NodeKind =
     | DotExpr
     | ForExpr
     | WhileExpr
+    | TryExpr
     // patterns
     | WildcardPat
     | IdentPat

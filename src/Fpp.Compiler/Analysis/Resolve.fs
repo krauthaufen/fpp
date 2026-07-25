@@ -261,7 +261,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     | GToken _ -> ()
                     | body -> walkExpr inner body |> ignore
                 env
-            | MatchExpr ->
+            | MatchExpr | TryExpr ->
                 for c in n.Children do
                     match c with
                     | GNode cl when cl.NodeKind = MatchClause ->

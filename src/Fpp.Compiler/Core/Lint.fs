@@ -198,6 +198,13 @@ let lint (decls : Decl list) : string list =
              | Some t -> unifyC ("assign " + v.Name) (exprType e) t
              | None -> exprType e |> ignore)
             tUnit
+        | ETry (b, cs) ->
+            let result = exprType b
+            for pat, guard, body in cs do
+                patType pat |> ignore
+                (match guard with Some g -> unifyC "try guard" (exprType g) tBool | None -> ())
+                unifyC "try result" (exprType body) result
+            result
         | EArray xs ->
             let elem = st.Fresh ()
             for x in xs do unifyC "array element" (exprType x) elem

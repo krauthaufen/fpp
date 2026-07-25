@@ -135,6 +135,12 @@ let rec private encExpr (e : Expr) : Sx =
     | ESeq xs -> L (A "es" :: List.map encExpr xs)
     | EWhile (c, b) -> L [ A "ew"; encExpr c; encExpr b ]
     | EAssign (v, e) -> L [ A "eg"; encVarId v; encExpr e ]
+    | ETry (b, cs) ->
+        L (A "eT" :: encExpr b
+           :: (cs |> List.map (fun (p, g, e) ->
+                L [ encPat p
+                    (match g with Some g -> L [ A "g"; encExpr g ] | None -> L [ A "n" ])
+                    encExpr e ])))
     | EArray xs -> L (A "ey" :: List.map encExpr xs)
     | EIndex (a, i) -> L [ A "ex"; encExpr a; encExpr i ]
     | EIndexSet (a, i, v) -> L [ A "ez"; encExpr a; encExpr i; encExpr v ]
@@ -247,6 +253,14 @@ let rec private decExpr (x : Sx) : Expr =
     | L (A "es" :: xs) -> ESeq (List.map decExpr xs)
     | L [ A "ew"; c; b ] -> EWhile (decExpr c, decExpr b)
     | L [ A "eg"; v; e ] -> EAssign (decVarId v, decExpr e)
+    | L (A "eT" :: b :: cs) ->
+        ETry (decExpr b,
+              cs |> List.choose (fun c ->
+                  match c with
+                  | L [ p; g; e ] ->
+                      let guard = match g with L [ A "g"; ge ] -> Some (decExpr ge) | _ -> None
+                      Some (decPat p, guard, decExpr e)
+                  | _ -> None))
     | L (A "ey" :: xs) -> EArray (List.map decExpr xs)
     | L [ A "ex"; a; i ] -> EIndex (decExpr a, decExpr i)
     | L [ A "ez"; a; i; v ] -> EIndexSet (decExpr a, decExpr i, decExpr v)

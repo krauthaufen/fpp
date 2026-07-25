@@ -14,7 +14,7 @@ let private runProgram (src : string) : string =
     Expect.isEmpty errors "emission errors"
     let tmp = System.IO.Path.GetTempFileName() + ".wat"
     System.IO.File.WriteAllText(tmp, wat)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, tmp)
+    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi

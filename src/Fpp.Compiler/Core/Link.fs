@@ -37,6 +37,11 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EField (r, _) -> scan r
         | EWhile (c, b) -> scan c; scan b
         | EAssign (v, e) -> demand (v.Path, v.Offset); scan e
+        | ETry (b, cs) ->
+            scan b
+            for _, g, e in cs do
+                (match g with Some g -> scan g | None -> ())
+                scan e
         | EArray xs -> List.iter scan xs
         | EIndex (a, i) -> scan a; scan i
         | EIndexSet (a, i, v) -> scan a; scan i; scan v

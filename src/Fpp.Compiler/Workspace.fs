@@ -120,6 +120,8 @@ module Builtin =
             "type Result<'t, 'e> ="
             "    | Ok of 't"
             "    | Error of 'e"
+            "type exn ="
+            "    | Failure of string"
             ""
         ]
 

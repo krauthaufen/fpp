@@ -34,7 +34,7 @@ let linkTests =
             let tmp = System.IO.Path.GetTempFileName() + ".wat"
             System.IO.File.WriteAllText(tmp, wat)
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", tmp)
+            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "-W exceptions=y " + tmp)
             psi.RedirectStandardOutput <- true
             use p = System.Diagnostics.Process.Start psi
             let out = p.StandardOutput.ReadToEnd()

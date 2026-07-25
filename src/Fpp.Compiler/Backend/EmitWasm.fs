@@ -111,6 +111,12 @@ let emit (decls : Decl list) : EmitResult =
         | EArray xs -> List.iter scanExpr xs
         | EIndex (a, i) -> scanExpr a; scanExpr i
         | EIndexSet (a, i, v) -> scanExpr a; scanExpr i; scanExpr v
+        | ETry (b, cs) ->
+            scanExpr b
+            for p, g, e in cs do
+                scanPat p
+                (match g with Some g -> scanExpr g | None -> ())
+                scanExpr e
         | _ -> ()
     for d in decls do
         match d with
@@ -229,7 +235,12 @@ let emit (decls : Decl list) : EmitResult =
             "(block (result anyref) (call $printval " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "ignore", [ a ]) ->
             "(block (result anyref) (drop " + recur a + ") (ref.i31 (i32.const 0)))"
-        | EApp (EUnknown "failwith", [ _ ]) -> "(unreachable)"
+        | EApp (EUnknown "failwith", [ a ]) ->
+            (match dictTryFind caseArity "Failure" with
+             | Some _ -> "(block (result anyref) (throw $fppexn (struct.new $u_Failure " + recur a + ")) (ref.i31 (i32.const 0)))"
+             | None -> "(unreachable)")
+        | EApp (EUnknown "raise", [ a ]) ->
+            "(block (result anyref) (throw $fppexn " + recur a + ") (ref.i31 (i32.const 0)))"
         | EApp (EVar (v, _), args) when (dictTryFind topArity (v.Path, v.Offset)) = Some args.Length ->
             // known full-arity call: direct (tail position -> return_call)
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
@@ -414,6 +425,32 @@ let emit (decls : Decl list) : EmitResult =
         | EIndexSet (a, i, v) ->
             "(block (result anyref) (array.set $arr (ref.cast (ref $arr) " + recur a + ") "
             + unwrapI32 (recur i) + " " + recur v + ") (ref.i31 (i32.const 0)))"
+        | ETry (body, cases) ->
+            let cases =
+                cases
+                |> List.collect (fun (p, g, b) ->
+                    match p with
+                    | POr ps -> ps |> List.map (fun q -> q, g, b)
+                    | _ -> [ p, g, b ])
+            let res = newLocal "tres"
+            let exn = newLocal "texn"
+            let w = System.Text.StringBuilder()
+            w.Append("(block (result anyref) (block $tdone" + res + " (local.set " + exn + " (block $tcatch" + res + " (result anyref) ") |> ignore
+            w.Append("(try_table (catch $fppexn $tcatch" + res + ") (local.set " + res + " " + recur body + ")) ") |> ignore
+            w.Append("(br $tdone" + res + "))) ") |> ignore
+            cases |> List.iteri (fun i (pat, guard, cbody) ->
+                let lbl = "$tcase" + res + "_" + string i
+                w.Append("(block " + lbl + " ") |> ignore
+                let tests = System.Text.StringBuilder()
+                compilePat locals extraLocals freeEnv tests lbl ("(local.get " + exn + ")") pat
+                w.Append(tests.ToString()) |> ignore
+                (match guard with
+                 | Some g -> w.Append("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ") |> ignore
+                 | None -> ())
+                w.Append("(local.set " + res + " " + recur cbody + ") (br $tdone" + res + ") ") |> ignore
+                w.Append(")") |> ignore)
+            w.Append(" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))") |> ignore
+            w.ToString()
         | EMatch (scrut, cases) ->
             // expand or-patterns into separate cases
             let cases =
@@ -548,6 +585,18 @@ let emit (decls : Decl list) : EmitResult =
             | EArray xs -> List.iter walk xs
             | EIndex (a, i) -> walk a; walk i
             | EIndexSet (a, i, v) -> walk a; walk i; walk v
+            | ETry (b, cs) ->
+                walk b
+                for p, g, e in cs do
+                    let rec bindP (p : Pat) =
+                        match p with
+                        | PVar (v, _) | PAs (_, v, _) -> dictSet bound (v.Path, v.Offset) true
+                        | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter bindP ps
+                        | PCons (a, b) -> bindP a; bindP b
+                        | _ -> ()
+                    bindP p
+                    (match g with Some g -> walk g | None -> ())
+                    walk e
             | _ -> ()
         walk body
         let freeList = vecToList free
@@ -594,6 +643,7 @@ let emit (decls : Decl list) : EmitResult =
             line ("  (import \"env\" \"" + v.Name + "\" (func " + mangle v + " " + ps + " " + rs + "))")
         | _ -> ()
     line "  (memory (export \"memory\") 1)"
+    line "  (tag $fppexn (param anyref))"
 
     // program-declared types
     for rn, fs, st in records do

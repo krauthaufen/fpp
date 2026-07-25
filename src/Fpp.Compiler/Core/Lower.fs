@@ -339,6 +339,34 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ c; b ] -> EWhile (lowerExpr (GNode c), lowerExpr (GNode b))
                  | _ -> note (offsetOf n) "while shape")
+            | TryExpr ->
+                let body =
+                    nodesOf n
+                    |> List.filter (fun m -> m.NodeKind <> MatchClause && isExprish m.NodeKind)
+                    |> List.map (fun m -> lowerExpr (GNode m))
+                let cases =
+                    nodesOf n
+                    |> List.filter (fun m -> m.NodeKind = MatchClause)
+                    |> List.map (fun cl ->
+                        let pats = nodesOf cl |> List.filter (fun m -> isPatKind m.NodeKind)
+                        let hasWhen = tokensOf cl |> List.exists (fun t -> t.Kind = Keyword && t.Text = "when")
+                        let exprs = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
+                        let guard, cbody =
+                            match hasWhen, exprs with
+                            | true, [ g; b ] -> Some (lowerExpr (GNode g)), lowerExpr (GNode b)
+                            | _, es ->
+                                (match List.tryLast es with
+                                 | Some b -> None, lowerExpr (GNode b)
+                                 | None -> None, ELit LUnit)
+                        let pat =
+                            match pats with
+                            | [ p ] -> lowerPat p
+                            | [] -> PWild
+                            | ps -> POr (List.map lowerPat ps)
+                        pat, guard, cbody)
+                (match List.tryLast body with
+                 | Some b -> ETry (b, cases)
+                 | None -> note (offsetOf n) "try shape")
             | BraceExpr -> note (offsetOf n) "computation/sequence body"
             | ErrorNode -> note (offsetOf n) "error node"
             | _ -> note (offsetOf n) ("node " + string n.NodeKind)

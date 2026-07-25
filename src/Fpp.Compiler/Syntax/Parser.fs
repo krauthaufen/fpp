@@ -147,7 +147,7 @@ let parse (src : string) : ParseResult =
     let canStartExpr () =
         canStartAtom () || s.IsKw "fun" || s.IsKw "if" || s.IsKw "match"
         || s.IsKw "function" || s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new"
-        || s.IsKw "for" || s.IsKw "while"
+        || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
 
     let canStartDecl () =
@@ -581,6 +581,16 @@ let parse (src : string) : ParseResult =
             else s.Diag "expected 'do'"
             if canStartExpr () || s.IsKw "let" || s.IsKw "yield" then vecAdd acc (parseBlock fcol)
             Green.node ForExpr (vecToList acc)
+        elif s.IsKw "try" then
+            let acc = vecNew<Green> ()
+            let tcol = s.CurCol
+            vecAdd acc (s.Bump ())
+            if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock tcol)
+            if s.IsKw "with" then
+                vecAdd acc (s.Bump ())
+                parseClauses acc tcol
+            else s.Diag "expected 'with' in try"
+            Green.node TryExpr (vecToList acc)
         elif s.IsKw "while" then
             let acc = vecNew<Green> ()
             let wcol = s.CurCol

@@ -489,6 +489,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               first
                           else tUnit)
                  | [] -> st.Fresh ())
+            | TryExpr ->
+                let result = st.Fresh ()
+                let exnTy = TCon ("exn", [])
+                for c in nodesOf n do
+                    if c.NodeKind = MatchClause then
+                        let cvars = dictNew<string, Type> ()
+                        for m in nodesOf c do
+                            if isPatKind m.NodeKind then
+                                unify (patType cvars m) exnTy |> ignore
+                        let bodies = nodesOf c |> List.filter (fun m -> isExprish m.NodeKind)
+                        (match List.tryLast bodies with
+                         | Some b -> unify (exprType (GNode b)) result |> ignore
+                         | None -> ())
+                    elif isExprish c.NodeKind then
+                        unify (exprType (GNode c)) result |> ignore
+                result
             | MatchExpr ->
                 let scrutTy =
                     nodesOf n

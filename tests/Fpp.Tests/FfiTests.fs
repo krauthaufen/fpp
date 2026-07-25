@@ -27,7 +27,7 @@ let ffiTests =
                 "(module\n  (func (export \"mul3\") (param i32) (result i32) (i32.mul (local.get 0) (i32.const 3)))\n  (func (export \"addmul\") (param i32) (param i32) (result i32) (i32.mul (i32.add (local.get 0) (local.get 1)) (i32.const 10))))")
             System.IO.File.WriteAllText(prog, wat)
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run --preload env=" + env + " " + prog)
+            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W exceptions=y --preload env=" + env + " " + prog)
             psi.RedirectStandardOutput <- true
             use p = System.Diagnostics.Process.Start psi
             let out = p.StandardOutput.ReadToEnd()

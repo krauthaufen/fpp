@@ -90,8 +90,16 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       SHIPPED (EWhile/EAssign in core, for desugars to while, oracle-checked).
       Arrays SHIPPED: [| |] literals, a.[i] get/set, .Length on
       arrays+strings, int[] types, oracle-verified incl. for-loop sum.
-      Open: general for-in over collections, exceptions (try/with parse +
-      raise semantics), string ops, printf formatting, CE bodies
+      NUMERIC TOWER SHIPPED: float/float32/int64 typed prims (Infer OpKinds
+      per operator -> suffixed core ops -> typed wasm instrs), boxes
+      $boxf/$boxs/$boxl, exact printers, oracle-verified.
+      STRUCTS SHIPPED: [<Struct>] records emit unboxed typed fields
+      (V2d = two raw f64s); index element typing; V2d array-sum oracle.
+      EXCEPTIONS SHIPPED: failwith/raise -> wasm throw, try/with ->
+      try_table + clause chain + rethrow; builtin exn/Failure;
+      oracle-verified (wasmtime -W exceptions=y; Chrome ships EH).
+      Open: general for-in over collections, string ops beyond concat,
+      printf formatting, CE bodies, try/finally
 - [~] Linker: fat-IR .fppir format DONE (Core/Serialize.fs s-expr:
       exports + schemes + decls), `fpp lib -o x.fppir` + `fpp build`
       accepting .fppir DONE (cross-lib resolution, typing, direct calls),

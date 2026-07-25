@@ -28,7 +28,7 @@ let private fppRun (src : string) : string =
     Expect.isEmpty errors "emission errors"
     let tmp = System.IO.Path.GetTempFileName() + ".wat"
     System.IO.File.WriteAllText(tmp, wat)
-    let out, code = run wasmtime tmp
+    let out, code = run wasmtime ("-W exceptions=y " + tmp)
     System.IO.File.Delete tmp
     Expect.equal code 0 "wasmtime failed"
     out
@@ -147,6 +147,20 @@ let oracleTests =
             "let b = print (pts.[2].X * pts.[0].Y)"
             "let dot (u : V2d) (v : V2d) = u.X * v.X + u.Y * v.Y"
             "let c = print (dot pts.[0] pts.[1])"
+        ]
+        oracle "exceptions: failwith, try/with, rethrow-free paths" [
+            "let risky n ="
+            "    if n < 0 then failwith \"negative\""
+            "    else n * 2"
+            "let safe n ="
+            "    try risky n"
+            "    with"
+            "    | Failure msg ->"
+            "        let x = print (\"caught: \" + msg)"
+            "        0 - 1"
+            "let a = print (safe 21)"
+            "let b = print (safe (0 - 5))"
+            "let c = print (safe 100)"
         ]
         oracle "string equality and chars" [
             "let pick s ="
