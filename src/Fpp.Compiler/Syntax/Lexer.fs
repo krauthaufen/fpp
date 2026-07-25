@@ -139,7 +139,8 @@ let tokenize (src : string) : Token list =
     /// pos is at a `'`. Char literal, or a lone quote (type variable prefix).
     let scanQuote (pos : int) : TokenKind * int =
         if peek (pos + 1) = '\\' then
-            let mutable i = pos + 2
+            // the escaped char is consumed unconditionally, so '\'' works
+            let mutable i = pos + 3
             while i < n && peek i <> '\'' && peek i <> '\n' && peek i <> '\r' do i <- i + 1
             CharLit, (if peek i = '\'' then i + 1 else i)
         elif peek (pos + 1) <> '\000' && peek (pos + 2) = '\'' then

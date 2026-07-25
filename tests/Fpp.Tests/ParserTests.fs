@@ -41,6 +41,16 @@ let parserRoundTripTests =
         roundTrips "broken: junk line" "let a = 1\n%%% what is this\nlet b = 2\n"
         roundTrips "broken: unclosed paren" "let f = (1 + 2\nlet g = 3\n"
         roundTrips "broken: member soup" "type T =\n    | A\n    member x.Foo = 1\n"
+        roundTrips "class with members" "type Db() =\n    let mutable rev = 0\n    member _.Revision = rev\n    member this.Bump (n : int) : unit =\n        rev <- rev + n\n"
+        roundTrips "interface impl" "type Option2<'a> =\n    | None2\n    | Some2 of 'a\n    interface Monad<Option2> with\n        static member Return x = Some2 x\n"
+        roundTrips "static abstract + assoc type" "type MonadState<'m> =\n    inherit Monad<'m>\n    static abstract type State\n    static abstract Get : unit -> 'm\n"
+        roundTrips "for and while" "let f xs =\n    for x in xs do\n        printfn \"%d\" x\n    let mutable i = 0\n    while i < 10 do\n        i <- i + 1\n    i\n"
+        roundTrips "escaped quote char" "let q = '\\''\n"
+        roundTrips "tuple destructuring let" "let a, b = 1, 2\n"
+        roundTrips "or pattern" "let f c =\n    match c with\n    | '!' | '$' | '%'\n    | '&' -> true\n    | _ -> false\n"
+        roundTrips "negative literal pattern" "let f x =\n    match x with\n    | -1 -> 0\n    | n -> n\n"
+        roundTrips "semicolon sequencing" "let f () =\n    if b then x <- 1; y <- 2\n    else y <- 3\n"
+        roundTrips "yield in list" "let xs = [ for i in 1..3 do yield i * 2 ]\n"
     ]
 
 [<Tests>]
@@ -86,6 +96,21 @@ let parserStructureTests =
                 Expect.equal rhs.NodeKind BinaryExpr "rhs of + is the * node"
             | _ -> failtest "unexpected shape for outer binary node"
         }
+        test "class members become MemberDecl nodes" {
+            let src = "type Db() =\n    member _.A = 1\n    member _.B = 2\n"
+            Expect.equal (nodesOf MemberDecl src |> List.length) 2 "two members"
+        }
+        test "interface impl nests its members" {
+            let src = "type T =\n    | A\n    interface M with\n        static member Return x = A\n"
+            match nodesOf InterfaceImpl src with
+            | [ i ] ->
+                let members = Green.collectNodes MemberDecl (GNode i)
+                Expect.equal members.Length 1 "member inside the interface node"
+            | _ -> failtest "expected one InterfaceImpl"
+        }
+        test "for loop structure" {
+            Expect.equal (nodesOf ForExpr "let f xs =\n    for x in xs do x\n" |> List.length) 1 "one ForExpr"
+        }
         test "broken input still yields diagnostics" {
             let r = parseRoot "let x 1\n"
             Expect.isNonEmpty r.Diagnostics "missing '=' is diagnosed"
@@ -108,5 +133,15 @@ let parserSelfTests =
                 let src = System.IO.File.ReadAllText f
                 let r = parseRoot src
                 Expect.equal (Green.toText (GNode r.Root)) src (sprintf "parser round-trip failed for %s" f)
+        }
+        test "zero diagnostics on the compiler's own sources" {
+            // the parser must understand every construct this repo uses —
+            // the dogfooding gate for the common-subset discipline
+            let root = __SOURCE_DIRECTORY__ + "/../.."
+            let files = System.IO.Directory.GetFiles(root, "*.fs", System.IO.SearchOption.AllDirectories)
+            let files = files |> Array.filter (fun f -> not (f.Contains "/obj/") && not (f.Contains "/bin/"))
+            for f in files do
+                let r = parseRoot (System.IO.File.ReadAllText f)
+                Expect.isEmpty r.Diagnostics (sprintf "diagnostics in %s" f)
         }
     ]

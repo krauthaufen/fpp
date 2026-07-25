@@ -14,9 +14,11 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - [x] Trivia-preserving lexer for the F# subset (round-trip property:
       concat of token texts == input, byte-for-byte)
 - [x] Green/red lossless syntax tree infrastructure
-- [~] Error-tolerant parser: modules, `let`, expressions, DUs, records,
-      matches, offside rule — core done incl. GADT cases, `>>` splitting,
-      recovery; classes/members/CEs still parse as tolerated ErrorNode soup
+- [x] Error-tolerant parser: modules, `let`, expressions, DUs, records,
+      matches, offside rule, class/interface bodies, members (incl. static
+      abstract + associated types), for/while, or-patterns, tuple lets;
+      gate: zero diagnostics on the repo's own sources (CE bodies and
+      record exprs remain lossless brace-soup, structured later)
 - [x] Query engine core (Salsa-style: memoized queries, dependency tracking,
       invalidation on edit, early cutoff)
 - [x] LSP server v0 as first query-engine client: diagnostics (syntax),

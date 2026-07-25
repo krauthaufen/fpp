@@ -99,13 +99,14 @@ let private infixPrec (text : string) : int =
     // F#-style: precedence by leading characters. 0 = not an infix operator.
     if text = "|" || text = "->" then 0
     elif text = ":=" || text = "<-" then 1
+    elif text = ".." || text = "..." then 4
     elif strLen text >= 2 && substr text 0 2 = "**" then 9
     else
         match charAt text 0 with
         | '*' | '/' | '%' -> 8
         | '+' | '-' -> 7
         | ':' -> if text = "::" then 6 else 0
-        | '^' -> 5
+        | '^' | '@' -> 5
         | '=' | '<' | '>' | '$' -> 4
         | '!' -> if strLen text > 1 then 4 else 0
         | '&' -> 3
@@ -113,7 +114,8 @@ let private infixPrec (text : string) : int =
         | _ -> 0
 
 let private rightAssoc (text : string) : bool =
-    text = "::" || charAt text 0 = '^' || (strLen text >= 2 && substr text 0 2 = "**")
+    text = "::" || charAt text 0 = '^' || charAt text 0 = '@'
+    || (strLen text >= 2 && substr text 0 2 = "**")
 
 let private literalKinds = [ IntLit; FloatLit; StringLit; CharLit ]
 
@@ -131,11 +133,13 @@ let parse (src : string) : ParseResult =
     let canStartAtom () =
         s.Is Ident || isLiteral () || isLiteralKw ()
         || s.Is LParen || s.Is LBracket || s.Is LBrace
+        || (s.IsOp "'" && (s.Peek 1).Kind = Ident)
 
     /// Can the current token start an expression at statement position?
     let canStartExpr () =
         canStartAtom () || s.IsKw "fun" || s.IsKw "if" || s.IsKw "match"
         || s.IsKw "function" || s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new"
+        || s.IsKw "for" || s.IsKw "while"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
 
     let canStartDecl () =
@@ -194,10 +198,15 @@ let parse (src : string) : ParseResult =
         else first
 
     and parsePostfixType (ctx : int) : Green =
-        // `int list`, `'a option` — postfix named application
+        // `int list`, `'a option`, `int[]` — postfix applications
         let mutable t = parseAppType ctx
-        while s.Is Ident && s.SameLine do
-            t <- Green.node PostfixType [ t; s.Bump () ]
+        let mutable go = true
+        while go do
+            if s.Is Ident && s.SameLine then
+                t <- Green.node PostfixType [ t; s.Bump () ]
+            elif s.Is LBracket && s.SameLine && (s.Peek 1).Kind = RBracket then
+                t <- Green.node PostfixType [ t; s.Bump (); s.Bump () ]
+            else go <- false
         t
 
     and parseAppType (ctx : int) : Green =
@@ -214,7 +223,8 @@ let parse (src : string) : ParseResult =
         let mutable go = true
         while go && not s.AtEof do
             s.SplitGt ()
-            if s.IsOp ">" then
+            if not s.SameLine then go <- false   // angle lists never span lines
+            elif s.IsOp ">" then
                 vecAdd acc (s.Bump ())
                 go <- false
             elif s.Is Comma then vecAdd acc (s.Bump ())
@@ -286,6 +296,7 @@ let parse (src : string) : ParseResult =
 
     and canStartAtomPat () =
         s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket
+        || (s.IsOp "-" && (let n = s.Peek 1 in n.Kind = IntLit || n.Kind = FloatLit))
 
     and parseAtomPat (ctx : int) : Green =
         if s.Is Ident then
@@ -300,16 +311,27 @@ let parse (src : string) : ParseResult =
                 Green.node IdentPat (vecToList acc)
         elif isLiteral () || isLiteralKw () then
             Green.node LiteralPat [ s.Bump () ]
+        elif s.IsOp "-" then
+            // negative literal pattern: `| -1 -> ...`
+            Green.node LiteralPat [ s.Bump (); s.Bump () ]
         elif s.Is LParen then
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())
-            // operator name `(+)` or unit `()` or nested pattern
-            if s.Is Operator && not (s.IsOp "'") then vecAdd acc (s.Bump ())
-            elif canStartAtomPat () then vecAdd acc (parsePat ctx)
-            // optional type ascription `(x : int)`
-            if s.IsOp ":" then
-                vecAdd acc (s.Bump ())
-                vecAdd acc (parseType ctx)
+            if s.Is Operator && not (s.IsOp "'") && (s.Peek 1).Kind = RParen then
+                vecAdd acc (s.Bump ())   // operator name `(+)`
+            else
+                // comma-separated patterns, each optionally ascribed:
+                // (x), (x : int), (a, b), (src : string, toks : Vec<Token>)
+                let mutable go = canStartAtomPat ()
+                while go do
+                    vecAdd acc (parseConsPat ctx)
+                    if s.IsOp ":" then
+                        vecAdd acc (s.Bump ())
+                        vecAdd acc (parseType ctx)
+                    if s.Is Comma then
+                        vecAdd acc (s.Bump ())
+                        go <- canStartAtomPat ()
+                    else go <- false
             if s.Is RParen then vecAdd acc (s.Bump ()) else s.Diag "expected ')' in pattern"
             Green.node ParenPat (vecToList acc)
         elif s.Is LBracket then
@@ -447,6 +469,35 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
             parseClauses acc col
             Green.node MatchExpr (vecToList acc)
+        elif s.IsKw "for" then
+            let acc = vecNew<Green> ()
+            let fcol = s.CurCol
+            vecAdd acc (s.Bump ())
+            vecAdd acc (parsePat fcol)
+            if s.IsKw "in" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseExpr fcol)
+            elif s.IsOp "=" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseExpr fcol)
+                if s.IsKw "to" || s.IsKw "downto" then
+                    vecAdd acc (s.Bump ())
+                    vecAdd acc (parseExpr fcol)
+            else s.Diag "expected 'in' or '=' in for loop"
+            if s.IsKw "do" then vecAdd acc (s.Bump ()) else s.Diag "expected 'do'"
+            if canStartExpr () || s.IsKw "let" || s.IsKw "yield" then vecAdd acc (parseBlock fcol)
+            Green.node ForExpr (vecToList acc)
+        elif s.IsKw "while" then
+            let acc = vecNew<Green> ()
+            let wcol = s.CurCol
+            vecAdd acc (s.Bump ())
+            vecAdd acc (parseExpr wcol)
+            if s.IsKw "do" then vecAdd acc (s.Bump ()) else s.Diag "expected 'do'"
+            if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock wcol)
+            Green.node WhileExpr (vecToList acc)
+        elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
+            // type variable in expression position (e.g. `unbox<'a>` soup)
+            Green.node IdentExpr [ s.Bump (); s.Bump () ]
         elif s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new" then
             let kw = s.Bump ()
             let arg = parseApp ctx
@@ -487,19 +538,29 @@ let parse (src : string) : ParseResult =
         Green.node MatchExpr (vecToList acc)
 
     and parseClauses (acc : Vec<Green>) (col : int) : unit =
-        let mutable go = true
-        while go && s.IsOp "|" && (s.SameLine || s.CurCol >= col) do
-            let mark = s.Mark
-            let barCol = s.CurCol
-            let c = vecNew<Green> ()
-            vecAdd c (s.Bump ())
+        let finishClause (c : Vec<Green>) (barCol : int) : unit =
             vecAdd c (parsePat barCol)
+            // or-pattern alternatives: bars before `->`/`when` extend the pattern
+            while s.IsOp "|" && not s.AtEof && (s.SameLine || s.CurCol >= col) do
+                vecAdd c (s.Bump ())
+                vecAdd c (parsePat barCol)
             if s.IsKw "when" then
                 vecAdd c (s.Bump ())
                 vecAdd c (parseExpr barCol)
             if s.IsOp "->" then vecAdd c (s.Bump ()) else s.Diag "expected '->' in match clause"
             if canStartExpr () || s.IsKw "let" then vecAdd c (parseBlock barCol)
             vecAdd acc (Green.node MatchClause (vecToList c))
+        // first clause may omit the bar: `match x with null -> ...`
+        if not (s.IsOp "|") && canStartAtomPat () && s.SameLine then
+            let c = vecNew<Green> ()
+            finishClause c s.CurCol
+        let mutable go = true
+        while go && s.IsOp "|" && (s.SameLine || s.CurCol >= col) do
+            let mark = s.Mark
+            let barCol = s.CurCol
+            let c = vecNew<Green> ()
+            vecAdd c (s.Bump ())
+            finishClause c barCol
             if s.Mark = mark then go <- false
 
     /// A sequence of statements sharing a column. Returns a single expression
@@ -507,20 +568,31 @@ let parse (src : string) : ParseResult =
     and parseBlock (outerCtx : int) : Green =
         let blockCol = s.CurCol
         let acc = vecNew<Green> ()
+        let canStartItem () =
+            canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
+            || s.IsKw "and" || s.IsKw "yield" || s.IsKw "return"
         let mutable go = true
         while go && not s.AtEof do
             let mark = s.Mark
-            if s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet blockCol)
+            if s.IsKw "let" || s.IsKw "use" || s.IsKw "and" then vecAdd acc (parseLet blockCol)
             elif s.IsKw "do" then
                 let d = s.Bump ()
                 let body = if canStartExpr () then parseBlock blockCol else Green.node ErrorNode []
                 vecAdd acc (Green.node BlockExpr [ d; body ])
+            elif s.IsKw "yield" || s.IsKw "return" then
+                let kids = vecNew<Green> ()
+                vecAdd kids (s.Bump ())
+                if s.IsOp "!" && s.SameLine then vecAdd kids (s.Bump ())
+                if canStartExpr () then vecAdd kids (parseExpr blockCol)
+                vecAdd acc (Green.node PrefixExpr (vecToList kids))
             elif canStartExpr () then vecAdd acc (parseExpr blockCol)
             else go <- false
             if s.Mark = mark then go <- false
-            // next item: fresh line, exactly at block column
+            // same-line `;` sequencing: `a <- 1; b <- 2`
+            elif s.Is Semicolon && s.SameLine then vecAdd acc (s.Bump ())
             elif s.AtEof || isBlockStopKw () || isCloser () then go <- false
-            elif not s.SameLine && s.CurCol = blockCol && (canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do") then ()
+            // next item: fresh line, exactly at block column
+            elif not s.SameLine && s.CurCol = blockCol && canStartItem () then ()
             else go <- false
         match vecToList acc with
         | [ single ] -> single
@@ -537,9 +609,18 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
         // binding name / pattern
         vecAdd acc (parseAtomPat letCol)
-        // curried parameters
-        while canStartAtomPat () && (s.SameLine || s.CurCol > letCol) do
-            vecAdd acc (parseAtomPat letCol)
+        if s.Is Comma then
+            // tuple destructuring: `let leading, p = scanLeading pos`
+            while s.Is Comma && s.SameLine do
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseConsPat letCol)
+        else
+            // explicit type parameters: `let inline vecNew<'a> () = ...`
+            if s.IsOp "<" && s.SameLine && (s.Peek 1).Text = "'" then
+                vecAdd acc (Green.node TyParams (parseAngleArgs letCol))
+            // curried parameters
+            while canStartAtomPat () && (s.SameLine || s.CurCol > letCol) do
+                vecAdd acc (parseAtomPat letCol)
         if s.IsOp ":" then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseType letCol)
@@ -563,14 +644,98 @@ let parse (src : string) : ParseResult =
         if s.Is Ident then vecAdd acc (s.Bump ()) else s.Diag "expected a type name"
         if s.IsOp "<" && s.SameLine then
             vecAdd acc (Green.node TyParams (parseAngleArgs typeCol))
+        // primary-constructor parameters: `type State(src : string) =`
+        if s.Is LParen && s.SameLine then
+            vecAdd acc (parseAtomPat typeCol)
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
-            if s.IsOp "|" then parseUnionCases acc typeCol
+            if isTypeBodyStart () && not s.SameLine && s.CurCol > typeCol then
+                ()   // class/interface body only — handled below
+            elif s.IsOp "|" then parseUnionCases acc typeCol
             elif s.Is LBrace then vecAdd acc (parseRecordRepr typeCol)
             elif looksLikeInlineUnion () then parseUnionCases acc typeCol
             elif canStartTypeAtom () then vecAdd acc (parseType typeCol)
             else s.Diag "expected a type representation"
+            // members may follow any representation (or be the whole body)
+            parseTypeBody acc typeCol
         Green.node TypeDecl (vecToList acc)
+
+    and isMemberStart () =
+        s.IsKw "member" || s.IsKw "static" || s.IsKw "abstract" || s.IsKw "override"
+        || s.IsKw "default" || s.IsKw "interface" || s.IsKw "inherit" || s.IsKw "val"
+        || s.IsKw "new"
+
+    and isTypeBodyStart () =
+        isMemberStart () || s.IsKw "let" || s.IsKw "do" || s.IsKw "use"
+
+    and parseTypeBody (acc : Vec<Green>) (typeCol : int) : unit =
+        let mutable go = true
+        while go && not s.AtEof && not s.SameLine && s.CurCol > typeCol && isTypeBodyStart () do
+            let mark = s.Mark
+            if s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
+            elif s.IsKw "do" then
+                let d = s.Bump ()
+                let body = if canStartExpr () then parseBlock typeCol else Green.node ErrorNode []
+                vecAdd acc (Green.node BlockExpr [ d; body ])
+            elif s.IsKw "interface" then vecAdd acc (parseInterfaceImpl ())
+            elif s.IsKw "inherit" then
+                let a = vecNew<Green> ()
+                vecAdd a (s.Bump ())
+                vecAdd a (parseType typeCol)
+                vecAdd acc (Green.node InheritDecl (vecToList a))
+            else vecAdd acc (parseMember ())
+            if s.Mark = mark then go <- false
+
+    and parseInterfaceImpl () : Green =
+        let acc = vecNew<Green> ()
+        let icol = s.CurCol
+        vecAdd acc (s.Bump ())   // interface
+        vecAdd acc (parseType icol)
+        // implementation constraints: `interface Functor<C<'f,'g>> when 'f : Functor with`
+        if s.IsKw "when" then
+            vecAdd acc (s.Bump ())
+            while not s.AtEof && not (s.IsKw "with") && (s.SameLine || s.CurCol > icol) do
+                vecAdd acc (s.Bump ())
+        if s.IsKw "with" then vecAdd acc (s.Bump ())
+        parseTypeBody acc icol
+        Green.node InterfaceImpl (vecToList acc)
+
+    and parseMember () : Green =
+        let acc = vecNew<Green> ()
+        let mcol = s.CurCol
+        while s.IsKw "static" || s.IsKw "member" || s.IsKw "abstract" || s.IsKw "override"
+              || s.IsKw "default" || s.IsKw "private" || s.IsKw "internal" || s.IsKw "public"
+              || s.IsKw "inline" || s.IsKw "val" || s.IsKw "mutable" do
+            vecAdd acc (s.Bump ())
+        if s.IsKw "type" then
+            // associated type: `static abstract type State`
+            vecAdd acc (s.Bump ())
+            if s.Is Ident then vecAdd acc (s.Bump ())
+        else
+            // [self .] name
+            if s.Is Ident then
+                vecAdd acc (s.Bump ())
+                if s.IsOp "." && s.SameLine then
+                    vecAdd acc (s.Bump ())
+                    if s.Is Ident then vecAdd acc (s.Bump ())
+            else s.Diag "expected a member name"
+            if s.IsOp "<" && s.SameLine && (s.Peek 1).Text = "'" then
+                vecAdd acc (Green.node TyParams (parseAngleArgs mcol))
+            while canStartAtomPat () && (s.SameLine || s.CurCol > mcol) do
+                vecAdd acc (parseAtomPat mcol)
+            if s.IsOp ":" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseType mcol)
+                // trailing constraints: `... -> 't<'m, 'a> when 'm : Monad`
+                if s.IsKw "when" then
+                    vecAdd acc (s.Bump ())
+                    while not s.AtEof && not (s.IsOp "=") && (s.SameLine || s.CurCol > mcol) do
+                        vecAdd acc (s.Bump ())
+            if s.IsOp "=" then
+                vecAdd acc (s.Bump ())
+                if s.AtEof || (not s.SameLine && s.CurCol <= mcol) then s.Diag "expected a member body"
+                else vecAdd acc (parseBlock mcol)
+        Green.node MemberDecl (vecToList acc)
 
     /// `type T = A | B of int` — an identifier directly followed by `|`/`of`.
     and looksLikeInlineUnion () : bool =

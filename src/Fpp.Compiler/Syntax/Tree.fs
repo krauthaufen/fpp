@@ -17,6 +17,9 @@ type NodeKind =
     | RecordRepr
     | RecordField
     | AttributeList
+    | MemberDecl
+    | InterfaceImpl
+    | InheritDecl
     // expressions
     | LiteralExpr
     | IdentExpr
@@ -33,6 +36,8 @@ type NodeKind =
     | MatchClause
     | BlockExpr
     | DotExpr
+    | ForExpr
+    | WhileExpr
     // patterns
     | WildcardPat
     | IdentPat
