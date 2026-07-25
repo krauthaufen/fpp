@@ -510,16 +510,18 @@ let parse (src : string) : ParseResult =
             if s.Is RBracket then vecAdd acc (s.Bump ()) else s.Diag "expected ']'"
             Green.node ListExpr (vecToList acc)
         elif s.Is LBrace then
-            // records, sequences, computation bodies: kept as balanced token
-            // soup for now — lossless, structured later
-            let acc = vecNew<Green> ()
-            vecAdd acc (s.Bump ())
-            let mutable depth = 1
-            while depth > 0 && not s.AtEof do
-                if s.Is LBrace then depth <- depth + 1
-                elif s.Is RBrace then depth <- depth - 1
+            if looksLikeRecordExpr () then parseRecordExpr ctx
+            else
+                // sequences and computation bodies: balanced token soup —
+                // lossless, structured when CEs are modeled
+                let acc = vecNew<Green> ()
                 vecAdd acc (s.Bump ())
-            Green.node BraceExpr (vecToList acc)
+                let mutable depth = 1
+                while depth > 0 && not s.AtEof do
+                    if s.Is LBrace then depth <- depth + 1
+                    elif s.Is RBrace then depth <- depth - 1
+                    vecAdd acc (s.Bump ())
+                Green.node BraceExpr (vecToList acc)
         elif s.IsKw "fun" then
             let acc = vecNew<Green> ()
             let funCol = s.CurCol
@@ -578,6 +580,59 @@ let parse (src : string) : ParseResult =
             Green.node PrefixExpr [ op; arg ]
         else
             errorUntilRecovery ctx "expected an expression"
+
+    /// At a `{`: a record expression starts with `Ident (. Ident)*` followed
+    /// by `=`, or `Ident ... with` (copy-and-update). Anything else (seq
+    /// ranges, CE bodies, object expressions) stays brace-soup.
+    and looksLikeRecordExpr () : bool =
+        let rec scan (k : int) =
+            let t = s.Peek k
+            if t.Kind = Ident then
+                let n = s.Peek (k + 1)
+                if n.Kind = Operator && n.Text = "." then scan (k + 2)
+                elif n.Kind = Operator && n.Text = "=" then true
+                elif n.Kind = Keyword && n.Text = "with" then true
+                else false
+            else false
+        scan 1
+
+    and parseRecordExpr (ctx : int) : Green =
+        let acc = vecNew<Green> ()
+        vecAdd acc (s.Bump ())   // '{'
+        // copy-and-update base: `{ expr with ... }`
+        let isWith =
+            let rec scan (k : int) =
+                let t = s.Peek k
+                if t.Kind = Ident then
+                    let n = s.Peek (k + 1)
+                    if n.Kind = Operator && n.Text = "." then scan (k + 2)
+                    else n.Kind = Keyword && n.Text = "with"
+                else false
+            scan 0
+        if isWith then
+            vecAdd acc (parseExpr ctx)
+            if s.IsKw "with" then vecAdd acc (s.Bump ())
+        let mutable go = true
+        while go && not s.AtEof && not (s.Is RBrace) do
+            let mark = s.Mark
+            if s.Is Semicolon then vecAdd acc (s.Bump ())
+            elif s.Is Ident then
+                let f = vecNew<Green> ()
+                let fieldCol = s.CurCol
+                vecAdd f (s.Bump ())
+                while s.IsOp "." && s.SameLine && (s.Peek 1).Kind = Ident do
+                    vecAdd f (s.Bump ())
+                    vecAdd f (s.Bump ())
+                if s.IsOp "=" then
+                    vecAdd f (s.Bump ())
+                    if canStartExpr () then vecAdd f (parseExpr fieldCol)
+                    else s.Diag "expected a field value"
+                else s.Diag "expected '=' in record field"
+                vecAdd acc (Green.node RecordExprField (vecToList f))
+            else vecAdd acc (s.Bump ())
+            if s.Mark = mark then go <- false
+        if s.Is RBrace then vecAdd acc (s.Bump ()) else s.Diag "expected '}'"
+        Green.node RecordExpr (vecToList acc)
 
     and parseIf (ctx : int) : Green =
         let acc = vecNew<Green> ()

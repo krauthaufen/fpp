@@ -113,6 +113,47 @@ let projectTests =
             let hover = ws.HoverAt "c.fpp" ("module App\nopen LibA\nopen LibB\nlet ".Length)
             Expect.equal hover (Some "let `r` : int") "LibB.Sub.foo wins for the qualified use"
         }
+        test "colliding modules from different opens MERGE" {
+            // Foo.A.bar and Blubb.A.boing both visible as A.xxx when both
+            // are open — containers merge, individual names shadow
+            let ws =
+                wsWith [
+                    "a.fpp", "module Foo\nmodule A =\n    let bar = 1\n"
+                    "b.fpp", "module Blubb\nmodule A =\n    let boing = \"b\"\n"
+                    "c.fpp", "module App\nopen Foo\nopen Blubb\nlet x = A.bar\nlet y = A.boing\n"
+                ]
+            Expect.isEmpty (ws.Diagnostics "c.fpp") "both resolve"
+            let h1 = ws.HoverAt "c.fpp" ("module App\nopen Foo\nopen Blubb\nlet ".Length)
+            let h2 = ws.HoverAt "c.fpp" ("module App\nopen Foo\nopen Blubb\nlet x = A.bar\nlet ".Length)
+            Expect.equal h1 (Some "let `x` : int") "A.bar from Foo"
+            Expect.equal h2 (Some "let `y` : string") "A.boing from Blubb"
+        }
+        test "within merged modules, colliding names still take the last open" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module Foo\nmodule A =\n    let same = \"foo\"\n"
+                    "b.fpp", "module Blubb\nmodule A =\n    let same = 1\n"
+                    "c.fpp", "module App\nopen Foo\nopen Blubb\nlet x = A.same\n"
+                ]
+            let h = ws.HoverAt "c.fpp" ("module App\nopen Foo\nopen Blubb\nlet ".Length)
+            Expect.equal h (Some "let `x` : int") "Blubb.A.same wins"
+        }
+        test "cross-file record fields type through opens" {
+            let ws =
+                wsWith [
+                    "a.fpp", "module Lib\ntype P =\n    { X : int\n      Y : string }\n"
+                    "b.fpp", "module App\nopen Lib\nlet p = { X = 1; Y = \"s\" }\nlet n = p.X + 1\n"
+                ]
+            Expect.isEmpty (ws.Diagnostics "b.fpp") "clean"
+            let h = ws.HoverAt "b.fpp" ("module App\nopen Lib\nlet ".Length)
+            Expect.equal h (Some "let `p` : P") "record type crossed files"
+        }
+        test "builtin Option is always in scope" {
+            let ws = wsWith [ "a.fpp", "module App\nlet f x =\n    match x with\n    | Some v -> v + 1\n    | None -> 0\nlet r = f (Some 1)\n" ]
+            Expect.isEmpty (ws.Diagnostics "a.fpp") "clean"
+            let h = ws.HoverAt "a.fpp" ("module App\nlet ".Length)
+            Expect.equal h (Some "let `f` : Option<int> -> int") "Option typing works"
+        }
         test "edit invalidates the project check" {
             let ws =
                 wsWith [

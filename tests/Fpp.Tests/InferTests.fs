@@ -8,7 +8,7 @@ open Fpp.Analysis
 let private inferSrc (src : string) : Infer.InferResult =
     let p = parse src
     let b = Resolve.resolve "test" (Fpp.Prelude.dictNew ()) p.Root
-    Infer.infer "test" p.Root b (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ())
+    Infer.infer "test" p.Root b (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ())
 
 /// The inferred type string of the definition named `name`.
 let private typeOf (src : string) (name : string) : string option =
@@ -102,6 +102,33 @@ let inferTests =
             let src = "type Expr<_> =\n  | Lit : int -> Expr<int>\nlet e = Lit 3\n"
             Expect.isEmpty (inferSrc src).Diagnostics "clean"
             Expect.equal (typeOf src "e") (Some "Expr<int>") "e : Expr<int>"
+        }
+        test "record construction gets the record type" {
+            let src = "type P =\n    { X : int\n      Y : string }\nlet p = { X = 1; Y = \"s\" }\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "p") (Some "P") "p : P"
+        }
+        test "wrong field value type is caught" {
+            let src = "type P =\n    { X : int }\nlet p = { X = \"nope\" }\n"
+            Expect.isNonEmpty (inferSrc src).Diagnostics "field mismatch reported"
+        }
+        test "field access types through the record" {
+            let src = "type P =\n    { X : int\n      Y : string }\nlet f (p : P) = p.X + 1\nlet g (p : P) = p.Y + \"!\"\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "f") (Some "P -> int") "f : P -> int"
+            Expect.equal (typeOf src "g") (Some "P -> string") "g : P -> string"
+        }
+        test "copy-and-update checks the base" {
+            let src = "type P =\n    { X : int }\nlet f (p : P) = { p with X = 2 }\nlet one = 1\nlet bad = { one with X = 2 }\n"
+            let r = inferSrc src
+            Expect.isNonEmpty r.Diagnostics "int base reported"
+            Expect.equal (typeOf src "f") (Some "P -> P") "f : P -> P"
+        }
+        test "generic record fields substitute parameters" {
+            let src = "type Box<'a> =\n    { Item : 'a }\nlet b = { Item = 3 }\nlet v = b.Item + 1\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "b") (Some "Box<int>") "b : Box<int>"
+            Expect.equal (typeOf src "v") (Some "int") "v : int"
         }
         test "hover includes the inferred type" {
             let ws = Workspace()

@@ -28,6 +28,8 @@ type NodeKind =
     | PrefixExpr
     | ParenExpr
     | BraceExpr
+    | RecordExpr
+    | RecordExprField
     | TupleExpr
     | ListExpr
     | LambdaExpr

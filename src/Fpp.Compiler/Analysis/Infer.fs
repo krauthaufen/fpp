@@ -20,11 +20,20 @@ type InferResult =
       /// definition offset, length, pretty-printed type
       DefTypes : (int * int * string) list }
 
+type FieldInfo =
+    { TypeName : string
+      Params : Var list
+      FieldType : Type }
+
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
 /// abbreviations keyed by short name across the project.
+/// `fields` is shared across the project under two keyings per field:
+/// bare "fieldName" (last declaration wins, F# shadowing) and
+/// "TypeName.fieldName" (for dot-access on a known record type).
 let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
-          (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>) : InferResult =
+          (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
+          (fields : Dict<string, FieldInfo>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let defSchemes = dictNew<int, Scheme> ()
@@ -63,6 +72,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
                 go sch.Body)
+
+    /// Substitute specific vars (by id) with given types, freshening nothing else.
+    let substVars (subst : Dict<int, Type>) (t : Type) : Type =
+        let rec go (t : Type) : Type =
+            match prune t with
+            | TVar v -> (match dictTryFind subst v.Id with Some a -> a | None -> TVar v)
+            | TCon (c, xs) -> TCon (c, List.map go xs)
+            | TFun (a, b) -> TFun (go a, go b)
+            | TTuple ts -> TTuple (List.map go ts)
+        go t
 
     let unifyAt (offset : int) (t1 : Type) (t2 : Type) : unit =
         match unify t1 t2 with
@@ -155,7 +174,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [] -> st.Fresh ())
         | PostfixType ->
             (match nodesOf n, tokensOf n with
-             | [ inner ], [ t ] when t.Kind = Ident -> TCon (t.Text, [ typeFromNode vars inner ])
+             | [ inner ], [ t ] when t.Kind = Ident ->
+                 let arg = typeFromNode vars inner
+                 (match expandAlias t.Text [ arg ] with
+                  | Some ty -> ty
+                  | None -> TCon (t.Text, [ arg ]))
              | [ inner ], _ -> typeFromNode vars inner   // int[] — array suffix
              | _ -> st.Fresh ())
         | FunType ->
@@ -481,16 +504,65 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some t -> t
                       | None -> st.Fresh ())
                  | None ->
-                     (match nodesOf n |> List.tryHead with
-                      | Some lhs -> exprType (GNode lhs) |> ignore
-                      | None -> ())
-                     st.Fresh ())
+                     let lhsTy =
+                         match nodesOf n |> List.tryHead with
+                         | Some lhs -> Some (exprType (GNode lhs))
+                         | None -> None
+                     (match lhsTy, lastIdent with
+                      | Some lt, Some name ->
+                          (match prune lt with
+                           | TCon (tn, args) ->
+                               (match dictTryFind fields (tn + "." + name.Text) with
+                                | Some fi when fi.Params.Length = args.Length ->
+                                    let subst = dictNew<int, Type> ()
+                                    List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                                    substVars subst fi.FieldType
+                                | _ -> st.Fresh ())
+                           | _ -> st.Fresh ())
+                      | _ -> st.Fresh ()))
             | ForExpr | WhileExpr ->
                 let fvars = dictNew<string, Type> ()
                 for m in nodesOf n do
                     if isPatKind m.NodeKind then patType fvars m |> ignore
                     elif isExprish m.NodeKind then exprType (GNode m) |> ignore
                 tUnit
+            | RecordExpr ->
+                let fieldNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = RecordExprField)
+                let baseExpr = nodesOf n |> List.tryFind (fun m -> m.NodeKind <> RecordExprField && isExprish m.NodeKind)
+                let firstFieldName =
+                    fieldNodes
+                    |> List.tryPick (fun f -> tokensOf f |> List.tryFind (fun t -> t.Kind = Ident))
+                (match firstFieldName |> Option.bind (fun t -> dictTryFind fields t.Text) with
+                 | Some info ->
+                     let subst = dictNew<int, Type> ()
+                     for pv in info.Params do dictSet subst pv.Id (st.Fresh ())
+                     let recTy = TCon (info.TypeName, info.Params |> List.map (fun pv -> substVars subst (TVar pv)))
+                     (match baseExpr with
+                      | Some b ->
+                          let off = match Green.tokens (GNode b) |> List.tryHead with Some t -> t.Offset | None -> 0
+                          unifyAt off (exprType (GNode b)) recTy
+                      | None -> ())
+                     for f in fieldNodes do
+                         let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
+                         let valTy =
+                             nodesOf f |> List.filter (fun m -> isExprish m.NodeKind)
+                             |> List.map (fun m -> exprType (GNode m))
+                         (match nameTok, List.tryLast valTy with
+                          | Some t, Some vt ->
+                              (match dictTryFind fields (info.TypeName + "." + t.Text) with
+                               | Some fi -> unifyAt t.Offset vt (substVars subst fi.FieldType)
+                               | None -> ())
+                          | _ -> ())
+                     recTy
+                 | None ->
+                     // unknown record type: walk values, stay unconstrained
+                     for f in fieldNodes do
+                         for m in nodesOf f do
+                             if isExprish m.NodeKind then exprType (GNode m) |> ignore
+                     (match baseExpr with
+                      | Some b -> exprType (GNode b) |> ignore
+                      | None -> ())
+                     st.Fresh ())
             | BraceExpr -> st.Fresh ()
             | ErrorNode -> st.Fresh ()
             | _ ->
@@ -607,9 +679,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
                 dictSet aliases name (paramVars, body)
             | None -> ()
+        let paramVarList () =
+            vecToList tyParams
+            |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
         // union cases become constructor schemes
         for m in nodesOf n do
             match m.NodeKind with
+            | RecordRepr ->
+                for f in nodesOf m do
+                    if f.NodeKind = RecordField then
+                        let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
+                        let tyNode = nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+                        (match nameTok, tyNode with
+                         | Some t, Some tn ->
+                             let ft = typeFromNode vars tn
+                             recordDef t ft
+                             let info = { TypeName = name; Params = paramVarList (); FieldType = ft }
+                             // bare name: last declaration wins (F# shadowing);
+                             // qualified key: dot-access on a known record type
+                             dictSet fields t.Text info
+                             dictSet fields (name + "." + t.Text) info
+                         | _ -> ())
             | UnionCase ->
                 let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
                 let isGadt = hasOpToken ":" m

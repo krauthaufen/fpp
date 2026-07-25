@@ -51,6 +51,11 @@ let parserRoundTripTests =
         roundTrips "negative literal pattern" "let f x =\n    match x with\n    | -1 -> 0\n    | n -> n\n"
         roundTrips "semicolon sequencing" "let f () =\n    if b then x <- 1; y <- 2\n    else y <- 3\n"
         roundTrips "yield in list" "let xs = [ for i in 1..3 do yield i * 2 ]\n"
+        roundTrips "record expr" "let p = { X = 1; Y = \"s\" }\n"
+        roundTrips "multiline record expr" "let r =\n    { Definitions = a\n      Resolutions = b }\n"
+        roundTrips "copy and update" "let q = { p with X = 2 }\n"
+        roundTrips "ce body stays soup" "let t = test \"n\" { Expect.equal 1 1 \"e\" }\n"
+        roundTrips "seq range stays soup" "let s = { 0 .. 10 }\n"
     ]
 
 [<Tests>]

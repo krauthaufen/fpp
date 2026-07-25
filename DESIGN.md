@@ -23,6 +23,12 @@ temporal: whatever entered scope last wins.
   the opened names in turn.
 - When a (possibly qualified) reference like `A.B.Foo` has multiple
   candidates through different opens, the **last** `open` wins.
+- Colliding modules/namespaces **merge** (explicit requirement): with
+  `Foo.A.bar` and `Blubb.A.boing` both in scope via opens, `A.bar` and
+  `A.boing` both resolve — the containers union their contents. Only when
+  the *same full name* exists in both does last-open-wins apply.
+  (Implementation: qualified lookup resolves each full path independently
+  against every open, so merging is the natural behavior.)
 
 
 - Syntax, offside rule, modules, `let` bindings, DUs, records, structs,

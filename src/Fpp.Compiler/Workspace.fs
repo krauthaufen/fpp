@@ -106,6 +106,25 @@ module private Outline =
 
 /// The workspace: one query database over a set of files. Both the LSP
 /// server and the batch CLI talk to the compiler exclusively through this.
+/// The auto-opened builtin prelude (FSharp.Core's role): well-known types
+/// every file sees without an `open`. No module header, so its exports live
+/// under bare names. `option<'a>` aliases the nominal `Option<'a>` so
+/// postfix `'v option` and constructor results unify.
+module Builtin =
+    let source =
+        String.concat "\n" [
+            "type Option<'a> ="
+            "    | None"
+            "    | Some of 'a"
+            "type option<'a> = Option<'a>"
+            "type Result<'t, 'e> ="
+            "    | Ok of 't"
+            "    | Error of 'e"
+            ""
+        ]
+
+    let path = "(builtin)"
+
 type Workspace() =
     let db = Db()
     do db.SetInput "project" "" (box ([] : string list))
@@ -139,12 +158,18 @@ type Workspace() =
             let imports = dictNew<string, Analysis.Resolve.Definition> ()
             let schemes = dictNew<string, Analysis.Types.Scheme> ()
             let aliases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
+            let fields = dictNew<string, Analysis.Infer.FieldInfo> ()
             let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
+            // the builtin prelude seeds imports and schemes for every file
+            let bp = Parser.parse Builtin.source
+            let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
+            for full, d in bb.Exports do dictSet imports full d
+            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields |> ignore
             for path in this.ProjectFiles do
                 let p = this.ParseFile path
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields
                 dictSet results path (b, inf)
             results)
 
@@ -153,7 +178,7 @@ type Workspace() =
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
-                (dictNew ()) (dictNew ())
+                (dictNew ()) (dictNew ()) (dictNew ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
