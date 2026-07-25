@@ -106,6 +106,22 @@ compiler can report where.
   semantics; immutable structs meanwhile share representation soundness
   by construction (copy vs reference unobservable).
 
+## Pinning (DECIDED — the FFI bridge for managed arrays)
+
+JNI-style copy-pinning, improved: the array value is a unique shared
+handle `(struct (mut (ref null $pk)) (mut i32 ptr) (mut i32 pincount))`.
+**Pin** = alloc linear block, word-copy the C image (bytes identical by
+construction), null the GC ref (managed side reclaimed — steady-state
+memory stays 1x, transient 2x only during the copy), return stable `ptr`
+for C/JS/GPU. **Unpin** = fresh packed array, copy back, free linear,
+patch handle. Aliases share the handle, so all see the mode; nested pins
+refcount. F++ access while pinned works via a two-state branch (GC
+array.get vs linear i64.load — same word codegen either way). Pointers
+and host views are invalidated at unpin. Cost when unpinned: one handle
+deref + predicted branch per access; mitigations queued: loop-invariant
+storage hoisting (bodies without pin/unpin), pin-free call-tree
+specialization. This REPLACES the staging-copy plan — pin IS the staging.
+
 ## Linear-memory lifetimes (struct arrays / buffers)
 
 wasm-GC has NO finalizers and NO weak refs — the engine collects a
