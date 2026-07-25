@@ -98,6 +98,13 @@ let lint (decls : Decl list) : string list =
         | ("=" | "<>" | "<" | ">" | "<=" | ">="), [ a; b ] ->
             unifyC ctx a b
             tBool
+        | ("&&&" | "|||" | "^^^" | "<<<" | ">>>"), [ a; b ] ->
+            unifyC ctx a tInt
+            unifyC ctx b tInt
+            tInt
+        | "u~~~", [ a ] ->
+            unifyC ctx a tInt
+            tInt
         | ("+" | "-" | "*" | "/" | "%" | "**"), [ a; b ] ->
             unifyC ctx a b
             a

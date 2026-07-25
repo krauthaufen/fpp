@@ -334,6 +334,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         elif text = "<|" then "pipeBack"
         elif text = "=" || text = "<>" || text = "<" || text = ">" || text = "<=" || text = ">=" then "cmp"
         elif text = "+" || text = "-" || text = "*" || text = "/" || text = "%" || text = "**" then "arith"
+        elif text = "&&&" || text = "|||" || text = "^^^" || text = "<<<" || text = ">>>" then "bits"
         elif text = "@" then "append"
         elif text = "<-" || text = ":=" then "assign"
         else "unknown"
@@ -393,6 +394,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | "arith" ->
                           unifyAt op.Offset lt rt
                           lt
+                      | "bits" ->
+                          unifyAt op.Offset lt tInt
+                          unifyAt op.Offset rt tInt
+                          tInt
                       | "cons" ->
                           unifyAt op.Offset rt (tList lt)
                           rt
@@ -422,6 +427,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | [ i ] -> unifyAt t.Offset i tBool
                       | _ -> ())
                      tBool
+                 | Some t when t.Text = "~~~" ->
+                     (match inner with
+                      | [ i ] -> unifyAt t.Offset i tInt
+                      | _ -> ())
+                     tInt
                  | Some t when t.Text = "-" || t.Text = "+" ->
                      (match inner with
                       | [ i ] ->

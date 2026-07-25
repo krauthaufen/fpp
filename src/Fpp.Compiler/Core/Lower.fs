@@ -206,7 +206,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | _ -> note (offsetOf n) "operator shape")
             | PrefixExpr ->
                 (match tokensOf n |> List.tryHead, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
-                 | Some op, [ a ] when op.Text = "-" || op.Text = "not" ->
+                 | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
                      let suffix =
                          match dictTryFind opKinds op.Offset with
                          | Some k -> k

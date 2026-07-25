@@ -108,10 +108,14 @@ let emit (decls : Decl list) : EmitResult =
 
     let caseArity = dictNew<string, int> ()
     let caseOwner = dictNew<string, string> ()
+    let caseTag = dictNew<string, int> ()
+    let mutable nextTag = 0
     for un, cs in unions do
         for cn, a in cs do
             dictSet caseArity cn a
             dictSet caseOwner cn un
+            dictSet caseTag cn nextTag
+            nextTag <- nextTag + 1
 
     let topArity = dictNew<string * int, int> ()   // (path,offset) -> arity of top-level fn
     let topName = dictNew<string * int, string> ()
@@ -355,13 +359,17 @@ let emit (decls : Decl list) : EmitResult =
         | EApp (EUnknown "memStoreF32", [ a; v ]) ->
             // raw linear-memory store: the zero-copy bridge to JS/WebGPU
             "(block (result anyref) (f32.store (call $toi " + recur a + ") (f32.demote_f64 (call $tof " + recur v + "))) (ref.i31 (i32.const 0)))"
+        | EApp (EUnknown "hash", [ a ]) ->
+            "(call $ofi (call $hashv " + recur a + "))"
+        | EApp (EUnknown "refEq", [ a; b ]) ->
+            boolWat ("(ref.eq (ref.cast (ref null eq) " + recur a + ") (ref.cast (ref null eq) " + recur b + "))")
         | EApp (EUnknown "print", [ a ]) ->
             "(block (result anyref) (call $printval " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "ignore", [ a ]) ->
             "(block (result anyref) (drop " + recur a + ") (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "failwith", [ a ]) ->
             (match dictTryFind caseArity "Failure" with
-             | Some _ -> "(block (result anyref) (throw $fppexn (struct.new $u_Failure " + recur a + ")) (ref.i31 (i32.const 0)))"
+             | Some _ -> "(block (result anyref) (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "Failure").Value + ") " + recur a + ")) (ref.i31 (i32.const 0)))"
              | None -> "(unreachable)")
         | EApp (EUnknown "raise", [ a ]) ->
             "(block (result anyref) (throw $fppexn " + recur a + ") (ref.i31 (i32.const 0)))"
@@ -447,6 +455,7 @@ let emit (decls : Decl list) : EmitResult =
         | EPrim ("u-f", [ a ]) -> "(call $off (f64.neg (call $tof " + recur a + ")))"
         | EPrim ("u-s", [ a ]) -> "(call $oss (f32.neg (call $tos " + recur a + ")))"
         | EPrim ("u-l", [ a ]) -> "(call $ofl (i64.sub (i64.const 0) (call $tol " + recur a + ")))"
+        | EPrim ("u~~~", [ a ]) -> intWat ("(i32.xor " + unwrapI32 (recur a) + " (i32.const -1))")
         | EPrim (op, [ a; b ]) ->
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)
@@ -464,6 +473,11 @@ let emit (decls : Decl list) : EmitResult =
              | "<>" -> boolWat ("(i32.eqz " + unwrapI32 ("(call $equal " + recur a + " " + recur b + ")") + ")")
              | "&&" -> recur (EIf (a, b, ELit (LBool false)))
              | "||" -> recur (EIf (a, ELit (LBool true), b))
+             | "&&&" -> intWat ("(i32.and " + ia () + " " + ib () + ")")
+             | "|||" -> intWat ("(i32.or " + ia () + " " + ib () + ")")
+             | "^^^" -> intWat ("(i32.xor " + ia () + " " + ib () + ")")
+             | "<<<" -> intWat ("(i32.shl " + ia () + " " + ib () + ")")
+             | ">>>" -> intWat ("(i32.shr_s " + ia () + " " + ib () + ")")
              | "::" -> "(struct.new $cons " + recur a + " " + recur b + ")"
              | "@" -> "(call $append " + recur a + " " + recur b + ")"
              | _ ->
@@ -482,7 +496,7 @@ let emit (decls : Decl list) : EmitResult =
             (match dictTryFind caseArity name with
              | Some 0 -> "(global.get $c_" + name + ")"
              | Some _ when not (List.isEmpty args) ->
-                 "(struct.new $u_" + name + " " + String.concat " " (List.map recur args) + ")"
+                 "(struct.new $du1 (i32.const " + string (dictTryFind caseTag name).Value + ") " + String.concat " " (List.map recur args) + ")"
              | Some _ ->
                  // payload ctor referenced unapplied
                  vecAdd errors ("unapplied constructor " + name)
@@ -810,12 +824,14 @@ let emit (decls : Decl list) : EmitResult =
             vecAdd errors "float patterns unsupported"
         | PCtor (name, _, args) ->
             (match dictTryFind caseArity name with
-             | Some 0 -> app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref $u_" + name + ") " + v + ")))")
-             | Some _ ->
-                 app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref $u_" + name + ") " + v + ")))")
-                 args |> List.iteri (fun i a ->
-                     let field = "(struct.get $u_" + name + " " + string i + " (ref.cast (ref $u_" + name + ") " + v + "))"
-                     compilePat locals extraLocals freeEnv out failLbl field a)
+             | Some a ->
+                 let ty = if a = 0 then "$du0" else "$du1"
+                 let tag = string (dictTryFind caseTag name).Value
+                 app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref " + ty + ") " + v + ")))")
+                 app ("(br_if " + failLbl + " (i32.ne (i32.const " + tag + ") (struct.get " + ty + " 0 (ref.cast (ref " + ty + ") " + v + "))))")
+                 args |> List.iteri (fun i a2 ->
+                     let field = "(struct.get $du1 1 (ref.cast (ref $du1) " + v + "))"
+                     compilePat locals extraLocals freeEnv out failLbl field a2)
              | None -> vecAdd errors ("unknown constructor pattern " + name))
         | PTuple ps ->
             let tn = "$tup" + string ps.Length
@@ -963,10 +979,11 @@ let emit (decls : Decl list) : EmitResult =
             | "f" | "s" | "l" | "i" -> "(field (ref " + parrOf k + "))"
             | _ -> "(field (ref $arr))"
         line ("  (type $sarr_" + rn + " (struct " + (fs |> List.map (fun (_, k) -> fa k) |> String.concat " ") + "))")
-    for _, cs in unions do
-        for cn, a in cs do
-            let fields = List.replicate (max a 0) "(field anyref)" |> String.concat " "
-            line ("  (type $u_" + cn + " (struct " + fields + "))")
+    // DU cases share two tagged layouts — wasm-GC canonicalizes
+    // same-shaped struct types into ONE heap type, so per-case types
+    // cannot be distinguished by ref.test; the i32 tag does it instead
+    line "  (type $du0 (struct (field i32)))"
+    line "  (type $du1 (struct (field i32) (field anyref)))"
     for n in vecToList tupleArities do
         let fields = List.replicate n "(field anyref)" |> String.concat " "
         line ("  (type $tup" + string n + " (struct " + fields + "))")
@@ -975,7 +992,7 @@ let emit (decls : Decl list) : EmitResult =
     for _, cs in unions do
         for cn, a in cs do
             if a = 0 then
-                line ("  (global $c_" + cn + " (ref $u_" + cn + ") (struct.new $u_" + cn + "))")
+                line ("  (global $c_" + cn + " (ref $du0) (struct.new $du0 (i32.const " + string (dictTryFind caseTag cn).Value + ")))")
 
     // runtime: putc, print, itoa, equal, append, apply
     line """  (func $putc (param $c i32)
@@ -1055,6 +1072,36 @@ let emit (decls : Decl list) : EmitResult =
           (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a)))
           (struct.get $cons 1 (ref.cast (ref $cons) (local.get $b)))))))
     (ref.i31 (ref.eq (ref.cast (ref null eq) (local.get $a)) (ref.cast (ref null eq) (local.get $b)))))
+  (func $hashv (param $v anyref) (result i32)
+    (local $i i32) (local $h i32)
+    (if (ref.test (ref i31) (local.get $v))
+      (then (return (i31.get_s (ref.cast (ref i31) (local.get $v))))))
+    (if (ref.test (ref $boxi) (local.get $v))
+      (then (return (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v))))))
+    (if (ref.test (ref $boxl) (local.get $v))
+      (then (return (i32.xor
+        (i32.wrap_i64 (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $v))))
+        (i32.wrap_i64 (i64.shr_u (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $v))) (i64.const 32)))))))
+    (if (ref.test (ref $boxf) (local.get $v))
+      (then (return (i32.xor
+        (i32.wrap_i64 (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))))
+        (i32.wrap_i64 (i64.shr_u (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))) (i64.const 32)))))))
+    (if (ref.test (ref $str) (local.get $v))
+      (then
+        (local.set $h (i32.const -2128831035))
+        (block $d (loop $go
+          (br_if $d (i32.ge_u (local.get $i) (array.len (ref.cast (ref $str) (local.get $v)))))
+          (local.set $h (i32.mul (i32.xor (local.get $h)
+            (array.get_u $str (ref.cast (ref $str) (local.get $v)) (local.get $i))) (i32.const 16777619)))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $go)))
+        (return (local.get $h))))
+    (if (ref.is_null (local.get $v)) (then (return (i32.const 0))))
+    (if (ref.test (ref $cons) (local.get $v))
+      (then (return (i32.xor
+        (i32.mul (call $hashv (struct.get $cons 0 (ref.cast (ref $cons) (local.get $v)))) (i32.const 31))
+        (call $hashv (struct.get $cons 1 (ref.cast (ref $cons) (local.get $v))))))))
+    (i32.const 1))
   (func $append (param $a anyref) (param $b anyref) (result anyref)
     (if (result anyref) (ref.test (ref $cons) (local.get $a))
       (then (struct.new $cons
