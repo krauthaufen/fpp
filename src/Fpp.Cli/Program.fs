@@ -7,10 +7,11 @@ open Fpp
 
 let private check (files : string list) : int =
     let ws = Workspace()
+    // argument order is the compile order — exports flow forward
+    for f in files do
+        ws.SetFileText f (System.IO.File.ReadAllText f)
     let mutable errors = 0
     for f in files do
-        let text = System.IO.File.ReadAllText f
-        ws.SetFileText f text
         for d in ws.Diagnostics f do
             errors <- errors + 1
             printfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message

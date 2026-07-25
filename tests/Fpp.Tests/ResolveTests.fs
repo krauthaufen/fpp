@@ -7,7 +7,7 @@ open Fpp.Syntax.Parser
 open Fpp.Analysis.Resolve
 
 let private resolveSrc (src : string) : BindResult =
-    resolve (parse src).Root
+    resolve "test" (Fpp.Prelude.dictNew ()) (parse src).Root
 
 /// The definition offset that the use of `name` at (0-based) occurrence `i` resolves to.
 let private defOf (src : string) (name : string) (useIndex : int) : int option =

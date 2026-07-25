@@ -97,9 +97,11 @@ type Server(ws : Workspace) =
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
             match ws.DefinitionAt uri offset with
             | Some d ->
-                let sl, sc = Lines.toLineCol starts d.Offset
-                let el, ec = Lines.toLineCol starts (d.Offset + d.Length)
-                respond (jobj [ "uri", jstr uri; "range", range sl sc el ec ])
+                // the definition may live in another file of the project
+                let defStarts = if d.Path = uri then starts else Lines.starts (ws.FileText d.Path)
+                let sl, sc = Lines.toLineCol defStarts d.Offset
+                let el, ec = Lines.toLineCol defStarts (d.Offset + d.Length)
+                respond (jobj [ "uri", jstr d.Path; "range", range sl sc el ec ])
             | None -> respond null
         | "textDocument/hover" ->
             let uri = ps.["textDocument"].["uri"].GetValue<string>()

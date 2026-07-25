@@ -273,14 +273,28 @@ let parse (src : string) : ParseResult =
 
     let rec parsePat (ctx : int) : Green =
         let first = parseConsPat ctx
-        if s.Is Comma && not (offside ctx) then
-            let acc = vecNew<Green> ()
-            vecAdd acc first
-            while s.Is Comma && not (offside ctx) do
-                vecAdd acc (s.Bump ())
-                vecAdd acc (parseConsPat ctx)
-            Green.node TuplePat (vecToList acc)
-        else first
+        let p =
+            if s.Is Comma && not (offside ctx) then
+                let acc = vecNew<Green> ()
+                vecAdd acc first
+                while s.Is Comma && not (offside ctx) do
+                    vecAdd acc (s.Bump ())
+                    vecAdd acc (parseConsPat ctx)
+                Green.node TuplePat (vecToList acc)
+            else first
+        parseAsSuffix p
+
+    /// `pat as name` — binds loosest of all pattern forms.
+    and parseAsSuffix (p : Green) : Green =
+        if s.IsKw "as" then
+            let kw = s.Bump ()
+            if s.Is Ident then
+                let name = Green.node IdentPat [ s.Bump () ]
+                Green.node AsPat [ p; kw; name ]
+            else
+                s.Diag "expected a name after 'as'"
+                Green.node AsPat [ p; kw ]
+        else p
 
     and parseConsPat (ctx : int) : Green =
         let lhs = parseAppPat ctx
@@ -330,7 +344,7 @@ let parse (src : string) : ParseResult =
                 // (x), (x : int), (a, b), (src : string, toks : Vec<Token>)
                 let mutable go = canStartAtomPat ()
                 while go do
-                    vecAdd acc (parseConsPat ctx)
+                    vecAdd acc (parseAsSuffix (parseConsPat ctx))
                     if s.IsOp ":" then
                         vecAdd acc (s.Bump ())
                         vecAdd acc (parseType ctx)

@@ -7,12 +7,13 @@ open Fpp.Analysis
 
 let private inferSrc (src : string) : Infer.InferResult =
     let p = parse src
-    Infer.infer p.Root (Resolve.resolve p.Root)
+    let b = Resolve.resolve "test" (Fpp.Prelude.dictNew ()) p.Root
+    Infer.infer "test" p.Root b (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ())
 
 /// The inferred type string of the definition named `name`.
 let private typeOf (src : string) (name : string) : string option =
     let r = inferSrc src
-    let b = Resolve.resolve (parse src).Root
+    let b = Resolve.resolve "test" (Fpp.Prelude.dictNew ()) (parse src).Root
     b.Definitions
     |> List.tryFind (fun d -> d.Name = name)
     |> Option.bind (fun d ->

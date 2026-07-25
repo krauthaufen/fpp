@@ -108,10 +108,22 @@ module private Outline =
 /// server and the batch CLI talk to the compiler exclusively through this.
 type Workspace() =
     let db = Db()
+    do db.SetInput "project" "" (box ([] : string list))
 
     member _.Db = db
 
-    member _.SetFileText (path : string) (text : string) : unit =
+    /// Set the compile order explicitly (CLI: argument order).
+    member _.SetProjectFiles (paths : string list) : unit =
+        db.SetInput "project" "" (box paths)
+
+    member _.ProjectFiles : string list =
+        unbox<string list> (db.GetInput "project" "")
+
+    member this.SetFileText (path : string) (text : string) : unit =
+        // unknown files join the project in arrival order (LSP didOpen)
+        let files = this.ProjectFiles
+        if not (List.contains path files) then
+            db.SetInput "project" "" (box (files @ [ path ]))
         db.SetInput "text" path (box text)
 
     member _.FileText (path : string) : string =
@@ -120,9 +132,28 @@ type Workspace() =
     member this.ParseFile (path : string) : Parser.ParseResult =
         db.MemoT "parse" path (fun () -> Parser.parse (this.FileText path))
 
+    /// Whole-project resolution + inference in compile order. Exports and
+    /// generalized schemes of earlier files flow into later ones.
+    member this.ProjectCheck () : Dict<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> =
+        db.MemoT "projectCheck" "" (fun () ->
+            let imports = dictNew<string, Analysis.Resolve.Definition> ()
+            let schemes = dictNew<string, Analysis.Types.Scheme> ()
+            let aliases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
+            let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
+            for path in this.ProjectFiles do
+                let p = this.ParseFile path
+                let b = Analysis.Resolve.resolve path imports p.Root
+                for full, d in b.Exports do dictSet imports full d
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases
+                dictSet results path (b, inf)
+            results)
+
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
-        db.MemoT "typecheck" path (fun () ->
-            Analysis.Infer.infer (this.ParseFile path).Root (this.Resolve path))
+        match dictTryFind (this.ProjectCheck ()) path with
+        | Some (_, i) -> i
+        | None ->
+            Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
+                (dictNew ()) (dictNew ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
@@ -144,8 +175,9 @@ type Workspace() =
             Outline.items starts r.Root.Children)
 
     member this.Resolve (path : string) : Analysis.Resolve.BindResult =
-        db.MemoT "resolve" path (fun () ->
-            Analysis.Resolve.resolve (this.ParseFile path).Root)
+        match dictTryFind (this.ProjectCheck ()) path with
+        | Some (b, _) -> b
+        | None -> Analysis.Resolve.resolve path (dictNew ()) (this.ParseFile path).Root
 
     /// Definition for the name whose use (or definition) covers the offset.
     member this.DefinitionAt (path : string) (offset : int) : Analysis.Resolve.Definition option =

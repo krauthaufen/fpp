@@ -3,12 +3,12 @@ module Fpp.Analysis.Resolve
 open Fpp.Prelude
 open Fpp.Syntax
 
-// Name resolution, v0: a single environment-threading pass over the syntax
-// tree. Produces a definition index and use->def resolutions for local names.
-// Names that don't resolve (BCL calls, other files) are silently skipped —
-// unresolved-name diagnostics wait until multi-file resolution and a stdlib
-// exist. Sequential visibility like F#: a name is visible after its binding
-// (before it only under `rec`).
+// Name resolution, v1: environment-threading pass with module paths, exports
+// and imports. Local scoping is the same as v0 (sequential visibility, rec,
+// shadowing). New: every top-level definition is exported under its full
+// dotted module path; a file resolves against the exports of the files
+// before it in the project (imports), consulting `open`ed prefixes and its
+// own module path. Unresolved names are still silently skipped.
 
 type DefKind =
     | DefLet
@@ -23,6 +23,8 @@ type DefKind =
 type Definition =
     { Name : string
       Kind : DefKind
+      /// file (workspace path/uri) this definition lives in
+      Path : string
       Offset : int
       Length : int }
 
@@ -33,7 +35,9 @@ type Resolution =
 
 type BindResult =
     { Definitions : Definition list
-      Resolutions : Resolution list }
+      Resolutions : Resolution list
+      /// full dotted path -> definition, for later files to import
+      Exports : (string * Definition) list }
 
 let kindLabel (k : DefKind) : string =
     match k with
@@ -48,20 +52,53 @@ let kindLabel (k : DefKind) : string =
 
 type private Env = Map<string, Definition>
 
-let resolve (root : GreenNode) : BindResult =
+let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNode) : BindResult =
     let defs = vecNew<Definition> ()
     let uses = vecNew<Resolution> ()
+    let exports = vecNew<string * Definition> ()
+    let ownExports = dictNew<string, Definition> ()
+    let opens = vecNew<string> ()
+    let mutable modulePath = ""
 
     let define (kind : DefKind) (t : Token) : Definition =
-        let d = { Name = t.Text; Kind = kind; Offset = t.Offset; Length = strLen t.Text }
+        let d = { Name = t.Text; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text }
         vecAdd defs d
         d
 
     let record (t : Token) (d : Definition) : unit =
         vecAdd uses { UseOffset = t.Offset; UseLength = strLen t.Text; Def = d }
 
+    let exportDef (d : Definition) : unit =
+        let full = if modulePath = "" then d.Name else modulePath + "." + d.Name
+        vecAdd exports (full, d)
+        dictSet ownExports full d
+
+    /// Bases to try when qualifying a name: the enclosing module path and all
+    /// its prefixes, every `open`, and the empty base.
+    let bases () : string list =
+        let rec prefixes (p : string) : string list =
+            if p = "" then [ "" ]
+            else
+                let i = p.LastIndexOf '.'
+                if i < 0 then [ p; "" ] else p :: prefixes (substr p 0 i)
+        prefixes modulePath @ vecToList opens @ [ "" ]
+
+    let findQualified (dotted : string) : Definition option =
+        bases ()
+        |> List.tryPick (fun b ->
+            let full = if b = "" then dotted else b + "." + dotted
+            match dictTryFind ownExports full with
+            | Some d -> Some d
+            | None -> dictTryFind imports full)
+
+    /// Local environment first, then opened/imported modules.
+    let lookupValue (env : Env) (name : string) : Definition option =
+        match Map.tryFind name env with
+        | Some d -> Some d
+        | None -> findQualified name
+
     let tryRecord (env : Env) (t : Token) : unit =
-        match Map.tryFind t.Text env with
+        match lookupValue env t.Text with
         | Some d -> record t d
         | None -> ()
 
@@ -81,11 +118,23 @@ let resolve (root : GreenNode) : BindResult =
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
+
+    /// Marks the boundary between top-level walking (defs are exported) and
+    /// walking inside binding bodies (defs are local).
+    let mutable atExportLevel = true
+
+    /// Run f with export-level off, restoring afterwards.
+    let inline local (f : unit -> 'a) : 'a =
+        let saved = atExportLevel
+        atExportLevel <- false
+        let r = f ()
+        atExportLevel <- saved
+        r
 
     // ---- types ------------------------------------------------------------
 
@@ -95,10 +144,17 @@ let resolve (root : GreenNode) : BindResult =
         | GNode n ->
             match n.NodeKind with
             | NamedType ->
-                (match n.Children with
-                 | GToken t :: _ when t.Kind = Ident ->
-                     (match Map.tryFind t.Text env with
+                let idents =
+                    n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+                (match idents with
+                 | [ t ] ->
+                     (match lookupValue env t.Text with
                       | Some d when d.Kind = DefType -> record t d
+                      | _ -> ())
+                 | many when not (List.isEmpty many) ->
+                     let dotted = many |> List.map (fun t -> t.Text) |> String.concat "."
+                     (match findQualified dotted with
+                      | Some d when d.Kind = DefType -> record (List.last many) d
                       | _ -> ())
                  | _ -> ())
             | VarType | AnonType -> ()
@@ -106,8 +162,6 @@ let resolve (root : GreenNode) : BindResult =
 
     // ---- patterns ---------------------------------------------------------
 
-    /// Bind the names of a pattern into the environment. Identifier patterns
-    /// that resolve to a known union case are uses, not bindings.
     let rec bindPat (kind : DefKind) (env : Env) (g : Green) : Env =
         match g with
         | GToken _ -> env
@@ -117,11 +171,10 @@ let resolve (root : GreenNode) : BindResult =
                 (match n.Children with
                  | GToken t :: rest when t.Kind = Ident ->
                      if not (List.isEmpty rest) then
-                         // dotted constructor reference: resolve head only
                          tryRecord env t
                          env
                      else
-                         match Map.tryFind t.Text env with
+                         match lookupValue env t.Text with
                          | Some d when d.Kind = DefCase ->
                              record t d
                              env
@@ -135,7 +188,6 @@ let resolve (root : GreenNode) : BindResult =
             | AppPat ->
                 (match n.Children with
                  | head :: args ->
-                     // the head is a constructor use
                      (match head with
                       | GNode hn when hn.NodeKind = IdentPat ->
                           (match hn.Children with
@@ -151,8 +203,21 @@ let resolve (root : GreenNode) : BindResult =
 
     // ---- expressions ------------------------------------------------------
 
-    /// Walk an expression; returns the environment extended by any bindings
-    /// this item introduces for its sequential successors (let in a block).
+    /// Flatten a pure identifier spine `a.b.c`; None if any segment is not a
+    /// plain identifier.
+    let rec flattenSpine (g : Green) : Token list option =
+        match g with
+        | GNode n when n.NodeKind = IdentExpr ->
+            (match n.Children with
+             | [ GToken t ] when t.Kind = Ident -> Some [ t ]
+             | _ -> None)
+        | GNode n when n.NodeKind = DotExpr ->
+            (match n.Children with
+             | [ lhs; GToken _; GToken r ] when r.Kind = Ident ->
+                 flattenSpine lhs |> Option.map (fun sp -> sp @ [ r ])
+             | _ -> None)
+        | _ -> None
+
     let rec walkExpr (env : Env) (g : Green) : Env =
         match g with
         | GToken _ -> env
@@ -161,15 +226,25 @@ let resolve (root : GreenNode) : BindResult =
             | IdentExpr ->
                 (match n.Children with
                  | [ GToken t ] when t.Kind = Ident -> tryRecord env t
-                 | _ -> ())   // quote-ident (type variable): skip
+                 | _ -> ())
                 env
             | DotExpr ->
-                // only the leftmost segment resolves locally
-                (match n.Children with
-                 | first :: _ -> walkExpr env first |> ignore
-                 | [] -> ())
+                (match flattenSpine g with
+                 | Some (head :: _ as spine) when (Map.tryFind head.Text env |> Option.forall (fun d -> d.Kind = DefModule)) ->
+                     // qualified module access: resolve the full spine
+                     let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
+                     (match findQualified dotted with
+                      | Some d ->
+                          record (List.last spine) d
+                          tryRecord env head
+                      | None -> tryRecord env head)
+                 | _ ->
+                     // member access on a value — resolve the lhs only
+                     (match n.Children with
+                      | first :: _ -> walkExpr env first |> ignore
+                      | [] -> ()))
                 env
-            | LetDecl -> walkLet env n
+            | LetDecl -> local (fun () -> walkLet env n)
             | LambdaExpr ->
                 let pats = n.Children |> List.filter (fun c -> match c with GNode p -> isPatKind p.NodeKind | _ -> false)
                 let inner = List.fold (bindPat DefParam) env pats
@@ -202,11 +277,11 @@ let resolve (root : GreenNode) : BindResult =
                     | GToken _ -> ()
                     | other -> walkExpr inner other |> ignore
                 env
-            | BraceExpr -> env   // token soup — nothing structured to resolve
+            | BraceExpr -> env
             | BlockExpr ->
                 let mutable e = env
                 for c in n.Children do e <- walkExpr e c
-                env   // block-local bindings do not escape
+                env
             | k when isTypeKind k ->
                 walkType env g
                 env
@@ -219,7 +294,7 @@ let resolve (root : GreenNode) : BindResult =
 
     and walkLet (env : Env) (n : GreenNode) : Env =
         let isRec = hasKwChild "rec" n.Children
-        // split children at the `=` token
+        let exportHere = atExportLevel
         let mutable seenEq = false
         let before = vecNew<Green> ()
         let after = vecNew<Green> ()
@@ -231,33 +306,38 @@ let resolve (root : GreenNode) : BindResult =
         let pats =
             vecToList before
             |> List.filter (fun c -> match c with GNode p -> isPatKind p.NodeKind | _ -> false)
-        // ascription types before `=`
         for c in vecToList before do
             match c with
             | GNode p when isTypeKind p.NodeKind -> walkType env c
             | _ -> ()
         let isDestructure =
-            vecToList before
-            |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
-        if isDestructure then
-            // `let a, b = ...` — every name binds into the outer scope
-            let envAll = List.fold (bindPat DefLet) env pats
-            for c in vecToList after do
-                walkExpr env c |> ignore
-            envAll
-        else
-        match pats with
-        | [] -> env
-        | namePat :: paramPats ->
-            let envWithName = bindPat DefLet env namePat
-            let bodyBase = if isRec then envWithName else env
-            let bodyEnv = List.fold (bindPat DefParam) bodyBase paramPats
-            for c in vecToList after do
-                walkExpr bodyEnv c |> ignore
-            envWithName
+            vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
+        let defsBefore = vecLen defs
+        let result =
+            if isDestructure then
+                let envAll = List.fold (bindPat DefLet) env pats
+                local (fun () ->
+                    for c in vecToList after do
+                        walkExpr env c |> ignore)
+                envAll
+            else
+                match pats with
+                | [] -> env
+                | namePat :: paramPats ->
+                    let envWithName = bindPat DefLet env namePat
+                    let bodyBase = if isRec then envWithName else env
+                    local (fun () ->
+                        let bodyEnv = List.fold (bindPat DefParam) bodyBase paramPats
+                        for c in vecToList after do
+                            walkExpr bodyEnv c |> ignore)
+                    envWithName
+        if exportHere then
+            for i in defsBefore .. vecLen defs - 1 do
+                let d = vecGet defs i
+                if d.Kind = DefLet then exportDef d
+        result
 
     and walkMember (env : Env) (n : GreenNode) : unit =
-        // [modifiers] [self .] name [typarams] params [: type] [= body]
         let mutable seenEq = false
         let idents = vecNew<Token> ()
         let pats = vecNew<Green> ()
@@ -279,18 +359,20 @@ let resolve (root : GreenNode) : BindResult =
             define DefMember name |> ignore
         | [ name ] -> define DefMember name |> ignore
         | _ -> ()
-        for p in vecToList pats do inner <- bindPat DefParam inner p
-        for c in vecToList body do walkExpr inner c |> ignore
+        local (fun () ->
+            for p in vecToList pats do inner <- bindPat DefParam inner p
+            for c in vecToList body do walkExpr inner c |> ignore)
 
     and walkTypeDecl (env : Env) (n : GreenNode) : Env =
         let nameTok = firstIdentToken n.Children
+        let exportHere = atExportLevel
         let mutable outer = env
         match nameTok with
         | Some t ->
             let d = define DefType t
             outer <- Map.add t.Text d outer
+            if exportHere then exportDef d
         | None -> ()
-        // union cases and record fields extend the outer environment
         for c in n.Children do
             match c with
             | GNode u when u.NodeKind = UnionCase ->
@@ -298,6 +380,7 @@ let resolve (root : GreenNode) : BindResult =
                  | Some t ->
                      let d = define DefCase t
                      outer <- Map.add t.Text d outer
+                     if exportHere then exportDef d
                  | None -> ())
                 for x in u.Children do
                     match x with
@@ -316,12 +399,11 @@ let resolve (root : GreenNode) : BindResult =
                             | _ -> ()
                     | _ -> ()
             | _ -> ()
-        // class body: ctor params + lets visible in members
         let mutable inner = outer
         for c in n.Children do
             match c with
             | GNode p when isPatKind p.NodeKind ->
-                inner <- bindPat DefParam inner c   // primary-ctor parameters
+                local (fun () -> inner <- bindPat DefParam inner c)
             | GNode m when m.NodeKind = MemberDecl -> walkMember inner m
             | GNode i when i.NodeKind = InterfaceImpl ->
                 for x in i.Children do
@@ -329,8 +411,8 @@ let resolve (root : GreenNode) : BindResult =
                     | GNode m when m.NodeKind = MemberDecl -> walkMember inner m
                     | GNode ty when isTypeKind ty.NodeKind -> walkType inner x
                     | _ -> ()
-            | GNode l when l.NodeKind = LetDecl -> inner <- walkLet inner l
-            | GNode b when b.NodeKind = BlockExpr -> walkExpr inner c |> ignore
+            | GNode l when l.NodeKind = LetDecl -> local (fun () -> inner <- walkLet inner l)
+            | GNode b when b.NodeKind = BlockExpr -> local (fun () -> walkExpr inner c |> ignore)
             | GNode ty when isTypeKind ty.NodeKind -> walkType outer c
             | _ -> ()
         outer
@@ -344,28 +426,46 @@ let resolve (root : GreenNode) : BindResult =
             | TypeDecl -> walkTypeDecl env n
             | ModuleDef ->
                 let mutable outer = env
-                (match firstIdentToken n.Children with
-                 | Some t ->
+                let nameToks =
+                    n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+                let segment = nameToks |> List.map (fun t -> t.Text) |> String.concat "."
+                (match nameToks with
+                 | t :: _ ->
                      let d = define DefModule t
                      outer <- Map.add t.Text d outer
-                 | None -> ())
+                     if atExportLevel then exportDef d
+                 | [] -> ())
+                let saved = modulePath
+                modulePath <- (if modulePath = "" then segment else modulePath + "." + segment)
                 let mutable inner = outer
                 for c in n.Children do
                     match c with
                     | GNode _ -> inner <- walkDecl inner c
                     | GToken _ -> ()
+                modulePath <- saved
                 outer
             | ModuleHeader ->
-                (match firstIdentToken n.Children with
-                 | Some t -> define DefModule t |> ignore
-                 | None -> ())
+                let nameToks =
+                    n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+                (match nameToks with
+                 | t :: _ -> define DefModule t |> ignore
+                 | [] -> ())
+                modulePath <- nameToks |> List.map (fun t -> t.Text) |> String.concat "."
                 env
-            | OpenDecl | AttributeList | TyParams -> env
-            | _ -> walkExpr env g |> ignore; env
+            | OpenDecl ->
+                let dotted =
+                    n.Children
+                    |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t.Text | _ -> None)
+                    |> String.concat "."
+                if dotted <> "" then vecAdd opens dotted
+                env
+            | AttributeList | TyParams -> env
+            | _ -> local (fun () -> walkExpr env g) |> ignore; env
 
     let mutable env : Env = Map.empty
     for c in root.Children do
         env <- walkDecl env c
 
     { Definitions = vecToList defs
-      Resolutions = vecToList uses }
+      Resolutions = vecToList uses
+      Exports = vecToList exports }

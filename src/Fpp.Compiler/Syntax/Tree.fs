@@ -47,6 +47,7 @@ type NodeKind =
     | AppPat
     | ParenPat
     | ListPat
+    | AsPat
     // types
     | NamedType
     | VarType
