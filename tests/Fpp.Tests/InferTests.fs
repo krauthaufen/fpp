@@ -130,6 +130,28 @@ let inferTests =
             Expect.equal (typeOf src "b") (Some "Box<int>") "b : Box<int>"
             Expect.equal (typeOf src "v") (Some "int") "v : int"
         }
+        test "class construction and member calls are typed" {
+            let src = "type Counter(seed : int) =\n    let mutable n = seed\n    member _.Get () = n\n    member _.Label (s : string) = s\nlet c = Counter(5)\nlet v = c.Get () + 1\nlet l = c.Label \"x\"\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "c") (Some "Counter") "ctor gives the class type"
+            Expect.equal (typeOf src "v") (Some "int") "member result typed"
+            Expect.equal (typeOf src "l") (Some "string") "member arg typed"
+        }
+        test "member misuse is caught" {
+            let src = "type C() =\n    member _.OnlyInt (n : int) = n\nlet c = C()\nlet bad = c.OnlyInt \"nope\"\n"
+            Expect.isNonEmpty (inferSrc src).Diagnostics "wrong member arg reported"
+        }
+        test "self identifier has the class type" {
+            let src = "type C() =\n    member _.A = 1\n    member this.B () = this.A + 1\nlet c = C()\nlet v = c.B ()\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "v") (Some "int") "self-access typed through"
+        }
+        test "record label sets disambiguate overlapping fields" {
+            let src = "type A =\n    { Shared : int\n      OnlyA : string }\ntype B =\n    { Shared : int\n      OnlyB : bool }\nlet a = { Shared = 1; OnlyA = \"x\" }\nlet b = { Shared = 2; OnlyB = true }\n"
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+            Expect.equal (typeOf src "a") (Some "A") "full label set picks A"
+            Expect.equal (typeOf src "b") (Some "B") "full label set picks B"
+        }
         test "hover includes the inferred type" {
             let ws = Workspace()
             ws.SetFileText "t" "let add a b = a + b + 1\n"
