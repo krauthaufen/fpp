@@ -162,6 +162,19 @@ let oracleTests =
             "let b = print (safe (0 - 5))"
             "let c = print (safe 100)"
         ]
+        oracle "heterogeneous struct arrays (SoA columns per field)" [
+            "[<Struct>]"
+            "type Particle = { X : float; Y : float; Id : int; Tag : string }"
+            "let ps = [| { X = 1.5; Y = 2.5; Id = 7; Tag = \"a\" }; { X = 3.0; Y = 4.0; Id = 9; Tag = \"b\" } |]"
+            "let sums ="
+            "    let mutable s = 0.0"
+            "    for i in 0 .. ps.Length - 1 do"
+            "        s <- s + ps.[i].X * ps.[i].Y"
+            "    s"
+            "let a = print sums"
+            "let b = print (ps.[0].Id + ps.[1].Id)"
+            "let c = print (ps.[1].Tag + ps.[0].Tag)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"
