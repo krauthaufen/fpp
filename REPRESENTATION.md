@@ -49,15 +49,24 @@ works on unboxed machine values and boxes only at uniform boundaries.
 - **Tuples**: anonymous structs, same as records. Flattening into locals in
   monomorphic contexts is an optimization pass.
 
-## Structs (value types)
+## Structs (value types) — first-class, no unnecessary boxing
 
-Key observation: for **immutable** data, copy-semantics vs
-reference-semantics is unobservable — so `[<Struct>]` records/DUs get the
-same heap representation as their boxed cousins in v1, at zero semantic
-cost. The observable difference only appears with mutable struct fields;
-those are **rejected in v1**. True flat/inline/stack struct layout arrives
-later as an escape-analysis + monomorphization optimization, not as a
-representation commitment.
+**Requirement (explicit):** structs are first-class citizens; boxing only
+where specialization is impossible in principle.
+
+Structs are flat value types: unboxed in locals, parameters, returns,
+record/DU fields, and arrays whenever the code path is specialized or the
+type is statically known — which tiers 1–2 of the generics scheme (below)
+make the common case. A struct boxes ONLY at tier-3 boundaries, and the
+compiler can report where.
+
+- wasm-GC note: "unboxed" there means flattened into the enclosing
+  struct/array/locals rather than a separate allocation; wasm-GC has no
+  interior pointers, so struct arrays flatten fields into the array payload.
+- Native note: true flat layout in registers/stack/inline fields, C-style.
+- Mutable struct fields: deferred until the emitter enforces copy
+  semantics; immutable structs meanwhile share representation soundness
+  by construction (copy vs reference unobservable).
 
 ## Arrays
 
@@ -68,17 +77,39 @@ representation commitment.
   type (`ref.test` chain / vtable) for load/store. Numeric hot loops are
   expected to be monomorphized, which erases the dispatch entirely.
 
-## Generics
+## Generics — three tiers (decided)
 
-- Baseline: **erased to uniform slots**. No runtime type tokens, no
-  reification; `typeof` is dropped from the language (spec keep/drop table).
-- Constraints (future typeclasses, static interface members): **implicit
-  dictionary parameters** (DESIGN.md) — a dictionary is an ordinary record
-  of functions/values in this same representation.
-- **Monomorphization is a directed optimization**: visible instantiations
-  may be cloned and unboxed; polymorphic recursion / HKT / escaping
-  polymorphism silently stay on the uniform path. Correctness never depends
-  on specialization succeeding.
+Survey of prior art that shaped this: C++ (templates + COMDAT linker
+dedup), Rust (generic MIR shipped in rlibs, instantiated downstream,
+symbol-hash dedup), .NET (specialize per value type, share `__Canon` for
+all reference types; NativeAOT does it ahead of time), Swift (unspecialized
+generic code over value-witness tables — no boxing even unspecialized),
+MLton (whole-program mono; possible only because SML lacks polymorphic
+recursion), Zig/D (comptime). GADTs force polymorphic recursion on us, so
+full monomorphization is impossible *in general* — but that only dictates
+the fallback tier, not the common case.
+
+- **Tier 1 — specialized per struct instantiation.** Library "objects" are
+  serialized typed Core IR (fat rlibs, Rust-style). The F++ link step —
+  which is ours and understands the type system — stamps needed
+  instantiations on demand and deduplicates them by mangled instantiation
+  identity (the COMDAT idea without the ELF archaeology). `Map<Vec2,_>`
+  gets real flat `Vec2` code.
+- **Tier 2 — one shared body for ALL reference-type instantiations** (the
+  .NET `__Canon` insight). References are uniform already; sharing kills
+  the C++/Rust bloat problem for the majority of instantiations.
+- **Tier 3 — fallback where specialization is impossible in principle**:
+  polymorphic recursion (GADTs), HKT-generic code, first-class polymorphic
+  values. v1: box structs at this boundary (with a compiler note).
+  Upgrade path: Swift-style value-witness tables remove even that boxing
+  later with no semantic change — the design keeps that door open.
+- No runtime type tokens, no reflection; `typeof` stays dropped. Runtime
+  instantiation can never be demanded (no `MakeGenericType`), so the
+  link-time closure of instantiations is complete except through tier 3 —
+  which is exactly what tier 3 is for.
+- Constraints (typeclasses, static interface members): **implicit
+  dictionary parameters**; in tier-1 code the dictionary is resolved
+  statically and inlined away, in tiers 2–3 it is a real record argument.
 
 ## Closures & currying
 
