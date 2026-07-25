@@ -88,8 +88,10 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 ## Stage 4.5 — Expanded mandate (user directive: "all of it")
 - [~] More F# surface area end-to-end: while/range-for/mutables/assignment
       SHIPPED (EWhile/EAssign in core, for desugars to while, oracle-checked).
-      Open: general for-in over collections, arrays, exceptions (try/with
-      parse + raise semantics), string ops, printf formatting, CE bodies
+      Arrays SHIPPED: [| |] literals, a.[i] get/set, .Length on
+      arrays+strings, int[] types, oracle-verified incl. for-loop sum.
+      Open: general for-in over collections, exceptions (try/with parse +
+      raise semantics), string ops, printf formatting, CE bodies
 - [~] Linker: fat-IR .fppir format DONE (Core/Serialize.fs s-expr:
       exports + schemes + decls), `fpp lib -o x.fppir` + `fpp build`
       accepting .fppir DONE (cross-lib resolution, typing, direct calls),

@@ -502,9 +502,23 @@ let parse (src : string) : ParseResult =
                     vecAdd acc (parseType ctx)
                 if s.Is RParen then vecAdd acc (s.Bump ()) else s.Diag "expected ')'"
                 Green.node ParenExpr (vecToList acc)
+        elif s.Is LBracket && (s.Peek 1).Kind = Operator && ((s.Peek 1).Text = "|" || (s.Peek 1).Text = "||") then
+            // array literal [| ... |]
+            let acc = vecNew<Green> ()
+            vecAdd acc (s.Bump ())   // [
+            vecAdd acc (s.Bump ())   // | (or || when empty)
+            let mutable go = true
+            while go && not s.AtEof && not (s.Is RBracket) && not (s.IsOp "|") do
+                let mark = s.Mark
+                if s.Is Semicolon then vecAdd acc (s.Bump ())
+                elif canStartExpr () then vecAdd acc (parseExpr ctx)
+                else vecAdd acc (s.Bump ())
+                if s.Mark = mark then go <- false
+            if s.IsOp "|" then vecAdd acc (s.Bump ())
+            if s.Is RBracket then vecAdd acc (s.Bump ()) else s.Diag "expected '|]'"
+            Green.node ArrayExpr (vecToList acc)
         elif s.Is LBracket then
-            // list / array: contents as `;`- or newline-separated expressions;
-            // stray `|` (array brackets) absorbed verbatim
+            // list: contents as `;`- or newline-separated expressions
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())
             let mutable go = true

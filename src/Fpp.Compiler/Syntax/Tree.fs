@@ -32,6 +32,7 @@ type NodeKind =
     | RecordExprField
     | TupleExpr
     | ListExpr
+    | ArrayExpr
     | LambdaExpr
     | IfExpr
     | MatchExpr

@@ -135,6 +135,9 @@ let rec private encExpr (e : Expr) : Sx =
     | ESeq xs -> L (A "es" :: List.map encExpr xs)
     | EWhile (c, b) -> L [ A "ew"; encExpr c; encExpr b ]
     | EAssign (v, e) -> L [ A "eg"; encVarId v; encExpr e ]
+    | EArray xs -> L (A "ey" :: List.map encExpr xs)
+    | EIndex (a, i) -> L [ A "ex"; encExpr a; encExpr i ]
+    | EIndexSet (a, i, v) -> L [ A "ez"; encExpr a; encExpr i; encExpr v ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -242,6 +245,9 @@ let rec private decExpr (x : Sx) : Expr =
     | L (A "es" :: xs) -> ESeq (List.map decExpr xs)
     | L [ A "ew"; c; b ] -> EWhile (decExpr c, decExpr b)
     | L [ A "eg"; v; e ] -> EAssign (decVarId v, decExpr e)
+    | L (A "ey" :: xs) -> EArray (List.map decExpr xs)
+    | L [ A "ex"; a; i ] -> EIndex (decExpr a, decExpr i)
+    | L [ A "ez"; a; i; v ] -> EIndexSet (decExpr a, decExpr i, decExpr v)
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =

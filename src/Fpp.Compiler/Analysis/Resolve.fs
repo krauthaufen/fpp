@@ -240,9 +240,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                           tryRecord env head
                       | None -> tryRecord env head)
                  | _ ->
-                     // member access on a value — resolve the lhs only
+                     // member access on a value: resolve the lhs, and walk
+                     // any index expression (a.[i])
                      (match n.Children with
-                      | first :: _ -> walkExpr env first |> ignore
+                      | first :: rest ->
+                          walkExpr env first |> ignore
+                          for c in rest do
+                              match c with
+                              | GNode m when m.NodeKind = ListExpr -> walkExpr env c |> ignore
+                              | _ -> ()
                       | [] -> ()))
                 env
             | LetDecl -> local (fun () -> walkLet env n)

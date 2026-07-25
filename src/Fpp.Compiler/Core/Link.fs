@@ -37,6 +37,9 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EField (r, _) -> scan r
         | EWhile (c, b) -> scan c; scan b
         | EAssign (v, e) -> demand (v.Path, v.Offset); scan e
+        | EArray xs -> List.iter scan xs
+        | EIndex (a, i) -> scan a; scan i
+        | EIndexSet (a, i, v) -> scan a; scan i; scan v
         | _ -> ()
     // roots: value initializers (program effects)
     for d in decls do

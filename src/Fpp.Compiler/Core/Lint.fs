@@ -198,6 +198,19 @@ let lint (decls : Decl list) : string list =
              | Some t -> unifyC ("assign " + v.Name) (exprType e) t
              | None -> exprType e |> ignore)
             tUnit
+        | EArray xs ->
+            let elem = st.Fresh ()
+            for x in xs do unifyC "array element" (exprType x) elem
+            TCon ("array", [ elem ])
+        | EIndex (a, i) ->
+            exprType a |> ignore
+            unifyC "index" (exprType i) tInt
+            st.Fresh ()
+        | EIndexSet (a, i, v) ->
+            exprType a |> ignore
+            unifyC "index" (exprType i) tInt
+            exprType v |> ignore
+            tUnit
 
     for d in decls do
         match d with

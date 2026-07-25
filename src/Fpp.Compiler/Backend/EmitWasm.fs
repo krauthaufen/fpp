@@ -93,6 +93,9 @@ let emit (decls : Decl list) : EmitResult =
         | EField (r, _) -> scanExpr r
         | EWhile (c, b) -> scanExpr c; scanExpr b
         | EAssign (_, e) -> scanExpr e
+        | EArray xs -> List.iter scanExpr xs
+        | EIndex (a, i) -> scanExpr a; scanExpr i
+        | EIndexSet (a, i, v) -> scanExpr a; scanExpr i; scanExpr v
         | _ -> ()
     for d in decls do
         match d with
@@ -292,6 +295,8 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
+        | EField (r, "Length") when not (dictTryFind fieldIndex "Length").IsSome ->
+            "(call $lenv " + recur r + ")"
         | EField (r, fname) ->
             (match dictTryFind fieldIndex fname with
              | Some (rn, idx) ->
@@ -320,6 +325,13 @@ let emit (decls : Decl list) : EmitResult =
                  | None ->
                      vecAdd errors ("assignment to unknown " + v.Name)
                      "(ref.i31 (i32.const 0))")
+        | EArray xs ->
+            "(array.new_fixed $arr " + string xs.Length + " " + String.concat " " (List.map recur xs) + ")"
+        | EIndex (a, i) ->
+            "(call $indexv " + recur a + " " + unwrapI32 (recur i) + ")"
+        | EIndexSet (a, i, v) ->
+            "(block (result anyref) (array.set $arr (ref.cast (ref $arr) " + recur a + ") "
+            + unwrapI32 (recur i) + " " + recur v + ") (ref.i31 (i32.const 0)))"
         | EMatch (scrut, cases) ->
             // expand or-patterns into separate cases
             let cases =
@@ -451,6 +463,9 @@ let emit (decls : Decl list) : EmitResult =
             | EField (r, _) -> walk r
             | EWhile (c, b) -> walk c; walk b
             | EAssign (v, e) -> noteFree (v.Path, v.Offset); walk e
+            | EArray xs -> List.iter walk xs
+            | EIndex (a, i) -> walk a; walk i
+            | EIndexSet (a, i, v) -> walk a; walk i; walk v
             | _ -> ()
         walk body
         let freeList = vecToList free
@@ -484,6 +499,7 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $str (array (mut i8)))"
     line "  (type $boxf (struct (field f64)))"
     line "  (type $boxi (struct (field i32)))"
+    line "  (type $arr (array (mut anyref)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
     for d in decls do
         match d with
@@ -583,6 +599,14 @@ let emit (decls : Decl list) : EmitResult =
         (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
         (call $append (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a))) (local.get $b))))
       (else (local.get $b))))
+  (func $indexv (param $v anyref) (param $i i32) (result anyref)
+    (if (ref.test (ref $str) (local.get $v))
+      (then (return (ref.i31 (array.get_u $str (ref.cast (ref $str) (local.get $v)) (local.get $i))))))
+    (array.get $arr (ref.cast (ref $arr) (local.get $v)) (local.get $i)))
+  (func $lenv (param $v anyref) (result anyref)
+    (if (ref.test (ref $str) (local.get $v))
+      (then (return (call $ofi (array.len (ref.cast (ref $str) (local.get $v)))))))
+    (call $ofi (array.len (ref.cast (ref $arr) (local.get $v)))))
   (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
     (local $r (ref $str)) (local $i i32) (local $la i32)
     (local.set $la (array.len (local.get $a)))

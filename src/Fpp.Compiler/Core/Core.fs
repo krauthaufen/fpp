@@ -51,6 +51,9 @@ type Expr =
     | ESeq of Expr list
     | EWhile of Expr * Expr
     | EAssign of VarId * Expr
+    | EArray of Expr list
+    | EIndex of Expr * Expr
+    | EIndexSet of Expr * Expr * Expr
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -94,6 +97,9 @@ let rec printExpr (e : Expr) : string =
     | EPrim (op, args) -> "(" + op + " " + String.concat " " (List.map printExpr args) + ")"
     | ESeq xs -> "(seq " + String.concat "; " (List.map printExpr xs) + ")"
     | EWhile (c, b) -> "(while " + printExpr c + " do " + printExpr b + ")"
+    | EArray xs -> "[|" + String.concat "; " (List.map printExpr xs) + "|]"
+    | EIndex (a, i) -> printExpr a + ".[" + printExpr i + "]"
+    | EIndexSet (a, i, v) -> printExpr a + ".[" + printExpr i + "] <- " + printExpr v
     | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
 
 and printPat (p : Pat) : string =

@@ -173,6 +173,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | "<-" ->
                           (match lowerExpr (GNode l) with
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
+                           | EIndex (a, i) -> EIndexSet (a, i, lowerExpr (GNode r))
                            | _ -> note (offsetOf n) "assignment target")
                       | "|>" -> EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
@@ -279,6 +280,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some t, Some v -> Some (t.Text, lowerExpr (GNode v))
                         | _ -> None)
                 ERecord ("?", fields)   // type name filled by lint/emission from inference if needed
+            | ArrayExpr ->
+                EArray (nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m)))
+            | DotExpr when (match nodesOf n with [ _; ix ] -> ix.NodeKind = ListExpr | _ -> false) ->
+                // index access: a.[i]
+                (match nodesOf n with
+                 | [ lhs; ix ] ->
+                     let idx =
+                         nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind)
+                         |> List.map (fun m -> lowerExpr (GNode m))
+                     (match idx with
+                      | [ i ] -> EIndex (lowerExpr (GNode lhs), i)
+                      | _ -> note (offsetOf n) "index shape")
+                 | _ -> note (offsetOf n) "index shape")
             | DotExpr ->
                 (match nodesOf n |> List.tryHead, Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some lhs, Some name ->

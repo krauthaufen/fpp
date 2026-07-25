@@ -93,6 +93,22 @@ let oracleTests =
             "    s"
             "let b = print (countFor ())"
         ]
+        oracle "arrays: literals, indexing, mutation, Length" [
+            "let xs = [| 10; 20; 30 |]"
+            "let a = print (xs.[0] + xs.[2])"
+            "let doIt () ="
+            "    xs.[1] <- 99"
+            "    xs.[1]"
+            "let b = print (doIt ())"
+            "let c = print (xs.Length)"
+            "let d = print (\"hello\".Length)"
+            "let sumArr (arr : int[]) ="
+            "    let mutable s = 0"
+            "    for i in 0 .. arr.Length - 1 do"
+            "        s <- s + arr.[i]"
+            "    s"
+            "let e = print (sumArr [| 1; 2; 3; 4 |])"
+        ]
         oracle "string concatenation" [
             "let greet name ="
             "    \"Hello, \" + name + \"!\""

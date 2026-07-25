@@ -182,7 +182,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  (match expandAlias t.Text [ arg ] with
                   | Some ty -> ty
                   | None -> TCon (t.Text, [ arg ]))
-             | [ inner ], _ -> typeFromNode vars inner   // int[] — array suffix
+             | [ inner ], _ -> TCon ("array", [ typeFromNode vars inner ])   // int[]
              | _ -> st.Fresh ())
         | FunType ->
             (match nodesOf n with
@@ -507,6 +507,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     last <- exprType (GNode m)
                 last
             | LetDecl -> inferLet n
+            | DotExpr when (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr)) ->
+                // index access a.[i]: walk lhs and index; element type unknown v0
+                for m in nodesOf n do
+                    if isExprish m.NodeKind then exprType (GNode m) |> ignore
+                st.Fresh ()
             | DotExpr ->
                 let lastIdent =
                     Green.tokens (GNode n)
@@ -589,6 +594,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some b -> exprType (GNode b) |> ignore
                       | None -> ())
                      st.Fresh ())
+            | ArrayExpr ->
+                let elem = st.Fresh ()
+                for m in nodesOf n do
+                    if isExprish m.NodeKind then
+                        let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
+                        unifyAt off (exprType (GNode m)) elem
+                TCon ("array", [ elem ])
             | BraceExpr -> st.Fresh ()
             | ErrorNode -> st.Fresh ()
             | _ ->
