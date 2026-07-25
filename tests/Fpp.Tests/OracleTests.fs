@@ -175,6 +175,21 @@ let oracleTests =
             "let b = print (ps.[0].Id + ps.[1].Id)"
             "let c = print (ps.[1].Tag + ps.[0].Tag)"
         ]
+        oracle "mixed-POD struct arrays (C-image words: f64 + i32 + f32)" [
+            "[<Struct>]"
+            "type Cell = { V : float; N : int; W : float32 }"
+            "let cs = [| { V = 1.5; N = 3; W = 0.25f }; { V = 2.5; N = 4; W = 0.5f } |]"
+            "let a = print (cs.[0].V + cs.[1].V)"
+            "let b = print (cs.[0].N + cs.[1].N)"
+            "let c = print (cs.[1].W + cs.[0].W)"
+            "let upd = cs.[0] <- { V = 9.0; N = 7; W = 1.0f }"
+            "let d = print (cs.[0].V)"
+            "let e = print (cs.[0].N)"
+            "let grown = Array.create 3 { V = 0.5; N = 2; W = 2.0f }"
+            "let f = print (grown.[2].V + grown.[1].V)"
+            "let h = print (grown.[1].W + grown.[0].W)"
+            "let g = print grown.Length"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

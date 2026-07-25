@@ -38,6 +38,64 @@ let emit (decls : Decl list) : EmitResult =
     let structRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, true) -> Some (n, fs) | _ -> None)
     let isStructName (n : string) = structRecords |> List.exists (fun (rn, _) -> rn = n)
     let parrOf (k : string) = "$parr_" + k
+    // ---- C ABI layout for POD structs (clang natural alignment) ----------
+    // fields: (name, kind, byteOffset); sizeof rounded to max align;
+    // storage = shared GC (array (mut i64)), strideWords per element
+    let podLayout = dictNew<string, (string * string * int) list * int * int> ()
+    for rn, fs in structRecords do
+        if fs |> List.forall (fun (_, k) -> k = "i" || k = "f" || k = "s" || k = "l") then
+            let mutable off = 0
+            let mutable maxA = 1
+            let placed =
+                fs |> List.map (fun (fn, k) ->
+                    let sz = if k = "i" || k = "s" then 4 else 8
+                    off <- ((off + sz - 1) / sz) * sz
+                    let o = off
+                    off <- off + sz
+                    if sz > maxA then maxA <- sz
+                    fn, k, o)
+            let sizeof_ = ((off + maxA - 1) / maxA) * maxA
+            dictSet podLayout rn (placed, sizeof_, (sizeof_ + 7) / 8)
+    let isPod (n : string) = (dictTryFind podLayout n).IsSome
+    /// raw field value FROM a word expression (kind-typed result)
+    let fieldFromWords (rn : string) (arrW : string) (baseW : string) (fn : string) : string =
+        let placed, _, _ = (dictTryFind podLayout rn).Value
+        let _, k, off = placed |> List.find (fun (n, _, _) -> n = fn)
+        let word = "(array.get $pk " + arrW + " (i32.add " + baseW + " (i32.const " + string (off / 8) + ")))"
+        let sh = (off % 8) * 8
+        match k with
+        | "f" -> "(f64.reinterpret_i64 " + word + ")"
+        | "l" -> word
+        | "s" ->
+            let bits = if sh = 0 then "(i32.wrap_i64 " + word + ")" else "(i32.wrap_i64 (i64.shr_u " + word + " (i64.const " + string sh + ")))"
+            "(f32.reinterpret_i32 " + bits + ")"
+        | _ ->
+            if sh = 0 then "(i32.wrap_i64 " + word + ")"
+            else "(i32.wrap_i64 (i64.shr_u " + word + " (i64.const " + string sh + ")))"
+    /// i64 word w built from a struct value in local `vl`
+    let wordFromStruct (rn : string) (vl : string) (w : int) : string =
+        let placed, _, _ = (dictTryFind podLayout rn).Value
+        let fidx = structRecords |> List.pick (fun (n, fs) -> if n = rn then Some (fs |> List.mapi (fun i (fn, _) -> fn, i)) else None)
+        let parts =
+            placed
+            |> List.filter (fun (_, _, off) -> off / 8 = w)
+            |> List.map (fun (fn, k, off) ->
+                let i = fidx |> List.find (fun (n, _) -> n = fn) |> snd
+                let fv = "(struct.get $r_" + rn + " " + string i + " (ref.cast (ref $r_" + rn + ") (local.get " + vl + ")))"
+                let sh = (off % 8) * 8
+                match k with
+                | "f" -> "(i64.reinterpret_f64 " + fv + ")"
+                | "l" -> fv
+                | "s" ->
+                    let b = "(i64.extend_i32_u (i32.reinterpret_f32 " + fv + "))"
+                    if sh = 0 then b else "(i64.shl " + b + " (i64.const " + string sh + "))"
+                | _ ->
+                    let b = "(i64.and (i64.extend_i32_u " + fv + ") (i64.const 4294967295))"
+                    if sh = 0 then b else "(i64.shl " + b + " (i64.const " + string sh + "))")
+        match parts with
+        | [] -> "(i64.const 0)"
+        | [ one ] -> one
+        | many -> many |> List.reduce (fun a b -> "(i64.or " + a + " " + b + ")")
     let boxOfKind (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
     let unboxOfKind (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
     // field name -> (record, index, kind); F# shadowing: last declaration wins
@@ -453,6 +511,16 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
+        | EField (EIndex (nm, a, i), fname) when isPod nm && (dictTryFind fieldIndex fname).IsSome ->
+            // fusion on packed arrays: single array.get + reinterpret
+            let _, _, wd = (dictTryFind podLayout nm).Value
+            let _, _, k = (dictTryFind fieldIndex fname).Value
+            let baseW = "(i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))"
+            let raw = fieldFromWords nm ("(ref.cast (ref $pk) " + recur a + ")") baseW fname
+            (match k with
+             | "f" | "s" | "l" -> boxK k raw
+             | "i" -> "(call $ofi " + raw + ")"
+             | _ -> raw)
         | EField (EIndex (nm, a, i), fname) when isStructName nm && (dictTryFind fieldIndex fname).IsSome ->
             // fusion: pts.[i].X reads the SoA field array directly — no
             // temporary struct materialization
@@ -508,6 +576,18 @@ let emit (decls : Decl list) : EmitResult =
             if pk <> "" then
                 let vals = xs |> List.map (fun x -> "(call " + unboxOfKind pk + " " + recur x + ")")
                 "(array.new_fixed " + parrOf pk + " " + string xs.Length + " " + String.concat " " vals + ")"
+            elif isPod elemName then
+                // C-image packed: N elements x strideWords i64 words
+                let _, _, wd = (dictTryFind podLayout elemName).Value
+                let elemLocals = xs |> List.map (fun _ -> newLocal "pk")
+                let ops =
+                    List.zip elemLocals xs
+                    |> List.collect (fun (l, x) ->
+                        [ for w in 0 .. wd - 1 ->
+                            let word = wordFromStruct elemName l w
+                            if w = 0 then "(block (result i64) (local.set " + l + " " + recur x + ") " + word + ")"
+                            else word ])
+                "(array.new_fixed $pk " + string (xs.Length * wd) + " " + String.concat " " ops + ")"
             elif isStructName elemName then
                 // SoA: element temps evaluated once (during the first field
                 // array), then per-field extraction into typed arrays
@@ -533,6 +613,16 @@ let emit (decls : Decl list) : EmitResult =
                 "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif pk <> "" then
                 "(call " + boxOfKind pk + " (array.get " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") " + unwrapI32 (recur i) + "))"
+            elif isPod nm then
+                let placed, _, wd = (dictTryFind podLayout nm).Value
+                let al = newLocal "pa"
+                let bl = newTypedLocal "pb" "i32"
+                let arrW = "(ref.cast (ref $pk) (local.get " + al + "))"
+                let fieldsW =
+                    placed |> List.map (fun (fn, _, _) -> fieldFromWords nm arrW ("(local.get " + bl + ")") fn)
+                "(block (result anyref) (local.set " + al + " " + recur a + ") "
+                + "(local.set " + bl + " (i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))) "
+                + "(struct.new $r_" + nm + " " + String.concat " " fieldsW + "))"
             elif isStructName nm then
                 let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
                 let al = newLocal "ia"
@@ -553,6 +643,19 @@ let emit (decls : Decl list) : EmitResult =
             if pk <> "" then
                 "(block (result anyref) (array.set " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") "
                 + unwrapI32 (recur i) + " (call " + unboxOfKind pk + " " + recur v + ")) (ref.i31 (i32.const 0)))"
+            elif isPod nm then
+                let _, _, wd = (dictTryFind podLayout nm).Value
+                let al = newLocal "wa"
+                let bl = newTypedLocal "wb" "i32"
+                let vl = newLocal "wv"
+                let arrW = "(ref.cast (ref $pk) (local.get " + al + "))"
+                let sets =
+                    [ for w in 0 .. wd - 1 ->
+                        "(array.set $pk " + arrW + " (i32.add (local.get " + bl + ") (i32.const " + string w + ")) " + wordFromStruct nm vl w + ")" ]
+                "(block (result anyref) (local.set " + al + " " + recur a + ") "
+                + "(local.set " + bl + " (i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))) "
+                + "(local.set " + vl + " " + recur v + ") "
+                + String.concat " " sets + " (ref.i31 (i32.const 0)))"
             elif isStructName nm then
                 let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
                 let al = newLocal "sa"
@@ -575,6 +678,9 @@ let emit (decls : Decl list) : EmitResult =
                 "(call $ofi (array.len (ref.cast (ref $str) " + recur a + ")))"
             elif pk <> "" then
                 "(call $ofi (array.len (ref.cast (ref " + parrOf pk + ") " + recur a + ")))"
+            elif isPod nm then
+                let _, _, wd = (dictTryFind podLayout nm).Value
+                "(call $ofi (i32.div_u (array.len (ref.cast (ref $pk) " + recur a + ")) (i32.const " + string wd + ")))"
             elif isStructName nm then
                 "(call $ofi (array.len (struct.get $sarr_" + nm + " 0 (ref.cast (ref $sarr_" + nm + ") " + recur a + "))))"
             else
@@ -584,6 +690,22 @@ let emit (decls : Decl list) : EmitResult =
             let pk = primKindOf nm
             if pk <> "" then
                 "(array.new " + parrOf pk + " (call " + unboxOfKind pk + " " + recur v + ") " + unwrapI32 (recur n) + ")"
+            elif isPod nm then
+                let _, _, wd = (dictTryFind podLayout nm).Value
+                let nl = newTypedLocal "kn" "i32"
+                let vl = newLocal "kv"
+                let arl = newLocal "ka"
+                let jl = newTypedLocal "kj" "i32"
+                let arrW = "(ref.cast (ref $pk) (local.get " + arl + "))"
+                let sets =
+                    [ for w in 0 .. wd - 1 ->
+                        "(array.set $pk " + arrW + " (i32.add (i32.mul (local.get " + jl + ") (i32.const " + string wd + ")) (i32.const " + string w + ")) " + wordFromStruct nm vl w + ")" ]
+                "(block (result anyref) (local.set " + nl + " " + unwrapI32 (recur n) + ") (local.set " + vl + " " + recur v + ") "
+                + "(local.set " + arl + " (array.new_default $pk (i32.mul (local.get " + nl + ") (i32.const " + string wd + ")))) "
+                + "(local.set " + jl + " (i32.const 0)) "
+                + "(block $kd" + jl + " (loop $kl" + jl + " (br_if $kd" + jl + " (i32.ge_u (local.get " + jl + ") (local.get " + nl + "))) "
+                + String.concat " " sets + " (local.set " + jl + " (i32.add (local.get " + jl + ") (i32.const 1))) (br $kl" + jl + "))) "
+                + "(local.get " + arl + "))"
             elif isStructName nm then
                 let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
                 let nl = newLocal "cn"
@@ -810,6 +932,7 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $parr_f (array (mut f64)))"
     line "  (type $parr_s (array (mut f32)))"
     line "  (type $parr_l (array (mut i64)))"
+    line "  (type $pk (array (mut i64)))"
     line "  (type $boxl (struct (field i64)))"
     line "  (type $boxs (struct (field f32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
@@ -834,6 +957,7 @@ let emit (decls : Decl list) : EmitResult =
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
         line ("  (type $r_" + rn + " (struct " + fields + "))")
     for rn, fs in structRecords do
+      if not (isPod rn) then
         let fa (k : string) =
             match k with
             | "f" | "s" | "l" | "i" -> "(field (ref " + parrOf k + "))"

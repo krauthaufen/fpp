@@ -50,7 +50,8 @@ let noBoxGate =
                     "" ])
             let wat, errs = ws.EmitProgram ()
             Expect.isEmpty errs "emits"
-            Expect.stringContains wat "$sarr_V2d" "V2d arrays are SoA-flat"
+            Expect.stringContains wat "array.new_fixed $pk" "V2d arrays are C-image packed"
+            Expect.isFalse (wat.Contains "$sarr_V2d") "no SoA wrapper for POD structs"
             Expect.stringContains wat "array.new_fixed $parr_i" "int arrays are flat i32"
             Expect.isFalse (wat.Contains "array.new_fixed $arr ") "no generic array construction"
             Expect.isFalse (wat.Contains "$indexv") "no dispatching reader"
