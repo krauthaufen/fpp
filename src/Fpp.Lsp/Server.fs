@@ -69,7 +69,9 @@ type Server(ws : Workspace) =
             respond (jobj [
                 "capabilities", jobj [
                     "textDocumentSync", jint 1   // full-document sync
-                    "documentSymbolProvider", jbool true ]
+                    "documentSymbolProvider", jbool true
+                    "definitionProvider", jbool true
+                    "hoverProvider", jbool true ]
                 "serverInfo", jobj [ "name", jstr "fpp-lsp"; "version", jstr "0.1" ] ])
         | "initialized" -> []
         | "textDocument/didOpen" ->
@@ -87,6 +89,28 @@ type Server(ws : Workspace) =
         | "textDocument/documentSymbol" ->
             let uri = ps.["textDocument"].["uri"].GetValue<string>()
             respond (this.Symbols uri)
+        | "textDocument/definition" ->
+            let uri = ps.["textDocument"].["uri"].GetValue<string>()
+            let line = ps.["position"].["line"].GetValue<int>()
+            let ch = ps.["position"].["character"].GetValue<int>()
+            let starts = Lines.starts (ws.FileText uri)
+            let offset = (if line < starts.Length then starts.[line] else 0) + ch
+            match ws.DefinitionAt uri offset with
+            | Some d ->
+                let sl, sc = Lines.toLineCol starts d.Offset
+                let el, ec = Lines.toLineCol starts (d.Offset + d.Length)
+                respond (jobj [ "uri", jstr uri; "range", range sl sc el ec ])
+            | None -> respond null
+        | "textDocument/hover" ->
+            let uri = ps.["textDocument"].["uri"].GetValue<string>()
+            let line = ps.["position"].["line"].GetValue<int>()
+            let ch = ps.["position"].["character"].GetValue<int>()
+            let starts = Lines.starts (ws.FileText uri)
+            let offset = (if line < starts.Length then starts.[line] else 0) + ch
+            match ws.HoverAt uri offset with
+            | Some text ->
+                respond (jobj [ "contents", jobj [ "kind", jstr "markdown"; "value", jstr text ] ])
+            | None -> respond null
         | "shutdown" -> respond null
         | "exit" ->
             exitRequested <- true

@@ -135,3 +135,24 @@ type Workspace() =
             let r = this.ParseFile path
             let starts = Lines.starts (this.FileText path)
             Outline.items starts r.Root.Children)
+
+    member this.Resolve (path : string) : Analysis.Resolve.BindResult =
+        db.MemoT "resolve" path (fun () ->
+            Analysis.Resolve.resolve (this.ParseFile path).Root)
+
+    /// Definition for the name whose use (or definition) covers the offset.
+    member this.DefinitionAt (path : string) (offset : int) : Analysis.Resolve.Definition option =
+        let r = this.Resolve path
+        let atUse =
+            r.Resolutions
+            |> List.tryFind (fun u -> offset >= u.UseOffset && offset < u.UseOffset + u.UseLength)
+            |> Option.map (fun u -> u.Def)
+        match atUse with
+        | Some d -> Some d
+        | None ->
+            r.Definitions
+            |> List.tryFind (fun d -> offset >= d.Offset && offset < d.Offset + d.Length)
+
+    member this.HoverAt (path : string) (offset : int) : string option =
+        this.DefinitionAt path offset
+        |> Option.map (fun d -> Analysis.Resolve.kindLabel d.Kind + " `" + d.Name + "`")

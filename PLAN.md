@@ -28,7 +28,11 @@ stage ends with something running in CI. Status legend: `[ ]` open,
   is a client-side config away: `dotnet run --project src/Fpp.Lsp`)
 
 ## Stage 2 — Names & types (the long one)
-- [ ] Name resolution (modules, opens, shadowing) as queries
+- [~] Name resolution (modules, opens, shadowing) as queries — v0 done:
+      single-file env-threading pass (sequential visibility, rec, shadowing,
+      case-vs-binding patterns, class scopes, destructuring); feeds LSP
+      go-to-definition + hover; 1125 defs / 2800 uses resolved on own
+      sources. Open: cross-file, opens, module-member (dotted) resolution
 - [ ] Constraint-based HM inference: generate + solve with deferral
 - [ ] Overload resolution as its own specced algorithm
 - [ ] Nominal subtyping, interfaces, classes
