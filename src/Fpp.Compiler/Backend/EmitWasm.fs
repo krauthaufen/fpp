@@ -23,16 +23,17 @@ let emit (decls : Decl list) : EmitResult =
     // ---- program shape ----------------------------------------------------
 
     let unions = decls |> List.choose (fun d -> match d with DUnion (n, _, cs) -> Some (n, cs) | _ -> None)
-    let records = decls |> List.choose (fun d -> match d with DRecord (n, _, fs) -> Some (n, fs) | _ -> None)
+    let records = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, st) -> Some (n, fs, st) | _ -> None)
 
-    // field name -> (record, index); F# shadowing: last declaration wins
-    let fieldIndex = dictNew<string, string * int> ()
-    for rn, fs in records do
-        fs |> List.iteri (fun i f -> dictSet fieldIndex f (rn, i))
-    let recordArity = dictNew<string, int> ()
-    for rn, fs in records do dictSet recordArity rn fs.Length
-    let recordOrder = dictNew<string, string list> ()
-    for rn, fs in records do dictSet recordOrder rn fs
+    // struct records store fields UNBOXED by kind; plain records stay anyref
+    let kindOfField (isStruct : bool) (k : string) = if isStruct then k else "r"
+    // field name -> (record, index, kind); F# shadowing: last declaration wins
+    let fieldIndex = dictNew<string, string * int * string> ()
+    for rn, fs, st in records do
+        fs |> List.iteri (fun i (f, k) -> dictSet fieldIndex f (rn, i, kindOfField st k))
+    let recordOrder = dictNew<string, (string * string) list> ()
+    for rn, fs, st in records do
+        dictSet recordOrder rn (fs |> List.map (fun (f, k) -> f, kindOfField st k))
 
     let caseArity = dictNew<string, int> ()
     let caseOwner = dictNew<string, string> ()
@@ -353,13 +354,18 @@ let emit (decls : Decl list) : EmitResult =
                  "(ref.i31 (i32.const 0))")
         | ERecord (_, fields) ->
             (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
-             | Some (rn, _) ->
+             | Some (rn, _, _) ->
                  let order = (dictTryFind recordOrder rn).Value
+                 let unboxBy (k : string) (w : string) =
+                     match k with
+                     | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
+                     | "l" -> "(call $tol " + w + ")" | "i" -> "(call $toi " + w + ")"
+                     | _ -> w
                  let vals =
                      order
-                     |> List.map (fun fname ->
+                     |> List.map (fun (fname, k) ->
                          match fields |> List.tryFind (fun (f, _) -> f = fname) with
-                         | Some (_, v) -> recur v
+                         | Some (_, v) -> unboxBy k (recur v)
                          | None ->
                              vecAdd errors ("missing field " + fname + " in " + rn)
                              "(ref.i31 (i32.const 0))")
@@ -371,8 +377,12 @@ let emit (decls : Decl list) : EmitResult =
             "(call $lenv " + recur r + ")"
         | EField (r, fname) ->
             (match dictTryFind fieldIndex fname with
-             | Some (rn, idx) ->
-                 "(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") " + recur r + "))"
+             | Some (rn, idx, k) ->
+                 let raw = "(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") " + recur r + "))"
+                 (match k with
+                  | "f" -> "(call $off " + raw + ")" | "s" -> "(call $oss " + raw + ")"
+                  | "l" -> "(call $ofl " + raw + ")" | "i" -> "(call $ofi " + raw + ")"
+                  | _ -> raw)
              | None ->
                  vecAdd errors ("unknown field " + fname)
                  "(ref.i31 (i32.const 0))")
@@ -586,8 +596,13 @@ let emit (decls : Decl list) : EmitResult =
     line "  (memory (export \"memory\") 1)"
 
     // program-declared types
-    for rn, fs in records do
-        let fields = fs |> List.map (fun _ -> "(field anyref)") |> String.concat " "
+    for rn, fs, st in records do
+        let fieldTy (k : string) =
+            match kindOfField st k with
+            | "f" -> "(field f64)" | "s" -> "(field f32)"
+            | "l" -> "(field i64)" | "i" -> "(field i32)"
+            | _ -> "(field anyref)"
+        let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
         line ("  (type $r_" + rn + " (struct " + fields + "))")
     for _, cs in unions do
         for cn, a in cs do

@@ -134,6 +134,20 @@ let oracleTests =
             "let x = 0.5f + 0.25f"
             "let a = print (x * 2.0f)"
         ]
+        oracle "struct V2d: array of structs, field sums" [
+            "[<Struct>]"
+            "type V2d = { X : float; Y : float }"
+            "let pts = [| { X = 1.5; Y = 2.5 }; { X = 3.25; Y = 0.75 }; { X = 10.0; Y = 20.0 } |]"
+            "let total ="
+            "    let mutable s = 0.0"
+            "    for i in 0 .. pts.Length - 1 do"
+            "        s <- s + pts.[i].X + pts.[i].Y"
+            "    s"
+            "let a = print total"
+            "let b = print (pts.[2].X * pts.[0].Y)"
+            "let dot (u : V2d) (v : V2d) = u.X * v.X + u.Y * v.Y"
+            "let c = print (dot pts.[0] pts.[1])"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

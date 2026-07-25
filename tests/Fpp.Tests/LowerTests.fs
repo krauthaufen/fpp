@@ -45,7 +45,7 @@ let lowerTests =
             let r, errs = lintSrc src
             Expect.isEmpty r.Notes "everything lowerable"
             Expect.isEmpty errs "lint clean"
-            let hasRecord = r.Decls |> List.exists (fun d -> match d with DRecord ("P", _, [ "X"; "Y" ]) -> true | _ -> false)
+            let hasRecord = r.Decls |> List.exists (fun d -> match d with DRecord ("P", _, [ ("X", _); ("Y", _) ], _) -> true | _ -> false)
             Expect.isTrue hasRecord "record declaration lowered"
         }
         test "blocks become nested lets" {

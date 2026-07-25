@@ -60,7 +60,8 @@ type Decl =
     /// foreign import: name resolves in the host's "env" module
     | DExtern of VarId * Scheme
     | DUnion of string * string list * (string * int) list
-    | DRecord of string * string list * string list
+    /// name, type params, fields as (name, kind "f|s|l|i|r"), isStruct
+    | DRecord of string * string list * (string * string) list * bool
 
 type LowerResult =
     { Decls : Decl list
@@ -122,6 +123,7 @@ let printDecl (d : Decl) : string =
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
         + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
-    | DRecord (n, ps, fs) ->
-        "record " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
-        + " = {" + String.concat "; " fs + "}"
+    | DRecord (n, ps, fs, st) ->
+        (if st then "struct " else "record ") + n
+        + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
+        + " = {" + String.concat "; " (fs |> List.map (fun (f, k) -> f + ":" + k)) + "}"

@@ -145,7 +145,9 @@ let private encDecl (d : Decl) : Sx =
     | DLet (r, v, s, e) -> L [ A "dl"; A (if r then "1" else "0"); encVarId v; encScheme s; encExpr e ]
     | DUnion (n, ps, cs) ->
         L [ A "du"; S n; L (List.map S ps); L (cs |> List.map (fun (c, a) -> L [ S c; A (string a) ])) ]
-    | DRecord (n, ps, fs) -> L [ A "dr"; S n; L (List.map S ps); L (List.map S fs) ]
+    | DRecord (n, ps, fs, st) ->
+        L [ A "dr"; S n; L (List.map S ps)
+            L (fs |> List.map (fun (f, k) -> L [ S f; A k ])); A (if st then "1" else "0") ]
 
 let private encDef (full : string, d : Resolve.Definition) : Sx =
     let kind =
@@ -257,9 +259,10 @@ let private decDecl (x : Sx) : Decl option =
     | L [ A "du"; S n; L ps; L cs ] ->
         Some (DUnion (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
                       cs |> List.choose (fun c -> match c with L [ S cn; A a ] -> Some (cn, int a) | _ -> None)))
-    | L [ A "dr"; S n; L ps; L fs ] ->
+    | L [ A "dr"; S n; L ps; L fs; A st ] ->
         Some (DRecord (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
-                       fs |> List.choose (fun f -> match f with S s -> Some s | _ -> None)))
+                       fs |> List.choose (fun f -> match f with L [ S fn; A k ] -> Some (fn, k) | _ -> None),
+                       st = "1"))
     | _ -> None
 
 let private decDef (x : Sx) : (string * Resolve.Definition) option =

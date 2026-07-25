@@ -20,6 +20,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
+    let mutable pendingStruct = false
 
     let useDefs = dictNew<int, Resolve.Definition> ()
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
@@ -444,16 +445,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> Option.map (fun t ->
                     let hasPayload = nodesOf c |> List.exists (fun x -> isTypeKind x.NodeKind)
                     t.Text, (if hasPayload then 1 else 0)))
+        let fieldKind (f : GreenNode) : string =
+            let tyName =
+                nodesOf f
+                |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+                |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
+                |> Option.map (fun t -> t.Text)
+            match tyName with
+            | Some "float" -> "f"
+            | Some "float32" -> "s"
+            | Some "int64" -> "l"
+            | Some "int" | Some "bool" | Some "char" -> "i"
+            | _ -> "r"
         let recordFields =
             nodesOf n
             |> List.filter (fun m -> m.NodeKind = RecordRepr)
             |> List.collect nodesOf
             |> List.filter (fun m -> m.NodeKind = RecordField)
-            |> List.choose (fun f -> tokensOf f |> List.tryFind (fun t -> t.Kind = Ident) |> Option.map (fun t -> t.Text))
+            |> List.choose (fun f ->
+                tokensOf f
+                |> List.tryFind (fun t -> t.Kind = Ident)
+                |> Option.map (fun t -> t.Text, fieldKind f))
         let hasMembers =
             nodesOf n |> List.exists (fun m -> m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
         if not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
-        elif not (List.isEmpty recordFields) then vecAdd decls (DRecord (name, tyParams, recordFields))
+        elif not (List.isEmpty recordFields) then
+            vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))
         if hasMembers then
             vecAdd notes ((match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0), "type members")
 
@@ -473,9 +490,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match lowerLetParts n with
                  | Some (SimpleLet (isRec, v, sch, rhs, _)) -> vecAdd decls (DLet (isRec, v, sch, rhs))
                  | _ -> vecAdd notes (offsetOf n, "top-level let shape"))
-            | TypeDecl -> lowerTypeDecl n
+            | TypeDecl ->
+                lowerTypeDecl n
+                pendingStruct <- false
             | ModuleDef -> nodesOf n |> List.iter (fun m -> lowerDecl (GNode m))
-            | ModuleHeader | OpenDecl | AttributeList -> ()
+            | AttributeList ->
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
+                    pendingStruct <- true
+            | ModuleHeader | OpenDecl -> ()
             | k when isExprish k ->
                 vecAdd decls (DLet (false, { Path = path; Offset = offsetOf n; Name = "_it" }, mono tUnit, lowerExpr g))
             | _ -> vecAdd notes (offsetOf n, "declaration " + string n.NodeKind)

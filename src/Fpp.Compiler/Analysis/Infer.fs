@@ -521,10 +521,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 last
             | LetDecl -> inferLet n
             | DotExpr when (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr)) ->
-                // index access a.[i]: walk lhs and index; element type unknown v0
+                // index access a.[i]: element type when the receiver is known
+                let lhsTy =
+                    nodesOf n
+                    |> List.tryFind (fun m -> m.NodeKind <> ListExpr && isExprish m.NodeKind)
+                    |> Option.map (fun m -> exprType (GNode m))
                 for m in nodesOf n do
-                    if isExprish m.NodeKind then exprType (GNode m) |> ignore
-                st.Fresh ()
+                    if m.NodeKind = ListExpr then exprType (GNode m) |> ignore
+                (match lhsTy |> Option.map prune with
+                 | Some (TCon ("array", [ e ])) -> e
+                 | Some (TCon ("string", [])) -> tChar
+                 | _ -> st.Fresh ())
             | DotExpr ->
                 let lastIdent =
                     Green.tokens (GNode n)
