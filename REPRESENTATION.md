@@ -104,6 +104,21 @@ compiler can report where.
   type (`ref.test` chain / vtable) for load/store. Numeric hot loops are
   expected to be monomorphized, which erases the dispatch entirely.
 
+## Buffers — linear memory for interop (planned)
+
+wasm-GC modules carry BOTH heaps: the GC heap (structs, flat arrays —
+opaque to hosts) and linear memory (exported; JS sees an ArrayBuffer with
+zero-copy TypedArray views; views detach on grow). Two array flavors:
+
+- **Managed arrays** (default): GC-flat as specified above.
+- **`Buffer<'T>`** (T scalar or flat struct): contiguous bytes in linear
+  memory. F++ access compiles to raw load/store (typed emission); the same
+  bytes are directly a Float64Array in JS / a WebGPU upload source — zero
+  copies for bulk vector data (the primary workload).
+- Unification: on native, linear memory is malloc — `Buffer<'T>` is ALSO
+  the C FFI array representation (pointer + length into a .so). One
+  abstraction serves WebGPU and C interop.
+
 ## Generics — three tiers (decided)
 
 Survey of prior art that shaped this: C++ (templates + COMDAT linker
