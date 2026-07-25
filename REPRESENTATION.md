@@ -105,6 +105,14 @@ recursion), Zig/D (comptime). GADTs force polymorphic recursion on us, so
 full monomorphization is impossible *in general* — but that only dictates
 the fallback tier, not the common case.
 
+- **Generic containers of structs flatten**: `list<MyStruct>` stamps a
+  cons cell with MyStruct's fields INLINE in the node (one allocation per
+  node, zero boxing); `MyStruct[]` is a flat field-group array. Escape
+  rule (v1): construction sites whose values can reach tier-3 positions
+  (conservative escape check) build the uniform representation instead,
+  with a compiler note; the witness-table endgame deletes this fallback
+  by making tier-3 code layout-agnostic. Boxing is a property of program
+  points, never of types — and all such points are enumerable at link.
 - **Tier 1 — specialized per struct instantiation.** Library "objects" are
   serialized typed Core IR (fat rlibs, Rust-style): the generic's IR *is*
   the template; instantiation = type substitution + ordinary code gen. The
