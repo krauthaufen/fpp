@@ -106,6 +106,26 @@ compiler can report where.
   semantics; immutable structs meanwhile share representation soundness
   by construction (copy vs reference unobservable).
 
+## Linear-memory lifetimes (struct arrays / buffers)
+
+wasm-GC has NO finalizers and NO weak refs — the engine collects a
+{ptr,len} handle silently; nothing can free the linear block from inside
+the module. Layered answer:
+
+- **Handle uniqueness (invariant)**: exactly one GC handle per linear
+  block, created at allocation, never duplicated (F# arrays alias by
+  reference anyway). Handle death == block death; free exactly once.
+- **JS hosts**: FinalizationRegistry — allocation notifies the host via a
+  tiny import; the registry frees on collection (best-effort timing; fine
+  for memory, never for scarce resources).
+- **First-class story: deterministic lifetimes** — arenas (per-frame
+  regions, bump-alloc, wholesale free: the natural shape of geometry
+  workloads) and `use`/IDisposable for individual buffers. v1: bump
+  allocator, program-lifetime blocks.
+- **Native backend**: problem disappears — our GC (MMTk/Boehm) has real
+  finalization.
+- Watch: wasm-GC post-MVP finalization/weak-ref proposals.
+
 ## Arrays
 
 - `'a[]` in polymorphic positions: wasm-GC array of uniform slots.
