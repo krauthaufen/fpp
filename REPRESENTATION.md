@@ -131,17 +131,24 @@ recursion), Zig/D (comptime). GADTs force polymorphic recursion on us, so
 full monomorphization is impossible *in general* — but that only dictates
 the fallback tier, not the common case.
 
-- **Struct-array layout (DECIDED, user requirement: AoS)**: semantics are
-  always array-of-structs (immutable values, layout unobservable). Default
-  layout = **interleaved AoS**: all-scalar structs in one typed array,
-  8-byte slots per field, ints via f64.reinterpret_i64 bit-casts; structs
-  with ref fields = hybrid (interleaved scalars + ref side-columns, since
-  refs cannot inhabit scalar slots). `[<Layout(SoA)>]` opt-out per type for
-  column-sweep workloads. Byte-exact packed AoS is impossible in wasm-GC
-  (no span reinterpret) — that is `Buffer<'T>`'s / the native backend's
-  domain, where AoS is just what memory does. Current implementation is
-  SoA; migration to AoS-default is the queued next step and keeps the
-  zero-alloc hot-loop gate (fusion becomes a strided array.get).
+- **Struct-array layout (DECIDED, corrected — user requirement: real AoS)**:
+  layout IS semantics at FFI boundaries; `V2d[]` must BE C layout. The
+  emscripten model, adopted: **POD struct arrays live in LINEAR MEMORY,
+  byte-exact C layout** — contiguous interleaved fields with C
+  sizes/alignment. The array value is a GC handle `{ptr:i32; len:i32}`;
+  element/field access compiles to raw typed load/store at
+  `ptr + i*sizeof + offset` (composes with typed emission — allocation-
+  free hot loops, now on true AoS). C FFI receives `ptr` directly; JS gets
+  zero-copy TypedArray views. `Buffer<'T>` and struct arrays UNIFY — one
+  concept. Ref-containing structs cannot live in linear memory (GC cannot
+  trace it — same boundary emscripten has by having no refs at all); they
+  keep a GC-side layout, and are exactly the structs C interop is
+  meaningless for. Allocator: bump v1 → free-list/RC later; JS hosts may
+  assist via FinalizationRegistry. Primitive arrays may stay GC-flat
+  ($parr_*) or move to linear per the same rule — linear preferred for
+  FFI-facing data. (Background: emscripten/Rust/TinyGo have trivial
+  interop precisely because everything is linear memory; the GC-heap
+  layout problem was self-inflicted.)
 - **Generic containers of structs flatten**: `list<MyStruct>` stamps a
   cons cell with MyStruct's fields INLINE in the node (one allocation per
   node, zero boxing); `MyStruct[]` is a flat field-group array. Escape
