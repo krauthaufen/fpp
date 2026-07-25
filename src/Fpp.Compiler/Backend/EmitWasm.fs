@@ -176,12 +176,20 @@ let emit (decls : Decl list) : EmitResult =
         match e with
         | ELit (LInt s) ->
             let digits = s |> String.filter (fun c -> isDigit c || c = '-')
-            let v = if digits = "" then 0 else int digits
-            "(call $ofi (i32.const " + string v + "))"
+            if s.EndsWith "L" then
+                "(call $ofl (i64.const " + (if digits = "" then "0" else digits) + "))"
+            else
+                let v = if digits = "" then 0 else int digits
+                "(call $ofi (i32.const " + string v + "))"
         | ELit (LBool b) -> "(ref.i31 (i32.const " + (if b then "1" else "0") + "))"
         | ELit LUnit -> "(ref.i31 (i32.const 0))"
         | ELit (LChar raw) -> "(ref.i31 (i32.const " + string (charCode raw) + "))"
-        | ELit (LFloat s) -> "(struct.new $boxf (f64.const " + (s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = 'e')) + "))"
+        | ELit (LFloat s) ->
+            let num = s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = 'e')
+            if s.EndsWith "f" || s.EndsWith "F" then
+                "(struct.new $boxs (f32.const " + num + "))"
+            else
+                "(struct.new $boxf (f64.const " + num + "))"
         | ELit (LString raw) ->
             let bytes = unescape raw
             let id = internString bytes
@@ -258,6 +266,48 @@ let emit (decls : Decl list) : EmitResult =
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
+        | EPrim (op, [ a; b ]) when
+            (op.Length > 1 && (op.EndsWith "f" || op.EndsWith "l" || op.EndsWith "s" || op.EndsWith "t")
+             && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ]) ->
+            let baseOp = op.Substring (0, op.Length - 1)
+            let kind = op.Substring (op.Length - 1)
+            let un, box_, ty =
+                match kind with
+                | "f" -> "$tof", "$off", "f64"
+                | "s" -> "$tos", "$oss", "f32"
+                | "l" -> "$tol", "$ofl", "i64"
+                | _ -> "$toi", "$ofi", "i32"
+            let wa = "(call " + un + " " + recur a + ")"
+            let wb = "(call " + un + " " + recur b + ")"
+            if kind = "t" then
+                // string ops: only + (concat) and comparisons via $equal
+                (match baseOp with
+                 | "+" -> "(call $strcat (ref.cast (ref $str) " + recur a + ") (ref.cast (ref $str) " + recur b + "))"
+                 | _ ->
+                     vecAdd errors ("unsupported string operator " + baseOp)
+                     "(ref.i31 (i32.const 0))")
+            else
+                let instr =
+                    match baseOp, kind with
+                    | "+", ("f" | "s") -> ty + ".add" | "-", ("f" | "s") -> ty + ".sub"
+                    | "*", ("f" | "s") -> ty + ".mul" | "/", ("f" | "s") -> ty + ".div"
+                    | "%", ("f" | "s") -> "" // no float rem in wasm
+                    | "+", _ -> ty + ".add" | "-", _ -> ty + ".sub"
+                    | "*", _ -> ty + ".mul" | "/", _ -> ty + ".div_s" | "%", _ -> ty + ".rem_s"
+                    | "<", ("f" | "s") -> ty + ".lt" | ">", ("f" | "s") -> ty + ".gt"
+                    | "<=", ("f" | "s") -> ty + ".le" | ">=", ("f" | "s") -> ty + ".ge"
+                    | "<", _ -> ty + ".lt_s" | ">", _ -> ty + ".gt_s"
+                    | "<=", _ -> ty + ".le_s" | _ -> ty + ".ge_s"
+                if instr = "" then
+                    vecAdd errors "float remainder unsupported"
+                    "(ref.i31 (i32.const 0))"
+                elif baseOp = "<" || baseOp = ">" || baseOp = "<=" || baseOp = ">=" then
+                    boolWat ("(" + instr + " " + wa + " " + wb + ")")
+                else
+                    "(call " + box_ + " (" + instr + " " + wa + " " + wb + "))"
+        | EPrim ("u-f", [ a ]) -> "(call $off (f64.neg (call $tof " + recur a + ")))"
+        | EPrim ("u-s", [ a ]) -> "(call $oss (f32.neg (call $tos " + recur a + ")))"
+        | EPrim ("u-l", [ a ]) -> "(call $ofl (i64.sub (i64.const 0) (call $tol " + recur a + ")))"
         | EPrim (op, [ a; b ]) ->
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)
@@ -522,6 +572,8 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $boxf (struct (field f64)))"
     line "  (type $boxi (struct (field i32)))"
     line "  (type $arr (array (mut anyref)))"
+    line "  (type $boxl (struct (field i64)))"
+    line "  (type $boxs (struct (field f32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
     for d in decls do
         match d with
@@ -580,8 +632,12 @@ let emit (decls : Decl list) : EmitResult =
       (then (call $prints (ref.cast (ref $str) (local.get $v))) (return)))
     (if (ref.test (ref $boxi) (local.get $v))
       (then (call $printi (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v)))) (return)))
+    (if (ref.test (ref $boxl) (local.get $v))
+      (then (call $printl (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $v)))) (return)))
     (if (ref.test (ref $boxf) (local.get $v))
-      (then (call $printi (i32.trunc_f64_s (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v))))) (return)))
+      (then (call $printf64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))) (return)))
+    (if (ref.test (ref $boxs) (local.get $v))
+      (then (call $printf64 (f64.promote_f32 (struct.get $boxs 0 (ref.cast (ref $boxs) (local.get $v))))) (return)))
     (call $putc (i32.const 63)))
   (func $equal (param $a anyref) (param $b anyref) (result anyref)
     (local $i i32)
@@ -601,6 +657,15 @@ let emit (decls : Decl list) : EmitResult =
             (local.set $i (i32.add (local.get $i) (i32.const 1)))
             (br $go)))
         (return (ref.i31 (i32.const 1)))))
+    (if (i32.and (ref.test (ref $boxl) (local.get $a)) (ref.test (ref $boxl) (local.get $b)))
+      (then (return (ref.i31 (i64.eq (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $a)))
+                                     (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $b))))))))
+    (if (i32.and (ref.test (ref $boxf) (local.get $a)) (ref.test (ref $boxf) (local.get $b)))
+      (then (return (ref.i31 (f64.eq (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $a)))
+                                     (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $b))))))))
+    (if (i32.and (ref.test (ref $boxs) (local.get $a)) (ref.test (ref $boxs) (local.get $b)))
+      (then (return (ref.i31 (f32.eq (struct.get $boxs 0 (ref.cast (ref $boxs) (local.get $a)))
+                                     (struct.get $boxs 0 (ref.cast (ref $boxs) (local.get $b))))))))
     (if (i32.and (ref.test (ref $boxi) (local.get $a)) (ref.test (ref $boxi) (local.get $b)))
       (then (return (ref.i31 (i32.eq (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $a)))
                                      (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $b))))))))
@@ -648,6 +713,51 @@ let emit (decls : Decl list) : EmitResult =
     (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
       (then (return (call $strcat (ref.cast (ref $str) (local.get $a)) (ref.cast (ref $str) (local.get $b))))))
     (call $ofi (i32.add (call $toi (local.get $a)) (call $toi (local.get $b)))))
+  (func $tof (param $v anyref) (result f64)
+    (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v))))
+  (func $off (param $x f64) (result anyref) (struct.new $boxf (local.get $x)))
+  (func $tos (param $v anyref) (result f32)
+    (struct.get $boxs 0 (ref.cast (ref $boxs) (local.get $v))))
+  (func $oss (param $x f32) (result anyref) (struct.new $boxs (local.get $x)))
+  (func $tol (param $v anyref) (result i64)
+    (if (result i64) (ref.test (ref i31) (local.get $v))
+      (then (i64.extend_i32_s (i31.get_s (ref.cast (ref i31) (local.get $v)))))
+      (else (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $v))))))
+  (func $ofl (param $n i64) (result anyref)
+    (if (result anyref)
+        (i64.eq (local.get $n)
+                (i64.shr_s (i64.shl (local.get $n) (i64.const 33)) (i64.const 33)))
+      (then (ref.i31 (i32.wrap_i64 (local.get $n))))
+      (else (struct.new $boxl (local.get $n)))))
+  (func $printl (param $n i64)
+    (local $m i64)
+    (if (i64.lt_s (local.get $n) (i64.const 0))
+      (then (call $putc (i32.const 45))
+            (local.set $n (i64.sub (i64.const 0) (local.get $n)))))
+    (local.set $m (i64.div_s (local.get $n) (i64.const 10)))
+    (if (i64.gt_s (local.get $m) (i64.const 0)) (then (call $printl (local.get $m))))
+    (call $putc (i32.add (i32.const 48) (i32.wrap_i64 (i64.rem_s (local.get $n) (i64.const 10))))))
+  (func $printf64 (param $v f64)
+    (local $ip f64) (local $frac f64) (local $k i32) (local $d i32)
+    (if (f64.lt (local.get $v) (f64.const 0))
+      (then (call $putc (i32.const 45))
+            (local.set $v (f64.neg (local.get $v)))))
+    (local.set $ip (f64.floor (local.get $v)))
+    (call $printl (i64.trunc_f64_s (local.get $ip)))
+    (local.set $frac (f64.sub (local.get $v) (local.get $ip)))
+    (if (f64.gt (local.get $frac) (f64.const 0))
+      (then
+        (call $putc (i32.const 46))
+        (block $done
+          (loop $go
+            (br_if $done (i32.ge_s (local.get $k) (i32.const 15)))
+            (local.set $frac (f64.mul (local.get $frac) (f64.const 10)))
+            (local.set $d (i32.trunc_f64_s (f64.floor (local.get $frac))))
+            (call $putc (i32.add (i32.const 48) (local.get $d)))
+            (local.set $frac (f64.sub (local.get $frac) (f64.floor (local.get $frac))))
+            (br_if $done (f64.eq (local.get $frac) (f64.const 0)))
+            (local.set $k (i32.add (local.get $k) (i32.const 1)))
+            (br $go))))))
   (func $ofi (param $n i32) (result anyref)
     (if (result anyref) (i32.eq (local.get $n) (i32.shr_s (i32.shl (local.get $n) (i32.const 1)) (i32.const 1)))
       (then (ref.i31 (local.get $n)))

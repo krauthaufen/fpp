@@ -115,6 +115,25 @@ let oracleTests =
             "let a = print (greet \"F++\")"
             "let b = print (1 + 2 + 3)"
         ]
+        oracle "floats: arithmetic, comparison, printing" [
+            "let a = print (1.5 + 2.25)"
+            "let b = print (10.0 / 4.0)"
+            "let c = print (3.5 * 2.0 - 0.5)"
+            "let d = print (if 2.5 > 2.25 then 1 else 0)"
+            "let area (r : float) = r * r * 3.140625"
+            "let e = print (area 2.0)"
+        ]
+        oracle "int64: wide arithmetic" [
+            "let big = 5000000000L"
+            "let a = print (big + big)"
+            "let b = print (big * 3L)"
+            "let c = print (9000000000L / 4L)"
+            "let d = print (if 5000000001L > big then 1 else 0)"
+        ]
+        oracle "float32 arithmetic" [
+            "let x = 0.5f + 0.25f"
+            "let a = print (x * 2.0f)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

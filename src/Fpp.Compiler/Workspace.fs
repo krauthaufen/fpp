@@ -230,8 +230,10 @@ type Workspace() =
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
         let lowerOne (path : string) (root : Syntax.GreenNode) =
             match dictTryFind r.Files path with
-            | Some (b, _) ->
-                let low = Fpp.Core.Lower.lower path root b r.Schemes
+            | Some (b, inf) ->
+                let ok = dictNew<int, string> ()
+                for off, k in inf.OpKinds do dictSet ok off k
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok
                 for d in low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -242,7 +244,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ())
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -268,9 +270,11 @@ type Workspace() =
             for d in this.Diagnostics path do
                 vecAdd errs (path + ": " + d.Message)
             match dictTryFind r.Files path with
-            | Some (b, _) ->
+            | Some (b, inf) ->
                 for e in b.Exports do vecAdd exports e
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes
+                let ok = dictNew<int, string> ()
+                for off, k in inf.OpKinds do dictSet ok off k
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -283,7 +287,10 @@ type Workspace() =
     member this.LowerFile (path : string) : Core.Ir.LowerResult =
         let r = this.ProjectCheck ()
         match dictTryFind r.Files path with
-        | Some (b, _) -> Core.Lower.lower path (this.ParseFile path).Root b r.Schemes
+        | Some (b, inf) ->
+            let ok = dictNew<int, string> ()
+            for off, k in inf.OpKinds do dictSet ok off k
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

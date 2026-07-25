@@ -18,7 +18,10 @@ open Fpp.Analysis.Types
 type InferResult =
     { Diagnostics : (int * string) list
       /// definition offset, length, pretty-printed type
-      DefTypes : (int * int * string) list }
+      DefTypes : (int * int * string) list
+      /// operator token offset -> resolved kind: "f"=float "s"=float32
+      /// "l"=int64 "t"=string ""=int/other — drives typed prim emission
+      OpKinds : (int * string) list }
 
 type FieldInfo =
     { TypeName : string
@@ -39,6 +42,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (fields : Dict<string, FieldInfo>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
+    let opKindsRaw = vecNew<int * Type> ()
     let defSchemes = dictNew<int, Scheme> ()
     let defTypes = vecNew<int * int * Type> ()
 
@@ -200,8 +204,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let literalType (t : Token) : Type =
         match t.Kind with
-        | IntLit -> tInt
-        | FloatLit -> tFloat
+        | IntLit ->
+            if t.Text.EndsWith "L" then TCon ("int64", []) else tInt
+        | FloatLit ->
+            if t.Text.EndsWith "f" || t.Text.EndsWith "F" then TCon ("float32", []) else tFloat
         | StringLit -> tString
         | CharLit -> tChar
         | Keyword when t.Text = "true" || t.Text = "false" -> tBool
@@ -370,6 +376,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let lt = exprType (GNode l)
                      let rt = exprType (GNode r)
                      (match opClass op.Text with
+                      | "arith" | "cmp" -> vecAdd opKindsRaw (op.Offset, lt)
+                      | _ -> ())
+                     (match opClass op.Text with
                       | "logic" ->
                           unifyAt op.Offset lt tBool
                           unifyAt op.Offset rt tBool
@@ -410,7 +419,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> ())
                      tBool
                  | Some t when t.Text = "-" || t.Text = "+" ->
-                     (match inner with [ i ] -> i | _ -> st.Fresh ())
+                     (match inner with
+                      | [ i ] ->
+                          vecAdd opKindsRaw (t.Offset, i)
+                          i
+                      | _ -> st.Fresh ())
                  | _ -> st.Fresh ())
             | ParenExpr ->
                 let vars = dictNew<string, Type> ()
@@ -842,7 +855,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     for c in root.Children do inferDecl c
 
+    let kindOf (t : Type) : string =
+        match prune t with
+        | TCon ("float", []) -> "f"
+        | TCon ("float32", []) -> "s"
+        | TCon ("int64", []) -> "l"
+        | TCon ("string", []) -> "t"
+        | _ -> ""
+
     { Diagnostics = vecToList diags
       DefTypes =
         vecToList defTypes
-        |> List.map (fun (off, len, ty) -> off, len, typeString ty) }
+        |> List.map (fun (off, len, ty) -> off, len, typeString ty)
+      OpKinds =
+        vecToList opKindsRaw
+        |> List.map (fun (off, ty) -> off, kindOf ty)
+        |> List.filter (fun (_, k) -> k <> "") }

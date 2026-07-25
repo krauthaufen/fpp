@@ -16,7 +16,7 @@ type private LetShape =
     | DestructureLet of Pat * Expr * Expr option
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
-          (schemes : Dict<string, Scheme>) : LowerResult =
+          (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -177,11 +177,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | _ -> note (offsetOf n) "assignment target")
                       | "|>" -> EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
-                      | _ -> EPrim (op.Text, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
+                      | _ ->
+                          // typed prims: inference resolved the operand kind
+                          // (equality stays unsuffixed — structural $equal)
+                          let suffixable =
+                              List.contains op.Text [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ]
+                          let suffix =
+                              if not suffixable then ""
+                              else
+                                  match dictTryFind opKinds op.Offset with
+                                  | Some k -> k
+                                  | None -> ""
+                          EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
                  | _ -> note (offsetOf n) "operator shape")
             | PrefixExpr ->
                 (match tokensOf n |> List.tryHead, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
-                 | Some op, [ a ] when op.Text = "-" || op.Text = "not" -> EPrim ("u" + op.Text, [ lowerExpr (GNode a) ])
+                 | Some op, [ a ] when op.Text = "-" || op.Text = "not" ->
+                     let suffix =
+                         match dictTryFind opKinds op.Offset with
+                         | Some k -> k
+                         | None -> ""
+                     EPrim ("u" + op.Text + suffix, [ lowerExpr (GNode a) ])
                  | Some op, [] when (litOf op).IsSome -> ELit (litOf op).Value
                  | _, [ a ] -> lowerExpr (GNode a)
                  | _ ->
