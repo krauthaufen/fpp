@@ -76,7 +76,18 @@ works on unboxed machine values and boxes only at uniform boundaries.
 - **Tuples**: anonymous structs, same as records. Flattening into locals in
   monomorphic contexts is an optimization pass.
 
-## Structs (value types) — first-class, no unnecessary boxing
+## Structs (value types) — first-class, C layout everywhere
+
+**NORMATIVE (user requirement): every POD struct has exactly one layout —
+the C ABI layout** (field offsets by natural alignment, struct alignment =
+max field alignment, size rounded up; what clang would compute). Every
+memory materialization uses it: arrays (linear AoS), buffers, nested
+structs (inlined at their C offsets), FFI (pointer or by-value per C ABI).
+The only permitted deviation mirrors C compilers themselves: values in
+locals/params may be scalarized into registers until materialized in
+memory. Field size table v1: int 4, float32 4, float 8, int64 8 (bool/char
+widths to be fixed with the C type-mapping table when bindgen lands).
+GC-heap struct encodings are temporaries, never the memory truth.
 
 **Requirement (explicit):** structs are first-class citizens; boxing only
 where specialization is impossible in principle.
