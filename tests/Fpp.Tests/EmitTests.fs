@@ -56,6 +56,14 @@ let noBoxGate =
             Expect.isFalse (wat.Contains "$indexv") "no dispatching reader"
             Expect.isFalse (wat.Contains "$setv") "no dispatching writer"
             Expect.isFalse (wat.Contains "$creatv") "no dispatching allocator"
+            // THE HOT-LOOP INVARIANT: the vector summation loop performs
+            // ZERO allocations — floats live in raw f64 locals, fields
+            // read directly from flat SoA arrays
+            let loopStart = wat.IndexOf "(loop $cont"
+            Expect.isGreaterThan loopStart 0 "loop emitted"
+            let loopBody = wat.Substring(loopStart, wat.IndexOf("(br $cont", loopStart) - loopStart)
+            for alloc in [ "struct.new $box"; "call $off"; "call $oss"; "call $ofl"; "struct.new $r_V2d" ] do
+                Expect.isFalse (loopBody.Contains alloc) (sprintf "allocation '%s' in hot loop" alloc)
         }
     ]
 

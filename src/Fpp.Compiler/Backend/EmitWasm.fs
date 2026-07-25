@@ -185,16 +185,60 @@ let emit (decls : Decl list) : EmitResult =
     let unwrapI32 (w : string) = "(call $toi " + w + ")"
     let intWat (w : string) = "(call $ofi " + w + ")"
 
+    // ---- scalar kind analysis: "f" f64, "s" f32, "l" i64, "u" uniform ----
+    // (ints stay uniform: i31 immediates are allocation-free already)
+    let localKinds = dictNew<string * int, string> ()
+    let suffixedOps = [ "+"; "-"; "*"; "/"; "%" ]
+    let rec kindOf (e : Expr) : string =
+        match e with
+        | ELit (LFloat t) -> if t.EndsWith "f" || t.EndsWith "F" then "s" else "f"
+        | ELit (LInt t) -> if t.EndsWith "L" then "l" else "u"
+        | EVar (v, _) ->
+            (match dictTryFind localKinds (v.Path, v.Offset) with
+             | Some k -> k
+             | None -> "u")
+        | EPrim (op, _) when op.Length > 1 && List.contains (op.Substring (0, op.Length - 1)) suffixedOps ->
+            (let k = op.Substring (op.Length - 1)
+             if k = "f" || k = "s" || k = "l" then k else "u")
+        | EPrim ("u-f", _) -> "f"
+        | EPrim ("u-s", _) -> "s"
+        | EPrim ("u-l", _) -> "l"
+        | EField (_, fname) ->
+            (match dictTryFind fieldIndex fname with
+             | Some (_, _, k) when k = "f" || k = "s" || k = "l" -> k
+             | _ -> "u")
+        | EIndex (nm, _, _) ->
+            let k = primKindOf nm
+            if k = "f" || k = "s" || k = "l" then k else "u"
+        | ELet (_, _, _, _, body) -> kindOf body
+        | ESeq xs -> (match List.tryLast xs with Some x -> kindOf x | None -> "u")
+        | EIf (_, t, f) ->
+            let a, b = kindOf t, kindOf f
+            if a = b then a else "u"
+        | _ -> "u"
+    let wasmTyOf (k : string) =
+        match k with
+        | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "anyref"
+    let boxK (k : string) (w : string) =
+        match k with
+        | "f" -> "(call $off " + w + ")" | "s" -> "(call $oss " + w + ")"
+        | "l" -> "(call $ofl " + w + ")" | _ -> w
+    let unboxK (k : string) (w : string) =
+        match k with
+        | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
+        | "l" -> "(call $tol " + w + ")" | _ -> w
+
     /// Compile one function body. `locals` maps (path,offset) to wasm local
     /// names; `extraLocals` collects locals to declare.
-    let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string>)
+    let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                         (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
         let recur = compileExpr locals extraLocals freeEnv false
         let recurT = compileExpr locals extraLocals freeEnv tail
-        let newLocal (base_ : string) : string =
+        let newTypedLocal (base_ : string) (ty : string) : string =
             let n = "$l" + string (vecLen extraLocals) + "_" + base_
-            vecAdd extraLocals n
+            vecAdd extraLocals (n, ty)
             n
+        let newLocal (base_ : string) : string = newTypedLocal base_ "anyref"
         match e with
         | ELit (LInt s) ->
             let digits = s |> String.filter (fun c -> isDigit c || c = '-')
@@ -219,7 +263,10 @@ let emit (decls : Decl list) : EmitResult =
         | EVar (v, _) ->
             let key = (v.Path, v.Offset)
             (match dictTryFind locals key with
-             | Some l -> "(local.get " + l + ")"
+             | Some l ->
+                 (match dictTryFind localKinds key with
+                  | Some k when k <> "u" -> boxK k ("(local.get " + l + ")")
+                  | _ -> "(local.get " + l + ")")
              | None ->
                  match dictTryFind freeEnv key with
                  | Some idx ->
@@ -290,10 +337,13 @@ let emit (decls : Decl list) : EmitResult =
              | ELam ([ (pv, _) ], b) -> compileLambda locals freeEnv pv b recur
              | other -> recur other)
         | ELet (_, v, _, rhs, body) ->
-            let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+            let k = kindOf rhs
+            let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
             let r = recur rhs
             dictSet locals (v.Path, v.Offset) l
-            "(block (result anyref) (local.set " + l + " " + r + ") " + recurT body + ")"
+            dictSet localKinds (v.Path, v.Offset) k
+            let stored = if k = "u" then r else unboxK k r
+            "(block (result anyref) (local.set " + l + " " + stored + ") " + recurT body + ")"
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
@@ -403,6 +453,19 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
+        | EField (EIndex (nm, a, i), fname) when isStructName nm && (dictTryFind fieldIndex fname).IsSome ->
+            // fusion: pts.[i].X reads the SoA field array directly — no
+            // temporary struct materialization
+            let _, fi, k = (dictTryFind fieldIndex fname).Value
+            let src = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") " + recur a + "))"
+            let raw =
+                match k with
+                | "f" | "s" | "l" | "i" -> "(array.get " + parrOf k + " " + src + " " + unwrapI32 (recur i) + ")"
+                | _ -> "(array.get $arr " + src + " " + unwrapI32 (recur i) + ")"
+            (match k with
+             | "f" | "s" | "l" -> boxK k raw
+             | "i" -> "(call $ofi " + raw + ")"
+             | _ -> raw)
         | EField (r, "Length") when not (dictTryFind fieldIndex "Length").IsSome ->
             "(call $lenv " + recur r + ")"
         | EField (r, fname) ->
@@ -430,7 +493,10 @@ let emit (decls : Decl list) : EmitResult =
             + "(drop " + recur b + ") (br $cont" + lbl + "))) (ref.i31 (i32.const 0)))"
         | EAssign (v, e) ->
             (match dictTryFind locals (v.Path, v.Offset) with
-             | Some l -> "(block (result anyref) (local.set " + l + " " + recur e + ") (ref.i31 (i32.const 0)))"
+             | Some l ->
+                 let k = match dictTryFind localKinds (v.Path, v.Offset) with Some k -> k | None -> "u"
+                 let stored = if k = "u" then recur e else unboxK k (recur e)
+                 "(block (result anyref) (local.set " + l + " " + stored + ") (ref.i31 (i32.const 0)))"
              | None ->
                  match dictTryFind topName (v.Path, v.Offset) with
                  | Some g -> "(block (result anyref) (global.set " + g + " " + recur e + ") (ref.i31 (i32.const 0)))"
@@ -591,7 +657,7 @@ let emit (decls : Decl list) : EmitResult =
         let app (s : string) = out.Append(s + " ") |> ignore
         let newLocal (base_ : string) =
             let n = "$p" + string (vecLen extraLocals) + "_" + base_
-            vecAdd extraLocals n
+            vecAdd extraLocals (n, "anyref")
             n
         match p with
         | PWild -> ()
@@ -716,9 +782,9 @@ let emit (decls : Decl list) : EmitResult =
         dictSet innerLocals (pv.Path, pv.Offset) "$a"
         let innerFree = dictNew<string * int, int> ()
         freeList |> List.iteri (fun i k -> dictSet innerFree k i)
-        let innerExtra = vecNew<string> ()
+        let innerExtra = vecNew<string * string> ()
         let bodyW = compileExpr innerLocals innerExtra innerFree true body
-        let localDecls = vecToList innerExtra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
+        let localDecls = vecToList innerExtra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
         vecAdd lifted
             ("(func " + fname + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) "
              + localDecls + " " + bodyW + ")")
@@ -955,18 +1021,18 @@ let emit (decls : Decl list) : EmitResult =
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
             let locals = dictNew<string * int, string> ()
             ps |> List.iteri (fun i (pv, _) -> dictSet locals (pv.Path, pv.Offset) ("$a" + string i))
-            let extra = vecNew<string> ()
+            let extra = vecNew<string * string> ()
             let bodyW = compileExpr locals extra (dictNew ()) true body
             let ps' = ps |> List.mapi (fun i _ -> "(param $a" + string i + " anyref)") |> String.concat " "
-            let localDecls = vecToList extra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
+            let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
             line ("  (func " + fname + " " + ps' + " (result anyref) " + localDecls + " " + bodyW + ")")
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
-            let extra = vecNew<string> ()
+            let extra = vecNew<string * string> ()
             let w = compileExpr locals extra (dictNew ()) false rhs
-            let localDecls = vecToList extra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
+            let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
             let initName = "$init" + string (vecLen initFuncs)
             line ("  (func " + initName + " " + localDecls + " (global.set " + gname + " " + w + "))")
             vecAdd initFuncs initName
@@ -1029,4 +1095,44 @@ let emit (decls : Decl list) : EmitResult =
     line ("  (func $_start (export \"_start\") " + calls + ")")
     line ")"
 
-    { Wat = sb.ToString (); Errors = vecToList errors }
+    // ---- peephole: cancel box/unbox round-trips ((call $tof (call $off X)) -> X etc.)
+    let peephole (text : string) : string =
+        let pairs =
+            [ "(call $tof ", "(call $off "
+              "(call $off ", "(call $tof "
+              "(call $tos ", "(call $oss "
+              "(call $oss ", "(call $tos "
+              "(call $tol ", "(call $ofl "
+              "(call $ofl ", "(call $tol "
+              "(call $toi ", "(call $ofi "
+              "(call $ofi ", "(call $toi " ]
+        let mutable t = text
+        let mutable changed = true
+        while changed do
+            changed <- false
+            for outer, inner in pairs do
+                let pat = outer + inner
+                let mutable idx = t.IndexOf pat
+                while idx >= 0 do
+                    // inner sexp starts right after `outer`
+                    let innerStart = idx + outer.Length
+                    let mutable depth = 0
+                    let mutable j = innerStart
+                    let mutable innerEnd = -1
+                    while innerEnd < 0 && j < t.Length do
+                        if t.[j] = '(' then depth <- depth + 1
+                        elif t.[j] = ')' then
+                            depth <- depth - 1
+                            if depth = 0 then innerEnd <- j
+                        j <- j + 1
+                    // outer must close immediately after inner
+                    if innerEnd > 0 && innerEnd + 1 < t.Length && t.[innerEnd + 1] = ')' then
+                        let arg = t.Substring (innerStart + inner.Length, innerEnd - (innerStart + inner.Length))
+                        t <- t.Substring (0, idx) + arg + t.Substring (innerEnd + 2)
+                        changed <- true
+                        idx <- t.IndexOf pat
+                    else
+                        idx <- t.IndexOf (pat, idx + 1)
+        t
+
+    { Wat = peephole (sb.ToString ()); Errors = vecToList errors }
