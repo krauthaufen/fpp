@@ -4,3 +4,5 @@ demo.wat
 demo.wasm
 gpu.wat
 gpu.wasm
+pin.wasm
+pin.html

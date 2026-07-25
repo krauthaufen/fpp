@@ -57,6 +57,8 @@ type Expr =
     | EIndexSet of string * Expr * Expr * Expr
     | EArrayLen of string * Expr
     | EArrayCreate of string * Expr * Expr
+    | EArrayPin of string * Expr
+    | EArrayUnpin of string * Expr
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -108,6 +110,8 @@ let rec printExpr (e : Expr) : string =
     | EIndexSet (_, a, i, v) -> printExpr a + ".[" + printExpr i + "] <- " + printExpr v
     | EArrayLen (_, a) -> printExpr a + ".Length"
     | EArrayCreate (_, n, v) -> "(Array.create " + printExpr n + " " + printExpr v + ")"
+    | EArrayPin (_, a) -> "(Array.pin " + printExpr a + ")"
+    | EArrayUnpin (_, a) -> "(Array.unpin " + printExpr a + ")"
     | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
 
 and printPat (p : Pat) : string =

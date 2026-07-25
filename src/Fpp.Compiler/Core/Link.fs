@@ -47,6 +47,8 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EIndexSet (_, a, i, v) -> scan a; scan i; scan v
         | EArrayLen (_, a) -> scan a
         | EArrayCreate (_, n, v) -> scan n; scan v
+        | EArrayPin (_, a) -> scan a
+        | EArrayUnpin (_, a) -> scan a
         | _ -> ()
     // roots: value initializers (program effects)
     for d in decls do

@@ -165,6 +165,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let f = lowerExpr (GNode head)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
                      (match f, loweredArgs with
+                      | EVar (bv, _), [ pa ] when bv.Name = "pin" && bv.Path = "(builtin)" ->
+                          let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
+                          EArrayPin (nm, pa)
+                      | EVar (bv, _), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
+                          let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
+                          EArrayUnpin (nm, pa)
                       | EVar (bv, _), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with

@@ -232,6 +232,12 @@ let lint (decls : Decl list) : string list =
             unifyC "create length" (exprType n) tInt
             exprType v |> ignore
             st.Fresh ()
+        | EArrayPin (_, a) ->
+            exprType a |> ignore
+            tInt
+        | EArrayUnpin (_, a) ->
+            exprType a |> ignore
+            tInt
 
     for d in decls do
         match d with

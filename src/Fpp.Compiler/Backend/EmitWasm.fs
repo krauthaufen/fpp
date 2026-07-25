@@ -57,11 +57,25 @@ let emit (decls : Decl list) : EmitResult =
             let sizeof_ = ((off + maxA - 1) / maxA) * maxA
             dictSet podLayout rn (placed, sizeof_, (sizeof_ + 7) / 8)
     let isPod (n : string) = (dictTryFind podLayout n).IsSome
+    /// word read/write through a handle: GC storage or linear when pinned
+    let hWordGet (hExpr : string) (idxExpr : string) : string =
+        "(if (result i64) (ref.is_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + ")))"
+        + " (then (i64.load (i32.add (struct.get $hnd 1 (ref.cast (ref $hnd) " + hExpr + ")) (i32.mul " + idxExpr + " (i32.const 8)))))"
+        + " (else (array.get $pk (ref.as_non_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + "))) " + idxExpr + ")))"
+    let hWordSet (hExpr : string) (idxExpr : string) (valExpr : string) : string =
+        "(if (ref.is_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + ")))"
+        + " (then (i64.store (i32.add (struct.get $hnd 1 (ref.cast (ref $hnd) " + hExpr + ")) (i32.mul " + idxExpr + " (i32.const 8))) " + valExpr + "))"
+        + " (else (array.set $pk (ref.as_non_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + "))) " + idxExpr + " " + valExpr + ")))"
+    let hLen (hExpr : string) : string =
+        "(if (result i32) (ref.is_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + ")))"
+        + " (then (struct.get $hnd 2 (ref.cast (ref $hnd) " + hExpr + ")))"
+        + " (else (array.len (ref.as_non_null (struct.get $hnd 0 (ref.cast (ref $hnd) " + hExpr + "))))))"
+
     /// raw field value FROM a word expression (kind-typed result)
     let fieldFromWords (rn : string) (arrW : string) (baseW : string) (fn : string) : string =
         let placed, _, _ = (dictTryFind podLayout rn).Value
         let _, k, off = placed |> List.find (fun (n, _, _) -> n = fn)
-        let word = "(array.get $pk " + arrW + " (i32.add " + baseW + " (i32.const " + string (off / 8) + ")))"
+        let word = hWordGet arrW ("(i32.add " + baseW + " (i32.const " + string (off / 8) + "))")
         let sh = (off % 8) * 8
         match k with
         | "f" -> "(f64.reinterpret_i64 " + word + ")"
@@ -188,6 +202,8 @@ let emit (decls : Decl list) : EmitResult =
         | EIndexSet (_, a, i, v) -> scanExpr a; scanExpr i; scanExpr v
         | EArrayLen (_, a) -> scanExpr a
         | EArrayCreate (_, n, v) -> scanExpr n; scanExpr v
+        | EArrayPin (_, a) -> scanExpr a
+        | EArrayUnpin (_, a) -> scanExpr a
         | ETry (b, cs) ->
             scanExpr b
             for p, g, e in cs do
@@ -303,7 +319,10 @@ let emit (decls : Decl list) : EmitResult =
         let newLocal (base_ : string) : string = newTypedLocal base_ "anyref"
         match e with
         | ELit (LInt s) ->
-            let digits = s |> String.filter (fun c -> isDigit c || c = '-')
+            let digits =
+                if s.StartsWith "0x" || s.StartsWith "0X" then
+                    string (System.Convert.ToInt32 (s.TrimEnd ([| 'L'; 'u' |]), 16))
+                else s |> String.filter (fun c -> isDigit c || c = '-')
             if s.EndsWith "L" then
                 "(call $ofl (i64.const " + (if digits = "" then "0" else digits) + "))"
             else
@@ -356,6 +375,8 @@ let emit (decls : Decl list) : EmitResult =
             "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "length"), [ a ]) ->
             "(call $lenv " + recur a + ")"
+        | EApp (EUnknown "memLoadF64", [ a ]) ->
+            "(call $off (f64.load (call $toi " + recur a + ")))"
         | EApp (EUnknown "memStoreF32", [ a; v ]) ->
             // raw linear-memory store: the zero-copy bridge to JS/WebGPU
             "(block (result anyref) (f32.store (call $toi " + recur a + ") (f32.demote_f64 (call $tof " + recur v + "))) (ref.i31 (i32.const 0)))"
@@ -530,7 +551,7 @@ let emit (decls : Decl list) : EmitResult =
             let _, _, wd = (dictTryFind podLayout nm).Value
             let _, _, k = (dictTryFind fieldIndex fname).Value
             let baseW = "(i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))"
-            let raw = fieldFromWords nm ("(ref.cast (ref $pk) " + recur a + ")") baseW fname
+            let raw = fieldFromWords nm (recur a) baseW fname
             (match k with
              | "f" | "s" | "l" -> boxK k raw
              | "i" -> "(call $ofi " + raw + ")"
@@ -601,7 +622,7 @@ let emit (decls : Decl list) : EmitResult =
                             let word = wordFromStruct elemName l w
                             if w = 0 then "(block (result i64) (local.set " + l + " " + recur x + ") " + word + ")"
                             else word ])
-                "(array.new_fixed $pk " + string (xs.Length * wd) + " " + String.concat " " ops + ")"
+                "(struct.new $hnd (array.new_fixed $pk " + string (xs.Length * wd) + " " + String.concat " " ops + ") (i32.const 0) (i32.const 0))"
             elif isStructName elemName then
                 // SoA: element temps evaluated once (during the first field
                 // array), then per-field extraction into typed arrays
@@ -631,7 +652,7 @@ let emit (decls : Decl list) : EmitResult =
                 let placed, _, wd = (dictTryFind podLayout nm).Value
                 let al = newLocal "pa"
                 let bl = newTypedLocal "pb" "i32"
-                let arrW = "(ref.cast (ref $pk) (local.get " + al + "))"
+                let arrW = "(local.get " + al + ")"
                 let fieldsW =
                     placed |> List.map (fun (fn, _, _) -> fieldFromWords nm arrW ("(local.get " + bl + ")") fn)
                 "(block (result anyref) (local.set " + al + " " + recur a + ") "
@@ -662,10 +683,10 @@ let emit (decls : Decl list) : EmitResult =
                 let al = newLocal "wa"
                 let bl = newTypedLocal "wb" "i32"
                 let vl = newLocal "wv"
-                let arrW = "(ref.cast (ref $pk) (local.get " + al + "))"
+                let arrW = "(local.get " + al + ")"
                 let sets =
                     [ for w in 0 .. wd - 1 ->
-                        "(array.set $pk " + arrW + " (i32.add (local.get " + bl + ") (i32.const " + string w + ")) " + wordFromStruct nm vl w + ")" ]
+                        hWordSet arrW ("(i32.add (local.get " + bl + ") (i32.const " + string w + "))") (wordFromStruct nm vl w) ]
                 "(block (result anyref) (local.set " + al + " " + recur a + ") "
                 + "(local.set " + bl + " (i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))) "
                 + "(local.set " + vl + " " + recur v + ") "
@@ -686,6 +707,16 @@ let emit (decls : Decl list) : EmitResult =
             else
                 vecAdd errors "array write needs a statically known element type (specialization pending)"
                 "(ref.i31 (i32.const 0))"
+        | EArrayPin (nm, a) ->
+            if isPod nm then "(call $ofi (call $pinh " + recur a + "))"
+            else
+                vecAdd errors "Array.pin requires a POD struct array"
+                "(ref.i31 (i32.const 0))"
+        | EArrayUnpin (nm, a) ->
+            if isPod nm then "(call $ofi (call $unpinh " + recur a + "))"
+            else
+                vecAdd errors "Array.unpin requires a POD struct array"
+                "(ref.i31 (i32.const 0))"
         | EArrayLen (nm, a) ->
             let pk = primKindOf nm
             if nm = "string" then
@@ -694,7 +725,7 @@ let emit (decls : Decl list) : EmitResult =
                 "(call $ofi (array.len (ref.cast (ref " + parrOf pk + ") " + recur a + ")))"
             elif isPod nm then
                 let _, _, wd = (dictTryFind podLayout nm).Value
-                "(call $ofi (i32.div_u (array.len (ref.cast (ref $pk) " + recur a + ")) (i32.const " + string wd + ")))"
+                "(call $ofi (i32.div_u " + hLen (recur a) + " (i32.const " + string wd + ")))"
             elif isStructName nm then
                 "(call $ofi (array.len (struct.get $sarr_" + nm + " 0 (ref.cast (ref $sarr_" + nm + ") " + recur a + "))))"
             else
@@ -710,12 +741,12 @@ let emit (decls : Decl list) : EmitResult =
                 let vl = newLocal "kv"
                 let arl = newLocal "ka"
                 let jl = newTypedLocal "kj" "i32"
-                let arrW = "(ref.cast (ref $pk) (local.get " + arl + "))"
+                let arrW = "(local.get " + arl + ")"
                 let sets =
                     [ for w in 0 .. wd - 1 ->
-                        "(array.set $pk " + arrW + " (i32.add (i32.mul (local.get " + jl + ") (i32.const " + string wd + ")) (i32.const " + string w + ")) " + wordFromStruct nm vl w + ")" ]
+                        hWordSet arrW ("(i32.add (i32.mul (local.get " + jl + ") (i32.const " + string wd + ")) (i32.const " + string w + "))") (wordFromStruct nm vl w) ]
                 "(block (result anyref) (local.set " + nl + " " + unwrapI32 (recur n) + ") (local.set " + vl + " " + recur v + ") "
-                + "(local.set " + arl + " (array.new_default $pk (i32.mul (local.get " + nl + ") (i32.const " + string wd + ")))) "
+                + "(local.set " + arl + " (struct.new $hnd (array.new_default $pk (i32.mul (local.get " + nl + ") (i32.const " + string wd + "))) (i32.const 0) (i32.const 0))) "
                 + "(local.set " + jl + " (i32.const 0)) "
                 + "(block $kd" + jl + " (loop $kl" + jl + " (br_if $kd" + jl + " (i32.ge_u (local.get " + jl + ") (local.get " + nl + "))) "
                 + String.concat " " sets + " (local.set " + jl + " (i32.add (local.get " + jl + ") (i32.const 1))) (br $kl" + jl + "))) "
@@ -809,7 +840,10 @@ let emit (decls : Decl list) : EmitResult =
             compilePat locals extraLocals freeEnv out failLbl ("(local.get " + l + ")") inner
         | PLit LUnit -> ()
         | PLit (LInt s) ->
-            let digits = s |> String.filter (fun c -> isDigit c || c = '-')
+            let digits =
+                if s.StartsWith "0x" || s.StartsWith "0X" then
+                    string (System.Convert.ToInt32 (s.TrimEnd ([| 'L'; 'u' |]), 16))
+                else s |> String.filter (fun c -> isDigit c || c = '-')
             let n = if digits = "" then 0 else int digits
             app ("(br_if " + failLbl + " (i32.eqz (i32.or (ref.test (ref i31) " + v + ") (ref.test (ref $boxi) " + v + "))))")
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + string n + ") " + unwrapI32 v + "))")
@@ -898,6 +932,8 @@ let emit (decls : Decl list) : EmitResult =
             | EIndexSet (_, a, i, v) -> walk a; walk i; walk v
             | EArrayLen (_, a) -> walk a
             | EArrayCreate (_, n, v) -> walk n; walk v
+            | EArrayPin (_, a) -> walk a
+            | EArrayUnpin (_, a) -> walk a
             | ETry (b, cs) ->
                 walk b
                 for p, g, e in cs do
@@ -949,6 +985,8 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $parr_s (array (mut f32)))"
     line "  (type $parr_l (array (mut i64)))"
     line "  (type $pk (array (mut i64)))"
+    // POD array value = handle: storage (null while pinned), ptr, words
+    line "  (type $hnd (struct (field (mut (ref null $pk))) (field (mut i32)) (field (mut i32))))"
     line "  (type $boxl (struct (field i64)))"
     line "  (type $boxs (struct (field f32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
@@ -960,8 +998,9 @@ let emit (decls : Decl list) : EmitResult =
             let rs = if rk = "i" then "(result i32)" else "(result anyref)"
             line ("  (import \"env\" \"" + v.Name + "\" (func " + mangle v + " " + ps + " " + rs + "))")
         | _ -> ()
-    line "  (memory (export \"memory\") 1)"
+    line "  (memory (export \"memory\") 17)"   // 1 page scratch + 16 pages pin heap
     line "  (tag $fppexn (param anyref))"
+    line "  (global $heap (mut i32) (i32.const 65536))"
 
     // program-declared types
     for rn, fs, st in records do
@@ -1072,6 +1111,45 @@ let emit (decls : Decl list) : EmitResult =
           (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a)))
           (struct.get $cons 1 (ref.cast (ref $cons) (local.get $b)))))))
     (ref.i31 (ref.eq (ref.cast (ref null eq) (local.get $a)) (ref.cast (ref null eq) (local.get $b)))))
+  (func $balloc (param $bytes i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $heap))
+    (global.set $heap (i32.and (i32.add (i32.add (local.get $p) (local.get $bytes)) (i32.const 7)) (i32.const -8)))
+    (local.get $p))
+  (func $pinh (param $h anyref) (result i32)
+    (local $s (ref null $pk)) (local $n i32) (local $i i32) (local $p i32)
+    (local.set $s (struct.get $hnd 0 (ref.cast (ref $hnd) (local.get $h))))
+    (if (ref.is_null (local.get $s))
+      (then (return (struct.get $hnd 1 (ref.cast (ref $hnd) (local.get $h))))))
+    (local.set $n (array.len (local.get $s)))
+    (local.set $p (call $balloc (i32.mul (local.get $n) (i32.const 8))))
+    (block $d (loop $go
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (i64.store (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 8)))
+                 (array.get $pk (local.get $s) (local.get $i)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $go)))
+    (struct.set $hnd 1 (ref.cast (ref $hnd) (local.get $h)) (local.get $p))
+    (struct.set $hnd 2 (ref.cast (ref $hnd) (local.get $h)) (local.get $n))
+    ;; drop the GC storage: managed side is reclaimed while pinned
+    (struct.set $hnd 0 (ref.cast (ref $hnd) (local.get $h)) (ref.null $pk))
+    (local.get $p))
+  (func $unpinh (param $h anyref) (result i32)
+    (local $s (ref $pk)) (local $n i32) (local $i i32) (local $p i32)
+    (if (i32.eqz (ref.is_null (struct.get $hnd 0 (ref.cast (ref $hnd) (local.get $h)))))
+      (then (return (i32.const 0))))
+    (local.set $n (struct.get $hnd 2 (ref.cast (ref $hnd) (local.get $h))))
+    (local.set $p (struct.get $hnd 1 (ref.cast (ref $hnd) (local.get $h))))
+    (local.set $s (array.new_default $pk (local.get $n)))
+    (block $d (loop $go
+      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))
+      (array.set $pk (local.get $s) (local.get $i)
+                 (i64.load (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 8)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br $go)))
+    (struct.set $hnd 0 (ref.cast (ref $hnd) (local.get $h)) (local.get $s))
+    (struct.set $hnd 1 (ref.cast (ref $hnd) (local.get $h)) (i32.const 0))
+    (i32.const 0))
   (func $hashv (param $v anyref) (result i32)
     (local $i i32) (local $h i32)
     (if (ref.test (ref i31) (local.get $v))

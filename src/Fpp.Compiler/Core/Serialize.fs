@@ -146,6 +146,8 @@ let rec private encExpr (e : Expr) : Sx =
     | EIndexSet (nm, a, i, v) -> L [ A "ez"; S nm; encExpr a; encExpr i; encExpr v ]
     | EArrayLen (nm, a) -> L [ A "eL"; S nm; encExpr a ]
     | EArrayCreate (nm, n, v) -> L [ A "eC"; S nm; encExpr n; encExpr v ]
+    | EArrayPin (nm, a) -> L [ A "eP"; S nm; encExpr a ]
+    | EArrayUnpin (nm, a) -> L [ A "eU"; S nm; encExpr a ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -268,6 +270,8 @@ let rec private decExpr (x : Sx) : Expr =
     | L [ A "ez"; S nm; a; i; v ] -> EIndexSet (nm, decExpr a, decExpr i, decExpr v)
     | L [ A "eL"; S nm; a ] -> EArrayLen (nm, decExpr a)
     | L [ A "eC"; S nm; n; v ] -> EArrayCreate (nm, decExpr n, decExpr v)
+    | L [ A "eP"; S nm; a ] -> EArrayPin (nm, decExpr a)
+    | L [ A "eU"; S nm; a ] -> EArrayUnpin (nm, decExpr a)
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =

@@ -124,6 +124,8 @@ module Builtin =
             "    | Failure of string"
             "module Array ="
             "    extern let create : int -> 'a -> 'a[]"
+            "    extern let pin : 'a[] -> int"
+            "    extern let unpin : 'a[] -> int"
             ""
         ]
 

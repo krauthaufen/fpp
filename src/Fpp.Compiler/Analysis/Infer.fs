@@ -366,13 +366,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some t -> t.Offset
                          | None -> 0
+                     let mutable firstArg = true
+                     let mutable firstArgTy = None
                      for a in args do
                          if isExprish a.NodeKind then
                              let argTy = exprType (GNode a)
+                             if firstArg then
+                                 firstArgTy <- Some argTy
+                                 firstArg <- false
                              let res = st.Fresh ()
                              unifyAt off funTy (TFun (argTy, res))
                              funTy <- res
-                     vecAdd arrKindsRaw (off, funTy)
+                     // prefer an array-typed result (Array.create), else an
+                     // array-typed first argument (Array.pin/unpin)
+                     (match prune funTy, firstArgTy |> Option.map prune with
+                      | TCon ("array", _), _ -> vecAdd arrKindsRaw (off, funTy)
+                      | _, Some (TCon ("array", _) as at) -> vecAdd arrKindsRaw (off, at)
+                      | _ -> vecAdd arrKindsRaw (off, funTy))
                      funTy
                  | [] -> st.Fresh ())
             | BinaryExpr ->
