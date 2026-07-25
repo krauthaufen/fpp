@@ -82,7 +82,18 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       fixed by the box-spill
 - [x] int32 box-spill ($ofi/$toi, normalize-on-box; full int32 wraparound
       semantics verified by the oracle)
-- [ ] tail calls, inner let rec, more oracle programs
+- [x] tail calls (return_call in tail positions; oracle: 1M-deep loop)
+- [ ] inner let rec, match-body tail positions, more oracle programs
+
+## Stage 4.5 — Expanded mandate (user directive: "all of it")
+- [ ] More F# surface area end-to-end: while/for loops, mutables, arrays,
+      exceptions (try/with parse + raise/failwith semantics), string ops,
+      printf-family formatting, CE bodies (structured, not soup)
+- [ ] Linker: fat-IR library format (serialize Core.Ir), demand-closure
+      instantiation fixpoint, tier-1 struct specialization, symbol dedup
+      (see REPRESENTATION.md tiers)
+- [ ] C FFI: extern declarations, wasm component/host imports on wasm,
+      direct C ABI on native; blittable struct passing rules
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood

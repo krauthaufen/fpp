@@ -71,6 +71,18 @@ let oracleTests =
             "let b = print (fact 13)"   // 1932053504 — needs full int32
             "let c = print \"done\""
         ]
+        oracle "tail recursion at depth 1000000" [
+            "let rec loop i acc ="
+            "    if i = 0 then acc"
+            "    else loop (i - 1) (acc + 1)"
+            "let a = print (loop 1000000 0)"
+        ]
+        oracle "string equality and chars" [
+            "let pick s ="
+            "    if s = \"yes\" then 1 else 0"
+            "let a = print (pick \"yes\")"
+            "let b = print (pick \"no\")"
+        ]
         oracle "lists, matches, recursion" [
             "let rec sum xs ="
             "    match xs with"

@@ -137,8 +137,9 @@ let emit (decls : Decl list) : EmitResult =
     /// Compile one function body. `locals` maps (path,offset) to wasm local
     /// names; `extraLocals` collects locals to declare.
     let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string>)
-                        (freeEnv : Dict<string * int, int>) (e : Expr) : string =
-        let recur = compileExpr locals extraLocals freeEnv
+                        (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
+        let recur = compileExpr locals extraLocals freeEnv false
+        let recurT = compileExpr locals extraLocals freeEnv tail
         let newLocal (base_ : string) : string =
             let n = "$l" + string (vecLen extraLocals) + "_" + base_
             vecAdd extraLocals n
@@ -188,9 +189,10 @@ let emit (decls : Decl list) : EmitResult =
             "(block (result anyref) (drop " + recur a + ") (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "failwith", [ _ ]) -> "(unreachable)"
         | EApp (EVar (v, _), args) when (dictTryFind topArity (v.Path, v.Offset)) = Some args.Length ->
-            // known full-arity call: direct
+            // known full-arity call: direct (tail position -> return_call)
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
-            "(call " + fname + " " + String.concat " " (List.map recur args) + ")"
+            let op = if tail then "return_call" else "call"
+            "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")"
         | EApp (f, args) ->
             let mutable w = recur f
             for a in args do
@@ -210,10 +212,10 @@ let emit (decls : Decl list) : EmitResult =
             let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
             let r = recur rhs
             dictSet locals (v.Path, v.Offset) l
-            "(block (result anyref) (local.set " + l + " " + r + ") " + recur body + ")"
+            "(block (result anyref) (local.set " + l + " " + r + ") " + recurT body + ")"
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
-            + recur t + ") (else " + recur f + "))"
+            + recurT t + ") (else " + recurT f + "))"
         | EPrim (op, [ a; b ]) ->
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)
@@ -286,7 +288,7 @@ let emit (decls : Decl list) : EmitResult =
              | last :: init ->
                  "(block (result anyref) "
                  + String.concat " " (List.rev init |> List.map (fun x -> "(drop " + recur x + ")"))
-                 + " " + recur last + ")")
+                 + " " + recurT last + ")")
         | EMatch (scrut, cases) ->
             // expand or-patterns into separate cases
             let cases =
@@ -345,7 +347,7 @@ let emit (decls : Decl list) : EmitResult =
         | PLit (LChar raw) ->
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + string (charCode raw) + ") " + unwrapI32 v + "))")
         | PLit (LString raw) ->
-            let lit = compileExpr locals extraLocals freeEnv (ELit (LString raw))
+            let lit = compileExpr locals extraLocals freeEnv false (ELit (LString raw))
             app ("(br_if " + failLbl + " (i32.eqz " + unwrapI32 ("(call $equal " + v + " " + lit + ")") + "))")
         | PLit (LFloat _) ->
             vecAdd errors "float patterns unsupported"
@@ -427,7 +429,7 @@ let emit (decls : Decl list) : EmitResult =
         let innerFree = dictNew<string * int, int> ()
         freeList |> List.iteri (fun i k -> dictSet innerFree k i)
         let innerExtra = vecNew<string> ()
-        let bodyW = compileExpr innerLocals innerExtra innerFree body
+        let bodyW = compileExpr innerLocals innerExtra innerFree true body
         let localDecls = vecToList innerExtra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
         vecAdd lifted
             ("(func " + fname + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) "
@@ -563,7 +565,7 @@ let emit (decls : Decl list) : EmitResult =
             let locals = dictNew<string * int, string> ()
             ps |> List.iteri (fun i (pv, _) -> dictSet locals (pv.Path, pv.Offset) ("$a" + string i))
             let extra = vecNew<string> ()
-            let bodyW = compileExpr locals extra (dictNew ()) body
+            let bodyW = compileExpr locals extra (dictNew ()) true body
             let ps' = ps |> List.mapi (fun i _ -> "(param $a" + string i + " anyref)") |> String.concat " "
             let localDecls = vecToList extra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
             line ("  (func " + fname + " " + ps' + " (result anyref) " + localDecls + " " + bodyW + ")")
@@ -572,7 +574,7 @@ let emit (decls : Decl list) : EmitResult =
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string> ()
-            let w = compileExpr locals extra (dictNew ()) rhs
+            let w = compileExpr locals extra (dictNew ()) false rhs
             let localDecls = vecToList extra |> List.map (fun l -> "(local " + l + " anyref)") |> String.concat " "
             let initName = "$init" + string (vecLen initFuncs)
             line ("  (func " + initName + " " + localDecls + " (global.set " + gname + " " + w + "))")
