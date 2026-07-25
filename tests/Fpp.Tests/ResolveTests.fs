@@ -111,7 +111,7 @@ let resolveLspTests =
             let ws = Workspace()
             ws.SetFileText "t" "let foo = 1\nlet b = foo\n"
             let hover = ws.HoverAt "t" (("let foo = 1\nlet b = ".Length))
-            Expect.equal hover (Some "let `foo`") "hover text"
+            Expect.equal hover (Some "let `foo` : int") "hover text with inferred type"
         }
         test "self-application: thousands of resolutions on own sources" {
             let root = __SOURCE_DIRECTORY__ + "/../.."

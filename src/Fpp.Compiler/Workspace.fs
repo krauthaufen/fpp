@@ -120,15 +120,22 @@ type Workspace() =
     member this.ParseFile (path : string) : Parser.ParseResult =
         db.MemoT "parse" path (fun () -> Parser.parse (this.FileText path))
 
+    member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
+        db.MemoT "typecheck" path (fun () ->
+            Analysis.Infer.infer (this.ParseFile path).Root (this.Resolve path))
+
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
             let r = this.ParseFile path
+            let t = this.TypeCheck path
             let starts = Lines.starts (this.FileText path)
-            r.Diagnostics
-            |> List.map (fun d ->
-                let line, col = Lines.toLineCol starts d.Offset
+            let at (offset : int) (msg : string) =
+                let line, col = Lines.toLineCol starts offset
                 { Path = path; Line = line; Col = col
-                  EndLine = line; EndCol = col + 1; Message = d.Message }))
+                  EndLine = line; EndCol = col + 1; Message = msg }
+            (r.Diagnostics |> List.map (fun d -> at d.Offset d.Message))
+            @ (t.Diagnostics |> List.map (fun (off, msg) -> at off msg))
+            |> List.sortBy (fun d -> d.Line, d.Col))
 
     member this.Outline (path : string) : OutlineItem list =
         db.MemoT "outline" path (fun () ->
@@ -155,4 +162,11 @@ type Workspace() =
 
     member this.HoverAt (path : string) (offset : int) : string option =
         this.DefinitionAt path offset
-        |> Option.map (fun d -> Analysis.Resolve.kindLabel d.Kind + " `" + d.Name + "`")
+        |> Option.map (fun d ->
+            let basis = Analysis.Resolve.kindLabel d.Kind + " `" + d.Name + "`"
+            let ty =
+                (this.TypeCheck path).DefTypes
+                |> List.tryFind (fun (off, _, _) -> off = d.Offset)
+            match ty with
+            | Some (_, _, ts) -> basis + " : " + ts
+            | None -> basis)

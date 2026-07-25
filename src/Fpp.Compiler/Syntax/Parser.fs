@@ -62,6 +62,12 @@ type private State(src : string, toks : Vec<Token>) =
     member this.SameLine : bool =
         pos = 0 || this.LineOf (vecGet toks (pos - 1)).Offset = this.CurLine
 
+    /// Is there whitespace/trivia between the previous token and this one?
+    member this.GapBefore : bool =
+        pos = 0
+        || (let p = vecGet toks (pos - 1)
+            p.Offset + strLen p.Text < (vecGet toks pos).Offset)
+
     member _.Mark : int = pos
 
     /// Token k positions ahead (clamped to Eof).
@@ -382,25 +388,73 @@ let parse (src : string) : ParseResult =
         lhs
 
     and parseApp (ctx : int) : Green =
+        // F#'s prefix-minus rule: `f -1` (space before the minus, none after
+        // a numeric literal) is application of a negative literal
+        let isNegLitArg () =
+            s.IsOp "-" && s.GapBefore
+            && (let n = s.Peek 1 in
+                (n.Kind = IntLit || n.Kind = FloatLit) && n.Offset = s.Cur.Offset + 1)
+        let parseArg () =
+            if isNegLitArg () then Green.node PrefixExpr [ s.Bump (); s.Bump () ]
+            else parsePostfix ctx
         let head = parsePostfix ctx
-        if canStartAtom () && (s.SameLine || s.CurCol > ctx) then
+        if (canStartAtom () || isNegLitArg ()) && (s.SameLine || s.CurCol > ctx) then
             let acc = vecNew<Green> ()
             vecAdd acc head
-            while canStartAtom () && (s.SameLine || s.CurCol > ctx) do
-                vecAdd acc (parsePostfix ctx)
+            while (canStartAtom () || isNegLitArg ()) && (s.SameLine || s.CurCol > ctx) do
+                vecAdd acc (parseArg ())
             Green.node AppExpr (vecToList acc)
         else head
 
     and parsePostfix (ctx : int) : Green =
         let mutable e = parseAtom ctx
-        while s.IsOp "." && s.SameLine do
-            let dot = s.Bump ()
-            if s.Is Ident then e <- Green.node DotExpr [ e; dot; s.Bump () ]
-            elif s.Is LBracket then e <- Green.node DotExpr [ e; dot; parseAtom ctx ]   // x.[i]
-            else
-                s.Diag "expected member name after '.'"
-                e <- Green.node DotExpr [ e; dot ]
+        let mutable go = true
+        while go do
+            if s.IsOp "." && s.SameLine then
+                let dot = s.Bump ()
+                if s.Is Ident then e <- Green.node DotExpr [ e; dot; s.Bump () ]
+                elif s.Is LBracket then e <- Green.node DotExpr [ e; dot; parseAtom ctx ]   // x.[i]
+                else
+                    s.Diag "expected member name after '.'"
+                    e <- Green.node DotExpr [ e; dot ]
+            elif s.IsOp "<" && isAdjacentTo e && looksLikeTypeArgs () then
+                // explicit generic application: GetValue<string>, vecNew<Green>
+                e <- Green.node AppExpr [ e; Green.node TyParams (parseAngleArgs ctx) ]
+            else go <- false
         e
+
+    /// The `<` begins immediately after the expression (F#'s disambiguator
+    /// between generic application and comparison).
+    and isAdjacentTo (e : Green) : bool =
+        match Green.tokens e |> List.tryLast with
+        | Some t -> t.Offset + strLen t.Text = s.Cur.Offset
+        | None -> false
+
+    /// Lookahead from a `<`: only type-shaped tokens until a matching `>`
+    /// on the same line.
+    and looksLikeTypeArgs () : bool =
+        let line = s.CurLine
+        let rec scan (k : int) (depth : int) : bool =
+            let t = s.Peek k
+            if t.Kind = Eof then false
+            elif s.LineOf t.Offset <> line then false
+            else
+                match t.Kind with
+                | Operator ->
+                    if t.Text = "<" then scan (k + 1) (depth + 1)
+                    elif charAt t.Text 0 = '>' then
+                        // a run of > closes that many levels
+                        let closed = depth - strLen t.Text
+                        if closed < 0 then false
+                        elif closed = 0 then true
+                        else scan (k + 1) closed
+                    elif t.Text = "'" || t.Text = "." || t.Text = "*" || t.Text = "->" then scan (k + 1) depth
+                    else false
+                | Ident -> scan (k + 1) depth
+                | Comma -> scan (k + 1) depth
+                | LBracket | RBracket -> scan (k + 1) depth   // int[]
+                | _ -> false
+        scan 1 1
 
     and parseAtom (ctx : int) : Green =
         if s.Is Ident then Green.node IdentExpr [ s.Bump () ]

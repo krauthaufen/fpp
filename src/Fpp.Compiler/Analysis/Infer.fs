@@ -1,0 +1,603 @@
+module Fpp.Analysis.Infer
+
+open Fpp.Prelude
+open Fpp.Syntax
+open Fpp.Analysis
+open Fpp.Analysis.Types
+
+// Type inference for the HM core, v0. The key trick: name resolution has
+// already solved all scoping, so schemes are keyed by *definition offset* —
+// a use looks up its definition through the resolver's use->def table and
+// instantiates that definition's scheme. No environment threading at all.
+//
+// Anything unresolved (BCL, other files, member access, brace-soup) gets a
+// fresh unconstrained variable — inference degrades to "unknown", never to a
+// false error. Mismatch diagnostics therefore only fire where both sides are
+// genuinely known.
+
+type InferResult =
+    { Diagnostics : (int * string) list
+      /// definition offset, length, pretty-printed type
+      DefTypes : (int * int * string) list }
+
+let infer (root : GreenNode) (binder : Resolve.BindResult) : InferResult =
+    let st = TypeState()
+    let diags = vecNew<int * string> ()
+    let defSchemes = dictNew<int, Scheme> ()
+    let defTypes = vecNew<int * int * Type> ()
+    // same-file type abbreviations: name -> (param vars, body)
+    let aliases = dictNew<string, Var list * Type> ()
+
+    let useDefs = dictNew<int, Resolve.Definition> ()
+    for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
+    let defsAt = dictNew<int, Resolve.Definition> ()
+    for d in binder.Definitions do dictSet defsAt d.Offset d
+
+    let unifyAt (offset : int) (t1 : Type) (t2 : Type) : unit =
+        match unify t1 t2 with
+        | Some msg -> vecAdd diags (offset, msg)
+        | None -> ()
+
+    let recordDef (t : Token) (ty : Type) : unit =
+        vecAdd defTypes (t.Offset, strLen t.Text, ty)
+
+    let nodesOf (n : GreenNode) : GreenNode list =
+        n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+
+    let tokensOf (n : GreenNode) : Token list =
+        n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+
+    let hasOpToken (text : string) (n : GreenNode) : bool =
+        tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = text)
+
+    let isPatKind (k : NodeKind) =
+        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat
+
+    let isTypeKind (k : NodeKind) =
+        k = NamedType || k = VarType || k = AnonType || k = TupleType
+        || k = FunType || k = AppType || k = PostfixType || k = ParenType
+
+    let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
+
+    // ---- syntax types -> Type ---------------------------------------------
+
+    /// Convert a type node. `vars` maps type-variable names to Types and is
+    /// per-declaration so repeated 'a in one signature mean the same thing.
+    let rec typeFromNode (vars : Dict<string, Type>) (n : GreenNode) : Type =
+        let namedVar (name : string) : Type =
+            match dictTryFind vars name with
+            | Some t -> t
+            | None ->
+                let t = st.Fresh ()
+                dictSet vars name t
+                t
+        let expandAlias (name : string) (args : Type list) : Type option =
+            match dictTryFind aliases name with
+            | Some (ps, body) when ps.Length = args.Length ->
+                let subst = dictNew<int, Type> ()
+                List.zip ps args |> List.iter (fun (p, a) -> dictSet subst p.Id a)
+                let rec go (t : Type) : Type =
+                    match prune t with
+                    | TVar v -> (match dictTryFind subst v.Id with Some a -> a | None -> TVar v)
+                    | TCon (c, xs) -> TCon (c, List.map go xs)
+                    | TFun (a, b) -> TFun (go a, go b)
+                    | TTuple ts -> TTuple (List.map go ts)
+                Some (go body)
+            | _ -> None
+        match n.NodeKind with
+        | VarType ->
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t -> namedVar t.Text
+             | None -> st.Fresh ())
+        | AnonType -> st.Fresh ()
+        | NamedType ->
+            let name = tokensOf n |> List.map (fun t -> t.Text) |> String.concat ""
+            (match expandAlias name [] with
+             | Some t -> t
+             | None -> TCon (name, []))
+        | AppType ->
+            (match nodesOf n with
+             | head :: _ ->
+                 let args =
+                     nodesOf n |> List.tail |> List.filter (fun m -> isTypeKind m.NodeKind)
+                     |> List.map (typeFromNode vars)
+                 (match nodesOf n |> List.tryHead with
+                  | Some h when h.NodeKind = NamedType ->
+                      let name = tokensOf h |> List.map (fun t -> t.Text) |> String.concat ""
+                      (match expandAlias name args with
+                       | Some t -> t
+                       | None -> TCon (name, args))
+                  | _ ->
+                      match typeFromNode vars head with
+                      | TCon (name, []) -> TCon (name, args)
+                      | TVar _ when args.Length > 0 ->
+                          // HKT application 'm<'a> — beyond the HM core for now
+                          st.Fresh ()
+                      | other -> other)
+             | [] -> st.Fresh ())
+        | PostfixType ->
+            (match nodesOf n, tokensOf n with
+             | [ inner ], [ t ] when t.Kind = Ident -> TCon (t.Text, [ typeFromNode vars inner ])
+             | [ inner ], _ -> typeFromNode vars inner   // int[] — array suffix
+             | _ -> st.Fresh ())
+        | FunType ->
+            (match nodesOf n with
+             | [ a; b ] -> TFun (typeFromNode vars a, typeFromNode vars b)
+             | _ -> st.Fresh ())
+        | TupleType ->
+            TTuple (nodesOf n |> List.filter (fun m -> isTypeKind m.NodeKind) |> List.map (typeFromNode vars))
+        | ParenType ->
+            (match nodesOf n with
+             | [ inner ] -> typeFromNode vars inner
+             | _ -> st.Fresh ())
+        | _ -> st.Fresh ()
+
+    // ---- literals ---------------------------------------------------------
+
+    let literalType (t : Token) : Type =
+        match t.Kind with
+        | IntLit -> tInt
+        | FloatLit -> tFloat
+        | StringLit -> tString
+        | CharLit -> tChar
+        | Keyword when t.Text = "true" || t.Text = "false" -> tBool
+        | _ -> st.Fresh ()
+
+    // ---- patterns ---------------------------------------------------------
+
+    /// Type of a pattern; assigns fresh monomorphic schemes to the names the
+    /// pattern binds (identified as definitions by the resolver).
+    let rec patType (n : GreenNode) : Type =
+        match n.NodeKind with
+        | WildcardPat -> st.Fresh ()
+        | LiteralPat ->
+            (match tokensOf n |> List.tryLast with
+             | Some t -> literalType t
+             | None -> st.Fresh ())
+        | IdentPat ->
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t ->
+                 match dictTryFind defsAt t.Offset with
+                 | Some _ ->
+                     // a binding introduced here
+                     let ty = st.Fresh ()
+                     dictSet defSchemes t.Offset (mono ty)
+                     recordDef t ty
+                     ty
+                 | None ->
+                     // a constructor use
+                     (match dictTryFind useDefs t.Offset with
+                      | Some d ->
+                          (match dictTryFind defSchemes d.Offset with
+                           | Some sch -> st.Instantiate sch
+                           | None -> st.Fresh ())
+                      | None -> st.Fresh ())
+             | None -> st.Fresh ())
+        | AppPat ->
+            (match nodesOf n with
+             | head :: args ->
+                 let ctorTy = patType head
+                 let argTys = args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map patType
+                 (match argTys with
+                  | [] -> ctorTy
+                  | [ argTy ] ->
+                      let res = st.Fresh ()
+                      (match tokensOf head |> List.tryHead with
+                       | Some t -> unifyAt t.Offset ctorTy (TFun (argTy, res))
+                       | None -> unify ctorTy (TFun (argTy, res)) |> ignore)
+                      res
+                  | _ -> st.Fresh ())
+             | [] -> st.Fresh ())
+        | TuplePat ->
+            TTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map patType)
+        | ConsPat ->
+            (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
+             | [ h; t ] ->
+                 let hd = patType h
+                 let tl = patType t
+                 (match tokensOf n |> List.tryHead with
+                  | Some tok -> unifyAt tok.Offset tl (tList hd)
+                  | None -> unify tl (tList hd) |> ignore)
+                 tl
+             | items -> (items |> List.iter (patType >> ignore)); st.Fresh ())
+        | ListPat ->
+            let elem = st.Fresh ()
+            for m in nodesOf n do
+                if isPatKind m.NodeKind then unify (patType m) elem |> ignore
+            tList elem
+        | ParenPat ->
+            // sequence of patterns, each optionally ascribed, comma-separated
+            let vars = dictNew<string, Type> ()
+            let items = vecNew<Type> ()
+            let kids = n.Children
+            let rec walk (ks : Green list) =
+                match ks with
+                | GNode p :: rest when isPatKind p.NodeKind ->
+                    let ty = patType p
+                    (match rest with
+                     | GToken c :: GNode a :: rest2 when c.Text = ":" && isTypeKind a.NodeKind ->
+                         unify ty (typeFromNode vars a) |> ignore
+                         vecAdd items ty
+                         walk rest2
+                     | _ ->
+                         vecAdd items ty
+                         walk rest)
+                | _ :: rest -> walk rest
+                | [] -> ()
+            walk kids
+            match vecToList items with
+            | [] -> tUnit
+            | [ one ] -> one
+            | many -> TTuple many
+        | _ -> st.Fresh ()
+
+    // ---- expressions ------------------------------------------------------
+
+    let opClass (text : string) : string =
+        if text = "&&" || text = "||" then "logic"
+        elif text = "::" then "cons"
+        elif text = "|>" then "pipe"
+        elif text = "<|" then "pipeBack"
+        elif text = "=" || text = "<>" || text = "<" || text = ">" || text = "<=" || text = ">=" then "cmp"
+        elif text = "+" || text = "-" || text = "*" || text = "/" || text = "%" || text = "**" then "arith"
+        elif text = "@" then "append"
+        elif text = "<-" || text = ":=" then "assign"
+        else "unknown"
+
+    let rec exprType (g : Green) : Type =
+        match g with
+        | GToken _ -> st.Fresh ()
+        | GNode n ->
+            match n.NodeKind with
+            | LiteralExpr ->
+                (match tokensOf n |> List.tryHead with
+                 | Some t -> literalType t
+                 | None -> st.Fresh ())
+            | IdentExpr ->
+                (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                 | Some t when (tokensOf n |> List.head).Kind = Ident ->
+                     (match dictTryFind useDefs t.Offset with
+                      | Some d ->
+                          (match dictTryFind defSchemes d.Offset with
+                           | Some sch -> st.Instantiate sch
+                           | None -> st.Fresh ())
+                      | None -> st.Fresh ())
+                 | _ -> st.Fresh ())   // quote-ident type variable
+            | AppExpr ->
+                (match nodesOf n with
+                 | head :: args ->
+                     let mutable funTy = exprType (GNode head)
+                     let off =
+                         match Green.tokens (GNode head) |> List.tryHead with
+                         | Some t -> t.Offset
+                         | None -> 0
+                     for a in args do
+                         if isExprish a.NodeKind then
+                             let argTy = exprType (GNode a)
+                             let res = st.Fresh ()
+                             unifyAt off funTy (TFun (argTy, res))
+                             funTy <- res
+                     funTy
+                 | [] -> st.Fresh ())
+            | BinaryExpr ->
+                (match nodesOf n, tokensOf n with
+                 | [ l; r ], [ op ] ->
+                     let lt = exprType (GNode l)
+                     let rt = exprType (GNode r)
+                     (match opClass op.Text with
+                      | "logic" ->
+                          unifyAt op.Offset lt tBool
+                          unifyAt op.Offset rt tBool
+                          tBool
+                      | "cmp" ->
+                          unifyAt op.Offset lt rt
+                          tBool
+                      | "arith" ->
+                          unifyAt op.Offset lt rt
+                          lt
+                      | "cons" ->
+                          unifyAt op.Offset rt (tList lt)
+                          rt
+                      | "append" ->
+                          unifyAt op.Offset lt rt
+                          lt
+                      | "pipe" ->
+                          let res = st.Fresh ()
+                          unifyAt op.Offset rt (TFun (lt, res))
+                          res
+                      | "pipeBack" ->
+                          let res = st.Fresh ()
+                          unifyAt op.Offset lt (TFun (rt, res))
+                          res
+                      | "assign" -> tUnit
+                      | _ -> st.Fresh ())
+                 | _ ->
+                     for m in nodesOf n do exprType (GNode m) |> ignore
+                     st.Fresh ())
+            | PrefixExpr ->
+                let inner =
+                    nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
+                    |> List.map (fun m -> exprType (GNode m))
+                (match tokensOf n |> List.tryHead with
+                 | Some t when t.Text = "not" ->
+                     (match inner with
+                      | [ i ] -> unifyAt t.Offset i tBool
+                      | _ -> ())
+                     tBool
+                 | Some t when t.Text = "-" || t.Text = "+" ->
+                     (match inner with [ i ] -> i | _ -> st.Fresh ())
+                 | _ -> st.Fresh ())
+            | ParenExpr ->
+                let vars = dictNew<string, Type> ()
+                let inner =
+                    n.Children
+                    |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
+                    |> List.map exprType
+                let ascribed =
+                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+                    |> Option.map (typeFromNode vars)
+                match inner, ascribed with
+                | [], _ -> tUnit
+                | [ t ], Some a -> unify t a |> ignore; t
+                | [ t ], None -> t
+                | many, _ -> List.last many
+            | TupleExpr ->
+                TTuple (n.Children
+                        |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
+                        |> List.map exprType)
+            | ListExpr ->
+                let elem = st.Fresh ()
+                let rec addItems (m : GreenNode) =
+                    if m.NodeKind = BlockExpr then
+                        for c in nodesOf m do addItems c
+                    elif m.NodeKind = LetDecl || m.NodeKind = ForExpr || m.NodeKind = WhileExpr then
+                        exprType (GNode m) |> ignore
+                    elif isExprish m.NodeKind then
+                        let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
+                        unifyAt off (exprType (GNode m)) elem
+                for m in nodesOf n do addItems m
+                tList elem
+            | LambdaExpr ->
+                let pats = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
+                let paramTys = pats |> List.map patType
+                let body =
+                    nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
+                    |> List.map (fun m -> exprType (GNode m))
+                let resT = match List.tryLast body with Some t -> t | None -> tUnit
+                List.foldBack (fun p acc -> TFun (p, acc)) paramTys resT
+            | IfExpr ->
+                let exprs = nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
+                (match exprs with
+                 | cond :: rest ->
+                     let condOff =
+                         match Green.tokens (GNode cond) |> List.tryHead with
+                         | Some t -> t.Offset | None -> 0
+                     unifyAt condOff (exprType (GNode cond)) tBool
+                     // an elif continuation nests as a child IfExpr and
+                     // completes the chain just like `else` does
+                     let hasElse =
+                         (tokensOf n |> List.exists (fun t -> t.Text = "else"))
+                         || (rest |> List.exists (fun m -> m.NodeKind = IfExpr))
+                     let branchTys = rest |> List.map (fun m -> exprType (GNode m))
+                     (match branchTys with
+                      | [] -> tUnit
+                      | [ one ] -> if hasElse then one else tUnit
+                      | first :: others ->
+                          if hasElse then
+                              for o in others do
+                                  let off = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
+                                  unifyAt off first o
+                              first
+                          else tUnit)
+                 | [] -> st.Fresh ())
+            | MatchExpr ->
+                let scrutTy =
+                    nodesOf n
+                    |> List.tryFind (fun m -> m.NodeKind <> MatchClause && isExprish m.NodeKind)
+                    |> Option.map (fun m -> exprType (GNode m))
+                let scrut = match scrutTy with Some t -> t | None -> st.Fresh ()
+                let result = st.Fresh ()
+                for cl in nodesOf n do
+                    if cl.NodeKind = MatchClause then
+                        let barOff = match tokensOf cl |> List.tryHead with Some t -> t.Offset | None -> 0
+                        // pattern nodes (before ->) unify with the scrutinee
+                        for m in nodesOf cl do
+                            if isPatKind m.NodeKind then
+                                unifyAt barOff (patType m) scrut
+                        // body: expr children; when-guard is bool but we keep it loose
+                        let bodies = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
+                        (match List.tryLast bodies with
+                         | Some b ->
+                             for extra in bodies do
+                                 if not (System.Object.ReferenceEquals (extra, b)) then
+                                     exprType (GNode extra) |> ignore
+                             unifyAt barOff (exprType (GNode b)) result
+                         | None -> ())
+                result
+            | BlockExpr ->
+                let mutable last = tUnit
+                for m in nodesOf n do
+                    last <- exprType (GNode m)
+                last
+            | LetDecl -> inferLet n
+            | DotExpr ->
+                (match nodesOf n |> List.tryHead with
+                 | Some lhs -> exprType (GNode lhs) |> ignore
+                 | None -> ())
+                st.Fresh ()
+            | ForExpr | WhileExpr ->
+                for m in nodesOf n do
+                    if isPatKind m.NodeKind then patType m |> ignore
+                    elif isExprish m.NodeKind then exprType (GNode m) |> ignore
+                tUnit
+            | BraceExpr -> st.Fresh ()
+            | ErrorNode -> st.Fresh ()
+            | _ ->
+                for m in nodesOf n do
+                    if isExprish m.NodeKind then exprType (GNode m) |> ignore
+                    elif isPatKind m.NodeKind then patType m |> ignore
+                st.Fresh ()
+
+    // ---- declarations -----------------------------------------------------
+
+    and inferLet (n : GreenNode) : Type =
+        let isRec =
+            tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "rec")
+        // split at `=`
+        let mutable seenEq = false
+        let before = vecNew<Green> ()
+        let after = vecNew<Green> ()
+        for c in n.Children do
+            match c with
+            | GToken t when t.Kind = Operator && t.Text = "=" && not seenEq -> seenEq <- true
+            | c -> vecAdd (if seenEq then after else before) c
+        let pats =
+            vecToList before
+            |> List.choose (fun c -> match c with GNode p when isPatKind p.NodeKind -> Some p | _ -> None)
+        let vars = dictNew<string, Type> ()
+        let ascription =
+            vecToList before
+            |> List.tryPick (fun c -> match c with GNode t when isTypeKind t.NodeKind -> Some (typeFromNode vars t) | _ -> None)
+        let isDestructure =
+            vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
+        match pats with
+        | [] ->
+            for c in vecToList after do exprType c |> ignore
+            tUnit
+        | namePat :: paramPats when not isDestructure ->
+            let hasIn =
+                tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "in")
+            st.EnterLevel ()
+            let nameTy = patType namePat
+            let paramTys = paramPats |> List.map patType
+            let bodyTys = vecToList after |> List.map exprType
+            // with `in`, the last after-expr is the continuation, the first
+            // is the binding body
+            let bodyTy =
+                match bodyTys, hasIn with
+                | b :: _, true -> b
+                | _, _ -> (match List.tryLast bodyTys with Some t -> t | None -> st.Fresh ())
+            let resultTy =
+                match ascription with
+                | Some a ->
+                    (match Green.tokens (GNode namePat) |> List.tryHead with
+                     | Some t -> unifyAt t.Offset bodyTy a
+                     | None -> unify bodyTy a |> ignore)
+                    bodyTy
+                | None -> bodyTy
+            let funTy = List.foldBack (fun p acc -> TFun (p, acc)) paramTys resultTy
+            (match Green.tokens (GNode namePat) |> List.tryHead with
+             | Some t -> unifyAt t.Offset nameTy funTy
+             | None -> unify nameTy funTy |> ignore)
+            ignore isRec   // rec already works: the name's tvar was bound before the body
+            st.ExitLevel ()
+            // generalize and overwrite the monomorphic scheme
+            (match Green.tokens (GNode namePat) |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t when (dictTryFind defsAt t.Offset).IsSome ->
+                 dictSet defSchemes t.Offset (st.Generalize funTy)
+             | _ -> ())
+            // `let x = e in body` evaluates to the continuation
+            if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
+            else tUnit
+        | _ ->
+            // destructuring: bind all pattern names, unify with the body
+            st.EnterLevel ()
+            let patTys = pats |> List.map patType
+            let bodyTys = vecToList after |> List.map exprType
+            st.ExitLevel ()
+            (match patTys, List.tryLast bodyTys with
+             | [ single ], Some b -> unify single b |> ignore
+             | many, Some b -> unify (TTuple many) b |> ignore
+             | _ -> ())
+            tUnit
+
+    and inferTypeDecl (n : GreenNode) : unit =
+        // declared type parameters
+        let vars = dictNew<string, Type> ()
+        let tyParams = vecNew<Type> ()
+        for m in nodesOf n do
+            if m.NodeKind = TyParams then
+                // 'a sits inside VarType nodes — walk all descendant tokens
+                for t in Green.tokens (GNode m) do
+                    if t.Kind = Ident && t.Text <> "_" && not (dictTryFind vars t.Text).IsSome then
+                        let v = st.Fresh ()
+                        dictSet vars t.Text v
+                        vecAdd tyParams v
+        let name =
+            match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+            | Some t -> t.Text
+            | None -> "?"
+        let selfTy = TCon (name, vecToList tyParams)
+        // type abbreviation: register for same-file expansion
+        let hasStructure =
+            nodesOf n
+            |> List.exists (fun m ->
+                m.NodeKind = UnionCase || m.NodeKind = RecordRepr
+                || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
+        if not hasStructure then
+            match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+            | Some repr ->
+                let body = typeFromNode vars repr
+                let paramVars =
+                    vecToList tyParams
+                    |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
+                dictSet aliases name (paramVars, body)
+            | None -> ()
+        // union cases become constructor schemes
+        for m in nodesOf n do
+            match m.NodeKind with
+            | UnionCase ->
+                let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
+                let isGadt = hasOpToken ":" m
+                let tyNode = nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+                let ctorTy =
+                    match tyNode with
+                    | Some tn when isGadt ->
+                        // per-case signature is the whole constructor type;
+                        // per-case variables live in their own scope
+                        let caseVars = dictNew<string, Type> ()
+                        typeFromNode caseVars tn
+                    | Some tn -> TFun (typeFromNode vars tn, selfTy)
+                    | None -> selfTy
+                (match caseTok with
+                 | Some t when (dictTryFind defsAt t.Offset).IsSome ->
+                     let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Body = ctorTy }
+                     dictSet defSchemes t.Offset sch
+                     recordDef t ctorTy
+                 | _ -> ())
+            | LetDecl -> inferLet m |> ignore
+            | MemberDecl -> inferMember m
+            | InterfaceImpl ->
+                for x in nodesOf m do
+                    if x.NodeKind = MemberDecl then inferMember x
+            | k when isPatKind k -> patType m |> ignore   // primary-ctor params
+            | _ -> ()
+
+    and inferMember (n : GreenNode) : unit =
+        let mutable seenEq = false
+        for c in n.Children do
+            match c with
+            | GToken t when t.Kind = Operator && t.Text = "=" && not seenEq -> seenEq <- true
+            | GNode p when not seenEq && isPatKind p.NodeKind -> patType p |> ignore
+            | GNode b when seenEq && isExprish b.NodeKind -> exprType c |> ignore
+            | _ -> ()
+
+    and inferDecl (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            match n.NodeKind with
+            | LetDecl -> inferLet n |> ignore
+            | TypeDecl -> inferTypeDecl n
+            | ModuleDef ->
+                for c in n.Children do inferDecl c
+            | ModuleHeader | OpenDecl | AttributeList -> ()
+            | _ -> exprType g |> ignore
+
+    for c in root.Children do inferDecl c
+
+    { Diagnostics = vecToList diags
+      DefTypes =
+        vecToList defTypes
+        |> List.map (fun (off, len, ty) -> off, len, typeString ty) }

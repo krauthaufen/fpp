@@ -33,7 +33,13 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       case-vs-binding patterns, class scopes, destructuring); feeds LSP
       go-to-definition + hover; 1125 defs / 2800 uses resolved on own
       sources. Open: cross-file, opens, module-member (dotted) resolution
-- [ ] Constraint-based HM inference: generate + solve with deferral
+- [~] HM inference core — v0 done: unification with levels (Rémy),
+      let-generalization, schemes keyed by def-offset (resolver solves all
+      scoping), DU/GADT constructor schemes, generic type params, same-file
+      abbreviation expansion, ascriptions, literals/apps/ops/match/if/lists;
+      typed hover; gate: ZERO type diagnostics on own sources. Open:
+      deferred constraints (overloads/classes), records, member types,
+      cross-file
 - [ ] Overload resolution as its own specced algorithm
 - [ ] Nominal subtyping, interfaces, classes
 - [ ] GADT mode: per-case schemes, match refinement, existentials,
