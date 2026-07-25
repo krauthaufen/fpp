@@ -125,6 +125,10 @@ module Builtin =
 
     let path = "(builtin)"
 
+type ProjectResults =
+    { Files : Fpp.Prelude.Dict<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult>
+      Schemes : Fpp.Prelude.Dict<string, Analysis.Types.Scheme> }
+
 type Workspace() =
     let db = Db()
     do db.SetInput "project" "" (box ([] : string list))
@@ -153,7 +157,7 @@ type Workspace() =
 
     /// Whole-project resolution + inference in compile order. Exports and
     /// generalized schemes of earlier files flow into later ones.
-    member this.ProjectCheck () : Dict<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> =
+    member this.ProjectCheck () : ProjectResults =
         db.MemoT "projectCheck" "" (fun () ->
             let imports = dictNew<string, Analysis.Resolve.Definition> ()
             let schemes = dictNew<string, Analysis.Types.Scheme> ()
@@ -171,10 +175,10 @@ type Workspace() =
                 for full, d in b.Exports do dictSet imports full d
                 let inf = Analysis.Infer.infer path p.Root b schemes aliases fields
                 dictSet results path (b, inf)
-            results)
+            { Files = results; Schemes = schemes })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
-        match dictTryFind (this.ProjectCheck ()) path with
+        match dictTryFind (this.ProjectCheck ()).Files path with
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
@@ -200,9 +204,16 @@ type Workspace() =
             Outline.items starts r.Root.Children)
 
     member this.Resolve (path : string) : Analysis.Resolve.BindResult =
-        match dictTryFind (this.ProjectCheck ()) path with
+        match dictTryFind (this.ProjectCheck ()).Files path with
         | Some (b, _) -> b
         | None -> Analysis.Resolve.resolve path (dictNew ()) (this.ParseFile path).Root
+
+    /// Lower a file to typed core (Stage 3). Runs on top of the project check.
+    member this.LowerFile (path : string) : Core.Ir.LowerResult =
+        let r = this.ProjectCheck ()
+        match dictTryFind r.Files path with
+        | Some (b, _) -> Core.Lower.lower path (this.ParseFile path).Root b r.Schemes
+        | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.
     member this.DefinitionAt (path : string) (offset : int) : Analysis.Resolve.Definition option =

@@ -345,6 +345,10 @@ let parse (src : string) : ParseResult =
                 let mutable go = canStartAtomPat ()
                 while go do
                     vecAdd acc (parseAsSuffix (parseConsPat ctx))
+                    // parenthesized or-pattern: ("&&" | "||")
+                    while s.IsOp "|" && not s.AtEof do
+                        vecAdd acc (s.Bump ())
+                        vecAdd acc (parseConsPat ctx)
                     if s.IsOp ":" then
                         vecAdd acc (s.Bump ())
                         vecAdd acc (parseType ctx)

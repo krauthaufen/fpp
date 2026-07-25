@@ -15,6 +15,9 @@
     <Compile Include="Analysis/Resolve.fs" />
     <Compile Include="Analysis/Types.fs" />
     <Compile Include="Analysis/Infer.fs" />
+    <Compile Include="Core/Core.fs" />
+    <Compile Include="Core/Lower.fs" />
+    <Compile Include="Core/Lint.fs" />
     <Compile Include="Query.fs" />
     <Compile Include="Workspace.fs" />
   </ItemGroup>

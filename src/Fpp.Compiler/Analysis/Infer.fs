@@ -293,6 +293,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          unify ty (typeFromNode pvars a) |> ignore
                          vecAdd items ty
                          walk rest2
+                     | GToken b :: _ when b.Kind = Operator && b.Text = "|" ->
+                         // or-alternatives: all unify, one item
+                         let rec ors (ks2 : Green list) =
+                             match ks2 with
+                             | GToken b2 :: GNode alt :: rest3 when b2.Kind = Operator && b2.Text = "|" && isPatKind alt.NodeKind ->
+                                 unify (patType pvars alt) ty |> ignore
+                                 ors rest3
+                             | _ -> ks2
+                         let rest2 = ors rest
+                         vecAdd items ty
+                         walk rest2
                      | _ ->
                          vecAdd items ty
                          walk rest)

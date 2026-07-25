@@ -1,0 +1,114 @@
+module Fpp.Core.Ir
+
+open Fpp.Analysis.Types
+
+// The typed core: a small, explicit IR in the spirit of GHC Core. Every
+// binder carries its inferred scheme; constructors carry theirs. Surface
+// sugar (pipelines, blocks, offside) is gone. Emission consumes this and
+// nothing else; the linter re-typechecks it after every pass.
+
+type VarId =
+    { Path : string
+      Offset : int
+      Name : string }
+
+type Lit =
+    | LInt of string
+    | LFloat of string
+    | LString of string
+    | LChar of string
+    | LBool of bool
+    | LUnit
+
+type Pat =
+    | PWild
+    | PLit of Lit
+    | PVar of VarId * Scheme
+    | PCtor of string * Scheme * Pat list
+    | PTuple of Pat list
+    | PCons of Pat * Pat
+    | PListLit of Pat list
+    | PAs of Pat * VarId * Scheme
+    | POr of Pat list
+
+type Expr =
+    | ELit of Lit
+    | EVar of VarId * Scheme
+    /// A name the project does not define (BCL etc.) — the emitter maps
+    /// known intrinsics and rejects the rest.
+    | EUnknown of string
+    | ELam of (VarId * Scheme) list * Expr
+    | EApp of Expr * Expr list
+    | ELet of bool * VarId * Scheme * Expr * Expr
+    | EIf of Expr * Expr * Expr
+    | EMatch of Expr * (Pat * Expr option * Expr) list
+    | ETuple of Expr list
+    | EListLit of Expr list
+    | ECtor of string * Scheme * Expr list
+    | ERecord of string * (string * Expr) list
+    | EField of Expr * string
+    | EPrim of string * Expr list
+    | ESeq of Expr list
+
+type Decl =
+    | DLet of bool * VarId * Scheme * Expr
+    | DUnion of string * string list * (string * int) list
+    | DRecord of string * string list * string list
+
+type LowerResult =
+    { Decls : Decl list
+      /// (offset, reason) — constructs outside the v1 emission subset
+      Notes : (int * string) list }
+
+/// Compact printer for debugging and snapshot tests.
+let rec printExpr (e : Expr) : string =
+    let pv (v : VarId, _ : Scheme) = v.Name
+    match e with
+    | ELit (LInt s) -> s
+    | ELit (LFloat s) -> s
+    | ELit (LString s) -> s
+    | ELit (LChar s) -> s
+    | ELit (LBool b) -> if b then "true" else "false"
+    | ELit LUnit -> "()"
+    | EVar (v, _) -> v.Name
+    | EUnknown n -> "?" + n
+    | ELam (ps, b) -> "(λ" + String.concat " " (List.map pv ps) + ". " + printExpr b + ")"
+    | EApp (f, args) -> "(" + String.concat " " (List.map printExpr (f :: args)) + ")"
+    | ELet (r, v, _, rhs, body) ->
+        "(let" + (if r then " rec " else " ") + v.Name + " = " + printExpr rhs + " in " + printExpr body + ")"
+    | EIf (c, t, f) -> "(if " + printExpr c + " then " + printExpr t + " else " + printExpr f + ")"
+    | EMatch (s, cases) ->
+        let pc (p, _, b) = printPat p + " -> " + printExpr b
+        "(match " + printExpr s + " with " + String.concat " | " (List.map pc cases) + ")"
+    | ETuple xs -> "(" + String.concat ", " (List.map printExpr xs) + ")"
+    | EListLit xs -> "[" + String.concat "; " (List.map printExpr xs) + "]"
+    | ECtor (n, _, args) ->
+        if List.isEmpty args then n else "(" + n + " " + String.concat " " (List.map printExpr args) + ")"
+    | ERecord (n, fs) ->
+        "{" + n + "| " + String.concat "; " (fs |> List.map (fun (f, v) -> f + " = " + printExpr v)) + "}"
+    | EField (r, f) -> printExpr r + "." + f
+    | EPrim (op, args) -> "(" + op + " " + String.concat " " (List.map printExpr args) + ")"
+    | ESeq xs -> "(seq " + String.concat "; " (List.map printExpr xs) + ")"
+
+and printPat (p : Pat) : string =
+    match p with
+    | PWild -> "_"
+    | PLit l -> printExpr (ELit l)
+    | PVar (v, _) -> v.Name
+    | PCtor (n, _, args) ->
+        if List.isEmpty args then n else "(" + n + " " + String.concat " " (List.map printPat args) + ")"
+    | PTuple ps -> "(" + String.concat ", " (List.map printPat ps) + ")"
+    | PCons (h, t) -> "(" + printPat h + " :: " + printPat t + ")"
+    | PListLit ps -> "[" + String.concat "; " (List.map printPat ps) + "]"
+    | PAs (p, v, _) -> "(" + printPat p + " as " + v.Name + ")"
+    | POr ps -> "(" + String.concat " | " (List.map printPat ps) + ")"
+
+let printDecl (d : Decl) : string =
+    match d with
+    | DLet (r, v, _, e) -> "let" + (if r then " rec " else " ") + v.Name + " = " + printExpr e
+    | DUnion (n, ps, cases) ->
+        "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
+        + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
+    | DRecord (n, ps, fs) ->
+        "record " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
+        + " = {" + String.concat "; " fs + "}"

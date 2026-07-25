@@ -54,11 +54,18 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - Exit: compiler's own source (common subset) typechecks
 
 ## Stage 3 — Typed core
-- [ ] Small typed core IR: explicit dictionaries, explicit GADT coercions,
-      kinds
-- [ ] Elaboration surface → core
-- [ ] Core linter (re-typecheck after every pass), on in CI always
-- Exit: every green Stage-2 test elaborates to lint-clean core
+- [x] Small typed core IR (`Core/Core.fs`) — binders/ctors carry schemes;
+      dictionaries and GADT coercions arrive with the typeclass layer
+- [x] Elaboration surface → core (`Core/Lower.fs`) for the v1 emission
+      subset (functional core + records/DUs); out-of-subset constructs
+      produce notes, never failures
+- [x] Core linter (`Core/Lint.fs`): independent re-typecheck; gate:
+      lint-clean on all sample programs AND on everything lowered from the
+      compiler's own sources
+- [x] REPRESENTATION.md: boxed/unboxed, structs, arrays, generics — the
+      uniform-slot baseline + specialization plan (user requirement)
+- Exit: REACHED — sample programs lower 100% note-free and lint-clean;
+  next stop is the wasm-GC emitter consuming Core.Ir
 
 ## Stage 4 — First backend: wasm-GC
 - [ ] Core → wasm-GC lowering (uniform boxed representation)
