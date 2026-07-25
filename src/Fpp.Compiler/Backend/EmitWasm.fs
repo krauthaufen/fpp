@@ -131,7 +131,8 @@ let emit (decls : Decl list) : EmitResult =
             vecAdd wrappers (fname, arity)
 
     let boolWat (w : string) = "(ref.i31 " + w + ")"
-    let unwrapI32 (w : string) = "(i31.get_s (ref.cast (ref i31) " + w + "))"
+    let unwrapI32 (w : string) = "(call $toi " + w + ")"
+    let intWat (w : string) = "(call $ofi " + w + ")"
 
     /// Compile one function body. `locals` maps (path,offset) to wasm local
     /// names; `extraLocals` collects locals to declare.
@@ -146,7 +147,7 @@ let emit (decls : Decl list) : EmitResult =
         | ELit (LInt s) ->
             let digits = s |> String.filter (fun c -> isDigit c || c = '-')
             let v = if digits = "" then 0 else int digits
-            "(ref.i31 (i32.const " + string v + "))"
+            "(call $ofi (i32.const " + string v + "))"
         | ELit (LBool b) -> "(ref.i31 (i32.const " + (if b then "1" else "0") + "))"
         | ELit LUnit -> "(ref.i31 (i32.const 0))"
         | ELit (LChar raw) -> "(ref.i31 (i32.const " + string (charCode raw) + "))"
@@ -217,11 +218,11 @@ let emit (decls : Decl list) : EmitResult =
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)
             (match op with
-             | "+" -> boolWat ("(i32.add " + ia () + " " + ib () + ")")
-             | "-" -> boolWat ("(i32.sub " + ia () + " " + ib () + ")")
-             | "*" -> boolWat ("(i32.mul " + ia () + " " + ib () + ")")
-             | "/" -> boolWat ("(i32.div_s " + ia () + " " + ib () + ")")
-             | "%" -> boolWat ("(i32.rem_s " + ia () + " " + ib () + ")")
+             | "+" -> intWat ("(i32.add " + ia () + " " + ib () + ")")
+             | "-" -> intWat ("(i32.sub " + ia () + " " + ib () + ")")
+             | "*" -> intWat ("(i32.mul " + ia () + " " + ib () + ")")
+             | "/" -> intWat ("(i32.div_s " + ia () + " " + ib () + ")")
+             | "%" -> intWat ("(i32.rem_s " + ia () + " " + ib () + ")")
              | "<" -> boolWat ("(i32.lt_s " + ia () + " " + ib () + ")")
              | ">" -> boolWat ("(i32.gt_s " + ia () + " " + ib () + ")")
              | "<=" -> boolWat ("(i32.le_s " + ia () + " " + ib () + ")")
@@ -236,7 +237,7 @@ let emit (decls : Decl list) : EmitResult =
                  vecAdd errors ("unsupported operator " + op)
                  "(ref.i31 (i32.const 0))")
         | EPrim ("unot", [ a ]) -> boolWat ("(i32.eqz " + unwrapI32 (recur a) + ")")
-        | EPrim ("u-", [ a ]) -> boolWat ("(i32.sub (i32.const 0) " + unwrapI32 (recur a) + ")")
+        | EPrim ("u-", [ a ]) -> intWat ("(i32.sub (i32.const 0) " + unwrapI32 (recur a) + ")")
         | EPrim (op, _) ->
             vecAdd errors ("unsupported operator " + op)
             "(ref.i31 (i32.const 0))"
@@ -337,7 +338,7 @@ let emit (decls : Decl list) : EmitResult =
         | PLit (LInt s) ->
             let digits = s |> String.filter (fun c -> isDigit c || c = '-')
             let n = if digits = "" then 0 else int digits
-            app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref i31) " + v + ")))")
+            app ("(br_if " + failLbl + " (i32.eqz (i32.or (ref.test (ref i31) " + v + ") (ref.test (ref $boxi) " + v + "))))")
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + string n + ") " + unwrapI32 v + "))")
         | PLit (LBool b) ->
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + (if b then "1" else "0") + ") " + unwrapI32 v + "))")
@@ -447,6 +448,7 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $cons (struct (field anyref) (field anyref)))"
     line "  (type $str (array (mut i8)))"
     line "  (type $boxf (struct (field f64)))"
+    line "  (type $boxi (struct (field i32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
     line "  (memory (export \"memory\") 1)"
 
@@ -495,6 +497,8 @@ let emit (decls : Decl list) : EmitResult =
       (then (call $printi (i31.get_s (ref.cast (ref i31) (local.get $v)))) (return)))
     (if (ref.test (ref $str) (local.get $v))
       (then (call $prints (ref.cast (ref $str) (local.get $v))) (return)))
+    (if (ref.test (ref $boxi) (local.get $v))
+      (then (call $printi (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v)))) (return)))
     (if (ref.test (ref $boxf) (local.get $v))
       (then (call $printi (i32.trunc_f64_s (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v))))) (return)))
     (call $putc (i32.const 63)))
@@ -516,6 +520,9 @@ let emit (decls : Decl list) : EmitResult =
             (local.set $i (i32.add (local.get $i) (i32.const 1)))
             (br $go)))
         (return (ref.i31 (i32.const 1)))))
+    (if (i32.and (ref.test (ref $boxi) (local.get $a)) (ref.test (ref $boxi) (local.get $b)))
+      (then (return (ref.i31 (i32.eq (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $a)))
+                                     (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $b))))))))
     (if (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
       (then (return (ref.i31 (i32.const 1)))))
     (if (i32.and (ref.test (ref $cons) (local.get $a)) (ref.test (ref $cons) (local.get $b)))
@@ -534,6 +541,14 @@ let emit (decls : Decl list) : EmitResult =
         (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
         (call $append (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a))) (local.get $b))))
       (else (local.get $b))))
+  (func $ofi (param $n i32) (result anyref)
+    (if (result anyref) (i32.eq (local.get $n) (i32.shr_s (i32.shl (local.get $n) (i32.const 1)) (i32.const 1)))
+      (then (ref.i31 (local.get $n)))
+      (else (struct.new $boxi (local.get $n)))))
+  (func $toi (param $v anyref) (result i32)
+    (if (result i32) (ref.test (ref i31) (local.get $v))
+      (then (i31.get_s (ref.cast (ref i31) (local.get $v))))
+      (else (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v))))))
   (func $applyc (param $f anyref) (param $a anyref) (result anyref)
     (call_ref $u1 (local.get $a)
       (struct.get $clo 1 (ref.cast (ref $clo) (local.get $f)))

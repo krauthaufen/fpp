@@ -77,8 +77,12 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - [x] `fpp build -o out.wat` CLI; end-to-end tests run wasmtime and assert
       stdout (hello/factorial, DUs+closures+records+lists+equality,
       guards/tuples/negatives)
-- [ ] Oracle harness: dotnet vs F++ differential tests
-- [ ] int32 box-spill (currently i31-only), tail calls, inner let rec
+- [x] Oracle harness ACTIVE: programs run under dotnet fsi AND fpp+wasmtime,
+      outputs diffed byte-exact — first catch: i31 overflow on fact 13,
+      fixed by the box-spill
+- [x] int32 box-spill ($ofi/$toi, normalize-on-box; full int32 wraparound
+      semantics verified by the oracle)
+- [ ] tail calls, inner let rec, more oracle programs
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
