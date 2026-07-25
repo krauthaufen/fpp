@@ -44,6 +44,11 @@ let emit (decls : Decl list) : EmitResult =
     let topArity = dictNew<string * int, int> ()   // (path,offset) -> arity of top-level fn
     let topName = dictNew<string * int, string> ()
     let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+    let externs = dictNew<string * int, int> ()   // key -> arity
+    let rec arrowArity (t : Fpp.Analysis.Types.Type) : int =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TFun (_, b) -> 1 + arrowArity b
+        | _ -> 0
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) ->
@@ -51,6 +56,11 @@ let emit (decls : Decl list) : EmitResult =
             dictSet topName (v.Path, v.Offset) (mangle v)
         | DLet (_, v, _, _) ->
             dictSet topName (v.Path, v.Offset) (mangle v)
+        | DExtern (v, sch) ->
+            let ar = arrowArity sch.Body
+            dictSet topArity (v.Path, v.Offset) ar
+            dictSet topName (v.Path, v.Offset) (mangle v)
+            dictSet externs (v.Path, v.Offset) ar
         | _ -> ()
 
     // tuple arities used anywhere
@@ -191,6 +201,11 @@ let emit (decls : Decl list) : EmitResult =
         | EApp (EVar (v, _), args) when (dictTryFind topArity (v.Path, v.Offset)) = Some args.Length ->
             // known full-arity call: direct (tail position -> return_call)
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
+            if (dictTryFind externs (v.Path, v.Offset)).IsSome then
+                // C-ABI boundary: unwrap ints in, wrap the i32 result out
+                "(call $ofi (call " + fname + " "
+                + String.concat " " (args |> List.map (fun a -> unwrapI32 (recur a))) + "))"
+            else
             let op = if tail then "return_call" else "call"
             "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")"
         | EApp (f, args) ->
@@ -452,6 +467,13 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $boxf (struct (field f64)))"
     line "  (type $boxi (struct (field i32)))"
     line "  (import \"wasi_snapshot_preview1\" \"fd_write\" (func $fd_write (param i32 i32 i32 i32) (result i32)))"
+    for d in decls do
+        match d with
+        | DExtern (v, sch) ->
+            let ar = arrowArity sch.Body
+            let ps = List.replicate ar "(param i32)" |> String.concat " "
+            line ("  (import \"env\" \"" + v.Name + "\" (func " + mangle v + " " + ps + " (result i32)))")
+        | _ -> ()
     line "  (memory (export \"memory\") 1)"
 
     // program-declared types

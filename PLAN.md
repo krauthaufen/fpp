@@ -95,7 +95,10 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       demand-closure DCE at link DONE (Core/Link.fs). Open: tier-1
       instantiation stamping (needs per-use instantiation types recorded
       in Infer), symbol dedup across libs
-- [ ] C FFI (user vision: SEAMLESS — include a header / link a .so, done):
+- [~] C FFI (user vision: SEAMLESS — include a header / link a .so, done):
+      `extern let name : type` SHIPPED — typed foreign imports, i32 C-ABI
+      boundary wrapping, cross-module linking via wasmtime --preload
+      (the exact shape clang --target=wasm32 emits). Open:
       Zig-@cImport model — libclang-parsed headers materialize extern
       declarations at compile time (fits the plugin architecture: a
       binding generator IS a declaration-emitting plugin); C++ via

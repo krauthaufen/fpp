@@ -410,6 +410,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | GToken _ -> ()
         | GNode n ->
             match n.NodeKind with
+            | LetDecl when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "extern") ->
+                (match nodesOf n |> List.tryPick (fun m -> if m.NodeKind = IdentPat then tokensOf m |> List.tryFind (fun t -> t.Kind = Ident) else None) with
+                 | Some t ->
+                     (match dictTryFind defsAt t.Offset with
+                      | Some d -> vecAdd decls (DExtern (varIdOf d, schemeOf d))
+                      | None -> vecAdd notes (offsetOf n, "extern name unresolved"))
+                 | None -> vecAdd notes (offsetOf n, "extern shape"))
             | LetDecl ->
                 (match lowerLetParts n with
                  | Some (SimpleLet (isRec, v, sch, rhs, _)) -> vecAdd decls (DLet (isRec, v, sch, rhs))

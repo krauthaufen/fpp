@@ -57,4 +57,5 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
     |> List.filter (fun d ->
         match d with
         | DLet (_, v, _, ELam _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
+        | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | _ -> true)

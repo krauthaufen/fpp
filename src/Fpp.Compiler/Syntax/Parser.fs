@@ -131,6 +131,8 @@ let parse (src : string) : ParseResult =
 
     // `and` continues whatever major declaration came last (let rec vs type)
     let mutable lastMajor = "let"
+    // set while parsing `extern let ...` — suppresses the missing-'=' diag
+    let mutable pendingExtern = false
 
     let isLiteral () = List.contains s.Cur.Kind literalKinds
     let isLiteralKw () = s.IsKw "true" || s.IsKw "false" || s.IsKw "null"
@@ -151,6 +153,7 @@ let parse (src : string) : ParseResult =
     let canStartDecl () =
         s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
         || s.IsKw "namespace" || s.IsKw "and" || s.IsKw "do" || s.IsKw "exception"
+        || s.IsKw "extern"
         || canStartExpr ()
         || (s.Is LBracket)   // attribute lists
 
@@ -758,7 +761,8 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"
             else vecAdd acc (parseBlock letCol)
-        else s.Diag "expected '=' in binding"
+        elif not pendingExtern then s.Diag "expected '=' in binding"
+        pendingExtern <- false
         if s.IsKw "in" && s.SameLine then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseBlock letCol)
@@ -971,7 +975,14 @@ let parse (src : string) : ParseResult =
         Green.node OpenDecl (vecToList acc)
 
     and parseDecl (ctx : int) : Green =
-        if s.IsKw "module" || s.IsKw "namespace" then parseModule ctx
+        if s.IsKw "extern" then
+            // `extern let name : type` — a foreign import declaration
+            let ext = s.Bump ()
+            pendingExtern <- true
+            (match parseLet ctx with
+             | GNode n -> Green.node LetDecl (ext :: n.Children)
+             | t -> t)
+        elif s.IsKw "module" || s.IsKw "namespace" then parseModule ctx
         elif s.IsKw "open" then parseOpen ()
         elif s.IsKw "let" || s.IsKw "use" then parseLet ctx
         elif s.IsKw "and" then

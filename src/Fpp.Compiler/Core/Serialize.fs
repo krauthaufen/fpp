@@ -136,6 +136,7 @@ let rec private encExpr (e : Expr) : Sx =
 
 let private encDecl (d : Decl) : Sx =
     match d with
+    | DExtern (v, s) -> L [ A "de"; encVarId v; encScheme s ]
     | DLet (r, v, s, e) -> L [ A "dl"; A (if r then "1" else "0"); encVarId v; encScheme s; encExpr e ]
     | DUnion (n, ps, cs) ->
         L [ A "du"; S n; L (List.map S ps); L (cs |> List.map (fun (c, a) -> L [ S c; A (string a) ])) ]
@@ -241,6 +242,7 @@ let rec private decExpr (x : Sx) : Expr =
 
 let private decDecl (x : Sx) : Decl option =
     match x with
+    | L [ A "de"; v; s ] -> Some (DExtern (decVarId v, decScheme s))
     | L [ A "dl"; A r; v; s; e ] -> Some (DLet ((r = "1"), decVarId v, decScheme s, decExpr e))
     | L [ A "du"; S n; L ps; L cs ] ->
         Some (DUnion (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),

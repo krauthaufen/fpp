@@ -52,6 +52,8 @@ type Expr =
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
+    /// foreign import: name resolves in the host's "env" module
+    | DExtern of VarId * Scheme
     | DUnion of string * string list * (string * int) list
     | DRecord of string * string list * string list
 
@@ -105,6 +107,7 @@ and printPat (p : Pat) : string =
 
 let printDecl (d : Decl) : string =
     match d with
+    | DExtern (v, _) -> "extern " + v.Name
     | DLet (r, v, _, e) -> "let" + (if r then " rec " else " ") + v.Name + " = " + printExpr e
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
