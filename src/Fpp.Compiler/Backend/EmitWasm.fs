@@ -44,11 +44,25 @@ let emit (decls : Decl list) : EmitResult =
     let topArity = dictNew<string * int, int> ()   // (path,offset) -> arity of top-level fn
     let topName = dictNew<string * int, string> ()
     let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
-    let externs = dictNew<string * int, int> ()   // key -> arity
+    // extern signatures: param/result kinds derived from the scheme.
+    // "i" = int (i32 ABI, wrapped), "r" = reference/other (opaque anyref)
+    let externs = dictNew<string * int, string list * string> ()
     let rec arrowArity (t : Fpp.Analysis.Types.Type) : int =
         match Fpp.Analysis.Types.prune t with
         | Fpp.Analysis.Types.TFun (_, b) -> 1 + arrowArity b
         | _ -> 0
+    let abiKind (t : Fpp.Analysis.Types.Type) : string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TCon ("int", []) -> "i"
+        | Fpp.Analysis.Types.TCon ("bool", []) -> "i"
+        | Fpp.Analysis.Types.TCon ("char", []) -> "i"
+        | _ -> "r"
+    let rec abiSig (t : Fpp.Analysis.Types.Type) : string list * string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TFun (a, b) ->
+            let ps, r = abiSig b
+            abiKind a :: ps, r
+        | r -> [], abiKind r
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) ->
@@ -60,7 +74,7 @@ let emit (decls : Decl list) : EmitResult =
             let ar = arrowArity sch.Body
             dictSet topArity (v.Path, v.Offset) ar
             dictSet topName (v.Path, v.Offset) (mangle v)
-            dictSet externs (v.Path, v.Offset) ar
+            dictSet externs (v.Path, v.Offset) (abiSig sch.Body)
         | _ -> ()
 
     // tuple arities used anywhere
@@ -198,6 +212,10 @@ let emit (decls : Decl list) : EmitResult =
         | EUnknown n ->
             vecAdd errors ("unknown name reaches emission: " + n)
             "(ref.i31 (i32.const 0))"
+        | EApp (EField (EUnknown "Array", "create"), [ n; v ]) ->
+            "(array.new $arr " + recur v + " " + unwrapI32 (recur n) + ")"
+        | EApp (EField (EUnknown "Array", "length"), [ a ]) ->
+            "(call $lenv " + recur a + ")"
         | EApp (EUnknown "print", [ a ]) ->
             "(block (result anyref) (call $printval " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "ignore", [ a ]) ->
@@ -206,13 +224,17 @@ let emit (decls : Decl list) : EmitResult =
         | EApp (EVar (v, _), args) when (dictTryFind topArity (v.Path, v.Offset)) = Some args.Length ->
             // known full-arity call: direct (tail position -> return_call)
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
-            if (dictTryFind externs (v.Path, v.Offset)).IsSome then
-                // C-ABI boundary: unwrap ints in, wrap the i32 result out
-                "(call $ofi (call " + fname + " "
-                + String.concat " " (args |> List.map (fun a -> unwrapI32 (recur a))) + "))"
-            else
+            (match dictTryFind externs (v.Path, v.Offset) with
+             | Some (pks, rk) ->
+                 // FFI boundary: ints cross as i32, references pass opaque
+                 let wrapped =
+                     List.zip pks args
+                     |> List.map (fun (k, a) -> if k = "i" then unwrapI32 (recur a) else recur a)
+                 let call = "(call " + fname + " " + String.concat " " wrapped + ")"
+                 if rk = "i" then "(call $ofi " + call + ")" else call
+             | None ->
             let op = if tail then "return_call" else "call"
-            "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")"
+            "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")")
         | EApp (f, args) ->
             let mutable w = recur f
             for a in args do
@@ -504,9 +526,10 @@ let emit (decls : Decl list) : EmitResult =
     for d in decls do
         match d with
         | DExtern (v, sch) ->
-            let ar = arrowArity sch.Body
-            let ps = List.replicate ar "(param i32)" |> String.concat " "
-            line ("  (import \"env\" \"" + v.Name + "\" (func " + mangle v + " " + ps + " (result i32)))")
+            let pks, rk = abiSig sch.Body
+            let ps = pks |> List.map (fun k -> if k = "i" then "(param i32)" else "(param anyref)") |> String.concat " "
+            let rs = if rk = "i" then "(result i32)" else "(result anyref)"
+            line ("  (import \"env\" \"" + v.Name + "\" (func " + mangle v + " " + ps + " " + rs + "))")
         | _ -> ()
     line "  (memory (export \"memory\") 1)"
 
@@ -696,6 +719,16 @@ let emit (decls : Decl list) : EmitResult =
     vecToList strings
     |> List.iteri (fun i sdata ->
         line ("  (data $d" + string i + " \"" + hexEscape (System.Text.Encoding.UTF8.GetBytes sdata) + "\")"))
+
+    // string accessors for host glue (JS reads/builds $str through these)
+    line """  (func (export "str_len") (param $s anyref) (result i32)
+    (array.len (ref.cast (ref $str) (local.get $s))))
+  (func (export "str_get") (param $s anyref) (param $i i32) (result i32)
+    (array.get_u $str (ref.cast (ref $str) (local.get $s)) (local.get $i)))
+  (func (export "str_new") (param $n i32) (result anyref)
+    (array.new_default $str (local.get $n)))
+  (func (export "str_set") (param $s anyref) (param $i i32) (param $b i32)
+    (array.set $str (ref.cast (ref $str) (local.get $s)) (local.get $i) (local.get $b)))"""
 
     // declare every function that appears in ref.func
     let declared = vecNew<string> ()

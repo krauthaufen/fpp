@@ -1,47 +1,38 @@
 module Demo
 
-extern let jsRandom : int -> int
+extern let jsRect : int -> int -> int -> int
+extern let jsStatus : string -> int
 
-type Shape =
-    | Dot
-    | Box of int
+let width = 129
+let rows = 64
 
-let rec fib n =
-    if n <= 1 then n
-    else fib (n - 1) + fib (n - 2)
+let drawRow (y : int) (cells : int[]) =
+    let mutable x = 0
+    while x < width do
+        let d = if cells.[x] = 1 then jsRect x y 1 else 0
+        x <- x + 1
+    0
 
-let fizzbuzz n =
-    if n % 15 = 0 then "FizzBuzz"
-    elif n % 3 = 0 then "Fizz"
-    elif n % 5 = 0 then "Buzz"
-    else "" + "#"
+let stepRow (cur : int[]) =
+    let next = Array.create width 0
+    let mutable i = 1
+    while i < width - 1 do
+        let v = cur.[i - 1] + cur.[i + 1]
+        next.[i] <- (if v = 1 then 1 else 0)
+        i <- i + 1
+    next
 
-let describe s =
-    match s with
-    | Dot -> "a dot"
-    | Box n -> "a box of " + fizzbuzz n
+let runAutomaton () =
+    let start = Array.create width 0
+    let z = start.[width / 2] <- 1
+    let mutable cur = start
+    let mutable y = 0
+    while y < rows do
+        let d = drawRow y cur
+        cur <- stepRow cur
+        y <- y + 1
+    0
 
-let header = print "=== F++ in the browser (wasm-GC) ==="
-let f1 = print ("fib 25 = " + "")
-let f2 = print (fib 25)
-let shapes = [ Dot; Box 15; Box 9; Box 10; Box 7 ]
-let rec show xs =
-    match xs with
-    | h :: t ->
-        let x = print (describe h)
-        show t
-    | [] -> 0
-let s1 = show shapes
-let dice = print "three JS dice rolls:"
-let d1 = print (jsRandom 6 + 1)
-let d2 = print (jsRandom 6 + 1)
-let d3 = print (jsRandom 6 + 1)
-let arr = [| 3; 1; 4; 1; 5; 9; 2; 6 |]
-let sumIt =
-    let mutable s = 0
-    for i in 0 .. arr.Length - 1 do
-        s <- s + arr.[i]
-    s
-let s2 = print ("array sum = " + "")
-let s3 = print sumIt
-let bye = print "=== done ==="
+let hello = print "rule 90, computed by F++"
+let go = runAutomaton ()
+let s = jsStatus ("F++ -> JS string: " + "rendered " + "on canvas")
