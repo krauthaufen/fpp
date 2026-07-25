@@ -43,9 +43,17 @@ works on unboxed machine values and boxes only at uniform boundaries.
   heap block. First slot: vtable (see equality).
 - **DUs**: one abstract supertype per union; one struct subtype per case
   (wasm-GC subtyping does the case test via `ref.test`). Nullary cases are
-  preallocated singletons. Payload fields typed like record fields. GADT
-  cases: same layout — the refinement is a compile-time fact, the payload is
-  uniform wherever the per-case signature has variables.
+  preallocated singletons. Payload fields typed like record fields.
+- **GADT cases**: same layout. The refinement (`Expr<int>` vs `Expr<bool>`)
+  is compile-time knowledge — at runtime only the case tag exists. Concrete
+  payload positions (`Lit : int -> Expr<int>`) are unboxed like any field.
+  Uniformity is forced ONLY at type-variable positions reachable through
+  polymorphic recursion or existentials — the precise place where boxing
+  must exist in principle. Even there the tier-3 witness upgrade applies:
+  small structs inline in an opaque buffer (Swift existential-container
+  style), large ones spill — the eventual cost floor is a witness memcpy,
+  not an allocation. A GADT used at concrete instantiations without
+  polymorphic recursion is just a DU and specializes under tier 1.
 - **Tuples**: anonymous structs, same as records. Flattening into locals in
   monomorphic contexts is an optimization pass.
 
@@ -90,11 +98,16 @@ full monomorphization is impossible *in general* — but that only dictates
 the fallback tier, not the common case.
 
 - **Tier 1 — specialized per struct instantiation.** Library "objects" are
-  serialized typed Core IR (fat rlibs, Rust-style). The F++ link step —
-  which is ours and understands the type system — stamps needed
-  instantiations on demand and deduplicates them by mangled instantiation
-  identity (the COMDAT idea without the ELF archaeology). `Map<Vec2,_>`
-  gets real flat `Vec2` code.
+  serialized typed Core IR (fat rlibs, Rust-style): the generic's IR *is*
+  the template; instantiation = type substitution + ordinary code gen. The
+  F++ link step — ours, type-aware — computes the demand closure as a
+  fixpoint from the roots (stamping may transitively demand more),
+  deduplicates by mangled instantiation identity, and binds call sites,
+  vtable slots and dictionary entries to the stamped symbols. Demands flow
+  across library boundaries in both directions (library generic at an
+  app-defined struct works: layout travels with the type in IR). Libraries
+  may pre-stamp instances for their internal uses; the final link stamps
+  the rest. `Map<Vec2,_>` gets real flat `Vec2` code.
 - **Tier 2 — one shared body for ALL reference-type instantiations** (the
   .NET `__Canon` insight). References are uniform already; sharing kills
   the C++/Rust bloat problem for the majority of instantiations.
