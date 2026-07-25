@@ -247,6 +247,9 @@ let emit (decls : Decl list) : EmitResult =
             "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "length"), [ a ]) ->
             "(call $lenv " + recur a + ")"
+        | EApp (EUnknown "memStoreF32", [ a; v ]) ->
+            // raw linear-memory store: the zero-copy bridge to JS/WebGPU
+            "(block (result anyref) (f32.store (call $toi " + recur a + ") (f32.demote_f64 (call $tof " + recur v + "))) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "print", [ a ]) ->
             "(block (result anyref) (call $printval " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "ignore", [ a ]) ->
