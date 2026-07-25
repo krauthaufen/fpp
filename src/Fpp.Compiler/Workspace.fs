@@ -208,6 +208,35 @@ type Workspace() =
         | Some (b, _) -> b
         | None -> Analysis.Resolve.resolve path (dictNew ()) (this.ParseFile path).Root
 
+    /// Lower the whole project (builtin first, then files in compile order)
+    /// and emit a wasm module. Returns (wat, all errors incl. diagnostics).
+    member this.EmitProgram () : string * string list =
+        let r = this.ProjectCheck ()
+        let errs = vecNew<string> ()
+        let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
+        let lowerOne (path : string) (root : Syntax.GreenNode) =
+            match dictTryFind r.Files path with
+            | Some (b, _) ->
+                let low = Fpp.Core.Lower.lower path root b r.Schemes
+                for d in low.Decls do vecAdd allDecls d
+                for off, why in low.Notes do
+                    vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
+            | None -> ()
+        for path in this.ProjectFiles do
+            for d in this.Diagnostics path do
+                vecAdd errs (path + ":" + string (d.Line + 1) + ":" + string (d.Col + 1) + ": " + d.Message)
+        // builtin decls (Option etc.) come first
+        let bp = Parser.parse Builtin.source
+        let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes
+        for d in blow.Decls do vecAdd allDecls d
+        for path in this.ProjectFiles do
+            lowerOne path (this.ParseFile path).Root
+        if vecLen errs > 0 then "", vecToList errs
+        else
+            let res = Fpp.Backend.EmitWasm.emit (vecToList allDecls)
+            res.Wat, res.Errors
+
     /// Lower a file to typed core (Stage 3). Runs on top of the project check.
     member this.LowerFile (path : string) : Core.Ir.LowerResult =
         let r = this.ProjectCheck ()

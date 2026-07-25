@@ -17,10 +17,23 @@ let private check (files : string list) : int =
             printfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message
     if errors = 0 then 0 else 1
 
+let private build (out : string) (files : string list) : int =
+    let ws = Workspace()
+    for f in files do
+        ws.SetFileText f (System.IO.File.ReadAllText f)
+    let wat, errors = ws.EmitProgram ()
+    if not (List.isEmpty errors) then
+        for e in errors do eprintfn "error: %s" e
+        1
+    else
+        System.IO.File.WriteAllText(out, wat)
+        0
+
 [<EntryPoint>]
 let main argv =
     match List.ofArray argv with
     | "check" :: files when not (List.isEmpty files) -> check files
+    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build out files
     | _ ->
-        eprintfn "usage: fpp check <file>..."
+        eprintfn "usage: fpp check <file>... | fpp build -o out.wat <file>..."
         2

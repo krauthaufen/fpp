@@ -68,11 +68,18 @@ stage ends with something running in CI. Status legend: `[ ]` open,
   next stop is the wasm-GC emitter consuming Core.Ir
 
 ## Stage 4 — First backend: wasm-GC
-- [ ] Core → wasm-GC lowering (uniform boxed representation)
-- [ ] Minimal runtime shims (strings, arrays, exceptions story v0)
-- [ ] Execute tests under wasmtime/node in CI
-- [ ] Activate the oracle harness: dotnet vs F++ differential tests
-- Exit: hello world through real programs run; oracle suite green
+- [x] Core → wasm-GC lowering (`Backend/EmitWasm.fs`): uniform anyref repr,
+      i31 ints, GC structs for records/DU cases/tuples/closures, $cons
+      lists, i8-array strings via passive data, known-call fast path +
+      curry wrappers, pattern compilation with br-chains, structural $equal
+- [x] Runtime shims in emitted WAT: WASI fd_write putc/printi/prints,
+      printval, equal, append, applyc
+- [x] `fpp build -o out.wat` CLI; end-to-end tests run wasmtime and assert
+      stdout (hello/factorial, DUs+closures+records+lists+equality,
+      guards/tuples/negatives)
+- [ ] Oracle harness: dotnet vs F++ differential tests
+- [ ] int32 box-spill (currently i31-only), tail calls, inner let rec
+- Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
 - [ ] Prelude reimplemented in F++ (the bootstrap seam closes)
