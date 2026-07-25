@@ -25,7 +25,15 @@ works on unboxed machine values and boxes only at uniform boundaries.
   `i32` in known contexts. In a uniform slot: values fitting 31 bits go in
   `i31ref`, the rest box — normalize on boxing, so equality of the two forms
   never diverges. Native: 63-bit immediate with the same spill-box rule.
-- **int64 / float**: unboxed in known contexts; boxed in uniform slots.
+- **int64**: unboxed `i64` in known contexts (native wasm arithmetic, same
+  cost as int). Uniform slots: values fitting 31 bits ride `i31` (no
+  type-confusion risk — static typing means int and int64 never share a
+  polymorphic slot), the rest spill to `$boxl (struct i64)`, normalize-on-
+  box like `$ofi`. Native: 63-bit immediates make the spill nearly
+  extinct — better than OCaml's always-boxed Int64.
+  ⚠ CURRENT GAP: `42L` is silently computed in i32 — int64 is a queued
+  feature; until then the suffix is a trap the oracle would catch.
+- **float**: unboxed in known contexts; boxed in uniform slots.
   We do **not** repeat OCaml's magic float-array special case; float
   performance comes from specialization (below), not representation hacks.
 - **bool / char / unit**: immediates (i31 / tagged word). `char` is a
