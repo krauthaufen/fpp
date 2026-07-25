@@ -162,7 +162,20 @@ recursion), Zig/D (comptime). GADTs force polymorphic recursion on us, so
 full monomorphization is impossible *in general* — but that only dictates
 the fallback tier, not the common case.
 
-- **Struct-array layout (DECIDED, corrected — user requirement: real AoS)**:
+- **Struct-array layout (FINAL — GC-managed C-image AoS)**: default
+  arrays are ordinary GC values — no finalizers, no disposal, no arenas
+  (user requirement). Representation: the struct's exact C byte image
+  packed into a GC `(array (mut i64))` — C natural alignment guarantees no
+  field of size <=8 straddles an 8-byte word, so clang-exact offsets map
+  onto words: f64 via i64.reinterpret_f64, 4-byte fields sharing words via
+  shift/mask (all register ops; zero-alloc access preserved, ps.[i].X =
+  one array.get + reinterpret). FFI/JS/GPU boundary = straight block copy
+  into linear staging (the .NET blittable-marshalling model; the image is
+  already C-exact so the copy is a dumb word loop, never per-field). For
+  copy-intolerant hot paths, `Buffer<'T>` (linear memory, zero-copy,
+  explicit lifetime) is the OPT-IN — the special case, not the default.
+  (Superseded design below kept for the record:)
+- **Struct-array layout (superseded — linear-by-default)**:
   layout IS semantics at FFI boundaries; `V2d[]` must BE C layout. The
   emscripten model, adopted: **POD struct arrays live in LINEAR MEMORY,
   byte-exact C layout** — contiguous interleaved fields with C
