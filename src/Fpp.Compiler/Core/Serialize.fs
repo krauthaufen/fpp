@@ -133,6 +133,8 @@ let rec private encExpr (e : Expr) : Sx =
     | EField (r, f) -> L [ A "ef"; encExpr r; S f ]
     | EPrim (op, args) -> L (A "ep" :: S op :: List.map encExpr args)
     | ESeq xs -> L (A "es" :: List.map encExpr xs)
+    | EWhile (c, b) -> L [ A "ew"; encExpr c; encExpr b ]
+    | EAssign (v, e) -> L [ A "eg"; encVarId v; encExpr e ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -238,6 +240,8 @@ let rec private decExpr (x : Sx) : Expr =
     | L [ A "ef"; r; S f ] -> EField (decExpr r, f)
     | L (A "ep" :: S op :: args) -> EPrim (op, List.map decExpr args)
     | L (A "es" :: xs) -> ESeq (List.map decExpr xs)
+    | L [ A "ew"; c; b ] -> EWhile (decExpr c, decExpr b)
+    | L [ A "eg"; v; e ] -> EAssign (decVarId v, decExpr e)
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =

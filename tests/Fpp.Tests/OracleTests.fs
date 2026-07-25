@@ -77,6 +77,22 @@ let oracleTests =
             "    else loop (i - 1) (acc + 1)"
             "let a = print (loop 1000000 0)"
         ]
+        oracle "imperative: while, range-for, mutables" [
+            "let sumTo n ="
+            "    let mutable acc = 0"
+            "    let mutable i = 1"
+            "    while i <= n do"
+            "        acc <- acc + i"
+            "        i <- i + 1"
+            "    acc"
+            "let a = print (sumTo 100)"
+            "let countFor () ="
+            "    let mutable s = 0"
+            "    for i in 1 .. 10 do"
+            "        s <- s + i * i"
+            "    s"
+            "let b = print (countFor ())"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

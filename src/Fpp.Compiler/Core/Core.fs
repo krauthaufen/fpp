@@ -49,6 +49,8 @@ type Expr =
     | EField of Expr * string
     | EPrim of string * Expr list
     | ESeq of Expr list
+    | EWhile of Expr * Expr
+    | EAssign of VarId * Expr
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -91,6 +93,8 @@ let rec printExpr (e : Expr) : string =
     | EField (r, f) -> printExpr r + "." + f
     | EPrim (op, args) -> "(" + op + " " + String.concat " " (List.map printExpr args) + ")"
     | ESeq xs -> "(seq " + String.concat "; " (List.map printExpr xs) + ")"
+    | EWhile (c, b) -> "(while " + printExpr c + " do " + printExpr b + ")"
+    | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
 
 and printPat (p : Pat) : string =
     match p with

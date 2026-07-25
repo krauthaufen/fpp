@@ -170,6 +170,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind), tokensOf n with
                  | [ l; r ], [ op ] ->
                      (match op.Text with
+                      | "<-" ->
+                          (match lowerExpr (GNode l) with
+                           | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
+                           | _ -> note (offsetOf n) "assignment target")
                       | "|>" -> EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
                       | _ -> EPrim (op.Text, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
@@ -284,8 +288,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some d -> EVar (varIdOf d, schemeOf d)
                       | None -> EField (lowerExpr (GNode lhs), name.Text))
                  | _ -> note (offsetOf n) "dot shape")
-            | ForExpr -> note (offsetOf n) "for loop"
-            | WhileExpr -> note (offsetOf n) "while loop"
+            | ForExpr ->
+                // range-for: `for i in a .. b do body` — desugars to a while
+                let pats = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
+                let exprs = nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
+                (match pats, exprs with
+                 | [ ip ], [ range; body ] ->
+                     (match lowerPat ip, lowerExpr (GNode range) with
+                      | PVar (iv, isch), EPrim ("..", [ lo; hi ]) ->
+                          let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
+                          ELet (false, iv, isch, lo,
+                            ELet (false, hiV, isch, hi,
+                              EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
+                                ESeq [ lowerExpr (GNode body)
+                                       EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                      | _, _ -> note (offsetOf n) "for loop (non-range)")
+                 | _ -> note (offsetOf n) "for loop shape")
+            | WhileExpr ->
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ c; b ] -> EWhile (lowerExpr (GNode c), lowerExpr (GNode b))
+                 | _ -> note (offsetOf n) "while shape")
             | BraceExpr -> note (offsetOf n) "computation/sequence body"
             | ErrorNode -> note (offsetOf n) "error node"
             | _ -> note (offsetOf n) ("node " + string n.NodeKind)

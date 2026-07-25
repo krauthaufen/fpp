@@ -189,6 +189,15 @@ let lint (decls : Decl list) : string list =
             let mutable last = tUnit
             for x in xs do last <- exprType x
             last
+        | EWhile (c, b) ->
+            unifyC "while condition" (exprType c) tBool
+            exprType b |> ignore
+            tUnit
+        | EAssign (v, e) ->
+            (match dictTryFind env (keyOf v) with
+             | Some t -> unifyC ("assign " + v.Name) (exprType e) t
+             | None -> exprType e |> ignore)
+            tUnit
 
     for d in decls do
         match d with

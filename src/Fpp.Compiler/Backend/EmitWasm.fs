@@ -91,6 +91,8 @@ let emit (decls : Decl list) : EmitResult =
         | ECtor (_, _, xs) -> List.iter scanExpr xs
         | ERecord (_, fs) -> for _, v in fs do scanExpr v
         | EField (r, _) -> scanExpr r
+        | EWhile (c, b) -> scanExpr c; scanExpr b
+        | EAssign (_, e) -> scanExpr e
         | _ -> ()
     for d in decls do
         match d with
@@ -304,6 +306,20 @@ let emit (decls : Decl list) : EmitResult =
                  "(block (result anyref) "
                  + String.concat " " (List.rev init |> List.map (fun x -> "(drop " + recur x + ")"))
                  + " " + recurT last + ")")
+        | EWhile (c, b) ->
+            let lbl = newLocal "w"   // unique id (also declares a spare local)
+            "(block (result anyref) (block $brk" + lbl + " (loop $cont" + lbl + " "
+            + "(br_if $brk" + lbl + " (i32.eqz " + unwrapI32 (recur c) + ")) "
+            + "(drop " + recur b + ") (br $cont" + lbl + "))) (ref.i31 (i32.const 0)))"
+        | EAssign (v, e) ->
+            (match dictTryFind locals (v.Path, v.Offset) with
+             | Some l -> "(block (result anyref) (local.set " + l + " " + recur e + ") (ref.i31 (i32.const 0)))"
+             | None ->
+                 match dictTryFind topName (v.Path, v.Offset) with
+                 | Some g -> "(block (result anyref) (global.set " + g + " " + recur e + ") (ref.i31 (i32.const 0)))"
+                 | None ->
+                     vecAdd errors ("assignment to unknown " + v.Name)
+                     "(ref.i31 (i32.const 0))")
         | EMatch (scrut, cases) ->
             // expand or-patterns into separate cases
             let cases =
@@ -433,6 +449,8 @@ let emit (decls : Decl list) : EmitResult =
             | ECtor (_, _, xs) -> List.iter walk xs
             | ERecord (_, fs) -> for _, v in fs do walk v
             | EField (r, _) -> walk r
+            | EWhile (c, b) -> walk c; walk b
+            | EAssign (v, e) -> noteFree (v.Path, v.Offset); walk e
             | _ -> ()
         walk body
         let freeList = vecToList free
