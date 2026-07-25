@@ -122,6 +122,18 @@ deref + predicted branch per access; mitigations queued: loop-invariant
 storage hoisting (bodies without pin/unpin), pin-free call-tree
 specialization. This REPLACES the staging-copy plan — pin IS the staging.
 
+**Per-backend cost model (same API, same semantics everywhere):**
+- wasm: copy-pin as above (no addresses/pinning in wasm-GC — two copies
+  is the minimum toll for the missing capability).
+- native v1 (Boehm, non-moving): everything is pinned by construction —
+  pin = take address (the packed C image IS the memory, so ptr is directly
+  a C struct pointer), unpin = no-op, zero copies; the handle's two-state
+  branch compiles away.
+- native endgame (MMTk/Immix): pin = set pin bit (Immix skips pinned
+  lines when defragmenting), still zero copies, compacting throughput for
+  everything unpinned. Native takes on the GC engineering wasm gave us
+  free: Boehm = conservative stack scan; MMTk = stack maps + barriers.
+
 ## Linear-memory lifetimes (struct arrays / buffers)
 
 wasm-GC has NO finalizers and NO weak refs — the engine collects a
