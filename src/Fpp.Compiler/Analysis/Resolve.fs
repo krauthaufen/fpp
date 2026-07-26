@@ -420,7 +420,19 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode p when isTypeKind p.NodeKind -> walkType env c
             | _ -> ()
         let mutable inner = env
+        // `new(args) = ...` has no member name; its parameters and body are
+        // walked like any other member's
+        if n.Children |> List.exists (fun c -> match c with GToken t -> t.Kind = Keyword && t.Text = "new" | _ -> false) then
+            local (fun () ->
+                let mutable ctorEnv = env
+                for p in vecToList pats do ctorEnv <- bindPat DefParam ctorEnv p
+                for c in vecToList body do walkExpr ctorEnv c |> ignore)
+        // `val mutable X : T` declares a FIELD, so it must not enter the
+        // member namespace — `x.X` is a field read, not a call
+        let isValDecl =
+            n.Children |> List.exists (fun c -> match c with GToken t -> t.Kind = Keyword && t.Text = "val" | _ -> false)
         let declareMember (name : Token) =
+            if isValDecl then define DefField name |> ignore else
             let d = define DefMember name
             dictSet memberDefs (owner + "." + name.Text) d
             let prior = match dictTryFind membersByName name.Text with Some l -> l | None -> []

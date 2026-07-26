@@ -584,6 +584,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> note (offsetOf n) "interface call without a receiver")
             | DotExpr when
                 (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                 | Some t -> t.Text = "defaultof" && (dictTryFind useDefs t.Offset).IsNone
+                 | None -> false) ->
+                // the zero of whatever type the context resolved
+                let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
+                (match dictTryFind memberSites t.Offset with
+                 | Some "int" | Some "bool" | Some "char" | Some "uint32" -> ELit (LInt "0")
+                 | Some "int64" -> ELit (LInt "0L")
+                 | Some "float" -> ELit (LFloat "0.0")
+                 | Some "float32" -> ELit (LFloat "0.0f")
+                 | _ -> ELit LNull)
+            | DotExpr when
+                (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some t -> (memberAt t).IsSome
                  | None -> false) ->
                 // member access: inference bound it to one type's member, and
@@ -982,7 +994,34 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 tokensOf f
                 |> List.tryFind (fun t -> t.Kind = Ident)
                 |> Option.map (fun t -> t.Text, fieldKind f))
-        let memberNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+        let allMemberNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+        let isVal (m : GreenNode) =
+            tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val")
+        let isNewCtor (m : GreenNode) =
+            tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "new")
+        // `val mutable X : T` declares STORAGE, not a member
+        let valFields =
+            allMemberNodes
+            |> List.filter isVal
+            |> List.choose (fun m ->
+                match tokensOf m |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                | Some nameTok ->
+                    let tyName =
+                        match nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                        | Some tn when tn.NodeKind = VarType ->
+                            (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t -> "'" + t.Text
+                             | None -> "?")
+                        | Some tn ->
+                            (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t when List.contains t.Text tyParams -> "'" + t.Text
+                             | Some t -> t.Text
+                             | None -> "?")
+                        | None -> "?"
+                    Some (nameTok.Text, tyName)
+                | None -> None)
+        let newCtorNode = allMemberNodes |> List.tryFind isNewCtor
+        let memberNodes = allMemberNodes |> List.filter (fun m -> not (isVal m) && not (isNewCtor m))
         let ctorPat = nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind)
         // `inherit Base(args)`: the base contributes the object's prefix
         let inheritNode = nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl)
@@ -1016,7 +1055,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // a class is anything with instance storage or a constructor
         let isClass =
             not isInterface
-            && List.isEmpty cases && List.isEmpty recordFields
+            && List.isEmpty cases && List.isEmpty recordFields && List.isEmpty valFields
             && (ctorPat.IsSome || baseName.IsSome || not (List.isEmpty classLets) || not (List.isEmpty memberNodes))
 
         // ---- instance state --------------------------------------------
@@ -1062,6 +1101,31 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.filter (fun (v, _) ->
                 not (allFields |> List.exists (fun (w, _) -> w.Name = v.Name && w.Offset > v.Offset)))
 
+        if not (List.isEmpty valFields) then
+            // declared storage: the type IS these fields
+            if pendingStruct then vecAdd structNames name
+            vecAdd decls (DRecord (name, tyParams, valFields, pendingStruct))
+            (match newCtorNode, tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+             | Some nc, Some tyDef ->
+                 let ps = nodesOf nc |> List.filter (fun m -> isPatKind m.NodeKind)
+                 let bodies =
+                     nodesOf nc
+                     |> List.filter (fun m -> isExprish m.NodeKind)
+                 let body =
+                     match lowerBlock bodies with
+                     | ERecord (_, fs) -> ERecord (name, fs)
+                     | other -> other
+                 let rhs =
+                     match paramBinds ps with
+                     | binds, [] -> ELam (binds, body)
+                     | _, structured ->
+                         let arg = { Path = path; Offset = tyDef.Offset; Name = "_arg" }
+                         let asch = mono (TCon ("?", []))
+                         (match structured with
+                          | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
+                          | pps -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ])))
+                 vecAdd decls (DLet (false, varIdOf tyDef, schemeOf tyDef, rhs))
+             | _ -> ())
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)
             vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))

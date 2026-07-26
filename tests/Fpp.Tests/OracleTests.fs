@@ -664,6 +664,26 @@ let oracleTests =
             "let b = print (join d e)"
             "let c = print (areaOf d)"
         ]
+        oracle "val fields, explicit new constructors, Unchecked.defaultof" [
+            "[<AllowNullLiteral>]"
+            "type Node(v : int) ="
+            "    member _.V = v"
+            "[<Struct>]"
+            "type Cursor ="
+            "    val mutable Index : int"
+            "    val mutable Cur : Node"
+            "    val mutable Ratio : float"
+            "    new(i : int) ="
+            "        {"
+            "            Index = i"
+            "            Cur = Unchecked.defaultof<_>"
+            "            Ratio = Unchecked.defaultof<_>"
+            "        }"
+            "let c = Cursor(7)"
+            "let a = print c.Index"
+            "let b = print (if isNull c.Cur then \"no node\" else \"node\")"
+            "let d = print c.Ratio"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

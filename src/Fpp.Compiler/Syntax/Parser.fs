@@ -931,6 +931,18 @@ let parse (src : string) : ParseResult =
             // associated type: `static abstract type State`
             vecAdd acc (s.Bump ())
             if s.Is Ident then vecAdd acc (s.Bump ())
+        elif s.IsKw "new" then
+            // an explicit constructor: `new(args) = { Field = ... }`
+            vecAdd acc (s.Bump ())
+            while canStartAtomPat () && (s.SameLine || s.CurCol > mcol) do
+                vecAdd acc (parseAtomPat mcol)
+            if s.IsOp ":" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseType mcol)
+            if s.IsOp "=" then
+                vecAdd acc (s.Bump ())
+                if not (s.AtEof || (not s.SameLine && s.CurCol <= mcol)) then
+                    vecAdd acc (parseBlock mcol)
         else
             // [self .] name
             if s.Is Ident then

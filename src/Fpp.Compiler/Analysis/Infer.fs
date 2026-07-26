@@ -839,6 +839,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     lastIdent
                     |> Option.bind (fun t -> dictTryFind useDefs t.Offset)
                     |> Option.filter (fun d -> d.Kind <> Resolve.DefMember)
+                // `Unchecked.defaultof<_>`: the context decides the type, and
+                // the zero value depends on it
+                let isDefaultOf =
+                    match lastIdent with
+                    | Some t -> t.Text = "defaultof" && (dictTryFind useDefs t.Offset).IsNone
+                    | None -> false
+                if isDefaultOf then
+                    let result = st.Fresh ()
+                    (match lastIdent with
+                     | Some t -> vecAdd pendingCasts (t.Offset, result)
+                     | None -> ())
+                    result
+                else
                 // `C.M` where C names a type: a static member, so the owner
                 // is the type itself and there is no receiver to type
                 let staticOwner =
@@ -1167,6 +1180,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      recordDef t ctorTy
                  | _ -> ())
             | LetDecl -> inferLet m |> ignore
+            | MemberDecl when tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val") ->
+                // `val mutable X : T` is a field declaration
+                (match tokensOf m |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast,
+                       nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                 | Some nameTok, Some tyNode ->
+                     let ft = typeFromNode vars tyNode
+                     recordDef nameTok ft
+                     let info =
+                         { TypeName = name; Params = paramVarList (); Quantified = []
+                           FieldType = ft; DefKey = None; IsStatic = false }
+                     dictSet fields nameTok.Text info
+                     dictSet fields (name + "." + nameTok.Text) info
+                 | _ -> ())
+            | MemberDecl when tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "new") ->
+                // an explicit constructor determines how the type is built
+                let ps = nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind)
+                let argTy =
+                    match ps |> List.map (patType vars) with
+                    | [] -> tUnit
+                    | [ one ] -> one
+                    | many -> TTuple many
+                for b in nodesOf m do
+                    if isExprish b.NodeKind then exprType (GNode b) |> ignore
+                (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                 | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
+                     let ctorTy = TFun (argTy, selfTy)
+                     setScheme nameTok.Offset { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Body = ctorTy }
+                 | _ -> ())
             | MemberDecl -> inferMember name vars (paramVarList ()) selfTy m
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
