@@ -174,7 +174,13 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                         if t.StartsWith "#" then
                             match dictTryFind subst t with
                             | Some concrete -> concrete
-                            | None -> t
+                            | None ->
+                                // outside a template an unsubstituted var is
+                                // UNCONSTRAINED at this call: nothing observes
+                                // it, so it carries no layout requirement and
+                                // canonicalizes (this is not a deopt — there
+                                // is no representation to specialize for)
+                                if isTemplate then t else "obj"
                         else t)
                 let needsLayout = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
                 let cls =
@@ -222,7 +228,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
     for d in decls do
         match d with
         | DLet (rc, v, sch, e) ->
-            let isTemplate = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+            let isFunction = (match e with ELam _ -> true | _ -> false)
+            let isTemplate = isFunction && (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
             vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) isTemplate e))
         | other -> vecAdd out other
 

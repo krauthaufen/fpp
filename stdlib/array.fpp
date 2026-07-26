@@ -1,41 +1,41 @@
 module Stdlib
 
-// Array module (FSharp.Core surface), int/float flavours. Element types are
-// concrete because generic array access needs tier-1 specialization (the
-// compiler rejects reads whose element type is only known as 'a). Accumulator
-// types stay generic. Indexing/length go through the packed C-image arrays,
-// so loop bodies remain allocation-free.
+// Array module (FSharp.Core surface). Element types are GENERIC: tier-1
+// monomorphization stamps one specialized copy per element type, so int[],
+// float[], string[] and struct[] each get code matching their own
+// representation — nothing is shared that would need boxing. Allocating
+// operations keep int/float flavours only because they need a seed value.
 
 module Array =
-    let length (a : int[]) = a.Length
-    let get (a : int[]) (i : int) = a.[i]
-    let set (a : int[]) (i : int) (v : int) = a.[i] <- v
+    let length (a : 'a[]) = a.Length
+    let get (a : 'a[]) (i : int) = a.[i]
+    let set (a : 'a[]) (i : int) (v : 'a) = a.[i] <- v
 
-    let fold (f : 's -> int -> 's) (s0 : 's) (a : int[]) =
+    let fold (f : 's -> 'a -> 's) (s0 : 's) (a : 'a[]) =
         let mutable s = s0
         for x in a do
             s <- f s x
         s
 
-    let iter (f : int -> unit) (a : int[]) =
+    let iter (f : 'a -> unit) (a : 'a[]) =
         for x in a do
             f x
 
-    let exists (p : int -> bool) (a : int[]) =
+    let exists (p : 'a -> bool) (a : 'a[]) =
         let mutable r = false
         for x in a do
             if p x then r <- true
         r
 
-    let forall (p : int -> bool) (a : int[]) =
+    let forall (p : 'a -> bool) (a : 'a[]) =
         let mutable r = true
         for x in a do
             if p x then r <- r else r <- false
         r
 
-    let contains (v : int) (a : int[]) = exists (fun x -> x = v) a
+    let contains (v : 'a) (a : 'a[]) = exists (fun x -> x = v) a
 
-    let tryFind (p : int -> bool) (a : int[]) =
+    let tryFind (p : 'a -> bool) (a : 'a[]) =
         let mutable r = None
         let mutable i = a.Length - 1
         while i >= 0 do
@@ -43,7 +43,7 @@ module Array =
             i <- i - 1
         r
 
-    let tryFindIndex (p : int -> bool) (a : int[]) =
+    let tryFindIndex (p : 'a -> bool) (a : 'a[]) =
         let mutable r = None
         let mutable i = a.Length - 1
         while i >= 0 do
@@ -51,7 +51,7 @@ module Array =
             i <- i - 1
         r
 
-    let toList (a : int[]) =
+    let toList (a : 'a[]) =
         let mutable acc = []
         let mutable i = a.Length - 1
         while i >= 0 do
@@ -59,7 +59,7 @@ module Array =
             i <- i - 1
         acc
 
-    let isEmpty (a : int[]) = a.Length = 0
+    let isEmpty (a : 'a[]) = a.Length = 0
 
     let sum (a : int[]) = fold (fun s x -> s + x) 0 a
     let foldF (f : 's -> float -> 's) (s0 : 's) (a : float[]) =
