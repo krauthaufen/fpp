@@ -64,8 +64,19 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       inheritance, `AbstractClass`.
 
 ### Measured against the acceptance target
-Running the real `HashCollections.fs` (4500 lines) through the front end,
-the remaining blockers in source order are:
+Running the real `HashCollections.fs` (4500 lines) through the front end:
+its first 183 lines — the hash-mixing helpers and the whole node class
+hierarchy (SetLinked, MapLinked, SetNode, SetLeaf, MapLeaf, Inner, with
+generic inheritance, property accessors, packed uint32 tag bits and the
+NodeKind enum) — now parse and typecheck with zero diagnostics. The first
+error was line 24 before this work.
+Remaining blockers, in source order from line 184:
+- [ ] `IEqualityComparer<'K>` and the other BCL interfaces: need F++
+      counterparts (GetHashCode/Equals/reference equality)
+- [ ] struct tuples: `let struct(ok, node) = ...`
+- [ ] `isNull` / null-as-empty (`AllowNullLiteral`): empty case as
+      `ref.null`, test as `ref.is_null`
+Earlier items, now done:
 - [x] `uint32`: literals (`1u`, `0xABCDu`), the type, unsigned ops
       (`/ % < > <= >= >>>` emit `i32.*_u`), `int`/`uint32` conversions as
       bit-preserving primitives, unsigned printing. Same i32 payload as
