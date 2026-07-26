@@ -139,6 +139,35 @@ type Workspace() =
     let db = Db()
     do db.SetInput "project" "" (box ([] : string list))
     do db.SetInput "libs" "" (box ([] : (string * string) list))
+    let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
+    let pluginErrors = vecNew<string> ()
+
+    /// Register a compiler plugin (project config, never source annotations).
+    member _.AddPlugin (p : Fpp.Core.Plugins.Plugin) : unit = vecAdd plugins p
+    member _.PluginErrors : string list = vecToList pluginErrors
+
+    /// Run the per-file plugin pipeline, linting after each stage.
+    member private _.RunPerFile (decls : Fpp.Core.Ir.Decl list) : Fpp.Core.Ir.Decl list =
+        let mutable cur = decls
+        for p in vecToList plugins do
+            let out = p.PerFile cur
+            match Fpp.Core.Lint.lint out with
+            | [] -> cur <- out
+            | errs ->
+                for e in errs |> List.truncate 3 do
+                    vecAdd pluginErrors ("plugin '" + p.Name + "' produced invalid core: " + e)
+        cur
+
+    member private _.RunWholeProgram (decls : Fpp.Core.Ir.Decl list) : Fpp.Core.Ir.Decl list =
+        let mutable cur = decls
+        for p in vecToList plugins do
+            let out = p.WholeProgram cur
+            match Fpp.Core.Lint.lint out with
+            | [] -> cur <- out
+            | errs ->
+                for e in errs |> List.truncate 3 do
+                    vecAdd pluginErrors ("plugin '" + p.Name + "' (whole-program) produced invalid core: " + e)
+        cur
 
     /// Register a fat-IR library (.fppir contents) for linking.
     member this.AddLibrary (name : string) (text : string) : unit =
@@ -242,7 +271,7 @@ type Workspace() =
                 let ak = dictNew<int, string> ()
                 for off, k in inf.ArrKinds do dictSet ak off k
                 let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak
-                for d in low.Decls do vecAdd allDecls d
+                for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
             | None -> ()
@@ -261,9 +290,10 @@ type Workspace() =
         for _, text in this.Libraries do
             let _, _, ds = Fpp.Core.Serialize.decodeLib text
             for d in ds do vecAdd libDecls d
+        for pe in this.PluginErrors do vecAdd errs pe
         if vecLen errs > 0 then "", vecToList errs
         else
-            let program = vecToList libDecls @ vecToList allDecls
+            let program = this.RunWholeProgram (vecToList libDecls @ vecToList allDecls)
             let linked = Fpp.Core.Link.deadCodeEliminate program
             let res = Fpp.Backend.EmitWasm.emit linked
             res.Wat, res.Errors
@@ -290,6 +320,7 @@ type Workspace() =
         let schemes =
             dictPairs r.Schemes
             |> List.filter (fun (k, _) -> not (k.StartsWith "(builtin)"))
+        for pe in this.PluginErrors do vecAdd errs pe
         if vecLen errs > 0 then "", vecToList errs
         else Fpp.Core.Serialize.encodeLib (vecToList exports) schemes (vecToList decls), []
 

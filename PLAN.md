@@ -117,6 +117,18 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       wasm: host imports; native: direct C ABI, blittable structs
 - Exit: hello world through real programs run — REACHED
 
+## Stage 4.9 — Compiler plugins (TAST -> TAST)
+- [x] `Core/Plugins.fs`: `Plugin = { Name; PerFile : Decl list -> Decl list;
+      WholeProgram : Decl list -> Decl list }`, registered in project config
+      (NO source annotations), run in order after lowering / at link
+- [x] Core linter validates every plugin's output — a broken plugin is a
+      compiler error naming it, never a miscompilation
+- [x] Shipped plugins: `constFold` (TAST rewrite) and `deriveShallowEquals`
+      (emits per-type shallow equality for every record; DCE drops unused,
+      which is what makes annotation-free derivation free)
+- [ ] Load third-party plugins from assemblies/config; expression-level
+      plugin blocks (`myplugin { ... }`) consuming the lossless token span
+
 ## Stage 5 — Stdlib & dogfood
 - [~] `stdlib/check.fpp`: **Check** — property/fuzzing library in F++
       (seed-threaded generators: int/bool/elem/list/pair; `forAll` runner
