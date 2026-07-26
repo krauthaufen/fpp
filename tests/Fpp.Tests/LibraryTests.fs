@@ -50,6 +50,9 @@ let stdlibTests =
         test "List module (F++ source) matches F#" {
             oracleFile "stdlib/list.fpp" "module Stdlib"
         }
+        test "Map/Set modules (patricia trie, F++ source) match F#" {
+            oracleFile "stdlib/map.fpp" "module Stdlib"
+        }
     ]
 
 [<Tests>]

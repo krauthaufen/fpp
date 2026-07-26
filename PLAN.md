@@ -118,6 +118,9 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
+- [~] `stdlib/map.fpp`: Map + Set modules in F++ over the patricia trie
+      (add/remove/tryFind/containsKey/fold/toList/ofList; Set union), all
+      oracle-verified against F#
 - [~] `stdlib/list.fpp`: List module written IN F++ (length/rev/map/filter/
       fold/sum/exists/tryFind/append/init), oracle-verified against F#
 - [ ] Prelude reimplemented in F++ (the bootstrap seam closes)
