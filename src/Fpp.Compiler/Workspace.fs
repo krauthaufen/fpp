@@ -133,7 +133,9 @@ module Builtin =
 
 type ProjectResults =
     { Files : Fpp.Prelude.Dict<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult>
-      Schemes : Fpp.Prelude.Dict<string, Analysis.Types.Scheme> }
+      Schemes : Fpp.Prelude.Dict<string, Analysis.Types.Scheme>
+      /// interface name -> its methods as (name, arity), project-wide
+      Interfaces : Fpp.Prelude.Dict<string, (string * int) list> }
 
 type Workspace() =
     let db = Db()
@@ -207,12 +209,13 @@ type Workspace() =
             let schemes = dictNew<string, Analysis.Types.Scheme> ()
             let aliases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
             let fields = dictNew<string, Analysis.Infer.FieldInfo> ()
+            let ifaces = dictNew<string, (string * int) list> ()
             let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
             // the builtin prelude seeds imports and schemes for every file
             let bp = Parser.parse Builtin.source
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
-            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields |> ignore
+            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces |> ignore
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
@@ -222,16 +225,23 @@ type Workspace() =
                 let p = this.ParseFile path
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces
                 dictSet results path (b, inf)
-            { Files = results; Schemes = schemes })
+            // libraries declare their interfaces in their serialized core
+            for _, text in this.Libraries do
+                let _, _, ds = Fpp.Core.Serialize.decodeLib text
+                for d in ds do
+                    match d with
+                    | Fpp.Core.Ir.DInterface (n, ms) -> dictSet ifaces n ms
+                    | _ -> ()
+            { Files = results; Schemes = schemes; Interfaces = ifaces })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
-                (dictNew ()) (dictNew ()) (dictNew ())
+                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
@@ -274,7 +284,7 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms r.Interfaces
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -285,7 +295,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Interfaces
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -334,7 +344,7 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -357,7 +367,7 @@ type Workspace() =
             for off, i in inf.InstSites do dictSet ik off i
             let ms = dictNew<int, string> ()
             for off, o in inf.MemberSites do dictSet ms off o
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

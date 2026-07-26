@@ -167,7 +167,15 @@ let parse (src : string) : ParseResult =
     let isCloser () = s.Is RParen || s.Is RBracket || s.Is RBrace || s.Is Comma || s.Is Semicolon
 
     /// A new line has begun and the current token sits at or left of `col`.
-    let offside (col : int) = not s.SameLine && s.CurCol <= col
+    // Inside brackets the offside rule is suspended: the closing bracket
+    // delimits the group, so a continuation line may sit at any column.
+    let mutable bracketDepth = 0
+    let inBrackets (f : unit -> Green) : Green =
+        bracketDepth <- bracketDepth + 1
+        let r = f ()
+        bracketDepth <- bracketDepth - 1
+        r
+    let offside (col : int) = bracketDepth = 0 && not s.SameLine && s.CurCol <= col
 
     // ---- error recovery ---------------------------------------------------
 
@@ -397,8 +405,12 @@ let parse (src : string) : ParseResult =
         let mutable go = true
         while go do
             // operators may sit at exactly the block column on a fresh line
-            let allowed = s.SameLine || s.CurCol >= ctx
-            if s.Is Operator && allowed && not (s.IsOp "|") && not (s.IsOp "->") then
+            let allowed = s.SameLine || s.CurCol >= ctx || bracketDepth > 0
+            if (s.IsOp ":>" || s.IsOp ":?>") && allowed then
+                // a cast's right operand is a TYPE, not an expression
+                let op = s.Bump ()
+                lhs <- Green.node CastExpr [ lhs; op; parseType ctx ]
+            elif s.Is Operator && allowed && not (s.IsOp "|") && not (s.IsOp "->") then
                 let prec = infixPrec s.Cur.Text
                 if prec >= minPrec && prec > 0 then
                     let opText = s.Cur.Text
@@ -497,7 +509,7 @@ let parse (src : string) : ParseResult =
             else
                 let acc = vecNew<Green> ()
                 vecAdd acc lp
-                if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock ctx)
+                if canStartExpr () || s.IsKw "let" then vecAdd acc (inBrackets (fun () -> parseBlock ctx))
                 elif s.Is Operator then vecAdd acc (s.Bump ())   // section like (+) with odd op
                 if s.IsOp ":" then
                     vecAdd acc (s.Bump ())

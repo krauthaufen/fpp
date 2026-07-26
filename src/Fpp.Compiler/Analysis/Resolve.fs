@@ -438,9 +438,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 local (fun () -> inner <- bindPat DefParam inner c)
             | GNode m when m.NodeKind = MemberDecl -> walkMember typeName inner m
             | GNode i when i.NodeKind = InterfaceImpl ->
+                // an explicit implementation is not part of the class' own
+                // member namespace: it is reached only through the interface
+                let ifaceName =
+                    i.Children
+                    |> List.tryPick (fun x ->
+                        match x with
+                        | GNode ty when isTypeKind ty.NodeKind ->
+                            Green.tokens x |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                        | _ -> None)
+                    |> Option.map (fun t -> t.Text)
+                let implOwner =
+                    match ifaceName with
+                    | Some inm -> typeName + "." + inm
+                    | None -> typeName
                 for x in i.Children do
                     match x with
-                    | GNode m when m.NodeKind = MemberDecl -> walkMember typeName inner m
+                    | GNode m when m.NodeKind = MemberDecl -> walkMember implOwner inner m
                     | GNode ty when isTypeKind ty.NodeKind -> walkType inner x
                     | _ -> ()
             | GNode l when l.NodeKind = LetDecl -> local (fun () -> inner <- walkLet inner l)

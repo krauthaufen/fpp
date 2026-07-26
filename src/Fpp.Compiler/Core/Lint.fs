@@ -243,6 +243,13 @@ let lint (decls : Decl list) : string list =
         | EArrayUnpin (_, a) ->
             exprType a |> ignore
             tInt
+        | EIfaceCall (_, _, recv, args) ->
+            exprType recv |> ignore
+            for a in args do exprType a |> ignore
+            st.Fresh ()
+        | ECast (tn, e, _) ->
+            exprType e |> ignore
+            TCon (tn, [])
 
     for d in decls do
         match d with
@@ -252,6 +259,6 @@ let lint (decls : Decl list) : string list =
             let rt = exprType rhs
             unifyC ("top-level " + v.Name) declared rt
             dictSet env (keyOf v) declared
-        | DExtern _ | DUnion _ | DRecord _ -> ()
+        | DExtern _ | DUnion _ | DRecord _ | DInterface _ | DClass _ -> ()
 
     vecToList errors

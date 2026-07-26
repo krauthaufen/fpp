@@ -48,7 +48,7 @@ type FieldInfo =
 /// "TypeName.fieldName" (for dot-access on a known record type).
 let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
-          (fields : Dict<string, FieldInfo>) : InferResult =
+          (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -620,6 +620,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     last <- exprType (GNode m)
                 last
             | LetDecl -> inferLet n
+            | CastExpr ->
+                // `e :> T` / `e :?> T`: the operand is typed for its own
+                // sake, the result is the target type
+                let cvars = dictNew<string, Type> ()
+                (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
+                 | Some operand -> exprType (GNode operand) |> ignore
+                 | None -> ())
+                (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                 | Some tn -> typeFromNode cvars tn
+                 | None -> st.Fresh ())
             | DotExpr when (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr)) ->
                 // index access a.[i]: element type when the receiver is known
                 let lhsTy =
@@ -888,6 +898,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some t -> t.Text
             | None -> "?"
         let selfTy = TCon (name, vecToList tyParams)
+        // a type whose members are all abstract IS an interface: it declares
+        // dispatch slots and nothing else
+        let memberDecls = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+        let isAbstractM (m : GreenNode) =
+            tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "abstract")
+        if not (List.isEmpty memberDecls) && memberDecls |> List.forall isAbstractM then
+            dictSet ifaces name
+                (memberDecls
+                 |> List.choose (fun m ->
+                     let nameTok =
+                         match tokensOf m |> List.filter (fun t -> t.Kind = Ident) with
+                         | [ _; nm ] -> Some nm
+                         | [ nm ] -> Some nm
+                         | _ -> None
+                     nameTok |> Option.map (fun t ->
+                         t.Text, (nodesOf m |> List.filter (fun p -> isPatKind p.NodeKind) |> List.length))))
         // type abbreviation: register for same-file expansion
         let hasStructure =
             nodesOf n
@@ -946,8 +972,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | LetDecl -> inferLet m |> ignore
             | MemberDecl -> inferMember name vars (paramVarList ()) selfTy m
             | InterfaceImpl ->
+                // implementations live under "Class.Interface.Method": they
+                // are not accessible as members of the class itself
+                let ifaceName =
+                    nodesOf m
+                    |> List.tryPick (fun x ->
+                        if isTypeKind x.NodeKind then
+                            Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                        else None)
+                    |> Option.map (fun t -> t.Text)
+                let owner = match ifaceName with Some inm -> name + "." + inm | None -> name
                 for x in nodesOf m do
-                    if x.NodeKind = MemberDecl then inferMember name vars (paramVarList ()) selfTy x
+                    if x.NodeKind = MemberDecl then inferMember owner vars (paramVarList ()) selfTy x
             | k when isPatKind k ->
                 // primary-ctor params — and the class becomes constructible:
                 // `State(src, toks)` gets the scheme ctorArgs -> Self

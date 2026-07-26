@@ -150,6 +150,8 @@ let rec private encExpr (e : Expr) : Sx =
     | EArrayCreate (nm, n, v) -> L [ A "eC"; S nm; encExpr n; encExpr v ]
     | EArrayPin (nm, a) -> L [ A "eP"; S nm; encExpr a ]
     | EArrayUnpin (nm, a) -> L [ A "eU"; S nm; encExpr a ]
+    | EIfaceCall (i, m, r, args) -> L (A "ei" :: S i :: S m :: encExpr r :: List.map encExpr args)
+    | ECast (t, e, d) -> L [ A "ec"; S t; encExpr e; A (if d then "1" else "0") ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -160,6 +162,12 @@ let private encDecl (d : Decl) : Sx =
     | DRecord (n, ps, fs, st) ->
         L [ A "dr"; S n; L (List.map S ps)
             L (fs |> List.map (fun (f, k) -> L [ S f; A k ])); A (if st then "1" else "0") ]
+    | DInterface (n, ms) ->
+        L [ A "di"; S n; L (ms |> List.map (fun (m, a) -> L [ S m; A (string a) ])) ]
+    | DClass (n, impls) ->
+        L [ A "dc"; S n
+            L (impls |> List.map (fun (i, ms) ->
+                L [ S i; L (ms |> List.map (fun (m, v) -> L [ S m; encVarId v ])) ])) ]
 
 let private encDef (full : string, d : Resolve.Definition) : Sx =
     let kind =
@@ -277,6 +285,8 @@ let rec private decExpr (x : Sx) : Expr =
     | L [ A "eC"; S nm; n; v ] -> EArrayCreate (nm, decExpr n, decExpr v)
     | L [ A "eP"; S nm; a ] -> EArrayPin (nm, decExpr a)
     | L [ A "eU"; S nm; a ] -> EArrayUnpin (nm, decExpr a)
+    | L (A "ei" :: S i :: S m :: r :: args) -> EIfaceCall (i, m, decExpr r, List.map decExpr args)
+    | L [ A "ec"; S t; e; A d ] -> ECast (t, decExpr e, d = "1")
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =
@@ -290,6 +300,15 @@ let private decDecl (x : Sx) : Decl option =
         Some (DRecord (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
                        fs |> List.choose (fun f -> match f with L [ S fn; A k ] -> Some (fn, k) | _ -> None),
                        st = "1"))
+    | L [ A "di"; S n; L ms ] ->
+        Some (DInterface (n, ms |> List.choose (fun m -> match m with L [ S mn; A a ] -> Some (mn, int a) | _ -> None)))
+    | L [ A "dc"; S n; L impls ] ->
+        Some (DClass (n,
+                impls |> List.choose (fun i ->
+                    match i with
+                    | L [ S iname; L ms ] ->
+                        Some (iname, ms |> List.choose (fun m -> match m with L [ S mn; v ] -> Some (mn, decVarId v) | _ -> None))
+                    | _ -> None)))
     | _ -> None
 
 let private decDef (x : Sx) : (string * Resolve.Definition) option =

@@ -64,6 +64,12 @@ type Expr =
     | EArrayCreate of string * Expr * Expr
     | EArrayPin of string * Expr
     | EArrayUnpin of string * Expr
+    /// interface name, method name, receiver, arguments — dispatched
+    /// through the receiver's vtable, not bound to any one implementation
+    | EIfaceCall of string * string * Expr * Expr list
+    /// target type, operand, isDowncast (`:?>` checks the class id at
+    /// runtime; `:>` is a static widening and checks nothing)
+    | ECast of string * Expr * bool
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -72,6 +78,11 @@ type Decl =
     | DUnion of string * string list * (string * int) list
     /// name, type params, fields as (name, kind "f|s|l|i|r"), isStruct
     | DRecord of string * string list * (string * string) list * bool
+    /// interface name, its methods as (name, arity)
+    | DInterface of string * (string * int) list
+    /// class name, and per implemented interface the functions that
+    /// implement its methods: (interface, [method, implementation])
+    | DClass of string * (string * (string * VarId) list) list
 
 type LowerResult =
     { Decls : Decl list
@@ -120,6 +131,9 @@ let rec printExpr (e : Expr) : string =
     | EArrayPin (_, a) -> "(Array.pin " + printExpr a + ")"
     | EArrayUnpin (_, a) -> "(Array.unpin " + printExpr a + ")"
     | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
+    | EIfaceCall (i, m, r, args) ->
+        "(" + i + "::" + m + " " + String.concat " " (List.map printExpr (r :: args)) + ")"
+    | ECast (t, e, down) -> "(" + printExpr e + (if down then " :?> " else " :> ") + t + ")"
 
 and printPat (p : Pat) : string =
     match p with
@@ -141,6 +155,10 @@ let printDecl (d : Decl) : string =
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
         + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
+    | DInterface (n, ms) ->
+        "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
+    | DClass (n, impls) ->
+        "class " + n + " : " + String.concat ", " (impls |> List.map fst)
     | DRecord (n, ps, fs, st) ->
         (if st then "struct " else "record ") + n
         + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")

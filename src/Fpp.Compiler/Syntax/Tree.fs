@@ -39,6 +39,7 @@ type NodeKind =
     | MatchClause
     | BlockExpr
     | DotExpr
+    | CastExpr
     | ForExpr
     | WhileExpr
     | TryExpr

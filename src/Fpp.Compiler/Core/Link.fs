@@ -64,6 +64,8 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | ECtor (n, s, xs) -> ECtor (n, s, List.map r xs)
         | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, r v))
         | EField (x, fn, o) -> EField (r x, fn, o)
+        | EIfaceCall (i, m, recv, args) -> EIfaceCall (i, m, r recv, List.map r args)
+        | ECast (t, x, d) -> ECast (t, r x, d)
         | EFieldSet (x, fn, o, v) -> EFieldSet (r x, fn, o, r v)
         | EWhile (c, b) -> EWhile (r c, r b)
         | EAssign (v, x) -> EAssign (v, r x)
@@ -111,6 +113,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> usesLayoutVar v)
         | EField (r, _, _) -> usesLayoutVar r
+        | EIfaceCall (_, _, recv, args) -> usesLayoutVar recv || anyOf args
+        | ECast (_, x, _) -> usesLayoutVar x
         | EFieldSet (r, _, _, v) -> usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
@@ -137,6 +141,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> callsLayoutDep v)
         | EField (r, _, _) -> callsLayoutDep r
+        | EIfaceCall (_, _, recv, args) -> callsLayoutDep recv || anyOf args
+        | ECast (_, x, _) -> callsLayoutDep x
         | EFieldSet (r, _, _, v) -> callsLayoutDep r || callsLayoutDep v
         | EWhile (c, b) -> callsLayoutDep c || callsLayoutDep b
         | EAssign (_, x) -> callsLayoutDep x
@@ -301,6 +307,8 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | ECtor (_, _, xs) -> List.iter scan xs
         | ERecord (_, fs) -> for _, v in fs do scan v
         | EField (r, _, _) -> scan r
+        | EIfaceCall (_, _, recv, args) -> scan recv; List.iter scan args
+        | ECast (_, x, _) -> scan x
         | EFieldSet (r, _, _, v) -> scan r; scan v
         | EWhile (c, b) -> scan c; scan b
         | EAssign (v, e) -> demand (v.Path, v.Offset); scan e
@@ -316,6 +324,15 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EArrayCreate (_, n, v) -> scan n; scan v
         | EArrayPin (_, a) -> scan a
         | EArrayUnpin (_, a) -> scan a
+        | _ -> ()
+    // roots: interface implementations. They are reached through a vtable,
+    // so no expression names them — a class that is constructed at all can
+    // have any of its interface methods called.
+    for d in decls do
+        match d with
+        | DClass (_, impls) ->
+            for _, ms in impls do
+                for _, v in ms do demand (v.Path, v.Offset)
         | _ -> ()
     // roots: value initializers (program effects)
     for d in decls do
