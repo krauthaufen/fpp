@@ -88,19 +88,34 @@ which narrow via the subtyping rule rather than by equality), generic
 arguments in a type test, `obj` as the top type, int-to-string, attributes
 on type members, and `static let` at its own column.
 
+Landed since: CONSTRUCTOR OVERLOADING (a type may declare a primary
+constructor and any number of `new(...)`; each is its own function,
+inference picks one by trial unification on a private copy of the scheme
+and records the choice, and it works through explicit type arguments);
+`seq` recognised as `IEnumerable` with arrays, lists and implementing
+types as subtypes; and dotted interface names resolving to the type rather
+than the module qualifier (`System.Collections.Generic.IEnumerable` was
+being filed under `System`).
+
+State: 92 lines with parse errors (frontier at 3678), 102 with type errors,
+down from 541/142.
+
 Remaining, in rough order of blocking power:
-- [ ] CONSTRUCTOR OVERLOADING. A type may declare both a primary
-      constructor and `new(...)`; today the second overwrites the first, so
-      `HashSet<'K>(comparer, root)` resolves against `new(elements: seq<_>)`
-      (5 of the 6 earliest type errors). This is the "overload resolution"
-      item, needed at least for constructors.
+- [ ] `Seq.*`, `String.concat`, `sprintf`
+- [ ] `IEnumerable`/`IEnumerator` as a working protocol:
+      `GetEnumerator`/`MoveNext`/`Dispose` (typing them is not enough —
+      they have to run)
+- [ ] `override ToString()`/`GetHashCode()`/`Equals(o)` object protocol
 - [ ] attributes inside a type-parameter list:
       `HashMap<'K, [<EqualityConditionalOn>] 'V>`
-- [ ] `Seq.*`, `String.concat`, `sprintf`
-- [ ] `IEnumerable`/`IEnumerator`: `GetEnumerator`/`MoveNext`/`Dispose`
-- [ ] `override ToString()`/`GetHashCode()`/`Equals(o)` object protocol
-- [ ] one unexplained type error at line 2247 (`MapLinked.exists`), where a
-      type and a module share a name
+- [ ] 36 diagnostics reporting `list<bool> vs bool` AT an attribute line
+      (e.g. 3736, 3744) — the attribute is being typed as a list
+      expression, but only in this file: the obvious minimal repro
+      (attributes on consecutive members) parses and runs clean, so the
+      trigger is something about the surrounding member bodies. Find the
+      real repro before fixing.
+- [ ] one type error at 2247 (`MapLinked.exists`), where a type and a
+      module share a name
 
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real
