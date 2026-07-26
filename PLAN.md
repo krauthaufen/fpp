@@ -40,7 +40,20 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       deferred constraints (overloads/classes), records, member types,
       cross-file
 - [ ] Overload resolution as its own specced algorithm
-- [ ] Nominal subtyping, interfaces, classes
+- [x] Nominal subtyping, interfaces, classes — receiver-directed member
+      binding (inference parks each dot-access and retries to fixpoint, so
+      member names need not be unique); classes with constructor state,
+      `let` fields incl. `mutable`, properties, methods, statics; explicit
+      interface implementations; single inheritance with prefix field
+      layout; `abstract`/`default`/`override` virtual dispatch; object
+      expressions (anonymous classes whose captures become fields);
+      `:>`/`:?>`/`:?`. Every class instance carries a descriptor
+      {classId, vtable} in a hidden first field — that is what makes
+      dispatch and checked casts work without knowing the concrete type.
+      Gate: six oracle programs byte-exact against dotnet fsi.
+      Open: generic classes are not yet monomorphized per struct argument
+      (member uses record no instantiation demands), `member val`,
+      `static let`, operators as members, interface inheritance.
 - [ ] GADT mode: per-case schemes, match refinement, existentials,
       escape diagnostics
 - [ ] Kinds + HKT: `'m<_>` params, bare-constructor type args,
