@@ -75,25 +75,44 @@ the set/map node implementation: generic inheritance, property accessors,
 packed uint32 tag bits, the NodeKind enum, null-terminated chains,
 IEqualityComparer dispatch, struct tuples, and implicit upcasts.
 
-Remaining blockers, in source order from line 3168 — one cluster, the
-struct enumerators:
-- [ ] `val mutable` fields (and assignment to them: the 18 lowering gaps)
-- [ ] explicit `new(...)` constructors with record-expression initialization
-- [ ] `Unchecked.defaultof<_>`
+The front end now reaches line **3260** of 4501. What remains is no longer
+F# language surface — it is the FSharp.Core / BCL surface the file depends
+on, which is Stage 5 work (port FSharp.Core), not compiler work:
+- `OptimizedClosures.FSharpFunc<...>.Adapt` (an FSharp.Core internal)
+- `DefaultEqualityComparer<'K>.Instance`
+- `IEnumerable`/`IEnumerator`: `GetEnumerator`/`MoveNext`/`Dispose`
+- `voption` (`ValueSome`/`ValueNone`), `Seq.*`, `Array.*`
+- `inline` functions (90 lines mention it)
+Most of the 596 remaining flagged lines cascade from a handful of these
+inside `static let` bindings, which derail their enclosing type body.
 
-Also still open, not yet reached: `member val`, `static let`, operators as
-members, interface inheritance.
+### Generic structs — attempted, reverted, and why
+A field declaration carries its TYPE rather than a pre-resolved kind, so a
+`'a` field is no longer frozen as boxed. That part is landed.
 
-### Generic structs — the remaining representation work
-A field declaration now carries its TYPE rather than a pre-resolved kind,
-so the backend derives the representation once the type is concrete. What
-is NOT yet done is stamping a generic struct record per instantiation:
-`Pair<float,float>` still shares one record whose fields are boxed, rather
-than a POD layout. Struct tuples inherit exactly this behaviour, being
-ordinary generic structs — which is the point: fixing it fixes both, and
-it is the same tier-1 stamping already done for functions, extended to
-record declarations. Needs: instantiated struct names at use sites
-(ERecord/EField/array element), and DRecord stamping in Link.
+Stamping a generic struct per instantiation was then built and REVERTED to
+a stash (`generic struct stamping WIP`). It demonstrably worked for the
+concrete case — `struct(int * int)` produced
+`$r_StructTuple2$<int.int> (struct (field (mut i32)) (field (mut i32)))`,
+i.e. genuinely unboxed — but broke the mixed case, and I would not leave
+that half-applied.
+
+The design, for whoever picks it up:
+- a type's name carries its instantiation, bracketed so nesting is
+  unambiguous: `Pair$<int.Pair$<int.int>>`;
+- Infer records that name at every site the backend identifies a type by
+  name: array element, field owner, record literal, struct-tuple pattern;
+- Link stamps a DRecord per used name, after monomorphization so the names
+  are concrete;
+- a record name still mentioning a type variable makes its function
+  layout-dependent, so the function is stamped and the name substituted.
+
+The unresolved symptom: with a generic producer (`addInPlace` returning
+`StructTuple2<bool, SetLinked<'K>>`) and a concrete consumer, the
+producer's clone was not created — the recursive call classified as
+Unclassifiable, which suggests the `#id` in the mangled record name does
+not always match the id of the scheme's quantified var that Link
+substitutes. Verify that correspondence first.
 
 Earlier items, now done:
 Earlier items, now done:
