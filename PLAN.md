@@ -118,7 +118,14 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
-- [~] `stdlib/map.fpp`: Map + Set modules in F++ over the patricia trie
+- [~] `stdlib/mapext.fpp`: **Map = MapExt** (AVL tree: height/count cached,
+      rebalance, add/remove/alter/change/update/tryMin/tryMax/fold/foldBack/
+      map/mapValues/filter/choose/exists/forall/partition/union/unionWith/
+      intersect/intersectWith/difference/choose2/map2/keys/values/toList/
+      ofList) + **Set** on the same tree; tests: per-function edges, AVL
+      invariants, ordering, laws, and a 400-op randomised differential
+      against an assoc-list model — 62 assertions, all matching F#
+- [~] `stdlib/map.fpp`: HashMap-style Map + Set (patricia trie) in F++ over the patricia trie
       (add/remove/tryFind/containsKey/fold/toList/ofList; Set union), all
       oracle-verified against F#
 - [~] `stdlib/list.fpp`: List module written IN F++ (length/rev/map/filter/

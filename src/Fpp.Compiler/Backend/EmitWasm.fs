@@ -486,6 +486,8 @@ let emit (decls : Decl list) : EmitResult =
         | EApp (EUnknown "memStoreF32", [ a; v ]) ->
             // raw linear-memory store: the zero-copy bridge to JS/WebGPU
             "(block (result anyref) (f32.store (call $toi " + recur a + ") (f32.demote_f64 (call $tof " + recur v + "))) (ref.i31 (i32.const 0)))"
+        | EApp (EUnknown "compare", [ a; b ]) ->
+            "(call $ofi (call $cmpv " + recur a + " " + recur b + "))"
         | EApp (EUnknown "hash", [ a ]) ->
             "(call $ofi (call $hashv " + recur a + "))"
         | EApp (EUnknown "refEq", [ a; b ]) ->
@@ -1478,6 +1480,50 @@ let emit (decls : Decl list) : EmitResult =
         (i32.mul (call $hashv (struct.get $cons 0 (ref.cast (ref $cons) (local.get $v)))) (i32.const 31))
         (call $hashv (struct.get $cons 1 (ref.cast (ref $cons) (local.get $v))))))))
     (i32.const 1))
+  (func $cmpv (param $a anyref) (param $b anyref) (result i32)
+    (local $i i32) (local $la i32) (local $lb i32) (local $x i32) (local $y i32) (local $c i32)
+    (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
+      (then
+        (local.set $la (array.len (ref.cast (ref $str) (local.get $a))))
+        (local.set $lb (array.len (ref.cast (ref $str) (local.get $b))))
+        (block $d (loop $go
+          (br_if $d (i32.or (i32.ge_u (local.get $i) (local.get $la))
+                            (i32.ge_u (local.get $i) (local.get $lb))))
+          (local.set $x (array.get_u $str (ref.cast (ref $str) (local.get $a)) (local.get $i)))
+          (local.set $y (array.get_u $str (ref.cast (ref $str) (local.get $b)) (local.get $i)))
+          (if (i32.lt_u (local.get $x) (local.get $y)) (then (return (i32.const -1))))
+          (if (i32.gt_u (local.get $x) (local.get $y)) (then (return (i32.const 1))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $go)))
+        (if (i32.lt_u (local.get $la) (local.get $lb)) (then (return (i32.const -1))))
+        (if (i32.gt_u (local.get $la) (local.get $lb)) (then (return (i32.const 1))))
+        (return (i32.const 0))))
+    (if (i32.and (ref.test (ref $boxf) (local.get $a)) (ref.test (ref $boxf) (local.get $b)))
+      (then
+        (if (f64.lt (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $a)))
+                    (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $b))))
+          (then (return (i32.const -1))))
+        (if (f64.gt (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $a)))
+                    (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $b))))
+          (then (return (i32.const 1))))
+        (return (i32.const 0))))
+    (if (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
+      (then (return (i32.const 0))))
+    (if (ref.is_null (local.get $a)) (then (return (i32.const -1))))
+    (if (ref.is_null (local.get $b)) (then (return (i32.const 1))))
+    (if (i32.and (ref.test (ref $cons) (local.get $a)) (ref.test (ref $cons) (local.get $b)))
+      (then
+        (local.set $c (call $cmpv (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
+                                  (struct.get $cons 0 (ref.cast (ref $cons) (local.get $b)))))
+        (if (i32.ne (local.get $c) (i32.const 0)) (then (return (local.get $c))))
+        (return (call $cmpv (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a)))
+                            (struct.get $cons 1 (ref.cast (ref $cons) (local.get $b)))))))
+    ;; numeric / immediates
+    (local.set $x (call $toi (local.get $a)))
+    (local.set $y (call $toi (local.get $b)))
+    (if (i32.lt_s (local.get $x) (local.get $y)) (then (return (i32.const -1))))
+    (if (i32.gt_s (local.get $x) (local.get $y)) (then (return (i32.const 1))))
+    (i32.const 0))
   (func $append (param $a anyref) (param $b anyref) (result anyref)
     (if (result anyref) (ref.test (ref $cons) (local.get $a))
       (then (struct.new $cons
