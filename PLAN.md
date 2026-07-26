@@ -75,21 +75,32 @@ the set/map node implementation: generic inheritance, property accessors,
 packed uint32 tag bits, the NodeKind enum, null-terminated chains,
 IEqualityComparer dispatch, struct tuples, and implicit upcasts.
 
-The front end now reaches line **3295** of 4501 on the unmodified file, and
-the same point on a lightly ported copy. Two ports were needed so far, both
-of the kind anticipated from the start (".NET internals need F++
-counterparts"): `OptimizedClosures.FSharpFunc<...>`/`.Adapt`/`.Invoke` is a
-CLR perf hack whose F++ counterpart is a plain curried function, and the
-prelude gained `voption`/`ValueSome`/`ValueNone` and
-`DefaultEqualityComparer`.
+On the acceptance target (4501 lines), the front end now reaches a parse
+frontier of line **3678**; only 92 lines still have parse errors and 142
+have type errors. The ported copy lives at
+`tests/reference-HashCollections.ported.fs` — two ports so far, both of the
+kind anticipated from the start: `OptimizedClosures.FSharpFunc`/`Adapt`/
+`Invoke` (a CLR perf hack; the F++ counterpart is a curried function), and
+prelude additions (`voption`, `DefaultEqualityComparer`).
 
-What remains is BCL/FSharp.Core surface plus one language feature:
-- [ ] type-test PATTERNS: `| :? HashSet<'K> as o ->` (the expression form
-      `x :? T` is done; the pattern form is not)
+Landed for the target this round: type-test PATTERNS (`| :? T as x ->`,
+which narrow via the subtyping rule rather than by equality), generic
+arguments in a type test, `obj` as the top type, int-to-string, attributes
+on type members, and `static let` at its own column.
+
+Remaining, in rough order of blocking power:
+- [ ] CONSTRUCTOR OVERLOADING. A type may declare both a primary
+      constructor and `new(...)`; today the second overwrites the first, so
+      `HashSet<'K>(comparer, root)` resolves against `new(elements: seq<_>)`
+      (5 of the 6 earliest type errors). This is the "overload resolution"
+      item, needed at least for constructors.
+- [ ] attributes inside a type-parameter list:
+      `HashMap<'K, [<EqualityConditionalOn>] 'V>`
 - [ ] `Seq.*`, `String.concat`, `sprintf`
 - [ ] `IEnumerable`/`IEnumerator`: `GetEnumerator`/`MoveNext`/`Dispose`
-- [ ] `override x.ToString()` / `GetHashCode()` / `Equals(o)` and the
-      object protocol they imply
+- [ ] `override ToString()`/`GetHashCode()`/`Equals(o)` object protocol
+- [ ] one unexplained type error at line 2247 (`MapLinked.exists`), where a
+      type and a module share a name
 
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real
