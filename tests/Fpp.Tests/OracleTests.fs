@@ -645,6 +645,25 @@ let oracleTests =
             "    let struct(p, q) = arr.[1]"
             "    print (p + q)"
         ]
+        oracle "nominal subtyping: implicit upcast at call sites" [
+            "type IShape ="
+            "    abstract member Area : int"
+            "type Base(tag : int) ="
+            "    member _.Tag = tag"
+            "type Derived(tag : int) ="
+            "    inherit Base(tag)"
+            "    member _.Extra = tag * 2"
+            "    interface IShape with"
+            "        member _.Area = tag"
+            "let tagOf (b : Base) = b.Tag"
+            "let areaOf (s : IShape) = s.Area"
+            "let join (a : Base) (b : Base) = a.Tag + b.Tag"
+            "let d = Derived(21)"
+            "let e = Derived(4)"
+            "let a = print (tagOf d)"
+            "let b = print (join d e)"
+            "let c = print (areaOf d)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

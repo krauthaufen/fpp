@@ -54,7 +54,8 @@ type FieldInfo =
 let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
           (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
-          (bases : Dict<string, Var list * Type>) : InferResult =
+          (bases : Dict<string, Var list * Type>)
+          (impls : Dict<string, string list>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -133,6 +134,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match unify t1 t2 with
         | Some msg -> vecAdd diags (offset, msg)
         | None -> ()
+
+    /// Nominal subtyping: is `sup` `sub` itself, an ancestor of it, or an
+    /// interface it implements? Inheritance and interfaces both count.
+    let rec isSupertypeOf (sup : string) (sub : string) : bool =
+        sup = sub
+        || (match dictTryFind impls sub with
+            | Some is -> List.contains sup is
+            | None -> false)
+        || (match dictTryFind bases sub with
+            | Some (_, bt) ->
+                (match prune bt with
+                 | TCon (b, _) -> isSupertypeOf sup b
+                 | _ -> false)
+            | None -> false)
+
+    /// Unify an argument against a parameter, allowing the argument to be a
+    /// subtype — F# inserts the upcast, and the representation is identical.
+    let unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
+        match prune paramTy, prune argTy with
+        | TCon (p, pa), TCon (a, aa) when p <> a && isSupertypeOf p a ->
+            // widening: only the type arguments they share need to agree
+            if pa.Length = aa.Length then List.iter2 (unifyAt offset) pa aa
+        | _ -> unifyAt offset paramTy argTy
 
     let recordDef (t : Token) (ty : Type) : unit =
         vecAdd defTypes (t.Offset, strLen t.Text, ty)
@@ -534,7 +558,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  firstArgTy <- Some argTy
                                  firstArg <- false
                              let res = st.Fresh ()
-                             unifyAt off funTy (TFun (argTy, res))
+                             // decompose first so a subclass argument can widen
+                             (match prune funTy with
+                              | TFun (pt, rt) ->
+                                  unifyArg off pt argTy
+                                  unifyAt off res rt
+                              | _ -> unifyAt off funTy (TFun (argTy, res)))
                              funTy <- res
                      // prefer an array-typed result (Array.create), else an
                      // array-typed first argument (Array.pin/unpin)
@@ -1150,6 +1179,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         else None)
                     |> Option.map (fun t -> t.Text)
                 let owner = match ifaceName with Some inm -> name + "." + inm | None -> name
+                (match ifaceName with
+                 | Some inm ->
+                     let prior = match dictTryFind impls name with Some l -> l | None -> []
+                     dictSet impls name (inm :: prior)
+                 | None -> ())
                 for x in nodesOf m do
                     if x.NodeKind = MemberDecl then inferMember owner vars (paramVarList ()) selfTy x
             | k when isPatKind k ->

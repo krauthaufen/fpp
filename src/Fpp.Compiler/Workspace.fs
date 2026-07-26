@@ -227,12 +227,13 @@ type Workspace() =
             let fields = dictNew<string, Analysis.Infer.FieldInfo> ()
             let ifaces = dictNew<string, (string * int) list> ()
             let bases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
+            let impls = dictNew<string, string list> ()
             let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
             // the builtin prelude seeds imports and schemes for every file
             let bp = Parser.parse Builtin.source
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
-            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases |> ignore
+            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls |> ignore
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
@@ -242,7 +243,7 @@ type Workspace() =
                 let p = this.ParseFile path
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core
             for _, text in this.Libraries do
@@ -250,7 +251,11 @@ type Workspace() =
                 for d in ds do
                     match d with
                     | Fpp.Core.Ir.DInterface (n, ms) -> dictSet ifaces n ms
-                    | Fpp.Core.Ir.DClass (n, Some b, _, _) -> dictSet bases n ([], Analysis.Types.TCon (b, []))
+                    | Fpp.Core.Ir.DClass (n, bse, _, cimpls) ->
+                        (match bse with
+                         | Some b -> dictSet bases n ([], Analysis.Types.TCon (b, []))
+                         | None -> ())
+                        dictSet impls n (cimpls |> List.map fst)
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases })
 
@@ -259,7 +264,7 @@ type Workspace() =
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
-                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
+                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
