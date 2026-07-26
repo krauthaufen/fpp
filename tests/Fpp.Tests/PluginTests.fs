@@ -183,3 +183,43 @@ let instantiationScopeTests =
             Expect.stringContains wat "func" "emits"
         }
     ]
+
+[<Tests>]
+let monoTests =
+    testList "monomorphization" [
+        test "struct instantiations are stamped, reference instantiations share one body" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "[<Struct>]"
+                    "type Pt = { A : int; B : int }"
+                    "let id2 (x : 'a) = x"
+                    "let a = id2 { X = 1.0; Y = 2.0 }"
+                    "let b = id2 { A = 3; B = 4 }"
+                    "let c = id2 \"s\""
+                    "let d = id2 \"t\""
+                    "let r = print (id2 5)"
+                    "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "compiles"
+            // wasm identifiers sanitize '$' to '_'
+            Expect.stringContains wat "id2_V2d" "V2d instantiation stamped"
+            Expect.stringContains wat "id2_Pt" "Pt instantiation stamped"
+            // definitions are followed by their parameter list; calls are not
+            let defsOf (needle : string) =
+                wat.Split([| needle + " (param" |], System.StringSplitOptions.None).Length - 1
+            // exactly one clone per struct type, no clone per reference type
+            Expect.equal (defsOf "_id2_V2d") 1 "one V2d clone"
+            Expect.equal (defsOf "_id2_Pt") 1 "one Pt clone"
+            Expect.isFalse (wat.Contains "id2_string") "reference instantiations share the canonical body"
+        }
+        test "classifier: struct -> stamp, reference -> canon" {
+            let isStruct (n : string) = n = "V2d"
+            Expect.equal (Fpp.Core.Link.classify isStruct [ "V2d" ]) (Fpp.Core.Link.Stamp [ "V2d" ]) "struct stamps"
+            Expect.equal (Fpp.Core.Link.classify isStruct [ "string" ]) Fpp.Core.Link.Canon "ref shares"
+            Expect.equal (Fpp.Core.Link.classify isStruct [ "int" ]) Fpp.Core.Link.Canon "int shares (i31)"
+        }
+    ]

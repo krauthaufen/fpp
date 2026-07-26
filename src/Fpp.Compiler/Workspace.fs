@@ -296,9 +296,21 @@ type Workspace() =
         if vecLen errs > 0 then "", vecToList errs
         else
             let program = this.RunWholeProgram (vecToList libDecls @ vecToList allDecls)
-            let linked = Fpp.Core.Link.deadCodeEliminate program
-            let res = Fpp.Backend.EmitWasm.emit linked
-            res.Wat, res.Errors
+            // tier-1: stamp per struct instantiation, share one body for
+            // reference instantiations, error on anything unclassifiable
+            let structNames =
+                program
+                |> List.choose (fun d ->
+                    match d with
+                    | Fpp.Core.Ir.DRecord (n, _, _, true) -> Some n
+                    | _ -> None)
+            let isStruct (n : string) = List.contains n structNames
+            let mono, monoErrs = Fpp.Core.Link.monomorphize isStruct program
+            let linked = Fpp.Core.Link.deadCodeEliminate mono
+            if not (List.isEmpty monoErrs) then "", monoErrs
+            else
+                let res = Fpp.Backend.EmitWasm.emit linked
+                res.Wat, res.Errors
 
     /// Produce a fat-IR library from the current project files.
     member this.BuildLibrary () : string * string list =
