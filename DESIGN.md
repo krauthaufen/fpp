@@ -316,13 +316,35 @@ The projection reduces: `x + y` at `'a` produces
 `'a` at once. The user writes one readable name; closure comes from the
 class, not from grounding.
 
-**The projection rule.** A projection must reduce either by a known
-concrete type or by a constraint in scope, and may never survive into a
-generalized signature. If it cannot reduce, that is an error naming the
-failing operator application and its two operand types — never an
-accumulated constraint chain. Error shape is a requirement here, not a
-nicety: dumping the chain is exactly what makes SRTP diagnostics
-unreadable.
+**Constraints are inferred, and projections may appear in results.**
+Requiring every projection to reduce would defeat the purpose: the point of
+this layer is writing generic math, and demanding annotations everywhere is
+just grounding by another route. So inference infers the constraint set as
+Haskell's does, and a signature may legitimately mention
+`Add<'a,'b>.Result`.
+
+The readability problem that creates is solved at the PRESENTATION layer,
+not by restricting the type system. Because one operator symbol maps to
+exactly one class, the projection is invertible and renders in operator
+notation:
+
+```
+let f a b c = (a + b) * c
+val f : 'a -> 'b -> 'c -> ('a + 'b) * 'c   when Add<'a,'b>, Mul<'a + 'b, 'c>
+```
+
+The inferred type mirrors the expression that produced it, which is what
+makes it legible — a chain of `Result` projections spelled out nominally is
+not. This is why the one-symbol-one-class invariant earns its keep twice.
+
+**Constraints are simplified before they are shown or stored.** Duplicates
+collapse, and anything entailed by a superclass already in the set is
+dropped — with `Fractional<'a>` present, `Add<'a,'a>` is not also reported.
+Without this the contexts grow linearly in the size of the body, which is
+the other half of why SRTP diagnostics read badly.
+
+**Errors name the operator application**, its two operand types, and the
+missing instance — never the accumulated chain.
 
 This is also what makes associated-type EQUALITY in constraints
 load-bearing rather than speculative: `with Result = 'a` is the mechanism.
@@ -352,6 +374,13 @@ instances, the only thing keeping resolution well-defined is: exactly one
 instance per `(a, b)` pair, globally, and an orphan rule — an instance must
 live in the module defining one of the two types. Without it two libraries
 can each declare `Mul<float, V3d>` and linking is ill-defined.
+
+**Termination has to be stated.** Associated types are type-level
+functions, so instance reduction can loop if an instance's result mentions
+a bigger type than its arguments. The rule: an instance's associated type
+must be structurally no larger than the instance head, so reduction is
+decreasing and terminates. Haskell needs the same discipline for type
+families.
 
 **Consequence for the constraint language.** Generic numeric code needs to
 say that an operation stays in its type: `sum` over `'a` requires

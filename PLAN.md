@@ -132,9 +132,16 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
 - closed classes (`Fractional<'a>` etc.) carry superclass constraints, so
   generic math annotates with ONE name and projections reduce from the
   constraint rather than from a concrete type
-- a projection reduces by a concrete type or a constraint in scope, and
-  never survives into a generalized signature; failures name the operator
-  application, not the constraint chain
+- constraints are INFERRED, and projections may appear in inferred results
+  (requiring them to reduce would be grounding by another route). The
+  readability problem is solved by PRESENTATION: one symbol maps to one
+  class, so `Add<'a,'b>.Result` renders as `'a + 'b` and an inferred type
+  mirrors the expression that produced it
+- constraint sets are simplified: duplicates collapse, superclass-entailed
+  constraints are dropped
+- instance reduction must be decreasing, or type-level evaluation can loop
+- errors name the operator application and its operand types, never the
+  accumulated chain
 - instances are free-standing (Haskell-style); `static member (+)` is sugar
   for the homogeneous case
 - one operator symbol maps to exactly one class
