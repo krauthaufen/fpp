@@ -107,6 +107,7 @@ let rec private encPat (p : Pat) : Sx =
     | PVar (v, s) -> L [ A "pv"; encVarId v; encScheme s ]
     | PCtor (n, s, ps) -> L (A "pc" :: S n :: encScheme s :: List.map encPat ps)
     | PTuple ps -> L (A "pt" :: List.map encPat ps)
+    | PTypeTest t -> L [ A "ptt"; S t ]
     | PCons (a, b) -> L [ A "pn"; encPat a; encPat b ]
     | PListLit ps -> L (A "pk" :: List.map encPat ps)
     | PAs (p, v, s) -> L [ A "pa"; encPat p; encVarId v; encScheme s ]
@@ -240,6 +241,7 @@ let rec private decPat (x : Sx) : Pat =
     | L [ A "pl"; l ] -> PLit (decLit l)
     | L [ A "pv"; v; s ] -> PVar (decVarId v, decScheme s)
     | L (A "pc" :: S n :: s :: ps) -> PCtor (n, decScheme s, List.map decPat ps)
+    | L [ A "ptt"; S t ] -> PTypeTest t
     | L (A "pt" :: ps) -> PTuple (List.map decPat ps)
     | L [ A "pn"; a; b ] -> PCons (decPat a, decPat b)
     | L (A "pk" :: ps) -> PListLit (List.map decPat ps)

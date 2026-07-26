@@ -30,6 +30,8 @@ type Pat =
     | PTuple of Pat list
     | PCons of Pat * Pat
     | PListLit of Pat list
+    /// `:? T` — matches when the value is a T (or a subclass)
+    | PTypeTest of string
     | PAs of Pat * VarId * Scheme
     | POr of Pat list
 
@@ -159,6 +161,7 @@ and printPat (p : Pat) : string =
     | PTuple ps -> "(" + String.concat ", " (List.map printPat ps) + ")"
     | PCons (h, t) -> "(" + printPat h + " :: " + printPat t + ")"
     | PListLit ps -> "[" + String.concat "; " (List.map printPat ps) + "]"
+    | PTypeTest t -> ":? " + t
     | PAs (p, v, _) -> "(" + printPat p + " as " + v.Name + ")"
     | POr ps -> "(" + String.concat " | " (List.map printPat ps) + ")"
 

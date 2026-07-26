@@ -56,6 +56,7 @@ let lint (decls : Decl list) : string list =
     let rec patType (p : Pat) : Type =
         match p with
         | PWild -> st.Fresh ()
+        | PTypeTest tn -> TCon (tn, [])
         | PLit l -> litType l
         | PVar (v, _) ->
             let t = st.Fresh ()

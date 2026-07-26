@@ -329,7 +329,7 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
             | PAs (inner, v, _) -> dictSet bound (v.Path, v.Offset) true; collectPat inner
             | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter collectPat ps
             | PCons (h, t) -> collectPat h; collectPat t
-            | PWild | PLit _ -> ()
+            | PWild | PLit _ | PTypeTest _ -> ()
         // mapExpr visits every node; we only use it to gather binders
         mapExpr
             (fun x ->

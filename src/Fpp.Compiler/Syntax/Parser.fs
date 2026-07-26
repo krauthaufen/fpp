@@ -336,11 +336,15 @@ let parse (src : string) : ParseResult =
 
     and canStartAtomPat () =
         s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket
-        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
+        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen) || s.IsOp ":?"
         || (s.IsOp "-" && (let n = s.Peek 1 in n.Kind = IntLit || n.Kind = FloatLit))
 
     and parseAtomPat (ctx : int) : Green =
-        if s.IsKw "struct" && (s.Peek 1).Kind = LParen then
+        if s.IsOp ":?" then
+            // type-test pattern: `| :? HashSet<'K> as o ->`
+            let op = s.Bump ()
+            Green.node TypeTestPat [ op; parseAtomType ctx ]
+        elif s.IsKw "struct" && (s.Peek 1).Kind = LParen then
             let kw = s.Bump ()
             Green.node StructTuplePat [ kw; parseAtomPat ctx ]
         elif s.Is Ident then

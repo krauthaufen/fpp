@@ -57,6 +57,7 @@ type NodeKind =
     | ParenPat
     | ListPat
     | AsPat
+    | TypeTestPat
     // types
     | NamedType
     | VarType

@@ -267,7 +267,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -430,6 +430,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       res
                   | _ -> st.Fresh ())
              | [] -> st.Fresh ())
+        | TypeTestPat ->
+            // `:? T` narrows to T; the scrutinee itself stays a supertype
+            (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+             | Some tn -> typeFromNode pvars tn
+             | None -> st.Fresh ())
         | TuplePat ->
             TTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map (patType pvars))
         | StructTuplePat ->
@@ -565,6 +570,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
+                              | Some t when t.Text = "string" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some tString
                               | Some t when t.Text = "isNull" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tBool
@@ -765,7 +773,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let cvars = dictNew<string, Type> ()
                         for m in nodesOf cl do
                             if isPatKind m.NodeKind then
-                                unifyAt barOff (patType cvars m) scrut
+                                // a `:?` pattern narrows: it is a SUBtype of
+                                // the scrutinee, not equal to it
+                                unifyArg barOff scrut (patType cvars m)
                         // body: expr children; when-guard is bool but we keep it loose
                         let bodies = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
                         (match List.tryLast bodies with

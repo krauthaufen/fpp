@@ -625,6 +625,12 @@ let emit (decls : Decl list) : EmitResult =
              | "s" -> "(call $ofi (i32.trunc_f32_s (call $tos " + recur a + ")))"
              | "l" -> "(call $ofi (i32.wrap_i64 (call $tol " + recur a + ")))"
              | _ -> recur a)
+        | EApp (EUnknown "string", [ a ]) ->
+            (match kindOf a with
+             | "f" | "s" | "l" ->
+                 vecAdd errors "string conversion is only defined for integers so far"
+                 "(ref.i31 (i32.const 0))"
+             | _ -> "(call $itoa " + unwrapI32 (recur a) + ")")
         | EApp (EUnknown "isNull", [ a ]) -> boolWat ("(ref.is_null " + recur a + ")")
         | EApp (EUnknown "printu", [ a ]) ->
             "(block (result anyref) (call $printu " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
@@ -1411,6 +1417,21 @@ let emit (decls : Decl list) : EmitResult =
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + string (charCode raw) + ") " + unwrapI32 v + "))")
         | PLit LNull ->
             app ("(br_if " + failLbl + " (i32.eqz (ref.is_null " + v + ")))")
+        | PTypeTest tn ->
+            // the same class-id check a `:?` expression performs
+            if not (isClassName tn) then
+                vecAdd errors ("cannot type-test against " + tn + ": not a class")
+            else
+                let idOf =
+                    "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
+                let test =
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    | [] -> "(i32.const 0)"
+                    | [ one ] -> one
+                    | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
+                // a null reference is not an instance of anything
+                app ("(br_if " + failLbl + " (ref.is_null " + v + "))")
+                app ("(br_if " + failLbl + " (i32.eqz " + test + "))")
         | PLit (LString raw) ->
             let lit = compileExpr locals extraLocals freeEnv false (ELit (LString raw))
             app ("(br_if " + failLbl + " (i32.eqz " + unwrapI32 ("(call $equal " + v + " " + lit + ")") + "))")
@@ -1848,6 +1869,41 @@ let emit (decls : Decl list) : EmitResult =
         (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
         (call $append (struct.get $cons 1 (ref.cast (ref $cons) (local.get $a))) (local.get $b))))
       (else (local.get $b))))
+  ;; int -> decimal string
+  (func $ndigits (param $n i32) (result i32)
+    (local $c i32) (local $m i32)
+    (local.set $m (local.get $n))
+    (if (i32.lt_s (local.get $m) (i32.const 0))
+      (then (local.set $c (i32.const 1)) (local.set $m (i32.sub (i32.const 0) (local.get $m))))
+      (else (local.set $c (i32.const 0))))
+    (local.set $c (i32.add (local.get $c) (i32.const 1)))
+    (block $done
+      (loop $go
+        (local.set $m (i32.div_u (local.get $m) (i32.const 10)))
+        (br_if $done (i32.eqz (local.get $m)))
+        (local.set $c (i32.add (local.get $c) (i32.const 1)))
+        (br $go)))
+    (local.get $c))
+  (func $itoa (param $n i32) (result anyref)
+    (local $len i32) (local $s (ref $str)) (local $i i32) (local $m i32) (local $neg i32)
+    (local.set $len (call $ndigits (local.get $n)))
+    (local.set $s (array.new $str (i32.const 48) (local.get $len)))
+    (local.set $m (local.get $n))
+    (if (i32.lt_s (local.get $m) (i32.const 0))
+      (then (local.set $neg (i32.const 1))
+            (local.set $m (i32.sub (i32.const 0) (local.get $m)))
+            (array.set $str (local.get $s) (i32.const 0) (i32.const 45))))
+    (local.set $i (i32.sub (local.get $len) (i32.const 1)))
+    (block $done
+      (loop $go
+        (array.set $str (local.get $s) (local.get $i)
+          (i32.add (i32.const 48) (i32.rem_u (local.get $m) (i32.const 10))))
+        (local.set $m (i32.div_u (local.get $m) (i32.const 10)))
+        (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+        (br_if $done (i32.eqz (local.get $m)))
+        (br_if $done (i32.lt_s (local.get $i) (local.get $neg)))
+        (br $go)))
+    (local.get $s))
   (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
     (local $r (ref $str)) (local $i i32) (local $la i32)
     (local.set $la (array.len (local.get $a)))

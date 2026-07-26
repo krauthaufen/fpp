@@ -134,7 +134,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
@@ -182,6 +182,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | None -> "?", mono (TCon ("?", []))
                  PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
              | [] -> PWild)
+        | TypeTestPat ->
+            (match nodesOf n
+                   |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+                   |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead) with
+             | Some t -> PTypeTest t.Text
+             | None -> PWild)
         | TuplePat -> PTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
         | ConsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with

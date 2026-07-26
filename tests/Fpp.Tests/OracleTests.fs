@@ -709,6 +709,26 @@ let oracleTests =
             "let a = print (show (pick 21))"
             "let b = print (show (pick (0 - 3)))"
         ]
+        oracle "type-test patterns and int-to-string" [
+            "type Shape(tag : int) ="
+            "    member _.Tag = tag"
+            "type Circle(r : int) ="
+            "    inherit Shape(1)"
+            "    member _.R = r"
+            "type Square(s : int) ="
+            "    inherit Shape(2)"
+            "    member _.S = s"
+            "let describe (x : Shape) ="
+            "    match x with"
+            "    | :? Circle as c -> \"circle \" + string c.R"
+            "    | :? Square as s -> \"square \" + string s.S"
+            "    | _ -> \"shape\""
+            "let a = print (describe (Circle(3)))"
+            "let b = print (describe (Square(4)))"
+            "let c = print (describe (Shape(9)))"
+            "let d = print (string (0 - 7))"
+            "let e = print (\"n=\" + string 1234567)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"
