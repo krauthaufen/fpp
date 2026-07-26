@@ -49,6 +49,23 @@ let divergenceGate =
             Expect.equal out "reference\nsame\nstable\n"
                 "arrays equal only themselves, and stay equal to themselves across mutation"
         }
+        test "an array's hash is its length, and survives mutation" {
+            // Identity equality only obliges equal values to hash equally,
+            // so length is legal — and it is the one thing about an array
+            // that writing to its elements cannot change.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let a = [| 1; 2; 3 |]"
+                    "let b = [| 9; 9 |]"
+                    "let h0 = hash a"
+                    "let m = a.[0] <- 99"
+                    "let r1 = print (if hash a = h0 then \"stable\" else \"CHANGED\")"
+                    "let r2 = print (if hash a = hash b then \"same\" else \"by-length\")"
+                    "" ])
+            Expect.equal out "stable\nby-length\n"
+                "an array's hash does not move when its contents do"
+        }
     ]
 
 [<Tests>]

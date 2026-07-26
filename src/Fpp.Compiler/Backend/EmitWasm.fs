@@ -1659,7 +1659,7 @@ let emit (decls : Decl list) : EmitResult =
               + string (classId cn) + ") " + vt + "))")
 
     // runtime: putc, print, itoa, equal, append, apply
-    line """  (func $putc (param $c i32)
+    let runtimeSrc = """  (func $putc (param $c i32)
     (i32.store8 (i32.const 64) (local.get $c))
     (i32.store (i32.const 0) (i32.const 64))
     (i32.store (i32.const 4) (i32.const 1))
@@ -1740,6 +1740,20 @@ let emit (decls : Decl list) : EmitResult =
                                      (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $b))))))))
     (if (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
       (then (return (ref.i31 (i32.const 1)))))
+    ;; tuples: $tupN is a distinct type per arity, so this cannot confuse
+    ;; two different shapes
+TUPLE_EQ
+    ;; DU cases: the tag is globally unique, so equal tags are the same case
+    (if (i32.and (ref.test (ref $du0) (local.get $a)) (ref.test (ref $du0) (local.get $b)))
+      (then (return (ref.i31 (i32.eq (struct.get $du0 0 (ref.cast (ref $du0) (local.get $a)))
+                                     (struct.get $du0 0 (ref.cast (ref $du0) (local.get $b))))))))
+    (if (i32.and (ref.test (ref $du1) (local.get $a)) (ref.test (ref $du1) (local.get $b)))
+      (then
+        (if (i32.ne (struct.get $du1 0 (ref.cast (ref $du1) (local.get $a)))
+                    (struct.get $du1 0 (ref.cast (ref $du1) (local.get $b))))
+          (then (return (ref.i31 (i32.const 0)))))
+        (return (call $equal (struct.get $du1 1 (ref.cast (ref $du1) (local.get $a)))
+                             (struct.get $du1 1 (ref.cast (ref $du1) (local.get $b)))))))
     (if (i32.and (ref.test (ref $cons) (local.get $a)) (ref.test (ref $cons) (local.get $b)))
       (then
         (if (i32.eqz (i31.get_s (ref.cast (ref i31) (call $equal
@@ -1803,6 +1817,25 @@ let emit (decls : Decl list) : EmitResult =
       (then (return (i32.xor
         (i32.wrap_i64 (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))))
         (i32.wrap_i64 (i64.shr_u (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))) (i64.const 32)))))))
+    ;; Arrays hash to their LENGTH: identity equality only obliges equal
+    ;; values to hash equally, and length is the one thing about an array
+    ;; that writes to its elements cannot change. See DIVERGENCES.md.
+    (if (ref.test (ref $arr) (local.get $v))
+      (then (return (array.len (ref.cast (ref $arr) (local.get $v))))))
+    (if (ref.test (ref $parr_i) (local.get $v))
+      (then (return (array.len (ref.cast (ref $parr_i) (local.get $v))))))
+    (if (ref.test (ref $parr_f) (local.get $v))
+      (then (return (array.len (ref.cast (ref $parr_f) (local.get $v))))))
+    (if (ref.test (ref $parr_s) (local.get $v))
+      (then (return (array.len (ref.cast (ref $parr_s) (local.get $v))))))
+    (if (ref.test (ref $parr_l) (local.get $v))
+      (then (return (array.len (ref.cast (ref $parr_l) (local.get $v))))))
+TUPLE_HASH
+    (if (ref.test (ref $du0) (local.get $v))
+      (then (return (struct.get $du0 0 (ref.cast (ref $du0) (local.get $v))))))
+    (if (ref.test (ref $du1) (local.get $v))
+      (then (return (i32.add (i32.mul (struct.get $du1 0 (ref.cast (ref $du1) (local.get $v))) (i32.const 31))
+                             (call $hashv (struct.get $du1 1 (ref.cast (ref $du1) (local.get $v))))))))
     (if (ref.test (ref $str) (local.get $v))
       (then
         (local.set $h (i32.const -2128831035))
@@ -1992,6 +2025,36 @@ let emit (decls : Decl list) : EmitResult =
     (call_ref $u1 (local.get $a)
       (struct.get $clo 1 (ref.cast (ref $clo) (local.get $f)))
       (struct.get $clo 0 (ref.cast (ref $clo) (local.get $f)))))"""
+
+    // Structural equality and hashing for tuples: $tupN is a distinct wasm
+    // type per arity, so testing it cannot confuse two different shapes.
+    let tupleEqCases =
+        vecToList tupleArities
+        |> List.map (fun n ->
+            let t = "$tup" + string n
+            let cmp i =
+                "        (if (i32.eqz (i31.get_s (ref.cast (ref i31) (call $equal "
+                + "(struct.get " + t + " " + string i + " (ref.cast (ref " + t + ") (local.get $a))) "
+                + "(struct.get " + t + " " + string i + " (ref.cast (ref " + t + ") (local.get $b)))))))\n"
+                + "          (then (return (ref.i31 (i32.const 0)))))"
+            "    (if (i32.and (ref.test (ref " + t + ") (local.get $a)) (ref.test (ref " + t + ") (local.get $b)))\n"
+            + "      (then\n"
+            + String.concat "\n" (List.init n cmp) + "\n"
+            + "        (return (ref.i31 (i32.const 1)))))")
+        |> String.concat "\n"
+    let tupleHashCases =
+        vecToList tupleArities
+        |> List.map (fun n ->
+            let t = "$tup" + string n
+            let part i =
+                "(call $hashv (struct.get " + t + " " + string i + " (ref.cast (ref " + t + ") (local.get $v))))"
+            let combined =
+                List.init n part
+                |> List.reduce (fun acc x -> "(i32.add (i32.mul " + acc + " (i32.const 31)) " + x + ")")
+            "    (if (ref.test (ref " + t + ") (local.get $v))\n      (then (return " + combined + ")))")
+        |> String.concat "\n"
+    line (runtimeSrc.Replace("TUPLE_EQ", tupleEqCases).Replace("TUPLE_HASH", tupleHashCases))
+
 
     // top-level functions and value initializers
     let initFuncs = vecNew<string> ()

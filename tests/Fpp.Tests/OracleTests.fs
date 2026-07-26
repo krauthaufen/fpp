@@ -755,6 +755,22 @@ let oracleTests =
             "let a = print (Pair.key p)"
             "let b = print p.K"
         ]
+        oracle "structural equality and hashing: DUs, tuples, records" [
+            "type P = { X : int; Y : string }"
+            "type Sh = | Dot | Box of int | Pair of int"
+            "let a = { X = 1; Y = \"s\" }"
+            "let b = { X = 1; Y = \"s\" }"
+            "let r1 = print (if a = b then \"eq\" else \"ne\")"
+            "let r2 = print (if Box 3 = Box 3 then \"eq\" else \"ne\")"
+            "let r3 = print (if Box 3 = Pair 3 then \"eq\" else \"ne\")"
+            "let r4 = print (if Box 3 = Box 4 then \"eq\" else \"ne\")"
+            "let r5 = print (if (1, \"s\") = (1, \"s\") then \"eq\" else \"ne\")"
+            "let r6 = print (if (1, 2) = (2, 1) then \"eq\" else \"ne\")"
+            "let r7 = print (if Dot = Dot then \"eq\" else \"ne\")"
+            "let r8 = print (if [1;2] = [1;2] then \"eq\" else \"ne\")"
+            "let h1 = print (if hash (Box 3) = hash (Box 3) then \"eq\" else \"ne\")"
+            "let h2 = print (if hash (1, \"s\") = hash (1, \"s\") then \"eq\" else \"ne\")"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"
