@@ -237,6 +237,28 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                  | [ GToken t ] when t.Kind = Ident -> tryRecord env t
                  | _ -> ())
                 env
+            | ObjExpr ->
+                // an anonymous class: its members are keyed by a synthetic
+                // name derived from the expression's position
+                let synth =
+                    match Green.tokens g |> List.tryHead with
+                    | Some t -> "obj@" + string t.Offset
+                    | None -> "obj@?"
+                let iface =
+                    n.Children
+                    |> List.tryPick (fun c ->
+                        match c with
+                        | GNode ty when isTypeKind ty.NodeKind ->
+                            (walkType env c
+                             Green.tokens c |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
+                        | _ -> None)
+                    |> Option.map (fun t -> t.Text)
+                let owner = match iface with Some i -> synth + "." + i | None -> synth
+                for c in n.Children do
+                    match c with
+                    | GNode m when m.NodeKind = MemberDecl -> walkMember owner env m
+                    | _ -> ()
+                env
             | DotExpr ->
                 (match flattenSpine g with
                  | Some (head :: _ as spine) when (Map.tryFind head.Text env |> Option.forall (fun d -> d.Kind = DefModule)) ->

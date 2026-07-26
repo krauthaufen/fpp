@@ -404,6 +404,28 @@ let oracleTests =
             "let a5 = print l.Extra"
             "let a6 = print (((l :> Base) :?> Leaf).Tag)"
         ]
+        oracle "object expressions: anonymous classes that capture" [
+            "type IMonoid ="
+            "    abstract member Zero : int"
+            "    abstract member Combine : int -> int -> int"
+            "let adder (bias : int) (scale : int) ="
+            "    { new IMonoid with"
+            "        member _.Zero = bias"
+            "        member _.Combine a b = (a + b) * scale }"
+            "let maxer ="
+            "    { new IMonoid with"
+            "        member _.Zero = 0"
+            "        member _.Combine a b = if a > b then a else b }"
+            "let rec foldWith (m : IMonoid) (xs : int list) ="
+            "    match xs with"
+            "    | h :: t -> m.Combine h (foldWith m t)"
+            "    | [] -> m.Zero"
+            "let xs = [1; 2; 3; 4]"
+            "let a = print (foldWith (adder 0 1) xs)"
+            "let b = print (foldWith (adder 100 1) xs)"
+            "let c = print (foldWith maxer xs)"
+            "let d = print (foldWith (adder 0 2) [1; 2])"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

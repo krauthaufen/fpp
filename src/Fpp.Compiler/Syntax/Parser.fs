@@ -546,7 +546,24 @@ let parse (src : string) : ParseResult =
             if s.Is RBracket then vecAdd acc (s.Bump ()) else s.Diag "expected ']'"
             Green.node ListExpr (vecToList acc)
         elif s.Is LBrace then
-            if looksLikeRecordExpr () then parseRecordExpr ctx
+            if s.IsKw "new" || ((s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "new") then
+                // object expression: `{ new IFace with member ... }` — an
+                // anonymous class, the natural way to hand over a dictionary
+                let acc = vecNew<Green> ()
+                vecAdd acc (s.Bump ())   // {
+                if s.IsKw "new" then vecAdd acc (s.Bump ())
+                vecAdd acc (parseType ctx)
+                if s.IsKw "with" then vecAdd acc (s.Bump ())
+                bracketDepth <- bracketDepth + 1
+                let mutable go = true
+                while go && not s.AtEof && not (s.Is RBrace) && isMemberStart () do
+                    let mark = s.Mark
+                    vecAdd acc (parseMember ())
+                    if s.Mark = mark then go <- false
+                bracketDepth <- bracketDepth - 1
+                if s.Is RBrace then vecAdd acc (s.Bump ()) else s.Diag "expected '}'"
+                Green.node ObjExpr (vecToList acc)
+            elif looksLikeRecordExpr () then parseRecordExpr ctx
             else
                 // sequences and computation bodies: balanced token soup —
                 // lossless, structured when CEs are modeled

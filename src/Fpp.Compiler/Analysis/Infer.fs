@@ -630,6 +630,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     last <- exprType (GNode m)
                 last
             | LetDecl -> inferLet n
+            | ObjExpr ->
+                // an anonymous class implementing one interface: type its
+                // members against a synthetic receiver, yield the interface
+                let synth =
+                    match Green.tokens (GNode n) |> List.tryHead with
+                    | Some t -> "obj@" + string t.Offset
+                    | None -> "obj@?"
+                let ivars = dictNew<string, Type> ()
+                let ifaceTy =
+                    match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                    | Some tn -> typeFromNode ivars tn
+                    | None -> st.Fresh ()
+                let ifaceName =
+                    match prune ifaceTy with
+                    | TCon (nm, _) -> nm
+                    | _ -> "?"
+                let selfTy = TCon (synth, [])
+                for m in nodesOf n do
+                    if m.NodeKind = MemberDecl then
+                        inferMember (synth + "." + ifaceName) (dictNew ()) [] selfTy m
+                ifaceTy
             | CastExpr ->
                 // `e :> T` / `e :?> T`: the operand is typed for its own
                 // sake, the result is the target type

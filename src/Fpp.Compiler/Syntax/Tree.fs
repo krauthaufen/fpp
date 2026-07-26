@@ -40,6 +40,7 @@ type NodeKind =
     | BlockExpr
     | DotExpr
     | CastExpr
+    | ObjExpr
     | ForExpr
     | WhileExpr
     | TryExpr
