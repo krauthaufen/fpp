@@ -97,7 +97,14 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             else
                 let i = p.LastIndexOf '.'
                 if i < 0 then [ p; "" ] else p :: prefixes (substr p 0 i)
-        List.rev (vecToList opens) @ prefixes modulePath @ [ "" ]
+        // An `open M` names a module RELATIVE to where it appears, so it has
+        // to be composed with the enclosing module path — otherwise opening
+        // a module fails to bring its nested modules into scope.
+        let opened =
+            List.rev (vecToList opens)
+            |> List.collect (fun o ->
+                (prefixes modulePath |> List.map (fun p -> if p = "" then o else p + "." + o)))
+        opened @ prefixes modulePath @ [ "" ]
 
     let findQualified (dotted : string) : Definition option =
         bases ()
