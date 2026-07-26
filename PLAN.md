@@ -75,47 +75,26 @@ the set/map node implementation: generic inheritance, property accessors,
 packed uint32 tag bits, the NodeKind enum, null-terminated chains,
 IEqualityComparer dispatch, struct tuples, and implicit upcasts.
 
-On the acceptance target (4501 lines), the front end now reaches a parse
-frontier of line **3678**; only 92 lines still have parse errors and 142
-have type errors. The ported copy lives at
-`tests/reference-HashCollections.ported.fs` — two ports so far, both of the
-kind anticipated from the start: `OptimizedClosures.FSharpFunc`/`Adapt`/
-`Invoke` (a CLR perf hack; the F++ counterpart is a curried function), and
-prelude additions (`voption`, `DefaultEqualityComparer`).
+On the acceptance target: the ported file (4130 lines after choosing a
+compilation target) now **parses with zero diagnostics and lowers with 11
+notes**. `ws.EmitProgram()` reports exactly **14 blockers**, and they are
+the whole remaining gap:
 
-Landed for the target this round: type-test PATTERNS (`| :? T as x ->`,
-which narrow via the subtyping rule rather than by equality), generic
-arguments in a type test, `obj` as the top type, int-to-string, attributes
-on type members, and `static let` at its own column.
+- 3 type errors:
+  - 2164 `MapLinked.exists` — a type and a module share a name
+  - 3792 `CopyTo(('K*'V)[], int)` vs `CopyTo(struct('K*'V)[], int)` —
+    MEMBER overloading (constructors are done; methods are not)
+  - 4111 `union` — same, on a member call
+- 11 `for e in <seq>` loops. These need the enumerator protocol for real:
+  `seq`/`IEnumerable`/`IEnumerator` as prelude interfaces, arrays and
+  lists implementing them, and `for-in` desugaring to
+  `GetEnumerator`/`MoveNext`/`Current`. Typing them is not enough — they
+  have to run.
 
-Landed since: CONSTRUCTOR OVERLOADING (a type may declare a primary
-constructor and any number of `new(...)`; each is its own function,
-inference picks one by trial unification on a private copy of the scheme
-and records the choice, and it works through explicit type arguments);
-`seq` recognised as `IEnumerable` with arrays, lists and implementing
-types as subtypes; and dotted interface names resolving to the type rather
-than the module qualifier (`System.Collections.Generic.IEnumerable` was
-being filed under `System`).
-
-State: 92 lines with parse errors (frontier at 3678), 102 with type errors,
-down from 541/142.
-
-Remaining, in rough order of blocking power:
-- [ ] `Seq.*`, `String.concat`, `sprintf`
-- [ ] `IEnumerable`/`IEnumerator` as a working protocol:
-      `GetEnumerator`/`MoveNext`/`Dispose` (typing them is not enough —
-      they have to run)
-- [ ] `override ToString()`/`GetHashCode()`/`Equals(o)` object protocol
-- [ ] attributes inside a type-parameter list:
-      `HashMap<'K, [<EqualityConditionalOn>] 'V>`
-- [ ] 36 diagnostics reporting `list<bool> vs bool` AT an attribute line
-      (e.g. 3736, 3744) — the attribute is being typed as a list
-      expression, but only in this file: the obvious minimal repro
-      (attributes on consecutive members) parses and runs clean, so the
-      trigger is something about the surrounding member bodies. Find the
-      real repro before fixing.
-- [ ] one type error at 2247 (`MapLinked.exists`), where a type and a
-      module share a name
+`tests/port-reference.py` is the reproducible port: every rule is a .NET
+dependency with no F++ counterpart (OptimizedClosures, CLR/tooling
+attributes, `#if` target choice), and each is documented in the script.
+Nothing in it works around a compiler limitation.
 
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real

@@ -842,11 +842,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let barOff = match tokensOf cl |> List.tryHead with Some t -> t.Offset | None -> 0
                         // pattern nodes (before ->) unify with the scrutinee
                         let cvars = dictNew<string, Type> ()
+                        let rec isTypeTest (m : GreenNode) =
+                            m.NodeKind = TypeTestPat
+                            || (m.NodeKind = AsPat
+                                && (nodesOf m |> List.exists isTypeTest))
                         for m in nodesOf cl do
                             if isPatKind m.NodeKind then
-                                // a `:?` pattern narrows: it is a SUBtype of
-                                // the scrutinee, not equal to it
-                                unifyArg barOff scrut (patType cvars m)
+                                // A `:?` clause states a runtime test, not an
+                                // equation: the tested type need not even be
+                                // one we have a declaration for. Typing its
+                                // binder is enough.
+                                if isTypeTest m then patType cvars m |> ignore
+                                else unifyArg barOff scrut (patType cvars m)
                         // body: expr children; when-guard is bool but we keep it loose
                         let bodies = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
                         (match List.tryLast bodies with
@@ -1543,6 +1550,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     pendingStructAttr <- true
             | ModuleHeader | OpenDecl -> ()
             | _ -> exprType g |> ignore
+
+    // Which interfaces each type implements has to be known BEFORE any
+    // body is checked: a type's own members may narrow to it (`:? HashSet`
+    // from a `seq`), and that test needs the subtype relation already.
+    let rec preScan (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            if n.NodeKind = TypeDecl then
+                match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some nameTok ->
+                    let rec ifaceOf (ty : GreenNode) : string option =
+                        match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                        | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                        | _ ->
+                            Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                            |> Option.map (fun t -> t.Text)
+                    let names =
+                        nodesOf n
+                        |> List.filter (fun m -> m.NodeKind = InterfaceImpl)
+                        |> List.choose (fun m ->
+                            nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) |> Option.bind ifaceOf)
+                    if not (List.isEmpty names) then
+                        let prior = match dictTryFind impls nameTok.Text with Some l -> l | None -> []
+                        dictSet impls nameTok.Text (prior @ names)
+                | None -> ()
+            elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
+    root.Children |> List.iter preScan
 
     for c in root.Children do inferDecl c
 
