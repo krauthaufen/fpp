@@ -1115,7 +1115,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf m
                     |> List.tryPick (fun x ->
                         if isTypeKind x.NodeKind then
-                            Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                            Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
                         else None)
                     |> Option.map (fun t -> t.Text)
                 let owner = match ifaceName with Some inm -> name + "." + inm | None -> name

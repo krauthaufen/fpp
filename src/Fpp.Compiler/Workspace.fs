@@ -123,6 +123,11 @@ module Builtin =
             "type exn ="
             "    | Failure of string"
             "    | InvalidCast of string"
+            // the equality-comparer abstraction the hash collections take
+            // as a parameter; `hash` and `=` are the structural defaults
+            "type IEqualityComparer<'a> ="
+            "    abstract member Equals : 'a * 'a -> bool"
+            "    abstract member GetHashCode : 'a -> int"
             "module Array ="
             "    extern let create : int -> 'a -> 'a[]"
             "    extern let pin : 'a[] -> int"

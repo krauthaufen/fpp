@@ -75,6 +75,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable currentClass = ""
     let fieldOfVar = dictNew<string * int, string * string> ()
 
+    /// The name of an interface written in a type position. For a generic
+    /// application the head is the interface — the LAST identifier is a type
+    /// argument (`IEqualityComparer<int>` is IEqualityComparer, not int).
+    let rec ifaceNameOf (tn : GreenNode) : string option =
+        let sub = tn.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+        match sub |> List.tryFind (fun m -> m.NodeKind = NamedType || m.NodeKind = AppType) with
+        | Some head when tn.NodeKind = AppType -> ifaceNameOf head
+        | _ ->
+            Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+            |> Option.map (fun t -> t.Text)
+
     /// `C.Foo` where C names a type: a static member, so no receiver.
     let isStaticUse (n : GreenNode) : bool =
         match n.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
@@ -484,12 +495,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let hi = match toks |> List.tryLast with Some t -> t.Offset | None -> 0
                 let synth = "obj@" + string lo
                 let iface =
-                    nodesOf n
-                    |> List.tryPick (fun m ->
-                        if isTypeKind m.NodeKind then
-                            Green.tokens (GNode m) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
-                        else None)
-                    |> Option.map (fun t -> t.Text)
+                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceNameOf
                 // captures: uses inside the expression bound to a LOCAL
                 // definition outside it (top-level bindings need no capture)
                 let captured = vecNew<VarId * Scheme> ()
@@ -1044,12 +1050,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.filter (fun m -> m.NodeKind = InterfaceImpl)
             |> List.map (fun i ->
                 let iname =
-                    nodesOf i
-                    |> List.tryPick (fun x ->
-                        if isTypeKind x.NodeKind then
-                            Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
-                        else None)
-                    |> Option.map (fun t -> t.Text)
+                    nodesOf i |> List.tryFind (fun x -> isTypeKind x.NodeKind) |> Option.bind ifaceNameOf
                 (match iname with Some x -> x | None -> "?"),
                 nodesOf i |> List.filter (fun m -> m.NodeKind = MemberDecl))
         let implemented = vecNew<string * (string * VarId) list> ()

@@ -40,7 +40,9 @@ let private fsiRun (src : string) : string =
         |> Array.filter (fun l -> not (l.StartsWith "module "))
         |> String.concat "\n"
     let prelude =
-        "let print (x : obj) =\n"
+        // IEqualityComparer lives in the builtin prelude on the F++ side
+        "open System.Collections.Generic\n"
+        + "let print (x : obj) =\n"
         + "    match x with\n"
         + "    | :? string as s -> printfn \"%s\" s\n"
         + "    | :? int as i -> printfn \"%d\" i\n"
@@ -568,6 +570,34 @@ let oracleTests =
             "let c = print (length empty)"
             "let d = print (if isNull empty then \"empty\" else \"no\")"
             "let e = print (if isNull three.Next then \"no next\" else \"has next\")"
+        ]
+        oracle "IEqualityComparer through object expressions" [
+            "[<AllowNullLiteral>]"
+            "type SetLinked<'K>(key : 'K, next : SetLinked<'K>) ="
+            "    let mutable key = key"
+            "    let mutable next = next"
+            "    member x.Key"
+            "        with get() = key"
+            "        and set v = key <- v"
+            "    member x.Next"
+            "        with get() = next"
+            "        and set v = next <- v"
+            "let rec contains (cmp : IEqualityComparer<'K>) (key : 'K) (n : SetLinked<'K>) ="
+            "    if isNull n then false"
+            "    elif cmp.Equals(n.Key, key) then true"
+            "    else contains cmp key n.Next"
+            "let structural ="
+            "    { new IEqualityComparer<int> with"
+            "        member _.Equals (a, b) = a = b"
+            "        member _.GetHashCode a = hash a }"
+            "let modular ="
+            "    { new IEqualityComparer<int> with"
+            "        member _.Equals (a, b) = a % 10 = b % 10"
+            "        member _.GetHashCode a = hash (a % 10) }"
+            "let chain = SetLinked(1, SetLinked(2, SetLinked(3, null)))"
+            "let a = print (if contains structural 2 chain then \"yes\" else \"no\")"
+            "let b = print (if contains structural 9 chain then \"yes\" else \"no\")"
+            "let c = print (if contains modular 12 chain then \"yes\" else \"no\")"
         ]
         oracle "string equality and chars" [
             "let pick s ="
