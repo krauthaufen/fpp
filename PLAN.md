@@ -75,44 +75,45 @@ the set/map node implementation: generic inheritance, property accessors,
 packed uint32 tag bits, the NodeKind enum, null-terminated chains,
 IEqualityComparer dispatch, struct tuples, and implicit upcasts.
 
-The front end now reaches line **3260** of 4501. What remains is no longer
-F# language surface — it is the FSharp.Core / BCL surface the file depends
-on, which is Stage 5 work (port FSharp.Core), not compiler work:
-- `OptimizedClosures.FSharpFunc<...>.Adapt` (an FSharp.Core internal)
-- `DefaultEqualityComparer<'K>.Instance`
-- `IEnumerable`/`IEnumerator`: `GetEnumerator`/`MoveNext`/`Dispose`
-- `voption` (`ValueSome`/`ValueNone`), `Seq.*`, `Array.*`
-- `inline` functions (90 lines mention it)
-Most of the 596 remaining flagged lines cascade from a handful of these
-inside `static let` bindings, which derail their enclosing type body.
+The front end now reaches line **3295** of 4501 on the unmodified file, and
+the same point on a lightly ported copy. Two ports were needed so far, both
+of the kind anticipated from the start (".NET internals need F++
+counterparts"): `OptimizedClosures.FSharpFunc<...>`/`.Adapt`/`.Invoke` is a
+CLR perf hack whose F++ counterpart is a plain curried function, and the
+prelude gained `voption`/`ValueSome`/`ValueNone` and
+`DefaultEqualityComparer`.
 
-### Generic structs — attempted, reverted, and why
-A field declaration carries its TYPE rather than a pre-resolved kind, so a
-`'a` field is no longer frozen as boxed. That part is landed.
+What remains is BCL/FSharp.Core surface plus one language feature:
+- [ ] type-test PATTERNS: `| :? HashSet<'K> as o ->` (the expression form
+      `x :? T` is done; the pattern form is not)
+- [ ] `Seq.*`, `String.concat`, `sprintf`
+- [ ] `IEnumerable`/`IEnumerator`: `GetEnumerator`/`MoveNext`/`Dispose`
+- [ ] `override x.ToString()` / `GetHashCode()` / `Equals(o)` and the
+      object protocol they imply
 
-Stamping a generic struct per instantiation was then built and REVERTED to
-a stash (`generic struct stamping WIP`). It demonstrably worked for the
-concrete case — `struct(int * int)` produced
-`$r_StructTuple2$<int.int> (struct (field (mut i32)) (field (mut i32)))`,
-i.e. genuinely unboxed — but broke the mixed case, and I would not leave
-that half-applied.
+### Generic structs — DONE
+A generic struct is stamped per instantiation, so its fields carry a real
+representation instead of being boxed: `Pair<float,float>` gets f64 fields,
+`Pair<int,int>` gets i32, and arrays of them are packed. Struct tuples get
+this for free, being ordinary generic structs. Reference types are NOT
+stamped: their fields are uniform whatever they hold, so splitting them
+would buy nothing.
 
-The design, for whoever picks it up:
-- a type's name carries its instantiation, bracketed so nesting is
-  unambiguous: `Pair$<int.Pair$<int.int>>`;
-- Infer records that name at every site the backend identifies a type by
-  name: array element, field owner, record literal, struct-tuple pattern;
-- Link stamps a DRecord per used name, after monomorphization so the names
-  are concrete;
-- a record name still mentioning a type variable makes its function
-  layout-dependent, so the function is stamped and the name substituted.
+How: a type's name carries its instantiation, bracketed so nesting stays
+unambiguous (`Pair$<int.Pair$<int.int>>`); Infer records that name wherever
+the backend identifies a type by name (array element, field owner, record
+literal, struct-tuple pattern); Link stamps a DRecord per used name after
+monomorphization; and a record name still mentioning a type variable makes
+its function layout-dependent, so the function is stamped and the name
+substituted.
 
-The unresolved symptom: with a generic producer (`addInPlace` returning
-`StructTuple2<bool, SetLinked<'K>>`) and a concrete consumer, the
-producer's clone was not created — the recursive call classified as
-Unclassifiable, which suggests the `#id` in the mangled record name does
-not always match the id of the scheme's quantified var that Link
-substitutes. Verify that correspondence first.
+Two latent bugs surfaced and were fixed:
+- a recursive self-call carries no instantiation (a function is monomorphic
+  inside its own body), so a stamped clone kept calling the template that
+  specialization had already removed;
+- synthetic `_arg` binders reused their definition's own offset, so a
+  parameter and its function shared one identity and any table keyed by
+  VarId confused them.
 
 Earlier items, now done:
 Earlier items, now done:
