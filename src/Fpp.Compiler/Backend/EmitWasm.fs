@@ -40,7 +40,10 @@ let emit (decls : Decl list) : EmitResult =
         | _ -> [ n ]
     /// every class that is `n` or derives from it — what a downcast accepts
     let subclassesOf (n : string) =
-        classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
+        // a plain record has no hierarchy: it is only itself
+        let derived =
+            classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
+        if List.isEmpty derived then [ n ] else derived
     let interfaceDecls = decls |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
     // one global slot per (interface, method), so every vtable agrees
     let vtableSlots =
@@ -67,15 +70,30 @@ let emit (decls : Decl list) : EmitResult =
                 |> List.tryPick (fun c ->
                     ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = m then Some v else None)))
             else None
+    /// Slots 0 and 1 of every vtable are equals and hash. The contract is
+    /// total, so every reference type fills them; interface methods follow.
+    let identitySlots = 2
     let slotOf (iface : string) (m : string) =
         vtableSlots |> List.tryFindIndex (fun (i, mm) -> i = iface && mm = m)
+        |> Option.map (fun i -> i + identitySlots)
     // functions reachable through a vtable keep the canonical all-anyref
     // signature — that IS the dispatch contract, so no specialization
+    /// The function filling an identity slot: a user override if the type
+    /// declares one, otherwise the generated function.
+    let identityImpl (cn : string) (name : string) : VarId option =
+        chainOf cn
+        |> List.tryPick (fun c ->
+            ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None)))
     let ifaceImplKeys =
         (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (_, ms) -> ms |> List.map (fun (_, v) -> v.Path, v.Offset))))
         @ (classDecls
            |> List.collect (fun (cn, _, _, _) ->
                 vtableSlots |> List.choose (fun (i, m) -> slotImpl cn i m |> Option.map (fun v -> v.Path, v.Offset))))
+        // an identity override is reached through a vtable too, so it keeps
+        // the canonical all-anyref signature
+        @ (classDecls
+           |> List.collect (fun (cn, _, _, _) ->
+                [ "Equals"; "GetHashCode" ] |> List.choose (fun m -> identityImpl cn m |> Option.map (fun v -> v.Path, v.Offset))))
     let isIfaceImpl (key : string * int) = List.contains key ifaceImplKeys
 
     let rawRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, st) -> Some (n, fs, st) | _ -> None)
@@ -88,10 +106,19 @@ let emit (decls : Decl list) : EmitResult =
             match baseOf n with
             | Some b when b <> n -> expandedFields b @ fs
             | _ -> fs
+    // EVERY reference type carries a descriptor: it is what lets equality,
+    // hashing and casts work on a value whose type is not statically known.
+    // Value types never need one — they are known statically.
+    let isObjRecord (n : string) =
+        rawRecords |> List.exists (fun (rn, _, st) -> rn = n && not st)
+    let objRecordNames = rawRecords |> List.filter (fun (_, _, st) -> not st) |> List.map (fun (n, _, _) -> n)
+    let descId (n : string) = objRecordNames |> List.findIndex (fun rn -> rn = n)
     let records =
         rawRecords
         |> List.map (fun (n, fs, st) ->
-            if isClassName n then n, ("__desc", "r") :: expandedFields n, st else n, fs, st)
+            if st then n, fs, st
+            elif isClassName n then n, ("__desc", "r") :: expandedFields n, st
+            else n, ("__desc", "r") :: fs, st)
 
     // A field declaration carries a TYPE; the representation is derived
     // here, once, from that type. A struct stores its fields unboxed where
@@ -886,7 +913,7 @@ let emit (decls : Decl list) : EmitResult =
                  let vals =
                      order
                      |> List.map (fun (fname, k) ->
-                         if fname = "__desc" && isClassName rn then "(global.get $desc_" + rn + ")"
+                         if fname = "__desc" && isObjRecord rn then "(global.get $desc_" + rn + ")"
                          else
                          match fields |> List.tryFind (fun (f, _) -> f = fname) with
                          | Some (_, v) -> unboxBy k (recur v)
@@ -999,7 +1026,7 @@ let emit (decls : Decl list) : EmitResult =
                  vecAdd errors ("no dispatch slot for " + iface + "." + mname)
                  "(ref.i31 (i32.const 0))")
         | ETypeTest (tn, e) ->
-            if not (isClassName tn) then
+            if not (isObjRecord tn) then
                 vecAdd errors ("cannot type-test against " + tn + ": not a class")
                 "(ref.i31 (i32.const 0))"
             else
@@ -1007,7 +1034,7 @@ let emit (decls : Decl list) : EmitResult =
                 let idOf =
                     "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
                 let test =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
                     | [] -> "(i32.const 0)"
                     | [ one ] -> one
                     | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
@@ -1017,7 +1044,7 @@ let emit (decls : Decl list) : EmitResult =
             // unchanged, so there is nothing to do at runtime
             recur e
         | ECast (tn, e, true) ->
-            if not (isClassName tn) then
+            if not (isObjRecord tn) then
                 vecAdd errors ("cannot downcast to " + tn + ": not a class")
                 "(ref.i31 (i32.const 0))"
             else
@@ -1026,7 +1053,7 @@ let emit (decls : Decl list) : EmitResult =
                     "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
                 // a downcast succeeds for the target class OR any subclass
                 let castTest =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
                     | [] -> "(i32.const 0)"
                     | [ one ] -> one
                     | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
@@ -1419,13 +1446,13 @@ let emit (decls : Decl list) : EmitResult =
             app ("(br_if " + failLbl + " (i32.eqz (ref.is_null " + v + ")))")
         | PTypeTest tn ->
             // the same class-id check a `:?` expression performs
-            if not (isClassName tn) then
+            if not (isObjRecord tn) then
                 vecAdd errors ("cannot type-test against " + tn + ": not a class")
             else
                 let idOf =
                     "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
                 let test =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
                     | [] -> "(i32.const 0)"
                     | [ one ] -> one
                     | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
@@ -1600,7 +1627,9 @@ let emit (decls : Decl list) : EmitResult =
                 slotImpl cn i m |> Option.bind (fun v -> dictTryFind topArity (v.Path, v.Offset))))
         |> List.distinct
         |> List.sort
-    for k in ifaceArities do
+    for k in (if List.contains 1 ifaceArities then ifaceArities else 1 :: ifaceArities)
+              |> (fun l -> if List.contains 2 l then l else 2 :: l)
+              |> List.sort do
         line ("  (type $v" + string k + " (func " + String.concat " " (List.replicate k "(param anyref)") + " (result anyref)))")
 
     // program-declared types
@@ -1614,7 +1643,7 @@ let emit (decls : Decl list) : EmitResult =
             | k2 when k2.StartsWith "S:" -> "(field (mut (ref $r_" + k2.Substring 2 + ")))"
             | _ -> "(field (mut anyref))"
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
-        if isClassName rn then
+        if isObjRecord rn then
             let super = match baseOf rn with Some b when b <> rn -> "$r_" + b | _ -> "$obj"
             line ("  (type $r_" + rn + " (sub " + super + " (struct " + fields + ")))")
         else line ("  (type $r_" + rn + " (struct " + fields + "))")
@@ -1640,9 +1669,51 @@ let emit (decls : Decl list) : EmitResult =
             if a = 0 then
                 line ("  (global $c_" + cn + " (ref $du0) (struct.new $du0 (i32.const " + string (dictTryFind caseTag cn).Value + ")))")
 
+    // Generated identity. A record compares and hashes over its fields; a
+    // class is its own identity unless it overrides. Both are reached
+    // through the descriptor, so a value of unknown type still resolves.
+    for rn, fs, st in records do
+      if not st && isObjRecord rn then
+        let fieldIdx = fs |> List.mapi (fun i (f, _) -> i, f) |> List.filter (fun (_, f) -> f <> "__desc")
+        let cast (v : string) = "(ref.cast (ref $r_" + rn + ") " + v + ")"
+        if isClassName rn then
+            // reference identity: a class is equal only to itself
+            line ("  (func $eq_" + rn + " (param $a anyref) (param $b anyref) (result anyref)"
+                  + " (ref.i31 (ref.eq (ref.cast (ref null eq) (local.get $a)) (ref.cast (ref null eq) (local.get $b)))))")
+            line ("  (func $hash_" + rn + " (param $v anyref) (result anyref) (ref.i31 (i32.const "
+                  + string (descId rn) + ")))")
+        else
+            let cmp =
+                fieldIdx
+                |> List.map (fun (i, _) ->
+                    "(i32.eqz (i31.get_s (ref.cast (ref i31) (call $equal (struct.get $r_" + rn + " " + string i
+                    + " " + cast "(local.get $a)" + ") (struct.get $r_" + rn + " " + string i + " " + cast "(local.get $b)" + ")))))")
+                |> List.map (fun c -> "(if " + c + " (then (return (ref.i31 (i32.const 0)))))")
+            line ("  (func $eq_" + rn + " (param $a anyref) (param $b anyref) (result anyref) "
+                  + String.concat " " cmp + " (ref.i31 (i32.const 1)))")
+            let h =
+                fieldIdx
+                |> List.map (fun (i, _) ->
+                    "(call $hashv (struct.get $r_" + rn + " " + string i + " " + cast "(local.get $v)" + "))")
+            let folded =
+                match h with
+                | [] -> "(i32.const " + string (descId rn) + ")"
+                | first :: rest ->
+                    rest |> List.fold (fun acc x -> "(i32.add (i32.mul " + acc + " (i32.const 31)) " + x + ")") first
+            line ("  (func $hash_" + rn + " (param $v anyref) (result anyref) (ref.i31 " + folded + "))")
+
     // per-class descriptor: class id plus the vtable, one slot per
     // (interface, method) in the whole program
-    for cn, impls in classImpls do
+    for cn in objRecordNames do
+        let identity =
+            [ "Equals", "$eq_" + cn; "GetHashCode", "$hash_" + cn ]
+            |> List.map (fun (mname, generated) ->
+                match identityImpl cn mname with
+                | Some v ->
+                    (match dictTryFind topName (v.Path, v.Offset) with
+                     | Some fn -> "(ref.func " + fn + ")"
+                     | None -> "(ref.func " + generated + ")")
+                | None -> "(ref.func " + generated + ")")
         let slots =
             vtableSlots
             |> List.map (fun (i, m) ->
@@ -1652,11 +1723,12 @@ let emit (decls : Decl list) : EmitResult =
                      | Some fn -> "(ref.func " + fn + ")"
                      | None -> "(ref.null func)")
                 | None -> "(ref.null func)")
+        let slots = identity @ slots
         let vt =
             if List.isEmpty slots then "(array.new_fixed $vt 0)"
             else "(array.new_fixed $vt " + string slots.Length + " " + String.concat " " slots + ")"
         line ("  (global $desc_" + cn + " (ref $desc) (struct.new $desc (i32.const "
-              + string (classId cn) + ") " + vt + "))")
+              + string (descId cn) + ") " + vt + "))")
 
     // runtime: putc, print, itoa, equal, append, apply
     let runtimeSrc = """  (func $putc (param $c i32)
@@ -1740,6 +1812,20 @@ let emit (decls : Decl list) : EmitResult =
                                      (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $b))))))))
     (if (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
       (then (return (ref.i31 (i32.const 1)))))
+    ;; Any reference type: descriptors are per-type, so two values whose
+    ;; descriptors differ are of different types and cannot be equal. That
+    ;; is what makes this sound where a shape test is not — wasm-GC
+    ;; canonicalizes same-shaped structs into ONE heap type.
+    (if (i32.and (ref.test (ref $obj) (local.get $a)) (ref.test (ref $obj) (local.get $b)))
+      (then
+        (if (i32.eqz (ref.eq
+              (ref.cast (ref null eq) (struct.get $obj 0 (ref.cast (ref $obj) (local.get $a))))
+              (ref.cast (ref null eq) (struct.get $obj 0 (ref.cast (ref $obj) (local.get $b))))))
+          (then (return (ref.i31 (i32.const 0)))))
+        (return (call_ref $v2 (local.get $a) (local.get $b)
+          (ref.cast (ref $v2) (array.get $vt
+            (struct.get $desc 1 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get $a)))))
+            (i32.const 0)))))))
     ;; tuples: $tupN is a distinct type per arity, so this cannot confuse
     ;; two different shapes
 TUPLE_EQ
@@ -1817,6 +1903,11 @@ TUPLE_EQ
       (then (return (i32.xor
         (i32.wrap_i64 (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))))
         (i32.wrap_i64 (i64.shr_u (i64.reinterpret_f64 (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))) (i64.const 32)))))))
+    (if (ref.test (ref $obj) (local.get $v))
+      (then (return (i31.get_s (ref.cast (ref i31) (call_ref $v1 (local.get $v)
+        (ref.cast (ref $v1) (array.get $vt
+          (struct.get $desc 1 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get $v)))))
+          (i32.const 1)))))))))
     ;; Arrays hash to their LENGTH: identity equality only obliges equal
     ;; values to hash equally, and length is the one thing about an array
     ;; that writes to its elements cannot change. See DIVERGENCES.md.

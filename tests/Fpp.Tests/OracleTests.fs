@@ -771,6 +771,19 @@ let oracleTests =
             "let h1 = print (if hash (Box 3) = hash (Box 3) then \"eq\" else \"ne\")"
             "let h2 = print (if hash (1, \"s\") = hash (1, \"s\") then \"eq\" else \"ne\")"
         ]
+        oracle "identity contract: records structural, classes by reference" [
+            "type A = { P : int; Q : int }"
+            "type C(v : int) ="
+            "    member _.V = v"
+            "let a = { P = 1; Q = 2 }"
+            "let r1 = print (if a = { P = 1; Q = 2 } then \"eq\" else \"ne\")"
+            "let r2 = print (if a = { P = 1; Q = 9 } then \"eq\" else \"ne\")"
+            "let r3 = print (if hash a = hash { P = 1; Q = 2 } then \"eq\" else \"ne\")"
+            "let c1 = C(5)"
+            "let c2 = C(5)"
+            "let r4 = print (if c1 = c2 then \"eq\" else \"ne\")"
+            "let r5 = print (if c1 = c1 then \"eq\" else \"ne\")"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"
