@@ -23,6 +23,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let decls = vecNew<Decl> ()
     let mutable pendingStruct = false
     let structNames = vecNew<string> ()
+    let statelessClasses = vecNew<string> ()
 
     let useDefs = dictNew<int, Resolve.Definition> ()
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
@@ -165,7 +166,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: args ->
                      let f = lowerExpr (GNode head)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
+                     let statelessCtor =
+                         match nodesOf n |> List.tryHead with
+                         | Some h when h.NodeKind = IdentExpr ->
+                             (match tokensOf h |> List.tryFind (fun t -> t.Kind = Ident) with
+                              | Some t ->
+                                  (match dictTryFind useDefs t.Offset with
+                                   | Some d ->
+                                       d.Kind = Resolve.DefType
+                                       && List.contains d.Name (vecToList statelessClasses)
+                                   | None -> false)
+                              | None -> false)
+                         | _ -> false
+                     if statelessCtor then ELit LUnit else
                      (match f, loweredArgs with
+                      | EField (_, mname), _ when
+                            (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t -> (dictTryFind useDefs t.Offset |> Option.map (fun d -> d.Kind = Resolve.DefMember)) = Some true
+                             | None -> false) ->
+                          let mt = (Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.last)
+                          let d = (dictTryFind useDefs mt.Offset).Value
+                          ignore mname
+                          EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
                       | EVar (bv, _), [ pa ] when bv.Name = "pin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayPin (nm, pa)
@@ -345,6 +367,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.tryHead with
                  | Some lhs -> EArrayLen ((dictTryFind arrKinds (offsetOf n)).Value, lowerExpr (GNode lhs))
                  | None -> note (offsetOf n) "length shape")
+            | DotExpr when
+                (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                 | Some t -> (dictTryFind useDefs t.Offset |> Option.map (fun d -> d.Kind = Resolve.DefMember)) = Some true
+                 | None -> false) ->
+                let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
+                let d = (dictTryFind useDefs t.Offset).Value
+                EVar (varIdOf d, schemeOf d)
             | DotExpr ->
                 (match nodesOf n |> List.tryHead, Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some lhs, Some name ->
@@ -547,8 +576,54 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 tokensOf f
                 |> List.tryFind (fun t -> t.Kind = Ident)
                 |> Option.map (fun t -> t.Text, fieldKind f))
+        let memberNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+        let hasState =
+            nodesOf n
+            |> List.exists (fun m ->
+                m.NodeKind = LetDecl
+                || (isPatKind m.NodeKind
+                    && Green.tokens (GNode m) |> List.exists (fun t -> t.Kind = Ident)))
         let hasMembers =
-            nodesOf n |> List.exists (fun m -> m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
+            (nodesOf n |> List.exists (fun m -> m.NodeKind = InterfaceImpl))
+            || (not (List.isEmpty memberNodes) && hasState)
+        // stateless class (builder objects, helper namespaces): every member
+        // becomes a top-level function; the instance itself carries nothing
+        if not hasState && not (List.isEmpty memberNodes) then vecAdd statelessClasses name
+        if not hasState then
+            for m in memberNodes do
+                let mutable seenEq = false
+                let idents = vecNew<Token> ()
+                let pats = vecNew<GreenNode> ()
+                let bodies = vecNew<Green> ()
+                for c in m.Children do
+                    match c with
+                    | GToken t when t.Kind = Operator && t.Text = "=" && not seenEq -> seenEq <- true
+                    | GToken t when not seenEq && t.Kind = Ident -> vecAdd idents t
+                    | GNode pn when not seenEq && isPatKind pn.NodeKind -> vecAdd pats pn
+                    | GNode b when seenEq && isExprish b.NodeKind -> vecAdd bodies c
+                    | _ -> ()
+                let nameTok =
+                    match vecToList idents with
+                    | [ _; nm ] -> Some nm
+                    | [ nm ] -> Some nm
+                    | _ -> None
+                match nameTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+                | Some d ->
+                    let body = lowerBlock (vecToList bodies |> List.choose (fun c -> match c with GNode x -> Some x | _ -> None))
+                    let ps = vecToList pats
+                    let rhs =
+                        if List.isEmpty ps then body
+                        else
+                            match paramBinds ps with
+                            | binds, [] -> ELam (binds, body)
+                            | _, structured ->
+                                let arg = { Path = path; Offset = d.Offset; Name = "_arg" }
+                                let sch = mono (TCon ("?", []))
+                                (match structured with
+                                 | [ pp ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ pp, None, body ]))
+                                 | pps -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ PTuple pps, None, body ])))
+                    vecAdd decls (DLet (false, varIdOf d, schemeOf d, rhs))
+                | None -> ()
         if not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name

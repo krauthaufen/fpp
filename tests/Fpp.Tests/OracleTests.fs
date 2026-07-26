@@ -249,6 +249,16 @@ let oracleTests =
             "    go [] xs"
             "let d = print (len (mapped (countDown 5)))"
         ]
+        oracle "stateless classes: members as callable methods" [
+            "type B() ="
+            "    member _.Bind (x : int, f : int -> int) = f (x + 1)"
+            "    member _.Return (v : int) = v"
+            "    member _.Twice (v : int) = v * 2"
+            "let b = B()"
+            "let r = b.Bind (1, fun x -> b.Return (x * 10))"
+            "let a = print r"
+            "let c = print (b.Twice 21)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

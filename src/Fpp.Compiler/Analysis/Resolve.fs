@@ -58,6 +58,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let exports = vecNew<string * Definition> ()
     let ownExports = dictNew<string, Definition> ()
     let opens = vecNew<string> ()
+    let memberDefs = dictNew<string, Definition> ()
     let mutable modulePath = ""
 
     let define (kind : DefKind) (t : Token) : Definition =
@@ -239,6 +240,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                           record (List.last spine) d
                           tryRecord env head
                       | None -> tryRecord env head)
+                 | _ when (match n.Children |> List.rev |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                           | Some t -> (dictTryFind memberDefs t.Text).IsSome
+                           | None -> false) ->
+                     // member access: bind to the member's definition
+                     let t = (n.Children |> List.rev |> List.pick (fun c -> match c with GToken x when x.Kind = Ident -> Some x | _ -> None))
+                     record t (dictTryFind memberDefs t.Text).Value
+                     (match n.Children with
+                      | first :: _ -> walkExpr env first |> ignore
+                      | [] -> ())
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])
@@ -363,7 +373,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             if self.Text <> "_" then
                 let d = define DefSelf self
                 inner <- Map.add self.Text d inner
-            define DefMember name |> ignore
+            dictSet memberDefs name.Text (define DefMember name)
         | [ name ] -> define DefMember name |> ignore
         | _ -> ()
         local (fun () ->
