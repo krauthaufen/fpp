@@ -816,7 +816,10 @@ let parse (src : string) : ParseResult =
     and parseLet (ctx : int) : Green =
         lastMajor <- "let"
         let acc = vecNew<Green> ()
+        // `static let` binds at the column of `static`, so its body may be
+        // indented relative to that rather than to `let`
         let letCol = s.CurCol
+        if s.IsKw "static" then vecAdd acc (s.Bump ())
         vecAdd acc (s.Bump ())   // let / use / and
         while s.IsKw "rec" || s.IsKw "inline" || s.IsKw "mutable" || s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" do
             vecAdd acc (s.Bump ())
@@ -901,10 +904,7 @@ let parse (src : string) : ParseResult =
             let mark = s.Mark
             if s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let" then
                 // `static let`: a binding on the type, not on an instance
-                let st = s.Bump ()
-                (match parseLet typeCol with
-                 | GNode ln -> vecAdd acc (Green.node LetDecl (st :: ln.Children))
-                 | g -> vecAdd acc g)
+                vecAdd acc (parseLet typeCol)
             elif s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
             elif s.IsKw "do" then
                 let d = s.Bump ()

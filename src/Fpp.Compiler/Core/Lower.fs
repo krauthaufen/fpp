@@ -1078,7 +1078,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), (if List.isEmpty args then [ ELit LUnit ] else args)))
                  | None -> Some (note (offsetOf i) ("unknown base class " + bn)))
             | _ -> None
-        let classLets = nodesOf n |> List.filter (fun m -> m.NodeKind = LetDecl)
+        let isStaticLet (m : GreenNode) =
+            tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
+        let staticLets = nodesOf n |> List.filter (fun m -> m.NodeKind = LetDecl && isStaticLet m)
+        let classLets = nodesOf n |> List.filter (fun m -> m.NodeKind = LetDecl && not (isStaticLet m))
+        for sl in staticLets do
+            match lowerLetParts sl with
+            | Some (SimpleLet (isRec, v, sch, rhs, _)) -> vecAdd decls (DLet (isRec, v, sch, rhs))
+            | _ -> vecAdd notes (offsetOf sl, "static let shape")
         let doNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = BlockExpr)
         let isAbstract (m : GreenNode) =
             tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "abstract")
