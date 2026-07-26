@@ -118,6 +118,8 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
+- [~] `stdlib/list.fpp`: List module written IN F++ (length/rev/map/filter/
+      fold/sum/exists/tryFind/append/init), oracle-verified against F#
 - [ ] Prelude reimplemented in F++ (the bootstrap seam closes)
 - [ ] Core collections, string, IO; Functor/Monad/Collection hierarchy
       proves out or gets revised
