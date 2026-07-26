@@ -287,6 +287,18 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      (match n.Children with
                       | first :: _ -> walkExpr env first |> ignore
                       | [] -> ())
+                 | Some (head :: rest) when
+                        (match Map.tryFind head.Text env with
+                         | Some d when d.Kind = DefType ->
+                             (match rest |> List.tryLast with
+                              | Some last -> (Map.tryFind last.Text env |> Option.map (fun c -> c.Kind = DefCase)) = Some true
+                              | None -> false)
+                         | _ -> false) ->
+                     // `NodeKind.Leaf`: a case named through its own type
+                     let spine = head :: rest
+                     let last = List.last spine
+                     record head (Map.find head.Text env)
+                     record last (Map.find last.Text env)
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])

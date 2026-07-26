@@ -875,15 +875,31 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.collect (fun m -> Green.tokens (GNode m))
             |> List.filter (fun t -> t.Kind = Ident && t.Text <> "_")
             |> List.map (fun t -> t.Text)
+        let caseNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = UnionCase)
         let cases =
-            nodesOf n
-            |> List.filter (fun m -> m.NodeKind = UnionCase)
+            caseNodes
             |> List.choose (fun c ->
                 tokensOf c
                 |> List.tryFind (fun t -> t.Kind = Ident)
                 |> Option.map (fun t ->
                     let hasPayload = nodesOf c |> List.exists (fun x -> isTypeKind x.NodeKind)
                     t.Text, (if hasPayload then 1 else 0)))
+        // `| Leaf = 0uy` on every case makes this an enum: the cases are
+        // integer constants, not constructors
+        let enumCases =
+            caseNodes
+            |> List.choose (fun c ->
+                let nameTok = tokensOf c |> List.tryFind (fun t -> t.Kind = Ident)
+                let valTok =
+                    nodesOf c
+                    |> List.filter (fun m -> m.NodeKind = LiteralExpr)
+                    |> List.tryPick (fun m -> tokensOf m |> List.tryHead)
+                match nameTok, valTok with
+                | Some nt, Some vt ->
+                    let digits = vt.Text |> String.filter (fun ch -> (ch >= '0' && ch <= '9') || ch = '-')
+                    Some (nt.Text, (if digits = "" then 0 else int digits))
+                | _ -> None)
+        let isEnum = not (List.isEmpty caseNodes) && enumCases.Length = caseNodes.Length
         let fieldKind (f : GreenNode) : string =
             let tyName =
                 nodesOf f
@@ -1055,7 +1071,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             currentClass <- ""
             if isClass then vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
 
-        if not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
+        if isEnum then vecAdd decls (DEnum (name, enumCases))
+        elif not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))

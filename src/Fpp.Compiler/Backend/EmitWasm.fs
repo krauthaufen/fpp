@@ -252,6 +252,12 @@ let emit (decls : Decl list) : EmitResult =
     for rn, fs, st in records do
         dictSet recordOrder rn (fs |> List.map (fun (f, k) -> f, kindOfField st k))
 
+    // enum cases are integer constants, never allocated cases
+    let enumConst = dictNew<string, int> ()
+    for d in decls do
+        match d with
+        | DEnum (_, cs) -> for c, v in cs do dictSet enumConst c v
+        | _ -> ()
     let caseArity = dictNew<string, int> ()
     let caseOwner = dictNew<string, string> ()
     let caseTag = dictNew<string, int> ()
@@ -796,6 +802,8 @@ let emit (decls : Decl list) : EmitResult =
             "(struct.new $tup" + string xs.Length + " " + String.concat " " (List.map recur xs) + ")"
         | EListLit xs ->
             List.foldBack (fun x acc -> "(struct.new $cons " + recur x + " " + acc + ")") xs "(ref.null any)"
+        | ECtor (name, _, _) when (dictTryFind enumConst name).IsSome ->
+            "(call $ofi (i32.const " + string (dictTryFind enumConst name).Value + "))"
         | ECtor (name, _, args) ->
             (match dictTryFind caseArity name with
              | Some 0 -> "(global.get $c_" + name + ")"

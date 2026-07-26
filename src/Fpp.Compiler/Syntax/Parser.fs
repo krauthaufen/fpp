@@ -999,6 +999,11 @@ let parse (src : string) : ParseResult =
                 // GADT-style per-case signature
                 vecAdd c (s.Bump ())
                 vecAdd c (parseType barCol)
+            elif s.IsOp "=" then
+                // enum case: `| Leaf = 0uy`
+                vecAdd c (s.Bump ())
+                if isLiteral () then vecAdd c (Green.node LiteralExpr [ s.Bump () ])
+                else s.Diag "expected an enum value"
             vecAdd acc (Green.node UnionCase (vecToList c))
             if s.Mark = mark then go <- false
 

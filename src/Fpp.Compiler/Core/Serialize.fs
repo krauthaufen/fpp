@@ -166,6 +166,8 @@ let private encDecl (d : Decl) : Sx =
             L (fs |> List.map (fun (f, k) -> L [ S f; A k ])); A (if st then "1" else "0") ]
     | DInterface (n, ms) ->
         L [ A "di"; S n; L (ms |> List.map (fun (m, a) -> L [ S m; A (string a) ])) ]
+    | DEnum (n, cs) ->
+        L [ A "dn"; S n; L (cs |> List.map (fun (c, v) -> L [ S c; A (string v) ])) ]
     | DClass (n, bse, own, impls) ->
         L [ A "dc"; S n
             (match bse with Some b -> S b | None -> A "-")
@@ -307,6 +309,8 @@ let private decDecl (x : Sx) : Decl option =
         Some (DRecord (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
                        fs |> List.choose (fun f -> match f with L [ S fn; A k ] -> Some (fn, k) | _ -> None),
                        st = "1"))
+    | L [ A "dn"; S n; L cs ] ->
+        Some (DEnum (n, cs |> List.choose (fun c -> match c with L [ S cn; A v ] -> Some (cn, int v) | _ -> None)))
     | L [ A "di"; S n; L ms ] ->
         Some (DInterface (n, ms |> List.choose (fun m -> match m with L [ S mn; A a ] -> Some (mn, int a) | _ -> None)))
     | L [ A "dc"; S n; b; L own; L impls ] ->

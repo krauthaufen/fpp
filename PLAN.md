@@ -76,8 +76,8 @@ the remaining blockers in source order are:
       solving — the same deferral member binding uses.
 - [ ] multi-entry attribute lists `[<AllowNullLiteral; AbstractClass>]`
       and `AbstractClass` itself
-- [ ] enum-style DU access in a base-constructor argument
-      (`inherit SetNode<'K>(NodeKind.Leaf, hash)`)
+- [x] enums (`| Leaf = 0uy`): an enum value IS its integer, the cases are
+      constants, and `NodeKind.Leaf` resolves through the type name.
 - [ ] null-as-empty (`AllowNullLiteral`): empty case as `ref.null`,
       test as `ref.is_null`
 - [ ] O(1) `toHashSet` via the prefix layout that now exists

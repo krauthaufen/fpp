@@ -529,6 +529,25 @@ let oracleTests =
             "let a = print (asBase d).Tag"
             "let b = print (asDerived (asBase d)).Extra"
         ]
+        oracle "enums: integer constants, packed tag bits" [
+            "type NodeKind ="
+            "    | Leaf = 0uy"
+            "    | Inner = 1uy"
+            "type SetNode(k : NodeKind, data : uint32) ="
+            "    let mutable store = (data <<< 1) ||| uint32 k"
+            "    member x.Data"
+            "        with get() = store >>> 1"
+            "        and set v = store <- (v <<< 1) ||| (store &&& 1u)"
+            "    member x.IsLeaf = (store &&& 1u) = 0u"
+            "let leaf = SetNode(NodeKind.Leaf, 42u)"
+            "let inner = SetNode(NodeKind.Inner, 7u)"
+            "let a = print leaf.Data"
+            "let b = print inner.Data"
+            "let c = print (if leaf.IsLeaf then \"leaf\" else \"inner\")"
+            "let d = print (if inner.IsLeaf then \"leaf\" else \"inner\")"
+            "let s = leaf.Data <- 99u"
+            "let e = print leaf.Data"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

@@ -83,6 +83,9 @@ type Decl =
     | DUnion of string * string list * (string * int) list
     /// name, type params, fields as (name, kind "f|s|l|i|r"), isStruct
     | DRecord of string * string list * (string * string) list * bool
+    /// enum name and its cases as (case, integer value). An enum value IS
+    /// its integer; the cases are constants, not constructors.
+    | DEnum of string * (string * int) list
     /// interface name, its methods as (name, arity)
     | DInterface of string * (string * int) list
     /// class name, base class, its own members as (name, function), and
@@ -163,6 +166,8 @@ let printDecl (d : Decl) : string =
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
         + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
+    | DEnum (n, cs) ->
+        "enum " + n + " = " + String.concat " | " (cs |> List.map (fun (c, v) -> c + "=" + string v))
     | DInterface (n, ms) ->
         "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
     | DClass (n, bse, own, impls) ->
