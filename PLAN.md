@@ -118,6 +118,10 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 - Exit: hello world through real programs run — REACHED
 
 ## Stage 5 — Stdlib & dogfood
+- [~] `stdlib/check.fpp`: **Check** — property/fuzzing library in F++
+      (seed-threaded generators: int/bool/elem/list/pair; `forAll` runner
+      reporting failure count + reproducible seed). Replaces hand-rolled
+      LCG loops; the basis for porting Adaptive's FsCheck properties
 - [~] `stdlib/mapext.fpp`: **Map = MapExt** (AVL tree: height/count cached,
       rebalance, add/remove/alter/change/update/tryMin/tryMax/fold/foldBack/
       map/mapValues/filter/choose/exists/forall/partition/union/unionWith/

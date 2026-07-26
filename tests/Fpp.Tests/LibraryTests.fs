@@ -50,6 +50,9 @@ let stdlibTests =
         test "List module (F++ source) matches F#" {
             oracleFile "stdlib/list.fpp" "module Stdlib"
         }
+        test "Check: property/fuzzing library (generators + forAll) matches F#" {
+            oracleFile "stdlib/check.fpp" "module Stdlib"
+        }
         test "MapExt Map + Set (AVL tree, 62 assertions incl. randomised model diff) match F#" {
             oracleFile "stdlib/mapext.fpp" "module Stdlib"
         }
