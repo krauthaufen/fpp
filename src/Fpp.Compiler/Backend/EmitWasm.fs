@@ -561,6 +561,17 @@ let emit (decls : Decl list) : EmitResult =
             (match curry ps body with
              | ELam ([ (pv, _) ], b) -> compileLambda locals freeEnv pv b recur
              | other -> recur other)
+        | ELet (true, v, _, ELam (ps, lbody), body) ->
+            // recursive local function: lambda-lift via a self-slot that is
+            // patched after construction (env cells are mutable)
+            let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+            dictSet locals (v.Path, v.Offset) l
+            // the closure captures a unique marker for itself; after the
+            // closure exists, every env slot holding the marker is patched
+            let cloW = recur (ELam (ps, lbody))
+            "(block (result anyref) (local.set " + l + " (global.get $selfmark)) "
+            + "(local.set " + l + " " + cloW + ") "
+            + "(call $patchself (local.get " + l + ")) " + recurT body + ")"
         | ELet (_, v, _, rhs, body) ->
             let k = kindOf rhs
             let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
@@ -1260,7 +1271,7 @@ let emit (decls : Decl list) : EmitResult =
     line "(module"
     line "  (type $u1 (func (param anyref anyref) (result anyref)))"
     line "  (type $clo (struct (field (ref $u1)) (field anyref)))"
-    line "  (type $cons (struct (field anyref) (field anyref)))"
+    line "  (type $cons (struct (field (mut anyref)) (field (mut anyref))))"
     line "  (type $str (array (mut i8)))"
     line "  (type $boxf (struct (field f64)))"
     line "  (type $boxi (struct (field i32)))"
@@ -1286,6 +1297,7 @@ let emit (decls : Decl list) : EmitResult =
     line "  (memory (export \"memory\") 17)"   // 1 page scratch + 16 pages pin heap
     line "  (tag $fppexn (param anyref))"
     line "  (global $heap (mut i32) (i32.const 65536))"
+    line "  (global $selfmark (ref $du0) (struct.new $du0 (i32.const -999)))"
 
     // program-declared types
     for rn, fs, st in records do
@@ -1543,6 +1555,19 @@ let emit (decls : Decl list) : EmitResult =
     (if (result i32) (ref.test (ref i31) (local.get $v))
       (then (i31.get_s (ref.cast (ref i31) (local.get $v))))
       (else (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v))))))
+  (func $patchself (param $c anyref)
+    ;; tie the recursive knot: replace the marker captured in the closure's
+    ;; environment with the closure itself
+    (local $e anyref)
+    (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
+    (block $done
+      (loop $go
+        (br_if $done (i32.eqz (ref.test (ref $cons) (local.get $e))))
+        (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
+                    (ref.cast (ref null eq) (global.get $selfmark)))
+          (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $c))))
+        (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
+        (br $go))))
   (func $applyc (param $f anyref) (param $a anyref) (result anyref)
     (call_ref $u1 (local.get $a)
       (struct.get $clo 1 (ref.cast (ref $clo) (local.get $f)))
