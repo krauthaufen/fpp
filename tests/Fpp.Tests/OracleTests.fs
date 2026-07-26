@@ -684,6 +684,21 @@ let oracleTests =
             "let b = print (if isNull c.Cur then \"no node\" else \"node\")"
             "let d = print c.Ratio"
         ]
+        oracle "generic structs specialize: unboxed fields per instantiation" [
+            "[<Struct>]"
+            "type Pair<'a, 'b> = { First : 'a; Second : 'b }"
+            "let p = { First = 1.5; Second = 2.5 }"
+            "let q = { First = 3; Second = 4 }"
+            "let a = print (p.First + p.Second)"
+            "let b = print (q.First + q.Second)"
+            "let arr = [| { First = 1; Second = 2 }; { First = 3; Second = 4 } |]"
+            "let sum ="
+            "    let mutable s = 0"
+            "    for i in 0 .. arr.Length - 1 do"
+            "        s <- s + arr.[i].First * arr.[i].Second"
+            "    s"
+            "let c = print sum"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

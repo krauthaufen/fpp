@@ -30,7 +30,11 @@ type InferResult =
       /// member/field name-token offset -> the receiver's type name. Member
       /// names are not unique, so this — not the name — binds a dot-access
       /// to the member it calls.
-      MemberSites : (int * string) list }
+      MemberSites : (int * string) list
+      /// offset -> the OWNER type at its instantiation (`Pair$int$int`), for
+      /// record construction and field access. Distinct from MemberSites,
+      /// which names the declaring type for member dispatch.
+      FieldOwners : (int * string) list }
 
 type FieldInfo =
     { TypeName : string
@@ -55,7 +59,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
           (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
           (bases : Dict<string, Var list * Type>)
-          (impls : Dict<string, string list>) : InferResult =
+          (impls : Dict<string, string list>)
+          (structTypes : Dict<string, bool>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -158,6 +163,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if pa.Length = aa.Length then List.iter2 (unifyAt offset) pa aa
         | _ -> unifyAt offset paramTy argTy
 
+    /// The name of a type at its instantiation. A name still mentioning a
+    /// type variable (`Pair$<#7.int>`) marks code that is itself generic:
+    /// stamping that code substitutes the variable and fixes the layout.
+    /// Only a STRUCT type is named per instantiation. A reference type's
+    /// fields are uniform whatever it is instantiated at, so stamping it
+    /// would buy nothing and only split the type.
+    let instName (t : Type) : string =
+        match prune t with
+        | TCon (n, args) when not (List.isEmpty args) && (dictTryFind structTypes n) = Some true ->
+            typeConName t
+        | TCon (n, _) -> n
+        | other -> typeConName other
+
     let recordDef (t : Token) (ty : Type) : unit =
         vecAdd defTypes (t.Offset, strLen t.Text, ty)
 
@@ -166,7 +184,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // after the access is first seen (a later call fixes the parameter, say).
     // Every access therefore returns a fresh variable immediately and parks
     // here; the parked set is retried to fixpoint once the file is inferred.
+    let mutable pendingStructAttr = false
     let memberSitesRaw = vecNew<int * string> ()
+    let fieldOwnersRaw = vecNew<int * string> ()
+    /// record literals, resolved after solving so the instantiation is known
+    let pendingRecords = vecNew<int * Type> ()
     let pendingDots = vecNew<int * Type * Type * string> ()
     /// `downcast`/`upcast` sites: the target type is only known once the
     /// surrounding expression has been solved
@@ -229,6 +251,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
                  unifyAt offset result (substVars subst fi.FieldType)
                  vecAdd memberSitesRaw (offset, fi.TypeName)
+                 if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
                  true
              | _ -> true)   // receiver known, no such member: retrying cannot help
         | _ -> false
@@ -417,7 +440,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 else [ m ]
             let ps =
                 nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.collect unwrap
-            TCon ("StructTuple" + string ps.Length, ps |> List.map (patType pvars))
+            let ty = TCon ("StructTuple" + string ps.Length, ps |> List.map (patType pvars))
+            // the element types are fixed by the right-hand side, so the
+            // instantiated name is only known after solving
+            (match Green.tokens (GNode n) |> List.tryHead with
+             | Some t -> vecAdd pendingRecords (t.Offset, ty)
+             | None -> ())
+            ty
         | ConsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
              | [ h; t ] ->
@@ -786,7 +815,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let elems =
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.collect unwrap
                 let ts = elems |> List.map (fun m -> exprType (GNode m))
-                TCon ("StructTuple" + string ts.Length, ts)
+                let ty = TCon ("StructTuple" + string ts.Length, ts)
+                (match Green.tokens (GNode n) |> List.tryHead with
+                 | Some t -> vecAdd fieldOwnersRaw (t.Offset, instName ty)
+                 | None -> ())
+                ty
             | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
                  | Some operand -> exprType (GNode operand) |> ignore
@@ -952,6 +985,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let subst = dictNew<int, Type> ()
                      for pv in info.Params do dictSet subst pv.Id (st.Fresh ())
                      let recTy = TCon (info.TypeName, info.Params |> List.map (fun pv -> substVars subst (TVar pv)))
+                     // remember which instantiation this literal builds, so
+                     // the stamped record (and its layout) is the one used
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t -> vecAdd pendingRecords (t.Offset, recTy)
+                      | None -> ())
                      (match baseExpr with
                       | Some b ->
                           let off = match Green.tokens (GNode b) |> List.tryHead with Some t -> t.Offset | None -> 0
@@ -1075,6 +1113,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             tUnit
 
     and inferTypeDecl (n : GreenNode) : unit =
+        if pendingStructAttr then
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t -> dictSet structTypes t.Text true
+             | None -> ())
+        pendingStructAttr <- false
         // declared type parameters
         let vars = dictNew<string, Type> ()
         let tyParams = vecNew<Type> ()
@@ -1385,7 +1428,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | TypeDecl -> inferTypeDecl n
             | ModuleDef ->
                 for c in n.Children do inferDecl c
-            | ModuleHeader | OpenDecl | AttributeList -> ()
+            | AttributeList ->
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
+                    pendingStructAttr <- true
+            | ModuleHeader | OpenDecl -> ()
             | _ -> exprType g |> ignore
 
     for c in root.Children do inferDecl c
@@ -1401,6 +1447,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if tryResolveDot offset recvTy result name then progress <- true
             else vecAdd still (offset, recvTy, result, name)
         parked <- vecToList still
+    // record literals: name the instantiation once everything is solved
+    for offset, ty in vecToList pendingRecords do
+        vecAdd fieldOwnersRaw (offset, instName ty)
+
     // contextual casts: the target is whatever the context settled on
     for offset, ty in vecToList pendingCasts do
         match prune ty with
@@ -1441,18 +1491,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | TVar v -> "#" + string v.Id
                 | _ -> ""))
       MemberSites = vecToList memberSitesRaw
+      FieldOwners = vecToList fieldOwnersRaw
       ArrKinds =
         vecToList arrKindsRaw
         |> List.choose (fun (off, ty) ->
             let nameOf (t : Type) =
                 match prune t with
-                | TCon (n, _) -> Some n
+                // the name carries the instantiation, so an array of
+                // Pair<int,int> is packed rather than an array of boxes
+                | TCon (_, _) -> Some (instName t)
                 // element type is the enclosing binding's type variable:
                 // name it so stamping substitutes the real element type
                 | TVar v -> Some ("#" + string v.Id)
                 | _ -> None
             match prune ty with
             | TCon ("array", [ e ]) -> nameOf e |> Option.map (fun n -> off, n)
-            | TCon (n, _) -> Some (off, n)
+            | TCon (_, _) -> Some (off, instName ty)
             | TVar v -> Some (off, "#" + string v.Id)
             | _ -> None) }

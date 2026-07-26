@@ -20,7 +20,7 @@ type private LetShape =
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
           (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>)
-          (memberSites : Dict<int, string>)
+          (memberSites : Dict<int, string>) (fieldOwners : Dict<int, string>)
           (ifaces : Dict<string, (string * int) list>) : LowerResult =
 
     let notes = vecNew<int * string> ()
@@ -399,7 +399,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | binds, [] -> ELam (binds, bodyE)
                  | _, structuredPats ->
                      // structured lambda params: match on a synthetic arg
-                     let arg = { Path = path; Offset = offsetOf n; Name = "_arg" }
+                     let arg = { Path = path; Offset = offsetOf n + 600000; Name = "_arg" }
                      let sch = mono (TCon ("?", []))
                      (match structuredPats with
                       | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, bodyE ]))
@@ -461,7 +461,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match name, value with
                         | Some t, Some v -> Some (t.Text, lowerExpr (GNode v))
                         | _ -> None)
-                ERecord ("?", fields)   // type name filled by lint/emission from inference if needed
+                let owner =
+                    match dictTryFind fieldOwners (offsetOf n) with
+                    | Some o -> o
+                    | None -> "?"
+                ERecord (owner, fields)
             | ArrayExpr ->
                 let elemName =
                     match dictTryFind arrKinds (offsetOf n) with
@@ -539,8 +543,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     else [ m ]
                 let elems =
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.collect unwrap
-                ERecord ("StructTuple" + string elems.Length,
-                         elems |> List.mapi (fun i m -> "Item" + string (i + 1), lowerExpr (GNode m)))
+                let tn =
+                    match dictTryFind fieldOwners (offsetOf n) with
+                    | Some o -> o
+                    | None -> "StructTuple" + string elems.Length
+                ERecord (tn, elems |> List.mapi (fun i m -> "Item" + string (i + 1), lowerExpr (GNode m)))
             | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
                 let kw = tokensOf n |> List.find (fun t -> t.Kind = Keyword)
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
@@ -632,7 +639,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                EVarI (varIdOf d, schemeOf d, inst)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None ->
-                          let owner = match dictTryFind memberSites name.Offset with Some o -> o | None -> ""
+                          let owner =
+                              match dictTryFind fieldOwners name.Offset with
+                              | Some o -> o
+                              | None -> (match dictTryFind memberSites name.Offset with Some o -> o | None -> "")
                           EField (lowerExpr (GNode lhs), name.Text, owner))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->
@@ -903,7 +913,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> List.choose (fun t -> dictTryFind defsAt t.Offset)
                 |> List.map (fun d -> varIdOf d, schemeOf d)
             if List.isEmpty binders then None
-            else Some (StructLet (binders, "StructTuple" + string binders.Length, lowerBlock rhsExprs, cont))
+            else
+                let tn =
+                    match dictTryFind fieldOwners (offsetOf sp) with
+                    | Some o -> o
+                    | None -> "StructTuple" + string binders.Length
+                Some (StructLet (binders, tn, lowerBlock rhsExprs, cont))
         | _ ->
         if isDestructure then
             match pats with
@@ -921,7 +936,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match paramBinds paramPats with
                          | binds, [] -> ELam (binds, body)
                          | _, structured ->
-                             let arg = { Path = path; Offset = d.Offset; Name = "_arg" }
+                             let arg = { Path = path; Offset = d.Offset + 600000; Name = "_arg" }
                              let sch = mono (TCon ("?", []))
                              (match structured with
                               | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, body ]))
@@ -1119,7 +1134,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match paramBinds ps with
                      | binds, [] -> ELam (binds, body)
                      | _, structured ->
-                         let arg = { Path = path; Offset = tyDef.Offset; Name = "_arg" }
+                         let arg = { Path = path; Offset = tyDef.Offset + 600000; Name = "_arg" }
                          let asch = mono (TCon ("?", []))
                          (match structured with
                           | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
@@ -1152,7 +1167,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match paramBinds [ ctorPat.Value ] with
                     | binds, [] -> ELam (binds, body)
                     | _, structured ->
-                        let arg = { Path = path; Offset = tyDef.Offset; Name = "_arg" }
+                        let arg = { Path = path; Offset = tyDef.Offset + 600000; Name = "_arg" }
                         let sch = mono (TCon ("?", []))
                         (match structured with
                          | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, body ]))

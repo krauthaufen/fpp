@@ -27,6 +27,7 @@ let mono (t : Type) : Scheme = { Quantified = []; Body = t }
 
 let tInt = TCon ("int", [])
 let tUInt = TCon ("uint32", [])
+
 let tFloat = TCon ("float", [])
 let tString = TCon ("string", [])
 let tChar = TCon ("char", [])
@@ -45,6 +46,18 @@ let rec prune (t : Type) : Type =
             r
         | None -> t
     | _ -> t
+
+/// The name of a type AT an instantiation: `Pair<float,int>` is the distinct
+/// type `Pair$float$int`. Generic structs must be stamped per instantiation
+/// or their fields stay boxed, so the name has to carry the arguments.
+let rec typeConName (t : Type) : string =
+    match prune t with
+    | TCon (n, []) -> n
+    // bracketed so nested arguments stay unambiguous:
+    // Pair<int, Pair<int,int>> -> Pair$<int.Pair$<int.int>>
+    | TCon (n, args) -> n + "$<" + String.concat "." (List.map typeConName args) + ">"
+    | TVar v -> "#" + string v.Id
+    | _ -> ""
 
 let rec freeVars (t : Type) : Var list =
     match prune t with

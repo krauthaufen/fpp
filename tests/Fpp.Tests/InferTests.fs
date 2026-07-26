@@ -8,7 +8,7 @@ open Fpp.Analysis
 let private inferSrc (src : string) : Infer.InferResult =
     let p = parse src
     let b = Resolve.resolve "test" (Fpp.Prelude.dictNew ()) p.Root
-    Infer.infer "test" p.Root b (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ())
+    Infer.infer "test" p.Root b (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ()) (Fpp.Prelude.dictNew ())
 
 /// The inferred type string of the definition named `name`.
 let private typeOf (src : string) (name : string) : string option =

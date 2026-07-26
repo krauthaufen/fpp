@@ -228,12 +228,13 @@ type Workspace() =
             let ifaces = dictNew<string, (string * int) list> ()
             let bases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
             let impls = dictNew<string, string list> ()
+            let structTypes = dictNew<string, bool> ()
             let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
             // the builtin prelude seeds imports and schemes for every file
             let bp = Parser.parse Builtin.source
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
-            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls |> ignore
+            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes |> ignore
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
@@ -243,7 +244,7 @@ type Workspace() =
                 let p = this.ParseFile path
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls structTypes
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core
             for _, text in this.Libraries do
@@ -264,7 +265,7 @@ type Workspace() =
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
-                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
+                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
@@ -307,7 +308,9 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms r.Interfaces
+                let fo = dictNew<int, string> ()
+                for off, o in inf.FieldOwners do dictSet fo off o
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo r.Interfaces
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -318,7 +321,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Interfaces
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Interfaces
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -340,7 +343,10 @@ type Workspace() =
                     | Fpp.Core.Ir.DRecord (n, _, _, true) -> Some n
                     | _ -> None)
             let isStruct (n : string) = List.contains n structNames
-            let mono, monoErrs = Fpp.Core.Link.monomorphize isStruct program
+            let mono0, monoErrs = Fpp.Core.Link.monomorphize isStruct program
+            // stamped clones have concrete instantiations, so record layouts
+            // can only be settled once monomorphization has run
+            let mono = Fpp.Core.Link.stampRecords mono0
             let linked = Fpp.Core.Link.deadCodeEliminate mono
             if not (List.isEmpty monoErrs) then "", monoErrs
             else
@@ -367,7 +373,9 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
+                let fo = dictNew<int, string> ()
+                for off, o in inf.FieldOwners do dictSet fo off o
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo r.Interfaces
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -390,7 +398,9 @@ type Workspace() =
             for off, i in inf.InstSites do dictSet ik off i
             let ms = dictNew<int, string> ()
             for off, o in inf.MemberSites do dictSet ms off o
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
+            let fo = dictNew<int, string> ()
+            for off, o in inf.FieldOwners do dictSet fo off o
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo r.Interfaces
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

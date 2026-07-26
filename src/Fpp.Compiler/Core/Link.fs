@@ -82,6 +82,79 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | other -> other
     f e2
 
+/// Stamp a generic record per instantiation. A `'a` field has no
+/// representation until `'a` is known, so sharing one declaration across
+/// instantiations would force every field to be boxed. Each instantiation
+/// gets its own declaration, and therefore its own layout.
+let stampRecords (decls : Decl list) : Decl list =
+    let templates =
+        decls
+        |> List.choose (fun d ->
+            match d with
+            | DRecord (n, ps, fs, st) when not (List.isEmpty ps) -> Some (n, (ps, fs, st))
+            | _ -> None)
+    if List.isEmpty templates then decls
+    else
+        let used = dictNew<string, bool> ()
+        let note (n : string) = if n <> "" && n <> "?" then dictSet used n true
+        let noteIn (e : Expr) =
+            mapExpr
+                (fun x ->
+                    (match x with
+                     | ERecord (n, _) -> note n
+                     | EField (_, _, o) | EFieldSet (_, _, o, _) -> note o
+                     | EArray (n, _) | EIndex (n, _, _) | EIndexSet (n, _, _, _)
+                     | EArrayLen (n, _) | EArrayCreate (n, _, _)
+                     | EArrayPin (n, _) | EArrayUnpin (n, _) -> note n
+                     | _ -> ())
+                    x)
+                e |> ignore
+        for d in decls do
+            match d with
+            | DLet (_, _, _, e) -> noteIn e
+            | _ -> ()
+        /// `Pair$<int.Pair$<int.int>>` -> ("Pair", ["int"; "Pair$<int.int>"])
+        let splitInst (name : string) : (string * string list) option =
+            let i = name.IndexOf "$<"
+            if i < 0 || not (name.EndsWith ">") then None
+            else
+                let baseName = name.Substring (0, i)
+                let inner = name.Substring (i + 2, name.Length - i - 3)
+                let args = vecNew<string> ()
+                let cur = System.Text.StringBuilder()
+                let mutable depth = 0
+                for c in inner do
+                    if c = '<' then depth <- depth + 1; cur.Append c |> ignore
+                    elif c = '>' then depth <- depth - 1; cur.Append c |> ignore
+                    elif c = '.' && depth = 0 then
+                        vecAdd args (cur.ToString ())
+                        cur.Clear () |> ignore
+                    else cur.Append c |> ignore
+                if cur.Length > 0 then vecAdd args (cur.ToString ())
+                Some (baseName, vecToList args)
+        let stamped = vecNew<Decl> ()
+        for name, _ in dictPairs used do
+            // a name still mentioning a type variable belongs to code that
+            // is itself generic; it is stamped when that code is
+            if name.Contains "$<" && not (name.Contains "#") then
+                match splitInst name with
+                | Some (baseName, args) when not (List.isEmpty args) ->
+                    (match templates |> List.tryFind (fun (n, _) -> n = baseName) with
+                     | Some (_, (ps, fs, st)) when ps.Length = args.Length ->
+                         let fs2 =
+                             fs
+                             |> List.map (fun (f, t) ->
+                                 if t.StartsWith "'" then
+                                     let v = t.Substring 1
+                                     match ps |> List.tryFindIndex (fun p -> p = v) with
+                                     | Some i -> f, List.item i args
+                                     | None -> f, t
+                                 else f, t)
+                         vecAdd stamped (DRecord (name, [], fs2, st))
+                     | _ -> ())
+                | _ -> ()
+        decls @ vecToList stamped
+
 /// Stamp one specialized copy per struct instantiation, rewrite the calls,
 /// and report anything that cannot be classified.
 let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
@@ -113,13 +186,15 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | EMatch (s, cs) -> usesLayoutVar s || (cs |> List.exists (fun (_, _, b) -> usesLayoutVar b))
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
-        | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> usesLayoutVar v)
+        // a record whose NAME still mentions a type variable has no layout
+        // yet, so code building it must be stamped just like an array op
+        | ERecord (n, fs) -> n.Contains "#" || (fs |> List.exists (fun (_, v) -> usesLayoutVar v))
         | ERecordExt (_, bse, fs) -> usesLayoutVar bse || (fs |> List.exists (fun (_, v) -> usesLayoutVar v))
-        | EField (r, _, _) -> usesLayoutVar r
+        | EField (r, _, o) -> o.Contains "#" || usesLayoutVar r
         | EIfaceCall (_, _, recv, args) -> usesLayoutVar recv || anyOf args
         | ECast (_, x, _) -> usesLayoutVar x
         | ETypeTest (_, x) -> usesLayoutVar x
-        | EFieldSet (r, _, _, v) -> usesLayoutVar r || usesLayoutVar v
+        | EFieldSet (r, _, o, v) -> o.Contains "#" || usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
         | ETry (b, cs) -> usesLayoutVar b || (cs |> List.exists (fun (_, _, x) -> usesLayoutVar x))
@@ -230,6 +305,9 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                                  + String.concat ", " i + "> in " + owner
                                  + ": the body is not available for stamping")
                           EVar (v, sch)))
+            | ERecord (n, fs) -> ERecord (substName subst n, fs)
+            | EField (x, fn, o) -> EField (x, fn, substName subst o)
+            | EFieldSet (x, fn, o, v) -> EFieldSet (x, fn, substName subst o, v)
             | EArray (n, xs) -> EArray (substName subst n, xs)
             | EIndex (n, a, i) -> EIndex (substName subst n, a, i)
             | EIndexSet (n, a, i, v) -> EIndexSet (substName subst n, a, i, v)
@@ -310,9 +388,22 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
                  |> List.iter (fun (qv, n) -> dictSet subst ("#" + string qv.Id) n)
+             // A recursive call carries no instantiation: inside its own
+             // body a function is monomorphic, so the self-call is a plain
+             // EVar. In a stamped clone it must target the clone, not the
+             // template that specialization removed.
+             let selfKey = (v.Path, v.Offset)
+             let selfFix (x : Expr) =
+                 mapExpr
+                     (fun y ->
+                         match y with
+                         | EVar (w, s2) when (w.Path, w.Offset) = selfKey -> EVar (nv, s2)
+                         | other -> other)
+                     x
              let clone =
                  DLet (rc, nv, substScheme inst sch,
-                       alphaRename (10000000 + (abs (hash mangled) % 1000000) * 10) (rewrite mangled subst false e))
+                       alphaRename (10000000 + (abs (hash mangled) % 1000000) * 10)
+                           (selfFix (rewrite mangled subst false e)))
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1
