@@ -125,10 +125,10 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
 - a CLASS is not a type: no values, no subtyping, no boxing, no `I` prefix.
   Declared with `class`, which is free (F#'s `type X() = class end` is not
   part of F++); instances with `instance`
-- a single-parameter class may stand where a type goes, and the same name
-  means the SAME type within one signature — unlike C++ `auto` and Rust
-  `impl Trait`, which would not share the scalar between
-  `Matrix<Fractional>` and `Vector<Fractional>`
+- a class NEVER stands where a type goes (`Matrix<Fractional>` rejected):
+  it hides whether two positions share a scalar and breaks down the moment
+  a function needs two different ones. Type variables are always named and
+  implicitly quantified, as in F#
 - closed classes (`Fractional<'a>` etc.) carry superclass constraints, so
   generic math annotates with ONE name and projections reduce from the
   constraint rather than from a concrete type

@@ -295,27 +295,23 @@ instance Add<V3d, V3d> when Fractional<float>
 Where a class has exactly one associated type, `Add<'a,'a> = 'a` is
 shorthand for `Add<'a,'a> with Result = 'a`.
 
-**A single-parameter class may stand where a type goes**, and that is how
-generic math is written:
+**A class never stands where a type goes.** Writing
+`Matrix<Fractional>` was considered and rejected: it hides whether two
+positions share a scalar, which in numerical code is precisely the fact a
+reader needs, and it works only until a function wants two DIFFERENT
+fractional types — at which point the signature has to be rewritten in
+another style. A syntax abandoned for the general case does not earn the
+rule it costs. Type variables are always named:
 
 ```
-let solve (m : Matrix<Fractional>) (b : Vector<Fractional>) : Vector<Fractional> = ...
+let solve (m : Matrix<'a>) (b : Vector<'a>) : Vector<'a>
+    when Fractional<'a> = ...
 ```
 
-`Fractional` there introduces an implicitly quantified type variable
-constrained by the class. The rule that makes this useful rather than
-misleading: **the same class name means the SAME type within one
-signature.** C++'s `auto` and Rust's `impl Trait` in argument position
-introduce a fresh variable per occurrence, so `Matrix<Fractional>` and
-`Vector<Fractional>` would not share a scalar — which for numerical code is
-exactly backwards. When two distinct instances of a class are genuinely
-wanted, name them: `when Fractional<'a>` and `when Fractional<'b>`.
+Variables are implicitly quantified as in F#, so no binder list is needed;
+identity is visible because the variable is written.
 
-The sugar applies to single-parameter classes only; nobody writes
-`x : Mul`, and the two-parameter operator classes appear in `requires`
-clauses rather than type positions.
-
-Either way the projection reduces: `x + y` at `'a` produces
+The projection reduces: `x + y` at `'a` produces
 `Add<'a,'a>.Result`, and the `requires` equality in scope rewrites it to
 `'a` at once. The user writes one readable name; closure comes from the
 class, not from grounding.
