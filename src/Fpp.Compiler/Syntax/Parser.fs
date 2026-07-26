@@ -872,7 +872,13 @@ let parse (src : string) : ParseResult =
                 // the base constructor's arguments
                 let a = vecNew<Green> ()
                 vecAdd a (s.Bump ())
-                if s.Is Ident then vecAdd a (Green.node NamedType [ s.Bump () ])
+                // parse the base type by hand: a full parseType would eat the
+                // constructor arguments as a parenthesised type
+                if s.Is Ident then
+                    let idt = s.Bump ()
+                    if s.IsOp "<" && s.SameLine then
+                        vecAdd a (Green.node AppType (Green.node NamedType [ idt ] :: parseAngleArgs typeCol))
+                    else vecAdd a (Green.node NamedType [ idt ])
                 else vecAdd a (parseType typeCol)
                 if s.Is LParen && s.SameLine then vecAdd a (parseAtom typeCol)
                 vecAdd acc (Green.node InheritDecl (vecToList a))
@@ -924,7 +930,36 @@ let parse (src : string) : ParseResult =
                     vecAdd acc (s.Bump ())
                     while not s.AtEof && not (s.IsOp "=") && (s.SameLine || s.CurCol > mcol) do
                         vecAdd acc (s.Bump ())
-            if s.IsOp "=" then
+            if s.IsKw "with"
+               && (let p = s.Peek 1 in
+                   p.Text = "get" || p.Text = "set" || p.Text = "inline"
+                   || p.Text = "private" || p.Text = "internal" || p.Text = "public") then
+                // property accessors: `member x.P with get() = ... and set v = ...`
+                vecAdd acc (s.Bump ())   // with
+                let mutable more = true
+                while more && not s.AtEof do
+                    let mark = s.Mark
+                    let a2 = vecNew<Green> ()
+                    while s.IsKw "inline" || s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" do
+                        vecAdd a2 (s.Bump ())
+                    if s.Is Ident && (s.Cur.Text = "get" || s.Cur.Text = "set") then
+                        vecAdd a2 (s.Bump ())
+                        while canStartAtomPat () && (s.SameLine || s.CurCol > mcol) do
+                            vecAdd a2 (parseAtomPat mcol)
+                        if s.IsOp ":" then
+                            vecAdd a2 (s.Bump ())
+                            vecAdd a2 (parseType mcol)
+                        if s.IsOp "=" then
+                            vecAdd a2 (s.Bump ())
+                            if not (s.AtEof || (not s.SameLine && s.CurCol <= mcol)) then
+                                vecAdd a2 (parseBlock mcol)
+                        vecAdd acc (Green.node AccessorDecl (vecToList a2))
+                        if s.IsKw "and" then vecAdd acc (s.Bump ()) else more <- false
+                    else
+                        for g in vecToList a2 do vecAdd acc g
+                        more <- false
+                    if s.Mark = mark then more <- false
+            elif s.IsOp "=" then
                 vecAdd acc (s.Bump ())
                 if s.AtEof || (not s.SameLine && s.CurCol <= mcol) then s.Diag "expected a member body"
                 else vecAdd acc (parseBlock mcol)

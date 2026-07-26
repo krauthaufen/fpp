@@ -73,6 +73,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         vecAdd defs d
         d
 
+    /// Define under a name other than the token's text (property accessors:
+    /// the `set` token declares a member called `set_Prop`).
+    let defineAs (kind : DefKind) (nm : string) (t : Token) : Definition =
+        let d = { Name = nm; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text }
+        vecAdd defs d
+        d
+
     let record (t : Token) (d : Definition) : unit =
         vecAdd uses { UseOffset = t.Offset; UseLength = strLen t.Text; Def = d }
 
@@ -411,6 +418,31 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 inner <- Map.add self.Text d inner
             declareMember name
         | [ name ] -> declareMember name
+        | _ -> ()
+        // property accessors carry their own parameters and bodies
+        let accessors =
+            n.Children |> List.choose (fun c -> match c with GNode a when a.NodeKind = AccessorDecl -> Some a | _ -> None)
+        match vecToList idents |> List.tryLast with
+        | Some propName when not (List.isEmpty accessors) ->
+            for acc in accessors do
+                let kindTok = acc.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+                (match kindTok with
+                 | Some kt when kt.Text = "set" ->
+                     let d = defineAs DefMember ("set_" + propName.Text) kt
+                     dictSet memberDefs (owner + ".set_" + propName.Text) d
+                 | _ -> ())
+                local (fun () ->
+                    let mutable accEnv = inner
+                    for c in acc.Children do
+                        match c with
+                        | GNode p when isPatKind p.NodeKind -> accEnv <- bindPat DefParam accEnv c
+                        | _ -> ()
+                    let mutable seenAccEq = false
+                    for c in acc.Children do
+                        match c with
+                        | GToken t when t.Kind = Operator && t.Text = "=" -> seenAccEq <- true
+                        | _ when seenAccEq -> walkExpr accEnv c |> ignore
+                        | _ -> ())
         | _ -> ()
         local (fun () ->
             for p in vecToList pats do inner <- bindPat DefParam inner p

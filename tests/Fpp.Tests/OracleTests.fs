@@ -459,6 +459,26 @@ let oracleTests =
             "let b = print (ib.Get 1)"
             "let c = print vb.Length"
         ]
+        oracle "properties: get/set accessors, generic base, inherited reads" [
+            "type Node<'K>(key : 'K) ="
+            "    let mutable key = key"
+            "    member x.Key"
+            "        with get() = key"
+            "        and set v = key <- v"
+            "type Pair<'K, 'V>(key : 'K, value : 'V) ="
+            "    inherit Node<'K>(key)"
+            "    let mutable value = value"
+            "    member x.Value"
+            "        with get() = value"
+            "        and set v = value <- v"
+            "let p = Pair(1, \"hi\")"
+            "let a = print p.Key"
+            "let b = print p.Value"
+            "let s = p.Value <- \"bye\""
+            "let c = print p.Value"
+            "let t = p.Key <- 42"
+            "let d = print p.Key"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

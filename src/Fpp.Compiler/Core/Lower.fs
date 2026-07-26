@@ -19,8 +19,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
           (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>)
           (memberSites : Dict<int, string>)
-          (ifaces : Dict<string, (string * int) list>)
-          (bases : Dict<string, string>) : LowerResult =
+          (ifaces : Dict<string, (string * int) list>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -288,7 +287,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | [ l; r ], [ op ] ->
                      (match op.Text with
                       | "<-" ->
-                          (match lowerExpr (GNode l) with
+                          // `recv.P <- v` calls the property's setter
+                          let propSetter =
+                              if l.NodeKind <> DotExpr then None
+                              else
+                                  match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                                  | Some t ->
+                                      (match dictTryFind memberSites t.Offset with
+                                       | Some owner ->
+                                           (match dictTryFind memberIndex (owner + ".set_" + t.Text) with
+                                            | Some sd ->
+                                                (match nodesOf l |> List.tryHead with
+                                                 | Some recv -> Some (sd, lowerExpr (GNode recv))
+                                                 | None -> None)
+                                            | None -> None)
+                                       | None -> None)
+                                  | None -> None
+                          (match propSetter with
+                           | Some (sd, recv) ->
+                               EApp (EVar (varIdOf sd, schemeOf sd), [ recv; lowerExpr (GNode r) ])
+                           | None ->
+                          match lowerExpr (GNode l) with
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
                            | EIndex (nm, a, i) -> EIndexSet (nm, a, i, lowerExpr (GNode r))
                            | EField (recv, fname, owner) -> EFieldSet (recv, fname, owner, lowerExpr (GNode r))
@@ -659,6 +678,65 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// receiver first, and return the name it was declared under together
     /// with the function it became.
     and liftMemberIn (name : string) (m : GreenNode) : (string * VarId) option =
+        let accessorNodes = nodesOf m |> List.filter (fun a -> a.NodeKind = AccessorDecl)
+        if not (List.isEmpty accessorNodes) then liftAccessors name m accessorNodes
+        else liftPlainMember name m
+
+    /// `member x.P with get() = ... and set v = ...` becomes two functions:
+    /// the property reader `P` and the writer `set_P`.
+    and liftAccessors (name : string) (m : GreenNode) (accessorNodes : GreenNode list) : (string * VarId) option =
+        let idents = tokensOf m |> List.filter (fun t -> t.Kind = Ident)
+        let selfTok, nameTok =
+            match idents with
+            | [ slf; nm ] -> Some slf, Some nm
+            | [ nm ] -> None, Some nm
+            | _ -> None, None
+        match nameTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+        | None -> None
+        | Some propDef ->
+            let mutable result = None
+            for acc in accessorNodes do
+                let kindTok = tokensOf acc |> List.tryFind (fun t -> t.Kind = Ident)
+                let isSetter = (kindTok |> Option.map (fun t -> t.Text)) = Some "set"
+                let defAt =
+                    if isSetter then kindTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
+                    else Some propDef
+                match defAt with
+                | None -> ()
+                | Some d ->
+                    let sch = schemeOf d
+                    let selfSch =
+                        match sch.Body with
+                        | TFun (a, _) -> mono a
+                        | _ -> mono (TCon (name, []))
+                    let selfBind =
+                        match selfTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+                        | Some sd -> varIdOf sd, selfSch
+                        | None -> { Path = path; Offset = d.Offset + 800000; Name = "this" }, selfSch
+                    currentSelf <- Some selfBind
+                    let mutable seenEq = false
+                    let bodies = vecNew<GreenNode> ()
+                    for c in acc.Children do
+                        match c with
+                        | GToken t when t.Kind = Operator && t.Text = "=" -> seenEq <- true
+                        | GNode b when seenEq && isExprish b.NodeKind -> vecAdd bodies b
+                        | _ -> ()
+                    let body = lowerBlock (vecToList bodies)
+                    currentSelf <- None
+                    // a lone `()` marks a no-argument getter, not a parameter
+                    let ps =
+                        nodesOf acc
+                        |> List.filter (fun p -> isPatKind p.NodeKind)
+                        |> List.filter (fun p -> not (List.isEmpty (Green.tokens (GNode p) |> List.filter (fun t -> t.Kind = Ident))))
+                    let binds =
+                        match paramBinds ps with
+                        | bs, [] -> bs
+                        | _, _ -> []
+                    vecAdd decls (DLet (false, varIdOf d, sch, ELam (selfBind :: binds, body)))
+                    if not isSetter then result <- Some (d.Name, varIdOf d)
+            result
+
+    and liftPlainMember (name : string) (m : GreenNode) : (string * VarId) option =
         let mutable seenEq = false
         let idents = vecNew<Token> ()
         let pats = vecNew<GreenNode> ()
@@ -856,9 +934,30 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match lowerLetParts l with
                 | Some (SimpleLet (isRec, v, sch, rhs, _)) -> Some (isRec, v, sch, rhs)
                 | _ -> None)
-        let instanceFields =
+        // A class-level `let` may shadow a constructor parameter of the same
+        // name (`let mutable key = key`). That is ONE piece of state: keep
+        // the shadowing binding, since it is what the members see.
+        // A constructor parameter only becomes instance state if a member
+        // reads it. One that merely feeds a `let`, a `do` or the base
+        // constructor lives and dies inside the constructor.
+        let rec memberIdents (m : GreenNode) : Token list =
+            if m.NodeKind = MemberDecl then Green.tokens (GNode m) |> List.filter (fun t -> t.Kind = Ident)
+            else nodesOf m |> List.collect memberIdents
+        let readByMembers =
+            nodesOf n
+            |> List.collect memberIdents
+            |> List.choose (fun t -> dictTryFind useDefs t.Offset)
+            |> List.map (fun d -> d.Path, d.Offset)
+        let ctorParamDefs =
+            ctorParamDefs
+            |> List.filter (fun d -> List.contains (d.Path, d.Offset) readByMembers)
+        let allFields =
             (ctorParamDefs |> List.map (fun d -> varIdOf d, schemeOf d))
             @ (classLetParts |> List.map (fun (_, v, sch, _) -> v, sch))
+        let instanceFields =
+            allFields
+            |> List.filter (fun (v, _) ->
+                not (allFields |> List.exists (fun (w, _) -> w.Name = v.Name && w.Offset > v.Offset)))
 
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)

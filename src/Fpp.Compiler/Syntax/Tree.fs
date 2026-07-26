@@ -18,6 +18,7 @@ type NodeKind =
     | RecordField
     | AttributeList
     | MemberDecl
+    | AccessorDecl
     | InterfaceImpl
     | InheritDecl
     // expressions

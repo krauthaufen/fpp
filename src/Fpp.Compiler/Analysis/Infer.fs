@@ -54,7 +54,7 @@ type FieldInfo =
 let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
           (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
-          (bases : Dict<string, string>) : InferResult =
+          (bases : Dict<string, Var list * Type>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -150,12 +150,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let tryResolveDot (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
         // members are inherited: walk up the base chain to the type that
         // actually declares this one, and bind to THAT declaration
-        let rec declaringOwner (tn : string) : FieldInfo option =
+        // Walk to the type that declares this member, carrying the receiver's
+        // type arguments up through each `inherit` so a generic base is
+        // instantiated the way the derived class instantiated it.
+        let rec declaringOwner (tn : string) (args : Type list) : (FieldInfo * string * Type list) option =
             match dictTryFind fields (tn + "." + name) with
-            | Some fi -> Some fi
+            | Some fi -> Some (fi, tn, args)
             | None ->
                 match dictTryFind bases tn with
-                | Some b -> declaringOwner b
+                | Some (ps, baseTy) ->
+                    let subst = dictNew<int, Type> ()
+                    if ps.Length = args.Length then
+                        List.zip ps args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                    (match prune (substVars subst baseTy) with
+                     | TCon (bn, bargs) -> declaringOwner bn bargs
+                     | _ -> None)
                 | None -> None
         // Instantiating the member's own scheme (rather than substituting
         // into its type) is what turns the use into a specialization demand:
@@ -185,11 +194,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ -> false
         match prune recvTy with
         | TCon (tn, args) ->
-            (match declaringOwner tn with
-             | Some fi when tracked tn args fi -> true
-             | Some fi when fi.Params.Length = args.Length ->
+            (match declaringOwner tn args with
+             | Some (fi, own, ownArgs) when own = tn && tracked tn args fi -> true
+             | Some (fi, _, ownArgs) when fi.Params.Length = ownArgs.Length ->
                  let subst = dictNew<int, Type> ()
-                 List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                 List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
                  for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
                  unifyAt offset result (substVars subst fi.FieldType)
                  vecAdd memberSitesRaw (offset, fi.TypeName)
@@ -967,8 +976,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // can walk the chain
         (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl) with
          | Some inh ->
-             (match Green.tokens (GNode inh) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
-              | Some t -> dictSet bases name t.Text
+             (match nodesOf inh |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+              | Some tn ->
+                  // typed in the class' own scope, so `inherit Node<'K>` on
+                  // `Pair<'K,'V>` records Node applied to Pair's first param
+                  let ownParams =
+                      vecToList tyParams
+                      |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
+                  dictSet bases name (ownParams, typeFromNode vars tn)
               | None -> ())
          | None -> ())
         // Any abstract member declares a dispatch slot — on a pure interface
@@ -1100,6 +1115,78 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 Some name
             | [ name ] -> Some name
             | _ -> None
+        // ---- property accessors -----------------------------------------
+        // `member x.P with get() = e and set v = e2` declares TWO members:
+        // the property itself and a `set_P` writer.
+        let accessors =
+            nodesOf n |> List.filter (fun m -> m.NodeKind = AccessorDecl)
+        if not (List.isEmpty accessors) then
+            let accOf (which : string) =
+                accessors
+                |> List.tryFind (fun a ->
+                    match tokensOf a |> List.tryFind (fun t -> t.Kind = Ident) with
+                    | Some t -> t.Text = which
+                    | None -> false)
+            let accParts (a : GreenNode) =
+                // a lone `()` is the getter's no-argument marker, not a param
+                let ps =
+                    nodesOf a
+                    |> List.filter (fun m -> isPatKind m.NodeKind)
+                    |> List.filter (fun p -> not (List.isEmpty (Green.tokens (GNode p) |> List.filter (fun t -> t.Kind = Ident))))
+                let bodies = nodesOf a |> List.filter (fun m -> isExprish m.NodeKind)
+                ps, bodies
+            let propTy =
+                match accOf "get" with
+                | Some g ->
+                    let ps, bodies = accParts g
+                    let pts = ps |> List.map (patType mvars)
+                    let bt = bodies |> List.map (fun b -> exprType (GNode b)) |> List.tryLast
+                    let rt = match bt with Some t -> t | None -> st.Fresh ()
+                    List.foldBack (fun p acc -> TFun (p, acc)) pts rt
+                | None -> st.Fresh ()
+            (match accOf "set" with
+             | Some sa ->
+                 let ps, bodies = accParts sa
+                 let pts = ps |> List.map (patType mvars)
+                 for b in bodies do exprType (GNode b) |> ignore
+                 // the written value has the property's type
+                 (match pts with
+                  | [ only ] -> unifyAt (match tokensOf sa |> List.tryHead with Some t -> t.Offset | None -> 0) only propTy
+                  | _ -> ())
+                 let setTy = List.foldBack (fun p acc -> TFun (p, acc)) pts tUnit
+                 (match tokensOf sa |> List.tryFind (fun t -> t.Kind = Ident) with
+                  | Some kt when (dictTryFind defsAt kt.Offset).IsSome ->
+                      let defTy = TFun (selfTy, setTy)
+                      setScheme kt.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Body = defTy }
+                      (match nameTok with
+                       | Some pn ->
+                           dictSet fields (tyName + ".set_" + pn.Text)
+                               { TypeName = tyName; Params = classParams
+                                 Quantified = []
+                                 FieldType = setTy
+                                 DefKey = Some (path, kt.Offset); IsStatic = false }
+                       | None -> ())
+                  | _ -> ())
+             | None -> ())
+            st.ExitLevel ()
+            (match nameTok with
+             | Some t ->
+                 recordDef t propTy
+                 let defTy = TFun (selfTy, propTy)
+                 if (dictTryFind defsAt t.Offset).IsSome then
+                     setScheme t.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Body = defTy }
+                 let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
+                 dictSet fields (tyName + "." + t.Text)
+                     { TypeName = tyName; Params = classParams
+                       Quantified =
+                           freeVars propTy |> List.distinctBy (fun v -> v.Id)
+                           |> List.filter (fun v -> not (Set.contains v.Id classIds))
+                       FieldType = propTy
+                       DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
+                       IsStatic = false }
+             | None -> ())
+        else
+
         let paramTys = vecToList pats |> List.map (patType mvars)
         // body typed only after parameters are bound
         let bodyTys = vecToList bodies |> List.map exprType

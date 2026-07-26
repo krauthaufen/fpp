@@ -137,8 +137,8 @@ type ProjectResults =
       Schemes : Fpp.Prelude.Dict<string, Analysis.Types.Scheme>
       /// interface name -> its methods as (name, arity), project-wide
       Interfaces : Fpp.Prelude.Dict<string, (string * int) list>
-      /// derived class -> its base class, project-wide
-      Bases : Fpp.Prelude.Dict<string, string> }
+      /// derived class -> (its own type params, its base type), project-wide
+      Bases : Fpp.Prelude.Dict<string, Analysis.Types.Var list * Analysis.Types.Type> }
 
 type Workspace() =
     let db = Db()
@@ -213,7 +213,7 @@ type Workspace() =
             let aliases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
             let fields = dictNew<string, Analysis.Infer.FieldInfo> ()
             let ifaces = dictNew<string, (string * int) list> ()
-            let bases = dictNew<string, string> ()
+            let bases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
             let results = dictNew<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult> ()
             // the builtin prelude seeds imports and schemes for every file
             let bp = Parser.parse Builtin.source
@@ -237,7 +237,7 @@ type Workspace() =
                 for d in ds do
                     match d with
                     | Fpp.Core.Ir.DInterface (n, ms) -> dictSet ifaces n ms
-                    | Fpp.Core.Ir.DClass (n, Some b, _, _) -> dictSet bases n b
+                    | Fpp.Core.Ir.DClass (n, Some b, _, _) -> dictSet bases n ([], Analysis.Types.TCon (b, []))
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases })
 
@@ -289,7 +289,7 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms r.Interfaces r.Bases
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms r.Interfaces
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -300,7 +300,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Interfaces r.Bases
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Interfaces
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -349,7 +349,7 @@ type Workspace() =
                 for off, i in inf.InstSites do dictSet ik off i
                 let ms = dictNew<int, string> ()
                 for off, o in inf.MemberSites do dictSet ms off o
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces r.Bases
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -372,7 +372,7 @@ type Workspace() =
             for off, i in inf.InstSites do dictSet ik off i
             let ms = dictNew<int, string> ()
             for off, o in inf.MemberSites do dictSet ms off o
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces r.Bases
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms r.Interfaces
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.
