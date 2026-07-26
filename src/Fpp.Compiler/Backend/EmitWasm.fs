@@ -80,10 +80,20 @@ let emit (decls : Decl list) : EmitResult =
     // signature — that IS the dispatch contract, so no specialization
     /// The function filling an identity slot: a user override if the type
     /// declares one, otherwise the generated function.
+    let declaredMembers =
+        decls |> List.choose (fun d -> match d with DMembers (n, own) -> Some (n, own) | _ -> None)
     let identityImpl (cn : string) (name : string) : VarId option =
         chainOf cn
         |> List.tryPick (fun c ->
-            ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None)))
+            let fromClass =
+                ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None))
+            match fromClass with
+            | Some v -> Some v
+            | None ->
+                declaredMembers
+                |> List.tryPick (fun (n, own) ->
+                    if n <> c then None
+                    else own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None)))
     let ifaceImplKeys =
         (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (_, ms) -> ms |> List.map (fun (_, v) -> v.Path, v.Offset))))
         @ (classDecls
@@ -91,9 +101,9 @@ let emit (decls : Decl list) : EmitResult =
                 vtableSlots |> List.choose (fun (i, m) -> slotImpl cn i m |> Option.map (fun v -> v.Path, v.Offset))))
         // an identity override is reached through a vtable too, so it keeps
         // the canonical all-anyref signature
-        @ (classDecls
-           |> List.collect (fun (cn, _, _, _) ->
-                [ "Equals"; "GetHashCode" ] |> List.choose (fun m -> identityImpl cn m |> Option.map (fun v -> v.Path, v.Offset))))
+        @ (declaredMembers
+           |> List.collect (fun (_, own) ->
+                own |> List.choose (fun (m, v) -> if m = "Equals" || m = "GetHashCode" then Some (v.Path, v.Offset) else None)))
     let isIfaceImpl (key : string * int) = List.contains key ifaceImplKeys
 
     let rawRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, st) -> Some (n, fs, st) | _ -> None)
@@ -1595,7 +1605,10 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $cons (struct (field (mut anyref)) (field (mut anyref))))"
     line "  (type $str (array (mut i8)))"
     line "  (type $boxf (struct (field f64)))"
-    line "  (type $boxi (struct (field i32)))"
+    // mutable so this stays a DIFFERENT heap type from $du0, which is also
+    // one i32: wasm-GC canonicalizes identical shapes, and a nullary DU case
+    // was being read as a boxed int
+    line "  (type $boxi (struct (field (mut i32))))"
     line "  (type $arr (array (mut anyref)))"
     line "  (type $parr_i (array (mut i32)))"
     line "  (type $parr_f (array (mut f64)))"
@@ -1725,14 +1738,24 @@ let emit (decls : Decl list) : EmitResult =
 
     // per-class descriptor: class id plus the vtable, one slot per
     // (interface, method) in the whole program
+    let identityAdapters = vecNew<string * int * string> ()
     for cn in objRecordNames do
         let identity =
-            [ "Equals", "$eq_" + cn; "GetHashCode", "$hash_" + cn ]
-            |> List.map (fun (mname, generated) ->
+            [ "Equals", "$eq_" + cn, 2; "GetHashCode", "$hash_" + cn, 1 ]
+            |> List.map (fun (mname, generated, wantArity) ->
                 match identityImpl cn mname with
                 | Some v ->
                     (match dictTryFind topName (v.Path, v.Offset) with
-                     | Some fn -> "(ref.func " + fn + ")"
+                     | Some fn ->
+                         // `GetHashCode()` is written with a unit argument, so
+                         // its arity does not match the slot; adapt it
+                         let actual = match dictTryFind topArity (v.Path, v.Offset) with Some a -> a | None -> wantArity
+                         if actual = wantArity then "(ref.func " + fn + ")"
+                         elif actual = wantArity + 1 then
+                             let ad = "$adapt" + string wantArity + "_" + cn + "_" + mname
+                             vecAdd identityAdapters (ad, wantArity, fn)
+                             "(ref.func " + ad + ")"
+                         else "(ref.func " + generated + ")"
                      | None -> "(ref.func " + generated + ")")
                 | None -> "(ref.func " + generated + ")")
         let slots =
@@ -1750,6 +1773,53 @@ let emit (decls : Decl list) : EmitResult =
             else "(array.new_fixed $vt " + string slots.Length + " " + String.concat " " slots + ")"
         line ("  (global $desc_" + cn + " (ref $desc) (struct.new $desc (i32.const "
               + string (descId cn) + ") " + vt + "))")
+
+    // A union's identity: structural by default (tag, then payload), or the
+    // union's own override. Indexed by case tag, which is globally unique.
+    line "  (func $eq_du_default (param $a anyref) (param $b anyref) (result anyref)"
+    line "    (if (i32.and (ref.test (ref $du1) (local.get $a)) (ref.test (ref $du1) (local.get $b)))"
+    line "      (then (return (call $equal (struct.get $du1 1 (ref.cast (ref $du1) (local.get $a)))"
+    line "                                (struct.get $du1 1 (ref.cast (ref $du1) (local.get $b)))))))"
+    line "    (ref.i31 (i32.const 1)))"
+    line "  (func $hash_du_default (param $v anyref) (result anyref)"
+    line "    (if (ref.test (ref $du1) (local.get $v))"
+    line "      (then (return (ref.i31 (i32.add"
+    line "        (i32.mul (struct.get $du1 0 (ref.cast (ref $du1) (local.get $v))) (i32.const 31))"
+    line "        (call $hashv (struct.get $du1 1 (ref.cast (ref $du1) (local.get $v)))))))))"
+    line "    (ref.i31 (struct.get $du0 0 (ref.cast (ref $du0) (local.get $v)))))"
+    let tagCount = (dictPairs caseTag |> List.map snd |> List.fold max (-1)) + 1
+    let duSlot (which : string) (dflt : string) (wantArity : int) =
+        List.init tagCount (fun t ->
+            let owner =
+                dictPairs caseTag
+                |> List.tryPick (fun (c, tg) -> if tg = t then dictTryFind caseOwner c else None)
+            match owner |> Option.bind (fun o -> identityImpl o which) with
+            | Some v ->
+                (match dictTryFind topName (v.Path, v.Offset) with
+                 | Some fn ->
+                     let actual = match dictTryFind topArity (v.Path, v.Offset) with Some a -> a | None -> wantArity
+                     if actual = wantArity then "(ref.func " + fn + ")"
+                     elif actual = wantArity + 1 then
+                         let ad = "$adaptdu" + string wantArity + "_" + string t
+                         vecAdd identityAdapters (ad, wantArity, fn)
+                         "(ref.func " + ad + ")"
+                     else "(ref.func " + dflt + ")"
+                 | None -> "(ref.func " + dflt + ")")
+            | None -> "(ref.func " + dflt + ")")
+    if tagCount > 0 then
+        line ("  (global $duEq (ref $vt) (array.new_fixed $vt " + string tagCount + " "
+              + String.concat " " (duSlot "Equals" "$eq_du_default" 2) + "))")
+        line ("  (global $duHash (ref $vt) (array.new_fixed $vt " + string tagCount + " "
+              + String.concat " " (duSlot "GetHashCode" "$hash_du_default" 1) + "))")
+    else
+        line "  (global $duEq (ref $vt) (array.new_fixed $vt 1 (ref.func $eq_du_default)))"
+        line "  (global $duHash (ref $vt) (array.new_fixed $vt 1 (ref.func $hash_du_default)))"
+
+    for ad, arity, target in vecToList identityAdapters do
+        let ps = List.init arity (fun i -> "(param $p" + string i + " anyref)") |> String.concat " "
+        let args = List.init arity (fun i -> "(local.get $p" + string i + ")") |> String.concat " "
+        line ("  (func " + ad + " " + ps + " (result anyref) (call " + target + " " + args
+              + " (ref.i31 (i32.const 0))))")
 
     // runtime: putc, print, itoa, equal, append, apply
     let runtimeSrc = """  (func $putc (param $c i32)
@@ -1850,17 +1920,23 @@ let emit (decls : Decl list) : EmitResult =
     ;; tuples: $tupN is a distinct type per arity, so this cannot confuse
     ;; two different shapes
 TUPLE_EQ
-    ;; DU cases: the tag is globally unique, so equal tags are the same case
+    ;; DU cases: the tag is globally unique, so equal tags are the same case,
+    ;; and a table indexed by tag is a DU's equivalent of a vtable — which is
+    ;; how an Equals override on a union is reached.
     (if (i32.and (ref.test (ref $du0) (local.get $a)) (ref.test (ref $du0) (local.get $b)))
-      (then (return (ref.i31 (i32.eq (struct.get $du0 0 (ref.cast (ref $du0) (local.get $a)))
-                                     (struct.get $du0 0 (ref.cast (ref $du0) (local.get $b))))))))
+      (then
+        (if (i32.ne (struct.get $du0 0 (ref.cast (ref $du0) (local.get $a)))
+                    (struct.get $du0 0 (ref.cast (ref $du0) (local.get $b))))
+          (then (return (ref.i31 (i32.const 0)))))
+        (return (call_ref $v2 (local.get $a) (local.get $b) (ref.cast (ref $v2)
+          (array.get $vt (global.get $duEq) (struct.get $du0 0 (ref.cast (ref $du0) (local.get $a)))))))))
     (if (i32.and (ref.test (ref $du1) (local.get $a)) (ref.test (ref $du1) (local.get $b)))
       (then
         (if (i32.ne (struct.get $du1 0 (ref.cast (ref $du1) (local.get $a)))
                     (struct.get $du1 0 (ref.cast (ref $du1) (local.get $b))))
           (then (return (ref.i31 (i32.const 0)))))
-        (return (call $equal (struct.get $du1 1 (ref.cast (ref $du1) (local.get $a)))
-                             (struct.get $du1 1 (ref.cast (ref $du1) (local.get $b)))))))
+        (return (call_ref $v2 (local.get $a) (local.get $b) (ref.cast (ref $v2)
+          (array.get $vt (global.get $duEq) (struct.get $du1 0 (ref.cast (ref $du1) (local.get $a)))))))))
     (if (i32.and (ref.test (ref $cons) (local.get $a)) (ref.test (ref $cons) (local.get $b)))
       (then
         (if (i32.eqz (i31.get_s (ref.cast (ref i31) (call $equal
@@ -1944,10 +2020,11 @@ TUPLE_EQ
       (then (return (array.len (ref.cast (ref $parr_l) (local.get $v))))))
 TUPLE_HASH
     (if (ref.test (ref $du0) (local.get $v))
-      (then (return (struct.get $du0 0 (ref.cast (ref $du0) (local.get $v))))))
+      (then (return (i31.get_s (ref.cast (ref i31) (call_ref $v1 (local.get $v) (ref.cast (ref $v1)
+        (array.get $vt (global.get $duHash) (struct.get $du0 0 (ref.cast (ref $du0) (local.get $v)))))))))))
     (if (ref.test (ref $du1) (local.get $v))
-      (then (return (i32.add (i32.mul (struct.get $du1 0 (ref.cast (ref $du1) (local.get $v))) (i32.const 31))
-                             (call $hashv (struct.get $du1 1 (ref.cast (ref $du1) (local.get $v))))))))
+      (then (return (i31.get_s (ref.cast (ref i31) (call_ref $v1 (local.get $v) (ref.cast (ref $v1)
+        (array.get $vt (global.get $duHash) (struct.get $du1 0 (ref.cast (ref $du1) (local.get $v)))))))))))
     (if (ref.test (ref $str) (local.get $v))
       (then
         (local.set $h (i32.const -2128831035))

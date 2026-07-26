@@ -479,6 +479,8 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
     // have any of its interface methods called.
     for d in decls do
         match d with
+        | DMembers (_, own) ->
+            for _, v in own do demand (v.Path, v.Offset)
         | DClass (_, _, own, impls) ->
             for _, v in own do demand (v.Path, v.Offset)
             for _, ms in impls do

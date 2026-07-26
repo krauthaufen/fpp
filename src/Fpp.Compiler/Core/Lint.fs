@@ -268,6 +268,6 @@ let lint (decls : Decl list) : string list =
             let rt = exprType rhs
             unifyC ("top-level " + v.Name) declared rt
             dictSet env (keyOf v) declared
-        | DExtern _ | DUnion _ | DRecord _ | DInterface _ | DClass _ | DEnum _ -> ()
+        | DExtern _ | DUnion _ | DRecord _ | DInterface _ | DClass _ | DEnum _ | DMembers _ -> ()
 
     vecToList errors

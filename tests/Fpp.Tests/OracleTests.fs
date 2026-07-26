@@ -784,6 +784,35 @@ let oracleTests =
             "let r4 = print (if c1 = c2 then \"eq\" else \"ne\")"
             "let r5 = print (if c1 = c1 then \"eq\" else \"ne\")"
         ]
+        oracle "Equals/GetHashCode overrides on records and unions" [
+            // F# demands CustomEquality when a record or union overrides
+            // these; we ignore the attribute, so the program is valid on both
+            "[<CustomEquality; NoComparison>]"
+            "type R ="
+            "    { A : int"
+            "      B : int }"
+            "    override x.Equals (o : obj) = true"
+            "    override x.GetHashCode () = 42"
+            "[<CustomEquality; NoComparison>]"
+            "type Sh ="
+            "    | Dot"
+            "    | Box of int"
+            "    override x.Equals (o : obj) = true"
+            "    override x.GetHashCode () = 7"
+            "type Plain ="
+            "    | Red"
+            "    | Blue of int"
+            "let p = { A = 1; B = 2 }"
+            "let q = { A = 9; B = 9 }"
+            "let r1 = print (if p = q then \"eq\" else \"ne\")"
+            "let r2 = print (hash p)"
+            "let r3 = print (if Box 1 = Box 2 then \"eq\" else \"ne\")"
+            "let r4 = print (hash (Box 1))"
+            "let r5 = print (hash Dot)"
+            "let r6 = print (if Blue 1 = Blue 2 then \"eq\" else \"ne\")"
+            "let r7 = print (if Blue 3 = Blue 3 then \"eq\" else \"ne\")"
+            "let r8 = print (if Red = Red then \"eq\" else \"ne\")"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

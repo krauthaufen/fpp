@@ -127,6 +127,14 @@ Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
       user-declared `Equals`/`GetHashCode` fills the slot instead.
 - [x] per-OBJECT identity hash for classes: a word in the object header,
       handed out on first use. Records and structs do not carry it.
+- [x] `Equals`/`GetHashCode` overrides work on ANY type — records and
+      unions too, not just classes. A union has no descriptor field, so its
+      identity dispatches through a table indexed by case tag, which is a
+      DU's equivalent of a vtable. `GetHashCode()` is written with a unit
+      argument, so its arity is adapted to the slot.
+- [x] `$boxi` was `(struct (field i32))` and so was `$du0` — the SAME heap
+      type after canonicalization, so a nullary union case was hashed as a
+      boxed int. `$boxi` is now mutable, which separates them.
 - [ ] `$hashv`/`$equal` still exist as the dynamic entry points. They are
       now thin — primitives, then descriptor dispatch — but the remaining
       shape tests (cons, tuple, DU) could move behind descriptors too.

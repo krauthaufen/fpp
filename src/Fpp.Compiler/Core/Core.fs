@@ -95,6 +95,10 @@ type Decl =
     /// class name, base class, its own members as (name, function), and
     /// per implemented interface the functions implementing its methods
     | DClass of string * string option * (string * VarId) list * (string * (string * VarId) list) list
+    /// type name and its own members as (name, function). Emitted for ANY
+    /// type that declares members — records and DUs included — so an
+    /// override can be found without the type being a class.
+    | DMembers of string * (string * VarId) list
 
 type LowerResult =
     { Decls : Decl list
@@ -176,6 +180,8 @@ let printDecl (d : Decl) : string =
         "enum " + n + " = " + String.concat " | " (cs |> List.map (fun (c, v) -> c + "=" + string v))
     | DInterface (n, ms) ->
         "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
+    | DMembers (n, own) ->
+        "members " + n + " {" + String.concat "; " (own |> List.map fst) + "}"
     | DClass (n, bse, own, impls) ->
         "class " + n
         + (match bse with Some b -> " inherit " + b | None -> "")

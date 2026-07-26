@@ -1269,6 +1269,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 vecAdd implemented (iname, bound)
             currentClass <- ""
             if isClass then vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
+            // records and DUs are not classes but may still declare members,
+            // and an Equals/GetHashCode among them overrides the generated one
+            if not (List.isEmpty (vecToList ownMembers)) then
+                vecAdd decls (DMembers (name, vecToList ownMembers))
 
         if isEnum then vecAdd decls (DEnum (name, enumCases))
         elif not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
