@@ -64,26 +64,47 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       inheritance, `AbstractClass`.
 
 ### Measured against the acceptance target
-Running the real `HashCollections.fs` (4500 lines) through the front end:
-its first 183 lines — the hash-mixing helpers and the whole node class
-hierarchy (SetLinked, MapLinked, SetNode, SetLeaf, MapLeaf, Inner, with
-generic inheritance, property accessors, packed uint32 tag bits and the
-NodeKind enum) — now parse and typecheck with zero diagnostics. The first
-error was line 24 before this work.
-The single remaining blocker is now **struct tuples** (`struct(ok, node)`
-as an expression and as a pattern, from line 193). Deliberately NOT
-implemented as a heap tuple: `struct(...)` is the user stating a
-representation, exactly the kind of intent that must not be silently
-downgraded. Doing it properly means multi-value returns generalised from
-the existing POD-result path to arbitrary (including reference) elements,
-plus a distinct type constructor so `struct(a,b)` and `(a,b)` do not
-unify. That is its own piece of work, on the scale of the class stack.
+Running the real `HashCollections.fs` (4501 lines) through the front end:
+**the first 3167 lines now parse and typecheck with zero diagnostics**, and
+lowering reports only 18 gaps in them, all of one kind (assignment to a
+`val mutable` field). The first error was line 24 when this measurement
+started; it has moved 24 -> 184 -> 530 -> 855 -> 3168.
 
-Also still open (not yet reached by the target): `member val`,
-`static let`, operators as members, interface inheritance,
-`Unchecked.defaultof`.
+That covers the hash-mixing helpers, the whole node class hierarchy, and
+the set/map node implementation: generic inheritance, property accessors,
+packed uint32 tag bits, the NodeKind enum, null-terminated chains,
+IEqualityComparer dispatch, struct tuples, and implicit upcasts.
+
+Remaining blockers, in source order from line 3168 — one cluster, the
+struct enumerators:
+- [ ] `val mutable` fields (and assignment to them: the 18 lowering gaps)
+- [ ] explicit `new(...)` constructors with record-expression initialization
+- [ ] `Unchecked.defaultof<_>`
+
+Also still open, not yet reached: `member val`, `static let`, operators as
+members, interface inheritance.
+
+### Generic structs — the remaining representation work
+A field declaration now carries its TYPE rather than a pre-resolved kind,
+so the backend derives the representation once the type is concrete. What
+is NOT yet done is stamping a generic struct record per instantiation:
+`Pair<float,float>` still shares one record whose fields are boxed, rather
+than a POD layout. Struct tuples inherit exactly this behaviour, being
+ordinary generic structs — which is the point: fixing it fixes both, and
+it is the same tier-1 stamping already done for functions, extended to
+record declarations. Needs: instantiated struct names at use sites
+(ERecord/EField/array element), and DRecord stamping in Link.
 
 Earlier items, now done:
+Earlier items, now done:
+- [x] struct tuples: NOT a concept in the core. `struct(a, b)` builds the
+      prelude's generic struct `StructTuple2<'a,'b>`, in expression,
+      pattern and type position — so every struct rule applies to it
+      unchanged, and improving generic-struct layout improves it for free.
+- [x] nominal subtyping: an argument may be a subclass of the parameter, or
+      a class implementing the expected interface. F# inserts the upcast
+      and the representation is identical, so unification widens instead
+      of failing.
 - [x] `IEqualityComparer<'a>` in the builtin prelude, satisfiable with an
       object expression. Fixed a real bug on the way: a generic interface
       (`IEqualityComparer<int>`) was registered under its type ARGUMENT,
