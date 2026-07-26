@@ -248,6 +248,66 @@ is never asked for a sine), `IOrdered<'a>` for comparison, and the
 Functor/Monad layer of the HKT design. Two flavours of class coexist, and
 which is which should be stated rather than assumed.
 
+**Closed classes carry the genericity; operator classes carry the
+notation.** Overloaded operators alone would make generic math unwritable:
+`a + b` yields `IAdd<'a,'b>.Result`, and without something to pin it, an
+unannotated numerical routine infers a chain of unreduced projections that
+is unreadable — the failure mode that makes F#'s SRTP errors notorious.
+The fix is nominal superclass constraints:
+
+```
+type IFractional<'a>
+    when 'a : IAdd<'a,'a> with Result = 'a
+     and 'a : IMul<'a,'a> with Result = 'a
+     and 'a : IDiv<'a,'a> with Result = 'a =
+    static abstract member Zero : 'a
+    static abstract member One  : 'a
+```
+
+`let solve<'a when 'a : IFractional> (m : Matrix<'a>) (b : Vector<'a>)`
+then typechecks with no concrete types anywhere: `x + y` at `'a` produces
+`IAdd<'a,'a>.Result`, and the superclass equality in scope reduces it to
+`'a` at once. The user writes one readable constraint; closure comes from
+the class, not from grounding.
+
+**The projection rule.** A projection must reduce either by a known
+concrete type or by a constraint in scope, and may never survive into a
+generalized signature. If it cannot reduce, that is an error naming the
+failing operator application and its two operand types — never an
+accumulated constraint chain. Error shape is a requirement here, not a
+nicety: dumping the chain is exactly what makes SRTP diagnostics
+unreadable.
+
+This is also what makes associated-type EQUALITY in constraints
+load-bearing rather than speculative: `with Result = 'a` is the mechanism.
+
+In practice generic numeric code is generic over the SCALAR, not the
+containers — `Matrix<'a>`/`Vector<'a>` operations are written concretely
+and constrained on `'a : IFractional`, while heterogeneous instances like
+`IMul<Matrix<'a>, Vector<'a>>` are declared once per container rather than
+inferred per call. So the two-parameter classes stay near-ground and the
+closed classes do the abstracting. (nalgebra's `T: RealField` is the same
+split.)
+
+**Instances are free-standing.** A two-parameter class has no natural
+owner — `IMul<M44d, V4d>` belongs to neither operand more than the other —
+so instances are declared Haskell-style rather than inside a type:
+
+```
+instance IMul<M44d, V4d> with
+    type Result = V4d
+    static member (*) m v = ...
+```
+
+`static member (+)` on a type stays as sugar for the homogeneous case
+`IAdd<T,T> with Result = T`, because that is what F# code in the wild
+writes.
+
+**One operator symbol, one class.** `a + b` must resolve by a single
+lookup keyed on the class and the operand pair. If several classes could
+define `+`, resolution becomes a search with ambiguity that is
+unresolvable in principle, not merely slow.
+
 **Coherence matters more here, not less.** With no laws to constrain
 instances, the only thing keeping resolution well-defined is: exactly one
 instance per `(a, b)` pair, globally, and an orphan rule — an instance must

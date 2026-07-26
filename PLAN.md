@@ -117,7 +117,17 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
   `Mul<Rhs> { type Output }` shape; the member is named `(*)`, not `Mul`
 - knowingly overloading rather than law-carrying algebra, for operators only
 - coherence: one instance per `(a, b)`, plus an orphan rule
-- constraints must be able to equate an associated type (`Result = 'a`)
+- constraints must be able to equate an associated type (`Result = 'a`) —
+  this is what closed classes use to pin operators to closure
+- closed classes (`IFractional<'a>` etc.) carry superclass constraints, so
+  generic math annotates with ONE name and projections reduce from the
+  constraint rather than from a concrete type
+- a projection reduces by a concrete type or a constraint in scope, and
+  never survives into a generalized signature; failures name the operator
+  application, not the constraint chain
+- instances are free-standing (Haskell-style); `static member (+)` is sugar
+  for the homogeneous case
+- one operator symbol maps to exactly one class
 Open: `static member (+)` in member position needs parser support — the same
 work serves user-defined operators and instance declarations.
 
