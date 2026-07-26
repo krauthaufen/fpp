@@ -286,8 +286,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
                      // a type with several constructors: inference chose one
                      let overloaded =
-                         if head.NodeKind <> IdentExpr then None
-                         else
+                         let ctorHead =
+                             if head.NodeKind = IdentExpr then Some head
+                             elif head.NodeKind = AppExpr
+                                  && (nodesOf head |> List.exists (fun x -> x.NodeKind = TyParams)) then
+                                 nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr)
+                             else None
+                         match ctorHead with
+                         | None -> None
+                         | Some head ->
                              match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
                              | Some ht ->
                                  (match dictTryFind ctorSites ht.Offset with

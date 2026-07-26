@@ -592,8 +592,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // actually accepts them — F#'s overload resolution,
                      // restricted to constructors.
                      let ctorChoice =
-                         if head.NodeKind <> IdentExpr then None
-                         else
+                         // the head may carry explicit type arguments:
+                         // `HashSet<'K>(comparer, root)`
+                         let ctorHead =
+                             if head.NodeKind = IdentExpr then Some head
+                             elif head.NodeKind = AppExpr
+                                  && (nodesOf head |> List.exists (fun x -> x.NodeKind = TyParams)) then
+                                 nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr)
+                             else None
+                         match ctorHead with
+                         | None -> None
+                         | Some head ->
                              match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
                              | Some ht ->
                                  (match dictTryFind useDefs ht.Offset with
