@@ -900,6 +900,8 @@ let parse (src : string) : ParseResult =
 
     and isTypeBodyStart () =
         isMemberStart () || s.IsKw "let" || s.IsKw "do" || s.IsKw "use"
+        // a member may carry attributes: `[<MethodImpl(...)>] member ...`
+        || (s.Is LBracket && (s.Peek 1).Kind = Operator && (s.Peek 1).Text = "<")
 
     and parseTypeBody (acc : Vec<Green>) (typeCol : int) : unit =
         // a member may sit on the same line as `with`, or on its own line
@@ -907,7 +909,8 @@ let parse (src : string) : ParseResult =
         let mutable go = true
         while go && not s.AtEof && (s.SameLine || (s.CurCol > typeCol)) && isTypeBodyStart () do
             let mark = s.Mark
-            if s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let" then
+            if s.Is LBracket then vecAdd acc (parseAttributeList ())
+            elif s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let" then
                 // `static let`: a binding on the type, not on an instance
                 vecAdd acc (parseLet typeCol)
             elif s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
