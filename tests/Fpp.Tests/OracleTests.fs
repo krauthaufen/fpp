@@ -517,6 +517,18 @@ let oracleTests =
             "let d = print (int 4000000000u)"
             "let e = print (uint32 (0 - 1))"
         ]
+        oracle "downcast/upcast take their target from the context" [
+            "type Base(tag : int) ="
+            "    member _.Tag = tag"
+            "type Derived(tag : int) ="
+            "    inherit Base(tag)"
+            "    member _.Extra = tag * 2"
+            "let asBase (d : Derived) : Base = upcast d"
+            "let asDerived (b : Base) : Derived = downcast b"
+            "let d = Derived(21)"
+            "let a = print (asBase d).Tag"
+            "let b = print (asDerived (asBase d)).Extra"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

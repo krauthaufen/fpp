@@ -149,6 +149,7 @@ let parse (src : string) : ParseResult =
     let canStartExpr () =
         canStartAtom () || s.IsKw "fun" || s.IsKw "if" || s.IsKw "match"
         || s.IsKw "function" || s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new"
+        || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
 
@@ -633,6 +634,12 @@ let parse (src : string) : ParseResult =
         elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
             // type variable in expression position (e.g. `unbox<'a>` soup)
             Green.node IdentExpr [ s.Bump (); s.Bump () ]
+        elif s.IsKw "downcast" || s.IsKw "upcast" then
+            // the target type comes from the context, so the node carries
+            // only the operator and the operand
+            let kw = s.Bump ()
+            let arg = parseApp ctx
+            Green.node CastExpr [ kw; arg ]
         elif s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new" then
             let kw = s.Bump ()
             let arg = parseApp ctx

@@ -71,8 +71,9 @@ the remaining blockers in source order are:
       bit-preserving primitives, unsigned printing. Same i32 payload as
       `int` — only the operations differ. Bitwise operators are now
       same-type rather than int-only, and shifts keep their operand's type.
-- [ ] `downcast` / `upcast` (target type comes from the context, so it
-      needs a type-directed resolution like member binding got)
+- [x] `downcast` / `upcast`: the target comes from the context, so the
+      site parks during inference and reads its resolved type back after
+      solving — the same deferral member binding uses.
 - [ ] multi-entry attribute lists `[<AllowNullLiteral; AbstractClass>]`
       and `AbstractClass` itself
 - [ ] enum-style DU access in a base-constructor argument

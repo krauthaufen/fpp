@@ -518,6 +518,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     (DClass (synth, None, [],
                              match iface with Some i -> [ i, bound ] | None -> []))
                 ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, EVar (v, sch)))
+            // `downcast e` / `upcast e`: inference resolved the target from
+            // the context and recorded it at the keyword
+            | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
+                let kw = tokensOf n |> List.find (fun t -> t.Kind = Keyword)
+                (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
+                 | Some o ->
+                     let inner = lowerExpr (GNode o)
+                     if kw.Text = "upcast" then inner
+                     else
+                         (match dictTryFind memberSites kw.Offset with
+                          | Some tn -> ECast (tn, inner, true)
+                          | None -> note (offsetOf n) "downcast without a known target type")
+                 | None -> note (offsetOf n) "cast shape")
             | CastExpr ->
                 let operand = nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind)
                 let target =

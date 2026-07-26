@@ -144,6 +144,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // here; the parked set is retried to fixpoint once the file is inferred.
     let memberSitesRaw = vecNew<int * string> ()
     let pendingDots = vecNew<int * Type * Type * string> ()
+    /// `downcast`/`upcast` sites: the target type is only known once the
+    /// surrounding expression has been solved
+    let pendingCasts = vecNew<int * Type> ()
 
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
@@ -721,6 +724,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     if m.NodeKind = MemberDecl then
                         inferMember (synth + "." + ifaceName) (dictNew ()) [] selfTy m
                 ifaceTy
+            // `downcast e` / `upcast e`: the target is whatever the context
+            // demands, so park the result and read it back once solved
+            | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
+                (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
+                 | Some operand -> exprType (GNode operand) |> ignore
+                 | None -> ())
+                let result = st.Fresh ()
+                (match tokensOf n |> List.tryHead with
+                 | Some t -> vecAdd pendingCasts (t.Offset, result)
+                 | None -> ())
+                result
             | CastExpr ->
                 // `e :> T` / `e :?> T`: the operand is typed for its own
                 // sake, the result is the target type
@@ -1278,6 +1292,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if tryResolveDot offset recvTy result name then progress <- true
             else vecAdd still (offset, recvTy, result, name)
         parked <- vecToList still
+    // contextual casts: the target is whatever the context settled on
+    for offset, ty in vecToList pendingCasts do
+        match prune ty with
+        | TCon (n, _) -> vecAdd memberSitesRaw (offset, n)
+        | _ -> ()
+
     // Anything still parked has an indeterminate receiver. We do NOT guess a
     // member from the name alone: the access stays unbound, and emission
     // rejects it with a real error rather than calling the wrong function.
