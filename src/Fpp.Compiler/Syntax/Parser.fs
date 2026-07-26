@@ -854,7 +854,11 @@ let parse (src : string) : ParseResult =
         if s.Is Ident then vecAdd acc (s.Bump ()) else s.Diag "expected a type name"
         if s.IsOp "<" && s.SameLine then
             vecAdd acc (Green.node TyParams (parseAngleArgs typeCol))
-        // primary-constructor parameters: `type State(src : string) =`
+        // primary-constructor parameters: `type State(src : string) =`,
+        // optionally with an access modifier: `type HashSet<'K> internal(...)`
+        while (s.IsKw "private" || s.IsKw "internal" || s.IsKw "public") && s.SameLine
+              && (s.Peek 1).Kind = LParen do
+            vecAdd acc (s.Bump ())
         if s.Is LParen && s.SameLine then
             vecAdd acc (parseAtomPat typeCol)
         if s.IsOp "=" then
@@ -874,15 +878,30 @@ let parse (src : string) : ParseResult =
         s.IsKw "member" || s.IsKw "static" || s.IsKw "abstract" || s.IsKw "override"
         || s.IsKw "default" || s.IsKw "interface" || s.IsKw "inherit" || s.IsKw "val"
         || s.IsKw "new"
+        // an access modifier may lead: `internal new(...)`, `private val ...`
+        || ((s.IsKw "private" || s.IsKw "internal" || s.IsKw "public")
+            && (let k = s.Peek 1 in
+                k.Kind = Keyword
+                && (k.Text = "member" || k.Text = "static" || k.Text = "abstract"
+                    || k.Text = "override" || k.Text = "default" || k.Text = "val"
+                    || k.Text = "new" || k.Text = "inline" || k.Text = "mutable")))
 
     and isTypeBodyStart () =
         isMemberStart () || s.IsKw "let" || s.IsKw "do" || s.IsKw "use"
 
     and parseTypeBody (acc : Vec<Green>) (typeCol : int) : unit =
+        // a member may sit on the same line as `with`, or on its own line
+        // indented past the construct
         let mutable go = true
-        while go && not s.AtEof && not s.SameLine && s.CurCol > typeCol && isTypeBodyStart () do
+        while go && not s.AtEof && (s.SameLine || (s.CurCol > typeCol)) && isTypeBodyStart () do
             let mark = s.Mark
-            if s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
+            if s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let" then
+                // `static let`: a binding on the type, not on an instance
+                let st = s.Bump ()
+                (match parseLet typeCol with
+                 | GNode ln -> vecAdd acc (Green.node LetDecl (st :: ln.Children))
+                 | g -> vecAdd acc g)
+            elif s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
             elif s.IsKw "do" then
                 let d = s.Bump ()
                 let body = if canStartExpr () then parseBlock typeCol else Green.node ErrorNode []
