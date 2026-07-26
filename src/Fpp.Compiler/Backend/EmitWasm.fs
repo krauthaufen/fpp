@@ -117,7 +117,9 @@ let emit (decls : Decl list) : EmitResult =
         rawRecords
         |> List.map (fun (n, fs, st) ->
             if st then n, fs, st
-            elif isClassName n then n, ("__desc", "r") :: expandedFields n, st
+            // a class is reference-equal, so it needs a per-OBJECT identity
+            // number; a record is structural and never does
+            elif isClassName n then n, ("__desc", "r") :: ("__idhash", "int") :: expandedFields n, st
             else n, ("__desc", "r") :: fs, st)
 
     // A field declaration carries a TYPE; the representation is derived
@@ -134,6 +136,9 @@ let emit (decls : Decl list) : EmitResult =
     let mutable structNameList : string list = []
     let kindOfField (isStruct : bool) (k : string) =
         if isStruct then kindOfType structNameList k else "r"
+    /// as above, but the synthetic identity word is a raw i32
+    let fieldKindOf (isStruct : bool) (fname : string) (k : string) =
+        if fname = "__idhash" then "i" else kindOfField isStruct k
     // flat-array element classification: primitive kind or a struct name
     let primKindOf (tyName : string) : string =
         match tyName with
@@ -275,7 +280,7 @@ let emit (decls : Decl list) : EmitResult =
     // field name -> (record, index, kind); F# shadowing: last declaration wins
     let fieldIndex = dictNew<string, string * int * string> ()
     for rn, fs, st in records do
-        fs |> List.iteri (fun i (f, k) -> dictSet fieldIndex f (rn, i, kindOfField st k))
+        fs |> List.iteri (fun i (f, k) -> dictSet fieldIndex f (rn, i, fieldKindOf st f k))
     /// Field slot lookup. With a known owner the record is exact; without
     /// one we fall back to the bare name (F# shadowing: last declaration
     /// wins), which is what unowned core from plugins/tests carries.
@@ -289,13 +294,13 @@ let emit (decls : Decl list) : EmitResult =
                     else
                         fs |> List.mapi (fun i (f, k) -> f, i, k)
                            |> List.tryPick (fun (f, i, k) ->
-                                if f = fname then Some (rn, i, kindOfField st k) else None))
+                                if f = fname then Some (rn, i, fieldKindOf st f k) else None))
         match byOwner with
         | Some x -> Some x
         | None -> dictTryFind fieldIndex fname
     let recordOrder = dictNew<string, (string * string) list> ()
     for rn, fs, st in records do
-        dictSet recordOrder rn (fs |> List.map (fun (f, k) -> f, kindOfField st k))
+        dictSet recordOrder rn (fs |> List.map (fun (f, k) -> f, fieldKindOf st f k))
 
     // enum cases are integer constants, never allocated cases
     let enumConst = dictNew<string, int> ()
@@ -884,7 +889,8 @@ let emit (decls : Decl list) : EmitResult =
                  let vals =
                      order
                      |> List.mapi (fun i (fname, k) ->
-                         if fname = "__desc" then "(global.get $desc_" + rn + ")"
+                         if fname = "__idhash" then "(i32.const 0)"
+                         elif fname = "__desc" then "(global.get $desc_" + rn + ")"
                          elif i < baseOrder.Length then
                              // same slot index in base and derived — prefix layout
                              "(struct.get $r_" + bn + " " + string i + " (ref.cast (ref $r_" + bn + ") (local.get " + b + ")))"
@@ -913,7 +919,8 @@ let emit (decls : Decl list) : EmitResult =
                  let vals =
                      order
                      |> List.map (fun (fname, k) ->
-                         if fname = "__desc" && isObjRecord rn then "(global.get $desc_" + rn + ")"
+                         if fname = "__idhash" then "(i32.const 0)"
+                         elif fname = "__desc" && isObjRecord rn then "(global.get $desc_" + rn + ")"
                          else
                          match fields |> List.tryFind (fun (f, _) -> f = fname) with
                          | Some (_, v) -> unboxBy k (recur v)
@@ -1612,6 +1619,8 @@ let emit (decls : Decl list) : EmitResult =
     line "  (tag $fppexn (param anyref))"
     line "  (global $heap (mut i32) (i32.const 65536))"
     line "  (global $selfmark (ref $du0) (struct.new $du0 (i32.const -999)))"
+    // identity numbers are handed out on first use and never reused
+    line "  (global $nextid (mut i32) (i32.const 0))"
 
     // object model: every class instance starts with its descriptor, so
     // dispatch and downcasts can read it without knowing the class
@@ -1636,13 +1645,13 @@ let emit (decls : Decl list) : EmitResult =
     for rn, fs, st in records do
         // every field is declared mutable: classes assign to their state,
         // and wasm-GC needs the mutability in the type, not at the use site
-        let fieldTy (k : string) =
-            match kindOfField st k with
+        let fieldTy2 (fname : string) (k : string) =
+            match fieldKindOf st fname k with
             | "f" -> "(field (mut f64))" | "s" -> "(field (mut f32))"
             | "l" -> "(field (mut i64))" | "i" -> "(field (mut i32))"
             | k2 when k2.StartsWith "S:" -> "(field (mut (ref $r_" + k2.Substring 2 + ")))"
             | _ -> "(field (mut anyref))"
-        let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
+        let fields = fs |> List.map (fun (f, k) -> fieldTy2 f k) |> String.concat " "
         if isObjRecord rn then
             let super = match baseOf rn with Some b when b <> rn -> "$r_" + b | _ -> "$obj"
             line ("  (type $r_" + rn + " (sub " + super + " (struct " + fields + ")))")
@@ -1680,8 +1689,20 @@ let emit (decls : Decl list) : EmitResult =
             // reference identity: a class is equal only to itself
             line ("  (func $eq_" + rn + " (param $a anyref) (param $b anyref) (result anyref)"
                   + " (ref.i31 (ref.eq (ref.cast (ref null eq) (local.get $a)) (ref.cast (ref null eq) (local.get $b)))))")
-            line ("  (func $hash_" + rn + " (param $v anyref) (result anyref) (ref.i31 (i32.const "
-                  + string (descId rn) + ")))")
+            // A per-OBJECT identity number, handed out on first use and kept
+            // in the object. wasm-GC exposes no address and no identity of
+            // its own — `ref.eq` compares, it does not number — because a
+            // moving collector would invalidate anything address-derived.
+            // This is what the JVM and .NET do for the same reason.
+            line ("  (func $hash_" + rn + " (param $v anyref) (result anyref) (local $h i32)")
+            line ("    (local.set $h (struct.get $r_" + rn + " 1 (ref.cast (ref $r_" + rn + ") (local.get $v))))")
+            line ("    (if (i32.eqz (local.get $h))")
+            line ("      (then")
+            line ("        (global.set $nextid (i32.add (global.get $nextid) (i32.const 1)))")
+            line ("        (local.set $h (global.get $nextid))")
+            line ("        (struct.set $r_" + rn + " 1 (ref.cast (ref $r_" + rn + ") (local.get $v)) (local.get $h))))")
+            // spread the sequential ids so they do not cluster in a table
+            line ("    (ref.i31 (i32.mul (local.get $h) (i32.const -1640531527))))")
         else
             let cmp =
                 fieldIdx

@@ -66,6 +66,30 @@ let divergenceGate =
             Expect.equal out "stable\nby-length\n"
                 "an array's hash does not move when its contents do"
         }
+        test "a class instance has its own identity hash" {
+            // wasm-GC exposes no address and no identity number of its own
+            // (i31 is an immediate, not a heap reference), so the number is
+            // handed out on first use and kept in the object.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type C(v : int) ="
+                    "    member _.V = v"
+                    "type D(v : int) ="
+                    "    inherit C(v)"
+                    "    member _.W = v * 2"
+                    "let a = C(5)"
+                    "let b = C(5)"
+                    "let d = D(7)"
+                    "let r1 = print (if hash a = hash a then \"stable\" else \"UNSTABLE\")"
+                    "let r2 = print (if hash a = hash b then \"COLLIDE\" else \"distinct\")"
+                    "let r3 = print (if hash d = hash a then \"COLLIDE\" else \"distinct\")"
+                    "let m = a.V"
+                    "let r4 = print (if hash a = hash a then \"stable\" else \"UNSTABLE\")"
+                    "" ])
+            Expect.equal out "stable\ndistinct\ndistinct\nstable\n"
+                "identity is per object, stable, and survives field access"
+        }
     ]
 
 [<Tests>]

@@ -243,7 +243,17 @@ reference-equal value any stable function of the object is legal; quality
 is a separate question from correctness.
 
 - classes: a lazily-assigned identity word in the object header, alongside
-  the descriptor. Paid only by types that are reference-equal.
+  the descriptor. Paid only by types that are reference-equal — a record is
+  structural and never carries one, a struct never does.
+
+  There is no alternative: wasm-GC exposes no address, no identity number
+  and no ordering on references, because a moving collector would
+  invalidate anything address-derived. `ref.eq` compares two references but
+  does not number one. `i31ref` looks like a counter-example and is not —
+  an i31 is a 31-bit immediate tagged as a reference, so `i31.get_s`
+  recovers the VALUE it encodes, which is exactly why primitives need no
+  stored word. A struct reference has no such projection. The JVM and .NET
+  store the same word for the same reason.
 - arrays: the length. Stable (our arrays are fixed-length), cheap, and
   unaffected by element mutation — which is precisely the property that
   made structural hashing incoherent for them.

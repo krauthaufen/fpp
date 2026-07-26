@@ -125,9 +125,8 @@ Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
       right answer by luck).
 - [x] generated per-type equals/hash in vtable slots 0 and 1; a
       user-declared `Equals`/`GetHashCode` fills the slot instead.
-- [ ] identity hash for classes is currently the type id, so two instances
-      of one class collide. Legal (equal values still hash equally) but
-      poor. Wants the lazily assigned header word from DESIGN.md.
+- [x] per-OBJECT identity hash for classes: a word in the object header,
+      handed out on first use. Records and structs do not carry it.
 - [ ] `$hashv`/`$equal` still exist as the dynamic entry points. They are
       now thin — primitives, then descriptor dispatch — but the remaining
       shape tests (cons, tuple, DU) could move behind descriptors too.
