@@ -130,6 +130,10 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       plugin blocks (`myplugin { ... }`) consuming the lossless token span
 
 ## Stage 5 — Stdlib & dogfood
+- [~] `stdlib/array.fpp`: Array module (length/get/set/fold/iter/exists/
+      forall/contains/tryFind/tryFindIndex/toList/isEmpty/sum/max/min +
+      init/map/filter/rev/copy/append/sort in int and float flavours);
+      generic element types await tier-1 specialization
 - [~] `stdlib/check.fpp`: **Check** — property/fuzzing library in F++
       (seed-threaded generators: int/bool/elem/list/pair; `forAll` runner
       reporting failure count + reproducible seed). Replaces hand-rolled
