@@ -55,9 +55,30 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       own scheme, so `Buf<V2d>` and `Buf<int>` stamp separate copies, and
       stamped clones are alpha-renamed so per-parameter backend state cannot
       leak between specializations.
-      Open: inherited members of a GENERIC base do not stamp (the base's
-      type arguments are not tracked through `inherit`); `member val`,
-      `static let`, operators as members, interface inheritance.
+      Property accessors (`member x.P with get() = ... and set v = ...`)
+      lower to a reader `P` and a writer `set_P`; a generic base is
+      instantiated through its `inherit` clause, so inherited members type
+      correctly on a derived receiver; a constructor parameter becomes a
+      field only when a member reads it (F#'s own storage rule).
+      Open: `member val`, `static let`, operators as members, interface
+      inheritance, `AbstractClass`.
+
+### Measured against the acceptance target
+Running the real `HashCollections.fs` (4500 lines) through the front end,
+the remaining blockers in source order are:
+- [ ] `uint32`: literals (`1u`), the type, and unsigned operations
+      (`>>>`, comparisons, division). This is the FIRST thing it hits and
+      is pervasive in the hashing code — a numeric-tower item, not an OOP
+      one. Needs lexer suffixes, a `uint32` TCon, and `i32.*_u` emission.
+- [ ] `downcast` / `upcast` (target type comes from the context, so it
+      needs a type-directed resolution like member binding got)
+- [ ] multi-entry attribute lists `[<AllowNullLiteral; AbstractClass>]`
+      and `AbstractClass` itself
+- [ ] enum-style DU access in a base-constructor argument
+      (`inherit SetNode<'K>(NodeKind.Leaf, hash)`)
+- [ ] null-as-empty (`AllowNullLiteral`): empty case as `ref.null`,
+      test as `ref.is_null`
+- [ ] O(1) `toHashSet` via the prefix layout that now exists
 - [ ] GADT mode: per-case schemes, match refinement, existentials,
       escape diagnostics
 - [ ] Kinds + HKT: `'m<_>` params, bare-constructor type args,
