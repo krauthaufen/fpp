@@ -743,6 +743,16 @@ let oracleTests =
             "let b = print r2.Span"
             "let c = print r2.Lo"
         ]
+        oracle "a type and a module may share a name" [
+            "type Pair<'a>(k : 'a) ="
+            "    member _.K = k"
+            "module Pair ="
+            "    let make (k : int) = Pair<int>(k)"
+            "    let key (p : Pair<int>) = p.K"
+            "let p : Pair<int> = Pair.make 7"
+            "let a = print (Pair.key p)"
+            "let b = print p.K"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

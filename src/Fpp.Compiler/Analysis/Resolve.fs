@@ -120,8 +120,32 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | Some d -> Some d
         | None -> findQualified name
 
+    /// Types live in their own namespace: F# lets a module and a type share
+    /// a name, and `MapLinked.exists` then means the module while
+    /// `MapLinked<'K,'V>` means the type.
+    let typeKey (name : string) = "type " + name
+
+    let lookupType (env : Env) (name : string) : Definition option =
+        match Map.tryFind (typeKey name) env with
+        | Some d -> Some d
+        | None ->
+            match Map.tryFind name env with
+            | Some d when d.Kind = DefType -> Some d
+            | _ -> findQualified name
+
     let tryRecord (env : Env) (t : Token) : unit =
-        match lookupValue env t.Text with
+        // A bare name in expression position is a value or a constructor,
+        // never a module: if a module shadows a type of the same name, the
+        // type is what was meant here.
+        let picked =
+            match Map.tryFind t.Text env with
+            | Some d when d.Kind = DefModule ->
+                (match Map.tryFind (typeKey t.Text) env with
+                 | Some ty -> Some ty
+                 | None -> Some d)
+            | Some d -> Some d
+            | None -> findQualified t.Text
+        match picked with
         | Some d -> record t d
         | None -> ()
 
@@ -171,7 +195,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
                 (match idents with
                  | [ t ] ->
-                     (match lookupValue env t.Text with
+                     (match lookupType env t.Text with
                       | Some d when d.Kind = DefType -> record t d
                       | _ -> ())
                  | many when not (List.isEmpty many) ->
@@ -277,8 +301,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 env
             | DotExpr ->
                 (match flattenSpine g with
-                 | Some (head :: _ as spine) when (Map.tryFind head.Text env |> Option.forall (fun d -> d.Kind = DefModule)) ->
-                     // qualified module access: resolve the full spine
+                 | Some (head :: _ as spine) when
+                        (let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
+                         (findQualified dotted).IsSome
+                         && (Map.tryFind head.Text env |> Option.forall (fun d -> d.Kind <> DefLet && d.Kind <> DefParam))) ->
+                     // qualified access: the spine names something real, and
+                     // the head is not a local shadowing it
                      let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
                      (match findQualified dotted with
                       | Some d ->
@@ -495,6 +523,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | Some t ->
             let d = define DefType t
             outer <- Map.add t.Text d outer
+            outer <- Map.add (typeKey t.Text) d outer
             if exportHere then exportDef d
         | None -> ()
         for c in n.Children do
