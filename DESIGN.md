@@ -220,17 +220,38 @@ every type, structurally, recursing into components. This is a TAST plugin
 (the mechanism already exists). A user-declared `Equals`/`GetHashCode`
 member replaces the generated one.
 
-**Semantics follow F#, with one deliberate exception.**
+**The contract is total.** Every value has `equals` and `hash`. There is no
+type for which they are unavailable, and no call that can fail to resolve
+one — a structural definition where the type has one, reference identity
+everywhere else. Nothing "does not support hashing".
 
-| kind | equality |
+| kind | equality and hash |
 | --- | --- |
-| struct, record, DU, tuple | structural |
+| primitive, string, struct, record, DU, tuple | structural |
 | class | reference identity, unless it overrides |
+| function / closure | reference identity |
 | **array** | **reference identity — F# says structural; we do not** |
+| anything else without a definition | reference identity |
 
-Classes being reference-equal is not only faithful, it is what keeps
-structural equality total: a cyclic object graph would otherwise not
-terminate.
+Reference identity is the floor, not a failure case. Classes being
+reference-equal is faithful to F# and is also what keeps structural
+equality total: a cyclic object graph would otherwise not terminate.
+
+**Identity hashing needs a number, and wasm-GC has no address-of.** The
+obligation is only `a = b` implies `hash a = hash b`, so for a
+reference-equal value any stable function of the object is legal; quality
+is a separate question from correctness.
+
+- classes: a lazily-assigned identity word in the object header, alongside
+  the descriptor. Paid only by types that are reference-equal.
+- arrays: the length. Stable (our arrays are fixed-length), cheap, and
+  unaffected by element mutation — which is precisely the property that
+  made structural hashing incoherent for them.
+- closures: a constant until something needs better. Legal, and honest
+  about being poor.
+
+Anything wanting real hash quality on a reference-equal type passes an
+`IEqualityComparer`, which is the custom-equality path already.
 
 Arrays are the one place we break with F# on purpose, because their
 contents may change while their identity stays the same. The reasoning,

@@ -39,8 +39,13 @@ honest; anyone who wants element-wise comparison can ask for it by name.
 The same argument decides hashing, and more sharply: a structural hash of a
 mutable buffer is incoherent as a hash key, because the hash moves under
 mutation while the object remains the same object. Anything holding it in a
-hash container silently loses it. `hash` on an array is therefore identity-
-based too.
+hash container silently loses it.
+
+`hash` on an array is therefore its LENGTH — stable, cheap, and unchanged
+by writes to elements. That is a legal hash for identity equality (the only
+obligation is that equal values hash equally), and it is deliberately not a
+good one: arrays are not meant to be hash keys. Anything that wants to key
+on array contents passes an `IEqualityComparer` that says so.
 
 This also matches what an array *is* in F++ — a buffer whose purpose is to
 be handed to C or JS by address, and which can be mutated through a pinned
