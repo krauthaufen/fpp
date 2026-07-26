@@ -619,9 +619,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     |> List.tryLast
                 (match lastIdent |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                  | Some d ->
-                     (match instantiateFor d with
-                      | Some t -> t
-                      | None -> st.Fresh ())
+                     // qualified use (Module.fn): record its instantiation too
+                     (match schemeOfDef d, lastIdent with
+                      | Some sc, Some tk when not (List.isEmpty sc.Quantified) && d.Path = path ->
+                          let ty, fresh = instantiateTracked sc
+                          vecAdd instRaw (tk.Offset, fresh)
+                          ty
+                      | _ ->
+                          match instantiateFor d with
+                          | Some t -> t
+                          | None -> st.Fresh ())
                  | None ->
                      let lhsTy =
                          match nodesOf n |> List.tryHead with

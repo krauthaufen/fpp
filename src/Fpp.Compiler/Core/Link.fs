@@ -118,6 +118,42 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         match d with
         | DLet (_, v, _, e) -> dictSet layoutDependent (v.Path, v.Offset) (usesLayoutVar e)
         | _ -> ()
+    // transitive: calling a layout-dependent generic at a symbolic
+    // instantiation makes the caller layout-dependent too (fixpoint)
+    let rec callsLayoutDep (e : Expr) : bool =
+        let anyOf xs = xs |> List.exists callsLayoutDep
+        match e with
+        | EVarI (v, _, inst) ->
+            (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+            && inst |> List.exists (fun t -> t = "" || t.StartsWith "#")
+        | ELam (_, b) -> callsLayoutDep b
+        | EApp (f, args) -> callsLayoutDep f || anyOf args
+        | ELet (_, _, _, r, b) -> callsLayoutDep r || callsLayoutDep b
+        | EIf (a, b, c) -> anyOf [ a; b; c ]
+        | EMatch (s, cs) -> callsLayoutDep s || (cs |> List.exists (fun (_, _, b) -> callsLayoutDep b))
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
+        | ECtor (_, _, xs) -> anyOf xs
+        | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> callsLayoutDep v)
+        | EField (r, _) -> callsLayoutDep r
+        | EWhile (c, b) -> callsLayoutDep c || callsLayoutDep b
+        | EAssign (_, x) -> callsLayoutDep x
+        | EArray (_, xs) -> anyOf xs
+        | EIndex (_, a, i) -> anyOf [ a; i ]
+        | EIndexSet (_, a, i, v) -> anyOf [ a; i; v ]
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> callsLayoutDep a
+        | EArrayCreate (_, a, b) -> anyOf [ a; b ]
+        | ETry (b, cs) -> callsLayoutDep b || (cs |> List.exists (fun (_, _, x) -> callsLayoutDep x))
+        | _ -> false
+    let mutable changed = true
+    while changed do
+        changed <- false
+        for d in decls do
+            match d with
+            | DLet (_, v, _, e) ->
+                if (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true && callsLayoutDep e then
+                    dictSet layoutDependent (v.Path, v.Offset) true
+                    changed <- true
+            | _ -> ()
 
     let stamped = dictNew<string, Decl> ()      // mangled name -> clone
     let queue = vecNew<(string * int) * string list> ()
@@ -125,7 +161,10 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
 
     // rewrite EVarI uses: struct instantiations point at the stamped clone,
     // reference instantiations keep the shared body
-    let rewrite (owner : string) (subst : Dict<string, string>) (e : Expr) : Expr =
+    // `isTemplate` marks the original body of a layout-dependent generic:
+    // it is never emitted (every use is stamped, DCE drops it), so demands
+    // that are still symbolic there are not errors — they resolve in clones.
+    let rewrite (owner : string) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
             | EVarI (v, sch, inst0) ->
@@ -147,7 +186,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                 (match cls with
                  | Canon -> EVar (v, sch)
                  | Unclassifiable why ->
-                     vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
+                     if not isTemplate then
+                         vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
                      EVar (v, sch)
                  | Stamp i ->
                      let mangled = mangleInst v.Name i
@@ -163,10 +203,11 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                           // a struct instantiation whose body we cannot see
                           // would have to run on the uniform representation:
                           // that is a silent deoptimization, so it is an error
-                          vecAdd errors
-                            ("cannot specialize '" + v.Name + "' at struct instantiation <"
-                             + String.concat ", " i + "> in " + owner
-                             + ": the body is not available for stamping")
+                          if not isTemplate then
+                              vecAdd errors
+                                ("cannot specialize '" + v.Name + "' at struct instantiation <"
+                                 + String.concat ", " i + "> in " + owner
+                                 + ": the body is not available for stamping")
                           EVar (v, sch)))
             | EArray (n, xs) -> EArray (substName subst n, xs)
             | EIndex (n, a, i) -> EIndex (substName subst n, a, i)
@@ -180,7 +221,9 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
     let out = vecNew<Decl> ()
     for d in decls do
         match d with
-        | DLet (rc, v, sch, e) -> vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) e))
+        | DLet (rc, v, sch, e) ->
+            let isTemplate = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+            vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) isTemplate e))
         | other -> vecAdd out other
 
     // transitive closure: stamping a clone may demand further stamps
@@ -197,12 +240,23 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
                  |> List.iter (fun (qv, n) -> dictSet subst ("#" + string qv.Id) n)
-             let clone = DLet (rc, nv, substScheme inst sch, rewrite mangled subst e)
+             let clone = DLet (rc, nv, substScheme inst sch, rewrite mangled subst false e)
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1
 
-    vecToList out @ (dictPairs stamped |> List.map snd), vecToList errors
+    // layout-dependent templates are never callable: every use is stamped
+    // (or an error), so they are removed by construction rather than left
+    // for reachability to maybe drop
+    let emitted =
+        vecToList out
+        |> List.filter (fun d ->
+            match d with
+            // only FUNCTION templates are unreachable-by-construction;
+            // value initializers are program effects and must never be cut
+            | DLet (_, v, _, ELam _) -> (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true
+            | _ -> true)
+    emitted @ (dictPairs stamped |> List.map snd), vecToList errors
 
 // The link step, v0: demand-closure over symbols. Roots are the program's
 // top-level value initializers; only reachable functions survive. Tier-1

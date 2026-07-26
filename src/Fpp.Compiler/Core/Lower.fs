@@ -407,7 +407,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // qualified value (resolver linked it) or field access
                      (match dictTryFind useDefs name.Offset with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
-                      | Some d -> EVar (varIdOf d, schemeOf d)
+                      | Some d ->
+                          (match dictTryFind instSites name.Offset with
+                           | Some inst when
+                                not (List.isEmpty inst)
+                                && d.Path = path
+                                && (dictTryFind topLevelDefs d.Offset).IsSome ->
+                               EVarI (varIdOf d, schemeOf d, inst)
+                           | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EField (lowerExpr (GNode lhs), name.Text))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->
