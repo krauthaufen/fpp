@@ -139,3 +139,47 @@ let instantiationCoreTests =
             Expect.equal found [ [ "V2d" ]; [ "int" ] ] "each use carries its instantiation into core"
         }
     ]
+
+[<Tests>]
+let instantiationScopeTests =
+    testList "specialization: annotation scope" [
+        test "generic locals never carry instantiations (only top-level bindings do)" {
+            // `s` is a generic accumulator local: it travels with its owner
+            // and is never separately specialized, so it must stay a plain
+            // EVar — otherwise every structural match on EVar becomes a trap.
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "let fold2 (f : 's -> int -> 's) (s0 : 's) (a : int[]) ="
+                    "    let mutable s = s0"
+                    "    for x in a do"
+                    "        s <- f s x"
+                    "    s"
+                    "let total = fold2 (fun acc x -> acc + x) 0 [| 1; 2; 3 |]"
+                    "let a = print total"
+                    "" ])
+            let low = ws.LowerFile "t.fpp"
+            Expect.isEmpty low.Notes "lowers completely"
+            let rec annotated (e : Expr) : (string * string list) list =
+                match e with
+                | EVarI (v, _, i) -> [ v.Name, i ]
+                | EApp (f, args) -> annotated f @ List.collect annotated args
+                | ELet (_, _, _, r, b) -> annotated r @ annotated b
+                | ELam (_, b) -> annotated b
+                | EWhile (c, b) -> annotated c @ annotated b
+                | EAssign (_, x) -> annotated x
+                | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) -> List.collect annotated xs
+                | EMatch (s, cs) -> annotated s @ (cs |> List.collect (fun (_, _, b) -> annotated b))
+                | _ -> []
+            let names =
+                low.Decls
+                |> List.collect (fun d -> match d with DLet (_, _, _, e) -> annotated e | _ -> [])
+                |> List.map fst
+            Expect.isFalse (List.contains "s" names) "the local accumulator is unannotated"
+            Expect.isTrue (List.contains "fold2" names) "the top-level generic call is annotated"
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "still compiles"
+            Expect.stringContains wat "func" "emits"
+        }
+    ]

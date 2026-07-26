@@ -22,6 +22,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
     let mutable pendingStruct = false
+    // offsets of top-level `let` bindings in this file — the only symbols
+    // Link can clone, hence the only uses that carry instantiations
+    let topLevelDefs = dictNew<int, bool> ()
+    let rec collectTop (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            match n.NodeKind with
+            | LetDecl ->
+                (match n.Children
+                       |> List.tryPick (fun c ->
+                            match c with
+                            | GNode p when p.NodeKind = IdentPat ->
+                                Green.tokens (GNode p) |> List.tryFind (fun t -> t.Kind = Ident)
+                            | _ -> None) with
+                 | Some t -> dictSet topLevelDefs t.Offset true
+                 | None -> ())
+            | ModuleDef -> n.Children |> List.iter collectTop
+            | _ -> ()
+    root.Children |> List.iter collectTop
     let structNames = vecNew<string> ()
     let statelessClasses = vecNew<string> ()
 
@@ -160,7 +180,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
                       | Some d ->
                           (match dictTryFind instSites t.Offset with
-                           | Some inst when not (List.isEmpty inst) ->
+                           | Some inst when
+                                not (List.isEmpty inst)
+                                && d.Path = path
+                                && (dictTryFind topLevelDefs d.Offset).IsSome ->
                                EVarI (varIdOf d, schemeOf d, inst)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EUnknown t.Text)
@@ -183,10 +206,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | None -> false)
                          | _ -> false
                      if statelessCtor then ELit LUnit else
-                     let f =
-                         match f with
-                         | EVarI (v, sch, _) when v.Path = "(builtin)" -> EVar (v, sch)
-                         | other -> other
                      (match f, loweredArgs with
                       | EField (_, mname), _ when
                             (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -223,7 +242,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match op.Text with
                       | "<-" ->
                           (match lowerExpr (GNode l) with
-                           | EVarI (v, _, _) -> EAssign (v, lowerExpr (GNode r))
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
                            | EIndex (nm, a, i) -> EIndexSet (nm, a, i, lowerExpr (GNode r))
                            | _ -> note (offsetOf n) "assignment target")
