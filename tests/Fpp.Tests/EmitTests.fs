@@ -69,6 +69,40 @@ let noBoxGate =
     ]
 
 [<Tests>]
+let scalarizationGate =
+    testList "representation gate: struct scalarization" [
+        test "struct params/returns pass as scalars — zero-alloc pipeline" {
+            let ws = Workspace()
+            ws.SetFileText "sc.fpp"
+                (String.concat "\n" [
+                    "module Sc"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let dot (a : V2d) (b : V2d) = a.X * b.X + a.Y * b.Y"
+                    "let scale (s : float) (v : V2d) = { X = s * v.X; Y = s * v.Y }"
+                    "let lenSq (v : V2d) = dot v v"
+                    "let pts = [| { X = 3.0; Y = 4.0 }; { X = 1.0; Y = 2.0 } |]"
+                    "let total ="
+                    "    let mutable acc = 0.0"
+                    "    let mutable i = 0"
+                    "    while i < pts.Length do"
+                    "        acc <- acc + lenSq (scale 2.0 pts.[i])"
+                    "        i <- i + 1"
+                    "    acc"
+                    "let a = print total"
+                    "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "compiles"
+            Expect.stringContains wat "(result f64 f64)" "struct return scalarized to leaves"
+            Expect.stringContains wat "(param $a0_0 f64) (param $a0_1 f64)" "struct params scalarized"
+            let loopStart = wat.IndexOf "(loop $cont"
+            let loopBody = wat.Substring(loopStart, wat.IndexOf("(br $cont", loopStart) - loopStart)
+            for alloc in [ "struct.new $box"; "struct.new $r_V2d"; "call $off"; "call $oss" ] do
+                Expect.isFalse (loopBody.Contains alloc) (sprintf "allocation '%s' in scalarized pipeline" alloc)
+        }
+    ]
+
+[<Tests>]
 let emitTests =
     testList "wasm end-to-end" [
         test "hello and factorial" {

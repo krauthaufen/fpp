@@ -209,6 +209,23 @@ let emit (decls : Decl list) : EmitResult =
         | Fpp.Analysis.Types.TCon ("float32", []) -> "s"
         | Fpp.Analysis.Types.TCon ("int64", []) -> "l"
         | _ -> "u"
+    // POD-struct positions in a signature: (paramStructs, resultStruct)
+    let sigStructs = dictNew<string * int, string option list * string option> ()
+    let structNameOfTy (t : Fpp.Analysis.Types.Type) : string option =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TCon (n, []) -> (if isPod n then Some n else None)
+        | _ -> None
+    let rec splitArrowTys (n : int) (t : Fpp.Analysis.Types.Type) =
+        if n = 0 then [], t
+        else
+            match Fpp.Analysis.Types.prune t with
+            | Fpp.Analysis.Types.TFun (a, b) ->
+                let ps, r = splitArrowTys (n - 1) b
+                a :: ps, r
+            | other -> [], other
+    let leavesOf (rn : string) =
+        let placed, _, _ = (dictTryFind podLayout rn).Value
+        placed
     let rec splitArrow (n : int) (t : Fpp.Analysis.Types.Type) : string list * string =
         if n = 0 then [], scalarKindOfTy t
         else
@@ -225,6 +242,12 @@ let emit (decls : Decl list) : EmitResult =
             let pk, rk = splitArrow ps.Length sch.Body
             if pk.Length = ps.Length && (rk <> "u" || List.exists (fun k -> k <> "u") pk) then
                 dictSet sigKinds (v.Path, v.Offset) (pk, rk)
+            let ptys, rty = splitArrowTys ps.Length sch.Body
+            if ptys.Length = ps.Length then
+                let pss = ptys |> List.map structNameOfTy
+                let rs = structNameOfTy rty
+                if List.exists Option.isSome pss || rs.IsSome then
+                    dictSet sigStructs (v.Path, v.Offset) (pss, rs)
         | DLet (_, v, _, _) ->
             dictSet topName (v.Path, v.Offset) (mangle v)
         | DExtern (v, sch) ->
@@ -333,6 +356,8 @@ let emit (decls : Decl list) : EmitResult =
     // ---- scalar kind analysis: "f" f64, "s" f32, "l" i64, "u" uniform ----
     // (ints stay uniform: i31 immediates are allocation-free already)
     let localKinds = dictNew<string * int, string> ()
+    // scalarized params: var -> (structName, leafPath -> local name)
+    let paramLeaves = dictNew<string * int, string * Dict<string, string>> ()
     let suffixedOps = [ "+"; "-"; "*"; "/"; "%" ]
     let rec kindOf (e : Expr) : string =
         match e with
@@ -365,6 +390,13 @@ let emit (decls : Decl list) : EmitResult =
             let a, b = kindOf t, kindOf f
             if a = b then a else "u"
         | _ -> "u"
+    let newTypedLocalOuter (v : Vec<string * string>) (base_ : string) (ty : string) : string =
+        let n = "$x" + string (vecLen v) + "_" + base_
+        vecAdd v (n, ty)
+        n
+    let wasmTyOf2 (k : string) =
+        match k with
+        | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
     let wasmTyOf (k : string) =
         match k with
         | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "anyref"
@@ -412,6 +444,9 @@ let emit (decls : Decl list) : EmitResult =
             let bytes = unescape raw
             let id = internString bytes
             "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (System.Text.Encoding.UTF8.GetByteCount bytes) + "))"
+        | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
+            let rn, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
+            structFromLeaves rn (fun lp -> "(local.get " + (dictTryFind m lp).Value + ")") ""
         | EVar (v, _) ->
             let key = (v.Path, v.Offset)
             (match dictTryFind locals key with
@@ -478,6 +513,28 @@ let emit (decls : Decl list) : EmitResult =
                  if rk = "i" then "(call $ofi " + call + ")" else call
              | None ->
             let op = if tail then "return_call" else "call"
+            match dictTryFind sigStructs (v.Path, v.Offset) with
+            | Some (_, rs) ->
+                let call = compileCall locals extraLocals freeEnv v args
+                (match rs with
+                 | Some srn ->
+                     // materialize the returned leaves for a uniform consumer
+                     let leaves = leavesOf srn
+                     let locs = leaves |> List.map (fun (_, k, _) -> newTypedLocal "rl" (wasmTyOf2 k))
+                     let sets = List.rev locs |> List.map (fun l -> "(local.set " + l + ")")
+                     let leafOf (path : string) =
+                         let idx = leaves |> List.findIndex (fun (lp, _, _) -> lp = path)
+                         "(local.get " + List.item idx locs + ")"
+                     "(block (result anyref) " + call + " " + String.concat " " sets + " "
+                     + structFromLeaves srn leafOf "" + ")"
+                 | None ->
+                     // scalar result: box for uniform consumers (peephole cancels)
+                     let rk2 =
+                         match dictTryFind sigKinds (v.Path, v.Offset) with
+                         | Some (_, r) -> r
+                         | None -> "u"
+                     if rk2 = "u" then call else boxK rk2 call)
+            | None ->
             match dictTryFind sigKinds (v.Path, v.Offset) with
             | Some (pks, rk) when pks.Length = args.Length ->
                 let wrapped =
@@ -627,6 +684,43 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
+        | EField (_, _) when
+            (let rec pathOfVar (e : Expr) =
+                match e with
+                | EVar (v, _) -> (match dictTryFind paramLeaves (v.Path, v.Offset) with
+                                  | Some (rn, m) -> Some (rn, m, "")
+                                  | None -> None)
+                | EField (b, f) ->
+                    (match pathOfVar b with
+                     | Some (rn, m, p) -> Some (rn, m, (if p = "" then f else p + "." + f))
+                     | None -> None)
+                | _ -> None
+             match e with
+             | EField (b, f) ->
+                 (match pathOfVar b with
+                  | Some (_, m, p) -> (dictTryFind m (if p = "" then f else p + "." + f)).IsSome
+                  | None -> false)
+             | _ -> false) ->
+            let rec pathOfVar (x : Expr) =
+                match x with
+                | EVar (v, _) -> (match dictTryFind paramLeaves (v.Path, v.Offset) with
+                                  | Some (rn, m) -> Some (rn, m, "")
+                                  | None -> None)
+                | EField (b, f) ->
+                    (match pathOfVar b with
+                     | Some (rn, m, p) -> Some (rn, m, (if p = "" then f else p + "." + f))
+                     | None -> None)
+                | _ -> None
+            (match e with
+             | EField (b, f) ->
+                 let rn, m, p = (pathOfVar b).Value
+                 let full = if p = "" then f else p + "." + f
+                 let loc = (dictTryFind m full).Value
+                 let _, k, _ = leavesOf rn |> List.find (fun (lp, _, _) -> lp = full)
+                 (match k with
+                  | "f" | "s" | "l" -> boxK k ("(local.get " + loc + ")")
+                  | _ -> "(call $ofi (local.get " + loc + "))")
+             | _ -> "(ref.i31 (i32.const 0))")
         | EField (inner, fname) when
             (let rec pathOf (e : Expr) =
                 match e with
@@ -925,6 +1019,92 @@ let emit (decls : Decl list) : EmitResult =
 
     /// Emit tests (branching to failLbl on mismatch) and binds for a pattern
     /// against the value expression `v`.
+    /// Emit code pushing the scalar leaves of a struct-typed expression.
+    /// Never materializes when the shape is known (record literal,
+    /// scalarized param, packed-array read, scalarized call).
+    and compileLeaves (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                      (freeEnv : Dict<string * int, int>) (rn : string) (e : Expr) : string =
+        let recur = compileExpr locals extraLocals freeEnv false
+        let leaves = leavesOf rn
+        let unboxLeaf (k : string) (w : string) =
+            match k with
+            | "f" | "s" | "l" -> unboxK k w
+            | _ -> "(call $toi " + w + ")"
+        match e with
+        | ERecord (_, _) ->
+            // project each leaf out of the literal without allocating
+            let rec leafFromRecord (rn2 : string) (ex : Expr) (path : string) : string option =
+                match ex with
+                | ERecord (_, fields) ->
+                    let i = path.IndexOf '.'
+                    let head = if i < 0 then path else path.Substring (0, i)
+                    (match fields |> List.tryFind (fun (f, _) -> f = head) with
+                     | Some (_, v) ->
+                         if i < 0 then
+                             let _, k, _ = leavesOf rn2 |> List.find (fun (lp, _, _) -> lp = path)
+                             Some (unboxLeaf k (recur v))
+                         else
+                             let fs = structRecords |> List.pick (fun (n, f) -> if n = rn2 then Some f else None)
+                             let _, fk = fs |> List.find (fun (fn, _) -> fn = head)
+                             leafFromRecord (structKindName fk) v (path.Substring (i + 1))
+                     | None -> None)
+                | _ -> None
+            let parts = leaves |> List.map (fun (lp, k, _) ->
+                match leafFromRecord rn e lp with
+                | Some w -> w
+                | None ->
+                    let l = newTypedLocalOuter extraLocals "lv" "anyref"
+                    unboxLeaf k ("(local.get " + l + ")"))
+            String.concat " " parts
+        | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
+            let _, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
+            leaves |> List.map (fun (lp, _, _) -> "(local.get " + (dictTryFind m lp).Value + ")") |> String.concat " "
+        | EIndex (nm, a, i) when nm = rn && isPod nm ->
+            // read leaves straight out of the packed array
+            let _, _, wd = (dictTryFind podLayout nm).Value
+            let al = newTypedLocalOuter extraLocals "la" "anyref"
+            let bl = newTypedLocalOuter extraLocals "lb" "i32"
+            let tys = leaves |> List.map (fun (_, k, _) -> wasmTyOf2 k) |> String.concat " "
+            "(block (result " + tys + ") (local.set " + al + " " + recur a + ") "
+            + "(local.set " + bl + " (i32.mul (call $toi " + recur i + ") (i32.const " + string wd + "))) "
+            + (leaves |> List.map (fun (lp, _, _) -> fieldFromWords nm ("(local.get " + al + ")") ("(local.get " + bl + ")") lp) |> String.concat " ")
+            + ")"
+        | EApp (EVar (fv, _), args) when
+            (match dictTryFind sigStructs (fv.Path, fv.Offset) with
+             | Some (_, Some r) -> r = rn && (dictTryFind topArity (fv.Path, fv.Offset)) = Some args.Length
+             | _ -> false) ->
+            // multi-value composition: the callee's leaves are our leaves
+            compileCall locals extraLocals freeEnv fv args
+        | _ ->
+            // fallback: materialize once, then project
+            let l = newTypedLocalOuter extraLocals "sv" "anyref"
+            "(block (result " + (leaves |> List.map (fun (_, k, _) -> wasmTyOf2 k) |> String.concat " ") + ") "
+            + "(local.set " + l + " " + recur e + ") "
+            + (leaves |> List.map (fun (lp, _, _) -> leafGet rn ("(local.get " + l + ")") lp) |> String.concat " ")
+            + ")"
+
+    /// A direct call, expanding struct args into leaves where scalarized.
+    and compileCall (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                    (freeEnv : Dict<string * int, int>) (v : VarId) (args : Expr list) : string =
+        let recur = compileExpr locals extraLocals freeEnv false
+        let fname = (dictTryFind topName (v.Path, v.Offset)).Value
+        let pss, _ =
+            match dictTryFind sigStructs (v.Path, v.Offset) with
+            | Some x -> x
+            | None -> List.replicate args.Length None, None
+        let pks, _ =
+            match dictTryFind sigKinds (v.Path, v.Offset) with
+            | Some x -> x
+            | None -> List.replicate args.Length "u", "u"
+        let wrapped =
+            args |> List.mapi (fun i a ->
+                match (if i < pss.Length then List.item i pss else None) with
+                | Some srn -> compileLeaves locals extraLocals freeEnv srn a
+                | None ->
+                    let k = if i < pks.Length then List.item i pks else "u"
+                    if k = "u" then recur a else unboxK k (recur a))
+        "(call " + fname + " " + String.concat " " wrapped + ")"
+
     and compilePat locals extraLocals freeEnv (out : System.Text.StringBuilder) (failLbl : string) (v : string) (p : Pat) : unit =
         let app (s : string) = out.Append(s + " ") |> ignore
         let newLocal (base_ : string) =
@@ -1378,19 +1558,39 @@ let emit (decls : Decl list) : EmitResult =
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
                 | None -> List.replicate ps.Length "u", "u"
+            let pss, rs =
+                match dictTryFind sigStructs (v.Path, v.Offset) with
+                | Some (a, b) -> a, b
+                | None -> List.replicate ps.Length None, None
             let locals = dictNew<string * int, string> ()
+            let paramDecls = vecNew<string> ()
             ps |> List.iteri (fun i (pv, _) ->
-                dictSet locals (pv.Path, pv.Offset) ("$a" + string i)
-                dictSet localKinds (pv.Path, pv.Offset) (List.item i pks))
+                match (if i < pss.Length then List.item i pss else None) with
+                | Some srn ->
+                    // scalarized: one param per leaf, field access hits them
+                    let m = dictNew<string, string> ()
+                    leavesOf srn |> List.iteri (fun j (lp, k, _) ->
+                        let nm = "$a" + string i + "_" + string j
+                        vecAdd paramDecls ("(param " + nm + " " + wasmTyOf2 k + ")")
+                        dictSet m lp nm)
+                    dictSet paramLeaves (pv.Path, pv.Offset) (srn, m)
+                | None ->
+                    vecAdd paramDecls ("(param $a" + string i + " " + wasmTyOf (List.item i pks) + ")")
+                    dictSet locals (pv.Path, pv.Offset) ("$a" + string i)
+                    dictSet localKinds (pv.Path, pv.Offset) (List.item i pks))
             let extra = vecNew<string * string> ()
-            let bodyRaw = compileExpr locals extra (dictNew ()) (rk = "u") body
-            let bodyW = if rk = "u" then bodyRaw else unboxK rk bodyRaw
-            let ps' =
-                ps |> List.mapi (fun i _ -> "(param $a" + string i + " " + wasmTyOf (List.item i pks) + ")")
-                |> String.concat " "
-            let resTy = wasmTyOf rk
-            let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
-            line ("  (func " + fname + " " + ps' + " (result " + resTy + ") " + localDecls + " " + bodyW + ")")
+            match rs with
+            | Some srn ->
+                let leaves = leavesOf srn
+                let bodyW = compileLeaves locals extra (dictNew ()) srn body
+                let resTys = leaves |> List.map (fun (_, k, _) -> wasmTyOf2 k) |> String.concat " "
+                let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
+                line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + resTys + ") " + localDecls + " " + bodyW + ")")
+            | None ->
+                let bodyRaw = compileExpr locals extra (dictNew ()) (rk = "u") body
+                let bodyW = if rk = "u" then bodyRaw else unboxK rk bodyRaw
+                let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
+                line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + wasmTyOf rk + ") " + localDecls + " " + bodyW + ")")
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
@@ -1470,7 +1670,11 @@ let emit (decls : Decl list) : EmitResult =
               "(call $tol ", "(call $ofl "
               "(call $ofl ", "(call $tol "
               "(call $toi ", "(call $ofi "
-              "(call $ofi ", "(call $toi " ]
+              "(call $ofi ", "(call $toi "
+              // literal box forms
+              "(call $tof ", "(struct.new $boxf "
+              "(call $tos ", "(struct.new $boxs "
+              "(call $tol ", "(struct.new $boxl " ]
         let mutable t = text
         let mutable changed = true
         while changed do
