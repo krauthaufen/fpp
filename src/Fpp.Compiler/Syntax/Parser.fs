@@ -489,8 +489,12 @@ let parse (src : string) : ParseResult =
                 | Operator ->
                     if t.Text = "<" then scan (k + 1) (depth + 1)
                     elif charAt t.Text 0 = '>' then
-                        // a run of > closes that many levels
-                        let closed = depth - strLen t.Text
+                        // only the LEADING run of '>' closes levels: the
+                        // lexer glues trailing symbols on, so `>.Instance`
+                        // arrives as the single operator ">."
+                        let mutable run = 0
+                        while run < strLen t.Text && charAt t.Text run = '>' do run <- run + 1
+                        let closed = depth - run
                         if closed < 0 then false
                         elif closed = 0 then true
                         else scan (k + 1) closed

@@ -699,6 +699,16 @@ let oracleTests =
             "    s"
             "let c = print sum"
         ]
+        oracle "voption: ValueSome/ValueNone from the prelude" [
+            "let pick (x : int) : voption<int> ="
+            "    if x > 0 then ValueSome (x * 2) else ValueNone"
+            "let show (v : voption<int>) ="
+            "    match v with"
+            "    | ValueSome n -> n"
+            "    | ValueNone -> 0 - 1"
+            "let a = print (show (pick 21))"
+            "let b = print (show (pick (0 - 3)))"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

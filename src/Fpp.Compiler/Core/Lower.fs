@@ -21,6 +21,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
           (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>)
           (memberSites : Dict<int, string>) (fieldOwners : Dict<int, string>)
+          (projectMembers : Dict<string, Resolve.Definition>)
           (ifaces : Dict<string, (string * int) list>) : LowerResult =
 
     let notes = vecNew<int * string> ()
@@ -69,6 +70,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // "TypeName.MemberName" -> the member's definition; a use site picks the
     // entry named by the receiver's inferred type (Infer.MemberSites)
     let memberIndex = dictNew<string, Resolve.Definition> ()
+    for k, d in dictPairs projectMembers do dictSet memberIndex k d
     for k, d in binder.Members do dictSet memberIndex k d
 
     // while lowering a class body: the receiver, and the class-level
@@ -90,12 +92,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// `C.Foo` where C names a type: a static member, so no receiver.
     let isStaticUse (n : GreenNode) : bool =
+        let rec headIdent (h : GreenNode) =
+            if h.NodeKind = IdentExpr then
+                h.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+            elif h.NodeKind = AppExpr then
+                match h.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
+                | Some inner -> headIdent inner
+                | None -> None
+            else None
         match n.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
-        | Some head when head.NodeKind = IdentExpr ->
-            (match head.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+        | Some head ->
+            (match headIdent head with
              | Some t -> (dictTryFind useDefs t.Offset |> Option.map (fun d -> d.Kind = Resolve.DefType)) = Some true
              | None -> false)
-        | _ -> false
+        | None -> false
 
     /// The member a dot-access binds to, if inference typed its receiver.
     let memberAt (t : Token) : (string * Resolve.Definition) option =
@@ -619,7 +629,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          && (dictTryFind topLevelDefs d.Offset).IsSome ->
                         EVarI (varIdOf d, schemeOf d, inst)
                     | _ -> EVar (varIdOf d, schemeOf d)
-                if isStaticUse n then fn
+                if isStaticUse n then
+                    // a static property is a function of unit; read it
+                    (match (schemeOf d).Body with
+                     | TFun (u, _) when u = tUnit -> EApp (fn, [ ELit LUnit ])
+                     | _ -> fn)
                 else
                     (match nodesOf n |> List.tryHead with
                      | Some lhs -> EApp (fn, [ lowerExpr (GNode lhs) ])
@@ -857,7 +871,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         (match structured with
                          | [ pp ] -> [ arg, asch ], EMatch (EVar (arg, asch), [ pp, None, body ])
                          | pps -> [ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ]))
-            let allBinds = if isStaticM then binds else selfBind :: binds
+            let allBinds =
+                if not isStaticM then selfBind :: binds
+                elif List.isEmpty binds then
+                    // a static property is re-evaluated per access, so it
+                    // lifts to a function of unit rather than a value
+                    // initializer that every program would have to run
+                    [ { Path = path; Offset = d.Offset + 500000; Name = "_unit" }, mono tUnit ]
+                else binds
             vecAdd decls (DLet (false, varIdOf d, sch, ELam (allBinds, mbody)))
             Some (d.Name, varIdOf d)
         | None -> None

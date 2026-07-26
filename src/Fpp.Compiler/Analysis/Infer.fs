@@ -888,15 +888,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // `C.M` where C names a type: a static member, so the owner
                 // is the type itself and there is no receiver to type
                 let staticOwner =
-                    match nodesOf n |> List.tryHead with
-                    | Some h when h.NodeKind = IdentExpr ->
-                        (match tokensOf h |> List.tryFind (fun t -> t.Kind = Ident) with
-                         | Some t ->
-                             (match dictTryFind useDefs t.Offset with
-                              | Some d when d.Kind = Resolve.DefType -> Some d.Name
-                              | _ -> None)
-                         | None -> None)
-                    | _ -> None
+                    // the head may be a bare type name or a generic
+                    // application: `Comparer.Instance` or `Comparer<int>.Instance`
+                    let headIdent (h : GreenNode) =
+                        if h.NodeKind = IdentExpr then tokensOf h |> List.tryFind (fun t -> t.Kind = Ident)
+                        elif h.NodeKind = AppExpr then
+                            match nodesOf h |> List.tryHead with
+                            | Some inner when inner.NodeKind = IdentExpr ->
+                                tokensOf inner |> List.tryFind (fun t -> t.Kind = Ident)
+                            | _ -> None
+                        else None
+                    match nodesOf n |> List.tryHead |> Option.bind headIdent with
+                    | Some t ->
+                        (match dictTryFind useDefs t.Offset with
+                         | Some d when d.Kind = Resolve.DefType -> Some d.Name
+                         | _ -> None)
+                    | None -> None
                 match staticOwner, lastIdent with
                 | Some tn, Some name when (dictTryFind fields (tn + "." + name.Text)).IsSome ->
                     let fi = (dictTryFind fields (tn + "." + name.Text)).Value
@@ -1398,7 +1405,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // the receiver, so the *definition's* scheme carries self; the type
         // seen at a use site (`c.M`) is the self-free one, recorded in fields
         let isStatic = tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
-        let defTy = if isStatic then memberTy else TFun (selfTy, memberTy)
+        // a static PROPERTY is re-evaluated per access, so it lifts to a
+        // function of unit — never a value initializer, which would run in
+        // every program whether or not anything reads it
+        let defTy =
+            if isStatic then
+                (if List.isEmpty paramTys then TFun (tUnit, memberTy) else memberTy)
+            else TFun (selfTy, memberTy)
         match nameTok with
         | Some t ->
             recordDef t memberTy
