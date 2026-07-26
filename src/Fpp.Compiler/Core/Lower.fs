@@ -184,10 +184,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
              | [] -> PWild)
         | TypeTestPat ->
-            (match nodesOf n
-                   |> List.tryFind (fun m -> isTypeKind m.NodeKind)
-                   |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead) with
-             | Some t -> PTypeTest t.Text
+            (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceNameOf with
+             | Some tn -> PTypeTest tn
              | None -> PWild)
         | TuplePat -> PTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
         | ConsPat ->
@@ -599,10 +597,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | CastExpr ->
                 let operand = nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind)
                 let target =
-                    nodesOf n
-                    |> List.tryFind (fun m -> isTypeKind m.NodeKind)
-                    |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
-                    |> Option.map (fun t -> t.Text)
+                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceNameOf
                 let isDown = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?>")
                 let isTest = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?")
                 (match operand, target with
