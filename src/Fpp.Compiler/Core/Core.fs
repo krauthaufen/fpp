@@ -49,6 +49,9 @@ type Expr =
     | EListLit of Expr list
     | ECtor of string * Scheme * Expr list
     | ERecord of string * (string * Expr) list
+    /// build a derived instance: the base part is copied out of a freshly
+    /// constructed base instance, then this class' own fields are appended
+    | ERecordExt of string * Expr * (string * Expr) list
     /// receiver, field name, owning type ("" when the owner is unknown)
     | EField of Expr * string * string
     | EFieldSet of Expr * string * string * Expr
@@ -80,9 +83,9 @@ type Decl =
     | DRecord of string * string list * (string * string) list * bool
     /// interface name, its methods as (name, arity)
     | DInterface of string * (string * int) list
-    /// class name, and per implemented interface the functions that
-    /// implement its methods: (interface, [method, implementation])
-    | DClass of string * (string * (string * VarId) list) list
+    /// class name, base class, its own members as (name, function), and
+    /// per implemented interface the functions implementing its methods
+    | DClass of string * string option * (string * VarId) list * (string * (string * VarId) list) list
 
 type LowerResult =
     { Decls : Decl list
@@ -114,6 +117,8 @@ let rec printExpr (e : Expr) : string =
     | EListLit xs -> "[" + String.concat "; " (List.map printExpr xs) + "]"
     | ECtor (n, _, args) ->
         if List.isEmpty args then n else "(" + n + " " + String.concat " " (List.map printExpr args) + ")"
+    | ERecordExt (n, b, fs) ->
+        "{" + n + "| base " + printExpr b + "; " + String.concat "; " (fs |> List.map (fun (f, v) -> f + " = " + printExpr v)) + "}"
     | ERecord (n, fs) ->
         "{" + n + "| " + String.concat "; " (fs |> List.map (fun (f, v) -> f + " = " + printExpr v)) + "}"
     | EField (r, f, _) -> printExpr r + "." + f
@@ -157,8 +162,11 @@ let printDecl (d : Decl) : string =
         + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
     | DInterface (n, ms) ->
         "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
-    | DClass (n, impls) ->
-        "class " + n + " : " + String.concat ", " (impls |> List.map fst)
+    | DClass (n, bse, own, impls) ->
+        "class " + n
+        + (match bse with Some b -> " inherit " + b | None -> "")
+        + " members {" + String.concat "; " (own |> List.map fst) + "}"
+        + (if List.isEmpty impls then "" else " : " + String.concat ", " (impls |> List.map fst))
     | DRecord (n, ps, fs, st) ->
         (if st then "struct " else "record ") + n
         + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")

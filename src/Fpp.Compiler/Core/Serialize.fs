@@ -131,6 +131,7 @@ let rec private encExpr (e : Expr) : Sx =
     | EListLit xs -> L (A "ek" :: List.map encExpr xs)
     | ECtor (n, s, args) -> L (A "ec" :: S n :: encScheme s :: List.map encExpr args)
     | ERecord (n, fs) -> L (A "er" :: S n :: (fs |> List.map (fun (f, v) -> L [ S f; encExpr v ])))
+    | ERecordExt (n, bse, fs) -> L (A "ee" :: S n :: encExpr bse :: (fs |> List.map (fun (f, v) -> L [ S f; encExpr v ])))
     | EField (r, f, o) -> L [ A "ef"; encExpr r; S f; S o ]
     | EFieldSet (r, f, o, v) -> L [ A "efs"; encExpr r; S f; S o; encExpr v ]
     | EPrim (op, args) -> L (A "ep" :: S op :: List.map encExpr args)
@@ -164,8 +165,10 @@ let private encDecl (d : Decl) : Sx =
             L (fs |> List.map (fun (f, k) -> L [ S f; A k ])); A (if st then "1" else "0") ]
     | DInterface (n, ms) ->
         L [ A "di"; S n; L (ms |> List.map (fun (m, a) -> L [ S m; A (string a) ])) ]
-    | DClass (n, impls) ->
+    | DClass (n, bse, own, impls) ->
         L [ A "dc"; S n
+            (match bse with Some b -> S b | None -> A "-")
+            L (own |> List.map (fun (m, v) -> L [ S m; encVarId v ]))
             L (impls |> List.map (fun (i, ms) ->
                 L [ S i; L (ms |> List.map (fun (m, v) -> L [ S m; encVarId v ])) ])) ]
 
@@ -264,6 +267,8 @@ let rec private decExpr (x : Sx) : Expr =
     | L (A "ec" :: S n :: s :: args) -> ECtor (n, decScheme s, List.map decExpr args)
     | L (A "er" :: S n :: fs) ->
         ERecord (n, fs |> List.choose (fun f -> match f with L [ S fn; v ] -> Some (fn, decExpr v) | _ -> None))
+    | L (A "ee" :: S n :: bse :: fs) ->
+        ERecordExt (n, decExpr bse, fs |> List.choose (fun f -> match f with L [ S fn; v ] -> Some (fn, decExpr v) | _ -> None))
     | L [ A "ef"; r; S f; S o ] -> EField (decExpr r, f, o)
     | L [ A "efs"; r; S f; S o; v ] -> EFieldSet (decExpr r, f, o, decExpr v)
     | L (A "ep" :: S op :: args) -> EPrim (op, List.map decExpr args)
@@ -302,8 +307,10 @@ let private decDecl (x : Sx) : Decl option =
                        st = "1"))
     | L [ A "di"; S n; L ms ] ->
         Some (DInterface (n, ms |> List.choose (fun m -> match m with L [ S mn; A a ] -> Some (mn, int a) | _ -> None)))
-    | L [ A "dc"; S n; L impls ] ->
+    | L [ A "dc"; S n; b; L own; L impls ] ->
         Some (DClass (n,
+                (match b with S bn -> Some bn | _ -> None),
+                own |> List.choose (fun m -> match m with L [ S mn; v ] -> Some (mn, decVarId v) | _ -> None),
                 impls |> List.choose (fun i ->
                     match i with
                     | L [ S iname; L ms ] ->

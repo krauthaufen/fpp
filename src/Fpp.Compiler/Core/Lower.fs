@@ -19,7 +19,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
           (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>)
           (memberSites : Dict<int, string>)
-          (ifaces : Dict<string, (string * int) list>) : LowerResult =
+          (ifaces : Dict<string, (string * int) list>)
+          (bases : Dict<string, string>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -436,7 +437,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some t ->
                      (match dictTryFind memberSites t.Offset with
-                      | Some owner -> (dictTryFind ifaces owner).IsSome
+                      | Some owner ->
+                          (match dictTryFind ifaces owner with
+                           | Some ms -> ms |> List.exists (fun (m, _) -> m = t.Text)
+                           | None -> false)
                       | None -> false)
                  | None -> false) ->
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
@@ -671,6 +675,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> Option.map (fun t -> t.Text, fieldKind f))
         let memberNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
         let ctorPat = nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind)
+        // `inherit Base(args)`: the base contributes the object's prefix
+        let inheritNode = nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl)
+        let baseName =
+            inheritNode
+            |> Option.bind (fun i -> Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead)
+            |> Option.map (fun t -> t.Text)
+        let baseCtorCall =
+            match inheritNode, baseName with
+            | Some i, Some bn ->
+                let bt = (Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.head)
+                let bdef = dictTryFind useDefs bt.Offset
+                let args =
+                    nodesOf i
+                    |> List.filter (fun m -> isExprish m.NodeKind)
+                    |> List.map (fun m -> lowerExpr (GNode m))
+                (match bdef with
+                 | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), (if List.isEmpty args then [ ELit LUnit ] else args)))
+                 | None -> Some (note (offsetOf i) ("unknown base class " + bn)))
+            | _ -> None
         let classLets = nodesOf n |> List.filter (fun m -> m.NodeKind = LetDecl)
         let doNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = BlockExpr)
         let isAbstract (m : GreenNode) =
@@ -685,7 +708,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let isClass =
             not isInterface
             && List.isEmpty cases && List.isEmpty recordFields
-            && (ctorPat.IsSome || not (List.isEmpty classLets) || not (List.isEmpty memberNodes))
+            && (ctorPat.IsSome || baseName.IsSome || not (List.isEmpty classLets) || not (List.isEmpty memberNodes))
 
         // ---- instance state --------------------------------------------
         // primary-constructor parameters and class-level `let`s are the
@@ -716,7 +739,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // ---- the constructor ----------------------------------------
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
             | Some tyDef when ctorPat.IsSome ->
-                let alloc = ERecord (name, instanceFields |> List.map (fun (v, sch) -> v.Name, EVar (v, sch)))
+                let ownFieldVals = instanceFields |> List.map (fun (v, sch) -> v.Name, EVar (v, sch))
+                let alloc =
+                    match baseCtorCall with
+                    | Some bc -> ERecordExt (name, bc, ownFieldVals)
+                    | None -> ERecord (name, ownFieldVals)
                 // `do` bodies run before the instance exists, so they cannot
                 // see `this` — F# allows only side effects there
                 let withDo =
@@ -756,6 +783,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match iname with Some x -> x | None -> "?"),
                 nodesOf i |> List.filter (fun m -> m.NodeKind = MemberDecl))
         let implemented = vecNew<string * (string * VarId) list> ()
+        let ownMembers = vecNew<string * VarId> ()
 
         /// Lift one member to a top-level function and return the name it
         /// was declared under together with the function it became.
@@ -810,23 +838,29 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if not isInterface then
             currentClass <- name
             for m in memberNodes do
-                if not (isAbstract m) then liftMember m |> ignore
+                if not (isAbstract m) then
+                    match liftMember m with
+                    | Some entry -> vecAdd ownMembers entry
+                    | None -> ()
             // explicit interface implementations: same lifting, but they are
             // reached only through the vtable, never by name on the class
             for iname, ms in implNodes do
                 let bound = ms |> List.choose liftMember
                 vecAdd implemented (iname, bound)
             currentClass <- ""
-            if isClass then vecAdd decls (DClass (name, vecToList implemented))
+            if isClass then vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
 
         if not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))
-        if isInterface then
+        // Abstract members declare dispatch slots whether the type is a pure
+        // interface or a base class with overridable methods.
+        if isInterface || (memberNodes |> List.exists isAbstract) then
             vecAdd decls
                 (DInterface (name,
                     memberNodes
+                    |> List.filter isAbstract
                     |> List.choose (fun m ->
                         match tokensOf m |> List.filter (fun t -> t.Kind = Ident) with
                         | [ _; nm ] | [ nm ] ->

@@ -27,9 +27,20 @@ let emit (decls : Decl list) : EmitResult =
     // A class instance carries a hidden first field pointing at its class
     // descriptor: {classId, vtable}. That is what makes interface dispatch
     // and checked downcasts possible without knowing the concrete type.
-    let classImpls = decls |> List.choose (fun d -> match d with DClass (n, impls) -> Some (n, impls) | _ -> None)
-    let isClassName (n : string) = classImpls |> List.exists (fun (cn, _) -> cn = n)
-    let classId (n : string) = classImpls |> List.findIndex (fun (cn, _) -> cn = n)
+    let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
+    let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
+    let isClassName (n : string) = classDecls |> List.exists (fun (cn, _, _, _) -> cn = n)
+    let classId (n : string) = classDecls |> List.findIndex (fun (cn, _, _, _) -> cn = n)
+    let baseOf (n : string) = classDecls |> List.tryPick (fun (cn, b, _, _) -> if cn = n then b else None)
+    let ownMembersOf (n : string) = classDecls |> List.tryPick (fun (cn, _, own, _) -> if cn = n then Some own else None)
+    /// a class and every ancestor, nearest first
+    let rec chainOf (n : string) : string list =
+        match baseOf n with
+        | Some b when b <> n -> n :: chainOf b
+        | _ -> [ n ]
+    /// every class that is `n` or derives from it — what a downcast accepts
+    let subclassesOf (n : string) =
+        classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
     let interfaceDecls = decls |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
     // one global slot per (interface, method), so every vtable agrees
     let vtableSlots =
@@ -37,19 +48,50 @@ let emit (decls : Decl list) : EmitResult =
          @ (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (m, _) -> i, m)))))
         |> List.distinct
         |> List.sort
+    /// The function filling slot (owner, method) for class `cn`: the nearest
+    /// definition walking up its chain — an override shadows what it overrides.
+    let slotImpl (cn : string) (owner : string) (m : string) : VarId option =
+        let fromIface =
+            chainOf cn
+            |> List.tryPick (fun c ->
+                classDecls
+                |> List.tryPick (fun (n2, _, _, impls) ->
+                    if n2 <> c then None
+                    else impls |> List.tryPick (fun (i, ms) -> if i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = m then Some v else None) else None)))
+        match fromIface with
+        | Some v -> Some v
+        | None ->
+            // a virtual method declared on a base class: nearest override wins
+            if List.contains owner (chainOf cn) then
+                chainOf cn
+                |> List.tryPick (fun c ->
+                    ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = m then Some v else None)))
+            else None
     let slotOf (iface : string) (m : string) =
         vtableSlots |> List.tryFindIndex (fun (i, mm) -> i = iface && mm = m)
     // functions reachable through a vtable keep the canonical all-anyref
     // signature — that IS the dispatch contract, so no specialization
     let ifaceImplKeys =
-        classImpls
-        |> List.collect (fun (_, impls) -> impls |> List.collect (fun (_, ms) -> ms |> List.map (fun (_, v) -> v.Path, v.Offset)))
+        (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (_, ms) -> ms |> List.map (fun (_, v) -> v.Path, v.Offset))))
+        @ (classDecls
+           |> List.collect (fun (cn, _, _, _) ->
+                vtableSlots |> List.choose (fun (i, m) -> slotImpl cn i m |> Option.map (fun v -> v.Path, v.Offset))))
     let isIfaceImpl (key : string * int) = List.contains key ifaceImplKeys
 
+    let rawRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, st) -> Some (n, fs, st) | _ -> None)
+    // prefix layout: a derived class starts with exactly its base's fields,
+    // which is what makes an upcast free and a base method work unchanged
+    let rec expandedFields (n : string) : (string * string) list =
+        match rawRecords |> List.tryPick (fun (rn, fs, _) -> if rn = n then Some fs else None) with
+        | None -> []
+        | Some fs ->
+            match baseOf n with
+            | Some b when b <> n -> expandedFields b @ fs
+            | _ -> fs
     let records =
-        decls
-        |> List.choose (fun d -> match d with DRecord (n, _, fs, st) -> Some (n, fs, st) | _ -> None)
-        |> List.map (fun (n, fs, st) -> if isClassName n then n, ("__desc", "r") :: fs, st else n, fs, st)
+        rawRecords
+        |> List.map (fun (n, fs, st) ->
+            if isClassName n then n, ("__desc", "r") :: expandedFields n, st else n, fs, st)
 
     // struct records store fields UNBOXED by kind; plain records stay anyref
     let kindOfField (isStruct : bool) (k : string) = if isStruct then k else "r"
@@ -723,6 +765,36 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors ("unknown constructor " + name)
                  "(ref.i31 (i32.const 0))")
+        | ERecordExt (rn, baseExpr, fields) ->
+            // a derived instance IS its base's layout plus its own fields, so
+            // the base part is copied slot-for-slot out of a base instance
+            (match dictTryFind recordOrder rn, baseOf rn with
+             | Some order, Some bn ->
+                 let baseOrder = match dictTryFind recordOrder bn with Some o -> o | None -> []
+                 let b = newLocal "b"
+                 let unboxBy (k : string) (w : string) =
+                     match k with
+                     | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
+                     | "l" -> "(call $tol " + w + ")" | "i" -> "(call $toi " + w + ")"
+                     | _ -> w
+                 let vals =
+                     order
+                     |> List.mapi (fun i (fname, k) ->
+                         if fname = "__desc" then "(global.get $desc_" + rn + ")"
+                         elif i < baseOrder.Length then
+                             // same slot index in base and derived — prefix layout
+                             "(struct.get $r_" + bn + " " + string i + " (ref.cast (ref $r_" + bn + ") (local.get " + b + ")))"
+                         else
+                             match fields |> List.tryFind (fun (f, _) -> f = fname) with
+                             | Some (_, v) -> unboxBy k (recur v)
+                             | None ->
+                                 vecAdd errors ("missing field " + fname + " in " + rn)
+                                 "(ref.i31 (i32.const 0))")
+                 "(block (result anyref) (local.set " + b + " " + recur baseExpr + ") "
+                 + "(struct.new $r_" + rn + " " + String.concat " " vals + "))"
+             | _ ->
+                 vecAdd errors ("cannot build " + rn + ": unknown base layout")
+                 "(ref.i31 (i32.const 0))")
         | ERecord (tyName, fields) ->
             (match (if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome
                     then Some (tyName, 0, "")
@@ -861,10 +933,16 @@ let emit (decls : Decl list) : EmitResult =
                 let t = newLocal "c"
                 let idOf =
                     "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
+                // a downcast succeeds for the target class OR any subclass
+                let castTest =
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    | [] -> "(i32.const 0)"
+                    | [ one ] -> one
+                    | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
                 "(block (result anyref) (local.set " + t + " " + recur e + ") "
-                + "(if (result anyref) (i32.eq " + idOf + " (i32.const " + string (classId tn) + ")) "
+                + "(if (result anyref) " + castTest + " "
                 + "(then (local.get " + t + ")) "
-                + "(else (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "Failure").Value
+                + "(else (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "InvalidCast").Value
                 + ") " + recur (ELit (LString ("\"invalid cast to " + tn + "\""))) + "))))) "
         | EFieldSet (r, fname, owner, v) ->
             (match fieldSlot owner fname with
@@ -1407,10 +1485,11 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $obj (sub (struct (field (mut anyref)))))"
     // one canonical function type per interface-method arity (receiver + args)
     let ifaceArities =
-        classImpls
-        |> List.collect (fun (_, impls) ->
-            impls |> List.collect (fun (_, ms) ->
-                ms |> List.choose (fun (_, v) -> dictTryFind topArity (v.Path, v.Offset))))
+        classDecls
+        |> List.collect (fun (cn, _, _, _) ->
+            vtableSlots
+            |> List.choose (fun (i, m) ->
+                slotImpl cn i m |> Option.bind (fun v -> dictTryFind topArity (v.Path, v.Offset))))
         |> List.distinct
         |> List.sort
     for k in ifaceArities do
@@ -1427,7 +1506,9 @@ let emit (decls : Decl list) : EmitResult =
             | k2 when k2.StartsWith "S:" -> "(field (mut (ref $r_" + k2.Substring 2 + ")))"
             | _ -> "(field (mut anyref))"
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
-        if isClassName rn then line ("  (type $r_" + rn + " (sub $obj (struct " + fields + ")))")
+        if isClassName rn then
+            let super = match baseOf rn with Some b when b <> rn -> "$r_" + b | _ -> "$obj"
+            line ("  (type $r_" + rn + " (sub " + super + " (struct " + fields + ")))")
         else line ("  (type $r_" + rn + " (struct " + fields + "))")
     for rn, fs in structRecords do
       if not (isPod rn) then
@@ -1457,7 +1538,7 @@ let emit (decls : Decl list) : EmitResult =
         let slots =
             vtableSlots
             |> List.map (fun (i, m) ->
-                match impls |> List.tryPick (fun (ii, ms) -> if ii = i then ms |> List.tryPick (fun (mm, v) -> if mm = m then Some v else None) else None) with
+                match slotImpl cn i m with
                 | Some v ->
                     (match dictTryFind topName (v.Path, v.Offset) with
                      | Some fn -> "(ref.func " + fn + ")"

@@ -189,6 +189,10 @@ let lint (decls : Decl list) : string list =
         | ERecord (_, fields) ->
             for _, v in fields do exprType v |> ignore
             st.Fresh ()
+        | ERecordExt (_, b, fields) ->
+            exprType b |> ignore
+            for _, v in fields do exprType v |> ignore
+            st.Fresh ()
         | EField (r, _, _) ->
             exprType r |> ignore
             st.Fresh ()

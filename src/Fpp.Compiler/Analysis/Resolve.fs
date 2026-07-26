@@ -457,6 +457,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     | GNode m when m.NodeKind = MemberDecl -> walkMember implOwner inner m
                     | GNode ty when isTypeKind ty.NodeKind -> walkType inner x
                     | _ -> ()
+            | GNode inh when inh.NodeKind = InheritDecl ->
+                // `inherit Base(args)`: bind the base name, resolve the args
+                // the arguments are constructor-parameter expressions, so
+                // they see the primary constructor's parameters
+                for x in inh.Children do
+                    match x with
+                    | GNode ty when isTypeKind ty.NodeKind -> walkType outer x
+                    | GNode _ -> local (fun () -> walkExpr inner x |> ignore)
+                    | GToken _ -> ()
             | GNode l when l.NodeKind = LetDecl -> local (fun () -> inner <- walkLet inner l)
             | GNode b when b.NodeKind = BlockExpr -> local (fun () -> walkExpr inner c |> ignore)
             | GNode ty when isTypeKind ty.NodeKind -> walkType outer c

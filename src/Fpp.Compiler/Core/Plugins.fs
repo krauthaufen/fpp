@@ -53,6 +53,7 @@ let constFold =
         | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (f, v) -> f, foldE v))
         | EField (r, f, o) -> EField (foldE r, f, o)
         | EFieldSet (r, f, o, v) -> EFieldSet (foldE r, f, o, foldE v)
+        | ERecordExt (n, b, fs) -> ERecordExt (n, foldE b, fs |> List.map (fun (k, v) -> k, foldE v))
         | EIfaceCall (i, m, r, args) -> EIfaceCall (i, m, foldE r, List.map foldE args)
         | ECast (t, e, d) -> ECast (t, foldE e, d)
         | EWhile (c, b) -> EWhile (foldE c, foldE b)

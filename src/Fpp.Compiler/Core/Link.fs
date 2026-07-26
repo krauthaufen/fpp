@@ -63,6 +63,7 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | EPrim (op, xs) -> EPrim (op, List.map r xs)
         | ECtor (n, s, xs) -> ECtor (n, s, List.map r xs)
         | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, r v))
+        | ERecordExt (n, bse, fs) -> ERecordExt (n, r bse, fs |> List.map (fun (k, v) -> k, r v))
         | EField (x, fn, o) -> EField (r x, fn, o)
         | EIfaceCall (i, m, recv, args) -> EIfaceCall (i, m, r recv, List.map r args)
         | ECast (t, x, d) -> ECast (t, r x, d)
@@ -112,6 +113,7 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> usesLayoutVar v)
+        | ERecordExt (_, bse, fs) -> usesLayoutVar bse || (fs |> List.exists (fun (_, v) -> usesLayoutVar v))
         | EField (r, _, _) -> usesLayoutVar r
         | EIfaceCall (_, _, recv, args) -> usesLayoutVar recv || anyOf args
         | ECast (_, x, _) -> usesLayoutVar x
@@ -140,6 +142,7 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> callsLayoutDep v)
+        | ERecordExt (_, bse, fs) -> callsLayoutDep bse || (fs |> List.exists (fun (_, v) -> callsLayoutDep v))
         | EField (r, _, _) -> callsLayoutDep r
         | EIfaceCall (_, _, recv, args) -> callsLayoutDep recv || anyOf args
         | ECast (_, x, _) -> callsLayoutDep x
@@ -306,6 +309,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter scan xs
         | ECtor (_, _, xs) -> List.iter scan xs
         | ERecord (_, fs) -> for _, v in fs do scan v
+        | ERecordExt (_, bse, fs) -> scan bse; (for _, v in fs do scan v)
         | EField (r, _, _) -> scan r
         | EIfaceCall (_, _, recv, args) -> scan recv; List.iter scan args
         | ECast (_, x, _) -> scan x
@@ -330,7 +334,8 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
     // have any of its interface methods called.
     for d in decls do
         match d with
-        | DClass (_, impls) ->
+        | DClass (_, _, own, impls) ->
+            for _, v in own do demand (v.Path, v.Offset)
             for _, ms in impls do
                 for _, v in ms do demand (v.Path, v.Offset)
         | _ -> ()

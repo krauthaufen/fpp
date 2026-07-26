@@ -48,7 +48,8 @@ type FieldInfo =
 /// "TypeName.fieldName" (for dot-access on a known record type).
 let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (shared : Dict<string, Scheme>) (aliases : Dict<string, Var list * Type>)
-          (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>) : InferResult =
+          (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
+          (bases : Dict<string, string>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -142,15 +143,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
     let tryResolveDot (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+        // members are inherited: walk up the base chain to the type that
+        // actually declares this one, and bind to THAT declaration
+        let rec declaringOwner (tn : string) : FieldInfo option =
+            match dictTryFind fields (tn + "." + name) with
+            | Some fi -> Some fi
+            | None ->
+                match dictTryFind bases tn with
+                | Some b -> declaringOwner b
+                | None -> None
         match prune recvTy with
         | TCon (tn, args) ->
-            (match dictTryFind fields (tn + "." + name) with
+            (match declaringOwner tn with
              | Some fi when fi.Params.Length = args.Length ->
                  let subst = dictNew<int, Type> ()
                  List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
                  for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
                  unifyAt offset result (substVars subst fi.FieldType)
-                 vecAdd memberSitesRaw (offset, tn)
+                 vecAdd memberSitesRaw (offset, fi.TypeName)
                  true
              | _ -> true)   // receiver known, no such member: retrying cannot help
         | _ -> false
@@ -898,14 +908,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some t -> t.Text
             | None -> "?"
         let selfTy = TCon (name, vecToList tyParams)
-        // a type whose members are all abstract IS an interface: it declares
-        // dispatch slots and nothing else
+        // `inherit Base(...)`: remember the base so member lookup and layout
+        // can walk the chain
+        (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl) with
+         | Some inh ->
+             (match Green.tokens (GNode inh) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+              | Some t -> dictSet bases name t.Text
+              | None -> ())
+         | None -> ())
+        // Any abstract member declares a dispatch slot — on a pure interface
+        // (all members abstract) or on a base class with overridable methods.
         let memberDecls = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
         let isAbstractM (m : GreenNode) =
             tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "abstract")
-        if not (List.isEmpty memberDecls) && memberDecls |> List.forall isAbstractM then
+        if memberDecls |> List.exists isAbstractM then
             dictSet ifaces name
                 (memberDecls
+                 |> List.filter isAbstractM
                  |> List.choose (fun m ->
                      let nameTok =
                          match tokensOf m |> List.filter (fun t -> t.Kind = Ident) with

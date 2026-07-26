@@ -851,9 +851,13 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (Green.node BlockExpr [ d; body ])
             elif s.IsKw "interface" then vecAdd acc (parseInterfaceImpl ())
             elif s.IsKw "inherit" then
+                // `inherit Base` or `inherit Base(args)`: the base type, then
+                // the base constructor's arguments
                 let a = vecNew<Green> ()
                 vecAdd a (s.Bump ())
-                vecAdd a (parseType typeCol)
+                if s.Is Ident then vecAdd a (Green.node NamedType [ s.Bump () ])
+                else vecAdd a (parseType typeCol)
+                if s.Is LParen && s.SameLine then vecAdd a (parseAtom typeCol)
                 vecAdd acc (Green.node InheritDecl (vecToList a))
             else vecAdd acc (parseMember ())
             if s.Mark = mark then go <- false
