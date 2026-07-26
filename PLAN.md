@@ -136,7 +136,10 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
   (requiring them to reduce would be grounding by another route). The
   readability problem is solved by PRESENTATION: one symbol maps to one
   class, so `Add<'a,'b>.Result` renders as `'a + 'b` and an inferred type
-  mirrors the expression that produced it
+  mirrors the expression that produced it. Pure sugar: defined only for a
+  class with one associated type and one operator member, never affects
+  inference, degrades to the nominal form (unlike `Matrix<Fractional>`,
+  which had a cliff). Display first, source syntax later
 - constraint sets are simplified: duplicates collapse, superclass-entailed
   constraints are dropped
 - instance reduction must be decreasing, or type-level evaluation can loop

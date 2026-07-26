@@ -323,10 +323,10 @@ just grounding by another route. So inference infers the constraint set as
 Haskell's does, and a signature may legitimately mention
 `Add<'a,'b>.Result`.
 
-The readability problem that creates is solved at the PRESENTATION layer,
-not by restricting the type system. Because one operator symbol maps to
-exactly one class, the projection is invertible and renders in operator
-notation:
+The readability problem that creates is solved by SYNTACTIC SUGAR at the
+presentation layer, not by restricting the type system. Because one
+operator symbol maps to exactly one class, the projection is invertible and
+renders in operator notation:
 
 ```
 let f a b c = (a + b) * c
@@ -336,6 +336,21 @@ val f : 'a -> 'b -> 'c -> ('a + 'b) * 'c   when Add<'a,'b>, Mul<'a + 'b, 'c>
 The inferred type mirrors the expression that produced it, which is what
 makes it legible — a chain of `Result` projections spelled out nominally is
 not. This is why the one-symbol-one-class invariant earns its keep twice.
+
+It is only sugar, and it is scoped. The notation is defined for a class
+with EXACTLY ONE associated type and ONE operator member; with two of
+either, `'a + 'b` cannot say which projection it means. The underlying type
+is always `Add<'a,'b>.Result` — the sugar never affects inference,
+unification or instance selection, only what is displayed.
+
+Unlike the rejected `Matrix<Fractional>`, this sugar DEGRADES rather than
+breaking down: the nominal form is always writable and always means the
+same thing, so a class that does not qualify simply displays nominally and
+nothing has to be rewritten. That is the difference between sugar worth
+having and a syntax with a cliff in it.
+
+Display first; accepting the notation in source as well is a later
+convenience, since it needs type-level operator grammar.
 
 **Constraints are simplified before they are shown or stored.** Duplicates
 collapse, and anything entailed by a superclass already in the set is
