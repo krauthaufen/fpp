@@ -107,3 +107,35 @@ let pluginTests =
             Expect.equal (runWat wat) "42\n" "both plugins ran, semantics intact"
         }
     ]
+
+[<Tests>]
+let instantiationCoreTests =
+    testList "specialization: core carries instantiations" [
+        test "polymorphic uses lower to EVarI with their concrete types" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let id2 (x : 'a) = x"
+                    "let a = id2 5"
+                    "let c = id2 { X = 1.0; Y = 2.0 }"
+                    "" ])
+            let low = ws.LowerFile "t.fpp"
+            let rec insts (e : Expr) : string list list =
+                match e with
+                | EVarI (_, _, i) -> [ i ]
+                | EApp (f, args) -> insts f @ List.collect insts args
+                | ELet (_, _, _, r, b) -> insts r @ insts b
+                | ELam (_, b) -> insts b
+                | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) -> List.collect insts xs
+                | ERecord (_, fs) -> fs |> List.collect (fun (_, v) -> insts v)
+                | _ -> []
+            let found =
+                low.Decls
+                |> List.collect (fun d -> match d with DLet (_, _, _, e) -> insts e | _ -> [])
+                |> List.sort
+            Expect.equal found [ [ "V2d" ]; [ "int" ] ] "each use carries its instantiation into core"
+        }
+    ]

@@ -17,7 +17,7 @@ type private LetShape =
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
-          (arrKinds : Dict<int, string>) : LowerResult =
+          (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -158,7 +158,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some t ->
                      (match dictTryFind useDefs t.Offset with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
-                      | Some d -> EVar (varIdOf d, schemeOf d)
+                      | Some d ->
+                          (match dictTryFind instSites t.Offset with
+                           | Some inst when not (List.isEmpty inst) ->
+                               EVarI (varIdOf d, schemeOf d, inst)
+                           | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EUnknown t.Text)
                  | None -> note (offsetOf n) "type-variable expression")
             | AppExpr ->
@@ -179,6 +183,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | None -> false)
                          | _ -> false
                      if statelessCtor then ELit LUnit else
+                     let f =
+                         match f with
+                         | EVarI (v, sch, _) when v.Path = "(builtin)" -> EVar (v, sch)
+                         | other -> other
                      (match f, loweredArgs with
                       | EField (_, mname), _ when
                             (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -215,6 +223,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match op.Text with
                       | "<-" ->
                           (match lowerExpr (GNode l) with
+                           | EVarI (v, _, _) -> EAssign (v, lowerExpr (GNode r))
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
                            | EIndex (nm, a, i) -> EIndexSet (nm, a, i, lowerExpr (GNode r))
                            | _ -> note (offsetOf n) "assignment target")

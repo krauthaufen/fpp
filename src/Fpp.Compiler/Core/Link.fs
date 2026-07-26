@@ -21,6 +21,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
             vecAdd work k
     let rec scan (e : Expr) =
         match e with
+        | EVarI (v, _, _) -> demand (v.Path, v.Offset)
         | EVar (v, _) -> demand (v.Path, v.Offset)
         | ELam (_, b) -> scan b
         | EApp (f, args) -> scan f; List.iter scan args

@@ -270,6 +270,7 @@ let emit (decls : Decl list) : EmitResult =
         | _ -> ()
     let rec scanExpr (e : Expr) =
         match e with
+        | EVarI (_, _, _) -> ()
         | ETuple xs -> noteTuple xs.Length; List.iter scanExpr xs
         | ELam (_, b) -> scanExpr b
         | EApp (f, args) -> scanExpr f; List.iter scanExpr args
@@ -444,6 +445,7 @@ let emit (decls : Decl list) : EmitResult =
             let bytes = unescape raw
             let id = internString bytes
             "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (System.Text.Encoding.UTF8.GetByteCount bytes) + "))"
+        | EVarI (v, sch, _) -> recur (EVar (v, sch))
         | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
             let rn, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
             structFromLeaves rn (fun lp -> "(local.get " + (dictTryFind m lp).Value + ")") ""
@@ -1069,6 +1071,7 @@ let emit (decls : Decl list) : EmitResult =
                     let l = newTypedLocalOuter extraLocals "lv" "anyref"
                     unboxLeaf k ("(local.get " + l + ")"))
             String.concat " " parts
+        | EVarI (v, sch, _) -> recur (EVar (v, sch))
         | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
             let _, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
             leaves |> List.map (fun (lp, _, _) -> "(local.get " + (dictTryFind m lp).Value + ")") |> String.concat " "
@@ -1197,6 +1200,7 @@ let emit (decls : Decl list) : EmitResult =
                 vecAdd free k
         let rec walk (e : Expr) =
             match e with
+            | EVarI (v, _, _) -> noteFree (v.Path, v.Offset)
             | EVar (v, _) -> noteFree (v.Path, v.Offset)
             | ELam (ps, b) ->
                 for v, _ in ps do dictSet bound (v.Path, v.Offset) true

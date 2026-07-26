@@ -40,6 +40,7 @@ let constFold =
                   | _ -> EPrim (op, [ a2; b2 ]))
              | _ -> EPrim (op, [ a2; b2 ]))
         | EPrim (op, xs) -> EPrim (op, List.map foldE xs)
+        | EVarI (v, s, i) -> EVarI (v, s, i)
         | ELam (ps, b) -> ELam (ps, foldE b)
         | EApp (f, args) -> EApp (foldE f, List.map foldE args)
         | ELet (r, v, s, rhs, body) -> ELet (r, v, s, foldE rhs, foldE body)

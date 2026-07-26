@@ -114,6 +114,7 @@ let rec private encPat (p : Pat) : Sx =
 let rec private encExpr (e : Expr) : Sx =
     match e with
     | ELit l -> L [ A "el"; encLit l ]
+    | EVarI (v, s, inst) -> L (A "eV" :: encVarId v :: encScheme s :: List.map S inst)
     | EVar (v, s) -> L [ A "ev"; encVarId v; encScheme s ]
     | EUnknown n -> L [ A "eu"; S n ]
     | ELam (ps, b) -> L [ A "em"; L (ps |> List.map (fun (v, s) -> L [ encVarId v; encScheme s ])); encExpr b ]
@@ -232,6 +233,8 @@ let rec private decPat (x : Sx) : Pat =
 let rec private decExpr (x : Sx) : Expr =
     match x with
     | L [ A "el"; l ] -> ELit (decLit l)
+    | L (A "eV" :: v :: s :: inst) ->
+        EVarI (decVarId v, decScheme s, inst |> List.choose (fun x -> match x with S t -> Some t | _ -> None))
     | L [ A "ev"; v; s ] -> EVar (decVarId v, decScheme s)
     | L [ A "eu"; S n ] -> EUnknown n
     | L [ A "em"; L ps; b ] ->

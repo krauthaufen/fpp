@@ -270,7 +270,9 @@ type Workspace() =
                 for off, k in inf.OpKinds do dictSet ok off k
                 let ak = dictNew<int, string> ()
                 for off, k in inf.ArrKinds do dictSet ak off k
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak
+                let ik = dictNew<int, string list> ()
+                for off, i in inf.InstSites do dictSet ik off i
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -281,7 +283,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ())
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ())
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -314,7 +316,9 @@ type Workspace() =
                 for off, k in inf.OpKinds do dictSet ok off k
                 let ak = dictNew<int, string> ()
                 for off, k in inf.ArrKinds do dictSet ak off k
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak
+                let ik = dictNew<int, string list> ()
+                for off, i in inf.InstSites do dictSet ik off i
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -333,7 +337,9 @@ type Workspace() =
             for off, k in inf.OpKinds do dictSet ok off k
             let ak = dictNew<int, string> ()
             for off, k in inf.ArrKinds do dictSet ak off k
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak
+            let ik = dictNew<int, string list> ()
+            for off, i in inf.InstSites do dictSet ik off i
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

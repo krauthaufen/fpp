@@ -33,6 +33,9 @@ type Pat =
 
 type Expr =
     | ELit of Lit
+    /// variable use; the string list is the concrete instantiation of the
+    /// binding's quantified vars ([] = monomorphic, "" entry = not concrete)
+    | EVarI of VarId * Scheme * string list
     | EVar of VarId * Scheme
     /// A name the project does not define (BCL etc.) — the emitter maps
     /// known intrinsics and rejects the rest.
@@ -83,6 +86,7 @@ let rec printExpr (e : Expr) : string =
     | ELit (LChar s) -> s
     | ELit (LBool b) -> if b then "true" else "false"
     | ELit LUnit -> "()"
+    | EVarI (v, _, inst) -> v.Name + "<" + String.concat "," inst + ">"
     | EVar (v, _) -> v.Name
     | EUnknown n -> "?" + n
     | ELam (ps, b) -> "(λ" + String.concat " " (List.map pv ps) + ". " + printExpr b + ")"

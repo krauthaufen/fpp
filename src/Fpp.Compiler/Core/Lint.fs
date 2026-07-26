@@ -124,6 +124,7 @@ let lint (decls : Decl list) : string list =
     let rec exprType (e : Expr) : Type =
         match e with
         | ELit l -> litType l
+        | EVarI (v, sch, _) -> exprType (EVar (v, sch))
         | EVar (v, sch) ->
             (match dictTryFind env (keyOf v) with
              | Some t -> t                     // local binder
