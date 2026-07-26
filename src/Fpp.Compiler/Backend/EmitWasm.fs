@@ -661,6 +661,30 @@ let emit (decls : Decl list) : EmitResult =
             boolWat ("(ref.eq (ref.cast (ref null eq) " + recur a + ") (ref.cast (ref null eq) " + recur b + "))")
         // int/uint32 conversions: same 32-bit payload, different reading;
         // from a wider or floating type they narrow explicitly
+        // conversions whose source type inference resolved
+        | EApp (EUnknown n, [ a ]) when n.Contains "#" ->
+            let target = n.Substring (0, n.IndexOf "#")
+            let src = n.Substring (n.IndexOf "#" + 1)
+            let raw =
+                match src with
+                | "l" -> "(call $tol " + recur a + ")"
+                | "f" -> "(call $tof " + recur a + ")"
+                | "s" -> "(call $tos " + recur a + ")"
+                | _ -> unwrapI32 (recur a)
+            (match target, src with
+             | "int64", "l" -> recur a
+             | "int64", ("f" | "s") -> "(call $ofl (i64.trunc_f" + (if src = "f" then "64" else "32") + "_s " + raw + "))"
+             | "int64", _ -> "(call $ofl (i64.extend_i32_s " + raw + "))"
+             | _, "l" -> "(call $ofi (i32.wrap_i64 " + raw + "))"
+             | _, "f" -> "(call $ofi (i32.trunc_f64_s " + raw + "))"
+             | _, "s" -> "(call $ofi (i32.trunc_f32_s " + raw + "))"
+             | _, _ -> recur a)
+        | EApp (EUnknown "int64", [ a ]) ->
+            (match kindOf a with
+             | "l" -> recur a
+             | "f" -> "(call $ofl (i64.trunc_f64_s (call $tof " + recur a + ")))"
+             | "s" -> "(call $ofl (i64.trunc_f32_s (call $tos " + recur a + ")))"
+             | _ -> "(call $ofl (i64.extend_i32_s " + unwrapI32 (recur a) + "))")
         | EApp (EUnknown ("uint32" | "int"), [ a ]) ->
             (match kindOf a with
              | "f" -> "(call $ofi (i32.trunc_f64_s (call $tof " + recur a + ")))"
@@ -769,6 +793,21 @@ let emit (decls : Decl list) : EmitResult =
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
+        // int64 bitwise and shifts. The suffixed-arithmetic path covers
+        // + - * / % and the comparisons but not these; a shift count is an
+        // int in F#, so it is widened to match the value being shifted.
+        | EPrim (op, [ a; b ]) when
+                op.EndsWith "l" && op.Length > 1
+                && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+            let ia = "(call $tol " + recur a + ")"
+            let ib = "(call $tol " + recur b + ")"
+            let shift = "(i64.extend_i32_s " + unwrapI32 (recur b) + ")"
+            (match op.Substring (0, op.Length - 1) with
+             | "&&&" -> "(call $ofl (i64.and " + ia + " " + ib + "))"
+             | "|||" -> "(call $ofl (i64.or " + ia + " " + ib + "))"
+             | "^^^" -> "(call $ofl (i64.xor " + ia + " " + ib + "))"
+             | "<<<" -> "(call $ofl (i64.shl " + ia + " " + shift + "))"
+             | _ -> "(call $ofl (i64.shr_s " + ia + " " + shift + "))")
         | EPrim (op, [ a; b ]) when op.EndsWith "w" && op.Length > 1 ->
             let ia = fun () -> unwrapI32 (recur a)
             let ib = fun () -> unwrapI32 (recur b)

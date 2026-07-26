@@ -266,6 +266,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EUnknown t.Text)
                  | None -> note (offsetOf n) "type-variable expression")
+            // a numeric conversion carries the source kind inference found
+            | AppExpr when
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | head :: [ _ ] when head.NodeKind = IdentExpr ->
+                     (match tokensOf head |> List.tryHead with
+                      | Some t ->
+                          List.contains t.Text [ "int"; "int64"; "uint32" ]
+                          && (dictTryFind useDefs t.Offset).IsNone
+                          && (dictTryFind opKinds t.Offset).IsSome
+                      | None -> false)
+                 | _ -> false) ->
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ head; a ] ->
+                     let t = (tokensOf head |> List.head)
+                     let k = (dictTryFind opKinds t.Offset).Value
+                     EApp (EUnknown (t.Text + "#" + k), [ lowerExpr (GNode a) ])
+                 | _ -> note (offsetOf n) "conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->

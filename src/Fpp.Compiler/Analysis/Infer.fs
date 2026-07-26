@@ -568,6 +568,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | AppExpr ->
                 (match nodesOf n with
                  | head :: args ->
+                     // a numeric conversion needs the SOURCE type, which the
+                     // backend's kind analysis cannot see through a global
+                     (match head.NodeKind, args with
+                      | IdentExpr, [ onlyArg ] when
+                            (match tokensOf head |> List.tryHead with
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32" ]
+                             | None -> false) ->
+                          (match tokensOf head |> List.tryHead with
+                           | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
+                           | None -> ())
+                      | _ -> ())
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (tokensOf head |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "print" ->
@@ -580,10 +591,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match head.NodeKind, args with
                          | IdentExpr, [ onlyArg ] ->
                              (match tokensOf head |> List.tryHead with
+                              | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon ("int64", []))
                               | Some t when (t.Text = "int" || t.Text = "uint32")
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
+                              | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon ("int64", []))
                               | Some t when t.Text = "string" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tString

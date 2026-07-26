@@ -813,6 +813,36 @@ let oracleTests =
             "let r7 = print (if Blue 3 = Blue 3 then \"eq\" else \"ne\")"
             "let r8 = print (if Red = Red then \"eq\" else \"ne\")"
         ]
+        oracle "int64: bitwise, shifts, conversions" [
+            "let big = 5000000000L"
+            "let a = print (big &&& 255L)"
+            "let b = print (big ||| 1L)"
+            "let c = print (big ^^^ 3L)"
+            "let d = print (big <<< 2)"
+            "let e = print (big >>> 3)"
+            "let f = print (0L - big)"
+            "let g = print (9000000000L % 7L)"
+            "let h = print (int64 42)"
+            "let i = print (int big)"
+            "let j = print (if hash 5L = hash 5L then \"heq\" else \"hne\")"
+        ]
+        oracle "int64 in structs, packed arrays and records" [
+            "[<Struct>]"
+            "type Span = { Lo : int64; Hi : int64 }"
+            "type Rec = { Id : int64; Name : string }"
+            "let s = { Lo = 1000000000000L; Hi = 2000000000000L }"
+            "let a = print (s.Hi - s.Lo)"
+            "let arr = [| { Lo = 1L; Hi = 2L }; { Lo = 10L; Hi = 20L } |]"
+            "let b = print (arr.[1].Hi + arr.[0].Lo)"
+            "let r = { Id = 9000000000L; Name = \"x\" }"
+            "let c = print r.Id"
+            "let d = print (if r = { Id = 9000000000L; Name = \"x\" } then \"eq\" else \"ne\")"
+            "let mutable acc = 0L"
+            "let e ="
+            "    for i in 0 .. arr.Length - 1 do"
+            "        acc <- acc + arr.[i].Hi"
+            "    print acc"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"
