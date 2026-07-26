@@ -26,7 +26,11 @@ type InferResult =
       ArrKinds : (int * string) list
       /// use offset -> concrete type per quantified var of the callee's
       /// scheme (tier-1 specialization demands; "" when not concrete)
-      InstSites : (int * string list) list }
+      InstSites : (int * string list) list
+      /// member/field name-token offset -> the receiver's type name. Member
+      /// names are not unique, so this — not the name — binds a dot-access
+      /// to the member it calls.
+      MemberSites : (int * string) list }
 
 type FieldInfo =
     { TypeName : string
@@ -126,6 +130,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let recordDef (t : Token) (ty : Type) : unit =
         vecAdd defTypes (t.Offset, strLen t.Text, ty)
+
+    // ---- deferred dot-access resolution -----------------------------------
+    // `x.M` is meaningless until x's type is known, and that can happen long
+    // after the access is first seen (a later call fixes the parameter, say).
+    // Every access therefore returns a fresh variable immediately and parks
+    // here; the parked set is retried to fixpoint once the file is inferred.
+    let memberSitesRaw = vecNew<int * string> ()
+    let pendingDots = vecNew<int * Type * Type * string> ()
+
+    /// Try to bind one dot-access. Returns false only when the receiver type
+    /// is still unknown — i.e. when retrying later could learn something.
+    let tryResolveDot (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+        match prune recvTy with
+        | TCon (tn, args) ->
+            (match dictTryFind fields (tn + "." + name) with
+             | Some fi when fi.Params.Length = args.Length ->
+                 let subst = dictNew<int, Type> ()
+                 List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                 for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                 unifyAt offset result (substVars subst fi.FieldType)
+                 vecAdd memberSitesRaw (offset, tn)
+                 true
+             | _ -> true)   // receiver known, no such member: retrying cannot help
+        | _ -> false
 
     let nodesOf (n : GreenNode) : GreenNode list =
         n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
@@ -617,7 +645,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     Green.tokens (GNode n)
                     |> List.filter (fun t -> t.Kind = Ident)
                     |> List.tryLast
-                (match lastIdent |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                // a member name binds through the receiver's type, never
+                // through the resolver's by-name candidate
+                let qualified =
+                    lastIdent
+                    |> Option.bind (fun t -> dictTryFind useDefs t.Offset)
+                    |> Option.filter (fun d -> d.Kind <> Resolve.DefMember)
+                // `C.M` where C names a type: a static member, so the owner
+                // is the type itself and there is no receiver to type
+                let staticOwner =
+                    match nodesOf n |> List.tryHead with
+                    | Some h when h.NodeKind = IdentExpr ->
+                        (match tokensOf h |> List.tryFind (fun t -> t.Kind = Ident) with
+                         | Some t ->
+                             (match dictTryFind useDefs t.Offset with
+                              | Some d when d.Kind = Resolve.DefType -> Some d.Name
+                              | _ -> None)
+                         | None -> None)
+                    | _ -> None
+                match staticOwner, lastIdent with
+                | Some tn, Some name when (dictTryFind fields (tn + "." + name.Text)).IsSome ->
+                    let fi = (dictTryFind fields (tn + "." + name.Text)).Value
+                    let subst = dictNew<int, Type> ()
+                    for pv in fi.Params do dictSet subst pv.Id (st.Fresh ())
+                    for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                    vecAdd memberSitesRaw (name.Offset, tn)
+                    substVars subst fi.FieldType
+                | _ ->
+                (match qualified with
                  | Some d ->
                      // qualified use (Module.fn): record its instantiation too
                      (match schemeOfDef d, lastIdent with
@@ -648,16 +703,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ ->
                      match lhsTy, lastIdent with
                       | Some lt, Some name ->
-                          (match prune lt with
-                           | TCon (tn, args) ->
-                               (match dictTryFind fields (tn + "." + name.Text) with
-                                | Some fi when fi.Params.Length = args.Length ->
-                                    let subst = dictNew<int, Type> ()
-                                    List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
-                                    for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
-                                    substVars subst fi.FieldType
-                                | _ -> st.Fresh ())
-                           | _ -> st.Fresh ())
+                          let result = st.Fresh ()
+                          if not (tryResolveDot name.Offset lt result name.Text) then
+                              vecAdd pendingDots (name.Offset, lt, result, name.Text)
+                          result
                       | _ -> st.Fresh ()))
             | ForExpr | WhileExpr ->
                 let fvars = dictNew<string, Type> ()
@@ -951,11 +1000,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
          | _ -> ())
         let memberTy = List.foldBack (fun p acc -> TFun (p, acc)) paramTys bodyTy
         st.ExitLevel ()
+        // an instance member lowers to a function whose first parameter is
+        // the receiver, so the *definition's* scheme carries self; the type
+        // seen at a use site (`c.M`) is the self-free one, recorded in fields
+        let isStatic = tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
+        let defTy = if isStatic then memberTy else TFun (selfTy, memberTy)
         match nameTok with
         | Some t ->
             recordDef t memberTy
             if (dictTryFind defsAt t.Offset).IsSome then
-                setScheme t.Offset (st.Generalize memberTy)
+                // quantify explicitly: the class' own type parameters live at
+                // the type-declaration level, which level-based
+                // generalization would refuse to close over
+                setScheme t.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Body = defTy }
             let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
             let quantified =
                 freeVars memberTy
@@ -978,6 +1035,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ -> exprType g |> ignore
 
     for c in root.Children do inferDecl c
+
+    // retry parked dot-accesses until nothing more can be learned: resolving
+    // one can fix a variable that unblocks another
+    let mutable parked = vecToList pendingDots
+    let mutable progress = true
+    while progress do
+        progress <- false
+        let still = vecNew<int * Type * Type * string> ()
+        for offset, recvTy, result, name in parked do
+            if tryResolveDot offset recvTy result name then progress <- true
+            else vecAdd still (offset, recvTy, result, name)
+        parked <- vecToList still
+    // Anything still parked has an indeterminate receiver. We do NOT guess a
+    // member from the name alone: the access stays unbound, and emission
+    // rejects it with a real error rather than calling the wrong function.
 
     let kindOf (t : Type) : string =
         match prune t with
@@ -1007,6 +1079,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // name it so stamping can substitute the caller's argument
                 | TVar v -> "#" + string v.Id
                 | _ -> ""))
+      MemberSites = vecToList memberSitesRaw
       ArrKinds =
         vecToList arrKindsRaw
         |> List.choose (fun (off, ty) ->

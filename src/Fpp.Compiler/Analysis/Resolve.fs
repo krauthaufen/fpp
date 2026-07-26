@@ -37,7 +37,11 @@ type BindResult =
     { Definitions : Definition list
       Resolutions : Resolution list
       /// full dotted path -> definition, for later files to import
-      Exports : (string * Definition) list }
+      Exports : (string * Definition) list
+      /// "TypeName.MemberName" -> the member's definition. Member names are
+      /// NOT globally unique, so a use site is bound by the receiver's
+      /// inferred type (see Infer.MemberSites), not by name alone.
+      Members : (string * Definition) list }
 
 let kindLabel (k : DefKind) : string =
     match k with
@@ -58,7 +62,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let exports = vecNew<string * Definition> ()
     let ownExports = dictNew<string, Definition> ()
     let opens = vecNew<string> ()
+    // "TypeName.MemberName" -> def, and bare name -> every def with that
+    // name (a use is disambiguated by the receiver type during inference)
     let memberDefs = dictNew<string, Definition> ()
+    let membersByName = dictNew<string, Definition list> ()
     let mutable modulePath = ""
 
     let define (kind : DefKind) (t : Token) : Definition =
@@ -241,11 +248,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                           tryRecord env head
                       | None -> tryRecord env head)
                  | _ when (match n.Children |> List.rev |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
-                           | Some t -> (dictTryFind memberDefs t.Text).IsSome
+                           | Some t -> (dictTryFind membersByName t.Text).IsSome
                            | None -> false) ->
-                     // member access: bind to the member's definition
+                     // member access: the name alone only tells us *a* member
+                     // exists. Record the first candidate so hover has
+                     // something; inference rebinds it by receiver type.
                      let t = (n.Children |> List.rev |> List.pick (fun c -> match c with GToken x when x.Kind = Ident -> Some x | _ -> None))
-                     record t (dictTryFind memberDefs t.Text).Value
+                     record t (dictTryFind membersByName t.Text).Value.Head
                      (match n.Children with
                       | first :: _ -> walkExpr env first |> ignore
                       | [] -> ())
@@ -354,7 +363,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 if d.Kind = DefLet then exportDef d
         result
 
-    and walkMember (env : Env) (n : GreenNode) : unit =
+    and walkMember (owner : string) (env : Env) (n : GreenNode) : unit =
         let mutable seenEq = false
         let idents = vecNew<Token> ()
         let pats = vecNew<Green> ()
@@ -368,13 +377,18 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode p when isTypeKind p.NodeKind -> walkType env c
             | _ -> ()
         let mutable inner = env
+        let declareMember (name : Token) =
+            let d = define DefMember name
+            dictSet memberDefs (owner + "." + name.Text) d
+            let prior = match dictTryFind membersByName name.Text with Some l -> l | None -> []
+            dictSet membersByName name.Text (prior @ [ d ])
         match vecToList idents with
         | [ self; name ] ->
             if self.Text <> "_" then
                 let d = define DefSelf self
                 inner <- Map.add self.Text d inner
-            dictSet memberDefs name.Text (define DefMember name)
-        | [ name ] -> define DefMember name |> ignore
+            declareMember name
+        | [ name ] -> declareMember name
         | _ -> ()
         local (fun () ->
             for p in vecToList pats do inner <- bindPat DefParam inner p
@@ -382,6 +396,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
 
     and walkTypeDecl (env : Env) (n : GreenNode) : Env =
         let nameTok = firstIdentToken n.Children
+        let typeName = match nameTok with Some t -> t.Text | None -> "?"
         let exportHere = atExportLevel
         let mutable outer = env
         match nameTok with
@@ -421,11 +436,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             match c with
             | GNode p when isPatKind p.NodeKind ->
                 local (fun () -> inner <- bindPat DefParam inner c)
-            | GNode m when m.NodeKind = MemberDecl -> walkMember inner m
+            | GNode m when m.NodeKind = MemberDecl -> walkMember typeName inner m
             | GNode i when i.NodeKind = InterfaceImpl ->
                 for x in i.Children do
                     match x with
-                    | GNode m when m.NodeKind = MemberDecl -> walkMember inner m
+                    | GNode m when m.NodeKind = MemberDecl -> walkMember typeName inner m
                     | GNode ty when isTypeKind ty.NodeKind -> walkType inner x
                     | _ -> ()
             | GNode l when l.NodeKind = LetDecl -> local (fun () -> inner <- walkLet inner l)
@@ -500,4 +515,5 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
 
     { Definitions = vecToList defs
       Resolutions = vecToList uses
-      Exports = vecToList exports }
+      Exports = vecToList exports
+      Members = dictPairs memberDefs }

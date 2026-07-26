@@ -189,9 +189,13 @@ let lint (decls : Decl list) : string list =
         | ERecord (_, fields) ->
             for _, v in fields do exprType v |> ignore
             st.Fresh ()
-        | EField (r, _) ->
+        | EField (r, _, _) ->
             exprType r |> ignore
             st.Fresh ()
+        | EFieldSet (r, _, _, v) ->
+            exprType r |> ignore
+            exprType v |> ignore
+            tUnit
         | EPrim (op, args) -> primType op (List.map exprType args) ("prim " + op)
         | ESeq xs ->
             let mutable last = tUnit

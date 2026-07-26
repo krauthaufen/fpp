@@ -163,6 +163,23 @@ let emit (decls : Decl list) : EmitResult =
     let fieldIndex = dictNew<string, string * int * string> ()
     for rn, fs, st in records do
         fs |> List.iteri (fun i (f, k) -> dictSet fieldIndex f (rn, i, kindOfField st k))
+    /// Field slot lookup. With a known owner the record is exact; without
+    /// one we fall back to the bare name (F# shadowing: last declaration
+    /// wins), which is what unowned core from plugins/tests carries.
+    let fieldSlot (owner : string) (fname : string) : (string * int * string) option =
+        let byOwner =
+            if owner = "" then None
+            else
+                records
+                |> List.tryPick (fun (rn, fs, st) ->
+                    if rn <> owner then None
+                    else
+                        fs |> List.mapi (fun i (f, k) -> f, i, k)
+                           |> List.tryPick (fun (f, i, k) ->
+                                if f = fname then Some (rn, i, kindOfField st k) else None))
+        match byOwner with
+        | Some x -> Some x
+        | None -> dictTryFind fieldIndex fname
     let recordOrder = dictNew<string, (string * string) list> ()
     for rn, fs, st in records do
         dictSet recordOrder rn (fs |> List.map (fun (f, k) -> f, kindOfField st k))
@@ -285,7 +302,8 @@ let emit (decls : Decl list) : EmitResult =
         | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter scanExpr xs
         | ECtor (_, _, xs) -> List.iter scanExpr xs
         | ERecord (_, fs) -> for _, v in fs do scanExpr v
-        | EField (r, _) -> scanExpr r
+        | EField (r, _, _) -> scanExpr r
+        | EFieldSet (r, _, _, v) -> scanExpr r; scanExpr v
         | EWhile (c, b) -> scanExpr c; scanExpr b
         | EAssign (_, e) -> scanExpr e
         | EArray (_, xs) -> List.iter scanExpr xs
@@ -374,8 +392,8 @@ let emit (decls : Decl list) : EmitResult =
         | EPrim ("u-f", _) -> "f"
         | EPrim ("u-s", _) -> "s"
         | EPrim ("u-l", _) -> "l"
-        | EField (_, fname) ->
-            (match dictTryFind fieldIndex fname with
+        | EField (_, fname, owner) ->
+            (match fieldSlot owner fname with
              | Some (_, _, k) when k = "f" || k = "s" || k = "l" -> k
              | _ -> "u")
         | EIndex (nm, _, _) ->
@@ -478,10 +496,10 @@ let emit (decls : Decl list) : EmitResult =
         | EUnknown n ->
             vecAdd errors ("unknown name reaches emission: " + n)
             "(ref.i31 (i32.const 0))"
-        | EApp (EField (EUnknown "Array", "create"), [ _; _ ]) ->
+        | EApp (EField (EUnknown "Array", "create", _), [ _; _ ]) ->
             vecAdd errors "Array.create needs a statically known element type"
             "(ref.i31 (i32.const 0))"
-        | EApp (EField (EUnknown "Array", "length"), [ a ]) ->
+        | EApp (EField (EUnknown "Array", "length", _), [ a ]) ->
             "(call $lenv " + recur a + ")"
         | EApp (EUnknown "memLoadF64", [ a ]) ->
             "(call $off (f64.load (call $toi " + recur a + ")))"
@@ -678,8 +696,10 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors ("unknown constructor " + name)
                  "(ref.i31 (i32.const 0))")
-        | ERecord (_, fields) ->
-            (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
+        | ERecord (tyName, fields) ->
+            (match (if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome
+                    then Some (tyName, 0, "")
+                    else fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f)) with
              | Some (rn, _, _) ->
                  let order = (dictTryFind recordOrder rn).Value
                  let unboxBy (k : string) (w : string) =
@@ -699,19 +719,19 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
-        | EField (_, _) when
+        | EField (_, _, _) when
             (let rec pathOfVar (e : Expr) =
                 match e with
                 | EVar (v, _) -> (match dictTryFind paramLeaves (v.Path, v.Offset) with
                                   | Some (rn, m) -> Some (rn, m, "")
                                   | None -> None)
-                | EField (b, f) ->
+                | EField (b, f, _) ->
                     (match pathOfVar b with
                      | Some (rn, m, p) -> Some (rn, m, (if p = "" then f else p + "." + f))
                      | None -> None)
                 | _ -> None
              match e with
-             | EField (b, f) ->
+             | EField (b, f, _) ->
                  (match pathOfVar b with
                   | Some (_, m, p) -> (dictTryFind m (if p = "" then f else p + "." + f)).IsSome
                   | None -> false)
@@ -721,13 +741,13 @@ let emit (decls : Decl list) : EmitResult =
                 | EVar (v, _) -> (match dictTryFind paramLeaves (v.Path, v.Offset) with
                                   | Some (rn, m) -> Some (rn, m, "")
                                   | None -> None)
-                | EField (b, f) ->
+                | EField (b, f, _) ->
                     (match pathOfVar b with
                      | Some (rn, m, p) -> Some (rn, m, (if p = "" then f else p + "." + f))
                      | None -> None)
                 | _ -> None
             (match e with
-             | EField (b, f) ->
+             | EField (b, f, _) ->
                  let rn, m, p = (pathOfVar b).Value
                  let full = if p = "" then f else p + "." + f
                  let loc = (dictTryFind m full).Value
@@ -736,11 +756,11 @@ let emit (decls : Decl list) : EmitResult =
                   | "f" | "s" | "l" -> boxK k ("(local.get " + loc + ")")
                   | _ -> "(call $ofi (local.get " + loc + "))")
              | _ -> "(ref.i31 (i32.const 0))")
-        | EField (inner, fname) when
+        | EField (inner, fname, _) when
             (let rec pathOf (e : Expr) =
                 match e with
                 | EIndex (nm2, a2, i2) -> (if isPod nm2 then Some (nm2, a2, i2, "") else None)
-                | EField (b, f2) ->
+                | EField (b, f2, _) ->
                     (match pathOf b with
                      | Some (nm2, a2, i2, p) -> Some (nm2, a2, i2, (if p = "" then f2 else p + "." + f2))
                      | None -> None)
@@ -755,7 +775,7 @@ let emit (decls : Decl list) : EmitResult =
             let rec pathOf (e : Expr) =
                 match e with
                 | EIndex (nm2, a2, i2) -> (if isPod nm2 then Some (nm2, a2, i2, "") else None)
-                | EField (b, f2) ->
+                | EField (b, f2, _) ->
                     (match pathOf b with
                      | Some (nm2, a2, i2, p) -> Some (nm2, a2, i2, (if p = "" then f2 else p + "." + f2))
                      | None -> None)
@@ -770,10 +790,10 @@ let emit (decls : Decl list) : EmitResult =
              | "f" | "s" | "l" -> boxK k raw
              | "i" -> "(call $ofi " + raw + ")"
              | _ -> raw)
-        | EField (EIndex (nm, a, i), fname) when isStructName nm && not (isPod nm) && (dictTryFind fieldIndex fname).IsSome ->
+        | EField (EIndex (nm, a, i), fname, owner) when isStructName nm && not (isPod nm) && (fieldSlot owner fname).IsSome ->
             // fusion: pts.[i].X reads the SoA field array directly — no
             // temporary struct materialization
-            let _, fi, k = (dictTryFind fieldIndex fname).Value
+            let _, fi, k = (fieldSlot owner fname).Value
             let src = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") " + recur a + "))"
             let raw =
                 match k with
@@ -783,10 +803,23 @@ let emit (decls : Decl list) : EmitResult =
              | "f" | "s" | "l" -> boxK k raw
              | "i" -> "(call $ofi " + raw + ")"
              | _ -> raw)
-        | EField (r, "Length") when not (dictTryFind fieldIndex "Length").IsSome ->
+        | EField (r, "Length", _) when not (dictTryFind fieldIndex "Length").IsSome ->
             "(call $lenv " + recur r + ")"
-        | EField (r, fname) ->
-            (match dictTryFind fieldIndex fname with
+        | EFieldSet (r, fname, owner, v) ->
+            (match fieldSlot owner fname with
+             | Some (rn, idx, k) ->
+                 let stored =
+                     match k with
+                     | "f" -> "(call $tof " + recur v + ")" | "s" -> "(call $tos " + recur v + ")"
+                     | "l" -> "(call $tol " + recur v + ")" | "i" -> "(call $toi " + recur v + ")"
+                     | _ -> recur v
+                 "(block (result anyref) (struct.set $r_" + rn + " " + string idx
+                 + " (ref.cast (ref $r_" + rn + ") " + recur r + ") " + stored + ") (ref.i31 (i32.const 0)))"
+             | None ->
+                 vecAdd errors ("unknown field " + fname)
+                 "(ref.i31 (i32.const 0))")
+        | EField (r, fname, owner) ->
+            (match fieldSlot owner fname with
              | Some (rn, idx, k) ->
                  let raw = "(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") " + recur r + "))"
                  (match k with
@@ -1226,7 +1259,8 @@ let emit (decls : Decl list) : EmitResult =
             | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter walk xs
             | ECtor (_, _, xs) -> List.iter walk xs
             | ERecord (_, fs) -> for _, v in fs do walk v
-            | EField (r, _) -> walk r
+            | EField (r, _, _) -> walk r
+            | EFieldSet (r, _, _, v) -> walk r; walk v
             | EWhile (c, b) -> walk c; walk b
             | EAssign (v, e) -> noteFree (v.Path, v.Offset); walk e
             | EArray (_, xs) -> List.iter walk xs
@@ -1307,12 +1341,14 @@ let emit (decls : Decl list) : EmitResult =
 
     // program-declared types
     for rn, fs, st in records do
+        // every field is declared mutable: classes assign to their state,
+        // and wasm-GC needs the mutability in the type, not at the use site
         let fieldTy (k : string) =
             match kindOfField st k with
-            | "f" -> "(field f64)" | "s" -> "(field f32)"
-            | "l" -> "(field i64)" | "i" -> "(field i32)"
-            | k2 when k2.StartsWith "S:" -> "(field (ref $r_" + k2.Substring 2 + "))"
-            | _ -> "(field anyref)"
+            | "f" -> "(field (mut f64))" | "s" -> "(field (mut f32))"
+            | "l" -> "(field (mut i64))" | "i" -> "(field (mut i32))"
+            | k2 when k2.StartsWith "S:" -> "(field (mut (ref $r_" + k2.Substring 2 + ")))"
+            | _ -> "(field (mut anyref))"
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
         line ("  (type $r_" + rn + " (struct " + fields + "))")
     for rn, fs in structRecords do

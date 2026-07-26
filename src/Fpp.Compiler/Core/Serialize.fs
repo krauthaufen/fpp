@@ -131,7 +131,8 @@ let rec private encExpr (e : Expr) : Sx =
     | EListLit xs -> L (A "ek" :: List.map encExpr xs)
     | ECtor (n, s, args) -> L (A "ec" :: S n :: encScheme s :: List.map encExpr args)
     | ERecord (n, fs) -> L (A "er" :: S n :: (fs |> List.map (fun (f, v) -> L [ S f; encExpr v ])))
-    | EField (r, f) -> L [ A "ef"; encExpr r; S f ]
+    | EField (r, f, o) -> L [ A "ef"; encExpr r; S f; S o ]
+    | EFieldSet (r, f, o, v) -> L [ A "efs"; encExpr r; S f; S o; encExpr v ]
     | EPrim (op, args) -> L (A "ep" :: S op :: List.map encExpr args)
     | ESeq xs -> L (A "es" :: List.map encExpr xs)
     | EWhile (c, b) -> L [ A "ew"; encExpr c; encExpr b ]
@@ -255,7 +256,8 @@ let rec private decExpr (x : Sx) : Expr =
     | L (A "ec" :: S n :: s :: args) -> ECtor (n, decScheme s, List.map decExpr args)
     | L (A "er" :: S n :: fs) ->
         ERecord (n, fs |> List.choose (fun f -> match f with L [ S fn; v ] -> Some (fn, decExpr v) | _ -> None))
-    | L [ A "ef"; r; S f ] -> EField (decExpr r, f)
+    | L [ A "ef"; r; S f; S o ] -> EField (decExpr r, f, o)
+    | L [ A "efs"; r; S f; S o; v ] -> EFieldSet (decExpr r, f, o, decExpr v)
     | L (A "ep" :: S op :: args) -> EPrim (op, List.map decExpr args)
     | L (A "es" :: xs) -> ESeq (List.map decExpr xs)
     | L [ A "ew"; c; b ] -> EWhile (decExpr c, decExpr b)

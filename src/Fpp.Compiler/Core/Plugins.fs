@@ -51,7 +51,8 @@ let constFold =
         | ESeq xs -> ESeq (List.map foldE xs)
         | ECtor (n, s, xs) -> ECtor (n, s, List.map foldE xs)
         | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (f, v) -> f, foldE v))
-        | EField (r, f) -> EField (foldE r, f)
+        | EField (r, f, o) -> EField (foldE r, f, o)
+        | EFieldSet (r, f, o, v) -> EFieldSet (foldE r, f, o, foldE v)
         | EWhile (c, b) -> EWhile (foldE c, foldE b)
         | EAssign (v, x) -> EAssign (v, foldE x)
         | EArray (n, xs) -> EArray (n, List.map foldE xs)
@@ -86,8 +87,8 @@ let deriveShallowEquals =
                 let bv = { Path = path; Offset = off + 200000; Name = "b" }
                 let sch = mono (TCon ("?", []))
                 let cmpField (f : string, kind : string) =
-                    let ea = EField (EVar (av, sch), f)
-                    let eb = EField (EVar (bv, sch), f)
+                    let ea = EField (EVar (av, sch), f, name)
+                    let eb = EField (EVar (bv, sch), f, name)
                     if kind = "r" then EApp (EUnknown "refEq", [ ea; eb ])
                     else EPrim ("=", [ ea; eb ])
                 let body =

@@ -49,7 +49,9 @@ type Expr =
     | EListLit of Expr list
     | ECtor of string * Scheme * Expr list
     | ERecord of string * (string * Expr) list
-    | EField of Expr * string
+    /// receiver, field name, owning type ("" when the owner is unknown)
+    | EField of Expr * string * string
+    | EFieldSet of Expr * string * string * Expr
     | EPrim of string * Expr list
     | ESeq of Expr list
     | EWhile of Expr * Expr
@@ -103,7 +105,8 @@ let rec printExpr (e : Expr) : string =
         if List.isEmpty args then n else "(" + n + " " + String.concat " " (List.map printExpr args) + ")"
     | ERecord (n, fs) ->
         "{" + n + "| " + String.concat "; " (fs |> List.map (fun (f, v) -> f + " = " + printExpr v)) + "}"
-    | EField (r, f) -> printExpr r + "." + f
+    | EField (r, f, _) -> printExpr r + "." + f
+    | EFieldSet (r, f, _, v) -> printExpr r + "." + f + " <- " + printExpr v
     | EPrim (op, args) -> "(" + op + " " + String.concat " " (List.map printExpr args) + ")"
     | ESeq xs -> "(seq " + String.concat "; " (List.map printExpr xs) + ")"
     | EWhile (c, b) -> "(while " + printExpr c + " do " + printExpr b + ")"

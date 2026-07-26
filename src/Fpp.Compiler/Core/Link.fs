@@ -63,7 +63,8 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | EPrim (op, xs) -> EPrim (op, List.map r xs)
         | ECtor (n, s, xs) -> ECtor (n, s, List.map r xs)
         | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, r v))
-        | EField (x, fn) -> EField (r x, fn)
+        | EField (x, fn, o) -> EField (r x, fn, o)
+        | EFieldSet (x, fn, o, v) -> EFieldSet (r x, fn, o, r v)
         | EWhile (c, b) -> EWhile (r c, r b)
         | EAssign (v, x) -> EAssign (v, r x)
         | EArray (n, xs) -> EArray (n, List.map r xs)
@@ -109,7 +110,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> usesLayoutVar v)
-        | EField (r, _) -> usesLayoutVar r
+        | EField (r, _, _) -> usesLayoutVar r
+        | EFieldSet (r, _, _, v) -> usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
         | ETry (b, cs) -> usesLayoutVar b || (cs |> List.exists (fun (_, _, x) -> usesLayoutVar x))
@@ -134,7 +136,8 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> callsLayoutDep v)
-        | EField (r, _) -> callsLayoutDep r
+        | EField (r, _, _) -> callsLayoutDep r
+        | EFieldSet (r, _, _, v) -> callsLayoutDep r || callsLayoutDep v
         | EWhile (c, b) -> callsLayoutDep c || callsLayoutDep b
         | EAssign (_, x) -> callsLayoutDep x
         | EArray (_, xs) -> anyOf xs
@@ -297,7 +300,8 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter scan xs
         | ECtor (_, _, xs) -> List.iter scan xs
         | ERecord (_, fs) -> for _, v in fs do scan v
-        | EField (r, _) -> scan r
+        | EField (r, _, _) -> scan r
+        | EFieldSet (r, _, _, v) -> scan r; scan v
         | EWhile (c, b) -> scan c; scan b
         | EAssign (v, e) -> demand (v.Path, v.Offset); scan e
         | ETry (b, cs) ->
