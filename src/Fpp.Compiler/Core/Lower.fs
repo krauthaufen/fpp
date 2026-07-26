@@ -88,7 +88,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match sub |> List.tryFind (fun m -> m.NodeKind = NamedType || m.NodeKind = AppType) with
         | Some head when tn.NodeKind = AppType -> ifaceNameOf head
         | _ ->
-            Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+            Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
             |> Option.map (fun t -> t.Text)
 
     /// `C.Foo` where C names a type: a static member, so no receiver.

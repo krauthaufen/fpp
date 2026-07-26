@@ -525,15 +525,21 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode i when i.NodeKind = InterfaceImpl ->
                 // an explicit implementation is not part of the class' own
                 // member namespace: it is reached only through the interface
-                // the interface is the HEAD of the type application
+                // the interface is the HEAD of the type application, and the
+                // last identifier of that head (the rest are module names)
+                let rec ifaceOf (ty : GreenNode) : string option =
+                    let sub = ty.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+                    match sub |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                    | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                    | _ ->
+                        Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                        |> Option.map (fun t -> t.Text)
                 let ifaceName =
                     i.Children
                     |> List.tryPick (fun x ->
                         match x with
-                        | GNode ty when isTypeKind ty.NodeKind ->
-                            Green.tokens x |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+                        | GNode ty when isTypeKind ty.NodeKind -> ifaceOf ty
                         | _ -> None)
-                    |> Option.map (fun t -> t.Text)
                 let implOwner =
                     match ifaceName with
                     | Some inm -> typeName + "." + inm

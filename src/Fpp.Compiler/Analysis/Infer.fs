@@ -146,9 +146,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Nominal subtyping: is `sup` `sub` itself, an ancestor of it, or an
     /// interface it implements? Inheritance and interfaces both count.
+    // `seq<'a>` IS `IEnumerable<'a>`, and arrays, lists and any type
+    // implementing it genuinely are sequences
+    let isSeqName (n : string) = n = "seq" || n = "IEnumerable"
     let rec isSupertypeOf (sup : string) (sub : string) : bool =
         // obj is the top type: everything widens to it
         sup = "obj" || sup = sub
+        || (isSeqName sup
+            && (isSeqName sub || sub = "array" || sub = "list"
+                || (match dictTryFind impls sub with
+                    | Some is -> is |> List.exists isSeqName
+                    | None -> false)))
         || (match dictTryFind impls sub with
             | Some is -> List.contains sup is
             | None -> false)
@@ -1348,13 +1356,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
                 // are not accessible as members of the class itself
+                let rec ifaceOf (ty : GreenNode) : string option =
+                    match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                    | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                    | _ ->
+                        Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                        |> Option.map (fun t -> t.Text)
                 let ifaceName =
-                    nodesOf m
-                    |> List.tryPick (fun x ->
-                        if isTypeKind x.NodeKind then
-                            Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
-                        else None)
-                    |> Option.map (fun t -> t.Text)
+                    nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) |> Option.bind ifaceOf
                 let owner = match ifaceName with Some inm -> name + "." + inm | None -> name
                 (match ifaceName with
                  | Some inm ->
