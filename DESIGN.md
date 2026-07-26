@@ -206,3 +206,89 @@ test executes twice — under `dotnet` and under the F++ pipeline — and output
 are diffed. A machine-checked conformance suite for the entire inherited
 surface, for free. The self-host fixpoint (stage2 compiles source →
 byte-identical stage3) runs in CI forever after the flip.
+
+## Identity: hashing and equality on every type
+
+Every value can be hashed and compared. Today that is a runtime walk
+(`$hashv`/`$equal`) that sniffs representations with `ref.test` chains —
+which is the runtime dispatch this design rejects everywhere else, and is
+unsound besides: wasm-GC canonicalizes same-shaped struct types into one
+heap type, so the walk cannot always tell two types apart. It goes away.
+
+**Generated, not discovered.** The compiler emits `equals` and `hash` for
+every type, structurally, recursing into components. This is a TAST plugin
+(the mechanism already exists). A user-declared `Equals`/`GetHashCode`
+member replaces the generated one.
+
+**Semantics follow F#, with one deliberate exception.**
+
+| kind | equality |
+| --- | --- |
+| struct, record, DU, tuple | structural |
+| class | reference identity, unless it overrides |
+| **array** | **reference identity — F# says structural; we do not** |
+
+Classes being reference-equal is not only faithful, it is what keeps
+structural equality total: a cyclic object graph would otherwise not
+terminate. Arrays are the one place we break with F# on purpose. An array
+is a mutable buffer whose whole point is to be passed to C or JS by
+address; structural equality on it is a trap — silently O(n), and wrong
+the moment someone mutates through a pinned pointer. Reference identity is
+what an array *is* here.
+
+Because the oracle gate compares against `dotnet fsi`, it can no longer
+arbitrate array equality: any such program legitimately differs. Oracle
+tests must not compare arrays with `=`, and this is the first entry in a
+list that must stay short and explicit.
+
+**Dispatch splits along the boxing line.**
+
+- A struct, or any statically-known type, gets a direct call to its
+  stamped function. No boxing, no dispatch — monomorphization already
+  provides this.
+- A reference type reached from generic (`Canon`) code dispatches through
+  a slot in its descriptor.
+
+**Every reference type therefore carries a descriptor.** Classes already
+do. DUs get theirs for free — the case tag indexes a descriptor table, so
+no word is added. Records take one extra word per instance; that is the
+accepted cost of uniform identity, and anything needing density should be
+`[<Struct>]`, which pays nothing. The rule is: *boxed things carry a
+descriptor; value types are known statically.*
+
+`IEqualityComparer` remains the path for CUSTOM equality — dictionary
+passing, exactly as in the typeclass design — and is what the collections
+take explicitly.
+
+## The library boundary: Fable's subset as the specification
+
+The set of FSharp.Core and BCL surface we implement is Fable's subset. Not
+its implementation — its *list*. It is the already-drawn and validated line
+between F# and .NET, it is documented and finite (so it is testable), and
+it matches what F# users targeting non-CLR hosts already expect.
+
+In scope: `List`, `Array`, `Seq`, `Option`, `Result`, `Map`, `Set`,
+`String`, `Printf`, and a thin `System` surface.
+
+Out of scope, explicitly: reflection, LINQ/IQueryable, `Task`/async
+(we design our own concurrency later), globalization and culture.
+
+Where we must diverge from Fable: it *maps* onto JS built-ins — its `seq`
+is a JS iterator, its string a JS string. We have no host library, so every
+shim is ours. That is an advantage: the stdlib is written in F++ itself,
+continuous with `stdlib/*.fpp`, and every function is oracle-tested against
+fsi. Only a minimal primitive floor stays as emitter intrinsics — string
+bytes, math, memory.
+
+`seq` is the hard one, being lazy and interface-based. It becomes a real
+interface (`IEnumerable`/`IEnumerator`) dispatched through the vtable
+machinery, with compiler-provided implementations for arrays and lists,
+and `for x in xs` desugaring to `GetEnumerator`/`MoveNext`/`Current`.
+
+### Order of work
+
+1. Descriptors on all reference types — the universal identity mechanism.
+2. Generated `equals`/`hash`; user overrides win.
+3. Delete the `$hashv`/`$equal` runtime walks.
+4. The stdlib proper, scoped by the Fable list, written in F++.
+5. `seq`/`IEnumerable` as a real interface plus `for-in` desugaring.
