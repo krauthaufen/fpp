@@ -98,6 +98,7 @@ let private encLit (l : Lit) : Sx =
     | LChar s -> L [ A "lc"; S s ]
     | LBool b -> L [ A "lb"; A (if b then "1" else "0") ]
     | LUnit -> L [ A "lu" ]
+    | LNull -> L [ A "ln" ]
 
 let rec private encPat (p : Pat) : Sx =
     match p with
@@ -230,6 +231,7 @@ let private decLit (x : Sx) : Lit =
     | L [ A "ls"; S s ] -> LString s
     | L [ A "lc"; S s ] -> LChar s
     | L [ A "lb"; A b ] -> LBool (b = "1")
+    | L [ A "ln" ] -> LNull
     | _ -> LUnit
 
 let rec private decPat (x : Sx) : Pat =

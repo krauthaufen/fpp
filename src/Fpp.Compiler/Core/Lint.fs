@@ -50,6 +50,7 @@ let lint (decls : Decl list) : string list =
         | LString _ -> tString
         | LChar _ -> tChar
         | LBool _ -> tBool
+        | LNull -> st.Fresh ()   // null inhabits any reference type
         | LUnit -> tUnit
 
     let rec patType (p : Pat) : Type =

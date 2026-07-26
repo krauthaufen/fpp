@@ -214,7 +214,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some l -> ELit l
                  | None ->
                      match tokensOf n |> List.tryHead with
-                     | Some t when t.Text = "null" -> ELit LUnit
+                     | Some t when t.Text = "null" -> ELit LNull
                      | _ -> note (offsetOf n) "literal")
             | IdentExpr ->
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with

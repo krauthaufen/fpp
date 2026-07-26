@@ -548,6 +548,27 @@ let oracleTests =
             "let s = leaf.Data <- 99u"
             "let e = print leaf.Data"
         ]
+        oracle "null as empty: nullable classes, isNull, null equality" [
+            "[<AllowNullLiteral>]"
+            "type Link(value : int, next : Link) ="
+            "    member _.Value = value"
+            "    member _.Next = next"
+            "let rec length (n : Link) ="
+            "    if isNull n then 0"
+            "    else 1 + length n.Next"
+            "let rec total (n : Link) ="
+            "    if isNull n then 0"
+            "    else n.Value + total n.Next"
+            "let empty : Link = null"
+            "let one = Link(10, null)"
+            "let two = Link(20, one)"
+            "let three = Link(30, two)"
+            "let a = print (length three)"
+            "let b = print (total three)"
+            "let c = print (length empty)"
+            "let d = print (if isNull empty then \"empty\" else \"no\")"
+            "let e = print (if isNull three.Next then \"no next\" else \"has next\")"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

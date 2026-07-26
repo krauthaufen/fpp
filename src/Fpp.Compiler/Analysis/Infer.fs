@@ -494,6 +494,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
+                              | Some t when t.Text = "isNull" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some tBool
                               | _ -> None)
                          | _ -> None
                      match conversion with

@@ -18,6 +18,8 @@ type Lit =
     | LString of string
     | LChar of string
     | LBool of bool
+    /// the null reference — distinct from unit, which is a real value
+    | LNull
     | LUnit
 
 type Pat =
@@ -106,6 +108,7 @@ let rec printExpr (e : Expr) : string =
     | ELit (LString s) -> s
     | ELit (LChar s) -> s
     | ELit (LBool b) -> if b then "true" else "false"
+    | ELit LNull -> "null"
     | ELit LUnit -> "()"
     | EVarI (v, _, inst) -> v.Name + "<" + String.concat "," inst + ">"
     | EVar (v, _) -> v.Name

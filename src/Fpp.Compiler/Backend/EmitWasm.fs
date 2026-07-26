@@ -537,6 +537,7 @@ let emit (decls : Decl list) : EmitResult =
                         else int digits
                 "(call $ofi (i32.const " + string v + "))"
         | ELit (LBool b) -> "(ref.i31 (i32.const " + (if b then "1" else "0") + "))"
+        | ELit LNull -> "(ref.null any)"
         | ELit LUnit -> "(ref.i31 (i32.const 0))"
         | ELit (LChar raw) -> "(ref.i31 (i32.const " + string (charCode raw) + "))"
         | ELit (LFloat s) ->
@@ -606,6 +607,7 @@ let emit (decls : Decl list) : EmitResult =
              | "s" -> "(call $ofi (i32.trunc_f32_s (call $tos " + recur a + ")))"
              | "l" -> "(call $ofi (i32.wrap_i64 (call $tol " + recur a + ")))"
              | _ -> recur a)
+        | EApp (EUnknown "isNull", [ a ]) -> boolWat ("(ref.is_null " + recur a + ")")
         | EApp (EUnknown "printu", [ a ]) ->
             "(block (result anyref) (call $printu " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "print", [ a ]) ->
@@ -1389,6 +1391,8 @@ let emit (decls : Decl list) : EmitResult =
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + (if b then "1" else "0") + ") " + unwrapI32 v + "))")
         | PLit (LChar raw) ->
             app ("(br_if " + failLbl + " (i32.ne (i32.const " + string (charCode raw) + ") " + unwrapI32 v + "))")
+        | PLit LNull ->
+            app ("(br_if " + failLbl + " (i32.eqz (ref.is_null " + v + ")))")
         | PLit (LString raw) ->
             let lit = compileExpr locals extraLocals freeEnv false (ELit (LString raw))
             app ("(br_if " + failLbl + " (i32.eqz " + unwrapI32 ("(call $equal " + v + " " + lit + ")") + "))")
@@ -1664,6 +1668,9 @@ let emit (decls : Decl list) : EmitResult =
     (call $putc (i32.const 63)))
   (func $equal (param $a anyref) (param $b anyref) (result anyref)
     (local $i i32)
+    ;; null equals only null
+    (if (i32.or (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))
+      (then (return (ref.i31 (i32.and (ref.is_null (local.get $a)) (ref.is_null (local.get $b)))))))
     (if (i32.and (ref.test (ref i31) (local.get $a)) (ref.test (ref i31) (local.get $b)))
       (then (return (ref.i31 (i32.eq (i31.get_s (ref.cast (ref i31) (local.get $a)))
                                      (i31.get_s (ref.cast (ref i31) (local.get $b))))))))
