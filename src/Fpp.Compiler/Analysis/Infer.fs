@@ -223,7 +223,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
 
     let isTypeKind (k : NodeKind) =
-        k = NamedType || k = VarType || k = AnonType || k = TupleType
+        k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
 
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
@@ -305,6 +305,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | _ -> st.Fresh ())
         | TupleType ->
             TTuple (nodesOf n |> List.filter (fun m -> isTypeKind m.NodeKind) |> List.map (typeFromNode vars))
+        | StructTupleType ->
+            // the same generic struct the expression and pattern forms use
+            let rec elems (m : GreenNode) =
+                if m.NodeKind = ParenType || m.NodeKind = TupleType then
+                    nodesOf m |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.collect elems
+                else [ m ]
+            let ts =
+                nodesOf n |> List.filter (fun m -> isTypeKind m.NodeKind) |> List.collect elems
+            TCon ("StructTuple" + string ts.Length, ts |> List.map (typeFromNode vars))
         | ParenType ->
             (match nodesOf n with
              | [ inner ] -> typeFromNode vars inner

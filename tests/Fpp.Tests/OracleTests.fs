@@ -631,6 +631,20 @@ let oracleTests =
             "let c = print (if step 1 then \"added\" else \"dup\")"
             "let d = print (size root)"
         ]
+        oracle "struct tuples in type position and in arrays" [
+            "let mk (a : int) (b : int) = struct(a, b)"
+            "let sumOf (xs : struct(int * int)[]) ="
+            "    let mutable s = 0"
+            "    for i in 0 .. xs.Length - 1 do"
+            "        let struct(p, q) = xs.[i]"
+            "        s <- s + p * q"
+            "    s"
+            "let arr = [| mk 1 2; mk 3 4; mk 5 6 |]"
+            "let a = print (sumOf arr)"
+            "let b ="
+            "    let struct(p, q) = arr.[1]"
+            "    print (p + q)"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

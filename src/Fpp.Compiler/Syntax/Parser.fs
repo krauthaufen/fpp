@@ -258,9 +258,14 @@ let parse (src : string) : ParseResult =
 
     and canStartTypeAtom () =
         s.Is Ident || s.IsOp "'" || s.Is LParen
+        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
 
     and parseAtomType (ctx : int) : Green =
-        if s.IsOp "'" then
+        if s.IsKw "struct" && (s.Peek 1).Kind = LParen then
+            // `struct('K * 'V)` names the generic struct StructTuple2<'K,'V>
+            let kw = s.Bump ()
+            Green.node StructTupleType [ kw; parseAtomType ctx ]
+        elif s.IsOp "'" then
             let q = s.Bump ()
             if s.Is Ident then Green.node VarType [ q; s.Bump () ]
             else Green.node VarType [ q ]

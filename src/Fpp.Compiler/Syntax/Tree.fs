@@ -62,6 +62,7 @@ type NodeKind =
     | VarType
     | AnonType
     | TupleType
+    | StructTupleType
     | FunType
     | AppType
     | PostfixType

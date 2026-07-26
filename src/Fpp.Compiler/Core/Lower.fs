@@ -126,7 +126,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
     let isTypeKind (k : NodeKind) =
-        k = NamedType || k = VarType || k = AnonType || k = TupleType
+        k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
 

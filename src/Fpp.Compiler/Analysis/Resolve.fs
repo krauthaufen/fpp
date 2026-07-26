@@ -137,7 +137,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
 
     let isTypeKind (k : NodeKind) =
-        k = NamedType || k = VarType || k = AnonType || k = TupleType
+        k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
 
     /// Marks the boundary between top-level walking (defs are exported) and
