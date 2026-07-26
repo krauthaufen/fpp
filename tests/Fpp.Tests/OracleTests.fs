@@ -35,9 +35,11 @@ let private fppRun (src : string) : string =
 
 let private fsiRun (src : string) : string =
     // strip the module header; provide the F# side of `print`
+    // drop only the header the harness itself prepends — a program may
+    // legitimately declare modules of its own
     let body =
         src.Split '\n'
-        |> Array.filter (fun l -> not (l.StartsWith "module "))
+        |> Array.filter (fun l -> l.Trim() <> "module M")
         |> String.concat "\n"
     let prelude =
         // IEqualityComparer lives in the builtin prelude on the F++ side
