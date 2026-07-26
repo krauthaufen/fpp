@@ -80,12 +80,13 @@ diagnostics, has 3 type errors, and lowers with 11 notes**.
 
 `EmitProgram` returns early on those, so to find the REAL remaining set the
 emitter was run directly (`emitforce` in the scratch harness). It reports
-**119 errors**, and the split matters: only ~16 are missing stdlib surface.
+**87 errors**, and the split matters: a minority are missing stdlib surface.
 The rest are compiler gaps:
 
-- [ ] a TYPE and a MODULE may share a name (F# allows it; we have one
-      namespace). `MapLinked`/`SetLinked` are both — 22 errors, the single
-      biggest item, and it cascades into the `unknown field` families.
+- [x] a TYPE and a MODULE may share a name — done. Types have their own
+      namespace, a dotted spine that resolves qualified IS qualified, and a
+      bare expression name prefers the type (a module is never a value).
+      119 -> 87 errors.
 - [ ] type tests and downcasts against BUILTIN collections: `:? array<'K>`,
       `:? list<'K>` need a runtime representation test, not a class id (12)
 - [ ] MEMBER overloading (constructors are done; methods are not)
