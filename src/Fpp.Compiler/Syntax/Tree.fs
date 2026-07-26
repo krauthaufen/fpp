@@ -32,6 +32,7 @@ type NodeKind =
     | RecordExpr
     | RecordExprField
     | TupleExpr
+    | StructTupleExpr
     | ListExpr
     | ArrayExpr
     | LambdaExpr
@@ -50,6 +51,7 @@ type NodeKind =
     | IdentPat
     | LiteralPat
     | TuplePat
+    | StructTuplePat
     | ConsPat
     | AppPat
     | ParenPat

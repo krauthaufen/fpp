@@ -133,7 +133,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | _ -> false)
 
     let isPatKind (k : NodeKind) =
-        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat
+        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
 
     let isTypeKind (k : NodeKind) =
@@ -200,6 +200,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                                  let d = define kind t
                                  Map.add t.Text d env
                  | _ -> env)
+            | StructTuplePat ->
+                n.Children |> List.fold (fun e c -> bindPat kind e c) env
             | WildcardPat | LiteralPat -> env
             | AppPat ->
                 (match n.Children with

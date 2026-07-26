@@ -93,8 +93,20 @@ let emit (decls : Decl list) : EmitResult =
         |> List.map (fun (n, fs, st) ->
             if isClassName n then n, ("__desc", "r") :: expandedFields n, st else n, fs, st)
 
-    // struct records store fields UNBOXED by kind; plain records stay anyref
-    let kindOfField (isStruct : bool) (k : string) = if isStruct then k else "r"
+    // A field declaration carries a TYPE; the representation is derived
+    // here, once, from that type. A struct stores its fields unboxed where
+    // the type allows; a reference type keeps everything uniform.
+    let kindOfType (structNamesOf : string list) (tyName : string) : string =
+        match tyName with
+        | "float" -> "f"
+        | "float32" -> "s"
+        | "int64" -> "l"
+        | "int" | "bool" | "char" -> "i"
+        | n when List.contains n structNamesOf -> "S:" + n
+        | _ -> "r"
+    let mutable structNameList : string list = []
+    let kindOfField (isStruct : bool) (k : string) =
+        if isStruct then kindOfType structNameList k else "r"
     // flat-array element classification: primitive kind or a struct name
     let primKindOf (tyName : string) : string =
         match tyName with
@@ -103,7 +115,13 @@ let emit (decls : Decl list) : EmitResult =
         | "float32" -> "s"
         | "int64" -> "l"
         | _ -> ""
-    let structRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, true) -> Some (n, fs) | _ -> None)
+    // struct layout works in representations, so convert the declared field
+    // types to kinds once, here at the boundary
+    let structRecordsDecl = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, true) -> Some (n, fs) | _ -> None)
+    structNameList <- structRecordsDecl |> List.map fst
+    let structRecords =
+        structRecordsDecl
+        |> List.map (fun (n, fs) -> n, fs |> List.map (fun (f, t) -> f, kindOfType structNameList t))
     let isStructName (n : string) = structRecords |> List.exists (fun (rn, _) -> rn = n)
     let parrOf (k : string) = "$parr_" + k
     // ---- C ABI layout for POD structs (clang natural alignment) ----------

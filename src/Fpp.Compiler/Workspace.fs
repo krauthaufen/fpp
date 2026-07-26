@@ -123,6 +123,14 @@ module Builtin =
             "type exn ="
             "    | Failure of string"
             "    | InvalidCast of string"
+            // struct tuples are nothing special: they ARE these generic
+            // structs, reached through `struct(a, b)` syntax
+            "[<Struct>]"
+            "type StructTuple2<'a, 'b> = { Item1 : 'a; Item2 : 'b }"
+            "[<Struct>]"
+            "type StructTuple3<'a, 'b, 'c> = { Item1 : 'a; Item2 : 'b; Item3 : 'c }"
+            "[<Struct>]"
+            "type StructTuple4<'a, 'b, 'c, 'd> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd }"
             // the equality-comparer abstraction the hash collections take
             // as a parameter; `hash` and `=` are the structural defaults
             "type IEqualityComparer<'a> ="

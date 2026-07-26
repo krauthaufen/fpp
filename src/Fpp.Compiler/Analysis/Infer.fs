@@ -219,7 +219,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = text)
 
     let isPatKind (k : NodeKind) =
-        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat
+        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
 
     let isTypeKind (k : NodeKind) =
@@ -376,6 +376,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [] -> st.Fresh ())
         | TuplePat ->
             TTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map (patType pvars))
+        | StructTuplePat ->
+            // the same generic struct the `struct(a, b)` expression builds
+            let rec unwrap (m : GreenNode) =
+                if m.NodeKind = ParenPat || m.NodeKind = TuplePat then
+                    nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) |> List.collect unwrap
+                else [ m ]
+            let ps =
+                nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.collect unwrap
+            TCon ("StructTuple" + string ps.Length, ps |> List.map (patType pvars))
         | ConsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
              | [ h; t ] ->
@@ -729,6 +738,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 ifaceTy
             // `downcast e` / `upcast e`: the target is whatever the context
             // demands, so park the result and read it back once solved
+            | StructTupleExpr ->
+                // `struct(a, b)` IS the generic struct StructTuple2<'a,'b> —
+                // no separate concept, just different syntax
+                let rec unwrap (m : GreenNode) =
+                    if m.NodeKind = ParenExpr || m.NodeKind = TupleExpr then
+                        nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.collect unwrap
+                    else [ m ]
+                let elems =
+                    nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.collect unwrap
+                let ts = elems |> List.map (fun m -> exprType (GNode m))
+                TCon ("StructTuple" + string ts.Length, ts)
             | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
                  | Some operand -> exprType (GNode operand) |> ignore
@@ -948,7 +968,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             vecToList before
             |> List.tryPick (fun c -> match c with GNode t when isTypeKind t.NodeKind -> Some (typeFromNode vars t) | _ -> None)
         let isDestructure =
-            vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
+            // `let struct(a, b) = e` binds several names, like `let a, b = e`
+            (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
+            || (match pats with [ p ] -> p.NodeKind = StructTuplePat | _ -> false)
         match pats with
         | [] ->
             for c in vecToList after do exprType c |> ignore

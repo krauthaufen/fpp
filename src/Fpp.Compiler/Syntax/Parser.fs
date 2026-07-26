@@ -148,6 +148,7 @@ let parse (src : string) : ParseResult =
     /// Can the current token start an expression at statement position?
     let canStartExpr () =
         canStartAtom () || s.IsKw "fun" || s.IsKw "if" || s.IsKw "match"
+        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
         || s.IsKw "function" || s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new"
         || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
@@ -330,10 +331,14 @@ let parse (src : string) : ParseResult =
 
     and canStartAtomPat () =
         s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket
+        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
         || (s.IsOp "-" && (let n = s.Peek 1 in n.Kind = IntLit || n.Kind = FloatLit))
 
     and parseAtomPat (ctx : int) : Green =
-        if s.Is Ident then
+        if s.IsKw "struct" && (s.Peek 1).Kind = LParen then
+            let kw = s.Bump ()
+            Green.node StructTuplePat [ kw; parseAtomPat ctx ]
+        elif s.Is Ident then
             if s.IsText "_" then Green.node WildcardPat [ s.Bump () ]
             else
                 // dotted constructor name, e.g. Lexer.Some
@@ -634,6 +639,10 @@ let parse (src : string) : ParseResult =
         elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
             // type variable in expression position (e.g. `unbox<'a>` soup)
             Green.node IdentExpr [ s.Bump (); s.Bump () ]
+        elif s.IsKw "struct" && (s.Peek 1).Kind = LParen then
+            // struct tuple: a value, not a heap allocation
+            let kw = s.Bump ()
+            Green.node StructTupleExpr [ kw; parseAtom ctx ]
         elif s.IsKw "downcast" || s.IsKw "upcast" then
             // the target type comes from the context, so the node carries
             // only the operator and the operand

@@ -14,6 +14,8 @@ open Fpp.Core.Ir
 type private LetShape =
     | SimpleLet of bool * VarId * Scheme * Expr * Expr option
     | DestructureLet of Pat * Expr * Expr option
+    /// `let struct(a, b) = e`: bind the struct once, then read its fields
+    | StructLet of (VarId * Scheme) list * string * Expr * Expr option
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
@@ -121,7 +123,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | None -> 0
 
     let isPatKind (k : NodeKind) =
-        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat
+        k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType
@@ -446,6 +448,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      ELet (isRec, v, sch, rhs, (match cont with Some c -> c | None -> ELit LUnit))
                  | Some (DestructureLet (pat, rhs, cont)) ->
                      EMatch (rhs, [ pat, None, (match cont with Some c -> c | None -> ELit LUnit) ])
+                 | Some (StructLet (bs, tn, rhs, cont)) ->
+                     structLetExpr bs tn rhs (match cont with Some c -> c | None -> ELit LUnit)
                  | None -> note (offsetOf n) "let shape")
             | RecordExpr ->
                 let fields =
@@ -512,7 +516,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> ()
                 let caps = vecToList captured
                 for v, _ in caps do dictSet fieldOfVar (v.Path, v.Offset) (synth, v.Name)
-                vecAdd decls (DRecord (synth, [], caps |> List.map (fun (v, _) -> v.Name, "r"), false))
+                vecAdd decls (DRecord (synth, [], caps |> List.map (fun (v, _) -> v.Name, "?"), false))
                 let savedClass = currentClass
                 currentClass <- synth
                 let bound =
@@ -526,6 +530,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, EVar (v, sch)))
             // `downcast e` / `upcast e`: inference resolved the target from
             // the context and recorded it at the keyword
+            | StructTupleExpr ->
+                // `struct(a, b)` builds StructTuple2<'a,'b> — an ordinary
+                // generic struct, so every struct rule applies unchanged
+                let rec unwrap (m : GreenNode) =
+                    if m.NodeKind = ParenExpr || m.NodeKind = TupleExpr then
+                        nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.collect unwrap
+                    else [ m ]
+                let elems =
+                    nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.collect unwrap
+                ERecord ("StructTuple" + string elems.Length,
+                         elems |> List.mapi (fun i m -> "Item" + string (i + 1), lowerExpr (GNode m)))
             | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
                 let kw = tokensOf n |> List.find (fun t -> t.Kind = Keyword)
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
@@ -698,6 +713,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
                     EMatch (rhs, [ pat, None, tail ])
+                | Some (StructLet (bs, tn, rhs, cont)) ->
+                    let tail =
+                        match cont, rest with
+                        | Some c, [] -> c
+                        | Some c, _ -> ESeq [ c; lowerBlock rest ]
+                        | None, _ -> lowerBlock rest
+                    structLetExpr bs tn rhs tail
                 | None -> ESeq [ note (offsetOf item) "let shape"; lowerBlock rest ]
             else
                 match rest with
@@ -818,6 +840,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             Some (d.Name, varIdOf d)
         | None -> None
 
+    /// Expand `let struct(a, b) = rhs in body` into a struct binding plus
+    /// one field read per binder — the struct itself is an ordinary value.
+    and structLetExpr (binders : (VarId * Scheme) list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
+        match binders with
+        | [] -> body
+        | (first, fsch) :: _ ->
+            let tmp = { Path = first.Path; Offset = first.Offset + 4000000; Name = "_st" }
+            let tsch = mono (TCon (tn, []))
+            let inner =
+                List.foldBack
+                    (fun (i, (v, vsch)) acc ->
+                        ELet (false, v, vsch, EField (EVar (tmp, tsch), "Item" + string (i + 1), tn), acc))
+                    (binders |> List.mapi (fun i b -> i, b))
+                    body
+            ignore fsch
+            ELet (false, tmp, tsch, rhs, inner)
+
     /// Classify and lower a LetDecl node.
     and lowerLetParts (n : GreenNode) : LetShape option =
         let isRec = tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "rec")
@@ -843,6 +882,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 bodyExprs |> List.take (bodyExprs.Length - 1),
                 Some (lowerExpr (GNode (List.last bodyExprs)))
             else bodyExprs, None
+        // `let struct(a, b) = rhs`
+        match pats with
+        | [ sp ] when sp.NodeKind = StructTuplePat ->
+            let binders =
+                Green.tokens (GNode sp)
+                |> List.filter (fun t -> t.Kind = Ident)
+                |> List.choose (fun t -> dictTryFind defsAt t.Offset)
+                |> List.map (fun d -> varIdOf d, schemeOf d)
+            if List.isEmpty binders then None
+            else Some (StructLet (binders, "StructTuple" + string binders.Length, lowerBlock rhsExprs, cont))
+        | _ ->
         if isDestructure then
             match pats with
             | [] -> None
@@ -906,19 +956,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     Some (nt.Text, (if digits = "" then 0 else int digits))
                 | _ -> None)
         let isEnum = not (List.isEmpty caseNodes) && enumCases.Length = caseNodes.Length
+        // A field records its TYPE, not a representation. Resolving a kind
+        // here would freeze a `'a` field as boxed before anyone knows what
+        // it is instantiated at; the backend derives the kind once the type
+        // is concrete.
         let fieldKind (f : GreenNode) : string =
-            let tyName =
-                nodesOf f
-                |> List.tryFind (fun x -> isTypeKind x.NodeKind)
-                |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
-                |> Option.map (fun t -> t.Text)
-            match tyName with
-            | Some n when List.contains n (vecToList structNames) -> "S:" + n
-            | Some "float" -> "f"
-            | Some "float32" -> "s"
-            | Some "int64" -> "l"
-            | Some "int" | Some "bool" | Some "char" -> "i"
-            | _ -> "r"
+            let tyNode = nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+            match tyNode with
+            | Some tn when tn.NodeKind = VarType ->
+                (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                 | Some t -> "'" + t.Text
+                 | None -> "?")
+            | Some tn ->
+                (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                 | Some t when List.contains t.Text tyParams -> "'" + t.Text
+                 | Some t -> t.Text
+                 | None -> "?")
+            | None -> "?"
         let recordFields =
             nodesOf n
             |> List.filter (fun m -> m.NodeKind = RecordRepr)
@@ -1010,7 +1064,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)
-            vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "r"), false))
+            vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))
 
             // ---- the constructor ----------------------------------------
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
