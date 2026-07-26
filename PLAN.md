@@ -117,6 +117,9 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
   `Mul<Rhs> { type Output }` shape; the member is named `(*)`, not `Mul`
 - knowingly overloading rather than law-carrying algebra, for operators only
 - coherence: one instance per `(a, b)`, plus an orphan rule
+- a constraint is a CLASS APPLIED TO TYPES, Haskell-style:
+  `when Fractional<'a>`, never `'a : Fractional`. The latter reads as
+  subtyping and has no reading for a two-parameter class
 - constraints must be able to equate an associated type (`Result = 'a`) —
   this is what closed classes use to pin operators to closure
 - a CLASS is not a type: no values, no subtyping, no boxing, no `I` prefix.

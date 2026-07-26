@@ -268,12 +268,32 @@ The fix is nominal superclass constraints:
 
 ```
 class Fractional<'a>
-    requires Add<'a,'a> with Result = 'a
-    requires Mul<'a,'a> with Result = 'a
-    requires Div<'a,'a> with Result = 'a
+    when Add<'a,'a> with Result = 'a
+    when Mul<'a,'a> with Result = 'a
+    when Div<'a,'a> with Result = 'a
     static Zero : 'a
     static One  : 'a
 ```
+
+**A constraint is a class applied to types**, Haskell-style, not a
+membership test on a variable. `when Fractional<'a>`, never
+`'a : Fractional`. The latter reads as subtyping — the very confusion the
+`class` keyword removes — and it has no sensible reading at all for a
+two-parameter class: in `'a : Mul<'a,'b>` neither parameter is the
+subject. The same spelling then serves superclass constraints, use-site
+constraints and instance contexts:
+
+```
+let solve (m : Matrix<'a>) (b : Vector<'a>) : Vector<'a>
+    when Fractional<'a> = ...
+
+instance Add<V3d, V3d> when Fractional<float>
+    type Result = V3d
+    static (+) a b = ...
+```
+
+Where a class has exactly one associated type, `Add<'a,'a> = 'a` is
+shorthand for `Add<'a,'a> with Result = 'a`.
 
 **A single-parameter class may stand where a type goes**, and that is how
 generic math is written:
@@ -289,7 +309,7 @@ signature.** C++'s `auto` and Rust's `impl Trait` in argument position
 introduce a fresh variable per occurrence, so `Matrix<Fractional>` and
 `Vector<Fractional>` would not share a scalar — which for numerical code is
 exactly backwards. When two distinct instances of a class are genuinely
-wanted, name them: `'a : Fractional` and `'b : Fractional`.
+wanted, name them: `when Fractional<'a>` and `when Fractional<'b>`.
 
 The sugar applies to single-parameter classes only; nobody writes
 `x : Mul`, and the two-parameter operator classes appear in `requires`
@@ -313,7 +333,7 @@ load-bearing rather than speculative: `with Result = 'a` is the mechanism.
 
 In practice generic numeric code is generic over the SCALAR, not the
 containers — `Matrix<'a>`/`Vector<'a>` operations are written concretely
-and constrained on `'a : Fractional`, while heterogeneous instances like
+and constrained by `when Fractional<'a>`, while heterogeneous instances like
 `Mul<Matrix<'a>, Vector<'a>>` are declared once per container rather than
 inferred per call. So the two-parameter classes stay near-ground and the
 closed classes do the abstracting. (nalgebra's `T: RealField` is the same
@@ -339,7 +359,7 @@ can each declare `Mul<float, V3d>` and linking is ill-defined.
 
 **Consequence for the constraint language.** Generic numeric code needs to
 say that an operation stays in its type: `sum` over `'a` requires
-`'a : Add<'a,'a>` *with* `Result = 'a`. So constraints must be able to
+`when Add<'a,'a> with Result = 'a`. So constraints must be able to
 equate an associated type, not merely require a class.
 
 **Sequencing.** `sin`/`cos`/`exp` ship monomorphically on `float` and
