@@ -75,26 +75,35 @@ the set/map node implementation: generic inheritance, property accessors,
 packed uint32 tag bits, the NodeKind enum, null-terminated chains,
 IEqualityComparer dispatch, struct tuples, and implicit upcasts.
 
-On the acceptance target: the ported file (4130 lines after choosing a
-compilation target) now **parses with zero diagnostics and lowers with 11
-notes**. `ws.EmitProgram()` reports exactly **14 blockers**, and they are
-the whole remaining gap:
+On the acceptance target: the ported file (4130 lines) **parses with zero
+diagnostics, has 3 type errors, and lowers with 11 notes**.
 
-- 3 type errors:
-  - 2164 `MapLinked.exists` — a type and a module share a name
-  - 3792 `CopyTo(('K*'V)[], int)` vs `CopyTo(struct('K*'V)[], int)` —
-    MEMBER overloading (constructors are done; methods are not)
-  - 4111 `union` — same, on a member call
-- 11 `for e in <seq>` loops. These need the enumerator protocol for real:
-  `seq`/`IEnumerable`/`IEnumerator` as prelude interfaces, arrays and
-  lists implementing them, and `for-in` desugaring to
-  `GetEnumerator`/`MoveNext`/`Current`. Typing them is not enough — they
-  have to run.
+`EmitProgram` returns early on those, so to find the REAL remaining set the
+emitter was run directly (`emitforce` in the scratch harness). It reports
+**119 errors**, and the split matters: only ~16 are missing stdlib surface.
+The rest are compiler gaps:
 
-`tests/port-reference.py` is the reproducible port: every rule is a .NET
-dependency with no F++ counterpart (OptimizedClosures, CLR/tooling
-attributes, `#if` target choice), and each is documented in the script.
-Nothing in it works around a compiler limitation.
+- [ ] a TYPE and a MODULE may share a name (F# allows it; we have one
+      namespace). `MapLinked`/`SetLinked` are both — 22 errors, the single
+      biggest item, and it cascades into the `unknown field` families.
+- [ ] type tests and downcasts against BUILTIN collections: `:? array<'K>`,
+      `:? list<'K>` need a runtime representation test, not a class id (12)
+- [ ] MEMBER overloading (constructors are done; methods are not)
+- [ ] the enumerator protocol so `for e in <seq>` lowers at all: `seq`/
+      `IEnumerable`/`IEnumerator` as prelude interfaces, arrays and lists
+      implementing them, `for-in` desugaring to GetEnumerator/MoveNext
+- [ ] then the genuine stdlib: `Seq.*`, `sprintf`, `String.concat`,
+      `Array.zeroCreate`, `KeyValuePair`
+
+So: stdlib alone would NOT make this compile. It is roughly a 1:6 split in
+favour of compiler work.
+
+Two real bugs found by pushing on this file, both fixed:
+- `open M` did not bring M's NESTED modules into scope, because an open was
+  recorded as a bare name instead of being resolved relative to where it
+  appears;
+- a cast or type test named its target by the LAST identifier of the type,
+  so `x :?> MapLeaf<'K, 'V>` tried to downcast to `V` (68 errors).
 
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real
