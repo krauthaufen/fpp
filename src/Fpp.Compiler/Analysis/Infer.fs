@@ -1003,10 +1003,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       ArrKinds =
         vecToList arrKindsRaw
         |> List.choose (fun (off, ty) ->
+            let nameOf (t : Type) =
+                match prune t with
+                | TCon (n, _) -> Some n
+                // element type is the enclosing binding's type variable:
+                // name it so stamping substitutes the real element type
+                | TVar v -> Some ("#" + string v.Id)
+                | _ -> None
             match prune ty with
-            | TCon ("array", [ e ]) ->
-                (match prune e with
-                 | TCon (n, []) -> Some (off, n)
-                 | _ -> None)
-            | TCon (n, []) -> Some (off, n)
+            | TCon ("array", [ e ]) -> nameOf e |> Option.map (fun n -> off, n)
+            | TCon (n, _) -> Some (off, n)
+            | TVar v -> Some (off, "#" + string v.Id)
             | _ -> None) }

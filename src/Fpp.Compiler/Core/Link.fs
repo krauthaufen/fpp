@@ -23,6 +23,14 @@ let classify (isStructName : string -> bool) (inst : string list) : Classificati
     elif inst |> List.exists isStructName then Stamp inst
     else Canon
 
+/// substitute a symbolic element/type name ("#id") with the concrete one
+let private substName (subst : Dict<string, string>) (n : string) =
+    if n.StartsWith "#" then
+        match dictTryFind subst n with
+        | Some concrete -> concrete
+        | None -> n
+    else n
+
 let private mangleInst (name : string) (inst : string list) =
     name + "$" + String.concat "$" inst
 
@@ -78,6 +86,39 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         match d with
         | DLet (rc, v, sch, e) -> dictSet bodies (v.Path, v.Offset) (rc, v, sch, e)
         | _ -> ()
+    // A body that performs array/layout operations at a type-variable
+    // element type cannot be shared: int[], string[] and struct[] have
+    // different representations. Such functions are stamped at EVERY
+    // instantiation, not just struct ones.
+    let layoutDependent = dictNew<string * int, bool> ()
+    let rec usesLayoutVar (e : Expr) : bool =
+        let anyOf xs = xs |> List.exists usesLayoutVar
+        let symbolic (n : string) = n.StartsWith "#"
+        match e with
+        | EArray (n, xs) -> symbolic n || anyOf xs
+        | EIndex (n, a, i) -> symbolic n || usesLayoutVar a || usesLayoutVar i
+        | EIndexSet (n, a, i, v) -> symbolic n || anyOf [ a; i; v ]
+        | EArrayLen (n, a) -> symbolic n || usesLayoutVar a
+        | EArrayCreate (n, a, b) -> symbolic n || anyOf [ a; b ]
+        | EArrayPin (n, a) | EArrayUnpin (n, a) -> symbolic n || usesLayoutVar a
+        | ELam (_, b) -> usesLayoutVar b
+        | EApp (f, args) -> usesLayoutVar f || anyOf args
+        | ELet (_, _, _, r, b) -> usesLayoutVar r || usesLayoutVar b
+        | EIf (a, b, c) -> anyOf [ a; b; c ]
+        | EMatch (s, cs) -> usesLayoutVar s || (cs |> List.exists (fun (_, _, b) -> usesLayoutVar b))
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
+        | ECtor (_, _, xs) -> anyOf xs
+        | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> usesLayoutVar v)
+        | EField (r, _) -> usesLayoutVar r
+        | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
+        | EAssign (_, x) -> usesLayoutVar x
+        | ETry (b, cs) -> usesLayoutVar b || (cs |> List.exists (fun (_, _, x) -> usesLayoutVar x))
+        | _ -> false
+    for d in decls do
+        match d with
+        | DLet (_, v, _, e) -> dictSet layoutDependent (v.Path, v.Offset) (usesLayoutVar e)
+        | _ -> ()
+
     let stamped = dictNew<string, Decl> ()      // mangled name -> clone
     let queue = vecNew<(string * int) * string list> ()
     let seen = dictNew<string, bool> ()
@@ -96,7 +137,14 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                             | Some concrete -> concrete
                             | None -> t
                         else t)
-                (match classify isStructName inst with
+                let needsLayout = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+                let cls =
+                    if needsLayout then
+                        if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then
+                            Unclassifiable "element layout is not statically known here"
+                        else Stamp inst
+                    else classify isStructName inst
+                (match cls with
                  | Canon -> EVar (v, sch)
                  | Unclassifiable why ->
                      vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
@@ -120,6 +168,13 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                              + String.concat ", " i + "> in " + owner
                              + ": the body is not available for stamping")
                           EVar (v, sch)))
+            | EArray (n, xs) -> EArray (substName subst n, xs)
+            | EIndex (n, a, i) -> EIndex (substName subst n, a, i)
+            | EIndexSet (n, a, i, v) -> EIndexSet (substName subst n, a, i, v)
+            | EArrayLen (n, a) -> EArrayLen (substName subst n, a)
+            | EArrayCreate (n, a, b) -> EArrayCreate (substName subst n, a, b)
+            | EArrayPin (n, a) -> EArrayPin (substName subst n, a)
+            | EArrayUnpin (n, a) -> EArrayUnpin (substName subst n, a)
             | other -> other)
 
     let out = vecNew<Decl> ()

@@ -251,3 +251,46 @@ let monoPropagationTests =
             Expect.equal (defsOf "_wrap_int") 0 "reference/immediate uses share"
         }
     ]
+
+[<Tests>]
+let monoLayoutTests =
+    testList "monomorphization: layout-dependent generics" [
+        test "generic array code is stamped per element type and runs" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let sumBy (a : 'a[]) (f : 'a -> float) ="
+                    "    let mutable s = 0.0"
+                    "    let mutable i = 0"
+                    "    while i < a.Length do"
+                    "        s <- s + f a.[i]"
+                    "        i <- i + 1"
+                    "    s"
+                    "let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |]"
+                    "let ints = [| 10; 20; 30 |]"
+                    "let a = print (sumBy pts (fun p -> p.X + p.Y))"
+                    "let b = print (sumBy ints (fun n -> 0.5))"
+                    "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "generic array code compiles once specialized"
+            let defsOf (needle : string) =
+                wat.Split([| needle + " (param" |], System.StringSplitOptions.None).Length - 1
+            // int[] and V2d[] have different representations, so BOTH get
+            // their own stamp — sharing would be a silent deoptimization
+            Expect.equal (defsOf "_sumBy_V2d") 1 "struct element stamp"
+            Expect.equal (defsOf "_sumBy_int") 1 "primitive element stamp"
+            let tmp = System.IO.Path.GetTempFileName() + ".wat"
+            System.IO.File.WriteAllText(tmp, wat)
+            let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "-W exceptions=y " + tmp)
+            psi.RedirectStandardOutput <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd()
+            p.WaitForExit()
+            System.IO.File.Delete tmp
+            Expect.equal out "10\n1.5\n" "both specializations compute correctly"
+        }
+    ]
