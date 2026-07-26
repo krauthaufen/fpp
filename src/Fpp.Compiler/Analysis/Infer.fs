@@ -38,7 +38,12 @@ type FieldInfo =
       Params : Var list
       /// the member's own generic variables — freshened per access
       Quantified : Var list
-      FieldType : Type }
+      FieldType : Type
+      /// for a member: the (path, offset) of the function it lifts to, so a
+      /// use site can instantiate THAT scheme and record the specialization
+      /// demand. None for plain record fields.
+      DefKey : (string * int) option
+      IsStatic : bool }
 
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
@@ -152,9 +157,36 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match dictTryFind bases tn with
                 | Some b -> declaringOwner b
                 | None -> None
+        // Instantiating the member's own scheme (rather than substituting
+        // into its type) is what turns the use into a specialization demand:
+        // a generic class' members must be stamped per element type just
+        // like a generic function's.
+        // Only when the member is declared on the receiver's OWN type: for an
+        // inherited member the declared self is the base, and unifying it
+        // with the receiver would demand a subtyping the unifier has no
+        // notion of. Type arguments are unified, never the nominal head.
+        let tracked (tn : string) (args : Type list) (fi : FieldInfo) : bool =
+            match fi.DefKey with
+            | Some (dp, doff) when dp = path && not fi.IsStatic && fi.TypeName = tn ->
+                (match dictTryFind defSchemes doff with
+                 | Some sch ->
+                     (match instantiateTracked sch with
+                      | TFun (selfT, memT), fresh ->
+                          (match prune selfT with
+                           | TCon (sn, sargs) when sn = tn && sargs.Length = args.Length ->
+                               List.iter2 (unifyAt offset) sargs args
+                               unifyAt offset result memT
+                               if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
+                               vecAdd memberSitesRaw (offset, fi.TypeName)
+                               true
+                           | _ -> false)
+                      | _ -> false)
+                 | None -> false)
+            | _ -> false
         match prune recvTy with
         | TCon (tn, args) ->
             (match declaringOwner tn with
+             | Some fi when tracked tn args fi -> true
              | Some fi when fi.Params.Length = args.Length ->
                  let subst = dictNew<int, Type> ()
                  List.zip fi.Params args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
@@ -986,7 +1018,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some t, Some tn ->
                              let ft = typeFromNode vars tn
                              recordDef t ft
-                             let info = { TypeName = name; Params = paramVarList (); Quantified = []; FieldType = ft }
+                             let info =
+                                 { TypeName = name; Params = paramVarList (); Quantified = []
+                                   FieldType = ft; DefKey = None; IsStatic = false }
                              // bare name: last declaration wins (F# shadowing);
                              // qualified key: dot-access on a known record type
                              dictSet fields t.Text info
@@ -1097,7 +1131,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> List.distinctBy (fun v -> v.Id)
                 |> List.filter (fun v -> not (Set.contains v.Id classIds))
             dictSet fields (tyName + "." + t.Text)
-                { TypeName = tyName; Params = classParams; Quantified = quantified; FieldType = memberTy }
+                { TypeName = tyName; Params = classParams; Quantified = quantified
+                  FieldType = memberTy
+                  DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
+                  IsStatic = isStatic }
         | None -> ()
 
     and inferDecl (g : Green) : unit =

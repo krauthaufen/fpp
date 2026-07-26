@@ -443,6 +443,22 @@ let oracleTests =
             "let c = print (classify (Base(3)))"
             "let d = print (if (Derived(4) :> Base) :? Base then \"yes\" else \"no\")"
         ]
+        oracle "generic classes specialize per element type" [
+            "[<Struct>]"
+            "type V2d = { X : float; Y : float }"
+            "type Buf<'a>(n : int, init : 'a) ="
+            "    let data = Array.create n init"
+            "    member _.Get (i : int) = data.[i]"
+            "    member _.Set (i : int) (v : 'a) = data.[i] <- v"
+            "    member _.Length = data.Length"
+            "let vb = Buf(2, { X = 1.0; Y = 2.0 })"
+            "let s1 = vb.Set 1 { X = 3.0; Y = 4.0 }"
+            "let ib = Buf(2, 7)"
+            "let s2 = ib.Set 1 9"
+            "let a = print (vb.Get 1).X"
+            "let b = print (ib.Get 1)"
+            "let c = print vb.Length"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

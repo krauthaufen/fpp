@@ -42,6 +42,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             | _ -> None) with
                  | Some t -> dictSet topLevelDefs t.Offset true
                  | None -> ())
+            | TypeDecl ->
+                // a class' constructor and members are top-level functions
+                // too, so their uses may carry specialization demands
+                (match n.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                 | Some t -> dictSet topLevelDefs t.Offset true
+                 | None -> ())
+                let rec collectMembers (m : GreenNode) =
+                    if m.NodeKind = MemberDecl then
+                        match m.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                        | [ _; nm ] | [ nm ] -> dictSet topLevelDefs nm.Offset true
+                        | _ -> ()
+                    elif m.NodeKind = InterfaceImpl then
+                        m.Children |> List.iter (fun c -> match c with GNode x -> collectMembers x | _ -> ())
+                n.Children |> List.iter (fun c -> match c with GNode m -> collectMembers m | _ -> ())
             | ModuleDef -> n.Children |> List.iter collectTop
             | _ -> ()
     root.Children |> List.iter collectTop
@@ -236,6 +250,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // instead of building a closure for the receiver
                       | EIfaceCall (iface, mname, recv, []), _ when head.NodeKind = DotExpr ->
                           EIfaceCall (iface, mname, recv, loweredArgs)
+                      | EApp (EVarI (mv, msch, minst), [ recv ]), _ when
+                            head.NodeKind = DotExpr
+                            && (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                                | Some t -> (memberAt t |> Option.map (fun (_, d) -> d.Offset = mv.Offset && d.Path = mv.Path)) = Some true
+                                | None -> false) ->
+                          EApp (EVarI (mv, msch, minst), recv :: loweredArgs)
                       | EApp (EVar (mv, msch), [ recv ]), _ when
                             head.NodeKind = DotExpr
                             && (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -503,7 +523,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // that member is a top-level function taking the receiver
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 let _, d = (memberAt t).Value
-                let fn = EVar (varIdOf d, schemeOf d)
+                // a member of a generic class is a generic function: carry
+                // the instantiation so the linker can stamp it
+                let fn =
+                    match dictTryFind instSites t.Offset with
+                    | Some inst when
+                         not (List.isEmpty inst)
+                         && d.Path = path
+                         && (dictTryFind topLevelDefs d.Offset).IsSome ->
+                        EVarI (varIdOf d, schemeOf d, inst)
+                    | _ -> EVar (varIdOf d, schemeOf d)
                 if isStaticUse n then fn
                 else
                     (match nodesOf n |> List.tryHead with

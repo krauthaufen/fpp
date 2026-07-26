@@ -239,6 +239,54 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
             | EArrayUnpin (n, a) -> EArrayUnpin (substName subst n, a)
             | other -> other)
 
+    /// Give a clone its own binder identities. Two stamped copies of the
+    /// same template otherwise share parameter and local VarIds, and every
+    /// backend table keyed by those (scalarized parameters, local kinds)
+    /// would then leak state from one specialization into another.
+    let alphaRename (delta : int) (e : Expr) : Expr =
+        let bound = dictNew<string * int, bool> ()
+        let rec collectPat (p : Pat) =
+            match p with
+            | PVar (v, _) -> dictSet bound (v.Path, v.Offset) true
+            | PAs (inner, v, _) -> dictSet bound (v.Path, v.Offset) true; collectPat inner
+            | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter collectPat ps
+            | PCons (h, t) -> collectPat h; collectPat t
+            | PWild | PLit _ -> ()
+        // mapExpr visits every node; we only use it to gather binders
+        mapExpr
+            (fun x ->
+                (match x with
+                 | ELam (ps, _) -> for v, _ in ps do dictSet bound (v.Path, v.Offset) true
+                 | ELet (_, v, _, _, _) -> dictSet bound (v.Path, v.Offset) true
+                 | EMatch (_, cs) -> for p, _, _ in cs do collectPat p
+                 | ETry (_, cs) -> for p, _, _ in cs do collectPat p
+                 | _ -> ())
+                x)
+            e |> ignore
+        let ren (v : VarId) =
+            if (dictTryFind bound (v.Path, v.Offset)).IsSome then { v with Offset = v.Offset + delta } else v
+        let rec renPat (p : Pat) =
+            match p with
+            | PVar (v, sc) -> PVar (ren v, sc)
+            | PAs (inner, v, sc) -> PAs (renPat inner, ren v, sc)
+            | PCtor (n, sc, ps) -> PCtor (n, sc, List.map renPat ps)
+            | PTuple ps -> PTuple (List.map renPat ps)
+            | PListLit ps -> PListLit (List.map renPat ps)
+            | POr ps -> POr (List.map renPat ps)
+            | PCons (h, t) -> PCons (renPat h, renPat t)
+            | other -> other
+        e
+        |> mapExpr (fun x ->
+            match x with
+            | EVar (v, sc) -> EVar (ren v, sc)
+            | EVarI (v, sc, inst) -> EVarI (ren v, sc, inst)
+            | EAssign (v, rhs) -> EAssign (ren v, rhs)
+            | ELam (ps, b) -> ELam (ps |> List.map (fun (v, sc) -> ren v, sc), b)
+            | ELet (rc, v, sc, rhs, b) -> ELet (rc, ren v, sc, rhs, b)
+            | EMatch (sc, cs) -> EMatch (sc, cs |> List.map (fun (p, g, b) -> renPat p, g, b))
+            | ETry (b, cs) -> ETry (b, cs |> List.map (fun (p, g, x2) -> renPat p, g, x2))
+            | other -> other)
+
     let out = vecNew<Decl> ()
     for d in decls do
         match d with
@@ -262,7 +310,9 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
                  |> List.iter (fun (qv, n) -> dictSet subst ("#" + string qv.Id) n)
-             let clone = DLet (rc, nv, substScheme inst sch, rewrite mangled subst false e)
+             let clone =
+                 DLet (rc, nv, substScheme inst sch,
+                       alphaRename (10000000 + (abs (hash mangled) % 1000000) * 10) (rewrite mangled subst false e))
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1

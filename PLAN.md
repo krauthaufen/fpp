@@ -51,8 +51,12 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       {classId, vtable} in a hidden first field — that is what makes
       dispatch and checked casts work without knowing the concrete type.
       Gate: six oracle programs byte-exact against dotnet fsi.
-      Open: generic classes are not yet monomorphized per struct argument
-      (member uses record no instantiation demands), `member val`,
+      Generic classes monomorphize: a member use instantiates the member's
+      own scheme, so `Buf<V2d>` and `Buf<int>` stamp separate copies, and
+      stamped clones are alpha-renamed so per-parameter backend state cannot
+      leak between specializations.
+      Open: inherited members of a GENERIC base do not stamp (the base's
+      type arguments are not tracked through `inherit`); `member val`,
       `static let`, operators as members, interface inheritance.
 - [ ] GADT mode: per-case schemes, match refinement, existentials,
       escape diagnostics
