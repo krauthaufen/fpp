@@ -41,21 +41,49 @@ let emit (decls : Decl list) : EmitResult =
     // ---- C ABI layout for POD structs (clang natural alignment) ----------
     // fields: (name, kind, byteOffset); sizeof rounded to max align;
     // storage = shared GC (array (mut i64)), strideWords per element
+    // C layout, recursive: nested struct fields (kind "S:Name") inline at
+    // their C offsets; `placed` lists LEAVES with dotted paths
     let podLayout = dictNew<string, (string * string * int) list * int * int> ()
-    for rn, fs in structRecords do
-        if fs |> List.forall (fun (_, k) -> k = "i" || k = "f" || k = "s" || k = "l") then
-            let mutable off = 0
-            let mutable maxA = 1
-            let placed =
-                fs |> List.map (fun (fn, k) ->
-                    let sz = if k = "i" || k = "s" then 4 else 8
-                    off <- ((off + sz - 1) / sz) * sz
-                    let o = off
-                    off <- off + sz
-                    if sz > maxA then maxA <- sz
-                    fn, k, o)
-            let sizeof_ = ((off + maxA - 1) / maxA) * maxA
-            dictSet podLayout rn (placed, sizeof_, (sizeof_ + 7) / 8)
+    let structKindName (k : string) = if k.StartsWith "S:" then k.Substring 2 else ""
+    let scalarSize (k : string) = if k = "i" || k = "s" then 4 else 8
+    let rec computeLayout (rn : string) : bool =
+        if (dictTryFind podLayout rn).IsSome then true
+        else
+            match structRecords |> List.tryFind (fun (n, _) -> n = rn) with
+            | None -> false
+            | Some (_, fs) ->
+                // nested structs must resolve first
+                let ok =
+                    fs |> List.forall (fun (_, k) ->
+                        if k = "i" || k = "f" || k = "s" || k = "l" then true
+                        else
+                            let sn = structKindName k
+                            sn <> "" && sn <> rn && computeLayout sn)
+                if not ok then false
+                else
+                    let mutable off = 0
+                    let mutable maxA = 1
+                    let leaves = vecNew<string * string * int> ()
+                    for fn, k in fs do
+                        if k = "i" || k = "f" || k = "s" || k = "l" then
+                            let sz = scalarSize k
+                            off <- ((off + sz - 1) / sz) * sz
+                            vecAdd leaves (fn, k, off)
+                            off <- off + sz
+                            if sz > maxA then maxA <- sz
+                        else
+                            let sn = structKindName k
+                            let nl, nsz, _ = (dictTryFind podLayout sn).Value
+                            let na = nl |> List.map (fun (_, k2, _) -> scalarSize k2) |> List.max
+                            off <- ((off + na - 1) / na) * na
+                            for np, nk, noff in nl do
+                                vecAdd leaves (fn + "." + np, nk, off + noff)
+                            off <- off + nsz
+                            if na > maxA then maxA <- na
+                    let sizeof_ = ((off + maxA - 1) / maxA) * maxA
+                    dictSet podLayout rn (vecToList leaves, sizeof_, (sizeof_ + 7) / 8)
+                    true
+    for rn, _ in structRecords do computeLayout rn |> ignore
     let isPod (n : string) = (dictTryFind podLayout n).IsSome
     /// word read/write through a handle: GC storage or linear when pinned
     let hWordGet (hExpr : string) (idxExpr : string) : string =
@@ -86,16 +114,35 @@ let emit (decls : Decl list) : EmitResult =
         | _ ->
             if sh = 0 then "(i32.wrap_i64 " + word + ")"
             else "(i32.wrap_i64 (i64.shr_u " + word + " (i64.const " + string sh + ")))"
+    /// read a dotted leaf path out of a GC struct expression
+    let rec leafGet (rn : string) (structExpr : string) (path : string) : string =
+        let i = path.IndexOf '.'
+        let head = if i < 0 then path else path.Substring (0, i)
+        let fs = structRecords |> List.pick (fun (n, f) -> if n = rn then Some f else None)
+        let idx = fs |> List.findIndex (fun (fn, _) -> fn = head)
+        let _, k = fs |> List.item idx
+        let get = "(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") " + structExpr + "))"
+        if i < 0 then get
+        else leafGet (structKindName k) get (path.Substring (i + 1))
+
+    /// build a struct value of `rn` from leaf expressions (by dotted path)
+    let rec structFromLeaves (rn : string) (leafOf : string -> string) (prefix : string) : string =
+        let fs = structRecords |> List.pick (fun (n, f) -> if n = rn then Some f else None)
+        let parts =
+            fs |> List.map (fun (fn, k) ->
+                let full = if prefix = "" then fn else prefix + "." + fn
+                if k.StartsWith "S:" then structFromLeaves (structKindName k) leafOf full
+                else leafOf full)
+        "(struct.new $r_" + rn + " " + String.concat " " parts + ")"
+
     /// i64 word w built from a struct value in local `vl`
     let wordFromStruct (rn : string) (vl : string) (w : int) : string =
         let placed, _, _ = (dictTryFind podLayout rn).Value
-        let fidx = structRecords |> List.pick (fun (n, fs) -> if n = rn then Some (fs |> List.mapi (fun i (fn, _) -> fn, i)) else None)
         let parts =
             placed
             |> List.filter (fun (_, _, off) -> off / 8 = w)
             |> List.map (fun (fn, k, off) ->
-                let i = fidx |> List.find (fun (n, _) -> n = fn) |> snd
-                let fv = "(struct.get $r_" + rn + " " + string i + " (ref.cast (ref $r_" + rn + ") (local.get " + vl + ")))"
+                let fv = leafGet rn ("(local.get " + vl + ")") fn
                 let sh = (off % 8) * 8
                 match k with
                 | "f" -> "(i64.reinterpret_f64 " + fv + ")"
@@ -580,17 +627,41 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors "record with unknown type"
                  "(ref.i31 (i32.const 0))")
-        | EField (EIndex (nm, a, i), fname) when isPod nm && (dictTryFind fieldIndex fname).IsSome ->
-            // fusion on packed arrays: single array.get + reinterpret
-            let _, _, wd = (dictTryFind podLayout nm).Value
-            let _, _, k = (dictTryFind fieldIndex fname).Value
+        | EField (inner, fname) when
+            (let rec pathOf (e : Expr) =
+                match e with
+                | EIndex (nm2, a2, i2) -> (if isPod nm2 then Some (nm2, a2, i2, "") else None)
+                | EField (b, f2) ->
+                    (match pathOf b with
+                     | Some (nm2, a2, i2, p) -> Some (nm2, a2, i2, (if p = "" then f2 else p + "." + f2))
+                     | None -> None)
+                | _ -> None
+             match pathOf inner with
+             | Some (nm2, _, _, p) ->
+                 let full = if p = "" then fname else p + "." + fname
+                 let placed, _, _ = (dictTryFind podLayout nm2).Value
+                 placed |> List.exists (fun (lp, _, _) -> lp = full)
+             | None -> false) ->
+            // packed-array fusion: whole leaf path -> one word read
+            let rec pathOf (e : Expr) =
+                match e with
+                | EIndex (nm2, a2, i2) -> (if isPod nm2 then Some (nm2, a2, i2, "") else None)
+                | EField (b, f2) ->
+                    (match pathOf b with
+                     | Some (nm2, a2, i2, p) -> Some (nm2, a2, i2, (if p = "" then f2 else p + "." + f2))
+                     | None -> None)
+                | _ -> None
+            let nm, a, i, p = (pathOf inner).Value
+            let full = if p = "" then fname else p + "." + fname
+            let placed, _, wd = (dictTryFind podLayout nm).Value
+            let _, k, _ = placed |> List.find (fun (lp, _, _) -> lp = full)
             let baseW = "(i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))"
-            let raw = fieldFromWords nm (recur a) baseW fname
+            let raw = fieldFromWords nm (recur a) baseW full
             (match k with
              | "f" | "s" | "l" -> boxK k raw
              | "i" -> "(call $ofi " + raw + ")"
              | _ -> raw)
-        | EField (EIndex (nm, a, i), fname) when isStructName nm && (dictTryFind fieldIndex fname).IsSome ->
+        | EField (EIndex (nm, a, i), fname) when isStructName nm && not (isPod nm) && (dictTryFind fieldIndex fname).IsSome ->
             // fusion: pts.[i].X reads the SoA field array directly — no
             // temporary struct materialization
             let _, fi, k = (dictTryFind fieldIndex fname).Value
@@ -687,11 +758,11 @@ let emit (decls : Decl list) : EmitResult =
                 let al = newLocal "pa"
                 let bl = newTypedLocal "pb" "i32"
                 let arrW = "(local.get " + al + ")"
-                let fieldsW =
-                    placed |> List.map (fun (fn, _, _) -> fieldFromWords nm arrW ("(local.get " + bl + ")") fn)
+                let leafOf (path : string) = fieldFromWords nm arrW ("(local.get " + bl + ")") path
                 "(block (result anyref) (local.set " + al + " " + recur a + ") "
                 + "(local.set " + bl + " (i32.mul " + unwrapI32 (recur i) + " (i32.const " + string wd + "))) "
-                + "(struct.new $r_" + nm + " " + String.concat " " fieldsW + "))"
+                + structFromLeaves nm leafOf "" + ")"
+                |> fun x -> ignore placed; x
             elif isStructName nm then
                 let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
                 let al = newLocal "ia"
@@ -1042,6 +1113,7 @@ let emit (decls : Decl list) : EmitResult =
             match kindOfField st k with
             | "f" -> "(field f64)" | "s" -> "(field f32)"
             | "l" -> "(field i64)" | "i" -> "(field i32)"
+            | k2 when k2.StartsWith "S:" -> "(field (ref $r_" + k2.Substring 2 + "))"
             | _ -> "(field anyref)"
         let fields = fs |> List.map (fun (_, k) -> fieldTy k) |> String.concat " "
         line ("  (type $r_" + rn + " (struct " + fields + "))")

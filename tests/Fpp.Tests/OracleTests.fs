@@ -190,6 +190,21 @@ let oracleTests =
             "let h = print (grown.[1].W + grown.[0].W)"
             "let g = print grown.Length"
         ]
+        oracle "nested POD structs (recursive C layout, dotted leaf fusion)" [
+            "[<Struct>]"
+            "type V2d = { X : float; Y : float }"
+            "[<Struct>]"
+            "type Box = { Min : V2d; Max : V2d; Tag : int }"
+            "let bs = [| { Min = { X = 1.0; Y = 2.0 }; Max = { X = 3.0; Y = 4.5 }; Tag = 7 };"
+            "            { Min = { X = 0.5; Y = 0.25 }; Max = { X = 10.0; Y = 20.0 }; Tag = 9 } |]"
+            "let a = print (bs.[0].Min.X + bs.[0].Max.Y)"
+            "let b = print (bs.[1].Max.X + bs.[1].Min.Y)"
+            "let c = print (bs.[0].Tag + bs.[1].Tag)"
+            "let upd = bs.[0] <- { Min = { X = 100.0; Y = 0.0 }; Max = { X = 1.0; Y = 1.0 }; Tag = 42 }"
+            "let d = print bs.[0].Min.X"
+            "let e = print bs.[0].Tag"
+            "let f = print bs.Length"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

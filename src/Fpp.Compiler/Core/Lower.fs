@@ -22,6 +22,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
     let mutable pendingStruct = false
+    let structNames = vecNew<string> ()
 
     let useDefs = dictNew<int, Resolve.Definition> ()
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
@@ -514,6 +515,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
                 |> Option.map (fun t -> t.Text)
             match tyName with
+            | Some n when List.contains n (vecToList structNames) -> "S:" + n
             | Some "float" -> "f"
             | Some "float32" -> "s"
             | Some "int64" -> "l"
@@ -532,6 +534,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             nodesOf n |> List.exists (fun m -> m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
         if not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
         elif not (List.isEmpty recordFields) then
+            if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))
         if hasMembers then
             vecAdd notes ((match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0), "type members")
