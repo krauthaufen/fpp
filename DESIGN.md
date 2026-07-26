@@ -207,6 +207,66 @@ are diffed. A machine-checked conformance suite for the entire inherited
 surface, for free. The self-host fixpoint (stage2 compiles source →
 byte-identical stage3) runs in CI forever after the flip.
 
+## Numeric classes and operators
+
+SRTP is removed, so operators and math functions get their polymorphism
+from typeclasses. The numeric hierarchy is the first serious client of
+that layer, and it is deliberately shaped unlike Haskell's.
+
+**Operators are overloading, not algebra.** Each operator is a two-parameter
+class whose result is an associated type — the shape Rust uses for
+`Mul<Rhs> { type Output }`, not the shape Haskell uses for `Num`:
+
+```
+type IMul<'a, 'b> =
+    static abstract type Result
+    static abstract member (*) : 'a -> 'b -> Result
+```
+
+The member is named `(*)`, not `Mul`, so an instance reads as an operator
+definition and lines up with F#'s existing `static member (+)` syntax.
+
+`Num` forces `(*) : a -> a -> a`, and almost nothing in linear algebra is
+closed like that: `M * v`, `s * v` and `M * M` all leave the type. Making
+the result an associated type — determined by the operand pair, not a free
+third parameter — is what makes matrix·vector the ordinary case instead of
+a special one.
+
+**This is knowingly not what typeclasses are for.** A class like
+`IMul<'a,'b>` carries no laws, and no generic algorithm can be written
+against it alone; it exists to overload notation. Haskell would not do
+this. We do it because the alternative — modelling `Apply`, `Compose`,
+`Scale` and componentwise product as separate law-carrying structures — 
+forces renaming operations that have universally understood spellings, and
+because the ambiguity argument does not survive contact with the domain:
+`V3d * V3d` componentwise is standard in computer graphics, not a mistake
+to be prevented. The trade is taken for OPERATORS specifically.
+
+Classes that do carry laws stay principled and single-parameter:
+`IFloating<'a>` for `sin`/`exp`/`log` (closed and homogeneous — a `V3d`
+is never asked for a sine), `IOrdered<'a>` for comparison, and the
+Functor/Monad layer of the HKT design. Two flavours of class coexist, and
+which is which should be stated rather than assumed.
+
+**Coherence matters more here, not less.** With no laws to constrain
+instances, the only thing keeping resolution well-defined is: exactly one
+instance per `(a, b)` pair, globally, and an orphan rule — an instance must
+live in the module defining one of the two types. Without it two libraries
+can each declare `IMul<float, V3d>` and linking is ill-defined.
+
+**Consequence for the constraint language.** Generic numeric code needs to
+say that an operation stays in its type: `sum` over `'a` requires
+`'a : IAdd<'a,'a>` *with* `Result = 'a`. So constraints must be able to
+equate an associated type, not merely require a class.
+
+**Sequencing.** `sin`/`cos`/`exp` ship monomorphically on `float` and
+`float32` first — that is how they are overwhelmingly used, and F# itself
+defaults `sin` to float. Those functions become the instance bodies when
+the class layer lands, so nothing is wasted. Operators on primitives are
+already resolved statically by inference and emitted as machine
+instructions; under the class formulation that is not a special case but
+the instance being known statically and inlined.
+
 ## Identity: hashing and equality on every type
 
 Every value can be hashed and compared. Today that is a runtime walk

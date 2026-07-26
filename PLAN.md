@@ -111,6 +111,16 @@ Two real bugs found by pushing on this file, both fixed:
 - a cast or type test named its target by the LAST identifier of the type,
   so `x :?> MapLeaf<'K, 'V>` tried to downcast to `V` (68 errors).
 
+### Typeclasses — the numeric hierarchy is the first client
+Design: DESIGN.md ("Numeric classes and operators"). Decided:
+- operators are two-parameter classes with an associated `Result`, the Rust
+  `Mul<Rhs> { type Output }` shape; the member is named `(*)`, not `Mul`
+- knowingly overloading rather than law-carrying algebra, for operators only
+- coherence: one instance per `(a, b)`, plus an orphan rule
+- constraints must be able to equate an associated type (`Result = 'a`)
+Open: `static member (+)` in member position needs parser support — the same
+work serves user-defined operators and instance declarations.
+
 ### Numeric tower
 - [x] int, int64, float, float32, uint32: literals, arithmetic, comparison,
       bitwise and shifts, conversions between them, packed struct fields,
