@@ -406,8 +406,8 @@ let parse (src : string) : ParseResult =
         while go do
             // operators may sit at exactly the block column on a fresh line
             let allowed = s.SameLine || s.CurCol >= ctx || bracketDepth > 0
-            if (s.IsOp ":>" || s.IsOp ":?>") && allowed then
-                // a cast's right operand is a TYPE, not an expression
+            if (s.IsOp ":>" || s.IsOp ":?>" || s.IsOp ":?") && allowed then
+                // a cast or type test takes a TYPE on the right, not an expression
                 let op = s.Bump ()
                 lhs <- Green.node CastExpr [ lhs; op; parseType ctx ]
             elif s.Is Operator && allowed && not (s.IsOp "|") && not (s.IsOp "->") then

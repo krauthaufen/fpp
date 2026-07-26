@@ -921,6 +921,20 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors ("no dispatch slot for " + iface + "." + mname)
                  "(ref.i31 (i32.const 0))")
+        | ETypeTest (tn, e) ->
+            if not (isClassName tn) then
+                vecAdd errors ("cannot type-test against " + tn + ": not a class")
+                "(ref.i31 (i32.const 0))"
+            else
+                let t = newLocal "q"
+                let idOf =
+                    "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
+                let test =
+                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (classId c) + "))") with
+                    | [] -> "(i32.const 0)"
+                    | [ one ] -> one
+                    | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
+                "(block (result anyref) (local.set " + t + " " + recur e + ") (call $ofi " + test + "))"
         | ECast (_, e, false) ->
             // widening to an interface or base class: representation is
             // unchanged, so there is nothing to do at runtime

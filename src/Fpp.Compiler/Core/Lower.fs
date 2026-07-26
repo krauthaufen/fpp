@@ -473,7 +473,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
                     |> Option.map (fun t -> t.Text)
                 let isDown = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?>")
+                let isTest = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?")
                 (match operand, target with
+                 | Some o, Some tn when isTest -> ETypeTest (tn, lowerExpr (GNode o))
                  | Some o, Some tn -> ECast (tn, lowerExpr (GNode o), isDown)
                  | _ -> note (offsetOf n) "cast shape")
             // dispatch through an interface: the receiver's concrete type is

@@ -153,6 +153,7 @@ let rec private encExpr (e : Expr) : Sx =
     | EArrayUnpin (nm, a) -> L [ A "eU"; S nm; encExpr a ]
     | EIfaceCall (i, m, r, args) -> L (A "ei" :: S i :: S m :: encExpr r :: List.map encExpr args)
     | ECast (t, e, d) -> L [ A "ec"; S t; encExpr e; A (if d then "1" else "0") ]
+    | ETypeTest (t, e) -> L [ A "et"; S t; encExpr e ]
 
 let private encDecl (d : Decl) : Sx =
     match d with
@@ -292,6 +293,7 @@ let rec private decExpr (x : Sx) : Expr =
     | L [ A "eU"; S nm; a ] -> EArrayUnpin (nm, decExpr a)
     | L (A "ei" :: S i :: S m :: r :: args) -> EIfaceCall (i, m, decExpr r, List.map decExpr args)
     | L [ A "ec"; S t; e; A d ] -> ECast (t, decExpr e, d = "1")
+    | L [ A "et"; S t; e ] -> ETypeTest (t, decExpr e)
     | _ -> ELit LUnit
 
 let private decDecl (x : Sx) : Decl option =

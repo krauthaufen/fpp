@@ -73,6 +73,8 @@ type Expr =
     /// target type, operand, isDowncast (`:?>` checks the class id at
     /// runtime; `:>` is a static widening and checks nothing)
     | ECast of string * Expr * bool
+    /// `e :? T` — is the value an instance of T (or a subclass)?
+    | ETypeTest of string * Expr
 
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
@@ -139,6 +141,7 @@ let rec printExpr (e : Expr) : string =
     | EIfaceCall (i, m, r, args) ->
         "(" + i + "::" + m + " " + String.concat " " (List.map printExpr (r :: args)) + ")"
     | ECast (t, e, down) -> "(" + printExpr e + (if down then " :?> " else " :> ") + t + ")"
+    | ETypeTest (t, e) -> "(" + printExpr e + " :? " + t + ")"
 
 and printPat (p : Pat) : string =
     match p with

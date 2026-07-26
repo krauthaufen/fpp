@@ -426,6 +426,23 @@ let oracleTests =
             "let c = print (foldWith maxer xs)"
             "let d = print (foldWith (adder 0 2) [1; 2])"
         ]
+        oracle "type tests: :? against classes and their subclasses" [
+            "type Base(tag : int) ="
+            "    member _.Tag = tag"
+            "type Derived(tag : int) ="
+            "    inherit Base(tag)"
+            "    member _.Extra = tag * 2"
+            "type Other(tag : int) ="
+            "    inherit Base(tag)"
+            "let classify (b : Base) ="
+            "    if b :? Derived then \"derived\""
+            "    elif b :? Other then \"other\""
+            "    else \"base\""
+            "let a = print (classify (Derived(1) :> Base))"
+            "let b = print (classify (Other(2) :> Base))"
+            "let c = print (classify (Base(3)))"
+            "let d = print (if (Derived(4) :> Base) :? Base then \"yes\" else \"no\")"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

@@ -658,9 +658,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
                  | Some operand -> exprType (GNode operand) |> ignore
                  | None -> ())
-                (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
-                 | Some tn -> typeFromNode cvars tn
-                 | None -> st.Fresh ())
+                if hasOpToken ":?" n then tBool
+                else
+                    match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                    | Some tn -> typeFromNode cvars tn
+                    | None -> st.Fresh ()
             | DotExpr when (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr)) ->
                 // index access a.[i]: element type when the receiver is known
                 let lhsTy =

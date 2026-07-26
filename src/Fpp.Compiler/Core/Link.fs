@@ -67,6 +67,7 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | EField (x, fn, o) -> EField (r x, fn, o)
         | EIfaceCall (i, m, recv, args) -> EIfaceCall (i, m, r recv, List.map r args)
         | ECast (t, x, d) -> ECast (t, r x, d)
+        | ETypeTest (t, x) -> ETypeTest (t, r x)
         | EFieldSet (x, fn, o, v) -> EFieldSet (r x, fn, o, r v)
         | EWhile (c, b) -> EWhile (r c, r b)
         | EAssign (v, x) -> EAssign (v, r x)
@@ -117,6 +118,7 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | EField (r, _, _) -> usesLayoutVar r
         | EIfaceCall (_, _, recv, args) -> usesLayoutVar recv || anyOf args
         | ECast (_, x, _) -> usesLayoutVar x
+        | ETypeTest (_, x) -> usesLayoutVar x
         | EFieldSet (r, _, _, v) -> usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
@@ -146,6 +148,7 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | EField (r, _, _) -> callsLayoutDep r
         | EIfaceCall (_, _, recv, args) -> callsLayoutDep recv || anyOf args
         | ECast (_, x, _) -> callsLayoutDep x
+        | ETypeTest (_, x) -> callsLayoutDep x
         | EFieldSet (r, _, _, v) -> callsLayoutDep r || callsLayoutDep v
         | EWhile (c, b) -> callsLayoutDep c || callsLayoutDep b
         | EAssign (_, x) -> callsLayoutDep x
@@ -313,6 +316,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EField (r, _, _) -> scan r
         | EIfaceCall (_, _, recv, args) -> scan recv; List.iter scan args
         | ECast (_, x, _) -> scan x
+        | ETypeTest (_, x) -> scan x
         | EFieldSet (r, _, _, v) -> scan r; scan v
         | EWhile (c, b) -> scan c; scan b
         | EAssign (v, e) -> demand (v.Path, v.Offset); scan e

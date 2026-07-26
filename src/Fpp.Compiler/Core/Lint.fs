@@ -254,6 +254,9 @@ let lint (decls : Decl list) : string list =
         | ECast (tn, e, _) ->
             exprType e |> ignore
             TCon (tn, [])
+        | ETypeTest (_, e) ->
+            exprType e |> ignore
+            tBool
 
     for d in decls do
         match d with
