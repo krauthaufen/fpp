@@ -144,6 +144,8 @@ let parse (src : string) : ParseResult =
         s.Is Ident || isLiteral () || isLiteralKw ()
         || s.Is LParen || s.Is LBracket || s.Is LBrace
         || (s.IsOp "'" && (s.Peek 1).Kind = Ident)
+        // a struct tuple can be an application argument: `f struct(a, b)`
+        || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
 
     /// Can the current token start an expression at statement position?
     let canStartExpr () =
@@ -257,11 +259,18 @@ let parse (src : string) : ParseResult =
         vecToList acc
 
     and canStartTypeAtom () =
-        s.Is Ident || s.IsOp "'" || s.Is LParen
+        s.Is Ident || s.IsOp "'" || s.Is LParen || s.IsOp "#"
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
 
     and parseAtomType (ctx : int) : Green =
-        if s.IsKw "struct" && (s.Peek 1).Kind = LParen then
+        if s.IsOp "#" then
+            // flexible type `#seq<'a>` — "some subtype of". Argument
+            // positions already widen, so the constraint adds nothing here.
+            let h = s.Bump ()
+            (match parseAtomType ctx with
+             | GNode inner -> Green.node inner.NodeKind (h :: inner.Children)
+             | g -> g)
+        elif s.IsKw "struct" && (s.Peek 1).Kind = LParen then
             // `struct('K * 'V)` names the generic struct StructTuple2<'K,'V>
             let kw = s.Bump ()
             Green.node StructTupleType [ kw; parseAtomType ctx ]
@@ -863,6 +872,11 @@ let parse (src : string) : ParseResult =
         vecAdd acc (s.Bump ())   // type / and
         while s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" || s.IsKw "rec" do
             vecAdd acc (s.Bump ())
+        // `and [<Struct>] Name(...)`: attributes may sit after the keyword
+        while s.Is LBracket && (s.Peek 1).Kind = Operator && (s.Peek 1).Text = "<" do
+            vecAdd acc (parseAttributeList ())
+            while s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" || s.IsKw "rec" do
+                vecAdd acc (s.Bump ())
         if s.Is Ident then vecAdd acc (s.Bump ()) else s.Diag "expected a type name"
         if s.IsOp "<" && s.SameLine then
             vecAdd acc (Green.node TyParams (parseAngleArgs typeCol))
@@ -884,6 +898,9 @@ let parse (src : string) : ParseResult =
             else s.Diag "expected a type representation"
             // members may follow any representation (or be the whole body)
             parseTypeBody acc typeCol
+        // nested `let`s in the body reset this, but a following `and`
+        // continues the TYPE, not those lets
+        lastMajor <- "type"
         Green.node TypeDecl (vecToList acc)
 
     and isMemberStart () =

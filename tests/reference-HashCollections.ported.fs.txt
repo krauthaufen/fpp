@@ -7,7 +7,6 @@ open System.Diagnostics
 
 module private HashNumberCrunching =
     type Mask = uint32
-    
     let inline combineHash (a: int) (b: int) =
         uint32 a ^^^ uint32 b + 0x9e3779b9u + ((uint32 a) <<< 6) + ((uint32 a) >>> 2) |> int
 
@@ -25,7 +24,6 @@ module private HashNumberCrunching =
 
     let inline zeroBit (k: uint32) (m: uint32) =
         if (k &&& m) <> 0u then 1u else 0u
-        
     let inline matchPrefixAndGetBit (hash: uint32) (prefix: uint32) (m: uint32) =
         if getPrefix hash m = prefix then zeroBit hash m
         else 2u
@@ -69,7 +67,6 @@ module internal HashImplementation =
     type NodeKind =
         | Leaf = 0uy
         | Inner = 1uy
-        
     [<AllowNullLiteral; AbstractClass>]
     type SetNode<'K>(k : NodeKind, data : uint32) =
         let mutable store = (data <<< 1) ||| uint32 k
@@ -165,7 +162,6 @@ module internal HashImplementation =
                 n
             else
                 SetLinked(n.Key, add cmp key n.SetNext)
-         
         let rec alter (cmp : IEqualityComparer<'K>) (key : 'K) (update : bool -> bool) (n : SetLinked<'K>) =
             if isNull n then
                 if update false then 
@@ -194,7 +190,6 @@ module internal HashImplementation =
                     n.SetNext <- node
                     ok
             struct(ok, n)
-         
         let rec contains (cmp : IEqualityComparer<'K>) (key : 'K) (n : SetLinked<'K>) =
             if isNull n then
                 false
@@ -239,18 +234,15 @@ module internal HashImplementation =
         let rec toList (acc : list<'K>) (n : SetLinked<'K>) =
             if isNull n then acc
             else n.Key :: toList acc n.SetNext
-                
         let rec copyTo (dst : 'K[]) (index : int) (n : SetLinked<'K>) =
             if isNull n then    
                 index
             else
                 dst.[index] <- n.Key
                 copyTo dst (index + 1) n.SetNext
-                    
         let rec mapToMap (mapping : 'K -> 'V) (n : SetLinked<'K>) =
             if isNull n then null
             else MapLinked(n.Key, mapping n.Key, mapToMap mapping n.SetNext)
-                 
         let rec chooseToMapV (mapping : 'K -> voption<'V>) (n : SetLinked<'K>) =
             if isNull n then null
             else 
@@ -259,7 +251,6 @@ module internal HashImplementation =
                     MapLinked(n.Key, value, chooseToMapV mapping n.SetNext)
                 | ValueNone ->
                     chooseToMapV mapping n.SetNext
-                    
         let rec overlaps 
             (cmp : IEqualityComparer<'K>)
             (a : SetLinked<'K>) (b : SetLinked<'K>) =
@@ -269,7 +260,6 @@ module internal HashImplementation =
                 contains cmp a.Key b ||
                 contains cmp b.Key a ||
                 overlaps cmp a.SetNext b.SetNext
-                  
         let rec subset 
             (cmp : IEqualityComparer<'K>)
             (a : SetLinked<'K>) (b : SetLinked<'K>) =
@@ -287,7 +277,6 @@ module internal HashImplementation =
             else
                 let struct(ok, b) = tryRemove cmp a.Key b
                 SetLinked(a.Key, union cmp a.SetNext b)
-                
         let rec xor 
             (cmp : IEqualityComparer<'K>)
             (a : SetLinked<'K>) (b : SetLinked<'K>) =
@@ -299,7 +288,6 @@ module internal HashImplementation =
                     xor cmp a.SetNext b
                 else
                     SetLinked(a.Key, xor cmp a.SetNext b)
-                
         let rec difference 
             (cmp : IEqualityComparer<'K>)
             (a : SetLinked<'K>) (b : SetLinked<'K>) =
@@ -308,7 +296,6 @@ module internal HashImplementation =
             else
                 let struct(ok, a) = tryRemove cmp b.Key a
                 difference cmp a b.SetNext
-                
         let rec intersect 
             (cmp : IEqualityComparer<'K>)
             (a : SetLinked<'K>) (b : SetLinked<'K>) =
@@ -330,9 +317,6 @@ module internal HashImplementation =
                 let struct(ok, b) = tryRemove cmp a.Key b
                 if ok then intersectionCount cmp (acc + 1) a.SetNext b
                 else intersectionCount cmp acc a.SetNext b
-                
-        
-        
         let rec computeDelta 
             (cmp : IEqualityComparer<'K>)
             (onlyLeft : 'K -> voption<'OP>) 
@@ -355,7 +339,6 @@ module internal HashImplementation =
                         computeDelta cmp onlyLeft onlyRight a.SetNext b
                     | ValueSome v ->
                         MapLinked(a.Key, v, computeDelta cmp onlyLeft onlyRight a.SetNext b)
-                   
         let rec applyDeltaNoState
             (apply : ('K -> bool -> 'D -> struct(bool * voption<'DOut>)))
             (delta : MapLinked<'K, 'D>) =
@@ -380,7 +363,6 @@ module internal HashImplementation =
                     | _ -> restDelta
 
             struct(result, state)
-                     
         let rec applyDelta
             (cmp : IEqualityComparer<'K>)
             (apply : ('K -> bool -> 'D -> struct(bool * voption<'DOut>)))
@@ -419,7 +401,6 @@ module internal HashImplementation =
                 MapLinked(key, value, n.MapNext)
             else
                 MapLinked(n.Key, n.Value, add cmp key value n.MapNext)
-                   
         let rec alter (cmp : IEqualityComparer<'K>) (key : 'K) (update : option<'V> -> option<'V>) (n : MapLinked<'K, 'V>) =
             if isNull n then
                 match update None with
@@ -431,7 +412,6 @@ module internal HashImplementation =
                 | None -> n.MapNext
             else
                 MapLinked(n.Key, n.Value, alter cmp key update n.MapNext)
-                   
         let rec alterV (cmp : IEqualityComparer<'K>) (key : 'K) (update : voption<'V> -> voption<'V>) (n : MapLinked<'K, 'V>) =
             if isNull n then
                 match update ValueNone with
@@ -443,7 +423,6 @@ module internal HashImplementation =
                 | ValueNone -> n.MapNext
             else
                 MapLinked(n.Key, n.Value, alterV cmp key update n.MapNext)
-                   
         let rec addInPlace (cmp : IEqualityComparer<'K>) (key : 'K) (value : 'V) (n : SetLinked<'K>) =
             let mutable n : SetLinked<'K> = n
             let ok =
@@ -460,7 +439,6 @@ module internal HashImplementation =
                     n.SetNext <- node
                     ok
             struct(ok, n)
-            
         let rec tryRemove (cmp : IEqualityComparer<'K>) (key : 'K) (n : MapLinked<'K, 'V>) =
             let mutable n : MapLinked<'K, 'V> = n
             let res =
@@ -487,7 +465,6 @@ module internal HashImplementation =
                 ValueSome n.Value
             else
                 tryFindV cmp key n.MapNext
-                
         let rec tryFind (cmp : IEqualityComparer<'K>) (key : 'K) (n : MapLinked<'K, 'V>) =
             if isNull n then
                 None
@@ -495,7 +472,6 @@ module internal HashImplementation =
                 Some n.Value
             else
                 tryFind cmp key n.MapNext
-                
         let rec containsKey (cmp : IEqualityComparer<'K>) (key : 'K) (n : MapLinked<'K, 'V>) =
             if isNull n then
                 false
@@ -507,54 +483,45 @@ module internal HashImplementation =
         let rec toList (acc : list<_>) (n : MapLinked<'K, 'V>) =
             if isNull n then acc
             else (n.Key,n.Value) :: toList acc n.MapNext
-                          
         let rec toListV (acc : list<_>) (n : MapLinked<'K, 'V>) =
             if isNull n then acc
             else struct(n.Key,n.Value) :: toListV acc n.MapNext
-                     
         let rec toValueList (acc : list<_>) (n : MapLinked<'K, 'V>) =
             if isNull n then acc
             else n.Value :: toValueList acc n.MapNext
-                    
         let rec toListMap (mapping : ('K -> 'V -> 'T)) (acc : list<'T>) (n : MapLinked<'K, 'V>) =
             if isNull n then acc
             else (mapping (n.Key) (n.Value)) :: toListMap mapping acc n.MapNext
-                
         let rec copyTo (dst : ('K * 'V)[]) (index : int) (n : MapLinked<'K, 'V>) =
             if isNull n then    
                 index
             else
                 dst.[index] <- (n.Key, n.Value)
                 copyTo dst (index + 1) n.MapNext
-                    
         let rec copyToV (dst : struct('K * 'V)[]) (index : int) (n : MapLinked<'K, 'V>) =
             if isNull n then    
                 index
             else
                 dst.[index] <- struct(n.Key, n.Value)
                 copyToV dst (index + 1) n.MapNext
-                    
         let rec copyValuesTo (dst : 'V[]) (index : int) (n : MapLinked<'K, 'V>) =
             if isNull n then    
                 index
             else
                 dst.[index] <- n.Value
                 copyValuesTo dst (index + 1) n.MapNext
-                      
         let rec fold (folder : ('S -> 'K -> 'V -> 'S)) (state : 'S) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 state
             else
                 let s1 = (folder (state) (node.Key) (node.Value))
                 fold folder s1 node.MapNext
-                       
         let rec exists (predicate : ('K -> 'V -> bool)) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 false
             else
                 (predicate (node.Key) (node.Value)) ||
                 exists predicate node.MapNext
-                
         let rec forall (predicate : ('K -> 'V -> bool)) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 true
@@ -579,13 +546,11 @@ module internal HashImplementation =
                 null
             else
                 MapLinked(node.Key, (mapping (node.Key) (node.Value)), map mapping node.MapNext)
-                 
         let rec filter (predicate : ('K -> 'V -> bool)) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 null
             elif (predicate (node.Key) (node.Value)) then
                 MapLinked(node.Key, node.Value, filter predicate node.MapNext)
-                
             else
                 filter predicate node.MapNext
 
@@ -624,7 +589,6 @@ module internal HashImplementation =
                 | ValueNone ->
                     intersect cmp resolve a.MapNext b
 
-                            
         let rec choose2VLeft
             (mapping : ('K -> voption<'A> -> voption<'B> -> voption<'C>))
             (a : MapLinked<'K, 'A>)  =
@@ -636,7 +600,6 @@ module internal HashImplementation =
                     MapLinked(a.Key, c, choose2VLeft mapping a.MapNext)
                 | ValueNone ->
                     choose2VLeft mapping a.MapNext
-                      
         let rec choose2VRight
             (mapping : ('K -> voption<'A> -> voption<'B> -> voption<'C>))
             (b : MapLinked<'K, 'B>)  =
@@ -672,8 +635,6 @@ module internal HashImplementation =
                         MapLinked(a.Key, c, choose2V cmp mapping a.MapNext b)
                     | ValueNone ->
                         choose2V cmp mapping a.MapNext b
-                        
-                    
         let rec union 
             (cmp : IEqualityComparer<'K>)
             (a : MapLinked<'K, 'V>) (b : MapLinked<'K, 'V>) =
@@ -682,15 +643,11 @@ module internal HashImplementation =
             else
                 let struct(res, a) = tryRemove cmp b.Key a
                 MapLinked(b.Key, b.Value, union cmp a b.MapNext)
-                    
-                    
-                    
         let rec unionWithSelf (mapping : ('K -> 'V -> 'V -> 'V)) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 null
             else
                 MapLinked(node.Key, (mapping (node.Key) (node.Value) (node.Value)), unionWithSelf mapping node.MapNext)
-                 
         let rec unionWith
             (cmp : IEqualityComparer<'K>)
             (resolve : ('K -> 'V -> 'V -> 'V))
@@ -705,7 +662,6 @@ module internal HashImplementation =
                     MapLinked(b.Key, v, unionWith cmp resolve a b.MapNext)
                 | ValueNone -> 
                     MapLinked(b.Key, b.Value, unionWith cmp resolve a b.MapNext)
-                
         let rec unionWithSelfV (mapping : ('K -> 'V -> 'V -> voption<'V>)) (node : MapLinked<'K, 'V>) =
             if isNull node then
                 null
@@ -715,7 +671,6 @@ module internal HashImplementation =
                     MapLinked(node.Key, v, unionWithSelfV mapping node.MapNext)
                 | ValueNone ->
                     unionWithSelfV mapping node.MapNext
-                       
         let rec unionWithV
             (cmp : IEqualityComparer<'K>)
             (resolve : ('K -> 'V -> 'V -> voption<'V>))
@@ -733,7 +688,6 @@ module internal HashImplementation =
                         unionWithV cmp resolve a b.MapNext
                 | ValueNone -> 
                     MapLinked(b.Key, b.Value, unionWithV cmp resolve a b.MapNext)
-                
         let rec computeDelta 
             (cmp : IEqualityComparer<'K>)
             (onlyLeft : ('K -> 'V -> voption<'OP>)) 
@@ -762,7 +716,6 @@ module internal HashImplementation =
                         computeDelta cmp onlyLeft onlyRight both a.MapNext b
                     | ValueSome v ->
                         MapLinked(a.Key, v, computeDelta cmp onlyLeft onlyRight both a.MapNext b)
-                    
         let rec applyDeltaNoState
             (apply : ('K -> voption<'V> -> 'D -> struct(voption<'V> * voption<'DOut>)))
             (delta : MapLinked<'K, 'D>) =
@@ -790,7 +743,6 @@ module internal HashImplementation =
                     | _ -> restDelta
 
             struct(result, state)
-                     
         let rec applyDelta
             (cmp : IEqualityComparer<'K>)
             (apply : ('K -> voption<'V> -> 'D -> struct(voption<'V> * voption<'DOut>)))
@@ -868,7 +820,6 @@ module internal HashImplementation =
                         (add cmp hash key node.Right) 
                 | _ ->
                     join node.Prefix node hash (SetLeaf(hash, key, null))
-             
         let rec alter (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (update : bool -> bool) (node : SetNode<'K>) =
             if isNull node then
                 if update false then
@@ -911,7 +862,6 @@ module internal HashImplementation =
                     else
                         node :> SetNode<_>
 
-                       
         let rec addInPlace (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (node : SetNode<'K>) =
             let mutable node : SetNode<'K> = node
             let ok =
@@ -953,7 +903,6 @@ module internal HashImplementation =
                     | _ ->
                         node <- join inner.Prefix inner hash (SetLeaf(hash, key, null))
                         true
-                 
             struct(ok, node)
 
         let inline addInPlace' (cmp : IEqualityComparer<'K>) (key : 'K) (node : SetNode<'K>) =
@@ -1063,7 +1012,6 @@ module internal HashImplementation =
                 let lh = hash acc a.Left
                 let nh = combineHash lh (combineHash (int a.Prefix) (int a.Mask))
                 hash nh a.Right
-                
         let rec iter (action : 'K -> unit) (node : SetNode<'K>) =
             if isNull node then
                 ()
@@ -1088,7 +1036,6 @@ module internal HashImplementation =
             else
                 let node = node :?> Inner<'K>
                 head node.Left
-                
         let rec fold (folder : ('S -> 'K -> 'S)) (state : 'S) (node : SetNode<'K>) =
             if isNull node then
                 state
@@ -1105,7 +1052,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 let state = fold folder state node.Left
                 fold folder state node.Right
-                
         let rec exists (predicate : 'K -> bool) (node : SetNode<'K>) =
             if isNull node then
                 false
@@ -1123,7 +1069,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 exists predicate node.Left ||
                 exists predicate node.Right
-               
         let rec forall (predicate : 'K -> bool) (node : SetNode<'K>) =
             if isNull node then
                 true
@@ -1141,8 +1086,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 forall predicate node.Left &&
                 forall predicate node.Right
-                    
-    
         let rec filter (predicate : 'K -> bool) (node : SetNode<'K>) =
             if isNull node then
                 null
@@ -1169,7 +1112,6 @@ module internal HashImplementation =
             else
                 let node = node :?> Inner<'K>
                 toList (toList acc node.Right) node.Left
-                    
         let rec copyTo (dst : 'K[]) (index : int) (node : SetNode<'K>) =
             if isNull node then
                 index
@@ -1181,7 +1123,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 let i0 = copyTo dst index node.Left
                 copyTo dst i0 node.Right
-                
         let rec mapToMap (mapping : 'K -> 'V) (node : SetNode<'K>) =
             if isNull node then
                 null
@@ -1213,7 +1154,6 @@ module internal HashImplementation =
                 let r = chooseToMapV mapping node.Right
                 newInner node.Prefix node.Mask l r
 
-                
         let rec subset 
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
@@ -1316,7 +1256,6 @@ module internal HashImplementation =
         let rec union
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then nb
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then na
@@ -1371,7 +1310,6 @@ module internal HashImplementation =
         let rec intersect
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na || isNull nb then null
             elif System.Object.ReferenceEquals(na, nb) then na
             elif na.IsLeaf then
@@ -1426,7 +1364,6 @@ module internal HashImplementation =
             (cmp : IEqualityComparer<'K>)
             (acc : int)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na || isNull nb then acc
             elif System.Object.ReferenceEquals(na, nb) then acc + size na
             elif na.IsLeaf then
@@ -1472,12 +1409,9 @@ module internal HashImplementation =
                     intersectionCount cmp acc a.Right b.Right
                 else
                     acc
-        
-        
         let rec xor
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then nb
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then null
@@ -1532,7 +1466,6 @@ module internal HashImplementation =
         let rec difference
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then null
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then null
@@ -1886,7 +1819,6 @@ module internal HashImplementation =
 
         let inline newInner (prefix : uint32) (mask : uint32) (l : SetNode<'K>) (r : SetNode<'K>) =
             SetNode.newInner prefix mask l r
-                
         let rec alterV (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (update : voption<'V> -> voption<'V>) (node : SetNode<'K>) =
             if isNull node then
                 match update ValueNone with
@@ -1927,7 +1859,6 @@ module internal HashImplementation =
                     match update ValueNone with
                     | ValueSome value -> join node.Prefix node hash (MapLeaf(hash, key, value, null))
                     | ValueNone -> node :> SetNode<_>
-                 
         let rec alter (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (update : option<'V> -> option<'V>) (node : SetNode<'K>) =
             if isNull node then
                 match update None with
@@ -1968,7 +1899,6 @@ module internal HashImplementation =
                     match update None with
                     | Some value -> join node.Prefix node hash (MapLeaf(hash, key, value, null))
                     | None -> node :> SetNode<_>
-                 
         let rec add (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (value : 'V) (node : SetNode<'K>) =
             if isNull node then
                 MapLeaf(hash, key, value, null) :> SetNode<_>
@@ -1997,7 +1927,6 @@ module internal HashImplementation =
                         (add cmp hash key value node.Right) 
                 | _ ->
                     join node.Prefix node hash (MapLeaf(hash, key, value, null))
-                 
         let rec tryRemove<'K, 'V> (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (node : SetNode<'K>) =
             let mutable node : SetNode<'K> = node
             let res =
@@ -2054,7 +1983,6 @@ module internal HashImplementation =
                 if n.Hash = hash then
                     if cmp.Equals(n.Key, key) then  ValueSome n.Value
                     else MapLinked.tryFindV cmp key n.MapNext
-                       
                 else
                     ValueNone
             else
@@ -2064,7 +1992,6 @@ module internal HashImplementation =
                 | 1u -> tryFindV<'K, 'V> cmp hash key n.Right
                 | _ ->
                     ValueNone
-  
         let rec tryFind<'K, 'V>  (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (node : SetNode<'K>) =
             if isNull node then
                 None
@@ -2074,7 +2001,6 @@ module internal HashImplementation =
                 if n.Hash = hash then
                     if cmp.Equals(n.Key, key) then Some n.Value
                     else MapLinked.tryFind cmp key n.MapNext
-                       
                 else
                     None
             else
@@ -2084,7 +2010,6 @@ module internal HashImplementation =
                 | 1u -> tryFind<'K, 'V> cmp hash key n.Right
                 | _ ->
                     None
-  
         let rec containsKey<'K, 'V>  (cmp : IEqualityComparer<'K>) (hash : uint32) (key : 'K) (node : SetNode<'K>) =
             if isNull node then
                 false
@@ -2094,7 +2019,6 @@ module internal HashImplementation =
                 if n.Hash = hash then
                     if cmp.Equals(n.Key, key) then true
                     else MapLinked.containsKey cmp key n.MapNext
-                       
                 else
                     false
             else
@@ -2154,7 +2078,6 @@ module internal HashImplementation =
             let hash = uint32 (cmp.GetHashCode key) &&& 0x7FFFFFFFu
             let struct(_, n) = addInPlace cmp hash key value node
             n
-                
         let rec toValueList (acc : list<'V>) (node : SetNode<'K>) =
             if isNull node then acc
             elif node.IsLeaf then
@@ -2166,7 +2089,6 @@ module internal HashImplementation =
             else
                 let node = node :?> Inner<'K>
                 toValueList (toValueList acc node.Right) node.Left
-                   
         let rec toList (acc : list<'K * 'V>) (node : SetNode<'K>) =
             if isNull node then acc
             elif node.IsLeaf then
@@ -2178,7 +2100,6 @@ module internal HashImplementation =
             else
                 let node = node :?> Inner<'K>
                 toList (toList acc node.Right) node.Left
-                   
         let rec toListV (acc : list<struct('K * 'V)>) (node : SetNode<'K>) =
             if isNull node then acc
             elif node.IsLeaf then
@@ -2201,7 +2122,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 toListMap mapping (toListMap mapping acc node.Right) node.Left
 
-            
         let rec copyTo (dst : ('K * 'V)[]) (index : int) (node : SetNode<'K>) =
             if isNull node then
                 index
@@ -2213,7 +2133,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 let i0 = copyTo dst index node.Left
                 copyTo dst i0 node.Right
-                    
         let rec copyValuesTo (dst : 'V[]) (index : int) (node : SetNode<'K>) =
             if isNull node then
                 index
@@ -2225,7 +2144,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 let i0 = copyValuesTo dst index node.Left
                 copyValuesTo dst i0 node.Right
-                
         let rec copyToV (dst : struct('K * 'V)[]) (index : int) (node : SetNode<'K>) =
             if isNull node then
                 index
@@ -2237,7 +2155,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 let i0 = copyToV dst index node.Left
                 copyToV dst i0 node.Right
-                
         let rec exists (predicate : ('K -> 'V -> bool)) (node : SetNode<'K>) =
             if isNull node then
                 false
@@ -2249,7 +2166,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 exists predicate node.Left ||
                 exists predicate node.Right
-                
         let rec forall (predicate : ('K -> 'V -> bool)) (node : SetNode<'K>) =
             if isNull node then
                 true
@@ -2288,7 +2204,6 @@ module internal HashImplementation =
                 let node = node :?> Inner<'K>
                 iter action node.Left
                 iter action node.Right
-                
 
         let rec map (mapping : ('K -> 'V -> 'T)) (node : SetNode<'K>) =
             if isNull node then
@@ -2317,7 +2232,6 @@ module internal HashImplementation =
                     node.Prefix node.Mask
                     (filter predicate node.Left)
                     (filter predicate node.Right)
-                   
         let rec choose (mapping : ('K -> 'V -> option<'T>)) (node : SetNode<'K>) =
             if isNull node then
                 null
@@ -2370,7 +2284,6 @@ module internal HashImplementation =
                 let lh = hash<'K, 'V> acc a.Left
                 let nh = combineHash lh (combineHash (int a.Prefix) (int a.Mask))
                 hash<'K, 'V> nh a.Right
-                
         let rec equals<'K, 'V>
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
@@ -2400,7 +2313,6 @@ module internal HashImplementation =
                     equals<'K, 'V> cmp a.Right b.Right
                 else
                     false
-                
         let rec private choose2VRight
             (mapping : ('K -> voption<'A> -> voption<'B> -> voption<'C>))
             (na : SetNode<'K>) = 
@@ -2423,7 +2335,6 @@ module internal HashImplementation =
                     a.Prefix a.Mask
                     (choose2VRight mapping a.Left)
                     (choose2VRight mapping a.Right)
-                 
         let rec private choose2VLeft
             (mapping : ('K -> voption<'A> -> voption<'B> -> voption<'C>))
             (na : SetNode<'K>) = 
@@ -2446,7 +2357,6 @@ module internal HashImplementation =
                     a.Prefix a.Mask
                     (choose2VLeft mapping a.Left)
                     (choose2VLeft mapping a.Right)
-                 
         let rec choose2V
             (cmp : IEqualityComparer<'K>)
             (mapping : ('K -> voption<'A> -> voption<'B> -> voption<'C>))
@@ -2553,12 +2463,10 @@ module internal HashImplementation =
                     let va = choose2VLeft mapping na
                     let vb = choose2VRight mapping nb
                     join a.Prefix va b.Prefix vb
-             
         let rec intersect
             (cmp : IEqualityComparer<'K>)
             (resolve : ('K -> 'A -> 'B -> 'C))
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na || isNull nb then null
             elif na.IsLeaf then
                 let a = na :?> MapLeaf<'K, 'A>
@@ -2608,7 +2516,6 @@ module internal HashImplementation =
                 else
                     null
 
-             
         let rec unionWithSelfV<'K, 'V>
             (mapping : ('K -> 'V -> 'V -> voption<'V>))
             (node : SetNode<'K>) =
@@ -2633,7 +2540,6 @@ module internal HashImplementation =
             (cmp : IEqualityComparer<'K>)
             (resolve : ('K -> 'V -> 'V -> voption<'V>))
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then nb
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then unionWithSelfV resolve na
@@ -2684,7 +2590,6 @@ module internal HashImplementation =
                     newInner a.Prefix a.Mask (unionWithV cmp resolve a.Left b.Left) (unionWithV cmp resolve a.Right b.Right)
                 else
                     join a.Prefix na b.Prefix nb
-                    
         let rec unionWithSelf (mapping : ('K -> 'V -> 'V -> 'V)) (node : SetNode<'K>) =
             if isNull node then
                 null
@@ -2699,7 +2604,6 @@ module internal HashImplementation =
             (cmp : IEqualityComparer<'K>)
             (resolve : ('K -> 'V -> 'V -> 'V))
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then nb
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then unionWithSelf resolve na
@@ -2750,12 +2654,10 @@ module internal HashImplementation =
                     newInner a.Prefix a.Mask (unionWith cmp resolve a.Left b.Left) (unionWith cmp resolve a.Right b.Right)
                 else
                     join a.Prefix na b.Prefix nb
-  
 
         let rec union<'K, 'V>
             (cmp : IEqualityComparer<'K>)
             (na : SetNode<'K>) (nb : SetNode<'K>) =
-            
             if isNull na then nb
             elif isNull nb then na
             elif System.Object.ReferenceEquals(na, nb) then na
@@ -2875,7 +2777,6 @@ module internal HashImplementation =
             else
                 let a = na :?> Inner<'K>
                 let b = nb :?> Inner<'K>
-                    
                 let cc = compareMasks a.Mask b.Mask 
                 if cc > 0 then
                     // a in b
@@ -2914,7 +2815,6 @@ module internal HashImplementation =
                         (computeDelta cmp onlyLeft onlyRight both a.Right b.Right)
                 else
                     join a.Prefix (chooseV onlyLeft na) b.Prefix (chooseV onlyRight nb)
-                        
 
         let rec applyDeltaNoState
             (apply : ('K -> voption<'V> -> 'D -> struct(voption<'V> * voption<'DOut>)))
@@ -2943,7 +2843,6 @@ module internal HashImplementation =
 
                     | ValueNone ->
                         let struct(rest, ls) = MapLinked.applyDeltaNoState apply delta.MapNext
-                            
                         match exists with
                         | ValueSome newValue -> state <- MapLeaf(delta.Hash, delta.Key, newValue, ls)
                         | ValueNone ->
@@ -3042,7 +2941,6 @@ module internal HashImplementation =
                         let struct(ld, ls) = applyDeltaNoState apply delta
                         state <- join s.Hash state d.Prefix ls
                         ld
-                            
 
                 else
                     let d = delta :?> Inner<'K>
@@ -3249,11 +3147,9 @@ type internal HashMapEnumerable<'K, 'V, 'T>(root : SetNode<'K>, mapping : ('K ->
     member x.GetEnumerator() = new HashMapEnumerator<_,_,_>(root, mapping)
     interface System.Collections.IEnumerable with member x.GetEnumerator() = x.GetEnumerator() :> _
     interface System.Collections.Generic.IEnumerable<'T> with member x.GetEnumerator() = x.GetEnumerator() :> _
-        
 
-[<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<HashSetProxy<_>>); CustomEquality; NoComparison; StructuredFormatDisplay("{AsString}"); CompiledName("FSharpHashSet`1");>]
+[<Struct>]
 type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) =
-        
     static let addOp = fun (v : 'K) -> ValueSome 1
     static let remOp = fun (v : 'K) -> ValueSome -1
     static let applyOp = 
@@ -3304,28 +3200,23 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
     // ====================================================================================
     // Queries: contains/etc.
     // ====================================================================================
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Contains(key : 'K) =
         if isNull root then
             false
         else
             let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
             SetNode.contains comparer hash key root
-        
     // ====================================================================================
     // Modifications: add/remove/etc.
     // ====================================================================================
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Add(key) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         HashSet<'K>(comparer, SetNode.add comparer hash key root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Alter(key : 'K, update : bool -> bool) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         HashSet<'K>(comparer, SetNode.alter comparer hash key update root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Remove(key) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(ok, root) = SetNode.tryRemove comparer hash key root
@@ -3333,8 +3224,6 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             HashSet<'K>(comparer, root)
         else
             x
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryRemove(key) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(ok, root) = SetNode.tryRemove comparer hash key root
@@ -3342,8 +3231,6 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             HashSet<'K>(comparer, root) |> Some
         else
             None
-             
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryRemoveV(key) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(ok, root) = SetNode.tryRemove comparer hash key root
@@ -3355,28 +3242,18 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
     // ====================================================================================
     // Unary Operations: map/choose/filter/etc.
     // ====================================================================================
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Iter(action : 'K -> unit) =
         SetNode.iter action root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Fold(folder : 'S -> 'K -> 'S, state : 'S) =
         if isNull root then
             state
         else
             let folder = folder
             SetNode.fold folder state root
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Exists(predicate : 'K -> bool) =
         SetNode.exists predicate root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Forall(predicate : 'K -> bool) =
         SetNode.forall predicate root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Map(mapping : 'K -> 'T) =
         let cmp = DefaultEqualityComparer<'T>.Instance
         let mutable root = null
@@ -3385,14 +3262,10 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             root <- SetNode.addInPlace' cmp n root
 
         HashSet<'T>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.MapToMap(mapping : 'K -> 'V) =
         let root = SetNode.mapToMap mapping root
         HashMap<'K, 'V>(comparer, root)
-        
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ChooseToMap(mapping : 'K -> option<'V>) =  
         let vmapping v =
             match mapping v with
@@ -3401,14 +3274,10 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
 
         let root = SetNode.chooseToMapV vmapping root
         HashMap<'K, 'V>(comparer, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ChooseToMapV(mapping : 'K -> voption<'V>) =  
         let root = SetNode.chooseToMapV mapping root
         HashMap<'K, 'V>(comparer, root)
-        
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ChooseV(mapping : 'K -> voption<'T>) =
         let cmp = DefaultEqualityComparer<'T>.Instance
         let mutable root = null
@@ -3419,8 +3288,6 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             | ValueNone ->
                 ()
         HashSet<'T>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Choose(mapping : 'K -> option<'T>) =
         let cmp = DefaultEqualityComparer<'T>.Instance
         let mutable root = null
@@ -3432,57 +3299,38 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             | None ->
                 ()
         HashSet<'T>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Filter(predicate : 'K -> bool) =
         HashSet(comparer, SetNode.filter predicate root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.First() : 'K =
         SetNode.head root
 
     // ====================================================================================
     // Binary Operations: overlaps/union/computeDelta/etc.
     // ====================================================================================
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member ApplyDelta(a : HashSet<'K>, b : HashMap<'K, 'D>, apply : 'K -> bool -> 'D -> struct(bool * voption<'DOut>)) =
         let state = a.Root
         let struct(delta, state) = SetNode.applyDelta a.Comparer (apply) state b.Root
         let state = HashSet<'K>(a.Comparer, state)
         let delta = HashMap<'K, 'DOut>(a.Comparer, delta)
         state, delta
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Overlaps(other : HashSet<'K>) =
         SetNode.overlaps comparer root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.SetEquals(other : HashSet<'K>) =
         x.Count = other.Count &&
         SetNode.equals comparer root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsSubsetOf(other : HashSet<'K>) =
         x.Count <= other.Count &&
         SetNode.subset comparer root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsSupersetOf(other : HashSet<'K>) =
         x.Count >= other.Count &&
         SetNode.subset comparer other.Root root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsProperSubsetOf(other : HashSet<'K>) =
         x.Count < other.Count &&
         SetNode.subset comparer root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsProperSupersetOf(other : HashSet<'K>) =
         other.Count < x.Count &&
         SetNode.subset comparer other.Root root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Overlaps(other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.Overlaps o
@@ -3490,16 +3338,12 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
         | :? array<'K> as o -> o |> Array.exists x.Contains
         | :? list<'K> as o -> o |> List.exists x.Contains
         | o -> o |> Seq.exists x.Contains
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.SetEquals(other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.SetEquals o
         | :? array<'K> as o -> x.SetEquals (HashSet.OfArray o)
         | :? list<'K> as o -> x.SetEquals (HashSet.OfList o)
         | o -> x.SetEquals (HashSet.OfSeq o)
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsSubsetOf (other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.IsSubsetOf o
@@ -3507,64 +3351,43 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
         | :? array<'K> as o -> x.IsSubsetOf (HashSet.OfArray o)
         | :? list<'K> as o -> x.IsSubsetOf (HashSet.OfList o)
         | o -> x.IsSubsetOf (HashSet.OfSeq o)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsProperSubsetOf (other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.IsProperSubsetOf o
         | :? array<'K> as o -> x.IsProperSubsetOf (HashSet.OfArray o)
         | :? list<'K> as o -> x.IsProperSubsetOf (HashSet.OfList o)
         | o -> x.IsProperSubsetOf (HashSet.OfSeq o)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsSupersetOf (other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.IsSupersetOf o
         | :? array<'K> as o -> o |> Array.forall x.Contains
         | :? list<'K> as o -> o |> List.forall x.Contains
         | o -> o |> Seq.forall x.Contains
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IsProperSupersetOf (other : seq<'K>) =
         match other with
         | :? HashSet<'K> as o -> x.IsProperSupersetOf o
         | :? array<'K> as o -> x.IsProperSupersetOf (HashSet.OfArray o)
         | :? list<'K> as o -> x.IsProperSupersetOf (HashSet.OfList o)
         | o -> x.IsProperSupersetOf (HashSet.OfSeq o)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.UnionWith(other : HashSet<'K>) =
         HashSet<'K>(comparer, SetNode.union comparer root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.SymmetricExceptWith(other : HashSet<'K>) =
         HashSet<'K>(comparer, SetNode.xor comparer root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ExceptWith(other : HashSet<'K>) =
         HashSet<'K>(comparer, SetNode.difference comparer root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IntersectWith(other : HashSet<'K>) =
         HashSet<'K>(comparer, SetNode.intersect comparer root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IntersectionCount(other : HashSet<'K>) =
         SetNode.intersectionCount comparer 0 root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ComputeDeltaAsHashMap(other : HashSet<'K>) =
         let delta = SetNode.computeDelta comparer remOp addOp root other.Root
         HashMap<'K, int>(comparer, delta)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ComputeDeltaAsHashMap(other : HashSet<'K>, remOp : 'K -> bool, addOp : 'K -> bool) =
         let rem = fun k -> if remOp k then ValueSome -1 else ValueNone
         let add = fun k -> if addOp k then ValueSome  1 else ValueNone
         let delta = SetNode.computeDelta comparer rem add root other.Root
         HashMap<'K, int>(comparer, delta)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ApplyDeltaAsHashMap(delta : HashMap<'K, int>) =
         let state = root
         let struct(delta, state) = SetNode.applyDelta comparer applyOp state delta.Root
@@ -3574,14 +3397,11 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
     // Creators: Empty/Singleton/OfList/OfSeq/etc.
     // ====================================================================================
     static member Empty = HashSet<'K>(DefaultEqualityComparer<'K>.Instance, null)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member Single(key : 'K) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let hash = uint32 (cmp.GetHashCode key) &&& 0x7FFFFFFFu
         HashSet(cmp, SetLeaf(hash, key, null))
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfSeq(elements : seq<'K>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
@@ -3589,23 +3409,18 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             root <- SetNode.addInPlace' cmp e root
         HashSet(cmp, root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfList(elements : list<'K>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for e in elements do 
             root <- SetNode.addInPlace' cmp e root
         HashSet(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArray(elements : 'K[]) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for e in elements do 
             root <- SetNode.addInPlace' cmp e root
         HashSet(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArrayRange(elements: array<'K>, offset: int, length: int) =  
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable i = offset
@@ -3616,35 +3431,25 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
             root <- SetNode.addInPlace' cmp e root
             i <- i + 1
         HashSet(cmp, root)
-        
     // ====================================================================================
     // Accessors: CopyTo/ToList/etc.
     // ====================================================================================
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToList() = SetNode.toList [] root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.CopyTo(array : 'K[], startIndex : int) =
         SetNode.copyTo array startIndex root |> ignore
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToArray() =
         let arr = Array.zeroCreate (size root)
         x.CopyTo(arr, 0)
         arr
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.GetEnumerator() = new HashSetEnumerator<'K>(root)
 
     interface System.Collections.IEnumerable with
         member x.GetEnumerator() = x.GetEnumerator() :> _
-            
     interface System.Collections.Generic.IEnumerable<'K> with
         member x.GetEnumerator() = x.GetEnumerator() :> _
 
     interface System.Collections.Generic.IReadOnlyCollection<'K> with
         member x.Count = x.Count
-        
     interface System.Collections.Generic.ICollection<'K> with
         member x.Count = x.Count
         member x.IsReadOnly = true
@@ -3675,11 +3480,10 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
 and internal HashSetProxy<'K>(set : HashSet<'K>) =
     let items = set |> Seq.truncate 10000 |> Seq.toArray
 
-    [<DebuggerBrowsable(DebuggerBrowsableState.RootHidden)>]
     member x.Items = items
 
-and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<HashMapProxy<_, _>>); CustomEquality; NoComparison; StructuredFormatDisplay("{AsString}"); CompiledName("FSharpHashMap`2")>] 
-    HashMap<'K, [<EqualityConditionalOn>] 'V> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) =
+and [<Struct>] 
+    HashMap<'K,  'V> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) =
     static let tupleGetter = (fun k v -> (k,v))
     static let valueTupleGetter = (fun k v -> struct(k,v))
     static let keyGetter = (fun k _ -> k)
@@ -3695,7 +3499,6 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
     member internal x.Comparer = comparer
     member x.Count = size root
     member x.IsEmpty = isNull root
-        
     override x.GetHashCode() =
         MapNode.hash<'K, 'V> 0 root
 
@@ -3703,10 +3506,8 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
         match o with
         | :? HashMap<'K, 'V> as o -> MapNode.equals<'K, 'V> comparer root o.Root
         | _ -> false
-        
     member x.Equals(o : HashMap<'K, 'V>) =
         MapNode.equals<'K, 'V> comparer root o.Root
-        
     override x.ToString() =
         if x.Count > 8 then
             x |> Seq.take 8 |> Seq.map (sprintf "%A") |> String.concat "; " |> sprintf "HashMap [%s; ...]"
@@ -3718,38 +3519,28 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
     // ====================================================================================
     // Modifications: add/remove/etc.
     // ====================================================================================
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Add(key : 'K, value : 'V) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         HashMap<'K, 'V>(comparer, MapNode.add comparer hash key value root)
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Alter(key : 'K, update : option<'V> -> option<'V>) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         HashMap<'K, 'V>(comparer, MapNode.alter comparer hash key update root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.AlterV(key : 'K, update : voption<'V> -> voption<'V>) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         HashMap<'K, 'V>(comparer, MapNode.alterV comparer hash key update root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Remove(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(res, root) = MapNode.tryRemove<'K, 'V> comparer hash key root
         match res with
         | ValueNone -> x
         | ValueSome _ -> HashMap<'K, 'V>(comparer, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryRemove(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(res, root) = MapNode.tryRemove<'K, 'V> comparer hash key root
         match res with
         | ValueNone -> None
         | ValueSome v -> Some (v, HashMap<'K, 'V>(comparer, root))
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryRemoveV(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         let struct(res, root) = MapNode.tryRemove<'K, 'V> comparer hash key root
@@ -3761,18 +3552,13 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
     // ====================================================================================
     // Unary Operations: map/choose/filter/etc.
     // ====================================================================================
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ContainsKey(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         MapNode.containsKey<'K, 'V> comparer hash key root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryFindV(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         MapNode.tryFindV<'K, 'V> comparer hash key root
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.TryFind(key : 'K) = 
         let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
         MapNode.tryFind<'K, 'V> comparer hash key root
@@ -3784,42 +3570,31 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
             | ValueSome v -> v
             | ValueNone -> raise <| KeyNotFoundException()
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Fold(folder : 'S -> 'K -> 'V -> 'S, state : 'S) =
         let folder = folder
         MapNode.fold folder state root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Exists(predicate : 'K -> 'V -> bool) =
         let predicate = predicate
         MapNode.exists predicate root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Forall(predicate : 'K -> 'V -> bool) =
         let predicate = predicate
         MapNode.forall predicate root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Iter(action : 'K -> 'V -> unit) =
         let action = action
         MapNode.iter action root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Map(mapping : 'K -> 'V -> 'T) =
         let mapping = mapping
         HashMap<'K, 'T>(comparer, MapNode.map mapping root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Choose(mapping : 'K -> 'V -> option<'T>) =
         let mapping = mapping
         HashMap<'K, 'T>(comparer, MapNode.choose mapping root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ChooseV(mapping : 'K -> 'V -> voption<'T>) =
         let mapping = mapping
         HashMap<'K, 'T>(comparer, MapNode.chooseV mapping root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Filter(predicate : 'K -> 'V -> bool) =
         let predicate = predicate
         HashMap<'K, 'V>(comparer, MapNode.filter predicate root)
@@ -3827,8 +3602,6 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
     // ====================================================================================
     // Binary Operations: computeDelta/etc.
     // ====================================================================================
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member ApplyDelta(a : HashMap<'K, 'V>, b : HashMap<'K, 'T>, apply : 'K -> voption<'V> -> 'T -> struct(voption<'V> * voption<'U>)) =
         let state = a.Root
         let struct(delta, state) = MapNode.applyDelta a.Comparer (apply) state b.Root
@@ -3836,66 +3609,44 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
         let delta = HashMap<'K, 'U>(a.Comparer, delta)
         state, delta
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member ApplyDeltaV(a : HashMap<'K, 'V>, b : HashMap<'K, 'T>, apply : 'K -> voption<'V> -> 'T -> struct(voption<'V> * voption<'U>)) =
         let state = a.Root
         let struct(delta, state) = MapNode.applyDelta a.Comparer (apply) state b.Root
         let state = HashMap<'K, 'V>(a.Comparer, state)
         let delta = HashMap<'K, 'U>(a.Comparer, delta)
         struct(state, delta)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Choose2V(other : HashMap<'K, 'T>, mapping : 'K -> voption<'V> -> voption<'T> -> voption<'U>) =
         let mapping = mapping
         HashMap<'K, 'U>(comparer, MapNode.choose2V comparer mapping root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IntersectWith(other : HashMap<'K, 'T>, resolve : 'K -> 'V -> 'T -> 'U) =
         let mapping = resolve
         HashMap<'K, 'U>(comparer, MapNode.intersect comparer mapping root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Intersect(other : HashMap<'K, 'T>) =
         let mapping = (fun _ a b -> (a, b))
         HashMap<'K, 'V * 'T>(comparer, MapNode.intersect comparer mapping root other.Root)
-        
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.IntersectionCount(other : HashMap<'K, 'T>) =
         SetNode.intersectionCount comparer 0 root other.Root
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Choose2(other : HashMap<'K, 'T>, mapping : 'K -> option<'V> -> option<'T> -> option<'U>) =
         let mapping = mapping
         let inline o v = match v with | ValueSome v -> Some v | ValueNone -> None
         let inline vo v = match v with | Some v -> ValueSome v | None -> ValueNone
         let realMapping = (fun k l r -> (mapping (k) (o l) (o r)) |> vo)
         HashMap<'K, 'U>(comparer, MapNode.choose2V comparer realMapping root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Map2V(other : HashMap<'K, 'T>, mapping : 'K -> voption<'V> -> voption<'T> -> 'U) =
         let mapping = mapping
         let realMapping = (fun k l r -> (mapping (k) (l) (r)) |> ValueSome)
         HashMap<'K, 'U>(comparer, MapNode.choose2V comparer realMapping root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.Map2(other : HashMap<'K, 'T>, mapping : 'K -> option<'V> -> option<'T> -> 'U) =
         let mapping = mapping
         let inline o v = match v with | ValueSome v -> Some v | ValueNone -> None
         let inline vo v = match v with | Some v -> ValueSome v | None -> ValueNone
         let realMapping = (fun k l r -> (mapping (k) (o l) (o r)) |> ValueSome)
         HashMap<'K, 'U>(comparer, MapNode.choose2V comparer realMapping root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.UnionWith(other : HashMap<'K, 'V>) =
         HashMap<'K, 'V>(comparer, MapNode.union<'K, 'V> comparer root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.UnionWith(other : HashMap<'K, 'V>, resolve : 'K -> 'V -> 'V -> 'V) =
         let resolve = resolve
         HashMap<'K, 'V>(comparer, MapNode.unionWith<'K, 'V> comparer resolve root other.Root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.UnionWithV(other : HashMap<'K, 'V>, resolve : 'K -> 'V -> 'V -> voption<'V>) =
         let resolve = resolve
         HashMap<'K, 'V>(comparer, MapNode.unionWithV<'K, 'V> comparer resolve root other.Root)
@@ -3904,14 +3655,11 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
     // Creators: Empty/Singleton/OfList/OfSeq/etc.
     // ====================================================================================
     static member Empty = HashMap<'K, 'V>(DefaultEqualityComparer<'K>.Instance, null)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member Single(key : 'K, value : 'V) : HashMap<'K, 'V> =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let hash = uint32 (cmp.GetHashCode key) &&& 0x7FFFFFFFu
         HashMap(cmp, MapLeaf(hash, key, value, null))
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfSeq(elements : seq<'K * 'V>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
@@ -3919,23 +3667,18 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfList(elements : list<'K * 'V>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for (k, v) in elements do 
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArray(elements : ('K * 'V)[]) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for (k, v) in elements do 
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArrayRange(elements: array<'K * 'V>, offset: int, length: int) =  
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable i = offset
@@ -3946,9 +3689,6 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
             root <- MapNode.addInPlace' cmp k v root
             i <- i + 1
         HashMap<'K, 'V>(cmp, root)
-        
-    #if !FABLE_COMPILER
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArrayRange(elements: array<struct('K * 'V)>, offset: int, length: int) =  
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable i = offset
@@ -3960,7 +3700,6 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
             i <- i + 1
         HashMap<'K, 'V>(cmp, root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfSeq(elements : seq<struct('K * 'V)>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
@@ -3968,121 +3707,78 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfList(elements : list<struct('K * 'V)>) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for struct(k, v) in elements do 
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     static member OfArray(elements : struct('K * 'V)[]) =
         let cmp = DefaultEqualityComparer<'K>.Instance
         let mutable root = null
         for struct(k, v) in elements do 
             root <- MapNode.addInPlace' cmp k v root
         HashMap<'K, 'V>(cmp, root)
-        
-    #endif
 
     // ====================================================================================
     // Accessors: GetKeys/CopyTo/ToList/etc.
     // ====================================================================================
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.GetKeys() = HashSet<'K>(comparer, root)
-        
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToList() : list<'K * 'V> = MapNode.toList [] root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToListV() : list<struct('K * 'V)> = MapNode.toListV [] root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToKeyList() = SetNode.toList [] root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToValueList() : list<'V> = MapNode.toValueList [] root
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.CopyTo(array : ('K * 'V)[], startIndex : int) =
         MapNode.copyTo array startIndex root |> ignore
-            
-    #if !FABLE_COMPILER
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.CopyTo(array : struct('K * 'V)[], startIndex : int) =
         MapNode.copyToV array startIndex root |> ignore
-            
-    #endif
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.CopyKeysTo(array : 'K[], startIndex : int) =
         SetNode.copyTo array startIndex root |> ignore
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.CopyValuesTo(array : 'V[], startIndex : int) =
         MapNode.copyValuesTo array startIndex root |> ignore
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToArray() =
         let array = Array.zeroCreate<'K * 'V> (size root)
         MapNode.copyTo array 0 root |> ignore
         array
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToArrayV() =
         let array = Array.zeroCreate<struct('K * 'V)> (size root)
         MapNode.copyToV array 0 root |> ignore
         array
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToValueArray() =
         let array = Array.zeroCreate<'V> (size root)
         MapNode.copyValuesTo array 0 root |> ignore
         array
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToKeyArray() =
         let array = Array.zeroCreate<'K> (size root)
         SetNode.copyTo array 0 root |> ignore
         array
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToSeq() =
         HashMapEnumerable(root, tupleGetter) :> seq<_>
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToSeqV() =
         HashMapEnumerable(root, valueTupleGetter) :> seq<_>
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToValueSeq() =
         HashMapEnumerable(root, valueGetter) :> seq<_>
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToKeySeq() =
         HashMapEnumerable(root, keyGetter) :> seq<_>
-            
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.ToKeyValueSeq() =
         HashMapEnumerable(root, kvpGetter) :> seq<_>
-         
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.GetEnumerator() = new HashMapEnumerator<'K, 'V, _>(root, tupleGetter)
-    
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member x.GetStructEnumerator() = new HashMapEnumerator<'K, 'V, _>(root, valueTupleGetter)
 
     interface System.Collections.IEnumerable with
         member x.GetEnumerator() = x.GetEnumerator() :> _
-            
     interface System.Collections.Generic.IEnumerable<'K * 'V> with
         member x.GetEnumerator() = x.GetEnumerator() :> _
-        
     interface System.Collections.Generic.IReadOnlyCollection<'K * 'V> with
         member x.Count = x.Count
-        
     interface System.Collections.Generic.ICollection<'K * 'V> with
         member x.IsReadOnly = true
         member x.Add(_) = failwith "readonly"
@@ -4096,7 +3792,6 @@ and [<Struct; DebuggerDisplay("Count = {Count}"); DebuggerTypeProxy(typedefof<Ha
         member x.CopyTo(dst : ('K * 'V)[], index : int) = x.CopyTo(dst, index)
 
 and [<Sealed>] internal HashMapProxy<'K, 'V>(map : HashMap<'K, 'V>) =
-    [<DebuggerBrowsable(DebuggerBrowsableState.RootHidden)>]
     member x.Items = 
         map.ToSeqV() 
         |> Seq.map (fun struct(k,v) -> KeyValuePairDebugFriendly(KeyValuePair(k, v))) 
@@ -4104,59 +3799,45 @@ and [<Sealed>] internal HashMapProxy<'K, 'V>(map : HashMap<'K, 'V>) =
         |> Seq.toArray
 
 and 
-    [<Sealed; DebuggerDisplay("{keyValue.Value}", Name = "[{keyValue.Key}]", Type = "")>]
+    [<Sealed>]
     internal KeyValuePairDebugFriendly<'K, 'V>(keyValue : KeyValuePair<'K, 'V>) =
 
-        [<DebuggerBrowsable(DebuggerBrowsableState.RootHidden)>]
         member x.KeyValue = keyValue
 
-[<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
-[<RequireQualifiedAccess>]
+
+
 module HashSet =
-    
     /// The empty set.
-    [<GeneralizableValue>]
     let empty<'T> = HashSet<'T>.Empty
 
     /// The number of elements in the set `O(1)`
     let inline count (set : HashSet<'T>) = set.Count
-    
     /// Is the set empty? `O(1)`
     let inline isEmpty (set : HashSet<'T>) = set.IsEmpty
-    
     /// Creates a set with a single entry.
     /// `O(1)`
     let inline single (element : 'T) = HashSet.Single(element)
-    
     /// Creates a set with all entries from the seq.
     /// `O(N)`
     let inline ofSeq (elements : seq<'T>) = HashSet.OfSeq elements
-    
     /// Creates a set with all entries from the Set.
     /// `O(N)`
     let inline ofSet (set: Set<'T>) = HashSet.OfSeq set
-    
     /// Creates a set with all entries from the list.
     /// `O(N)`
     let inline ofList (elements : list<'T>) = HashSet.OfList elements
-    
     /// Creates a set with all entries from the array.
     /// `O(N)`
     let inline ofArray (elements : 'T[]) = HashSet.OfArray elements
-    
     /// Adds the given value. `O(1)`
     let inline add (value : 'T) (set : HashSet<'T>) = set.Add(value)
-    
     /// Removes the given value. `O(1)`
     let inline remove (value : 'T) (set : HashSet<'T>) = set.Remove value
-    
     /// Tries to remove the given value from the set and returns the rest of the set.
     /// `O(1)`       
     let inline tryRemove (value : 'T) (set : HashSet<'T>) = set.TryRemove value
     let inline tryRemoveV (value : 'T) (set : HashSet<'T>) = set.TryRemoveV value
     let inline alter (value : 'T) (update : bool -> bool) (m : HashSet<'T>) = m.Alter(value, update)
-        
-        
     /// Applies the iter function to all entries of the set.
     /// `O(N)`
     let inline iter (action : 'T -> unit) (set : HashSet<'T>) = set.Iter action
@@ -4165,7 +3846,6 @@ module HashSet =
     /// Note that the order for elements is undefined.
     /// `O(N)`
     let inline fold (folder : 'S -> 'T -> 'S) (state : 'S) (set : HashSet<'T>) = set.Fold(folder, state)
-    
     /// Tests whether an entry making the predicate true exists.
     /// `O(N)`
     let inline exists (predicate : 'T -> bool) (set : HashSet<'T>) = set.Exists predicate
@@ -4173,7 +3853,6 @@ module HashSet =
     /// Tests whether all entries fulfil the given predicate.
     /// `O(N)`
     let inline forall (predicate : 'T -> bool) (set : HashSet<'T>) = set.Forall predicate
-    
     /// Creates a new set by applying the given function to all entries.
     /// `O(N)`
     let inline map (mapping : 'T -> 'U) (set : HashSet<'T>) = set.Map mapping
@@ -4181,11 +3860,9 @@ module HashSet =
     /// Creates a new set by applying the given function to all entries.
     /// `O(N)`
     let inline choose (mapping : 'T -> option<'U>) (set : HashSet<'T>) = set.Choose mapping
-    
     /// Creates a new set by applying the given function to all entries.
     /// `O(N)`
     let inline chooseV (mapping : 'T -> voption<'U>) (set : HashSet<'T>) = set.ChooseV mapping
-    
     /// Creates a new set that contains all entries for which predicate was true.
     /// `O(N)`
     let inline filter (predicate : 'T -> bool) (set : HashSet<'T>) = set.Filter predicate
@@ -4202,22 +3879,18 @@ module HashSet =
 
     /// Tests if an entry for the given key exists. `O(1)`
     let inline contains (value : 'T) (set : HashSet<'T>) = set.Contains value
-            
     /// Returns the first element in the set
     let inline head (set : HashSet<'T>) : 'T = set.First()
 
     /// Creates a seq holding all values.
     /// `O(N)`
     let inline toSeq (set : HashSet<'K>) = set :> seq<_>
-    
     /// Creates a list holding all values.
     /// `O(N)`
     let inline toList (set : HashSet<'K>) = set.ToList()
-    
     /// Creates an array holding all values.
     /// `O(N)`
     let inline toArray (set : HashSet<'K>) = set.ToArray()
-        
     /// Creates a Set holding all entries contained in the HashSet.
     /// `O(N * log N)`
     let inline toSet (set: HashSet<'T>) =
@@ -4226,22 +3899,17 @@ module HashSet =
     /// Creates a new set containing all elements from set1 and set2.
     /// `O(N + M)`  
     let inline union (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.UnionWith set2
- 
     /// Creates a new set containing all elements that are in set1 AND set2.
     /// `O(N + M)`  
     let inline intersect (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.IntersectWith set2
-    
     /// Creates a new set containing all elements that are either in set1 or set2 (but not in both)
     /// `O(N + M)`  
     let inline xor (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.SymmetricExceptWith set2
-    
     /// Creates a new set containing all elements from set1 that are not int set2.
     /// `O(N + M)`  
     let inline difference (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.ExceptWith set2
-    
     /// Returns the number of elements that are in both sets.
     let inline intersectionCount (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.IntersectionCount set2
-    
     /// Creates a new set containing all elements that are in at least one of the given sets.
     let unionMany (sets : #seq<HashSet<'T>>) =
         use e = sets.GetEnumerator()
@@ -4251,7 +3919,6 @@ module HashSet =
             s
         else
             empty
-            
     /// Creates a new set containing all elements that are in all the given sets.
     let intersectMany (sets : #seq<HashSet<'T>>) =
         use e = sets.GetEnumerator()
@@ -4264,7 +3931,6 @@ module HashSet =
 
     /// Checks if the two sets are equal. `O(N)`
     let inline equals (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.SetEquals set2
-    
     /// Checks if the two sets have at least one element in common. `O(N)`
     let inline overlaps (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.Overlaps set2
 
@@ -4280,44 +3946,33 @@ module HashSet =
     /// Checks if all elements from `set2` are in `set1` and `set1` contains at least one element that is not in `set3`. `O(N)`
     let inline isProperSuperset (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.IsProperSupersetOf set2
 
-[<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
-[<RequireQualifiedAccess>]
+
+
 module HashMap =
     /// the empty map.
-    [<GeneralizableValue>]
     let empty<'K, 'V> = HashMap<'K, 'V>.Empty
 
     /// The number of elements in the map `O(1)`
     let inline count (map : HashMap<'K, 'V>) = map.Count
-    
     /// Is the map empty? `O(1)`
     let inline isEmpty (map : HashMap<'K, 'V>) = map.IsEmpty
 
     /// Are the two maps equal? `O(min(N, M))`
     let inline equals (map1 : HashMap<'K, 'V>) (map2 : HashMap<'K, 'V>) = map1.Equals map2
-    
     /// Creates a map with a single entry. `O(1)`
     let inline single (key : 'K) (value : 'V) : HashMap<'K, 'V> = HashMap.Single(key, value)
-    
     /// Creates a map with all entries from the seq. `O(N)`
     let inline ofSeq (elements : seq<'K * 'V>) = HashMap.OfSeq elements
-    
     /// Creates a map with all entries from the list. `O(N)`
     let inline ofList (elements : list<'K * 'V>) = HashMap.OfList elements
-    
     /// Creates a map with all entries from the array. `O(N)`
     let inline ofArray (elements : ('K * 'V)[]) = HashMap.OfArray elements
-    
-    #if !FABLE_COMPILER
     /// Creates a map with all entries from the seq. `O(N)`
     let inline ofSeqV (elements : seq<struct('K * 'V)>) = HashMap.OfSeq elements
-    
     /// Creates a map with all entries from the list. `O(N)`
     let inline ofListV (elements : list<struct('K * 'V)>) = HashMap.OfList elements
-    
     /// Creates a map with all entries from the array. `O(N)`
     let inline ofArrayV (elements : struct('K * 'V)[]) = HashMap.OfArray elements
-    #endif
 
     /// Creates a map with all entries from the map. `O(N)`
     let inline ofMap (elements : Map<'K, 'V>) = elements |> Map.toSeq |> HashMap.OfSeq
@@ -4327,7 +3982,6 @@ module HashMap =
 
     /// Removes the entry for the given key. `O(1)`
     let inline remove k (m : HashMap<'K, 'V>) = m.Remove k
- 
     /// Tries to remove the entry for the given key from the map and returns its value and the rest of the map.
     /// `O(1)`
     let inline tryRemove k (m : HashMap<'K, 'V>) = m.TryRemove k
@@ -4336,29 +3990,24 @@ module HashMap =
     /// `O(1)`
     let inline tryRemoveV k (m : HashMap<'K, 'V>) = m.TryRemoveV k
 
-    
     /// Adds, deletes or updates the entry for the given key.
     /// The update functions gets the optional old value and may optionally return
     /// A new value (or None for deleting the entry).
     /// `O(1)`
     let inline alter k update (m : HashMap<'K, 'V>) = m.Alter(k, update)
-    
     /// Adds, deletes or updates the entry for the given key.
     /// The update functions gets the optional old value and may optionally return
     /// A new value (or None for deleting the entry).
     /// `O(1)`
     let inline alterV k update (m : HashMap<'K, 'V>) = m.AlterV(k, update)
-    
     /// Adds or updates the entry for the given key.
     /// The update functions gets the optional old value and returns a new value for the key.
     /// `O(1)`
     let inline update k update (m : HashMap<'K, 'V>) = m.Alter(k, update >> Some)
-    
     /// Adds or updates the entry for the given key.
     /// The update functions gets the optional old value and returns a new value for the key.
     /// `O(1)`
     let inline updateV k update (m : HashMap<'K, 'V>) = m.AlterV(k, update >> ValueSome)
-    
     /// Tests if an entry for the given key exists. `O(1)`
     let inline containsKey k (m : HashMap<'K, 'V>) = m.ContainsKey k
 
@@ -4369,7 +4018,6 @@ module HashMap =
     /// Tries to find the value for the given key.
     /// `O(1)`
     let inline tryFindV k (m : HashMap<'K, 'V>) = m.TryFindV k
-    
     /// Finds the value for the given key and raises KeyNotFoundException on failure.
     /// `O(1)`
     let inline find k (m : HashMap<'K, 'V>) = 
@@ -4380,31 +4028,24 @@ module HashMap =
     /// Tests whether all entries fulfil the given predicate.
     /// `O(N)`
     let inline forall predicate (m : HashMap<'K, 'V>) = m.Forall predicate
-    
     /// Tests whether an entry making the predicate true exists.
     /// `O(N)`
     let inline exists predicate (m : HashMap<'K, 'V>) = m.Exists predicate
-    
     /// Creates a new map (with the same keys) by applying the given function to all entries.
     /// `O(N)`
     let inline map mapping (m : HashMap<'K, 'V>) = m.Map mapping
-    
     /// Creates a new map (with the same keys) by applying the given function to all entries.
     /// `O(N)`
     let inline choose mapping (m : HashMap<'K, 'V>) = m.Choose mapping
-    
     /// Creates a new map (with the same keys) by applying the given function to all entries.
     /// `O(N)`
     let inline chooseV mapping (m : HashMap<'K, 'V>) = m.ChooseV mapping
-    
     /// Creates a new map (with the same keys) that contains all entries for which predicate was true.
     /// `O(N)`
     let inline filter predicate (m : HashMap<'K, 'V>) = m.Filter predicate
-    
     /// Applies the iter function to all entries of the map.
     /// `O(N)`
     let inline iter (action : 'K -> 'V -> unit) (m : HashMap<'K, 'V>) = m.Iter(action)
-    
     /// Folds over all entries of the map.
     /// Note that the order for elements is undefined.
     /// `O(N)`
@@ -4412,13 +4053,11 @@ module HashMap =
 
     /// Creates a list holding all tuples contained in the map. `O(N)`
     let inline toList (m : HashMap<'K, 'V>) = m.ToList()
-    
     /// Creates a list holding all tuples contained in the map. `O(N)`
     let inline toListV (m : HashMap<'K, 'V>) = m.ToListV()
 
     /// Creates a list holding all keys contained in the map. `O(N)`
     let inline toKeyList (m : HashMap<'K, 'V>) = m.ToKeyList()    
-    
     /// Creates a list holding all values contained in the map. `O(N)`
     let inline toValueList (m : HashMap<'K, 'V>) = m.ToValueList()
 
@@ -4448,42 +4087,32 @@ module HashMap =
 
     /// Creates a Map holding all tuples contained in the map. `O(N * log N)`
     let inline toMap (m : HashMap<'K, 'V>) = m.ToSeq() |> Map.ofSeq
-    
     /// Creates a HashSet holding all keys contained in the map. `O(1)`
     let inline keys (m : HashMap<'K, 'V>) = m.GetKeys()
 
     /// Applies the given mapping function to all elements of the two maps. `O(N + M)`
     let inline choose2V (mapping : 'K -> voption<'T1> -> voption<'T2> -> voption<'R>) (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.Choose2V(r, mapping)
-    
     /// Applies the given mapping function to all elements of the two maps. `O(N + M)`
     let inline choose2 (mapping : 'K -> option<'T1> -> option<'T2> -> option<'R>) (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.Choose2(r, mapping)
-    
     /// returns only the keys that are in both maps together with their tuples values. `O(N + M)`
     let inline intersect (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.Intersect(r)
-    
     /// Applies the given mapping function to overlapping elements of the two maps. `O(N + M)`
     let inline intersectWith (mapping : 'K -> 'T1 -> 'T2 -> 'R) (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.IntersectWith(r, mapping)
-    
     /// Returns the number of elements that are in both sets.
     let inline intersectionCount (map1 : HashMap<'K, 'T1>) (map2 : HashMap<'K, 'T2>) = map1.IntersectionCount map2
-    
     /// Applies the given mapping function to all elements of the two maps. `O(N + M)`
     let inline map2V (mapping : 'K -> voption<'T1> -> voption<'T2> -> 'R) (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.Map2V(r, mapping)
-    
     /// Applies the given mapping function to all elements of the two maps. `O(N + M)`
     let inline map2 (mapping : 'K -> option<'T1> -> option<'T2> -> 'R) (l : HashMap<'K, 'T1>) (r : HashMap<'K, 'T2>) = l.Map2(r, mapping)
 
-    
     /// Creates a new map containing all elements from l and r.
     /// Colliding entries are taken from r.
     /// `O(N + M)`  
     let inline union (map1 : HashMap<'K, 'V>) (map2 : HashMap<'K, 'V>) = map1.UnionWith(map2)
-    
     /// Creates a new map containing all elements from l and r.
     /// Colliding entries are resolved using the given function.
     /// `O(N + M)`  
     let inline unionWith (resolve : 'K -> 'V -> 'V -> 'V) (map1 : HashMap<'K, 'V>) (map2 : HashMap<'K, 'V>) = map1.UnionWith(map2, resolve)
-    
     /// Creates a new map by unioning all the given maps.
     let unionMany (maps : #seq<HashMap<'K, 'V>>) = 
         use e = maps.GetEnumerator()
