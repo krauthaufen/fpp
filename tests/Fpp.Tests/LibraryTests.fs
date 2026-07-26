@@ -53,8 +53,8 @@ let stdlibTests =
         test "MapExt Map + Set (AVL tree, 62 assertions incl. randomised model diff) match F#" {
             oracleFile "stdlib/mapext.fpp" "module Stdlib"
         }
-        test "Map/Set modules (patricia trie, F++ source) match F#" {
-            oracleFile "stdlib/map.fpp" "module Stdlib"
+        test "HashMap + HashSet (patricia trie, 44 assertions incl. randomised model diff) match F#" {
+            oracleFile "stdlib/hashmap.fpp" "module Stdlib"
         }
     ]
 

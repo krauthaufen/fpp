@@ -125,7 +125,12 @@ stage ends with something running in CI. Status legend: `[ ]` open,
       ofList) + **Set** on the same tree; tests: per-function edges, AVL
       invariants, ordering, laws, and a 400-op randomised differential
       against an assoc-list model — 62 assertions, all matching F#
-- [~] `stdlib/map.fpp`: HashMap-style Map + Set (patricia trie) in F++ over the patricia trie
+- [~] `stdlib/hashmap.fpp`: **HashMap + HashSet** core (patricia trie) with
+      the same operator vocabulary as Map/Set (add/remove/alter/change/
+      update/tryFind/containsKey/findOr/fold/map/mapValues/filter/choose/
+      exists/forall/partition/union/unionWith/intersect/intersectWith/
+      difference/choose2/map2/keys/values/toList/ofList); 44 assertions
+      incl. a 500-op randomised differential against an assoc-list model over the patricia trie
       (add/remove/tryFind/containsKey/fold/toList/ofList; Set union), all
       oracle-verified against F#
 - [~] `stdlib/list.fpp`: List module written IN F++ (length/rev/map/filter/
