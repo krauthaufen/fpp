@@ -16,13 +16,10 @@ type Classification =
 
 /// `isStructName` decides which type names are value types needing layout.
 let classify (isStructName : string -> bool) (inst : string list) : Classification =
-    // "" = the use sits inside a generic body and instantiates at the
-    // ENCLOSING function's type variable. Sound answer today: the shared
-    // (canonical) body — the callee runs on the uniform representation.
-    // Completing tier-1 means substituting the caller's instantiation into
-    // these nested demands when the caller is itself stamped, so a struct
-    // instantiation propagates all the way down instead of stopping here.
-    if inst |> List.exists (fun t -> t = "") then Canon
+    // "#id" = instantiated at the enclosing binding's type variable. In the
+    // UNSTAMPED generic body that is exactly the canonical (uniform) case;
+    // inside a stamped clone these have already been substituted away.
+    if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then Canon
     elif inst |> List.exists isStructName then Stamp inst
     else Canon
 
@@ -87,10 +84,18 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
 
     // rewrite EVarI uses: struct instantiations point at the stamped clone,
     // reference instantiations keep the shared body
-    let rewrite (owner : string) (e : Expr) : Expr =
+    let rewrite (owner : string) (subst : Dict<string, string>) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
-            | EVarI (v, sch, inst) ->
+            | EVarI (v, sch, inst0) ->
+                // propagate the caller's instantiation into nested demands
+                let inst =
+                    inst0 |> List.map (fun t ->
+                        if t.StartsWith "#" then
+                            match dictTryFind subst t with
+                            | Some concrete -> concrete
+                            | None -> t
+                        else t)
                 (match classify isStructName inst with
                  | Canon -> EVar (v, sch)
                  | Unclassifiable why ->
@@ -107,15 +112,20 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                           EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (hash mangled) % 1000000)
                                   Name = mangled }, substScheme i sch)
                       | None ->
-                          // no body available (imported without IR): the
-                          // shared body is the only sound choice
+                          // a struct instantiation whose body we cannot see
+                          // would have to run on the uniform representation:
+                          // that is a silent deoptimization, so it is an error
+                          vecAdd errors
+                            ("cannot specialize '" + v.Name + "' at struct instantiation <"
+                             + String.concat ", " i + "> in " + owner
+                             + ": the body is not available for stamping")
                           EVar (v, sch)))
             | other -> other)
 
     let out = vecNew<Decl> ()
     for d in decls do
         match d with
-        | DLet (rc, v, sch, e) -> vecAdd out (DLet (rc, v, sch, rewrite v.Name e))
+        | DLet (rc, v, sch, e) -> vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) e))
         | other -> vecAdd out other
 
     // transitive closure: stamping a clone may demand further stamps
@@ -126,7 +136,13 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
          | Some (rc, v, sch, e) ->
              let mangled = mangleInst v.Name inst
              let nv = { Path = v.Path; Offset = v.Offset + 7000000 + (abs (hash mangled) % 1000000); Name = mangled }
-             let clone = DLet (rc, nv, substScheme inst sch, rewrite mangled e)
+             // map the callee's quantified vars to this instantiation so
+             // demands nested in the body specialize too
+             let subst = dictNew<string, string> ()
+             if sch.Quantified.Length = inst.Length then
+                 List.zip sch.Quantified inst
+                 |> List.iter (fun (qv, n) -> dictSet subst ("#" + string qv.Id) n)
+             let clone = DLet (rc, nv, substScheme inst sch, rewrite mangled subst e)
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1

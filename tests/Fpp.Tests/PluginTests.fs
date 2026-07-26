@@ -223,3 +223,31 @@ let monoTests =
             Expect.equal (Fpp.Core.Link.classify isStruct [ "int" ]) Fpp.Core.Link.Canon "int shares (i31)"
         }
     ]
+
+[<Tests>]
+let monoPropagationTests =
+    testList "monomorphization: propagation" [
+        test "a stamped clone specializes the generic calls inside it" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let wrap (x : 'a) = x"
+                    "let outer (y : 'b) = wrap (wrap y)"
+                    "let a = outer { X = 1.0; Y = 2.0 }"
+                    "let b = print (outer 5)"
+                    "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "compiles"
+            let defsOf (needle : string) =
+                wat.Split([| needle + " (param" |], System.StringSplitOptions.None).Length - 1
+            Expect.equal (defsOf "_outer_V2d") 1 "outer stamped at V2d"
+            // the nested generic call inherits the caller's instantiation
+            Expect.equal (defsOf "_wrap_V2d") 1 "inner call specialized too"
+            // int goes through the shared bodies, no clones
+            Expect.equal (defsOf "_outer_int") 0 "reference/immediate uses share"
+            Expect.equal (defsOf "_wrap_int") 0 "reference/immediate uses share"
+        }
+    ]

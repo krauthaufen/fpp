@@ -995,6 +995,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             fresh |> List.map (fun f ->
                 match prune f with
                 | TCon (n, _) -> n
+                // still a variable: this use sits inside a generic body and
+                // instantiates at the ENCLOSING binding's type variable —
+                // name it so stamping can substitute the caller's argument
+                | TVar v -> "#" + string v.Id
                 | _ -> ""))
       ArrKinds =
         vecToList arrKindsRaw
