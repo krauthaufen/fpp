@@ -70,13 +70,27 @@ hierarchy (SetLinked, MapLinked, SetNode, SetLeaf, MapLeaf, Inner, with
 generic inheritance, property accessors, packed uint32 tag bits and the
 NodeKind enum) — now parse and typecheck with zero diagnostics. The first
 error was line 24 before this work.
-Remaining blockers, in source order from line 184:
-- [ ] `IEqualityComparer<'K>` and the other BCL interfaces: need F++
-      counterparts (GetHashCode/Equals/reference equality)
-- [ ] struct tuples: `let struct(ok, node) = ...`
-- [ ] `isNull` / null-as-empty (`AllowNullLiteral`): empty case as
-      `ref.null`, test as `ref.is_null`
+The single remaining blocker is now **struct tuples** (`struct(ok, node)`
+as an expression and as a pattern, from line 193). Deliberately NOT
+implemented as a heap tuple: `struct(...)` is the user stating a
+representation, exactly the kind of intent that must not be silently
+downgraded. Doing it properly means multi-value returns generalised from
+the existing POD-result path to arbitrary (including reference) elements,
+plus a distinct type constructor so `struct(a,b)` and `(a,b)` do not
+unify. That is its own piece of work, on the scale of the class stack.
+
+Also still open (not yet reached by the target): `member val`,
+`static let`, operators as members, interface inheritance,
+`Unchecked.defaultof`.
+
 Earlier items, now done:
+- [x] `IEqualityComparer<'a>` in the builtin prelude, satisfiable with an
+      object expression. Fixed a real bug on the way: a generic interface
+      (`IEqualityComparer<int>`) was registered under its type ARGUMENT,
+      so every generic interface implementation was misfiled.
+- [x] null as empty: `null` was lowering to unit — a real value, silently
+      wrong. It is now `ref.null`, with `isNull`, null patterns, and
+      `$equal` treating null as equal only to null.
 - [x] `uint32`: literals (`1u`, `0xABCDu`), the type, unsigned ops
       (`/ % < > <= >= >>>` emit `i32.*_u`), `int`/`uint32` conversions as
       bit-preserving primitives, unsigned printing. Same i32 payload as
