@@ -136,6 +136,9 @@ let emit (decls : Decl list) : EmitResult =
     let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
     // extern signatures: param/result kinds derived from the scheme.
     // "i" = int (i32 ABI, wrapped), "r" = reference/other (opaque anyref)
+    // scalar-typed signatures: (paramKinds, resultKind) for top-level fns
+    // whose scheme is monomorphic in the scalar positions
+    let sigKinds = dictNew<string * int, string list * string> ()
     let externs = dictNew<string * int, string list * string> ()
     let rec arrowArity (t : Fpp.Analysis.Types.Type) : int =
         match Fpp.Analysis.Types.prune t with
@@ -153,11 +156,28 @@ let emit (decls : Decl list) : EmitResult =
             let ps, r = abiSig b
             abiKind a :: ps, r
         | r -> [], abiKind r
+    let scalarKindOfTy (t : Fpp.Analysis.Types.Type) : string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TCon ("float", []) -> "f"
+        | Fpp.Analysis.Types.TCon ("float32", []) -> "s"
+        | Fpp.Analysis.Types.TCon ("int64", []) -> "l"
+        | _ -> "u"
+    let rec splitArrow (n : int) (t : Fpp.Analysis.Types.Type) : string list * string =
+        if n = 0 then [], scalarKindOfTy t
+        else
+            match Fpp.Analysis.Types.prune t with
+            | Fpp.Analysis.Types.TFun (a, b) ->
+                let ps, r = splitArrow (n - 1) b
+                scalarKindOfTy a :: ps, r
+            | other -> [], scalarKindOfTy other
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) ->
+        | DLet (_, v, sch, ELam (ps, _)) ->
             dictSet topArity (v.Path, v.Offset) ps.Length
             dictSet topName (v.Path, v.Offset) (mangle v)
+            let pk, rk = splitArrow ps.Length sch.Body
+            if pk.Length = ps.Length && (rk <> "u" || List.exists (fun k -> k <> "u") pk) then
+                dictSet sigKinds (v.Path, v.Offset) (pk, rk)
         | DLet (_, v, _, _) ->
             dictSet topName (v.Path, v.Offset) (mangle v)
         | DExtern (v, sch) ->
@@ -288,6 +308,10 @@ let emit (decls : Decl list) : EmitResult =
         | EIndex (nm, _, _) ->
             let k = primKindOf nm
             if k = "f" || k = "s" || k = "l" then k else "u"
+        | EApp (EVar (v, _), args) ->
+            (match dictTryFind sigKinds (v.Path, v.Offset), dictTryFind topArity (v.Path, v.Offset) with
+             | Some (_, rk), Some ar when ar = args.Length -> rk
+             | _ -> "u")
         | ELet (_, _, _, _, body) -> kindOf body
         | ESeq xs -> (match List.tryLast xs with Some x -> kindOf x | None -> "u")
         | EIf (_, t, f) ->
@@ -407,7 +431,17 @@ let emit (decls : Decl list) : EmitResult =
                  if rk = "i" then "(call $ofi " + call + ")" else call
              | None ->
             let op = if tail then "return_call" else "call"
-            "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")")
+            match dictTryFind sigKinds (v.Path, v.Offset) with
+            | Some (pks, rk) when pks.Length = args.Length ->
+                let wrapped =
+                    List.zip pks args
+                    |> List.map (fun (k, a) -> if k = "u" then recur a else unboxK k (recur a))
+                // tail calls need matching result types; a boxed result
+                // means the raw call cannot be a tail call
+                let opv = if rk = "u" then op else "call"
+                let call = "(" + opv + " " + fname + " " + String.concat " " wrapped + ")"
+                if rk = "u" then call else boxK rk call
+            | _ -> "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")")
         | EApp (f, args) ->
             let mutable w = recur f
             for a in args do
@@ -1268,13 +1302,23 @@ let emit (decls : Decl list) : EmitResult =
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
+            let pks, rk =
+                match dictTryFind sigKinds (v.Path, v.Offset) with
+                | Some (pk, r) -> pk, r
+                | None -> List.replicate ps.Length "u", "u"
             let locals = dictNew<string * int, string> ()
-            ps |> List.iteri (fun i (pv, _) -> dictSet locals (pv.Path, pv.Offset) ("$a" + string i))
+            ps |> List.iteri (fun i (pv, _) ->
+                dictSet locals (pv.Path, pv.Offset) ("$a" + string i)
+                dictSet localKinds (pv.Path, pv.Offset) (List.item i pks))
             let extra = vecNew<string * string> ()
-            let bodyW = compileExpr locals extra (dictNew ()) true body
-            let ps' = ps |> List.mapi (fun i _ -> "(param $a" + string i + " anyref)") |> String.concat " "
+            let bodyRaw = compileExpr locals extra (dictNew ()) (rk = "u") body
+            let bodyW = if rk = "u" then bodyRaw else unboxK rk bodyRaw
+            let ps' =
+                ps |> List.mapi (fun i _ -> "(param $a" + string i + " " + wasmTyOf (List.item i pks) + ")")
+                |> String.concat " "
+            let resTy = wasmTyOf rk
             let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
-            line ("  (func " + fname + " " + ps' + " (result anyref) " + localDecls + " " + bodyW + ")")
+            line ("  (func " + fname + " " + ps' + " (result " + resTy + ") " + localDecls + " " + bodyW + ")")
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
