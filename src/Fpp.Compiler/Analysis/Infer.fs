@@ -23,7 +23,10 @@ type InferResult =
       /// "l"=int64 "t"=string ""=int/other — drives typed prim emission
       OpKinds : (int * string) list
       /// array-site offset -> element type name (for flat struct arrays)
-      ArrKinds : (int * string) list }
+      ArrKinds : (int * string) list
+      /// use offset -> concrete type per quantified var of the callee's
+      /// scheme (tier-1 specialization demands; "" when not concrete)
+      InstSites : (int * string list) list }
 
 type FieldInfo =
     { TypeName : string
@@ -46,6 +49,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
     let arrKindsRaw = vecNew<int * Type> ()
+    let instRaw = vecNew<int * Type list> ()
     let defSchemes = dictNew<int, Scheme> ()
     let defTypes = vecNew<int * int * Type> ()
 
@@ -62,6 +66,28 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// freshened over ALL their variables (not just quantified ones), so
     /// residual free variables — value restriction, inference gaps — can
     /// never let one file's unifications contaminate another file.
+    /// Instantiate, reporting the fresh var used for each quantified var so
+    /// the call site becomes a specialization demand once solving finishes.
+    let instantiateTracked (sch : Scheme) : Type * Type list =
+        if List.isEmpty sch.Quantified then sch.Body, []
+        else
+            let subst = dictNew<int, Type> ()
+            let fresh = sch.Quantified |> List.map (fun v ->
+                let f = st.Fresh ()
+                dictSet subst v.Id f
+                f)
+            let rec go (t : Type) : Type =
+                match prune t with
+                | TVar v -> (match dictTryFind subst v.Id with Some f -> f | None -> TVar v)
+                | TCon (n, args) -> TCon (n, List.map go args)
+                | TFun (a, b) -> TFun (go a, go b)
+                | TTuple ts -> TTuple (List.map go ts)
+            go sch.Body, fresh
+
+    let schemeOfDef (d : Resolve.Definition) : Scheme option =
+        if d.Path = path then dictTryFind defSchemes d.Offset
+        else dictTryFind shared (d.Path + ":" + string d.Offset)
+
     let instantiateFor (d : Resolve.Definition) : Type option =
         if d.Path = path then
             dictTryFind defSchemes d.Offset |> Option.map st.Instantiate
@@ -353,9 +379,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some t when (tokensOf n |> List.head).Kind = Ident ->
                      (match dictTryFind useDefs t.Offset with
                       | Some d ->
-                          (match instantiateFor d with
-                           | Some t -> t
-                           | None -> st.Fresh ())
+                          (match schemeOfDef d with
+                           | Some sc when not (List.isEmpty sc.Quantified) && d.Path = path ->
+                               let ty, fresh = instantiateTracked sc
+                               vecAdd instRaw (t.Offset, fresh)
+                               ty
+                           | _ ->
+                               match instantiateFor d with
+                               | Some ty -> ty
+                               | None -> st.Fresh ())
                       | None -> st.Fresh ())
                  | _ -> st.Fresh ())   // quote-ident type variable
             | AppExpr ->
@@ -956,6 +988,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         vecToList opKindsRaw
         |> List.map (fun (off, ty) -> off, kindOf ty)
         |> List.filter (fun (_, k) -> k <> "")
+      InstSites =
+        vecToList instRaw
+        |> List.map (fun (off, fresh) ->
+            off,
+            fresh |> List.map (fun f ->
+                match prune f with
+                | TCon (n, _) -> n
+                | _ -> ""))
       ArrKinds =
         vecToList arrKindsRaw
         |> List.choose (fun (off, ty) ->

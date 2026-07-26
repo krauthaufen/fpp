@@ -179,3 +179,29 @@ let inferSelfTests =
             Expect.equal diags 0 "zero type diagnostics on own sources"
         }
     ]
+
+[<Tests>]
+let instantiationTests =
+    testList "specialization demands" [
+        test "each use of a polymorphic binding records its instantiation" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp"
+                (String.concat "\n" [
+                    "module M"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let id2 (x : 'a) = x"
+                    "let a = id2 5"
+                    "let b = id2 \"s\""
+                    "let c = id2 { X = 1.0; Y = 2.0 }"
+                    "" ])
+            let inf = ws.TypeCheck "t.fpp"
+            let seen = inf.InstSites |> List.map snd |> List.sort
+            Expect.equal seen [ [ "V2d" ]; [ "int" ]; [ "string" ] ] "one demand per use, concrete"
+        }
+        test "monomorphic bindings record nothing" {
+            let ws = Workspace()
+            ws.SetFileText "t.fpp" "module M\nlet f (x : int) = x + 1\nlet a = f 1\nlet b = f 2\n"
+            Expect.isEmpty (ws.TypeCheck "t.fpp").InstSites "no demands for monomorphic code"
+        }
+    ]
