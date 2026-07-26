@@ -729,6 +729,20 @@ let oracleTests =
             "let d = print (string (0 - 7))"
             "let e = print (\"n=\" + string 1234567)"
         ]
+        oracle "constructor overloading: primary plus explicit new" [
+            "type Range(lo : int, hi : int) ="
+            "    let mutable a = lo"
+            "    let mutable b = hi"
+            "    new(single : int) = Range(single, single)"
+            "    member _.Lo = a"
+            "    member _.Hi = b"
+            "    member _.Span = b - a"
+            "let r1 = Range(3, 9)"
+            "let r2 = Range(5)"
+            "let a = print r1.Span"
+            "let b = print r2.Span"
+            "let c = print r2.Lo"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

@@ -21,6 +21,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
           (arrKinds : Dict<int, string>) (instSites : Dict<int, string list>)
           (memberSites : Dict<int, string>) (fieldOwners : Dict<int, string>)
+          (ctorSites : Dict<int, int>)
           (projectMembers : Dict<string, Resolve.Definition>)
           (ifaces : Dict<string, (string * int) list>) : LowerResult =
 
@@ -283,6 +284,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: args ->
                      let f = lowerExpr (GNode head)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
+                     // a type with several constructors: inference chose one
+                     let overloaded =
+                         if head.NodeKind <> IdentExpr then None
+                         else
+                             match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
+                             | Some ht ->
+                                 (match dictTryFind ctorSites ht.Offset with
+                                  | Some coff -> dictTryFind defsAt coff
+                                  | None -> None)
+                             | None -> None
+                     match overloaded with
+                     | Some cd -> EApp (EVar (varIdOf cd, schemeOf cd), loweredArgs)
+                     | None ->
                      (match f, loweredArgs with
                       // `recv.M args`: the member access already applied the
                       // receiver, so fold the arguments into that same call
@@ -1062,7 +1076,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | None -> "?"
                     Some (nameTok.Text, tyName)
                 | None -> None)
-        let newCtorNode = allMemberNodes |> List.tryFind isNewCtor
+        let newCtorNodes = allMemberNodes |> List.filter isNewCtor
+        let newCtorNode = List.tryHead newCtorNodes
         let memberNodes = allMemberNodes |> List.filter (fun m -> not (isVal m) && not (isNewCtor m))
         let ctorPat = nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind)
         // `inherit Base(args)`: the base contributes the object's prefix
@@ -1150,31 +1165,44 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.filter (fun (v, _) ->
                 not (allFields |> List.exists (fun (w, _) -> w.Name = v.Name && w.Offset > v.Offset)))
 
+        // Mirrors inference: with no primary constructor the FIRST `new` is
+        // what the type name denotes; the rest live at their own keyword.
+        let ctorDefOf (isFirst : bool) (nc : GreenNode) =
+            if isFirst && ctorPat.IsNone then
+                tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
+            else
+                tokensOf nc |> List.tryFind (fun t -> t.Kind = Keyword && t.Text = "new")
+                |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
+        // `new(...)` constructors: a type may declare several, and each is
+        // its own function so a call site can pick between them
+        let emitExplicitCtors () =
+            newCtorNodes
+            |> List.iteri (fun i nc ->
+                match ctorDefOf (i = 0) nc with
+                | Some cd ->
+                    let ps = nodesOf nc |> List.filter (fun m -> isPatKind m.NodeKind)
+                    let bodies = nodesOf nc |> List.filter (fun m -> isExprish m.NodeKind)
+                    let body =
+                        match lowerBlock bodies with
+                        | ERecord (rn, fs) when rn = "?" -> ERecord (name, fs)
+                        | other -> other
+                    let rhs =
+                        match paramBinds ps with
+                        | binds, [] -> ELam (binds, body)
+                        | _, structured ->
+                            let arg = { Path = path; Offset = cd.Offset + 600000; Name = "_arg" }
+                            let asch = mono (TCon ("?", []))
+                            (match structured with
+                             | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
+                             | pps -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ])))
+                    vecAdd decls (DLet (false, varIdOf cd, schemeOf cd, rhs))
+                | None -> ())
+
         if not (List.isEmpty valFields) then
             // declared storage: the type IS these fields
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, valFields, pendingStruct))
-            (match newCtorNode, tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
-             | Some nc, Some tyDef ->
-                 let ps = nodesOf nc |> List.filter (fun m -> isPatKind m.NodeKind)
-                 let bodies =
-                     nodesOf nc
-                     |> List.filter (fun m -> isExprish m.NodeKind)
-                 let body =
-                     match lowerBlock bodies with
-                     | ERecord (_, fs) -> ERecord (name, fs)
-                     | other -> other
-                 let rhs =
-                     match paramBinds ps with
-                     | binds, [] -> ELam (binds, body)
-                     | _, structured ->
-                         let arg = { Path = path; Offset = tyDef.Offset + 600000; Name = "_arg" }
-                         let asch = mono (TCon ("?", []))
-                         (match structured with
-                          | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
-                          | pps -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ])))
-                 vecAdd decls (DLet (false, varIdOf tyDef, schemeOf tyDef, rhs))
-             | _ -> ())
+            emitExplicitCtors ()
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)
             vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))
@@ -1208,6 +1236,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | ps -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ PTuple ps, None, body ])))
                 vecAdd decls (DLet (false, varIdOf tyDef, schemeOf tyDef, rhs))
             | _ -> ()
+            emitExplicitCtors ()
 
         // ---- members ----------------------------------------------------
         // every instance member lifts to a top-level function whose first

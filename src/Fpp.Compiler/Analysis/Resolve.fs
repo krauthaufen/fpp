@@ -423,6 +423,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         // `new(args) = ...` has no member name; its parameters and body are
         // walked like any other member's
         if n.Children |> List.exists (fun c -> match c with GToken t -> t.Kind = Keyword && t.Text = "new" | _ -> false) then
+            // an explicit constructor is its own definition, so a type may
+            // have several and a call site can pick between them
+            (match n.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Keyword && t.Text = "new" -> Some t | _ -> None) with
+             | Some nt -> dictSet memberDefs (owner + ".new@" + string nt.Offset) (defineAs DefMember "new" nt)
+             | None -> ())
             local (fun () ->
                 let mutable ctorEnv = env
                 for p in vecToList pats do ctorEnv <- bindPat DefParam ctorEnv p

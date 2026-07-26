@@ -31,6 +31,9 @@ type InferResult =
       /// names are not unique, so this — not the name — binds a dot-access
       /// to the member it calls.
       MemberSites : (int * string) list
+      /// application-head offset -> the definition offset of the chosen
+      /// constructor, when a type offers more than one
+      CtorSites : (int * int) list
       /// offset -> the OWNER type at its instantiation (`Pair$int$int`), for
       /// record construction and field access. Distinct from MemberSites,
       /// which names the declaring type for member dispatch.
@@ -60,7 +63,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
           (bases : Dict<string, Var list * Type>)
           (impls : Dict<string, string list>)
-          (structTypes : Dict<string, bool>) : InferResult =
+          (structTypes : Dict<string, bool>)
+          (ctors : Dict<string, (int * Scheme) list>) : InferResult =
     let st = TypeState()
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
@@ -188,6 +192,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable pendingStructAttr = false
     let memberSitesRaw = vecNew<int * string> ()
     let fieldOwnersRaw = vecNew<int * string> ()
+    let ctorSitesRaw = vecNew<int * int> ()
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
     let pendingDots = vecNew<int * Type * Type * string> ()
@@ -581,6 +586,54 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> None
                      match conversion with
                      | Some t -> t
+                     | None ->
+                     // A type may offer several constructors. Type the
+                     // arguments first, then take the one whose parameter
+                     // actually accepts them — F#'s overload resolution,
+                     // restricted to constructors.
+                     let ctorChoice =
+                         if head.NodeKind <> IdentExpr then None
+                         else
+                             match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
+                             | Some ht ->
+                                 (match dictTryFind useDefs ht.Offset with
+                                  | Some d when d.Kind = Resolve.DefType ->
+                                      (match dictTryFind ctors d.Name with
+                                       | Some cs when cs.Length > 1 -> Some (ht, cs)
+                                       | _ -> None)
+                                  | _ -> None)
+                             | None -> None
+                     match ctorChoice with
+                     | Some (ht, cs) ->
+                         let argTys =
+                             args |> List.filter (fun a -> isExprish a.NodeKind)
+                                  |> List.map (fun a -> exprType (GNode a))
+                         let argTy =
+                             match argTys with
+                             | [] -> tUnit
+                             | [ one ] -> one
+                             | many -> TTuple many
+                         let fits (sch : Scheme) =
+                             match prune (st.Instantiate sch) with
+                             | TFun (dom, res) ->
+                                 // a trial unification on a private copy:
+                                 // committing here would corrupt the others
+                                 let probe = st.Instantiate { Quantified = []; Body = argTy }
+                                 (match unify (st.Instantiate { Quantified = []; Body = dom }) probe with
+                                  | None -> Some res
+                                  | Some _ -> None)
+                             | _ -> None
+                         let chosen =
+                             cs |> List.tryPick (fun (o, sch) -> fits sch |> Option.map (fun _ -> o, sch))
+                         (match chosen with
+                          | Some (o, sch) ->
+                              vecAdd ctorSitesRaw (ht.Offset, o)
+                              (match prune (st.Instantiate sch) with
+                               | TFun (dom, res) -> unifyAt ht.Offset dom argTy; res
+                               | other -> other)
+                          | None ->
+                              vecAdd diags (ht.Offset, "no constructor of " + ht.Text + " accepts these arguments")
+                              st.Fresh ())
                      | None ->
                      let mutable funTy = exprType (GNode head)
                      let off =
@@ -1264,11 +1317,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | many -> TTuple many
                 for b in nodesOf m do
                     if isExprish b.NodeKind then exprType (GNode b) |> ignore
-                (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
-                 | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
-                     let ctorTy = TFun (argTy, selfTy)
-                     setScheme nameTok.Offset { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Body = ctorTy }
-                 | _ -> ())
+                let ctorTy = TFun (argTy, selfTy)
+                let csch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Body = ctorTy }
+                // With no primary constructor the FIRST `new` is what the
+                // type name denotes; any others live at their own keyword.
+                let prior = match dictTryFind ctors name with Some l -> l | None -> []
+                let typeTok = tokensOf n |> List.tryFind (fun t -> t.Kind = Ident)
+                let siteOffset =
+                    match typeTok with
+                    | Some tt when List.isEmpty prior && (dictTryFind defsAt tt.Offset).IsSome -> Some tt.Offset
+                    | _ ->
+                        tokensOf m
+                        |> List.tryFind (fun t -> t.Kind = Keyword && t.Text = "new")
+                        |> Option.map (fun t -> t.Offset)
+                (match siteOffset with
+                 | Some off ->
+                     setScheme off csch
+                     dictSet ctors name (prior @ [ off, csch ])
+                 | None -> ())
             | MemberDecl -> inferMember name vars (paramVarList ()) selfTy m
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
@@ -1297,6 +1363,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let ctorTy = TFun (ctorArgTy, selfTy)
                      let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Body = ctorTy }
                      setScheme nameTok.Offset sch
+                     let prior = match dictTryFind ctors name with Some l -> l | None -> []
+                     dictSet ctors name (prior @ [ nameTok.Offset, sch ])
                  | _ -> ())
             | _ -> ()
 
@@ -1516,6 +1584,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | _ -> ""))
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
+      CtorSites = vecToList ctorSitesRaw
       ArrKinds =
         vecToList arrKindsRaw
         |> List.choose (fun (off, ty) ->
