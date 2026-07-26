@@ -230,16 +230,13 @@ member replaces the generated one.
 
 Classes being reference-equal is not only faithful, it is what keeps
 structural equality total: a cyclic object graph would otherwise not
-terminate. Arrays are the one place we break with F# on purpose. An array
-is a mutable buffer whose whole point is to be passed to C or JS by
-address; structural equality on it is a trap — silently O(n), and wrong
-the moment someone mutates through a pinned pointer. Reference identity is
-what an array *is* here.
+terminate.
 
-Because the oracle gate compares against `dotnet fsi`, it can no longer
-arbitrate array equality: any such program legitimately differs. Oracle
-tests must not compare arrays with `=`, and this is the first entry in a
-list that must stay short and explicit.
+Arrays are the one place we break with F# on purpose, because their
+contents may change while their identity stays the same. The reasoning,
+and the rules governing any future departure, live in DIVERGENCES.md —
+including that the oracle gate cannot arbitrate such a case and each one
+needs a test asserting our own behaviour.
 
 **Dispatch splits along the boxing line.**
 

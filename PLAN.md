@@ -27,6 +27,11 @@ stage ends with something running in CI. Status legend: `[ ]` open,
   round-trips the whole compiler's own source — REACHED (editor wiring
   is a client-side config away: `dotnet run --project src/Fpp.Lsp`)
 
+Deliberate departures from F# are recorded in DIVERGENCES.md, each with
+its reason. The oracle gate cannot arbitrate them, so each carries a test
+asserting our own semantics ("deliberate divergences from F#" in
+EmitTests).
+
 ## Stage 2 — Names & types (the long one)
 - [x] Name resolution (modules, opens, shadowing) as queries — env-threading
       pass with module paths, exports/imports, `open`, qualified spine

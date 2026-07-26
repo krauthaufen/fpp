@@ -26,6 +26,32 @@ let private runProgram (src : string) : string =
     out
 
 [<Tests>]
+let divergenceGate =
+    // Entries in DIVERGENCES.md cannot be checked by the oracle: running
+    // them under dotnet fsi legitimately disagrees. They are asserted here
+    // against OUR stated semantics instead.
+    testList "deliberate divergences from F#" [
+        test "arrays are compared by reference, not structurally" {
+            // F# would print "structural" and "equal-content". An array's
+            // contents may change while its identity stays the same, and
+            // comparing one is O(n) hidden behind a symbol that looks free.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let a = [| 1; 2; 3 |]"
+                    "let b = [| 1; 2; 3 |]"
+                    "let c = a"
+                    "let x = print (if a = b then \"structural\" else \"reference\")"
+                    "let y = print (if a = c then \"same\" else \"different\")"
+                    "let m = a.[0] <- 99"
+                    "let z = print (if a = c then \"stable\" else \"changed\")"
+                    "" ])
+            Expect.equal out "reference\nsame\nstable\n"
+                "arrays equal only themselves, and stay equal to themselves across mutation"
+        }
+    ]
+
+[<Tests>]
 let noBoxGate =
     testList "representation gate" [
         test "vectors and primitive arrays are flat — no generic arrays, no dispatchers" {
