@@ -205,6 +205,24 @@ let oracleTests =
             "let e = print bs.[0].Tag"
             "let f = print bs.Length"
         ]
+        oracle "for-in over arrays (structs and primitives)" [
+            "[<Struct>]"
+            "type V2d = { X : float; Y : float }"
+            "let pts = [| { X = 1.5; Y = 2.5 }; { X = 3.0; Y = 4.0 } |]"
+            "let ints = [| 1; 2; 3; 4 |]"
+            "let s ="
+            "    let mutable acc = 0.0"
+            "    for p in pts do"
+            "        acc <- acc + p.X + p.Y"
+            "    acc"
+            "let a = print s"
+            "let t ="
+            "    let mutable n = 0"
+            "    for i in ints do"
+            "        n <- n + i * i"
+            "    n"
+            "let b = print t"
+        ]
         oracle "string equality and chars" [
             "let pick s ="
             "    if s = \"yes\" then 1 else 0"

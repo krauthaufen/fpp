@@ -622,6 +622,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> st.Fresh ()))
             | ForExpr | WhileExpr ->
                 let fvars = dictNew<string, Type> ()
+                // `for x in arr do`: bind x to the element type and record
+                // the collection's element name for lowering
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | coll :: _ when n.NodeKind = ForExpr ->
+                     let ct = exprType (GNode coll)
+                     (match prune ct with
+                      | TCon ("array", [ e ]) ->
+                          (match Green.tokens (GNode coll) |> List.tryHead with
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, ct)
+                           | None -> ())
+                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                           | Some ip -> unify (patType fvars ip) e |> ignore
+                           | None -> ())
+                      | _ -> ())
+                 | _ -> ())
                 for m in nodesOf n do
                     if isPatKind m.NodeKind then patType fvars m |> ignore
                     elif isExprish m.NodeKind then exprType (GNode m) |> ignore

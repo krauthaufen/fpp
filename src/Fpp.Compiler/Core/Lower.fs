@@ -368,6 +368,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
                                 ESeq [ lowerExpr (GNode body)
                                        EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                      | PVar (iv, isch), coll ->
+                          // for x in arr do body  ==>  indexed while loop
+                          let nm =
+                              match dictTryFind arrKinds (offsetOf range) with
+                              | Some x -> x
+                              | None -> ""
+                          if nm = "" then note (offsetOf n) "for-in (unknown element type)"
+                          else
+                              let av = { Path = iv.Path; Offset = iv.Offset + 2000000; Name = "_arr" }
+                              let ix = { Path = iv.Path; Offset = iv.Offset + 3000000; Name = "_ix" }
+                              let ish = mono (TCon ("int", []))
+                              ELet (false, av, isch, coll,
+                                ELet (false, ix, ish, ELit (LInt "0"),
+                                  EWhile (EPrim ("<", [ EVar (ix, ish); EArrayLen (nm, EVar (av, isch)) ]),
+                                    ELet (false, iv, isch, EIndex (nm, EVar (av, isch), EVar (ix, ish)),
+                                      ESeq [ lowerExpr (GNode body)
+                                             EAssign (ix, EPrim ("+", [ EVar (ix, ish); ELit (LInt "1") ])) ]))))
                       | _, _ -> note (offsetOf n) "for loop (non-range)")
                  | _ -> note (offsetOf n) "for loop shape")
             | WhileExpr ->
