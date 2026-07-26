@@ -213,18 +213,29 @@ SRTP is removed, so operators and math functions get their polymorphism
 from typeclasses. The numeric hierarchy is the first serious client of
 that layer, and it is deliberately shaped unlike Haskell's.
 
+**A class is not a type.** It has no values, no subtyping and no boxing —
+you can never hold something of type `Fractional`. C# puts static abstract
+members on interfaces, which look like types you could hold and are not;
+that confusion is designed out here with a distinct keyword. `class` is
+free: F#'s verbose `type X() = class ... end` form is not part of F++. And
+since these are not interfaces, they carry no `I` prefix.
+
 **Operators are overloading, not algebra.** Each operator is a two-parameter
 class whose result is an associated type — the shape Rust uses for
 `Mul<Rhs> { type Output }`, not the shape Haskell uses for `Num`:
 
 ```
-type IMul<'a, 'b> =
-    static abstract type Result
-    static abstract member (*) : 'a -> 'b -> Result
+class Mul<'a, 'b>
+    type Result
+    static (*) : 'a -> 'b -> Result
+
+instance Mul<M44d, V4d>
+    type Result = V4d
+    static (*) m v = ...
 ```
 
 The member is named `(*)`, not `Mul`, so an instance reads as an operator
-definition and lines up with F#'s existing `static member (+)` syntax.
+definition and lines up with F#'s `static member (+)` syntax.
 
 `Num` forces `(*) : a -> a -> a`, and almost nothing in linear algebra is
 closed like that: `M * v`, `s * v` and `M * M` all leave the type. Making
@@ -233,7 +244,7 @@ third parameter — is what makes matrix·vector the ordinary case instead of
 a special one.
 
 **This is knowingly not what typeclasses are for.** A class like
-`IMul<'a,'b>` carries no laws, and no generic algorithm can be written
+`Mul<'a,'b>` carries no laws, and no generic algorithm can be written
 against it alone; it exists to overload notation. Haskell would not do
 this. We do it because the alternative — modelling `Apply`, `Compose`,
 `Scale` and componentwise product as separate law-carrying structures — 
@@ -243,32 +254,51 @@ because the ambiguity argument does not survive contact with the domain:
 to be prevented. The trade is taken for OPERATORS specifically.
 
 Classes that do carry laws stay principled and single-parameter:
-`IFloating<'a>` for `sin`/`exp`/`log` (closed and homogeneous — a `V3d`
-is never asked for a sine), `IOrdered<'a>` for comparison, and the
+`Floating<'a>` for `sin`/`exp`/`log` (closed and homogeneous — a `V3d`
+is never asked for a sine), `Ordered<'a>` for comparison, and the
 Functor/Monad layer of the HKT design. Two flavours of class coexist, and
 which is which should be stated rather than assumed.
 
 **Closed classes carry the genericity; operator classes carry the
 notation.** Overloaded operators alone would make generic math unwritable:
-`a + b` yields `IAdd<'a,'b>.Result`, and without something to pin it, an
+`a + b` yields `Add<'a,'b>.Result`, and without something to pin it, an
 unannotated numerical routine infers a chain of unreduced projections that
 is unreadable — the failure mode that makes F#'s SRTP errors notorious.
 The fix is nominal superclass constraints:
 
 ```
-type IFractional<'a>
-    when 'a : IAdd<'a,'a> with Result = 'a
-     and 'a : IMul<'a,'a> with Result = 'a
-     and 'a : IDiv<'a,'a> with Result = 'a =
-    static abstract member Zero : 'a
-    static abstract member One  : 'a
+class Fractional<'a>
+    requires Add<'a,'a> with Result = 'a
+    requires Mul<'a,'a> with Result = 'a
+    requires Div<'a,'a> with Result = 'a
+    static Zero : 'a
+    static One  : 'a
 ```
 
-`let solve<'a when 'a : IFractional> (m : Matrix<'a>) (b : Vector<'a>)`
-then typechecks with no concrete types anywhere: `x + y` at `'a` produces
-`IAdd<'a,'a>.Result`, and the superclass equality in scope reduces it to
-`'a` at once. The user writes one readable constraint; closure comes from
-the class, not from grounding.
+**A single-parameter class may stand where a type goes**, and that is how
+generic math is written:
+
+```
+let solve (m : Matrix<Fractional>) (b : Vector<Fractional>) : Vector<Fractional> = ...
+```
+
+`Fractional` there introduces an implicitly quantified type variable
+constrained by the class. The rule that makes this useful rather than
+misleading: **the same class name means the SAME type within one
+signature.** C++'s `auto` and Rust's `impl Trait` in argument position
+introduce a fresh variable per occurrence, so `Matrix<Fractional>` and
+`Vector<Fractional>` would not share a scalar — which for numerical code is
+exactly backwards. When two distinct instances of a class are genuinely
+wanted, name them: `'a : Fractional` and `'b : Fractional`.
+
+The sugar applies to single-parameter classes only; nobody writes
+`x : Mul`, and the two-parameter operator classes appear in `requires`
+clauses rather than type positions.
+
+Either way the projection reduces: `x + y` at `'a` produces
+`Add<'a,'a>.Result`, and the `requires` equality in scope rewrites it to
+`'a` at once. The user writes one readable name; closure comes from the
+class, not from grounding.
 
 **The projection rule.** A projection must reduce either by a known
 concrete type or by a constraint in scope, and may never survive into a
@@ -283,24 +313,17 @@ load-bearing rather than speculative: `with Result = 'a` is the mechanism.
 
 In practice generic numeric code is generic over the SCALAR, not the
 containers — `Matrix<'a>`/`Vector<'a>` operations are written concretely
-and constrained on `'a : IFractional`, while heterogeneous instances like
-`IMul<Matrix<'a>, Vector<'a>>` are declared once per container rather than
+and constrained on `'a : Fractional`, while heterogeneous instances like
+`Mul<Matrix<'a>, Vector<'a>>` are declared once per container rather than
 inferred per call. So the two-parameter classes stay near-ground and the
 closed classes do the abstracting. (nalgebra's `T: RealField` is the same
 split.)
 
 **Instances are free-standing.** A two-parameter class has no natural
-owner — `IMul<M44d, V4d>` belongs to neither operand more than the other —
-so instances are declared Haskell-style rather than inside a type:
-
-```
-instance IMul<M44d, V4d> with
-    type Result = V4d
-    static member (*) m v = ...
-```
-
-`static member (+)` on a type stays as sugar for the homogeneous case
-`IAdd<T,T> with Result = T`, because that is what F# code in the wild
+owner — `Mul<M44d, V4d>` belongs to neither operand more than the other —
+so instances are declared Haskell-style rather than inside a type, as in
+the example above. `static member (+)` on a type stays as sugar for the homogeneous case
+`Add<T,T> with Result = T`, because that is what F# code in the wild
 writes.
 
 **One operator symbol, one class.** `a + b` must resolve by a single
@@ -312,11 +335,11 @@ unresolvable in principle, not merely slow.
 instances, the only thing keeping resolution well-defined is: exactly one
 instance per `(a, b)` pair, globally, and an orphan rule — an instance must
 live in the module defining one of the two types. Without it two libraries
-can each declare `IMul<float, V3d>` and linking is ill-defined.
+can each declare `Mul<float, V3d>` and linking is ill-defined.
 
 **Consequence for the constraint language.** Generic numeric code needs to
 say that an operation stays in its type: `sum` over `'a` requires
-`'a : IAdd<'a,'a>` *with* `Result = 'a`. So constraints must be able to
+`'a : Add<'a,'a>` *with* `Result = 'a`. So constraints must be able to
 equate an associated type, not merely require a class.
 
 **Sequencing.** `sin`/`cos`/`exp` ship monomorphically on `float` and

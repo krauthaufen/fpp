@@ -119,7 +119,14 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
 - coherence: one instance per `(a, b)`, plus an orphan rule
 - constraints must be able to equate an associated type (`Result = 'a`) —
   this is what closed classes use to pin operators to closure
-- closed classes (`IFractional<'a>` etc.) carry superclass constraints, so
+- a CLASS is not a type: no values, no subtyping, no boxing, no `I` prefix.
+  Declared with `class`, which is free (F#'s `type X() = class end` is not
+  part of F++); instances with `instance`
+- a single-parameter class may stand where a type goes, and the same name
+  means the SAME type within one signature — unlike C++ `auto` and Rust
+  `impl Trait`, which would not share the scalar between
+  `Matrix<Fractional>` and `Vector<Fractional>`
+- closed classes (`Fractional<'a>` etc.) carry superclass constraints, so
   generic math annotates with ONE name and projections reduce from the
   constraint rather than from a concrete type
 - a projection reduces by a concrete type or a constraint in scope, and
