@@ -117,14 +117,20 @@ Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
       REFERENCE: `Box 3 <> Box 3`). Sound because case tags are globally
       unique and `$tupN` is one wasm type per arity.
 - [x] arrays hash by length — stable under element mutation
-- [ ] RECORDS are still unsound dynamically: two records of the same shape
-      are ONE wasm type after canonicalization, and a 2-field record even
-      canonicalizes with `$cons`, so it is currently compared as a list
-      cell. It happens to give the right answer. This is what descriptors
-      are for.
-- [ ] descriptors on every reference type; generated per-type equals/hash;
-      then delete the `$hashv`/`$equal` walks
-- [ ] identity hash for classes (a lazily assigned header word)
+- [x] descriptors on every reference type. Records compare and hash
+      structurally and soundly: differing descriptors mean differing types,
+      which a shape test cannot establish (wasm-GC canonicalizes
+      same-shaped structs into ONE heap type — a 2-field record used to
+      canonicalize with `$cons` and was compared as a list cell, giving the
+      right answer by luck).
+- [x] generated per-type equals/hash in vtable slots 0 and 1; a
+      user-declared `Equals`/`GetHashCode` fills the slot instead.
+- [ ] identity hash for classes is currently the type id, so two instances
+      of one class collide. Legal (equal values still hash equally) but
+      poor. Wants the lazily assigned header word from DESIGN.md.
+- [ ] `$hashv`/`$equal` still exist as the dynamic entry points. They are
+      now thin — primitives, then descriptor dispatch — but the remaining
+      shape tests (cons, tuple, DU) could move behind descriptors too.
 
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real
