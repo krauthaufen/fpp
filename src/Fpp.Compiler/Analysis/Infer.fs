@@ -143,7 +143,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Nominal subtyping: is `sup` `sub` itself, an ancestor of it, or an
     /// interface it implements? Inheritance and interfaces both count.
     let rec isSupertypeOf (sup : string) (sub : string) : bool =
-        sup = sub
+        // obj is the top type: everything widens to it
+        sup = "obj" || sup = sub
         || (match dictTryFind impls sub with
             | Some is -> List.contains sup is
             | None -> false)

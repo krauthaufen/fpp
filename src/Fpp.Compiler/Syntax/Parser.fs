@@ -343,7 +343,8 @@ let parse (src : string) : ParseResult =
         if s.IsOp ":?" then
             // type-test pattern: `| :? HashSet<'K> as o ->`
             let op = s.Bump ()
-            Green.node TypeTestPat [ op; parseAtomType ctx ]
+            // the tested type may be a generic application: `:? HashSet<'K>`
+            Green.node TypeTestPat [ op; parseAppType ctx ]
         elif s.IsKw "struct" && (s.Peek 1).Kind = LParen then
             let kw = s.Bump ()
             Green.node StructTuplePat [ kw; parseAtomPat ctx ]
