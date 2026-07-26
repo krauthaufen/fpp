@@ -111,6 +111,14 @@ Two real bugs found by pushing on this file, both fixed:
 - a cast or type test named its target by the LAST identifier of the type,
   so `x :?> MapLeaf<'K, 'V>` tried to downcast to `V` (68 errors).
 
+### Numeric tower
+- [x] int, int64, float, float32, uint32: literals, arithmetic, comparison,
+      bitwise and shifts, conversions between them, packed struct fields,
+      structural equality and hashing. Conversions dispatch on the type
+      INFERENCE resolved, not the backend's kind analysis — the latter
+      cannot see through a global.
+- [ ] uint64, and the smaller widths (int8/16, byte). No demand yet.
+
 ### Identity: hash and equals — in progress
 Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
 - [x] DUs and tuples compare and hash structurally (they were compared by
