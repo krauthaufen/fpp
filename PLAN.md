@@ -111,6 +111,21 @@ Two real bugs found by pushing on this file, both fixed:
 - a cast or type test named its target by the LAST identifier of the type,
   so `x :?> MapLeaf<'K, 'V>` tried to downcast to `V` (68 errors).
 
+### Identity: hash and equals — in progress
+Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
+- [x] DUs and tuples compare and hash structurally (they were compared by
+      REFERENCE: `Box 3 <> Box 3`). Sound because case tags are globally
+      unique and `$tupN` is one wasm type per arity.
+- [x] arrays hash by length — stable under element mutation
+- [ ] RECORDS are still unsound dynamically: two records of the same shape
+      are ONE wasm type after canonicalization, and a 2-field record even
+      canonicalizes with `$cons`, so it is currently compared as a list
+      cell. It happens to give the right answer. This is what descriptors
+      are for.
+- [ ] descriptors on every reference type; generated per-type equals/hash;
+      then delete the `$hashv`/`$equal` walks
+- [ ] identity hash for classes (a lazily assigned header word)
+
 ### Generic structs — DONE
 A generic struct is stamped per instantiation, so its fields carry a real
 representation instead of being boxed: `Pair<float,float>` gets f64 fields,
