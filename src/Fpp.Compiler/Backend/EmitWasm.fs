@@ -510,14 +510,25 @@ let emit (decls : Decl list) : EmitResult =
         let newLocal (base_ : string) : string = newTypedLocal base_ "anyref"
         match e with
         | ELit (LInt s) ->
-            let digits =
-                if s.StartsWith "0x" || s.StartsWith "0X" then
-                    string (System.Convert.ToInt32 (s.TrimEnd ([| 'L'; 'u' |]), 16))
-                else s |> String.filter (fun c -> isDigit c || c = '-')
+            // an unsigned literal keeps its bit pattern: 4000000000u is the
+            // i32 whose unsigned reading is that value
+            let isHex = s.StartsWith "0x" || s.StartsWith "0X"
+            let isUnsigned = s.EndsWith "u" || s.EndsWith "U"
             if s.EndsWith "L" then
+                let digits =
+                    if isHex then string (System.Convert.ToInt64 (s.Substring(2).TrimEnd ([| 'L' |]), 16))
+                    else s |> String.filter (fun c -> isDigit c || c = '-')
                 "(call $ofl (i64.const " + (if digits = "" then "0" else digits) + "))"
             else
-                let v = if digits = "" then 0 else int digits
+                // both int and uint32 are one i32; an unsigned literal is the
+                // i32 with that bit pattern
+                let v =
+                    if isHex then int (System.Convert.ToUInt32 (s.Substring(2).TrimEnd ([| 'u'; 'U' |]), 16))
+                    else
+                        let digits = s |> String.filter (fun c -> isDigit c || c = '-')
+                        if digits = "" then 0
+                        elif isUnsigned then int (System.UInt32.Parse digits)
+                        else int digits
                 "(call $ofi (i32.const " + string v + "))"
         | ELit (LBool b) -> "(ref.i31 (i32.const " + (if b then "1" else "0") + "))"
         | ELit LUnit -> "(ref.i31 (i32.const 0))"
@@ -581,6 +592,16 @@ let emit (decls : Decl list) : EmitResult =
             "(call $ofi (call $hashv " + recur a + "))"
         | EApp (EUnknown "refEq", [ a; b ]) ->
             boolWat ("(ref.eq (ref.cast (ref null eq) " + recur a + ") (ref.cast (ref null eq) " + recur b + "))")
+        // int/uint32 conversions: same 32-bit payload, different reading;
+        // from a wider or floating type they narrow explicitly
+        | EApp (EUnknown ("uint32" | "int"), [ a ]) ->
+            (match kindOf a with
+             | "f" -> "(call $ofi (i32.trunc_f64_s (call $tof " + recur a + ")))"
+             | "s" -> "(call $ofi (i32.trunc_f32_s (call $tos " + recur a + ")))"
+             | "l" -> "(call $ofi (i32.wrap_i64 (call $tol " + recur a + ")))"
+             | _ -> recur a)
+        | EApp (EUnknown "printu", [ a ]) ->
+            "(block (result anyref) (call $printu " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "print", [ a ]) ->
             "(block (result anyref) (call $printval " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "ignore", [ a ]) ->
@@ -674,6 +695,27 @@ let emit (decls : Decl list) : EmitResult =
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
+        | EPrim (op, [ a; b ]) when op.EndsWith "w" && op.Length > 1 ->
+            let ia = fun () -> unwrapI32 (recur a)
+            let ib = fun () -> unwrapI32 (recur b)
+            (match op.Substring (0, op.Length - 1) with
+             | "+" -> intWat ("(i32.add " + ia () + " " + ib () + ")")
+             | "-" -> intWat ("(i32.sub " + ia () + " " + ib () + ")")
+             | "*" -> intWat ("(i32.mul " + ia () + " " + ib () + ")")
+             | "/" -> intWat ("(i32.div_u " + ia () + " " + ib () + ")")
+             | "%" -> intWat ("(i32.rem_u " + ia () + " " + ib () + ")")
+             | "<" -> boolWat ("(i32.lt_u " + ia () + " " + ib () + ")")
+             | ">" -> boolWat ("(i32.gt_u " + ia () + " " + ib () + ")")
+             | "<=" -> boolWat ("(i32.le_u " + ia () + " " + ib () + ")")
+             | ">=" -> boolWat ("(i32.ge_u " + ia () + " " + ib () + ")")
+             | "&&&" -> intWat ("(i32.and " + ia () + " " + ib () + ")")
+             | "|||" -> intWat ("(i32.or " + ia () + " " + ib () + ")")
+             | "^^^" -> intWat ("(i32.xor " + ia () + " " + ib () + ")")
+             | "<<<" -> intWat ("(i32.shl " + ia () + " " + ib () + ")")
+             | ">>>" -> intWat ("(i32.shr_u " + ia () + " " + ib () + ")")
+             | other ->
+                 vecAdd errors ("unsupported unsigned operator " + other)
+                 "(ref.i31 (i32.const 0))")
         | EPrim (op, [ a; b ]) when
             (op.Length > 1 && (op.EndsWith "f" || op.EndsWith "l" || op.EndsWith "s" || op.EndsWith "t")
              && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ]) ->
@@ -744,6 +786,7 @@ let emit (decls : Decl list) : EmitResult =
              | _ ->
                  vecAdd errors ("unsupported operator " + op)
                  "(ref.i31 (i32.const 0))")
+        // uint32: the payload is the same i32, only the operations differ
         | EPrim ("unot", [ a ]) -> boolWat ("(i32.eqz " + unwrapI32 (recur a) + ")")
         | EPrim ("u-", [ a ]) -> intWat ("(i32.sub (i32.const 0) " + unwrapI32 (recur a) + ")")
         | EPrim (op, _) ->
@@ -1578,6 +1621,17 @@ let emit (decls : Decl list) : EmitResult =
     (local.set $m (i32.div_s (local.get $n) (i32.const 10)))
     (if (i32.gt_s (local.get $m) (i32.const 0)) (then (call $printi (local.get $m))))
     (call $putc (i32.add (i32.const 48) (i32.rem_s (local.get $n) (i32.const 10)))))
+  (func $printiu (param $n i32)
+    (local $m i32)
+    (local.set $m (i32.div_u (local.get $n) (i32.const 10)))
+    (if (i32.gt_u (local.get $m) (i32.const 0)) (then (call $printiu (local.get $m))))
+    (call $putc (i32.add (i32.const 48) (i32.rem_u (local.get $n) (i32.const 10)))))
+  (func $printu (param $v anyref)
+    (if (ref.test (ref i31) (local.get $v))
+      (then (call $printiu (i31.get_s (ref.cast (ref i31) (local.get $v)))) (return)))
+    (if (ref.test (ref $boxi) (local.get $v))
+      (then (call $printiu (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v)))) (return)))
+    (call $printval (local.get $v)))
   (func $prints (param $s (ref $str))
     (local $i i32)
     (block $done

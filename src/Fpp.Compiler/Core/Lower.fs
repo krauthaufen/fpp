@@ -238,6 +238,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EUnknown t.Text)
                  | None -> note (offsetOf n) "type-variable expression")
+            | AppExpr when
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | head :: [ _ ] when head.NodeKind = IdentExpr ->
+                     (match tokensOf head |> List.tryHead with
+                      | Some t -> t.Text = "print" && (dictTryFind opKinds t.Offset) = Some "w"
+                      | None -> false)
+                 | _ -> false) ->
+                // an unsigned value prints unsigned
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ _; a ] -> EApp (EUnknown "printu", [ lowerExpr (GNode a) ])
+                 | _ -> note (offsetOf n) "print shape")
             | AppExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: args ->
@@ -318,7 +329,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // typed prims: inference resolved the operand kind
                           // (equality stays unsuffixed — structural $equal)
                           let suffixable =
-                              List.contains op.Text [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ]
+                              List.contains op.Text
+                                  [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="
+                                    // unsigned shifts/division differ from signed
+                                    ">>>"; "&&&"; "|||"; "^^^"; "<<<" ]
                           let suffix =
                               if not suffixable then ""
                               else

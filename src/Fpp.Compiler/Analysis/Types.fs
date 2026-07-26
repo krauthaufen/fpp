@@ -26,6 +26,7 @@ type Scheme =
 let mono (t : Type) : Scheme = { Quantified = []; Body = t }
 
 let tInt = TCon ("int", [])
+let tUInt = TCon ("uint32", [])
 let tFloat = TCon ("float", [])
 let tString = TCon ("string", [])
 let tChar = TCon ("char", [])

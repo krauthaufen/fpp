@@ -313,7 +313,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let literalType (t : Token) : Type =
         match t.Kind with
         | IntLit ->
-            if t.Text.EndsWith "L" then TCon ("int64", []) else tInt
+            // integer literal suffixes: 5L is int64, 5u is uint32
+            if t.Text.EndsWith "L" then TCon ("int64", [])
+            elif t.Text.EndsWith "u" || t.Text.EndsWith "U" then tUInt
+            else tInt
         | FloatLit ->
             if t.Text.EndsWith "f" || t.Text.EndsWith "F" then TCon ("float32", []) else tFloat
         | StringLit -> tString
@@ -472,6 +475,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | AppExpr ->
                 (match nodesOf n with
                  | head :: args ->
+                     (match head.NodeKind, args with
+                      | IdentExpr, [ onlyArg ] when
+                            (tokensOf head |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "print" ->
+                          (match tokensOf head |> List.tryHead with
+                           | Some pt -> vecAdd opKindsRaw (pt.Offset, exprType (GNode onlyArg))
+                           | None -> ())
+                      | _ -> ())
+                     // numeric conversions are primitives, not functions
+                     let conversion =
+                         match head.NodeKind, args with
+                         | IdentExpr, [ onlyArg ] ->
+                             (match tokensOf head |> List.tryHead with
+                              | Some t when (t.Text = "int" || t.Text = "uint32")
+                                            && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (if t.Text = "int" then tInt else tUInt)
+                              | _ -> None)
+                         | _ -> None
+                     match conversion with
+                     | Some t -> t
+                     | None ->
                      let mutable funTy = exprType (GNode head)
                      let off =
                          match Green.tokens (GNode head) |> List.tryHead with
@@ -502,7 +526,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let lt = exprType (GNode l)
                      let rt = exprType (GNode r)
                      (match opClass op.Text with
-                      | "arith" | "cmp" -> vecAdd opKindsRaw (op.Offset, lt)
+                      | "arith" | "cmp" | "bits" -> vecAdd opKindsRaw (op.Offset, lt)
                       | _ -> ())
                      (match opClass op.Text with
                       | "logic" ->
@@ -516,9 +540,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt op.Offset lt rt
                           lt
                       | "bits" ->
-                          unifyAt op.Offset lt tInt
-                          unifyAt op.Offset rt tInt
-                          tInt
+                          // F#: `&&&`/`|||`/`^^^` are same-type; the shift
+                          // operators take an int distance and keep the type
+                          if op.Text = "<<<" || op.Text = ">>>" then
+                              unifyAt op.Offset rt tInt
+                              lt
+                          else
+                              unifyAt op.Offset lt rt
+                              lt
                       | "cons" ->
                           unifyAt op.Offset rt (tList lt)
                           rt
@@ -549,10 +578,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> ())
                      tBool
                  | Some t when t.Text = "~~~" ->
+                     // bitwise complement keeps its operand's integer type
                      (match inner with
-                      | [ i ] -> unifyAt t.Offset i tInt
-                      | _ -> ())
-                     tInt
+                      | [ i ] -> i
+                      | _ -> tInt)
                  | Some t when t.Text = "-" || t.Text = "+" ->
                      (match inner with
                       | [ i ] ->
@@ -1258,6 +1287,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon ("float", []) -> "f"
         | TCon ("float32", []) -> "s"
         | TCon ("int64", []) -> "l"
+        | TCon ("uint32", []) -> "w"
         | TCon ("string", []) -> "t"
         | _ -> ""
 

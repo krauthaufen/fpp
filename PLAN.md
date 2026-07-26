@@ -66,10 +66,11 @@ stage ends with something running in CI. Status legend: `[ ]` open,
 ### Measured against the acceptance target
 Running the real `HashCollections.fs` (4500 lines) through the front end,
 the remaining blockers in source order are:
-- [ ] `uint32`: literals (`1u`), the type, and unsigned operations
-      (`>>>`, comparisons, division). This is the FIRST thing it hits and
-      is pervasive in the hashing code — a numeric-tower item, not an OOP
-      one. Needs lexer suffixes, a `uint32` TCon, and `i32.*_u` emission.
+- [x] `uint32`: literals (`1u`, `0xABCDu`), the type, unsigned ops
+      (`/ % < > <= >= >>>` emit `i32.*_u`), `int`/`uint32` conversions as
+      bit-preserving primitives, unsigned printing. Same i32 payload as
+      `int` — only the operations differ. Bitwise operators are now
+      same-type rather than int-only, and shifts keep their operand's type.
 - [ ] `downcast` / `upcast` (target type comes from the context, so it
       needs a type-directed resolution like member binding got)
 - [ ] multi-entry attribute lists `[<AllowNullLiteral; AbstractClass>]`
