@@ -196,6 +196,27 @@ Open:
       stamped operator carries one operand type, so only the homogeneous
       case resolves there
 
+### Tooling: projects and editors
+Docs: editors/README.md.
+- [x] `*.fppproj` manifests: an ordered source list, libraries, output. No
+      globbing — the compile order is semantic, and a directory listing
+      would hide the one fact the file exists to state
+- [x] `fpp check <proj>` / `fpp build <proj>` take the manifest
+- [x] the LSP server finds the manifest by walking up from the opened file,
+      so an editor never has to be told where it is; it works in filesystem
+      paths, with URIs only at the protocol edge
+- [x] hover shows the generalized scheme WITH its class context
+- [x] VS Code extension (editors/vscode): client, TextMate grammar covering
+      class/instance/operator members, build command
+- [x] Rider/IntelliJ via LSP4IJ — configuration only, documented
+- [ ] Visual Studio needs a VSIX implementing ILanguageClient; buildable
+      only on Windows with the VS SDK, so not written
+- [ ] completion, references, rename, semantic tokens
+- [ ] a real cross-file bug this surfaced and fixed: a generic binding used
+      from ANOTHER file recorded no specialization demand, so its body was
+      dropped as a template and the call was unbound. Every generic
+      arithmetic function hit this once operators became class members
+
 ### Numeric tower
 - [x] int, int64, float, float32, uint32: literals, arithmetic, comparison,
       bitwise and shifts, conversions between them, packed struct fields,
