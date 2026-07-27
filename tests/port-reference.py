@@ -124,6 +124,13 @@ def drop_fsharp_core_set_bridges(src):
         out.append(line)
     return "\n".join(out)
 
+def dotnet_exception_ctors(src):
+    """.NET exception CLASSES construct with optional arguments; the port's
+    exn is a union, so the no-argument form gets .NET's own message."""
+    return src.replace(
+        "KeyNotFoundException()",
+        'KeyNotFoundException("The given key was not present in the dictionary.")')
+
 src = open(sys.argv[1]).read()
 open(sys.argv[2], "w").write(
-    drop_fsharp_core_set_bridges(strip_attrs(port_closures(pick_branch(src)))))
+    dotnet_exception_ctors(drop_fsharp_core_set_bridges(strip_attrs(port_closures(pick_branch(src))))))

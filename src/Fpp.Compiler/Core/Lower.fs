@@ -380,9 +380,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match Fpp.Analysis.Format.parse raw with
                            | Ok segs ->
                                let holes = Fpp.Analysis.Format.holes segs
-                               if List.length holes <> List.length holeArgs then
-                                   note (offsetOf n) "a format must be applied to all its arguments"
+                               if List.length holes < List.length holeArgs then
+                                   note (offsetOf n) "more arguments than the format has holes"
                                else
+                               // PARTIAL application expands to a lambda:
+                               // `Seq.map (sprintf "%A")` is ordinary F#
+                               let missing = List.length holes - List.length holeArgs
+                               let lamBinds =
+                                   List.init missing (fun i ->
+                                       { Path = path; Offset = offsetOf n + 7000000 + i; Name = "_fmt" + string i },
+                                       mono (TCon ("?", [])))
                                let kindAt (i : int) =
                                    match dictTryFind opKinds (ft.Offset + 1 + i) with
                                    | Some k -> k
@@ -428,7 +435,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        match seg with
                                        | Fpp.Analysis.Format.Text t2 -> ELit (LString ("\"" + t2 + "\""))
                                        | Fpp.Analysis.Format.Hole (c, width, zero, left) ->
-                                           let e = lowerExpr (GNode (List.item hi holeArgs))
+                                           let e =
+                                               if hi < List.length holeArgs then
+                                                   lowerExpr (GNode (List.item hi holeArgs))
+                                               else
+                                                   let v, sch = List.item (hi - List.length holeArgs) lamBinds
+                                                   EVar (v, sch)
                                            let r = render hi c e
                                            hi <- hi + 1
                                            if width = 0 then r
@@ -445,11 +457,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    match pieces with
                                    | [] -> ELit (LString "\"\"")
                                    | first :: rest -> List.fold (fun acc p -> EPrim ("+t", [ acc; p ])) first rest
-                               (match fn with
-                                | "sprintf" -> total
-                                | "printf" -> EApp (EUnknown "prints", [ total ])
-                                | "printfn" -> EApp (EUnknown "prints", [ EPrim ("+t", [ total; ELit (LString "\"\\n\"") ]) ])
-                                | _ -> EApp (EUnknown "failwith", [ total ]))
+                               let whole =
+                                   match fn with
+                                   | "sprintf" -> total
+                                   | "printf" -> EApp (EUnknown "prints", [ total ])
+                                   | "printfn" -> EApp (EUnknown "prints", [ EPrim ("+t", [ total; ELit (LString "\"\\n\"") ]) ])
+                                   | _ -> EApp (EUnknown "failwith", [ total ])
+                               if missing = 0 then whole else ELam (lamBinds, whole)
                            | Error msg -> note ft.Offset msg)
                       | _ -> note (offsetOf n) "a format string must be a literal")
                  | [] -> note (offsetOf n) "format application shape")
@@ -780,6 +794,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             vecAdd captured (varIdOf d, schemeOf d)
                         | _ -> ()
                 let caps = vecToList captured
+                // a var may be a capture of SEVERAL nested object
+                // expressions at once — the enclosing mapping is restored
+                // before the construction site is built
+                let savedMaps =
+                    caps |> List.map (fun (v, _) ->
+                        (v.Path, v.Offset), dictTryFind fieldOfVar (v.Path, v.Offset))
                 for v, _ in caps do dictSet fieldOfVar (v.Path, v.Offset) (synth, v.Name)
                 vecAdd decls (DRecord (synth, [], caps |> List.map (fun (v, _) -> v.Name, "?"), false))
                 let savedClass = currentClass
@@ -789,10 +809,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     |> List.filter (fun m -> m.NodeKind = MemberDecl)
                     |> List.choose (liftMemberIn synth)
                 currentClass <- savedClass
+                for k, prior in savedMaps do
+                    match prior with
+                    | Some p -> dictSet fieldOfVar k p
+                    | None -> (fieldOfVar : Dict<string * int, string * string>).Remove k |> ignore
                 vecAdd decls
                     (DClass (synth, None, [],
                              match iface with Some i -> [ i, bound ] | None -> []))
-                ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, EVar (v, sch)))
+                // the CONSTRUCTION reads each captured var in the enclosing
+                // scope — where it may itself be a field of the class being
+                // lowered (a nested object expression, or a ctor parameter
+                // that became instance state)
+                let capInit (v : VarId, sch : Scheme) : Expr =
+                    match currentSelf, dictTryFind fieldOfVar (v.Path, v.Offset) with
+                    | Some (sv, ssch), Some (owner, fname) when owner = currentClass ->
+                        EField (EVar (sv, ssch), fname, currentClass)
+                    | _ -> EVar (v, sch)
+                ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, capInit (v, sch)))
             // `downcast e` / `upcast e`: inference resolved the target from
             // the context and recorded it at the keyword
             | StructTupleExpr ->
@@ -1118,6 +1151,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match selfTok |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
                         | Some sd -> varIdOf sd, selfSch
                         | None -> { Path = path; Offset = d.Offset + 800000; Name = "this" }, selfSch
+                    let savedSelf = currentSelf
                     currentSelf <- Some selfBind
                     let mutable seenEq = false
                     let bodies = vecNew<GreenNode> ()
@@ -1127,7 +1161,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | GNode b when seenEq && isExprish b.NodeKind -> vecAdd bodies b
                         | _ -> ()
                     let body = lowerBlock (vecToList bodies)
-                    currentSelf <- None
+                    currentSelf <- savedSelf
                     // a lone `()` marks a no-argument getter, not a parameter
                     let ps =
                         nodesOf acc
@@ -1170,9 +1204,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | Some sd -> varIdOf sd, selfSch
                 | None -> { Path = path; Offset = d.Offset + 800000; Name = "this" }, selfSch
             let isStaticM = tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
+            // save, don't clear: a nested object expression's members lift
+            // from INSIDE this body, and clearing killed the enclosing self
+            // for everything after them
+            let savedSelf = currentSelf
             if not isStaticM then currentSelf <- Some selfBind
             let body = lowerBlock (vecToList bodies |> List.choose (fun c -> match c with GNode x -> Some x | _ -> None))
-            currentSelf <- None
+            currentSelf <- savedSelf
             let ps = vecToList pats
             let binds, mbody =
                 if List.isEmpty ps then [], body

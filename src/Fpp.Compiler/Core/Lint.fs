@@ -145,7 +145,22 @@ let lint (decls : Decl list) : string list =
             for a in args do
                 let at = exprType a
                 let res = st.Fresh ()
-                unifyC "application" ft (TFun (at, res))
+                // an argument may WIDEN to the parameter (a list where a seq
+                // is declared, a subclass where a base is). The lint has no
+                // inheritance tables, so it decomposes and skips the nominal
+                // head where the names differ — argument-position soundness
+                // stays with inference; the lint still checks everything else
+                (match prune ft with
+                 | TFun (pt, rt) ->
+                     (match prune pt, prune at with
+                      // a seq parameter accepts anything enumerable, and must
+                      // not pull a still-free argument var to IEnumerable —
+                      // the argument's real type may be the list that WIDENS
+                      | TCon (("IEnumerable" | "seq"), _), _ -> ()
+                      | TCon (pn, _), TCon (an, _) when pn <> an -> ()
+                      | p, a2 -> unifyC "application" p a2)
+                     unifyC "application" res rt
+                 | _ -> unifyC "application" ft (TFun (at, res)))
                 ft <- res
             ft
         | ELet (isRec, v, _, rhs, body) ->

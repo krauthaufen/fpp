@@ -1219,12 +1219,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt op.Offset lt rt
                           lt
                       | "pipe" ->
+                          // decompose first, so the piped value may WIDEN to
+                          // the parameter (a list into a seq)
                           let res = st.Fresh ()
-                          unifyAt op.Offset rt (TFun (lt, res))
+                          (match prune rt with
+                           | TFun (pt, rt2) ->
+                               unifyArg op.Offset pt lt
+                               unifyAt op.Offset res rt2
+                           | _ -> unifyAt op.Offset rt (TFun (lt, res)))
                           res
                       | "pipeBack" ->
                           let res = st.Fresh ()
-                          unifyAt op.Offset lt (TFun (rt, res))
+                          (match prune lt with
+                           | TFun (pt, lt2) ->
+                               unifyArg op.Offset pt rt
+                               unifyAt op.Offset res lt2
+                           | _ -> unifyAt op.Offset lt (TFun (rt, res)))
                           res
                       | "assign" -> tUnit
                       | _ -> st.Fresh ())

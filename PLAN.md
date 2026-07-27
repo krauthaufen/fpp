@@ -142,6 +142,13 @@ all member overloading. The split at first measurement:
 - [x] ofSet/toSet dropped by the port script: they bridge to FSharp.Core's
       Set, a type that lives outside the file being ported
 
+### Acceptance emit status after the stdlib layer
+61 -> 37 emit errors. The tail: type tests against BUILTIN collections
+(`:? list`/`:? array`/`:? ISet`, 12 — a designed feature, representation
+tests not class ids), a resolution corner where `HashSet.OfSeq` inside the
+class's own ISet impl fails to bind, and array-write specialization in two
+generic bodies.
+
 ### ACCEPTANCE MILESTONE: the whole file front-ends clean
 `reference-HashCollections.ported.fs.txt` (4130 lines): **0 diagnostics,
 0 lowering notes**. First error line 24 at the start; the journey ran
@@ -150,8 +157,31 @@ all member overloading. The split at first measurement:
 `Object.ReferenceEquals`) plus array-write specialization in generic
 bodies — "compiling and running" now means the backend tail, not the
 language.
-- [ ] then the genuine stdlib: `Seq.*`, `sprintf`, `String.concat`,
-      `Array.zeroCreate`, `KeyValuePair`
+- [x] the genuine stdlib, done as CORE (the prelude, auto-opened):
+      * `string x` for every primitive kind, .NET spellings; number-to-
+        string builders (ltoa/ftoa/ftoa6/hex/octal) are the primary
+        implementations and the printers print their result
+      * the printf family as COMPILE-TIME expansion — %d %i %u %s %c %b
+        %x %X %o %f %A, %%, width and 0/- flags, byte-exact against F#;
+        %e/%g refused rather than approximated; partial application
+        expands to a lambda (`Seq.map (sprintf "%A")`); %A quotes strings
+        and chars, and dispatches on the runtime representation at a
+        statically-unknown hole
+      * `Seq`: lazy map/filter/truncate/take over the enumerator protocol
+        (object expressions), eager exists/forall/fold/iter/length/toList
+      * `String`: length/concat/replicate/init/exists/forall/iter/iteri/map
+      * `KeyValuePair` (a struct class), `KeyNotFoundException` as an exn
+        case (the port script rewrites the .NET nullary ctor to carry
+        .NET's own message)
+- [ ] string INSTANCE members (s.Substring, s.Contains, ...) need extension
+      members on a builtin type — a language feature, not stdlib
+- [x] two capture bugs the lazy Seq surfaced: a nested object expression's
+      construction read captured vars RAW even when they were fields of the
+      enclosing anonymous class, and each member lift CLEARED currentSelf
+      instead of restoring it — any object expression inside a member
+      poisoned everything after it
+- [x] pipes widen: `xs |> Seq.length` decomposes the function type first,
+      so a list flows into a seq parameter, as in application position
 
 So: stdlib alone would NOT make this compile. It is roughly a 1:6 split in
 favour of compiler work.

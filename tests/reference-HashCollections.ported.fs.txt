@@ -3568,7 +3568,7 @@ and [<Struct>]
             let hash = uint32 (comparer.GetHashCode key) &&& 0x7FFFFFFFu
             match MapNode.tryFindV<'K, 'V> comparer hash key root with
             | ValueSome v -> v
-            | ValueNone -> raise <| KeyNotFoundException()
+            | ValueNone -> raise <| KeyNotFoundException("The given key was not present in the dictionary.")
 
     member x.Fold(folder : 'S -> 'K -> 'V -> 'S, state : 'S) =
         let folder = folder
@@ -4019,7 +4019,7 @@ module HashMap =
     let inline find k (m : HashMap<'K, 'V>) = 
         match m.TryFindV k with
         | ValueSome v -> v
-        | ValueNone -> raise <| KeyNotFoundException()
+        | ValueNone -> raise <| KeyNotFoundException("The given key was not present in the dictionary.")
 
     /// Tests whether all entries fulfil the given predicate.
     /// `O(N)`
