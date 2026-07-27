@@ -114,6 +114,32 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | TTuple ts -> TTuple (List.map go ts)
             go sch.Body, fresh, List.map (mapConstraint go) sch.Constraints
 
+    /// Instantiate an IMPORTED scheme. Every variable is freshened, not just
+    /// the quantified ones, so a residual free variable in another file's
+    /// scheme can never be unified here — but the fresh counterparts of the
+    /// quantified vars are still reported, because a call across a file
+    /// boundary is a specialization demand exactly like a local one.
+    let instantiateImported (sch : Scheme) : Type * Type list * Constraint list =
+        let subst = dictNew<int, Type> ()
+        let rec go (t : Type) : Type =
+            match prune t with
+            | TVar v ->
+                (match dictTryFind subst v.Id with
+                 | Some f -> f
+                 | None ->
+                     let f = st.Fresh ()
+                     dictSet subst v.Id f
+                     f)
+            | TCon (c, xs) -> TCon (c, List.map go xs)
+            | TFun (a, b) -> TFun (go a, go b)
+            | TTuple ts -> TTuple (List.map go ts)
+        let body = go sch.Body
+        let cs = List.map (mapConstraint go) sch.Constraints
+        let fresh =
+            sch.Quantified
+            |> List.map (fun v -> match dictTryFind subst v.Id with Some f -> f | None -> st.Fresh ())
+        body, fresh, cs
+
     let schemeOfDef (d : Resolve.Definition) : Scheme option =
         if d.Path = path then dictTryFind defSchemes d.Offset
         else dictTryFind shared (d.Path + ":" + string d.Offset)
@@ -761,6 +787,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                owe cs
                                vecAdd instRaw (t.Offset, fresh)
                                ty
+                           | Some sc when not (List.isEmpty sc.Quantified) ->
+                               // another file's generic binding: still a
+                               // specialization demand, so record it
+                               let ty, fresh, cs = instantiateImported sc
+                               owe cs
+                               vecAdd instRaw (t.Offset, fresh)
+                               ty
                            | _ ->
                                match instantiateFor d with
                                | Some (ty, cs) -> owe cs; ty
@@ -1255,6 +1288,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match schemeOfDef d, lastIdent with
                       | Some sc, Some tk when not (List.isEmpty sc.Quantified) && d.Path = path ->
                           let ty, fresh, cs = instantiateTracked sc
+                          oweAt tk cs
+                          vecAdd instRaw (tk.Offset, fresh)
+                          ty
+                      | Some sc, Some tk when not (List.isEmpty sc.Quantified) ->
+                          let ty, fresh, cs = instantiateImported sc
                           oweAt tk cs
                           vecAdd instRaw (tk.Offset, fresh)
                           ty

@@ -279,8 +279,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match dictTryFind instSites t.Offset with
                            | Some inst when
                                 not (List.isEmpty inst)
-                                && d.Path = path
-                                && (dictTryFind topLevelDefs d.Offset).IsSome ->
+                                // another file's top-level binding is just as
+                                // stampable — Link sees the whole program, so
+                                // the demand is meaningful across files
+                                && (if d.Path = path then (dictTryFind topLevelDefs d.Offset).IsSome else true) ->
                                EVarI (varIdOf d, schemeOf d, inst)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None -> EUnknown t.Text)

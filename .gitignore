@@ -6,3 +6,8 @@ gpu.wat
 gpu.wasm
 pin.wasm
 pin.html
+
+# vscode extension build artefacts
+editors/vscode/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix

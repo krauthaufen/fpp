@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "F++ project",
+  "scopeName": "source.fppproj",
+  "patterns": [
+    { "name": "comment.line.number-sign.fppproj", "match": "#.*$" },
+    {
+      "match": "^\\s*(name|out|lib|src)\\b(.*)$",
+      "captures": {
+        "1": { "name": "keyword.other.fppproj" },
+        "2": { "name": "string.unquoted.fppproj" }
+      }
+    }
+  ],
+  "repository": {}
+}

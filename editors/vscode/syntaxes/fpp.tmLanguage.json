@@ -1,0 +1,115 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "F++",
+  "scopeName": "source.fpp",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#attributes" },
+    { "include": "#classdecl" },
+    { "include": "#typedecl" },
+    { "include": "#keywords" },
+    { "include": "#constraints" },
+    { "include": "#numbers" },
+    { "include": "#typevars" },
+    { "include": "#operators" },
+    { "include": "#types" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.fpp", "match": "//.*$" },
+        {
+          "name": "comment.block.fpp",
+          "begin": "\\(\\*(?!\\))",
+          "end": "\\*\\)"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.fpp",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "name": "constant.character.escape.fpp", "match": "\\\\." }]
+    },
+    "chars": {
+      "name": "string.quoted.single.fpp",
+      "match": "'(\\\\.|[^'\\\\])'"
+    },
+    "attributes": {
+      "name": "meta.attribute.fpp",
+      "begin": "\\[<",
+      "end": ">\\]",
+      "patterns": [{ "name": "entity.name.function.attribute.fpp", "match": "[A-Za-z_][A-Za-z0-9_]*" }]
+    },
+    "classdecl": {
+      "patterns": [
+        {
+          "match": "\\b(class|instance)\\s+([A-Z][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "keyword.other.fpp" },
+            "2": { "name": "entity.name.class.fpp" }
+          }
+        },
+        {
+          "comment": "an operator member: static (+) ...",
+          "match": "\\b(static|member|abstract|override|default)\\s+(\\([-+*/%<>=!&|^~@:.]+\\))",
+          "captures": {
+            "1": { "name": "keyword.other.fpp" },
+            "2": { "name": "entity.name.function.operator.fpp" }
+          }
+        }
+      ]
+    },
+    "typedecl": {
+      "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.fpp" },
+        "2": { "name": "entity.name.type.fpp" }
+      }
+    },
+    "constraints": {
+      "comment": "when C<'a> — the class in a constraint",
+      "match": "\\b(when)\\s+([A-Z][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.fpp" },
+        "2": { "name": "entity.name.class.fpp" }
+      }
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.fpp",
+          "match": "\\b(if|then|else|elif|match|with|for|while|do|done|to|downto|try|finally|return|yield|function)\\b"
+        },
+        {
+          "name": "keyword.other.fpp",
+          "match": "\\b(let|rec|and|in|module|namespace|open|type|class|instance|when|of|as|new|inherit|interface|abstract|override|default|static|member|val|mutable|extern|exception|struct|end|begin|inline|private|internal|public|use|lazy|fun|global|assert|upcast|downcast|fixed|delegate|void)\\b"
+        },
+        { "name": "constant.language.fpp", "match": "\\b(true|false|null)\\b" },
+        { "name": "keyword.operator.logical.fpp", "match": "\\b(not|or)\\b" }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        { "name": "constant.numeric.float.fpp", "match": "\\b[0-9][0-9_]*\\.[0-9_]*([eE][-+]?[0-9]+)?[fFmM]?\\b" },
+        { "name": "constant.numeric.integer.fpp", "match": "\\b0[xX][0-9a-fA-F_]+([uUlL]|UL|LL)?\\b" },
+        { "name": "constant.numeric.integer.fpp", "match": "\\b[0-9][0-9_]*([uUlLyYsS]|UL|LL)?\\b" }
+      ]
+    },
+    "typevars": {
+      "name": "entity.name.type.parameter.fpp",
+      "match": "'[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "operators": {
+      "name": "keyword.operator.fpp",
+      "match": "(\\|>|<\\||->|<-|:>|:\\?>|:\\?|::|\\|\\||&&|[-+*/%<>=!&|^~@]+)"
+    },
+    "types": {
+      "comment": "a capitalised name is a type or a module",
+      "name": "entity.name.type.fpp",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    }
+  }
+}

@@ -18,6 +18,7 @@
     <Compile Include="OracleTests.fs" />
     <Compile Include="LibraryTests.fs" />
     <Compile Include="ClassTests.fs" />
+    <Compile Include="ProjectTests2.fs" />
     <Compile Include="PluginTests.fs" />
     <Compile Include="LinkTests.fs" />
     <Compile Include="FfiTests.fs" />

@@ -1,0 +1,103 @@
+{
+  "name": "fpp",
+  "displayName": "F++",
+  "description": "F++ language support: diagnostics, hover types, go to definition, outline.",
+  "version": "0.1.0",
+  "publisher": "fpp",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.fppproj"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "fpp",
+        "aliases": [
+          "F++",
+          "fpp"
+        ],
+        "extensions": [
+          ".fpp"
+        ],
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "fppproj",
+        "aliases": [
+          "F++ project"
+        ],
+        "extensions": [
+          ".fppproj"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "fpp",
+        "scopeName": "source.fpp",
+        "path": "./syntaxes/fpp.tmLanguage.json"
+      },
+      {
+        "language": "fppproj",
+        "scopeName": "source.fppproj",
+        "path": "./syntaxes/fppproj.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "F++",
+      "properties": {
+        "fpp.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the fpp-lsp executable. Empty means 'dotnet run' against fpp.serverProject."
+        },
+        "fpp.server.project": {
+          "type": "string",
+          "default": "src/Fpp.Lsp/Fpp.Lsp.fsproj",
+          "description": "Project to run when fpp.server.path is empty, relative to the workspace root."
+        },
+        "fpp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the language server protocol traffic."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "fpp.restartServer",
+        "title": "F++: Restart Language Server"
+      },
+      {
+        "command": "fpp.build",
+        "title": "F++: Build Project"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}

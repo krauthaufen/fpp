@@ -279,6 +279,22 @@ type Workspace() =
     member _.ProjectFiles : string list =
         unbox<string list> (db.GetInput "project" "")
 
+    /// Load a `*.fppproj`: its sources become the compile order, its
+    /// libraries are linked. Files already open in the editor keep the text
+    /// the editor has — an unsaved buffer is the truth, not the file on disk.
+    /// Returns the project and any errors in the manifest itself.
+    member this.LoadProject (projectPath : string) : Project.Project * (int * string) list =
+        let r = Project.read projectPath
+        let open_ = this.ProjectFiles |> Set.ofList
+        for l in r.Loaded.Libs do
+            if System.IO.File.Exists l then this.AddLibrary l (System.IO.File.ReadAllText l)
+        db.SetInput "project" "" (box r.Loaded.Sources)
+        for s in r.Loaded.Sources do
+            if not (Set.contains s open_) then
+                let text = if System.IO.File.Exists s then System.IO.File.ReadAllText s else ""
+                db.SetInput "text" s (box text)
+        r.Loaded, r.Errors
+
     member this.SetFileText (path : string) (text : string) : unit =
         // unknown files join the project in arrival order (LSP didOpen)
         let files = this.ProjectFiles
@@ -539,9 +555,16 @@ type Workspace() =
         this.DefinitionAt path offset
         |> Option.map (fun d ->
             let basis = Analysis.Resolve.kindLabel d.Kind + " `" + d.Name + "`"
-            let ty =
-                (this.TypeCheck path).DefTypes
-                |> List.tryFind (fun (off, _, _) -> off = d.Offset)
-            match ty with
-            | Some (_, _, ts) -> basis + " : " + ts
-            | None -> basis)
+            // the generalized scheme is the better answer where there is one:
+            // it carries the class context, which is most of what a reader
+            // needs from a signature in this language. It also works when the
+            // definition lives in ANOTHER file, where this file's DefTypes
+            // has nothing to say.
+            let scheme =
+                dictTryFind (this.ProjectCheck ()).Schemes (d.Path + ":" + string d.Offset)
+            match scheme with
+            | Some sch -> basis + " : " + Analysis.Types.schemeString sch
+            | None ->
+                match (this.TypeCheck d.Path).DefTypes |> List.tryFind (fun (off, _, _) -> off = d.Offset) with
+                | Some (_, _, ts) -> basis + " : " + ts
+                | None -> basis)

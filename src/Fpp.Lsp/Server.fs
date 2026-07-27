@@ -24,6 +24,33 @@ let private range (sl : int) (sc : int) (el : int) (ec : int) : JsonNode =
     jobj [ "start", jobj [ "line", jint sl; "character", jint sc ]
            "end", jobj [ "line", jint el; "character", jint ec ] ]
 
+/// The workspace is keyed by filesystem path, the protocol by URI. Keeping
+/// the workspace on paths is what lets a project manifest — which names
+/// files on disk — and an editor buffer refer to the same thing.
+module private Uri =
+
+    let toPath (uri : string) : string =
+        if uri.StartsWith "file://" then
+            let raw = uri.Substring 7
+            let unescaped = System.Uri.UnescapeDataString raw
+            // file:///c:/... on Windows carries a leading slash
+            if unescaped.Length > 2 && unescaped.[0] = '/' && unescaped.[2] = ':' then unescaped.Substring 1
+            else unescaped
+        else uri
+
+    /// Escape a path segment-wise: `/` must survive, everything else that
+    /// needs escaping gets it.
+    let private escape (p : string) : string =
+        p.Split '/' |> Array.map System.Uri.EscapeDataString |> String.concat "/"
+
+    let ofPath (path : string) : string =
+        if path.StartsWith "file://" then path
+        elif path.StartsWith "/" then "file://" + escape path
+        elif System.IO.Path.IsPathRooted path then "file:///" + escape (path.Replace('\\', '/'))
+        // a path we never resolved to disk (the builtin prelude): pass it
+        // back unchanged rather than inventing a location for it
+        else path
+
 let private symbolKind (detail : string) : int =
     match detail with
     | "module" -> 2
@@ -33,12 +60,30 @@ let private symbolKind (detail : string) : int =
 
 type Server(ws : Workspace) =
     let mutable exitRequested = false
+    /// project files already loaded, so a second file from the same project
+    /// does not reload it
+    let loadedProjects = System.Collections.Generic.HashSet<string>()
 
     member _.ExitRequested = exitRequested
 
-    member private _.PublishDiagnostics (uri : string) : JsonNode =
+    /// Make sure `path` is checked in its project's compile order. An editor
+    /// opens a file, never a project, so the project has to be found from
+    /// the file — otherwise a file's exports arrive in the order the user
+    /// happened to click, which is not the order it is compiled in.
+    member private _.EnsureProject (path : string) : unit =
+        if not (path.EndsWith Project.extension) then
+            let dir =
+                let d = System.IO.Path.GetDirectoryName path
+                if System.String.IsNullOrEmpty d then "." else d
+            match Project.findFor dir with
+            | Some proj when not (loadedProjects.Contains proj) ->
+                loadedProjects.Add proj |> ignore
+                ws.LoadProject proj |> ignore
+            | _ -> ()
+
+    member private _.PublishDiagnostics (path : string) : JsonNode =
         let diags =
-            ws.Diagnostics uri
+            ws.Diagnostics path
             |> List.map (fun d ->
                 jobj [ "range", range d.Line d.Col d.EndLine d.EndCol
                        "severity", jint 1
@@ -46,7 +91,7 @@ type Server(ws : Workspace) =
                        "message", jstr d.Message ])
         jobj [ "jsonrpc", jstr "2.0"
                "method", jstr "textDocument/publishDiagnostics"
-               "params", jobj [ "uri", jstr uri; "diagnostics", jarr diags ] ]
+               "params", jobj [ "uri", jstr (Uri.ofPath path); "diagnostics", jarr diags ] ]
 
     member private _.Symbols (uri : string) : JsonNode =
         let rec conv (it : OutlineItem) : JsonNode =
@@ -76,40 +121,43 @@ type Server(ws : Workspace) =
         | "initialized" -> []
         | "textDocument/didOpen" ->
             let doc = ps.["textDocument"]
-            let uri = doc.["uri"].GetValue<string>()
-            ws.SetFileText uri (doc.["text"].GetValue<string>())
-            [ this.PublishDiagnostics uri ]
+            let path = Uri.toPath (doc.["uri"].GetValue<string>())
+            // the project first, so the file lands in its declared position
+            // in the compile order rather than being appended
+            this.EnsureProject path
+            ws.SetFileText path (doc.["text"].GetValue<string>())
+            [ this.PublishDiagnostics path ]
         | "textDocument/didChange" ->
-            let uri = ps.["textDocument"].["uri"].GetValue<string>()
+            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
             let changes = ps.["contentChanges"].AsArray()
             if changes.Count > 0 then
-                ws.SetFileText uri (changes.[changes.Count - 1].["text"].GetValue<string>())
-            [ this.PublishDiagnostics uri ]
+                ws.SetFileText path (changes.[changes.Count - 1].["text"].GetValue<string>())
+            [ this.PublishDiagnostics path ]
         | "textDocument/didClose" -> []
         | "textDocument/documentSymbol" ->
-            let uri = ps.["textDocument"].["uri"].GetValue<string>()
-            respond (this.Symbols uri)
+            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
+            respond (this.Symbols path)
         | "textDocument/definition" ->
-            let uri = ps.["textDocument"].["uri"].GetValue<string>()
+            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
             let line = ps.["position"].["line"].GetValue<int>()
             let ch = ps.["position"].["character"].GetValue<int>()
-            let starts = Lines.starts (ws.FileText uri)
+            let starts = Lines.starts (ws.FileText path)
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
-            match ws.DefinitionAt uri offset with
+            match ws.DefinitionAt path offset with
             | Some d ->
                 // the definition may live in another file of the project
-                let defStarts = if d.Path = uri then starts else Lines.starts (ws.FileText d.Path)
+                let defStarts = if d.Path = path then starts else Lines.starts (ws.FileText d.Path)
                 let sl, sc = Lines.toLineCol defStarts d.Offset
                 let el, ec = Lines.toLineCol defStarts (d.Offset + d.Length)
-                respond (jobj [ "uri", jstr d.Path; "range", range sl sc el ec ])
+                respond (jobj [ "uri", jstr (Uri.ofPath d.Path); "range", range sl sc el ec ])
             | None -> respond null
         | "textDocument/hover" ->
-            let uri = ps.["textDocument"].["uri"].GetValue<string>()
+            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
             let line = ps.["position"].["line"].GetValue<int>()
             let ch = ps.["position"].["character"].GetValue<int>()
-            let starts = Lines.starts (ws.FileText uri)
+            let starts = Lines.starts (ws.FileText path)
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
-            match ws.HoverAt uri offset with
+            match ws.HoverAt path offset with
             | Some text ->
                 respond (jobj [ "contents", jobj [ "kind", jstr "markdown"; "value", jstr text ] ])
             | None -> respond null
