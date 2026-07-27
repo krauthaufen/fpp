@@ -562,7 +562,10 @@ let parse (src : string) : ParseResult =
         elif s.Is LParen then
             let lp = s.Bump ()
             if s.Is RParen then Green.node ParenExpr [ lp; s.Bump () ]   // unit
-            elif s.Is Operator && not (s.IsOp "'") && infixPrec s.Cur.Text > 0 && not (canStartExpr ()) then
+            elif s.Is Operator && not (s.IsOp "'") && infixPrec s.Cur.Text > 0
+                 // `(+)` and `(-)` too: a lone operator before `)` is a
+                 // section even when the operator could start a prefix expr
+                 && ((s.Peek 1).Kind = RParen || not (canStartExpr ())) then
                 // operator section (+)
                 let op = s.Bump ()
                 let acc = vecNew<Green> ()

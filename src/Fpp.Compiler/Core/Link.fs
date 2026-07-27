@@ -196,6 +196,23 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         match d with
         | DLet (rc, v, sch, e) -> dictSet bodies (v.Path, v.Offset) (rc, v, sch, e)
         | _ -> ()
+    // Two top-level functions may share a bare name (Array.rev and Seq.rev):
+    // their stamps must not collide, so an AMBIGUOUS name carries its
+    // definition offset. Unique names keep the readable form.
+    let nameShared = dictNew<string, bool> ()
+    let nameSeenAt = dictNew<string, string * int> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, _) ->
+            (match dictTryFind nameSeenAt v.Name with
+             | Some k when k <> (v.Path, v.Offset) -> dictSet nameShared v.Name true
+             | Some _ -> ()
+             | None -> dictSet nameSeenAt v.Name (v.Path, v.Offset))
+        | _ -> ()
+    let mangleFor (v : VarId) (inst : string list) =
+        if (dictTryFind nameShared v.Name) = Some true
+        then mangleInst (v.Name + "_" + string v.Offset) inst
+        else mangleInst v.Name inst
     // A body that performs array/layout operations at a type-variable
     // element type cannot be shared: int[], string[] and struct[] have
     // different representations. Such functions are stamped at EVERY
@@ -339,7 +356,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                          vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
                      EVar (v, sch)
                  | Stamp i ->
-                     let mangled = mangleInst v.Name i
+                     let mangled = mangleFor v i
                      let key = (v.Path, v.Offset)
                      (match dictTryFind bodies key with
                       | Some (_, _, _, _) ->
@@ -482,7 +499,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         let key, inst = vecGet queue i
         (match dictTryFind bodies key with
          | Some (rc, v, sch, e) ->
-             let mangled = mangleInst v.Name inst
+             let mangled = mangleFor v inst
              let nv = { Path = v.Path; Offset = v.Offset + 7000000 + (abs (hash mangled) % 1000000); Name = mangled }
              // map the callee's quantified vars to this instantiation so
              // demands nested in the body specialize too

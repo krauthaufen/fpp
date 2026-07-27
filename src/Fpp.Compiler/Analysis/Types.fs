@@ -77,32 +77,62 @@ let mapConstraint (f : Type -> Type) (c : Constraint) : Constraint =
       Args = List.map f c.Args
       Assoc = c.Assoc |> List.map (fun (n, t) -> n, f t) }
 
-let rec freeVars (t : Type) : Var list =
-    match prune t with
-    | TVar v -> [ v ]
-    | TCon (_, args) -> List.collect freeVars args
-    | TFun (a, b) -> freeVars a @ freeVars b
-    | TTuple ts -> List.collect freeVars ts
+// Types legitimately SHARE sub-DAGs (a variable solved once, read many
+// times); every structural walker must be DAG-aware or a shared node
+// expands into an exponential tree walk. Each walker below carries a
+// reference-identity visited set.
+let private refComparer<'a when 'a : not struct> =
+    { new System.Collections.Generic.IEqualityComparer<'a> with
+        member _.Equals (a, b) = System.Object.ReferenceEquals (a, b)
+        member _.GetHashCode a = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode a }
 
-let rec private occurs (v : Var) (t : Type) : bool =
-    match prune t with
-    | TVar w -> System.Object.ReferenceEquals (v, w)
-    | TCon (_, args) -> List.exists (occurs v) args
-    | TFun (a, b) -> occurs v a || occurs v b
-    | TTuple ts -> List.exists (occurs v) ts
+let freeVars (t : Type) : Var list =
+    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
+    let acc = System.Collections.Generic.List<Var> ()
+    let rec go (t : Type) : unit =
+        let p = prune t
+        if seen.Add p then
+            match p with
+            | TVar v -> acc.Add v
+            | TCon (_, args) -> List.iter go args
+            | TFun (a, b) -> go a; go b
+            | TTuple ts -> List.iter go ts
+    go t
+    List.ofSeq acc
+
+let private occurs (v : Var) (t : Type) : bool =
+    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
+    let rec go (t : Type) : bool =
+        let p = prune t
+        if not (seen.Add p) then false
+        else
+            match p with
+            | TVar w -> System.Object.ReferenceEquals (v, w)
+            | TCon (_, args) -> List.exists go args
+            | TFun (a, b) -> go a || go b
+            | TTuple ts -> List.exists go ts
+    go t
 
 /// Clamp levels of all vars in t to at most `level` (link-time invariant
 /// that keeps generalization sound).
-let rec private adjustLevels (level : int) (t : Type) : unit =
-    match prune t with
-    | TVar w -> if w.Level > level then w.Level <- level
-    | TCon (_, args) -> List.iter (adjustLevels level) args
-    | TFun (a, b) -> adjustLevels level a; adjustLevels level b
-    | TTuple ts -> List.iter (adjustLevels level) ts
+let private adjustLevels (level : int) (t : Type) : unit =
+    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
+    let rec go (t : Type) : unit =
+        let p = prune t
+        if seen.Add p then
+            match p with
+            | TVar w -> if w.Level > level then w.Level <- level
+            | TCon (_, args) -> List.iter go args
+            | TFun (a, b) -> go a; go b
+            | TTuple ts -> List.iter go ts
+    go t
 
 /// Pretty-print with 'a, 'b, ... assigned per call in order of appearance.
+/// BUDGETED: a type that shares sub-DAGs expands exponentially as a tree,
+/// and a diagnostic renderer must never be where a compile goes to die.
 let typeString (t : Type) : string =
     let names = dictNew<int, string> ()
+    let mutable budget = 2000
     let nameOf (v : Var) : string =
         match dictTryFind names v.Id with
         | Some n -> n
@@ -111,6 +141,9 @@ let typeString (t : Type) : string =
             dictSet names v.Id n
             n
     let rec go (atom : bool) (t : Type) : string =
+        budget <- budget - 1
+        if budget <= 0 then "…"
+        else
         match prune t with
         | TVar v -> nameOf v
         | TCon (n, []) -> n
@@ -166,11 +199,37 @@ let schemeString (sch : Scheme) : string =
 /// Structural unification. Returns an error message on mismatch, None on
 /// success. Partial effects on failure are acceptable — the tree is only
 /// used for diagnostics and hover after errors.
-let rec unify (t1 : Type) (t2 : Type) : string option =
+let private pairComparer =
+    { new System.Collections.Generic.IEqualityComparer<struct (Type * Type)> with
+        member _.Equals (struct (a1, b1), struct (a2, b2)) =
+            System.Object.ReferenceEquals (a1, a2) && System.Object.ReferenceEquals (b1, b2)
+        member _.GetHashCode (struct (a, b)) =
+            (System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode a * 397)
+            ^^^ System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode b }
+
+let rec private unifySeen (seen : System.Collections.Generic.HashSet<struct (Type * Type)>) (t1 : Type) (t2 : Type) : string option =
+    let unify a b = unifySeen seen a b
     let a = prune t1
     let b = prune t2
+    if System.Object.ReferenceEquals (a, b) then None
+    // a revisited PAIR is already being unified higher up the walk: the
+    // shared sub-DAG expands exponentially as a tree without this cut
+    elif not (seen.Add (struct (a, b))) then None
+    else
     match a, b with
     | TVar v, TVar w when System.Object.ReferenceEquals (v, w) -> None
+    | TVar v, TVar w ->
+        // union by LEVEL: the SHALLOWER variable stays the representative.
+        // Schemes quantify representatives — re-pointing a class-level
+        // variable at a member-level one would make every scheme that
+        // quantifies it miss its substitution at instantiation, and the
+        // first concrete use would then ground the raw variable for ALL
+        if v.Level < w.Level then
+            w.Link <- Some (TVar v)
+        else
+            adjustLevels w.Level (TVar v)
+            v.Link <- Some (TVar w)
+        None
     | TVar v, other | other, TVar v ->
         if occurs v other then
             Some ("the type " + typeString other + " would contain itself")
@@ -195,9 +254,15 @@ let rec unify (t1 : Type) (t2 : Type) : string option =
     | _ ->
         Some ("type mismatch: " + typeString a + " vs " + typeString b)
 
+let unify (t1 : Type) (t2 : Type) : string option =
+    unifySeen (System.Collections.Generic.HashSet<struct (Type * Type)> (pairComparer)) t1 t2
+
 /// Variable supply and level tracking for one inference run.
 type TypeState() =
-    let mutable nextId = 0
+    // the id supply is PROCESS-WIDE: schemes from a cached prelude live
+    // across TypeStates, and id-keyed substitutions must never confuse a
+    // cached variable with a fresh one that restarted the count
+    static let mutable nextId = 0
     let mutable level = 0
 
     member _.Level = level
@@ -205,8 +270,8 @@ type TypeState() =
     member _.ExitLevel () = level <- level - 1
 
     member _.Fresh () : Type =
-        nextId <- nextId + 1
-        TVar { Id = nextId; Level = level; Link = None }
+        let id = System.Threading.Interlocked.Increment (&nextId)
+        TVar { Id = id; Level = level; Link = None }
 
     /// Quantify variables deeper than the current level. A constraint is
     /// carried into the scheme when it mentions a quantified variable — the
@@ -239,15 +304,26 @@ type TypeState() =
         else
             let subst = dictNew<int, Type> ()
             for v in s.Quantified do dictSet subst v.Id (this.Fresh ())
+            // memoized on node identity: the copy PRESERVES the body's
+            // sharing — a naive walk materializes a shared sub-DAG once per
+            // path, and the copies grow exponentially
+            let memo = System.Collections.Generic.Dictionary<Type, Type> (refComparer)
             let rec go (t : Type) : Type =
-                match prune t with
-                | TVar v ->
-                    (match dictTryFind subst v.Id with
-                     | Some fresh -> fresh
-                     | None -> TVar v)
-                | TCon (n, args) -> TCon (n, List.map go args)
-                | TFun (a, b) -> TFun (go a, go b)
-                | TTuple ts -> TTuple (List.map go ts)
+                let p = prune t
+                match memo.TryGetValue p with
+                | true, r -> r
+                | _ ->
+                    let r =
+                        match p with
+                        | TVar v ->
+                            (match dictTryFind subst v.Id with
+                             | Some fresh -> fresh
+                             | None -> TVar v)
+                        | TCon (n, args) -> TCon (n, List.map go args)
+                        | TFun (a, b) -> TFun (go a, go b)
+                        | TTuple ts -> TTuple (List.map go ts)
+                    memo.[p] <- r
+                    r
             go s.Body, List.map (mapConstraint go) s.Constraints
 
     member this.Instantiate (s : Scheme) : Type = fst (this.InstantiateC s)

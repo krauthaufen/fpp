@@ -513,6 +513,9 @@ let emit (decls : Decl list) : EmitResult =
         if not (vecToList wrappers |> List.exists (fun (n, _) -> n = fname)) then
             vecAdd wrappers (fname, arity)
 
+    // single-payload constructors used as first-class functions
+    let ctorAsFn = vecNew<string> ()
+
     let boolWat (w : string) = "(ref.i31 " + w + ")"
     let unwrapI32 (w : string) = "(call $toi " + w + ")"
     let intWat (w : string) = "(call $ofi " + w + ")"
@@ -973,7 +976,7 @@ let emit (decls : Decl list) : EmitResult =
         // therefore the correctly-rounded f16 answer.
         | EPrim (op, [ a; b ]) when
             op.EndsWith "h" && op.Length > 1
-            && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "<"; ">"; "<="; ">=" ] ->
+            && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "<"; ">"; "<="; ">="; "="; "<>" ] ->
             let baseOp = op.Substring (0, op.Length - 1)
             let wa = "(call $h2f " + unwrapI32 (recur a) + ")"
             let wb = "(call $h2f " + unwrapI32 (recur b) + ")"
@@ -985,6 +988,10 @@ let emit (decls : Decl list) : EmitResult =
              | "<" -> boolWat ("(f32.lt " + wa + " " + wb + ")")
              | ">" -> boolWat ("(f32.gt " + wa + " " + wb + ")")
              | "<=" -> boolWat ("(f32.le " + wa + " " + wb + ")")
+             // IEEE equality, not the bit pattern: -0.0h equals 0.0h,
+             // and a NaN half equals nothing — not even itself
+             | "=" -> boolWat ("(f32.eq " + wa + " " + wb + ")")
+             | "<>" -> boolWat ("(f32.ne " + wa + " " + wb + ")")
              | _ -> boolWat ("(f32.ge " + wa + " " + wb + ")"))
         | EPrim (("sqrth" | "absh" | "truncateh" | "u-h") as op, [ a ]) ->
             let w = "(call $h2f " + unwrapI32 (recur a) + ")"
@@ -1064,8 +1071,13 @@ let emit (decls : Decl list) : EmitResult =
              | Some 0 -> "(global.get $c_" + name + ")"
              | Some _ when not (List.isEmpty args) ->
                  "(struct.new $du1 (i32.const " + string (dictTryFind caseTag name).Value + ") " + String.concat " " (List.map recur args) + ")"
+             | Some 1 ->
+                 // the constructor as a VALUE (`|> Some`, `>> ValueSome`):
+                 // a closure whose function builds the case
+                 if not (List.contains name (vecToList ctorAsFn)) then vecAdd ctorAsFn name
+                 "(struct.new $clo (ref.func $ctorfn_" + name + ") (ref.null any))"
              | Some _ ->
-                 // payload ctor referenced unapplied
+                 // multi-payload ctor referenced unapplied
                  vecAdd errors ("unapplied constructor " + name)
                  "(ref.i31 (i32.const 0))"
              | None ->
@@ -2998,6 +3010,10 @@ TUPLE_HASH
             else
                 line ("  (func " + wk + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) (struct.new $clo (ref.func " + fname + ".w" + string (k + 1) + ") (struct.new $cons (local.get $a) (local.get $env))))")
 
+    // constructors as first-class functions
+    for name in vecToList ctorAsFn do
+        line ("  (func $ctorfn_" + name + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) (struct.new $du1 (i32.const " + string (dictTryFind caseTag name).Value + ") (local.get $a)))")
+
     // lifted lambdas
     for f in vecToList lifted do line ("  " + f)
 
@@ -3027,6 +3043,7 @@ TUPLE_HASH
     let declared = vecNew<string> ()
     for f, arity in vecToList wrappers do
         for k in 0 .. arity - 1 do vecAdd declared (f + ".w" + string k)
+    for name in vecToList ctorAsFn do vecAdd declared ("$ctorfn_" + name)
     for i in 1 .. liftCount do vecAdd declared ("$lam" + string i)
     if vecLen declared > 0 then
         line ("  (elem declare func " + String.concat " " (vecToList declared) + ")")

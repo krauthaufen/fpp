@@ -610,3 +610,91 @@ Earlier items, now done:
 - Written in the F#/F++ common subset; runtime touchpoints behind `Prelude`
 - No type-level lambdas; kinds capped ~rank 2; associated types not fundeps;
   no orphans; uniform representation baseline
+
+### ACCEPTANCE MILESTONE 2: the whole file EMITS and RUNS
+`reference-HashCollections.ported.fs.txt`: **0 diagnostics, 0 lowering
+notes, 0 emit errors** — 330KB of wat that wasmtime validates, instantiates
+and runs to exit 0. The journey: 87 -> 61 -> 36 -> 23 -> 14 -> 5 -> 0.
+What broke the tail, in dependency order:
+
+- **The full value restriction.** A parameterless binding whose RHS is
+  expansive stays monomorphic. `let a = Array.zeroCreate n` had every use
+  instantiating fresh variables, so the stamper could not tie the array's
+  element type to the enclosing instantiation.
+- **Assignments now unify.** `lt <- rt` typed both sides and unified
+  NOTHING; `inner <- Some e` constrained nothing and the payload stayed
+  unknown forever. Now argument-style (a list still widens into a seq cell).
+- **Union by level.** Var-var unification kept whichever variable was on
+  the right; re-pointing a class-level variable at a member-level one made
+  every scheme quantifying it miss its substitution at instantiation, and
+  the first concrete use grounded the raw variable for the whole class
+  (HashMap.OfList became `list<'a * int>` because a DELTA member used
+  `HashMap<'K, int>`). The shallower variable is now always the
+  representative. This subsumed an earlier ordering fix in property-setter
+  typing and is the root fix for the whole "silently int-only" family.
+- **Written type args in expression position** (`HashMap<'K, int>(...)`)
+  resolved in a FRESH scope, disconnecting 'K from the member's 'K —
+  a tyScope now carries the enclosing binding's named variables.
+- **Cross-file/same-class instantiation demands**: qualified uses of
+  another file's generics, statics resolved through the PARKED path, and
+  `static let`s all lost their instantiation lists, so layout-dependent
+  callees had their templates removed and nothing stamped. All three now
+  record demands (in the defining scheme's variable order).
+- **`and`-groups**: sibling types now pre-bind in Resolve AND pre-register
+  primary-ctor schemes in Infer, so `HashSet`'s members can build the
+  `HashMap` declared after them.
+- Stamp names disambiguate when two top-level functions share a bare name
+  (Array.rev / Seq.rev both stamped to `rev$int` and one clobbered the
+  other in the stamped-clone dict).
+- `$str` sentinel: string CHAR access no longer collides with arrays whose
+  ELEMENTS are strings; boxed element types fall back to the uniform $arr.
+- Enum cases named through their type (`NodeKind.Inner`) survive an
+  unrelated type also answering to the case's name.
+- struct-tuple PATTERNS in lambdas and match arms destructure through a
+  synthetic binder; single-payload constructors work as first-class
+  functions (`|> Some`, `update >> ValueSome`).
+
+### Stdlib: List, Array, Seq as real modules
+Full everyday F# core surface, written in F++ in the prelude: `List` (~40
+functions incl. stable merge sort, splitAt, zip/unzip, sum/max under class
+constraints), `Array` (same surface, bottom-up stable merge sort, copy/sub/
+fill/blit, ofSeq/toList round-trips), `Seq` extended (append/collect/choose/
+mapi/skip/init/singleton/replicate/sortWith/rev/toArray + eager folds).
+Operator sections `(+)` parse, type with the operator's class constraints,
+and lower to a lambda over the same resolution an infix use gets.
+
+### Next: the collections must WORK, not just run
+A smoke test appending real HashSet/HashMap usage compiles clean but traps
+at runtime: `IsLeaf` (a bit-packed base-class member) cast-fails when
+called from a stamped `addInPlace$int` clone. Minimal repros of the
+inheritance + stamped-builder shape pass, so the failing ingredient is
+still unisolated. Also parked: `HashMap [ ... ]` (ctor overloads from seq),
+top-level `let x, y = ...` destructure lowering ("top-level let shape"),
+inline `let ... in` destructure + index corner.
+
+### Solver termination and the suite clock
+Three non-termination bugs in constraint solving, all found by reading after
+a stack sample: numeric defaulting re-picked the SAME non-ground constraint
+forever when its defaulting unification failed (a tuple arg vs int — this
+alone was 8.5M solver calls on Workspace.fs); a failed IMPROVEMENT re-queued
+its unchanged constraint inside the same pass; and an instance context could
+grow the queue unboundedly (now deduped per pass + budgeted). The structural
+walkers (unify, occurs, freeVars, adjustLevels, typeString, instantiation
+copies) are DAG-aware now — types legitimately share sub-graphs, and a tree
+walk over them is exponential. The prelude is analyzed ONCE per process and
+copied per project (the suite paid it per test), and the type-var id supply
+is process-wide so cached and fresh variables can never collide. Suite:
+54s, 349 green.
+
+### KNOWN OPEN: self-application regressed to red (4 tests)
+Today's semantic changes surface ~318 diagnostics on the compiler's OWN
+sources (the F# self-application gates): union-by-level shifted which
+variable id survives a merge and id-keyed substitutions elsewhere now miss
+in places the old direction happened to satisfy; the defaulting fix REPORTS
+mismatches it previously looped on (`Ordered<string * string>` from sortBy
+with tuple keys — tuple Ordered instances do not exist yet); and Types.fs
+now contains `struct (Type * Type)` in generic args, which the F++ parser
+cannot parse. The assignment unification is restricted to plain-identifier
+targets (dot targets can resolve to setter shapes the dot machinery still
+mistypes). These four tests fail FAST now — before the fixes they hung the
+suite outright. The 4130-line acceptance file remains 0/0/0 and runs.

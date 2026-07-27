@@ -171,13 +171,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 go sch.Body, List.map (mapConstraint go) sch.Constraints)
 
     /// Substitute specific vars (by id) with given types, freshening nothing else.
+    /// Memoized on node identity so a shared sub-DAG is copied ONCE.
     let substVars (subst : Dict<int, Type>) (t : Type) : Type =
+        let memo = System.Collections.Generic.Dictionary<Type, Type> (HashIdentity.Reference)
         let rec go (t : Type) : Type =
-            match prune t with
-            | TVar v -> (match dictTryFind subst v.Id with Some a -> a | None -> TVar v)
-            | TCon (c, xs) -> TCon (c, List.map go xs)
-            | TFun (a, b) -> TFun (go a, go b)
-            | TTuple ts -> TTuple (List.map go ts)
+            let p = prune t
+            match memo.TryGetValue p with
+            | true, r -> r
+            | _ ->
+                let r =
+                    match p with
+                    | TVar v -> (match dictTryFind subst v.Id with Some a -> a | None -> TVar v)
+                    | TCon (c, xs) -> TCon (c, List.map go xs)
+                    | TFun (a, b) -> TFun (go a, go b)
+                    | TTuple ts -> TTuple (List.map go ts)
+                memo.[p] <- r
+                r
         go t
 
     let unifyAt (offset : int) (t1 : Type) (t2 : Type) : unit =
@@ -393,6 +402,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      unifyAt offset result (substVars subst fi.FieldType)
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
+                     // a SAME-FILE member is a generic function once lifted:
+                     // this use is a specialization demand like any other,
+                     // recorded in the definition scheme's own variable
+                     // order so the stamper's zip lines up. Without it a
+                     // layout-dependent static resolved through the PARKED
+                     // path emitted a bare EVar — and the template it named
+                     // had been removed by stamping
+                     (match fi.DefKey with
+                      | Some (dp, doff) when dp = path ->
+                          (match dictTryFind defSchemes doff with
+                           | Some sch when not (List.isEmpty sch.Quantified) ->
+                               let inst =
+                                   sch.Quantified
+                                   |> List.map (fun qv ->
+                                       match dictTryFind subst qv.Id with
+                                       | Some t -> t
+                                       | None -> st.Fresh ())
+                               vecAdd instRaw (offset, inst)
+                           | _ -> ())
+                      | _ -> ())
                      true
                  else true
              | None ->
@@ -556,9 +585,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let queue = vecNew<int * Constraint> ()
         for w in wanted do vecAdd queue w
         let mutable i = 0
-        while i < vecLen queue do
+        // an instance context that re-demands its own class would grow the
+        // queue forever INSIDE this pass — dedupe repeats, bound the work
+        let seenKey = dictNew<string, bool> ()
+        let keyOf (c : Constraint) =
+            c.Class + "|" + String.concat "," (List.map typeString c.Args)
+        let budget = vecLen queue * 4 + 256
+        while i < vecLen queue && i < budget do
             let offset, c = vecGet queue i
             i <- i + 1
+            let k = keyOf c
+            if (dictTryFind seenKey k).IsSome then vecAdd survivors (offset, c)
+            else
+            dictSet seenKey k true
             match byGiven c with
             | Some assoc ->
                 progress <- true
@@ -583,8 +622,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     progress <- true
                     let sub = dictNew<int, Type> ()
                     for v in inst.Params do dictSet sub v.Id (st.Fresh ())
-                    List.iter2 (fun h a -> unifyAt offset (Classes.substInst sub h) a) inst.Head c.Args
-                    vecAdd queue (offset, c)
+                    let mutable failed = false
+                    List.iter2
+                        (fun h a ->
+                            match unify (Classes.substInst sub h) a with
+                            | Some err ->
+                                failed <- true
+                                vecAdd diags (offset, err)
+                            | None -> ())
+                        inst.Head c.Args
+                    // a FAILED improvement is terminal: re-queueing the
+                    // unchanged constraint would improve it again, forever,
+                    // inside this very pass — the fuel counter never fires
+                    if not failed then vecAdd queue (offset, c)
                 | Classes.Deferred -> vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
                     if isGround c then
@@ -594,6 +644,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              "no instance " + c.Class + "<"
                              + String.concat ", " (List.map typeString c.Args) + ">")
                     else vecAdd survivors (offset, c)
+        // whatever the budget cut off survives untouched for the next pass
+        while i < vecLen queue do
+            vecAdd survivors (vecGet queue i)
+            i <- i + 1
         wanted <- vecToList survivors
         progress
 
@@ -614,6 +668,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// > 0 while typing a nested let — those must neither solve nor move
     /// the wanted pool, which belongs to the enclosing top-level binding
     let mutable letDepth = 0
+
+    /// The enclosing binding's named type variables ('K of the member or
+    /// class being typed). Written type arguments in EXPRESSION position
+    /// (`HashMap<'K, 'V>(...)`) must resolve here — a fresh scope would
+    /// disconnect them from the signature they name
+    let mutable tyScope : Dict<string, Type> = dictNew<string, Type> ()
 
     let generalizeBinding (declared : Constraint list) (ty : Type) : Scheme =
         if letDepth > 0 then
@@ -1132,8 +1192,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match args |> List.tryFind (fun m -> m.NodeKind = TyParams) with
                       | Some tp ->
                           let written =
+                              // resolved in the ENCLOSING binding's type-var
+                              // scope: `HashMap<'K, 'V>(...)` inside a member
+                              // means the member's 'K, not a fresh one
                               nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind)
-                              |> List.map (typeFromNode (dictNew ()))
+                              |> List.map (typeFromNode tyScope)
                           (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                            | Some ht ->
                                let fresh =
@@ -1261,7 +1324,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                unifyAt op.Offset res lt2
                            | _ -> unifyAt op.Offset lt (TFun (rt, res)))
                           res
-                      | "assign" -> tUnit
+                      | "assign" ->
+                          // the RHS must fit the target — like an argument,
+                          // so a list may still widen into a seq-typed cell.
+                          // Without this, `inner <- Some e` constrained
+                          // NOTHING and the payload stayed unknown forever
+                          // the tie is what lets an option CELL learn its
+                          // payload (`inner <- Some e`) — but ONLY for a
+                          // plain variable target. A dot target can resolve
+                          // to a SETTER shape the dot machinery still
+                          // mistypes, and unifying through that poisons the
+                          // value's type far from the assignment
+                          if op.Text = "<-" && l.NodeKind = IdentExpr then
+                              unifyArg op.Offset lt rt
+                          tUnit
                       | _ -> st.Fresh ())
                  | _ ->
                      for m in nodesOf n do exprType (GNode m) |> ignore
@@ -1311,6 +1387,62 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
                     |> Option.map (typeFromNode vars)
                 match inner, ascribed with
+                | [], _ when (tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text <> ":")) ->
+                    // an operator SECTION `(+)`: the operator as a function.
+                    // Typed exactly as its infix use would be, against two
+                    // fresh operands — same class wanted, same markers, so
+                    // lowering and stamping treat the body like any infix use
+                    let op = tokensOf n |> List.find (fun t -> t.Kind = Operator && t.Text <> ":")
+                    let lt = st.Fresh ()
+                    let rt = st.Fresh ()
+                    (match opClass op.Text with
+                     | "arith" | "cmp" | "bits" -> vecAdd opKindsRaw (op.Offset, lt)
+                     | _ -> ())
+                    (match opClass op.Text with
+                     | "logic" ->
+                         unifyAt op.Offset lt tBool
+                         unifyAt op.Offset rt tBool
+                         TFun (tBool, TFun (tBool, tBool))
+                     | "cmp" ->
+                         unifyAt op.Offset lt rt
+                         (match Classes.operatorClass op.Text with
+                          | Some cls when (dictTryFind classes.Classes cls).IsSome ->
+                              let c = { Class = cls; Args = [ lt ]; Assoc = [] }
+                              addWanted op.Offset c
+                              vecAdd pendingClassUses (op.Offset, Classes.operatorMemberName op.Text, c, false)
+                              vecAdd opTypesRaw (op.Offset, lt)
+                          | _ -> ())
+                         TFun (lt, TFun (rt, tBool))
+                     | "arith" ->
+                         (match Classes.operatorClass op.Text with
+                          | Some cls when (dictTryFind classes.Classes cls).IsSome ->
+                              let cd = (dictTryFind classes.Classes cls).Value
+                              let res = st.Fresh ()
+                              let c =
+                                  if cd.Params.Length = 1 then
+                                      unifyAt op.Offset lt rt
+                                      unifyAt op.Offset res lt
+                                      { Class = cls; Args = [ lt ]; Assoc = [] }
+                                  else { Class = cls; Args = [ lt; rt ]; Assoc = [ "Result", res ] }
+                              addWanted op.Offset c
+                              vecAdd pendingClassUses (op.Offset, Classes.operatorMemberName op.Text, c, false)
+                              vecAdd opTypesRaw (op.Offset, lt)
+                              TFun (lt, TFun (rt, res))
+                          | _ ->
+                              unifyAt op.Offset lt rt
+                              TFun (lt, TFun (rt, lt)))
+                     | "bits" ->
+                         if op.Text = "<<<" || op.Text = ">>>" then
+                             unifyAt op.Offset rt tInt
+                         else unifyAt op.Offset lt rt
+                         TFun (lt, TFun (rt, lt))
+                     | "cons" ->
+                         unifyAt op.Offset rt (tList lt)
+                         TFun (lt, TFun (rt, rt))
+                     | "append" ->
+                         unifyAt op.Offset lt rt
+                         TFun (lt, TFun (rt, lt))
+                     | _ -> st.Fresh ())
                 | [], _ -> tUnit
                 | [ t ], Some a -> unify t a |> ignore; t
                 | [ t ], None -> t
@@ -1798,6 +1930,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             vecToList before
             |> List.choose (fun c -> match c with GNode p when isPatKind p.NodeKind -> Some p | _ -> None)
         let vars = dictNew<string, Type> ()
+        // a TOP-LEVEL binding owns the written-type-variable scope; a nested
+        // let keeps its enclosing binding's scope, as F# scoping demands
+        if letDepth = 0 then tyScope <- vars
         // NOTE: must be called only after EnterLevel — variables created by
         // the ascription have to live at the binding's level to generalize
         let ascriptionOf () =
@@ -1922,6 +2057,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         pendingStructAttr <- false
         // declared type parameters
         let vars = dictNew<string, Type> ()
+        tyScope <- vars
         let tyParams = vecNew<Type> ()
         for m in nodesOf n do
             if m.NodeKind = TyParams then
@@ -2104,6 +2240,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // member scope: the class type variables plus the member's own
         let mvars = dictNew<string, Type> ()
         for k, v in dictPairs tyVars do dictSet mvars k v
+        tyScope <- mvars
         st.EnterLevel ()
         let mutable seenEq = false
         let idents = vecNew<Token> ()
@@ -2161,11 +2298,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some sa ->
                  let ps, bodies = accParts sa
                  let pts = ps |> List.map (patType mvars)
-                 for b in bodies do exprType (GNode b) |> ignore
-                 // the written value has the property's type
+                 // the written value has the property's type — tie it BEFORE
+                 // typing the body, so the body's own unifications (the
+                 // assignment inside the setter) see the settled variable
                  (match pts with
                   | [ only ] -> unifyAt (match tokensOf sa |> List.tryHead with Some t -> t.Offset | None -> 0) only propTy
                   | _ -> ())
+                 for b in bodies do exprType (GNode b) |> ignore
                  let setTy = List.foldBack (fun p acc -> TFun (p, acc)) pts tUnit
                  (match tokensOf sa |> List.tryFind (fun t -> t.Kind = Ident) with
                   | Some kt when (dictTryFind defsAt kt.Offset).IsSome ->
@@ -2248,6 +2387,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     and inferInstanceMember (expected : Type option) (t : Token) (m : GreenNode) : unit =
         st.EnterLevel ()
         let mvars = dictNew<string, Type> ()
+        tyScope <- mvars
         let pats = nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind)
         let bodies =
             m.Children |> List.filter (fun c -> match c with GNode b -> isExprish b.NodeKind | _ -> false)
@@ -2310,6 +2450,42 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 None
                         inferInstanceMember expected t m
 
+    /// Pre-register the primary-constructor scheme of an `and`-chained type,
+    /// so an EARLIER sibling's body can construct it. The real pass
+    /// re-registers the same offset with its own variables; both schemes
+    /// instantiate by copy, so the two never meet.
+    and predeclareCtor (n : GreenNode) : unit =
+        let vars = dictNew<string, Type> ()
+        let tyParams = vecNew<Type> ()
+        for m in nodesOf n do
+            if m.NodeKind = TyParams then
+                for t in Green.tokens (GNode m) do
+                    if t.Kind = Ident && t.Text <> "_" && not (dictTryFind vars t.Text).IsSome then
+                        let v = st.Fresh ()
+                        dictSet vars t.Text v
+                        vecAdd tyParams v
+        match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+        | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
+            let selfTy = TCon (nameTok.Text, vecToList tyParams)
+            (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+             | Some p ->
+                 let ctorArgTy = patType vars p
+                 let ctorTy = TFun (ctorArgTy, selfTy)
+                 setScheme nameTok.Offset
+                     { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id)
+                       Constraints = []; Body = ctorTy }
+             | None -> ())
+        | _ -> ()
+
+    and predeclareAndGroups (children : Green list) : unit =
+        for c in children do
+            match c with
+            | GNode n when n.NodeKind = TypeDecl ->
+                (match Green.tokens c |> List.tryHead with
+                 | Some t when t.Kind = Keyword && t.Text = "and" -> predeclareCtor n
+                 | _ -> ())
+            | _ -> ()
+
     and inferDecl (g : Green) : unit =
         match g with
         | GToken _ -> ()
@@ -2318,6 +2494,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | LetDecl -> inferLet n |> ignore
             | TypeDecl -> inferTypeDecl n
             | ModuleDef ->
+                predeclareAndGroups n.Children
                 for c in n.Children do inferDecl c
             | AttributeList ->
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
@@ -2465,6 +2642,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     root.Children |> List.iter (scanKind ClassDecl inferClassDecl)
     root.Children |> List.iter (scanKind InstanceDecl inferInstanceDecl)
 
+    predeclareAndGroups root.Children
     for c in root.Children do inferDecl c
     solveWanted ()
 
@@ -2478,7 +2656,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | Some (offset, c) ->
             (match Classes.select classes c.Class (c.Args |> List.map (fun _ -> tInt)) [] with
              | Classes.Solved _ ->
-                 for a in c.Args do unifyAt offset a tInt
+                 // a defaulting unification can FAIL (the arg is a tuple,
+                 // int is not): report once and drop the constraint, or
+                 // tryFind selects the very same one forever
+                 let mutable failed = false
+                 for a in c.Args do
+                     match unify a tInt with
+                     | Some err ->
+                         failed <- true
+                         vecAdd diags (offset, err)
+                     | None -> ()
+                 if failed then
+                     wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c)))
                  defaulting <- true
                  solveWanted ()
              | _ -> wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c))))

@@ -956,3 +956,103 @@ let genericArrayTests =
             Expect.equal out "2\n" "the [] literal is still polymorphic locally"
         }
     ]
+
+[<Tests>]
+let stdlibModuleTests =
+    testList "stdlib: List, Array and Seq as real modules" [
+        test "List: sort, fold with an operator section, sum, contains" {
+            let out =
+                run [ "let a = print (List.head (List.sort [ 3; 1; 2 ]))"
+                      "let b = print (List.fold (+) 0 [ 1; 2; 3 ])"
+                      "let c = print (List.sum [ 1.5; 2.5 ])"
+                      "let d = print (if List.contains \"x\" [ \"y\"; \"x\" ] then 1 else 0)"
+                      "let e = print (List.last (List.sortBy (fun x -> -x) [ 3; 1; 2 ]))"
+                      "let f = print (List.item 2 (List.append [ 1 ] [ 2; 3 ]))" ]
+            Expect.equal out "1\n6\n4\n1\n1\n3\n" "list surface"
+        }
+        test "Array: sort, map, unzip round-trips at multiple element types" {
+            let out =
+                run [ "let a = print ((Array.sort [| 3; 1; 2 |]).[0])"
+                      "let b = print (Array.sum (Array.map (fun x -> x * x) [| 1; 2; 3 |]))"
+                      "let c = print ((Array.rev [| \"x\"; \"y\" |]).[0])"
+                      "let d = print ((Array.sortBy (fun s -> String.length s) [| \"ccc\"; \"a\"; \"bb\" |]).[0])"
+                      "let e ="
+                      "    let x, y = Array.unzip (Array.zip [| 1; 2 |] [| \"a\"; \"b\" |])"
+                      "    print (x.[1] + String.length y.[1])" ]
+            Expect.equal out "1\n14\ny\na\n3\n" "array surface"
+        }
+        test "Seq: lazy combinators compose and materialize" {
+            let out =
+                run [ "let a = print (Seq.length (Seq.append [ 1; 2 ] [| 3 |]))"
+                      "let b = print (Seq.head (Seq.skip 2 [ 1; 2; 3; 4 ]))"
+                      "let c = print (Seq.length (Seq.collect (fun x -> Seq.replicate x x) [ 1; 2; 3 ]))"
+                      "let d = print (Seq.head (Seq.sort [ \"b\"; \"a\" ]))"
+                      "let e = print (Seq.reduce (+) (Seq.mapi (fun i x -> i * x) [ 1; 2; 3 ]))"
+                      "let f = print ((Seq.toArray (Seq.singleton 5)).[0])"
+                      "let g = print (Seq.last (Seq.rev [ 3; 1; 2 ]))" ]
+            Expect.equal out "3\n3\n6\na\n8\n5\n3\n" "seq surface"
+        }
+        test "an operator section is the operator as a function" {
+            let out =
+                run [ "let f = (+)"
+                      "let a = print (f 1 2)"
+                      "let b = print ((*) 3 4)"
+                      "let c = print (List.fold (+) 0.5 [ 1.0; 2.0 ])"
+                      "let d = print (if (<) 1 2 then 1 else 0)" ]
+            Expect.equal out "3\n12\n3.5\n1\n" "sections at int, float and comparison"
+        }
+        test "assignment constrains the target: an option cell learns its payload" {
+            let out =
+                run [ "let f (xs : seq<int>) (b : bool) ="
+                      "    let mutable inner = None"
+                      "    if b then inner <- Some (xs.GetEnumerator())"
+                      "    match inner with"
+                      "    | Some en ->"
+                      "        en.MoveNext() |> ignore"
+                      "        en.Current"
+                      "    | None -> -1"
+                      "let a = print (f [ 7; 8 ] true)"
+                      "let b = print (f [ 7; 8 ] false)" ]
+            Expect.equal out "7\n-1\n" "the enumerator dispatches through the learned interface"
+        }
+        test "a property setter does not corrupt the constructor's generality" {
+            // the class-level value variable and the setter parameter unify;
+            // the representative must stay the one the ctor scheme quantifies,
+            // or every ctor use shares one raw variable and the first
+            // concrete use grounds them ALL (map became int-only)
+            let out =
+                run [ "[<AllowNullLiteral>]"
+                      "type Linked<'K, 'V>(key : 'K, value : 'V, next : Linked<'K, 'V>) ="
+                      "    let mutable value = value"
+                      "    member x.Key = key"
+                      "    member x.Next = next"
+                      "    member x.Value"
+                      "        with get() = value"
+                      "        and set v = value <- v"
+                      "let rec map (mapping : ('K -> 'V -> 'T)) (node : Linked<'K, 'V>) ="
+                      "    if isNull node then null"
+                      "    else Linked(node.Key, (mapping (node.Key) (node.Value)), map mapping node.Next)"
+                      "let one = Linked(1, 2, Linked(3, 4, null))"
+                      "let r = map (fun k v -> string (k + v)) one"
+                      "let p = print r.Value"
+                      "let q = print r.Next.Value" ]
+            Expect.equal out "3\n7\n" "map stays generic in its result type"
+        }
+    ]
+
+[<Tests>]
+let halfEqualityTests =
+    testList "float16 equality is IEEE, not the bit pattern" [
+        test "negative zero equals zero; NaN equals nothing" {
+            let out =
+                run [ "let nz = -0.0h"
+                      "let z = 0.0h"
+                      "let a = print (if nz = z then 1 else 0)"
+                      "let nan = 0.0h / 0.0h"
+                      "let b = print (if nan = nan then 1 else 0)"
+                      "let c = print (if nan <> nan then 1 else 0)"
+                      "let d = print (if 1.5h = 1.5h then 1 else 0)"
+                      "let e = print (if 1.5h <> 2.5h then 1 else 0)" ]
+            Expect.equal out "1\n0\n1\n1\n1\n" "IEEE semantics at half width"
+        }
+    ]

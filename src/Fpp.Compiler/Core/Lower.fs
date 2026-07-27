@@ -61,6 +61,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> ()
                     elif m.NodeKind = InterfaceImpl then
                         m.Children |> List.iter (fun c -> match c with GNode x -> collectMembers x | _ -> ())
+                    elif m.NodeKind = LetDecl
+                         && (Green.tokens (GNode m) |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")) then
+                        // a `static let` lifts to a top-level binding, so its
+                        // uses may carry specialization demands too
+                        match m.Children
+                              |> List.tryPick (fun c ->
+                                   match c with
+                                   | GNode p when p.NodeKind = IdentPat ->
+                                       Green.tokens (GNode p) |> List.tryFind (fun t -> t.Kind = Ident)
+                                   | _ -> None) with
+                        | Some t -> dictSet topLevelDefs t.Offset true
+                        | None -> ()
                 n.Children |> List.iter (fun c -> match c with GNode m -> collectMembers m | _ -> ())
             | InstanceDecl ->
                 // an instance member is a top-level function like any other
@@ -533,18 +545,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 | Some t -> (memberAt t |> Option.map (fun (_, d) -> d.Offset = mv.Offset && d.Path = mv.Path)) = Some true
                                 | None -> false) ->
                           EApp (EVar (mv, msch), recv :: loweredArgs)
-                      | EVar (bv, _), [ pa ] when bv.Name = "pin" && bv.Path = "(builtin)" ->
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "pin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayPin (nm, pa)
-                      | EVar (bv, _), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayUnpin (nm, pa)
-                      | EVar (bv, _), [ cn ] when bv.Name = "zeroCreate" && bv.Path = "(builtin)" ->
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ cn ] when bv.Name = "zeroCreate" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           // the zero value is per-representation, so the
                           // marker survives to the emitter, which knows it
                           EArrayCreate (nm, cn, EUnknown "$zero")
-                      | EVar (bv, _), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with
                               | Some x -> x
@@ -605,7 +617,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     // unsigned shifts/division differ from signed
                                     ">>>"; "&&&"; "|||"; "^^^"; "<<<" ]
                           let suffix =
-                              if not suffixable then ""
+                              if not suffixable then
+                                  // halves must NOT fall through to structural
+                                  // $equal: comparing the i31 BIT PATTERN makes
+                                  // -0.0h <> 0.0h and nan_h = nan_h
+                                  if (op.Text = "=" || op.Text = "<>")
+                                     && (dictTryFind opKinds op.Offset) = Some "h" then "h"
+                                  else ""
                               else
                                   match dictTryFind opKinds op.Offset with
                                   // bool and char exist for conversions and
@@ -668,6 +686,40 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> note (offsetOf n) "prefix"))
             | ParenExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [] when (Green.tokens (GNode n) |> List.exists (fun t -> t.Kind = Operator && t.Text <> ":")) ->
+                     // operator section `(+)`: a lambda over the infix use,
+                     // with the same suffix/class resolution an infix
+                     // occurrence would get at this offset
+                     let op = Green.tokens (GNode n) |> List.find (fun t -> t.Kind = Operator && t.Text <> ":")
+                     let va = { Path = path; Offset = offsetOf n + 610000; Name = "_opl" }
+                     let vb = { Path = path; Offset = offsetOf n + 610001; Name = "_opr" }
+                     let sch = mono (TCon ("?", []))
+                     let la = EVar (va, sch)
+                     let lb = EVar (vb, sch)
+                     let suffixable =
+                         List.contains op.Text
+                             [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="
+                               ">>>"; "&&&"; "|||"; "^^^"; "<<<" ]
+                     let suffix =
+                         if not suffixable then ""
+                         else
+                             match dictTryFind opKinds op.Offset with
+                             | Some "b" | Some "c" -> ""
+                             | Some k -> k
+                             | None ->
+                                 match dictTryFind opTypes op.Offset with
+                                 | Some t when t <> "" && t <> "int" && t <> "char" && t <> "bool" -> "@" + t
+                                 | _ -> ""
+                     let body =
+                         match dictTryFind classUses op.Offset with
+                         | Some im ->
+                             let call =
+                                 EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
+                                       [ la; lb ])
+                             if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
+                             else call
+                         | None -> EPrim (op.Text + suffix, [ la; lb ])
+                     ELam ([ va, sch; vb, sch ], body)
                  | [] -> ELit LUnit
                  | [ one ] -> lowerExpr (GNode one)
                  | many -> ESeq (List.map (fun m -> lowerExpr (GNode m)) many))
@@ -688,6 +740,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
                     |> List.map (fun m -> lowerExpr (GNode m))
                 let bodyE = match List.tryLast body with Some b -> b | None -> ELit LUnit
+                if pats |> List.exists (fun p -> p.NodeKind = StructTuplePat) then
+                    // `fun struct(k, v) -> ...`: each struct-tuple parameter
+                    // becomes a synthetic argument destructured in the body
+                    let mutable bodyW = bodyE
+                    let binds =
+                        pats |> List.map (fun p ->
+                            if p.NodeKind = StructTuplePat then
+                                let binders =
+                                    Green.tokens (GNode p)
+                                    |> List.filter (fun t -> t.Kind = Ident)
+                                    |> List.choose (fun t -> dictTryFind defsAt t.Offset)
+                                    |> List.map (fun d -> varIdOf d, schemeOf d)
+                                let tn =
+                                    match dictTryFind fieldOwners (offsetOf p) with
+                                    | Some o -> o
+                                    | None -> "StructTuple" + string binders.Length
+                                let arg = { Path = path; Offset = offsetOf p + 650000; Name = "_sarg" }
+                                let sch = mono (TCon (tn, []))
+                                bodyW <- structLetExpr binders tn (EVar (arg, sch)) bodyW
+                                arg, sch
+                            else
+                                match lowerPat p with
+                                | PVar (v, s) -> v, s
+                                | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
+                                | _ ->
+                                    // a structured sibling: bind and match
+                                    let arg = { Path = path; Offset = offsetOf p + 650000; Name = "_arg" }
+                                    let sch = mono (TCon ("?", []))
+                                    bodyW <- EMatch (EVar (arg, sch), [ lowerPat p, None, bodyW ])
+                                    arg, sch)
+                    ELam (binds, bodyW)
+                else
                 (match paramBinds pats with
                  | binds, [] -> ELam (binds, bodyE)
                  | _, structuredPats ->
@@ -724,11 +808,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 (match List.tryLast es with
                                  | Some b -> None, lowerExpr (GNode b)
                                  | None -> None, ELit LUnit)
-                        let pat =
+                        let pat, body =
                             match pats with
-                            | [ p ] -> lowerPat p
-                            | [] -> PWild
-                            | ps -> POr (List.map lowerPat ps)   // bar-separated alternatives
+                            | [ p ] when p.NodeKind = StructTuplePat ->
+                                // `| struct(a, b) ->`: bind the whole value,
+                                // then read its fields into the binders
+                                let binders =
+                                    Green.tokens (GNode p)
+                                    |> List.filter (fun t -> t.Kind = Ident)
+                                    |> List.choose (fun t -> dictTryFind defsAt t.Offset)
+                                    |> List.map (fun d -> varIdOf d, schemeOf d)
+                                let tn =
+                                    match dictTryFind fieldOwners (offsetOf p) with
+                                    | Some o -> o
+                                    | None -> "StructTuple" + string binders.Length
+                                let tmp = { Path = path; Offset = offsetOf p + 4100000; Name = "_sm" }
+                                let sch = mono (TCon (tn, []))
+                                PVar (tmp, sch), structLetExpr binders tn (EVar (tmp, sch)) body
+                            | [ p ] -> lowerPat p, body
+                            | [] -> PWild, body
+                            | ps -> POr (List.map lowerPat ps), body   // bar-separated alternatives
                         pat, guard, body)
                 (match scrut with
                  | Some s -> EMatch (lowerExpr (GNode s), cases)
@@ -924,8 +1023,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match dictTryFind instSites t.Offset with
                     | Some inst when
                          not (List.isEmpty inst)
-                         && d.Path = path
-                         && (dictTryFind topLevelDefs d.Offset).IsSome ->
+                         // cross-file members are exports, hence top-level;
+                         // their stamps matter just as much as local ones
+                         && (if d.Path = path then (dictTryFind topLevelDefs d.Offset).IsSome else true) ->
                         EVarI (varIdOf d, schemeOf d, inst)
                     | _ -> EVar (varIdOf d, schemeOf d)
                 if isStaticUse n then
@@ -958,8 +1058,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match dictTryFind instSites name.Offset with
                            | Some inst when
                                 not (List.isEmpty inst)
-                                && d.Path = path
-                                && (dictTryFind topLevelDefs d.Offset).IsSome ->
+                                // a qualified use of another file's binding
+                                // (Module.f) records a demand like any other
+                                && (if d.Path = path then (dictTryFind topLevelDefs d.Offset).IsSome else true) ->
                                EVarI (varIdOf d, schemeOf d, inst)
                            | _ -> EVar (varIdOf d, schemeOf d))
                       | None ->

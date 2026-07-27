@@ -114,6 +114,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 (prefixes modulePath |> List.map (fun p -> if p = "" then o else p + "." + o)))
         opened @ prefixes modulePath @ [ "" ]
 
+    // "TypeName.CaseName" -> the case's definition, so `NodeKind.Inner`
+    // still means the CASE when an unrelated type also answers to `Inner`
+    let typeCases = dictNew<string, Definition> ()
+
     let findQualified (dotted : string) : Definition option =
         bases ()
         |> List.tryPick (fun b ->
@@ -187,6 +191,39 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             match c with
             | GToken t -> t.Kind = Keyword && t.Text = kw
             | _ -> false)
+
+    /// `type A ... and B ...`: the members of an `and` group see EACH OTHER,
+    /// so every sibling's name is bound before any body in the group is
+    /// walked. Keyed by the index of the group's first declaration; the
+    /// bindings are value-equal to what walkTypeDecl registers later.
+    let andGroupBindings (children : Green list) : Dict<int, (string * Definition) list> =
+        let m = dictNew<int, (string * Definition) list> ()
+        let arr = Array.ofList children
+        let isTypeDecl (g : Green) = match g with GNode n -> n.NodeKind = TypeDecl | _ -> false
+        let startsWithAnd (g : Green) =
+            match Green.tokens g |> List.tryHead with
+            | Some t -> t.Kind = Keyword && t.Text = "and"
+            | None -> false
+        let mutable i = 0
+        while i < arr.Length do
+            if isTypeDecl arr.[i] && not (startsWithAnd arr.[i]) then
+                let mutable j = i + 1
+                while j < arr.Length && isTypeDecl arr.[j] && startsWithAnd arr.[j] do j <- j + 1
+                if j - i > 1 then
+                    let binds =
+                        [ for k in i .. j - 1 do
+                            match arr.[k] with
+                            | GNode n ->
+                                match firstIdentToken n.Children with
+                                | Some t ->
+                                    yield t.Text, { Name = t.Text; Kind = DefType; Path = path
+                                                    Offset = t.Offset; Length = strLen t.Text }
+                                | None -> ()
+                            | GToken _ -> () ]
+                    dictSet m i binds
+                i <- j
+            else i <- i + 1
+        m
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
@@ -362,14 +399,22 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                         (match Map.tryFind head.Text env with
                          | Some d when d.Kind = DefType ->
                              (match rest |> List.tryLast with
-                              | Some last -> (Map.tryFind last.Text env |> Option.map (fun c -> c.Kind = DefCase)) = Some true
+                              | Some last ->
+                                  // the case is looked up in the TYPE's own
+                                  // cases first: an unrelated type sharing
+                                  // the case's name must not shadow it
+                                  (dictTryFind typeCases (d.Name + "." + last.Text)).IsSome
+                                  || (Map.tryFind last.Text env |> Option.map (fun c -> c.Kind = DefCase)) = Some true
                               | None -> false)
                          | _ -> false) ->
                      // `NodeKind.Leaf`: a case named through its own type
                      let spine = head :: rest
                      let last = List.last spine
-                     record head (Map.find head.Text env)
-                     record last (Map.find last.Text env)
+                     let headDef = Map.find head.Text env
+                     record head headDef
+                     (match dictTryFind typeCases (headDef.Name + "." + last.Text) with
+                      | Some cd -> record last cd
+                      | None -> record last (Map.find last.Text env))
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])
@@ -598,6 +643,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                  | Some t ->
                      let d = define DefCase t
                      outer <- Map.add t.Text d outer
+                     dictSet typeCases (typeName + "." + t.Text) d
                      if exportHere then exportDef d
                  | None -> ())
                 for x in u.Children do
@@ -758,10 +804,18 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 let saved = modulePath
                 modulePath <- (if modulePath = "" then segment else modulePath + "." + segment)
                 let mutable inner = outer
+                let groups = andGroupBindings n.Children
+                let mutable idx = 0
                 for c in n.Children do
-                    match c with
-                    | GNode _ -> inner <- walkDecl inner c
-                    | GToken _ -> ()
+                    (match dictTryFind groups idx with
+                     | Some binds ->
+                         for nm, d in binds do
+                             inner <- Map.add nm d (Map.add (typeKey nm) d inner)
+                     | None -> ())
+                    (match c with
+                     | GNode _ -> inner <- walkDecl inner c
+                     | GToken _ -> ())
+                    idx <- idx + 1
                 modulePath <- saved
                 outer
             | ModuleHeader ->
@@ -798,8 +852,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | _ -> local (fun () -> walkExpr env g) |> ignore; env
 
     let mutable env : Env = Map.empty
+    let rootGroups = andGroupBindings root.Children
+    let mutable rootIdx = 0
     for c in root.Children do
+        (match dictTryFind rootGroups rootIdx with
+         | Some binds ->
+             for nm, d in binds do
+                 env <- Map.add nm d (Map.add (typeKey nm) d env)
+         | None -> ())
         env <- walkDecl env c
+        rootIdx <- rootIdx + 1
 
     { Definitions = vecToList defs
       Resolutions = vecToList uses
