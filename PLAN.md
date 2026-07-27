@@ -176,6 +176,13 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
       string). Primitive instances declare no bodies: the backend emits the
       machine instruction, which is the design's "the instance is known
       statically and inlined" spelled out
+- [x] `Ordered<'a>` (`< > <= >=`, homogeneous, always bool, no associated
+      type) and `Neg<'a>` (unary minus). `=`/`<>` are deliberately NOT a
+      class: structural equality is total. String ordering is ordinal
+      (`$strcmp`, byte-wise), oracle-checked against F#
+- [x] class members are qualifiable: `Num.Zero`, `Add.(+)`. A primitive
+      instance gains a generated wrapper function so a NAMED use denotes
+      something callable while `a + b` stays a machine instruction
 - [x] user instances with bodies, homogeneous and heterogeneous
       (`Mul<float, V2d>`) — an instance member is an ordinary top-level
       function
@@ -195,6 +202,13 @@ Open:
 - [ ] a heterogeneous instance reached from inside a generic body: the
       stamped operator carries one operand type, so only the homogeneous
       case resolves there
+- [ ] the rest of the math surface has no classes yet, so none of it is
+      generic OR present: `sqrt`/`sin`/`cos`/`exp`/`log` (a `Floating<'a>`
+      class), `abs`, `min`/`max`, `**`, and `%` on floats (wasm has no float
+      remainder, so an instance needs a body)
+- [x] a real bug this surfaced: stamping decisions did not walk match/try
+      GUARDS, so a generic operator in a `when` clause was invisible to
+      specialization. Pre-existing — it applied to array ops too
 
 ### Tooling: projects and editors
 Docs: editors/README.md.

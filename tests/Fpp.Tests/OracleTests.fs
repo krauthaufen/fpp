@@ -861,6 +861,16 @@ let oracleTests =
             "let a = print (sum [1; 2; 3; 4; 5])"
             "let b = print (sum (rev [] [10; 20; 30]))"
         ]
+        oracle "string ordering is ordinal, like F#" [
+            "let cmp a b ="
+            "    if a < b then \"lt\" elif a > b then \"gt\" else \"eq\""
+            "let a = print (cmp \"apple\" \"banana\")"
+            "let b = print (cmp \"banana\" \"apple\")"
+            "let c = print (cmp \"apple\" \"apple\")"
+            "let d = print (cmp \"app\" \"apple\")"
+            "let e = print (cmp \"Zebra\" \"apple\")"   // case matters, ordinally
+            "let f = print (cmp \"\" \"a\")"
+        ]
         oracle "tuples, guards, negatives, arithmetic" [
             "let classify t ="
             "    match t with"

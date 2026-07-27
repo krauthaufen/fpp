@@ -843,9 +843,16 @@ let emit (decls : Decl list) : EmitResult =
             let wa = "(call " + un + " " + recur a + ")"
             let wb = "(call " + un + " " + recur b + ")"
             if kind = "t" then
-                // string ops: only + (concat) and comparisons via $equal
+                // `+` concatenates; ordering is a byte-wise compare, which is
+                // ordinal — the same thing F#'s `<` on strings does
+                let cmp =
+                    "(call $strcmp (ref.cast (ref $str) " + recur a + ") (ref.cast (ref $str) " + recur b + "))"
                 (match baseOp with
                  | "+" -> "(call $strcat (ref.cast (ref $str) " + recur a + ") (ref.cast (ref $str) " + recur b + "))"
+                 | "<" -> boolWat ("(i32.lt_s " + cmp + " (i32.const 0))")
+                 | ">" -> boolWat ("(i32.gt_s " + cmp + " (i32.const 0))")
+                 | "<=" -> boolWat ("(i32.le_s " + cmp + " (i32.const 0))")
+                 | ">=" -> boolWat ("(i32.ge_s " + cmp + " (i32.const 0))")
                  | _ ->
                      vecAdd errors ("unsupported string operator " + baseOp)
                      "(ref.i31 (i32.const 0))")
@@ -2179,6 +2186,23 @@ TUPLE_HASH
       (array.set $str (local.get $r) (i32.add (local.get $la) (local.get $i)) (array.get_u $str (local.get $b) (local.get $i)))
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l2)))
     (local.get $r))
+  (func $strcmp (param $a (ref $str)) (param $b (ref $str)) (result i32)
+    (local $i i32) (local $la i32) (local $lb i32) (local $ca i32) (local $cb i32)
+    (local.set $la (array.len (local.get $a)))
+    (local.set $lb (array.len (local.get $b)))
+    (block $done (loop $go
+      ;; one operand exhausted: the shorter string sorts first
+      (br_if $done (i32.or (i32.ge_u (local.get $i) (local.get $la))
+                           (i32.ge_u (local.get $i) (local.get $lb))))
+      (local.set $ca (array.get_u $str (local.get $a) (local.get $i)))
+      (local.set $cb (array.get_u $str (local.get $b) (local.get $i)))
+      (if (i32.ne (local.get $ca) (local.get $cb))
+        (then (return (select (i32.const -1) (i32.const 1)
+                              (i32.lt_u (local.get $ca) (local.get $cb))))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $go)))
+    (if (i32.lt_u (local.get $la) (local.get $lb)) (then (return (i32.const -1))))
+    (if (i32.gt_u (local.get $la) (local.get $lb)) (then (return (i32.const 1))))
+    (i32.const 0))
   (func $addv (param $a anyref) (param $b anyref) (result anyref)
     (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
       (then (return (call $strcat (ref.cast (ref $str) (local.get $a)) (ref.cast (ref $str) (local.get $b))))))

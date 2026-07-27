@@ -87,7 +87,10 @@ let instancesOf (t : Tables) (cls : string) : InstanceDef list =
     | Some v -> vecToList v
     | None -> []
 
-/// The operator each arithmetic class carries. One symbol, one class.
+/// The class each operator symbol belongs to. One symbol, one class — that
+/// invariant is what makes `a + b` a single lookup instead of a search.
+/// `=` and `<>` are absent on purpose: structural equality is total and
+/// needs no instance.
 let operatorClass (op : string) : string option =
     match op with
     | "+" -> Some "Add"
@@ -95,7 +98,13 @@ let operatorClass (op : string) : string option =
     | "*" -> Some "Mul"
     | "/" -> Some "Div"
     | "%" -> Some "Rem"
+    | "<" | ">" | "<=" | ">=" -> Some "Ordered"
+    // the backend spells unary minus `u-`, to keep it apart from binary
+    | "~-" | "u-" -> Some "Neg"
     | _ -> None
+
+/// How the backend spells a class operator as a primitive.
+let primOperator (op : string) : string = if op = "~-" then "u-" else op
 
 /// The member name a class uses for its operator, given the symbol.
 let operatorMember (op : string) : string = "(" + op + ")"
@@ -110,9 +119,11 @@ let memberOperator (m : string) : string option =
 /// something callable — so one wrapper function is generated per primitive
 /// instance member. Ordinary operator uses never reach it, and dead-code
 /// elimination drops the ones nobody named.
-let wrapperMember (i : InstanceDef) (memberName : string) : InstMember =
+/// `index` is the member's position in its class, so an instance with
+/// several members (Ordered has four) gives each wrapper its own identity.
+let wrapperMember (i : InstanceDef) (index : int) (memberName : string) : InstMember =
     { MPath = i.Path
-      MOffset = 2000000 + i.Offset * 8
+      MOffset = 2000000 + i.Offset * 8 + index
       MName = memberName
       MTakesUnit = false }
 

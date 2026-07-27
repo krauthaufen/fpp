@@ -140,7 +140,18 @@ module Builtin =
               "class Integral<'a>"
               "    when Num<'a>"
               "    when Div<'a, 'a> = 'a"
-              "    when Rem<'a, 'a> = 'a" ]
+              "    when Rem<'a, 'a> = 'a"
+              // comparison is homogeneous and always yields bool, so it is a
+              // single-parameter class with no associated type. `=` and `<>`
+              // are NOT here: structural equality is total and needs no
+              // instance to be written.
+              "class Ordered<'a>"
+              "    static (<) : 'a -> 'a -> bool"
+              "    static (>) : 'a -> 'a -> bool"
+              "    static (<=) : 'a -> 'a -> bool"
+              "    static (>=) : 'a -> 'a -> bool"
+              "class Neg<'a>"
+              "    static (~-) : 'a -> 'a" ]
         ]
 
     /// The primitive instances. They bind their associated type and stop
@@ -169,7 +180,13 @@ module Builtin =
                       "    static One = " + one ]
                     (if hasRem then [ "instance Integral<" + t + ">" ]
                      else [ "instance Fractional<" + t + ">" ])
+                    [ "instance Ordered<" + t + ">" ]
+                    // F# has no unary minus on an unsigned type
+                    (if t = "uint32" then [] else [ "instance Neg<" + t + ">" ])
                 ])
+            // strings and chars order, they just do not do arithmetic
+            [ "instance Ordered<string>"
+              "instance Ordered<char>" ]
         ]
 
     let source =
@@ -462,7 +479,7 @@ type Workspace() =
                     let heads = i.Head |> List.map Analysis.Types.typeConName
                     for m, im in i.Members do
                         // operators only: other members are reached by name
-                        if m.StartsWith "(" && m.EndsWith ")" then
+                        if (Analysis.Classes.memberOperator m).IsSome then
                             dictSet instanceFns
                                 (cls + "@" + String.concat "@" heads)
                                 { Path = im.MPath; Offset = im.MOffset; Name = im.MName }

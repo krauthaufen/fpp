@@ -125,6 +125,32 @@ let genericMathTests =
                       "let c = print (add \"x\" \"y\")" ]
             Expect.equal out "3\n4\nxy\n" "one body, three specializations"
         }
+        test "comparison and unary minus are class members too" {
+            // both used to run the INTEGER instruction at every type once the
+            // body was generic, and trap on a float
+            let out =
+                run [ "let mx a b = if a > b then a else b"
+                      "let neg (x : 'a) : 'a when Num<'a> = -x"
+                      "let a = print (mx 3 4)"
+                      "let b = print (mx 2.5 1.5)"
+                      "let c = print (mx \"a\" \"b\")"
+                      "let d = print (neg 3)"
+                      "let e = print (neg 2.5)" ]
+            Expect.equal out "4\n2.5\nb\n-3\n-2.5\n" "Ordered and Neg stamp like the rest"
+        }
+        test "a generic operator inside a match guard is stamped" {
+            // the guard is as much part of the body as the result is; it was
+            // not being walked when deciding what to specialize
+            let out =
+                run [ "let classify t ="
+                      "    match t with"
+                      "    | a, b when a > b -> \"first\""
+                      "    | a, b when a < b -> \"second\""
+                      "    | _ -> \"same\""
+                      "let a = print (classify (2, 1))"
+                      "let b = print (classify (1.5, 2.5))" ]
+            Expect.equal out "first\nsecond\n" "guards specialize with their clause"
+        }
         test "a closed class carries the genericity" {
             let out =
                 run [ "let sum3 (a : 'a) (b : 'a) (c : 'a) : 'a when Num<'a> = a + b + c"

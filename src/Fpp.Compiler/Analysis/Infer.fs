@@ -526,7 +526,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | Classes.Solved (inst, _) ->
             match inst.Members |> List.tryPick (fun (m, k) -> if m = memberName then Some k else None) with
             | Some k -> Some k
-            | None when byName && inst.Builtin -> Some (Classes.wrapperMember inst memberName)
+            | None when byName && inst.Builtin ->
+                let index =
+                    match dictTryFind classes.Classes c.Class with
+                    | Some cd -> cd.Members |> List.findIndex (fun (m, _) -> m = memberName)
+                    | None -> 0
+                Some (Classes.wrapperMember inst index memberName)
             | None -> None
         | _ -> None
 
@@ -947,7 +952,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt op.Offset rt tBool
                           tBool
                       | "cmp" ->
+                          // comparison stays homogeneous; what the class adds
+                          // is that a body generic in the operand type gets
+                          // stamped, instead of silently running the integer
+                          // comparison at every type
                           unifyAt op.Offset lt rt
+                          (match Classes.operatorClass op.Text with
+                           | Some cls when (dictTryFind classes.Classes cls).IsSome ->
+                               let c = { Class = cls; Args = [ lt ]; Assoc = [] }
+                               addWanted op.Offset c
+                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c, false)
+                               vecAdd opTypesRaw (op.Offset, lt)
+                               solveWanted ()
+                           | _ -> ())
                           tBool
                       | "arith" ->
                           // an operator is a class member: the operand pair
@@ -1017,6 +1034,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match inner with
                       | [ i ] ->
                           vecAdd opKindsRaw (t.Offset, i)
+                          if t.Text = "-" && (dictTryFind classes.Classes "Neg").IsSome then
+                              let c = { Class = "Neg"; Args = [ i ]; Assoc = [] }
+                              addWanted t.Offset c
+                              vecAdd pendingClassUses (t.Offset, Classes.operatorMember "~-", c, false)
+                              vecAdd opTypesRaw (t.Offset, i)
+                              solveWanted ()
                           i
                       | _ -> st.Fresh ())
                  | _ -> st.Fresh ())

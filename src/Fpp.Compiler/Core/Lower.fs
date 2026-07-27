@@ -450,8 +450,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let suffix =
                          match dictTryFind opKinds op.Offset with
                          | Some k -> k
-                         | None -> ""
-                     EPrim ("u" + op.Text + suffix, [ lowerExpr (GNode a) ])
+                         | None ->
+                             // as for a binary operator: a type variable or a
+                             // user instance, both resolved after stamping
+                             match dictTryFind opTypes op.Offset with
+                             | Some t when t <> "" && t <> "int" && t <> "char" && t <> "bool" -> "@" + t
+                             | _ -> ""
+                     match dictTryFind classUses op.Offset with
+                     | Some im ->
+                         EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
+                               [ lowerExpr (GNode a) ])
+                     | None -> EPrim ("u" + op.Text + suffix, [ lowerExpr (GNode a) ])
                  | Some op, [] when (litOf op).IsSome -> ELit (litOf op).Value
                  | _, [ a ] -> lowerExpr (GNode a)
                  | _ ->

@@ -210,7 +210,12 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EApp (f, args) -> usesLayoutVar f || anyOf args
         | ELet (_, _, _, r, b) -> usesLayoutVar r || usesLayoutVar b
         | EIf (a, b, c) -> anyOf [ a; b; c ]
-        | EMatch (s, cs) -> usesLayoutVar s || (cs |> List.exists (fun (_, _, b) -> usesLayoutVar b))
+        // the GUARD counts as much as the body: an operator or array op in
+        // a `when` clause is just as unshareable across instantiations
+        | EMatch (s, cs) ->
+            usesLayoutVar s
+            || (cs |> List.exists (fun (_, g, b) ->
+                    usesLayoutVar b || (match g with Some x -> usesLayoutVar x | None -> false)))
         | ETuple xs | EListLit xs | ESeq xs -> anyOf xs
         // an operator at a type variable cannot be shared either: the
         // instance — and so the machine instruction — differs per type
@@ -228,7 +233,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EFieldSet (r, _, o, v) -> o.Contains "#" || usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
-        | ETry (b, cs) -> usesLayoutVar b || (cs |> List.exists (fun (_, _, x) -> usesLayoutVar x))
+        | ETry (b, cs) ->
+            usesLayoutVar b
+            || (cs |> List.exists (fun (_, g, x) ->
+                    usesLayoutVar x || (match g with Some y -> usesLayoutVar y | None -> false)))
         | _ -> false
     for d in decls do
         match d with
@@ -246,7 +254,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EApp (f, args) -> callsLayoutDep f || anyOf args
         | ELet (_, _, _, r, b) -> callsLayoutDep r || callsLayoutDep b
         | EIf (a, b, c) -> anyOf [ a; b; c ]
-        | EMatch (s, cs) -> callsLayoutDep s || (cs |> List.exists (fun (_, _, b) -> callsLayoutDep b))
+        | EMatch (s, cs) ->
+            callsLayoutDep s
+            || (cs |> List.exists (fun (_, g, b) ->
+                    callsLayoutDep b || (match g with Some x -> callsLayoutDep x | None -> false)))
         | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         | ERecord (_, fs) -> fs |> List.exists (fun (_, v) -> callsLayoutDep v)
@@ -263,7 +274,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EIndexSet (_, a, i, v) -> anyOf [ a; i; v ]
         | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> callsLayoutDep a
         | EArrayCreate (_, a, b) -> anyOf [ a; b ]
-        | ETry (b, cs) -> callsLayoutDep b || (cs |> List.exists (fun (_, _, x) -> callsLayoutDep x))
+        | ETry (b, cs) ->
+            callsLayoutDep b
+            || (cs |> List.exists (fun (_, g, x) ->
+                    callsLayoutDep x || (match g with Some y -> callsLayoutDep y | None -> false)))
         | _ -> false
     let mutable changed = true
     while changed do
@@ -350,9 +364,15 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                               match Classes.operatorClass (resolved.Substring (0, resolved.IndexOf "@")) with
                               | Some c -> c
                               | None -> ""
-                          (match dictTryFind instanceFns (cls + "@" + tn + "@" + tn) with
+                          // homogeneous two-parameter, else single-parameter
+                          let key2 = cls + "@" + tn + "@" + tn
+                          let key1 = cls + "@" + tn
+                          (match dictTryFind instanceFns key2 with
                            | Some fn -> EApp (EVar (fn, mono (TCon ("?", []))), xs)
-                           | None -> EPrim (resolved, xs))
+                           | None ->
+                               match dictTryFind instanceFns key1 with
+                               | Some fn -> EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                               | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
@@ -572,20 +592,37 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
         | Some cd ->
             for i in vecToList insts do
                 if i.Builtin then
-                    for m, msch in cd.Members do
-                        match Classes.memberOperator m, i.Head, i.Assoc with
-                        | Some op, [ l; r ], [ (_, res) ] ->
-                            let im = Classes.wrapperMember i m
+                    for index, (m, msch) in List.indexed cd.Members do
+                        match Classes.memberOperator m with
+                        | None -> ()
+                        | Some op ->
+                            // the operand types come from the head; the result
+                            // from the associated type where the class has one
+                            // (Add), and from the member's own signature where
+                            // it does not (Ordered returns bool)
+                            let operands =
+                                match i.Head with
+                                | [ only ] ->
+                                    let rec arity (t : Type) = match prune t with TFun (_, b) -> 1 + arity b | _ -> 0
+                                    List.replicate (max 1 (arity msch.Body)) only
+                                | many -> many
+                            let result =
+                                match i.Assoc with
+                                | [ (_, res) ] -> res
+                                | _ ->
+                                    let rec ret (t : Type) = match prune t with TFun (_, b) -> ret b | other -> other
+                                    ret msch.Body
+                            let im = Classes.wrapperMember i index m
                             let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
                             let ps =
-                                [ { Path = im.MPath; Offset = im.MOffset + 1; Name = "a" }, mono l
-                                  { Path = im.MPath; Offset = im.MOffset + 2; Name = "b" }, mono r ]
-                            let sch = mono (TFun (l, TFun (r, res)))
+                                operands
+                                |> List.mapi (fun k t ->
+                                    { Path = im.MPath; Offset = im.MOffset * 16 + k; Name = "p" + string k }, mono t)
+                            let sch = mono (List.foldBack (fun t acc -> TFun (t, acc)) operands result)
                             let args = ps |> List.map (fun (pv, psch) -> EVar (pv, psch))
-                            ignore msch
+                            let prim = Classes.primOperator op
                             yield DLet (false, v, sch,
-                                        ELam (ps, EPrim (withOpType (op + "@") (typeConName l), args)))
-                        | _ -> () ]
+                                        ELam (ps, EPrim (withOpType (prim + "@") (typeConName (List.head operands)), args))) ]
 
 /// Monomorphize with no user instances in play.
 let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
