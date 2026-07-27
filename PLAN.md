@@ -247,6 +247,14 @@ Docs: editors/README.md.
       INFERENCE resolved, not the backend's kind analysis — the latter
       cannot see through a global.
 - [ ] uint64, and the smaller widths (int8/16, byte). No demand yet.
+- [ ] `decimal` — DEFERRED, deliberately. wasm has four numeric types and
+      none of them is decimal, so it would be a software bignum: a 96-bit
+      mantissa with a scale, 96x96->192 multiply, long division, and
+      round-half-to-even, to be bit-exact with .NET. That is a few hundred
+      lines for a type this language's users are unlikely to reach for.
+      Cheap to reverse: the class layer makes it purely additive — a type
+      plus `Add`/`Num`/`Ordered`/`Fractional` instances, no compiler change.
+      Revisit if something real needs exact base-10 money.
 
 ### Identity: hash and equals — in progress
 Contract and semantics: DESIGN.md ("Identity"), divergences: DIVERGENCES.md.
