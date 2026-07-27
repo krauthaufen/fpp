@@ -199,6 +199,14 @@ let schemeString (sch : Scheme) : string =
 /// Structural unification. Returns an error message on mismatch, None on
 /// success. Partial effects on failure are acceptable — the tree is only
 /// used for diagnostics and hover after errors.
+/// The id a STORED quantified variable answers to NOW: unification may
+/// have re-pointed it at another variable, and a substitution keyed on the
+/// recorded id would miss every occurrence in the (pruned) body.
+let prunedId (v : Var) : int =
+    match prune (TVar v) with
+    | TVar w -> w.Id
+    | _ -> v.Id
+
 let private pairComparer =
     { new System.Collections.Generic.IEqualityComparer<struct (Type * Type)> with
         member _.Equals (struct (a1, b1), struct (a2, b2)) =
@@ -262,7 +270,7 @@ type TypeState() =
     // the id supply is PROCESS-WIDE: schemes from a cached prelude live
     // across TypeStates, and id-keyed substitutions must never confuse a
     // cached variable with a fresh one that restarted the count
-    static let mutable nextId = 0
+    let mutable nextId = 0
     let mutable level = 0
 
     member _.Level = level
@@ -270,8 +278,8 @@ type TypeState() =
     member _.ExitLevel () = level <- level - 1
 
     member _.Fresh () : Type =
-        let id = System.Threading.Interlocked.Increment (&nextId)
-        TVar { Id = id; Level = level; Link = None }
+        nextId <- nextId + 1
+        TVar { Id = nextId; Level = level; Link = None }
 
     /// Quantify variables deeper than the current level. A constraint is
     /// carried into the scheme when it mentions a quantified variable — the
@@ -303,7 +311,7 @@ type TypeState() =
         if List.isEmpty s.Quantified then s.Body, s.Constraints
         else
             let subst = dictNew<int, Type> ()
-            for v in s.Quantified do dictSet subst v.Id (this.Fresh ())
+            for v in s.Quantified do dictSet subst (prunedId v) (this.Fresh ())
             // memoized on node identity: the copy PRESERVES the body's
             // sharing — a naive walk materializes a shared sub-DAG once per
             // path, and the copies grow exponentially

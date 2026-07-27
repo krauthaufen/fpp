@@ -211,15 +211,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 while j < arr.Length && isTypeDecl arr.[j] && startsWithAnd arr.[j] do j <- j + 1
                 if j - i > 1 then
                     let binds =
-                        [ for k in i .. j - 1 do
+                        [ i .. j - 1 ]
+                        |> List.choose (fun k ->
                             match arr.[k] with
                             | GNode n ->
-                                match firstIdentToken n.Children with
-                                | Some t ->
-                                    yield t.Text, { Name = t.Text; Kind = DefType; Path = path
-                                                    Offset = t.Offset; Length = strLen t.Text }
-                                | None -> ()
-                            | GToken _ -> () ]
+                                (match firstIdentToken n.Children with
+                                 | Some t ->
+                                     Some (t.Text, { Name = t.Text; Kind = DefType; Path = path
+                                                     Offset = t.Offset; Length = strLen t.Text })
+                                 | None -> None)
+                            | GToken _ -> None)
                     dictSet m i binds
                 i <- j
             else i <- i + 1

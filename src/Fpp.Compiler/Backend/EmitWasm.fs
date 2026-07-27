@@ -3089,8 +3089,10 @@ TUPLE_HASH
                         j <- j + 1
                     // outer must close immediately after inner
                     if innerEnd > 0 && innerEnd + 1 < t.Length && t.[innerEnd + 1] = ')' then
-                        let arg = t.Substring (innerStart + inner.Length, innerEnd - (innerStart + inner.Length))
-                        t <- t.Substring (0, idx) + arg + t.Substring (innerEnd + 2)
+                        let arg : string = t.Substring (innerStart + inner.Length, innerEnd - (innerStart + inner.Length))
+                        let before : string = t.Substring (0, idx)
+                        let after : string = t.Substring (innerEnd + 2)
+                        t <- before + arg + after
                         changed <- true
                         idx <- t.IndexOf pat
                     else

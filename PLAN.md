@@ -698,3 +698,28 @@ cannot parse. The assignment unification is restricted to plain-identifier
 targets (dot targets can resolve to setter shapes the dot machinery still
 mistypes). These four tests fail FAST now — before the fixes they hung the
 suite outright. The 4130-line acceptance file remains 0/0/0 and runs.
+
+### Self-application back from 322 to green (3 of 4 gates)
+The 300-diagnostic regression had ONE cause: making the type-var id supply
+process-wide (a theory-driven "fix" during the perf hunt, never validated —
+per-file inference relies on per-run id spaces). Reverted; the prelude cache
+never needed it. The rest of the tail: `Ordered` on tuples is structural now
+(the builtin instance demands orderedness componentwise), .NET's List<'a>
+widens to seq, one comprehension and one peephole line rewritten into the
+typeable subset. Parser/project/inference self-application: ZERO diagnostics
+again. Still red: the LOWERING gate — 27 lint errors in the lowered core of
+Infer/Lower/EmitWasm/Workspace, all from constructs added today; each is a
+small lowering-imprecision hunt.
+
+### The prelude is a real source file now
+`stdlib/prelude.fpp` (1492 lines of actual F++, editor support and all),
+embedded into Fpp.Compiler as a resource at build time; `Builtin.source`
+reads the resource. Analyzed once per process (the cache), copied per
+project. Precompiling to a serialized form stays unnecessary while the
+one-time cost is ~250ms.
+
+### Backlog: binary wasm emission
+The backend emits .wat text — debuggable, and wasmtime takes it directly.
+Browsers only take binary .wasm, so before F++ output meets the web either
+a binary section-writer (LEB128 + type/func/code sections) or a wat2wasm
+assembly step must land.

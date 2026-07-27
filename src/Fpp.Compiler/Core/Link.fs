@@ -68,7 +68,7 @@ let private substScheme (inst : string list) (sch : Scheme) : Scheme =
     if List.isEmpty sch.Quantified || sch.Quantified.Length <> inst.Length then sch
     else
         let m = dictNew<int, Type> ()
-        List.zip sch.Quantified inst |> List.iter (fun (v, n) -> dictSet m v.Id (TCon (n, [])))
+        List.zip sch.Quantified inst |> List.iter (fun (v, n) -> dictSet m (prunedId v) (TCon (n, [])))
         let rec go (t : Type) : Type =
             match prune t with
             | TVar v -> (match dictTryFind m v.Id with Some c -> c | None -> TVar v)
@@ -506,7 +506,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
              let subst = dictNew<string, string> ()
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
-                 |> List.iter (fun (qv, n) -> dictSet subst ("#" + string qv.Id) n)
+                 |> List.iter (fun (qv, n) -> dictSet subst ("#" + string (prunedId qv)) n)
              // A recursive call carries no instantiation: inside its own
              // body a function is monomorphic, so the self-call is a plain
              // EVar. In a stamped clone it must target the clone, not the

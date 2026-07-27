@@ -109,7 +109,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let subst = dictNew<int, Type> ()
             let fresh = sch.Quantified |> List.map (fun v ->
                 let f = st.Fresh ()
-                dictSet subst v.Id f
+                // keyed by the var's CURRENT representative: unification may
+                // have re-pointed the recorded var since generalization
+                dictSet subst (prunedId v) f
                 f)
             let rec go (t : Type) : Type =
                 match prune t with
@@ -203,7 +205,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // obj is the top type: everything widens to it
         sup = "obj" || sup = sub
         || (isSeqName sup
-            && (isSeqName sub || sub = "array" || sub = "list"
+            && (isSeqName sub || sub = "array" || sub = "list" || sub = "List"
                 || (match dictTryFind impls sub with
                     | Some is -> is |> List.exists isSeqName
                     | None -> false)))
@@ -324,7 +326,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | Some (ps, baseTy) ->
                     let subst = dictNew<int, Type> ()
                     if ps.Length = args.Length then
-                        List.zip ps args |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                        List.zip ps args |> List.iter (fun (pv, a) -> dictSet subst (prunedId pv) a)
                     (match prune (substVars subst baseTy) with
                      | TCon (bn, bargs) -> declaringOwner bn bargs
                      | _ -> None)
@@ -397,8 +399,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          if fi.Params.Length = ownArgs.Length then ownArgs
                          else fi.Params |> List.map (fun _ -> st.Fresh ())
                      let subst = dictNew<int, Type> ()
-                     List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
-                     for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                     List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst (prunedId pv) a)
+                     for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
                      unifyAt offset result (substVars subst fi.FieldType)
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
@@ -606,6 +608,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some (_, gt) -> unifyAt offset ty gt
                     | None -> ()
             | None ->
+                // ordering on TUPLES is structural, as in F#: the builtin
+                // instance demands orderedness of every component instead
+                match c.Class, c.Args |> List.map prune with
+                | "Ordered", [ TTuple ts ] ->
+                    progress <- true
+                    for t in ts do
+                        vecAdd queue (offset, { Class = "Ordered"; Args = [ t ]; Assoc = [] })
+                | _ ->
                 match Classes.select classes c.Class c.Args c.Assoc with
                 | Classes.Solved (inst, sub) ->
                     progress <- true
@@ -1691,8 +1701,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     (match fieldCandidates (tn + "." + name.Text) with
                      | [ (_, fi) ] ->
                          let subst = dictNew<int, Type> ()
-                         for pv in fi.Params do dictSet subst pv.Id (st.Fresh ())
-                         for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                         for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                         for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
                          vecAdd memberSitesRaw (name.Offset, tn)
                          substVars subst fi.FieldType
                      | (_, first) :: _ ->
