@@ -38,6 +38,10 @@ type InferResult =
       /// member it resolved to. Absent when the instance is builtin, which
       /// is exactly when the backend emits the operation itself.
       ClassUses : (int * Classes.InstMember) list
+      /// a class-member use that did NOT resolve, because the type is still
+      /// a variable of the enclosing binding: "Class:member:typeName". The
+      /// binding is stamped, and the member resolves in each copy.
+      ClassPending : (int * string) list
       /// arithmetic-operator offset -> the operand type's name, or "#id"
       /// when it is a type variable of the enclosing binding. The suffix
       /// letters in OpKinds only cover the primitive types; this covers the
@@ -521,17 +525,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         wanted <- wanted |> List.filter (fun (_, c) -> not (moved c))
         sch
 
+    /// Which function an operator or a named member resolves to.
+    ///
+    /// The rule is PER MEMBER, not per instance: a member the instance gives
+    /// a body to is called; one it leaves out is a machine instruction. That
+    /// is what lets `instance Floating<float>` write `exp` in source while
+    /// `sqrt` stays an `f64.sqrt`, and what stops `compare`'s own body from
+    /// calling itself through the `<` it is written with.
+    ///
+    /// A NAMED use additionally falls back to a generated wrapper, because a
+    /// name has to denote something callable even where the operator is an
+    /// instruction.
     let instanceMember (byName : bool) (c : Constraint) (memberName : string) : Classes.InstMember option =
         match Classes.select classes c.Class c.Args c.Assoc with
         | Classes.Solved (inst, _) ->
             match inst.Members |> List.tryPick (fun (m, k) -> if m = memberName then Some k else None) with
             | Some k -> Some k
-            | None when byName && inst.Builtin ->
-                let index =
-                    match dictTryFind classes.Classes c.Class with
-                    | Some cd -> cd.Members |> List.findIndex (fun (m, _) -> m = memberName)
-                    | None -> 0
-                Some (Classes.wrapperMember inst index memberName)
+            | None when byName ->
+                (match dictTryFind classes.Classes c.Class with
+                 | Some cd ->
+                     (match cd.Members |> List.tryFindIndex (fun (m, _) -> m = memberName) with
+                      | Some index -> Some (Classes.wrapperMember inst index memberName)
+                      | None -> None)
+                 | None -> None)
             | None -> None
         | _ -> None
 
@@ -961,7 +977,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | Some cls when (dictTryFind classes.Classes cls).IsSome ->
                                let c = { Class = cls; Args = [ lt ]; Assoc = [] }
                                addWanted op.Offset c
-                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c, false)
+                               vecAdd pendingClassUses (op.Offset, Classes.operatorMemberName op.Text, c, false)
                                vecAdd opTypesRaw (op.Offset, lt)
                                solveWanted ()
                            | _ -> ())
@@ -972,12 +988,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // that instance says it is
                           (match Classes.operatorClass op.Text with
                            | Some cls when (dictTryFind classes.Classes cls).IsSome ->
+                               let cd = (dictTryFind classes.Classes cls).Value
+                               // a two-parameter class (Add) takes the operand
+                               // PAIR and yields its associated Result; a
+                               // one-parameter one (`**` through Floating) is
+                               // homogeneous and closed
                                let res = st.Fresh ()
-                               let c = { Class = cls; Args = [ lt; rt ]; Assoc = [ "Result", res ] }
+                               let c =
+                                   if cd.Params.Length = 1 then
+                                       unifyAt op.Offset lt rt
+                                       unifyAt op.Offset res lt
+                                       { Class = cls; Args = [ lt ]; Assoc = [] }
+                                   else { Class = cls; Args = [ lt; rt ]; Assoc = [ "Result", res ] }
                                addWanted op.Offset c
                                // if this resolves to an instance with a body,
                                // the operator IS a call to it
-                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c, false)
+                               vecAdd pendingClassUses (op.Offset, Classes.operatorMemberName op.Text, c, false)
                                // solve eagerly: with one operand known the
                                // choice is often already forced, and fixing
                                // it here keeps later inference honest
@@ -1037,7 +1063,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           if t.Text = "-" && (dictTryFind classes.Classes "Neg").IsSome then
                               let c = { Class = "Neg"; Args = [ i ]; Assoc = [] }
                               addWanted t.Offset c
-                              vecAdd pendingClassUses (t.Offset, Classes.operatorMember "~-", c, false)
+                              vecAdd pendingClassUses (t.Offset, Classes.operatorMemberName "~-", c, false)
                               vecAdd opTypesRaw (t.Offset, i)
                               solveWanted ()
                           i
@@ -2012,7 +2038,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> List.choose (constraintOf vars)
             let bodied = members |> List.filter (fun m -> not (isAssocDecl m) && hasBody m)
             let offset = match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0
-            let builtin = List.isEmpty bodied && path = Classes.builtinPath
+            // A PRELUDE instance is primitive: the backend supplies whatever
+            // it does not write out. That is per member, so
+            // `instance Floating<float>` can write `exp` in source and still
+            // let `sqrt` be an f64.sqrt.
+            let builtin = path = Classes.builtinPath
             let inst : Classes.InstanceDef =
                 { Class = name
                   Params = ps; Head = args; Assoc = assoc; Context = context
@@ -2102,10 +2132,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // a class-member use binds to an instance member only once solving has
     // settled; a builtin instance has no member to bind to, which is exactly
     // when the backend emits the operation itself
+    let classPendingRaw = vecNew<int * string> ()
     for offset, name, c, byName in vecToList pendingClassUses do
         match instanceMember byName c name with
         | Some key -> vecAdd classUsesRaw (offset, key)
-        | None -> ()
+        | None ->
+            // unresolved because the operand type is still a variable: name
+            // the class, the member and the variable, and let stamping
+            // finish the job in each specialized copy
+            if byName then
+                let tn =
+                    match c.Args |> List.tryHead |> Option.map prune with
+                    | Some (TCon (n, _)) -> n
+                    | Some (TVar v) -> "#" + string v.Id
+                    | _ -> ""
+                if tn <> "" then vecAdd classPendingRaw (offset, c.Class + ":" + name + ":" + tn)
 
     // retry parked dot-accesses until nothing more can be learned: resolving
     // one can fix a variable that unblocks another
@@ -2165,6 +2206,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       FieldOwners = vecToList fieldOwnersRaw
       CtorSites = vecToList ctorSitesRaw
       ClassUses = vecToList classUsesRaw
+      ClassPending = vecToList classPendingRaw
       OpTypes =
         vecToList opTypesRaw
         |> List.map (fun (off, ty) ->

@@ -875,6 +875,27 @@ let emit (decls : Decl list) : EmitResult =
                     boolWat ("(" + instr + " " + wa + " " + wb + ")")
                 else
                     "(call " + box_ + " (" + instr + " " + wa + " " + wb + "))"
+        // unary machine instructions the numeric classes expose by name.
+        // `abs` is the INSTRUCTION rather than `if x < 0 then -x`, because
+        // that form gets -0.0 and NaN wrong.
+        | EPrim (("sqrtf" | "sqrts" | "absf" | "abss" | "truncatef" | "truncates") as op, [ a ]) ->
+            let f32 = op.EndsWith "s"
+            let ty = if f32 then "f32" else "f64"
+            let un = if f32 then "$tos" else "$tof"
+            let box_ = if f32 then "$oss" else "$off"
+            let instr =
+                if op.StartsWith "sqrt" then ".sqrt"
+                elif op.StartsWith "abs" then ".abs"
+                else ".trunc"
+            "(call " + box_ + " (" + ty + instr + " (call " + un + " " + recur a + ")))"
+        | EPrim ("abs", [ a ]) ->
+            let x = unwrapI32 (recur a)
+            intWat ("(select (i32.sub (i32.const 0) " + x + ") " + x
+                    + " (i32.lt_s " + x + " (i32.const 0)))")
+        | EPrim ("absl", [ a ]) ->
+            let x = "(call $tol " + recur a + ")"
+            "(call $ofl (select (i64.sub (i64.const 0) " + x + ") " + x
+            + " (i64.lt_s " + x + " (i64.const 0))))"
         | EPrim ("u-f", [ a ]) -> "(call $off (f64.neg (call $tof " + recur a + ")))"
         | EPrim ("u-s", [ a ]) -> "(call $oss (f32.neg (call $tos " + recur a + ")))"
         | EPrim ("u-l", [ a ]) -> "(call $ofl (i64.sub (i64.const 0) (call $tol " + recur a + ")))"

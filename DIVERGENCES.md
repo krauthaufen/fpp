@@ -57,3 +57,43 @@ generated (see DESIGN.md, "Identity"), arrays must be given identity
 equality *explicitly* — the natural implementation of "structural equality,
 recursing into components" would quietly make them structural and break
 this.
+
+---
+
+## The transcendental functions are ours, and not bit-identical to .NET
+
+F#: `exp`, `log`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `asin`,
+`acos`, `atan`, `atan2` and `**` come from the platform's libm, and .NET
+publishes their results as the answer.
+F++: they are implemented in F++ itself, in the prelude, and agree with
+.NET to about 1e-15 relative — not to the last bit.
+
+**Reason: there is nothing to call.** wasm has `sqrt`, `abs` and `trunc` as
+instructions and stops there. There is no libm beneath a wasm module, and
+no host function to import that would not put a foreign dependency at the
+bottom of the language. So these functions are not a binding to an
+implementation; they *are* the implementation, and the accuracy is whatever
+we write.
+
+What that costs, precisely:
+
+- `exp` and `log` reduce against a two-word split of ln2 and use a Taylor
+  series; `sin` and `cos` reduce against a three-word split of pi/2. The
+  reduction degrades for arguments past roughly 1e8, where three words of
+  pi/2 stop being enough. .NET stays accurate much further out.
+- `pow` is exact for integer exponents up to 2^1024 (repeated squaring, so
+  `(-2.0) ** 3.0` is exactly `-8`), and goes through `exp (b * log a)`
+  otherwise, which loses a few more bits than a dedicated `pow`.
+- `sqrt`, `abs` and `truncate` ARE the machine instructions, so those are
+  bit-identical.
+
+**Consequence for the gate.** The oracle diffs stdout byte-for-byte, so it
+cannot arbitrate these: the last digit legitimately differs. They are
+tested against F# to a tolerance instead ("the math surface" in
+ClassTests), which is the honest check — and `sqrt`/`abs`/`truncate`, being
+exact, stay eligible for the oracle.
+
+**Not a divergence:** `%` on floats. F# defines it as the truncated
+remainder and so do we (`a - b * truncate (a / b)`), even though wasm has no
+instruction for it. `min`/`max` likewise use F#'s own definition,
+`if a < b then a else b`.

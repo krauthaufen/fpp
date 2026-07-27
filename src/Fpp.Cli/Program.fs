@@ -47,14 +47,16 @@ let private build (out : string) (files : string list) : int =
 
 /// A project names its sources in compile order and its output, so `check`
 /// and `build` take one argument instead of a hand-ordered file list.
-let private withProject (proj : string) (f : string list -> string list -> string -> int) : int =
+/// Returns None once it has reported a bad manifest.
+let private openProject (proj : string) : (string list * string) option =
     let r = Project.read proj
     if not (List.isEmpty r.Errors) then
         for line, msg in r.Errors do eprintfn "%s:%d: error: %s" proj line msg
-        1
+        None
     else
         let dir = System.IO.Path.GetDirectoryName r.Loaded.Path
-        f r.Loaded.Libs r.Loaded.Sources (System.IO.Path.Combine (dir, r.Loaded.Out))
+        let out = System.IO.Path.Combine (dir, r.Loaded.Out)
+        Some (r.Loaded.Libs @ r.Loaded.Sources, out)
 
 let private isProject (f : string) = f.EndsWith Project.extension
 
@@ -62,11 +64,17 @@ let private isProject (f : string) = f.EndsWith Project.extension
 let main argv =
     match List.ofArray argv with
     | [ "check"; proj ] when isProject proj ->
-        withProject proj (fun libs srcs _ -> check (libs @ srcs))
+        (match openProject proj with
+         | Some (files, _) -> check files
+         | None -> 1)
     | [ "build"; proj ] when isProject proj ->
-        withProject proj (fun libs srcs out -> build out (libs @ srcs))
+        (match openProject proj with
+         | Some (files, out) -> build out files
+         | None -> 1)
     | [ "build"; proj; "-o"; out ] when isProject proj ->
-        withProject proj (fun libs srcs _ -> build out (libs @ srcs))
+        (match openProject proj with
+         | Some (files, _) -> build out files
+         | None -> 1)
     | "check" :: files when not (List.isEmpty files) -> check files
     | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build out files
     | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files

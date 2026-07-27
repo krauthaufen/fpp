@@ -202,10 +202,19 @@ Open:
 - [ ] a heterogeneous instance reached from inside a generic body: the
       stamped operator carries one operand type, so only the homogeneous
       case resolves there
-- [ ] the rest of the math surface has no classes yet, so none of it is
-      generic OR present: `sqrt`/`sin`/`cos`/`exp`/`log` (a `Floating<'a>`
-      class), `abs`, `min`/`max`, `**`, and `%` on floats (wasm has no float
-      remainder, so an instance needs a body)
+- [x] the math surface: `Abs`, `MinMax`, `Floating` (sqrt, truncate, exp,
+      log, sin, cos, tan, sinh, cosh, tanh, asin, acos, atan, atan2, pow),
+      `%` on floats. `sqrt`/`abs`/`truncate` are machine instructions; the
+      transcendentals are written in F++ in the prelude, because wasm has no
+      libm under it — accurate to ~1e-15 but not bit-identical, so they are
+      tested to a tolerance (DIVERGENCES.md)
+- [x] `Ordered` is ONE operation (`compare : 'a -> 'a -> int`); `<`/`>`/
+      `<=`/`>=` are notation for a test on its result wherever the instance
+      is not primitive. `MinMax` deliberately does NOT require `Ordered`, so
+      a vector can have a componentwise min without a total order
+- [x] a named class member used inside GENERIC code (`compare key k` on a
+      generic key, which the MapExt port needs) resolves after stamping —
+      the member and its type travel in the IR until the copy is concrete
 - [x] a real bug this surfaced: stamping decisions did not walk match/try
       GUARDS, so a generic operator in a `when` clause was invisible to
       specialization. Pre-existing — it applied to array ops too

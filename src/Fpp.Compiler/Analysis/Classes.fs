@@ -99,9 +99,20 @@ let operatorClass (op : string) : string option =
     | "/" -> Some "Div"
     | "%" -> Some "Rem"
     | "<" | ">" | "<=" | ">=" -> Some "Ordered"
+    | "**" -> Some "Floating"
     // the backend spells unary minus `u-`, to keep it apart from binary
     | "~-" | "u-" -> Some "Neg"
     | _ -> None
+
+/// The member an operator resolves to. Usually the operator's own name, but
+/// comparison goes through the single `compare`, and `**` through `pow` —
+/// neither can be spelled as an operator member (`(**)` opens a comment).
+let operatorMemberName (op : string) : string =
+    match op with
+    | "<" | ">" | "<=" | ">=" -> "compare"
+    | "**" -> "pow"
+    | "~-" | "u-" -> "(~-)"
+    | other -> "(" + other + ")"
 
 /// How the backend spells a class operator as a primitive.
 let primOperator (op : string) : string = if op = "~-" then "u-" else op

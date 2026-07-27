@@ -48,6 +48,10 @@ let private withOpType (op : string) (name : string) : string =
     // reports it rather than silently running the integer path
     | other -> baseOp + "@" + other
 
+/// Key for one instance member: the class, the member, and the head types.
+let instanceKey (cls : string) (memberName : string) (heads : string list) : string =
+    cls + "|" + memberName + "|" + String.concat "@" heads
+
 let private substName (subst : Dict<string, string>) (n : string) =
     if n.StartsWith "#" then
         match dictTryFind subst n with
@@ -221,6 +225,9 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         // instance — and so the machine instruction — differs per type
         | EPrim (op, xs) ->
             (match opTypeName op with Some n -> symbolic n | None -> false) || anyOf xs
+        // an unresolved class member is unshareable for the same reason an
+        // operator is: which function it denotes depends on the type
+        | EUnknown n -> n.StartsWith "$class:" && n.Contains "#"
         | ECtor (_, _, xs) -> anyOf xs
         // a record whose NAME still mentions a type variable has no layout
         // yet, so code building it must be stamped just like an array op
@@ -365,16 +372,35 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                               | Some c -> c
                               | None -> ""
                           // homogeneous two-parameter, else single-parameter
-                          let key2 = cls + "@" + tn + "@" + tn
-                          let key1 = cls + "@" + tn
+                          let baseOp = resolved.Substring (0, resolved.IndexOf "@")
+                          let mem = Classes.operatorMemberName baseOp
+                          let key2 = instanceKey cls mem [ tn; tn ]
+                          let key1 = instanceKey cls mem [ tn ]
+                          let asCall (fn : VarId) =
+                              let call = EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                              // ordering has one operation; the predicates
+                              // test its result
+                              if cls = "Ordered" then EPrim (baseOp, [ call; ELit (LInt "0") ]) else call
                           (match dictTryFind instanceFns key2 with
-                           | Some fn -> EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                           | Some fn -> asCall fn
                            | None ->
                                match dictTryFind instanceFns key1 with
-                               | Some fn -> EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                               | Some fn -> asCall fn
                                | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
+            | EUnknown n when n.StartsWith "$class:" ->
+                (match n.Substring(7).Split ':' with
+                 | [| cls; memberName; tn0 |] ->
+                     let tn = substName subst tn0
+                     // a one-parameter class keys on one head, a homogeneous
+                     // two-parameter one on the pair
+                     let byOne = dictTryFind instanceFns (instanceKey cls memberName [ tn ])
+                     let byTwo = dictTryFind instanceFns (instanceKey cls memberName [ tn; tn ])
+                     (match (match byOne with Some _ -> byOne | None -> byTwo) with
+                      | Some fn -> EVar (fn, mono (TCon ("?", [])))
+                      | None -> EUnknown ("$class:" + cls + ":" + memberName + ":" + tn))
+                 | _ -> EUnknown n)
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
             | EField (x, fn, o) -> EField (x, fn, substName subst o)
             | EFieldSet (x, fn, o, v) -> EFieldSet (x, fn, substName subst o, v)
@@ -584,7 +610,10 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
 /// no member because `a + b` compiles to `i32.add`, but `Add.(+)` names the
 /// member, and a name must denote a function. Generated here rather than
 /// written in the prelude, because a prelude body would have to spell the
-/// operator that this very instance defines.
+/// very operation it is defining — `compare` written with `<` at int would
+/// call itself.
+///
+/// Only members the instance did NOT give a body get one here.
 let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
     [ for cls, insts in dictPairs classes.Instances do
         match dictTryFind classes.Classes cls with
@@ -593,36 +622,74 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
             for i in vecToList insts do
                 if i.Builtin then
                     for index, (m, msch) in List.indexed cd.Members do
-                        match Classes.memberOperator m with
-                        | None -> ()
-                        | Some op ->
-                            // the operand types come from the head; the result
-                            // from the associated type where the class has one
-                            // (Add), and from the member's own signature where
-                            // it does not (Ordered returns bool)
-                            let operands =
-                                match i.Head with
-                                | [ only ] ->
-                                    let rec arity (t : Type) = match prune t with TFun (_, b) -> 1 + arity b | _ -> 0
-                                    List.replicate (max 1 (arity msch.Body)) only
-                                | many -> many
-                            let result =
-                                match i.Assoc with
-                                | [ (_, res) ] -> res
-                                | _ ->
-                                    let rec ret (t : Type) = match prune t with TFun (_, b) -> ret b | other -> other
-                                    ret msch.Body
+                        let alreadyBodied = i.Members |> List.exists (fun (mn, _) -> mn = m)
+                        // the operand types come from the head; the result
+                        // from the associated type where the class has one
+                        // (Add), and from the member's own signature where it
+                        // does not (compare returns int)
+                        let rec arity (t : Type) = match prune t with TFun (_, b) -> 1 + arity b | _ -> 0
+                        let operands =
+                            match i.Head with
+                            | [ only ] -> List.replicate (max 1 (arity msch.Body)) only
+                            | many -> many
+                        let result =
+                            match i.Assoc with
+                            | [ (_, res) ] -> res
+                            | _ ->
+                                let rec ret (t : Type) = match prune t with TFun (_, b) -> ret b | other -> other
+                                ret msch.Body
+                        let im = Classes.wrapperMember i index m
+                        let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                        let ps =
+                            operands
+                            |> List.mapi (fun k t ->
+                                { Path = im.MPath; Offset = im.MOffset * 16 + k; Name = "p" + string k }, mono t)
+                        let sch = mono (List.foldBack (fun t acc -> TFun (t, acc)) operands result)
+                        let args = ps |> List.map (fun (pv, psch) -> EVar (pv, psch))
+                        let opnd = typeConName (List.head operands)
+                        let prim (name : string) = EPrim (withOpType (name + "@") opnd, args)
+                        let body =
+                            match Classes.memberOperator m with
+                            | Some op -> Some (prim (Classes.primOperator op))
+                            // three-way comparison out of the two primitive
+                            // predicates — the one place the ordering
+                            // predicates are more primitive than `compare`
+                            | None when m = "compare" ->
+                                Some (EIf (EPrim (withOpType "<@" opnd, args),
+                                           ELit (LInt "-1"),
+                                           EIf (EPrim (withOpType ">@" opnd, args),
+                                                ELit (LInt "1"),
+                                                ELit (LInt "0"))))
+                            // unary machine instructions
+                            | None when m = "sqrt" || m = "abs" || m = "truncate" -> Some (prim m)
+                            | None -> None
+                        let emit =
+                            match body with
+                            | Some b -> if alreadyBodied then [] else [ DLet (false, v, sch, ELam (ps, b)) ]
+                            | None -> []
+                        yield! emit ]
+
+/// Every instance member that has a function behind it — the bodies an
+/// instance wrote, plus the wrappers generated for the primitive ones. This
+/// is what a use site resolves against once monomorphization has made the
+/// type concrete.
+let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId> =
+    let table = dictNew<string, VarId> ()
+    for cls, insts in dictPairs classes.Instances do
+        match dictTryFind classes.Classes cls with
+        | None -> ()
+        | Some cd ->
+            for i in vecToList insts do
+                let heads = i.Head |> List.map typeConName
+                for index, (m, _) in List.indexed cd.Members do
+                    let key = instanceKey cls m heads
+                    match i.Members |> List.tryPick (fun (mn, im) -> if mn = m then Some im else None) with
+                    | Some im -> dictSet table key { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                    | None ->
+                        if i.Builtin then
                             let im = Classes.wrapperMember i index m
-                            let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
-                            let ps =
-                                operands
-                                |> List.mapi (fun k t ->
-                                    { Path = im.MPath; Offset = im.MOffset * 16 + k; Name = "p" + string k }, mono t)
-                            let sch = mono (List.foldBack (fun t acc -> TFun (t, acc)) operands result)
-                            let args = ps |> List.map (fun (pv, psch) -> EVar (pv, psch))
-                            let prim = Classes.primOperator op
-                            yield DLet (false, v, sch,
-                                        ELam (ps, EPrim (withOpType (prim + "@") (typeConName (List.head operands)), args))) ]
+                            dictSet table key { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+    table
 
 /// Monomorphize with no user instances in play.
 let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =

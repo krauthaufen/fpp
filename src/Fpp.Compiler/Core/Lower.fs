@@ -25,6 +25,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (projectMembers : Dict<string, Resolve.Definition>)
           (ifaces : Dict<string, (string * int) list>)
           (classUses : Dict<int, Fpp.Analysis.Classes.InstMember>)
+          (classPending : Dict<int, string>)
           (opTypes : Dict<int, string>) : LowerResult =
 
     let notes = vecNew<int * string> ()
@@ -266,6 +267,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let sch = mono (TCon ("?", []))
                           if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
                       | None ->
+                     match dictTryFind classPending t.Offset with
+                      // not resolved yet: the operand type is a variable of
+                      // the enclosing binding, which stamping will fix
+                      | Some payload -> EUnknown ("$class:" + payload)
+                      | None ->
                      match dictTryFind useDefs t.Offset with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
                       | Some d when currentSelf.IsSome
@@ -439,8 +445,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // ordinary call to that body
                           match dictTryFind classUses op.Offset with
                           | Some im ->
-                              EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
-                                    [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                              let call =
+                                  EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
+                                        [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                              // ordering has ONE operation: the predicates are
+                              // notation for a test on its result
+                              if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
+                              else call
                           | None ->
                               EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
                  | _ -> note (offsetOf n) "operator shape")
@@ -735,6 +746,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
                           let sch = mono (TCon ("?", []))
                           if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
+                      | None ->
+                     match dictTryFind classPending name.Offset with
+                      | Some payload -> EUnknown ("$class:" + payload)
                       | None ->
                      match dictTryFind useDefs name.Offset |> Option.filter (fun d -> d.Kind <> Resolve.DefMember) with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])

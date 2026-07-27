@@ -141,18 +141,259 @@ module Builtin =
               "    when Num<'a>"
               "    when Div<'a, 'a> = 'a"
               "    when Rem<'a, 'a> = 'a"
-              // comparison is homogeneous and always yields bool, so it is a
-              // single-parameter class with no associated type. `=` and `<>`
-              // are NOT here: structural equality is total and needs no
-              // instance to be written.
+              // Comparison is ONE operation returning an int, not four
+              // predicates: `<` and friends are notation for `compare _ _ < 0`
+              // wherever the instance is not primitive. `=`/`<>` are absent on
+              // purpose — structural equality is total and needs no instance.
               "class Ordered<'a>"
-              "    static (<) : 'a -> 'a -> bool"
-              "    static (>) : 'a -> 'a -> bool"
-              "    static (<=) : 'a -> 'a -> bool"
-              "    static (>=) : 'a -> 'a -> bool"
+              "    static compare : 'a -> 'a -> int"
               "class Neg<'a>"
-              "    static (~-) : 'a -> 'a" ]
+              "    static (~-) : 'a -> 'a"
+              "class Abs<'a>"
+              "    static abs : 'a -> 'a"
+              // min/max deliberately do NOT require Ordered: a vector has no
+              // total order but does have a componentwise minimum, and that
+              // is the operation graphics code actually wants
+              "class MinMax<'a>"
+              "    static min : 'a -> 'a -> 'a"
+              "    static max : 'a -> 'a -> 'a"
+              "class Floating<'a>"
+              "    when Fractional<'a>"
+              "    static sqrt : 'a -> 'a"
+              "    static truncate : 'a -> 'a"
+              "    static exp : 'a -> 'a"
+              "    static log : 'a -> 'a"
+              "    static sin : 'a -> 'a"
+              "    static cos : 'a -> 'a"
+              "    static tan : 'a -> 'a"
+              "    static sinh : 'a -> 'a"
+              "    static cosh : 'a -> 'a"
+              "    static tanh : 'a -> 'a"
+              "    static asin : 'a -> 'a"
+              "    static acos : 'a -> 'a"
+              "    static atan : 'a -> 'a"
+              "    static atan2 : 'a -> 'a -> 'a"
+              // `**` is notation for `pow`, not a member spelled `(**)`:
+              // that spelling cannot exist, because `(*` opens a comment
+              "    static pow : 'a -> 'a -> 'a" ]
         ]
+
+    /// `exp`, `log`, `sin`, `cos`, `tan` and `pow`, written in F++ itself.
+    /// wasm has `sqrt`, `abs` and `trunc` as instructions and nothing else,
+    /// and there is no libm underneath — so these are the implementation,
+    /// not a binding to one.
+    ///
+    /// Written once, with `~` marking the float-width suffix, and generated
+    /// for each width: the algorithms are identical, only the literals differ.
+    ///
+    /// Accuracy is a few ulp, and NOT bit-identical to .NET: reduction is
+    /// Cody-Waite with a three-term split (so it degrades for arguments
+    /// past ~1e8), and `pow` goes through `exp (b * log a)`. Recorded in
+    /// DIVERGENCES.md.
+    let private floatingSource = """
+// exact: doubling and halving a float are exact until it goes subnormal,
+// which exp's range check has already excluded
+let scale2~N~ m k =
+    let mutable r = m
+    let mutable n = k
+    while n > 0.0~ do
+        r <- r * 2.0~
+        n <- n - 1.0~
+    while n < 0.0~ do
+        r <- r * 0.5~
+        n <- n + 1.0~
+    r
+let exp~N~ x =
+    if x <> x then x
+    elif x > 709.782712893384~ then 1.0~ / 0.0~
+    elif x < -745.1332191019411~ then 0.0~
+    else
+        // x = k ln2 + r with |r| <= ln2/2, then Taylor to r^13/13!
+        let k = truncate (x * 1.4426950408889634~ + (if x < 0.0~ then -0.5~ else 0.5~))
+        let r = (x - k * 0.6931471803691238~) - k * 1.9082149292705877e-10~
+        let p =
+            1.0~ + r * (1.0~ + r * (0.5~ + r * (0.16666666666666666~
+                + r * (0.041666666666666664~ + r * (0.008333333333333333~
+                + r * (0.001388888888888889~ + r * (0.0001984126984126984~
+                + r * (2.48015873015873e-05~ + r * (2.7557319223985893e-06~
+                + r * (2.755731922398589e-07~ + r * (2.5052108385441718e-08~
+                + r * 2.08767569878681e-09~)))))))))))
+        scale2~N~ p k
+let log~N~ x =
+    if x <> x then x
+    elif x < 0.0~ then 0.0~ / 0.0~
+    elif x = 0.0~ then -1.0~ / 0.0~
+    else
+        // x = m 2^e with m in [sqrt(1/2), sqrt 2), then the atanh series in
+        // s = (m-1)/(m+1), where |s| <= 0.1716
+        let mutable m = x
+        let mutable e = 0.0~
+        while m >= 1.4142135623730951~ do
+            m <- m * 0.5~
+            e <- e + 1.0~
+        while m < 0.7071067811865476~ do
+            m <- m * 2.0~
+            e <- e - 1.0~
+        let s = (m - 1.0~) / (m + 1.0~)
+        let q = s * s
+        let p =
+            1.0~ + q * (0.3333333333333333~ + q * (0.2~ + q * (0.14285714285714285~
+                + q * (0.1111111111111111~ + q * (0.09090909090909091~
+                + q * (0.07692307692307693~ + q * (0.06666666666666667~
+                + q * (0.058823529411764705~ + q * 0.05263157894736842~))))))))
+        (e * 0.6931471803691238~ + e * 1.9082149292705877e-10~) + 2.0~ * s * p
+// pi/2 split three ways, so the reduction keeps its digits for moderately
+// large arguments; it degrades past ~1e8
+let reduce~N~ x =
+    let q = truncate (x * 0.6366197723675814~ + (if x < 0.0~ then -0.5~ else 0.5~))
+    ((x - q * 1.5707963267341256~) - q * 6.077100506506192e-11~) - q * 1.2154201862823113e-21~
+let quadrant~N~ x =
+    let q = truncate (x * 0.6366197723675814~ + (if x < 0.0~ then -0.5~ else 0.5~))
+    let m = q - 4.0~ * truncate (q / 4.0~)
+    if m < 0.0~ then m + 4.0~ else m
+let sinCore~N~ r =
+    let q = r * r
+    r * (1.0~ + q * (-0.16666666666666666~ + q * (0.008333333333333333~
+        + q * (-0.0001984126984126984~ + q * (2.7557319223985893e-06~
+        + q * (-2.505210838544172e-08~ + q * (1.6059043836821613e-10~
+        + q * -7.647163731819816e-13~)))))))
+let cosCore~N~ r =
+    let q = r * r
+    1.0~ + q * (-0.5~ + q * (0.041666666666666664~ + q * (-0.001388888888888889~
+        + q * (2.48015873015873e-05~ + q * (-2.755731922398589e-07~
+        + q * (2.08767569878681e-09~ + q * -1.1470745597729725e-11~))))))
+let sin~N~ x =
+    if x <> x then x
+    else
+        let n = quadrant~N~ x
+        let r = reduce~N~ x
+        if n = 0.0~ then sinCore~N~ r
+        elif n = 1.0~ then cosCore~N~ r
+        elif n = 2.0~ then -(sinCore~N~ r)
+        else -(cosCore~N~ r)
+let cos~N~ x =
+    if x <> x then x
+    else
+        let n = quadrant~N~ x
+        let r = reduce~N~ x
+        if n = 0.0~ then cosCore~N~ r
+        elif n = 1.0~ then -(sinCore~N~ r)
+        elif n = 2.0~ then -(cosCore~N~ r)
+        else sinCore~N~ r
+// an integer exponent is done by repeated squaring, which is EXACT — the
+// exp/log route would return -7.999999999999998 for (-2)^3
+let powIntN~N~ a n =
+    let mutable r = 1.0~
+    let mutable f = a
+    let mutable k = n
+    while k > 0.0~ do
+        let half = truncate (k * 0.5~)
+        if k - half - half <> 0.0~ then r <- r * f
+        f <- f * f
+        k <- half
+    r
+let pow~N~ a b =
+    if b = 0.0~ then 1.0~
+    elif b <> b then b
+    else
+        let k = truncate b
+        let mag = if b < 0.0~ then -b else b
+        if k = b && mag <= 1024.0~ then
+            let r = powIntN~N~ a mag
+            if b < 0.0~ then 1.0~ / r else r
+        elif a > 0.0~ then exp~N~ (b * log~N~ a)
+        elif a = 0.0~ then (if b > 0.0~ then 0.0~ else 1.0~ / 0.0~)
+        else
+            // a negative base is defined only at an integer exponent, and
+            // that case was handled above
+            0.0~ / 0.0~
+// hyperbolics. Near zero sinh cancels catastrophically in
+// (e^x - e^-x)/2, so small arguments take the series instead; cosh has no
+// such problem, and tanh saturates rather than overflowing.
+let sinh~N~ x =
+    if x <> x then x
+    else
+        let a = if x < 0.0~ then -x else x
+        if a < 0.5~ then
+            let q = x * x
+            x * (1.0~ + q * (0.16666666666666666~ + q * (0.008333333333333333~
+                + q * (0.0001984126984126984~ + q * 2.7557319223985893e-06~))))
+        else
+            let e = exp~N~ x
+            (e - 1.0~ / e) * 0.5~
+let cosh~N~ x =
+    if x <> x then x
+    else
+        let e = exp~N~ (if x < 0.0~ then -x else x)
+        (e + 1.0~ / e) * 0.5~
+let tanh~N~ x =
+    if x <> x then x
+    else
+        let a = if x < 0.0~ then -x else x
+        if a < 0.5~ then sinh~N~ x / cosh~N~ x
+        elif a > 20.0~ then (if x < 0.0~ then -1.0~ else 1.0~)
+        else
+            let e = exp~N~ (a + a)
+            let t = (e - 1.0~) / (e + 1.0~)
+            if x < 0.0~ then -t else t
+// atan by halving twice — atan y = 2 atan (y / (1 + sqrt (1 + y*y))) — which
+// brings the argument under 0.2 before the series, where it converges fast
+let atan~N~ x =
+    if x <> x then x
+    else
+        let a = if x < 0.0~ then -x else x
+        let big = a > 1.0~
+        let y = if big then 1.0~ / a else a
+        let y1 = y / (1.0~ + sqrt (1.0~ + y * y))
+        let y2 = y1 / (1.0~ + sqrt (1.0~ + y1 * y1))
+        let q = y2 * y2
+        let s =
+            y2 * (1.0~ - q * (0.3333333333333333~ - q * (0.2~ - q * (0.14285714285714285~
+                - q * (0.1111111111111111~ - q * (0.09090909090909091~
+                - q * (0.07692307692307693~ - q * (0.06666666666666667~
+                - q * (0.058823529411764705~ - q * (0.05263157894736842~
+                - q * 0.047619047619047616~)))))))))
+        let r = 4.0~ * s
+        let m = if big then 1.5707963267948966~ - r else r
+        if x < 0.0~ then -m else m
+let asin~N~ x =
+    if x <> x then x
+    elif x >= 1.0~ then 1.5707963267948966~
+    elif x <= -1.0~ then -1.5707963267948966~
+    else atan~N~ (x / sqrt (1.0~ - x * x))
+let atan2~N~ y x =
+    if x > 0.0~ then atan~N~ (y / x)
+    elif x < 0.0~ then
+        if y >= 0.0~ then atan~N~ (y / x) + 3.141592653589793~
+        else atan~N~ (y / x) - 3.141592653589793~
+    elif y > 0.0~ then 1.5707963267948966~
+    elif y < 0.0~ then -1.5707963267948966~
+    else 0.0~
+instance Floating<~T~>
+    static exp x = exp~N~ x
+    static log x = log~N~ x
+    static sin x = sin~N~ x
+    static cos x = cos~N~ x
+    static tan x = sin~N~ x / cos~N~ x
+    static sinh x = sinh~N~ x
+    static cosh x = cosh~N~ x
+    static tanh x = tanh~N~ x
+    static asin x = asin~N~ x
+    static acos x = 1.5707963267948966~ - asin~N~ x
+    static atan x = atan~N~ x
+    static atan2 y x = atan2~N~ y x
+    static pow a b = pow~N~ a b
+instance Rem<~T~, ~T~>
+    type Result = ~T~
+    static (%) a b = a - b * truncate (a / b)
+"""
+
+    /// `~T~` is the type, `~N~` the helper-name suffix, and a bare `~` the
+    /// literal suffix. Order matters: the named markers go first.
+    let private floatingInstance (t : string) (nameSuffix : string) (litSuffix : string) : string list =
+        floatingSource.Replace("~T~", t).Replace("~N~", nameSuffix).Replace("~", litSuffix).Split '\n'
+        |> Array.toList
+        |> List.filter (fun l -> l.Trim() <> "")
 
     /// The primitive instances. They bind their associated type and stop
     /// there: the backend emits these as machine instructions, so there is
@@ -183,10 +424,26 @@ module Builtin =
                     [ "instance Ordered<" + t + ">" ]
                     // F# has no unary minus on an unsigned type
                     (if t = "uint32" then [] else [ "instance Neg<" + t + ">" ])
+                    (if t = "uint32" then [] else [ "instance Abs<" + t + ">" ])
+                    // min/max are written out rather than generated: they are
+                    // the definition F# uses, and they must NOT go through
+                    // Ordered, so that a componentwise instance stays possible
+                    [ "instance MinMax<" + t + ">"
+                      "    static min a b = if a < b then a else b"
+                      "    static max a b = if a > b then a else b" ]
                 ])
             // strings and chars order, they just do not do arithmetic
             [ "instance Ordered<string>"
-              "instance Ordered<char>" ]
+              "instance Ordered<char>"
+              "instance MinMax<string>"
+              "    static min a b = if a < b then a else b"
+              "    static max a b = if a > b then a else b"
+              "instance MinMax<char>"
+              "    static min a b = if a < b then a else b"
+              "    static max a b = if a > b then a else b" ]
+            // the transcendentals, and the float remainder they need
+            floatingInstance "float" "F" ""
+            floatingInstance "float32" "F32" "f"
         ]
 
     let source =
@@ -243,7 +500,10 @@ type ProjectResults =
       /// "TypeName.MemberName" -> definition, project-wide
       Members : Fpp.Prelude.Dict<string, Analysis.Resolve.Definition>
       /// classes and their instances, project-wide
-      Classes : Analysis.Classes.Tables }
+      Classes : Analysis.Classes.Tables
+      /// the prelude's own inference result — it is source like any other
+      /// file, and its bodies use the classes it declares
+      BuiltinInfer : Analysis.Infer.InferResult }
 
 type Workspace() =
     let db = Db()
@@ -350,7 +610,8 @@ type Workspace() =
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
             for k, d in bb.Members do dictSet members k d
-            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes ctors classes |> ignore
+            let binf =
+                Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes ctors classes
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
@@ -376,7 +637,7 @@ type Workspace() =
                         dictSet impls n (cimpls |> List.map fst)
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
-              Members = members; Classes = classes })
+              Members = members; Classes = classes; BuiltinInfer = binf })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with
@@ -433,9 +694,11 @@ type Workspace() =
                 for off, o in inf.CtorSites do dictSet cs off o
                 let cu = dictNew<int, Analysis.Classes.InstMember> ()
                 for off, m in inf.ClassUses do dictSet cu off m
+                let cp = dictNew<int, string> ()
+                for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -446,7 +709,30 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Members r.Interfaces (dictNew ()) (dictNew ())
+        // the prelude is source like any other file: its own bodies call the
+        // class members it declares, so it needs its own tables
+        let bi = r.BuiltinInfer
+        let bok = dictNew<int, string> ()
+        for k, v in bi.OpKinds do dictSet bok k v
+        let bak = dictNew<int, string> ()
+        for k, v in bi.ArrKinds do dictSet bak k v
+        let bik = dictNew<int, string list> ()
+        for k, v in bi.InstSites do dictSet bik k v
+        let bms = dictNew<int, string> ()
+        for k, v in bi.MemberSites do dictSet bms k v
+        let bfo = dictNew<int, string> ()
+        for k, v in bi.FieldOwners do dictSet bfo k v
+        let bcs = dictNew<int, int> ()
+        for k, v in bi.CtorSites do dictSet bcs k v
+        let bcu = dictNew<int, Analysis.Classes.InstMember> ()
+        for k, v in bi.ClassUses do dictSet bcu k v
+        let bcp = dictNew<int, string> ()
+        for k, v in bi.ClassPending do dictSet bcp k v
+        let bot = dictNew<int, string> ()
+        for k, v in bi.OpTypes do dictSet bot k v
+        let blow =
+            Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes bok bak bik bms bfo bcs
+                r.Members r.Interfaces bcu bcp bot
         for d in blow.Decls do vecAdd allDecls d
         // one function per primitive instance member, so `Add.(+)` denotes
         // something callable even where `a + b` is a machine instruction
@@ -473,16 +759,7 @@ type Workspace() =
             let isStruct (n : string) = List.contains n structNames
             // an instance member is the operator's implementation once
             // stamping has made the operand type concrete
-            let instanceFns = dictNew<string, Fpp.Core.Ir.VarId> ()
-            for cls, insts in dictPairs r.Classes.Instances do
-                for i in vecToList insts do
-                    let heads = i.Head |> List.map Analysis.Types.typeConName
-                    for m, im in i.Members do
-                        // operators only: other members are reached by name
-                        if (Analysis.Classes.memberOperator m).IsSome then
-                            dictSet instanceFns
-                                (cls + "@" + String.concat "@" heads)
-                                { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+            let instanceFns = Fpp.Core.Link.instanceFunctions r.Classes
             let mono0, monoErrs = Fpp.Core.Link.monomorphizeWith isStruct instanceFns program
             // stamped clones have concrete instantiations, so record layouts
             // can only be settled once monomorphization has run
@@ -519,9 +796,11 @@ type Workspace() =
                 for off, o in inf.CtorSites do dictSet cs off o
                 let cu = dictNew<int, Analysis.Classes.InstMember> ()
                 for off, m in inf.ClassUses do dictSet cu off m
+                let cp = dictNew<int, string> ()
+                for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -550,9 +829,11 @@ type Workspace() =
             for off, o in inf.CtorSites do dictSet cs off o
             let cu = dictNew<int, Analysis.Classes.InstMember> ()
             for off, m in inf.ClassUses do dictSet cu off m
+            let cp = dictNew<int, string> ()
+            for off, t in inf.ClassPending do dictSet cp off t
             let ot = dictNew<int, string> ()
             for off, t in inf.OpTypes do dictSet ot off t
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

@@ -20,6 +20,11 @@ let private jarr (items : JsonNode list) : JsonNode =
     for i in items do a.Add i
     a
 
+/// Field access on a JSON object. Spelled as a call rather than a
+/// string-keyed indexer: that is not an array index and must not lower
+/// as one — the compiler's own sources stay inside the subset it supports.
+let private fld (n : JsonNode) (key : string) : JsonNode = n.Item key
+
 let private range (sl : int) (sc : int) (el : int) (ec : int) : JsonNode =
     jobj [ "start", jobj [ "line", jint sl; "character", jint sc ]
            "end", jobj [ "line", jint el; "character", jint ec ] ]
@@ -31,22 +36,16 @@ module private Uri =
 
     let toPath (uri : string) : string =
         if uri.StartsWith "file://" then
-            let raw = uri.Substring 7
-            let unescaped = System.Uri.UnescapeDataString raw
+            let unescaped = System.Uri.UnescapeDataString (uri.Substring 7)
             // file:///c:/... on Windows carries a leading slash
-            if unescaped.Length > 2 && unescaped.[0] = '/' && unescaped.[2] = ':' then unescaped.Substring 1
+            if unescaped.Length > 2 && unescaped.StartsWith "/" && unescaped.Substring(2, 1) = ":" then
+                unescaped.Substring 1
             else unescaped
         else uri
 
-    /// Escape a path segment-wise: `/` must survive, everything else that
-    /// needs escaping gets it.
-    let private escape (p : string) : string =
-        p.Split '/' |> Array.map System.Uri.EscapeDataString |> String.concat "/"
-
     let ofPath (path : string) : string =
         if path.StartsWith "file://" then path
-        elif path.StartsWith "/" then "file://" + escape path
-        elif System.IO.Path.IsPathRooted path then "file:///" + escape (path.Replace('\\', '/'))
+        elif System.IO.Path.IsPathRooted path then System.Uri(path).AbsoluteUri
         // a path we never resolved to disk (the builtin prelude): pass it
         // back unchanged rather than inventing a location for it
         else path
@@ -104,9 +103,9 @@ type Server(ws : Workspace) =
 
     /// Handle one incoming message; returns the messages to send back.
     member this.Handle (msg : JsonNode) : JsonNode list =
-        let method = match msg.["method"] with null -> "" | m -> m.GetValue<string>()
-        let id = msg.["id"]
-        let ps = msg.["params"]
+        let method = match fld msg "method" with null -> "" | m -> m.GetValue<string>()
+        let id = fld msg "id"
+        let ps = fld msg "params"
         let respond (result : JsonNode) =
             [ jobj [ "jsonrpc", jstr "2.0"; "id", id.DeepClone(); "result", result ] ]
         match method with
@@ -120,27 +119,27 @@ type Server(ws : Workspace) =
                 "serverInfo", jobj [ "name", jstr "fpp-lsp"; "version", jstr "0.1" ] ])
         | "initialized" -> []
         | "textDocument/didOpen" ->
-            let doc = ps.["textDocument"]
-            let path = Uri.toPath (doc.["uri"].GetValue<string>())
+            let doc = fld ps "textDocument"
+            let path = Uri.toPath ((fld doc "uri").GetValue<string>())
             // the project first, so the file lands in its declared position
             // in the compile order rather than being appended
             this.EnsureProject path
-            ws.SetFileText path (doc.["text"].GetValue<string>())
+            ws.SetFileText path ((fld doc "text").GetValue<string>())
             [ this.PublishDiagnostics path ]
         | "textDocument/didChange" ->
-            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
-            let changes = ps.["contentChanges"].AsArray()
+            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let changes = (fld ps "contentChanges").AsArray()
             if changes.Count > 0 then
-                ws.SetFileText path (changes.[changes.Count - 1].["text"].GetValue<string>())
+                ws.SetFileText path ((fld changes.[changes.Count - 1] "text").GetValue<string>())
             [ this.PublishDiagnostics path ]
         | "textDocument/didClose" -> []
         | "textDocument/documentSymbol" ->
-            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
+            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
             respond (this.Symbols path)
         | "textDocument/definition" ->
-            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
-            let line = ps.["position"].["line"].GetValue<int>()
-            let ch = ps.["position"].["character"].GetValue<int>()
+            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let line = (fld (fld ps "position") "line").GetValue<int>()
+            let ch = (fld (fld ps "position") "character").GetValue<int>()
             let starts = Lines.starts (ws.FileText path)
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
             match ws.DefinitionAt path offset with
@@ -152,9 +151,9 @@ type Server(ws : Workspace) =
                 respond (jobj [ "uri", jstr (Uri.ofPath d.Path); "range", range sl sc el ec ])
             | None -> respond null
         | "textDocument/hover" ->
-            let path = Uri.toPath (ps.["textDocument"].["uri"].GetValue<string>())
-            let line = ps.["position"].["line"].GetValue<int>()
-            let ch = ps.["position"].["character"].GetValue<int>()
+            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let line = (fld (fld ps "position") "line").GetValue<int>()
+            let ch = (fld (fld ps "position") "character").GetValue<int>()
             let starts = Lines.starts (ws.FileText path)
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
             match ws.HoverAt path offset with
