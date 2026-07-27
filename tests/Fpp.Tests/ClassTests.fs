@@ -354,6 +354,39 @@ let float16Tests =
                       "let c = print (float32 (hyp 3.0h 4.0h))" ]
             Expect.equal out "5\n5\n5\n" "one body, three widths"
         }
+        test "a half array is PACKED: i16 elements, 2 bytes each" {
+            let wat, errors =
+                compile [ "let xs = [| 1.5h; 2.25h; 3.0h |]"
+                          "let a = print (float32 xs.[1])"
+                          "let b ="
+                          "    xs.[2] <- 0.5h"
+                          "    print (float32 xs.[2])"
+                          "let c = print xs.Length" ]
+            Expect.isEmpty errors "compiles"
+            // the size win is the point — assert the representation itself
+            Expect.stringContains wat "$parr_h (array (mut i16))" "packed element type"
+            Expect.stringContains wat "array.new_fixed $parr_h" "the literal builds it"
+        }
+        test "packed half arrays read, write and fold correctly" {
+            let out =
+                run [ "let xs = [| 1.5h; 2.25h; 3.0h |]"
+                      "let a = print (float32 xs.[1])"
+                      "let b ="
+                      "    xs.[2] <- 0.5h"
+                      "    print (float32 xs.[2])"
+                      "let big = Array.create 1000 1.0h"
+                      "let sum (a : 'a[]) (z : 'a) : 'a when Num<'a> ="
+                      "    let mutable acc = z"
+                      "    let mutable i = 0"
+                      "    while i < a.Length do"
+                      "        acc <- acc + a.[i]"
+                      "        i <- i + 1"
+                      "    acc"
+                      "let c = print (float32 (sum big Zero))"
+                      "let d = print (float32 (sum xs Zero))" ]
+            // 1000 ones: integers are exact in f16 up to 2048
+            Expect.equal out "2.25\n0.5\n1000\n4.25\n" "packed storage behaves like storage"
+        }
         test "an E-exponent literal survives emission" {
             // the emitter dropped `E` and `+` from float literals, turning
             // 1.0E5 into 1.05

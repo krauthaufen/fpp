@@ -254,9 +254,11 @@ Docs: editors/README.md.
       Conversion from DOUBLE goes straight to f16 ($f2h64) rather than
       through f32, which would round twice and is observably different at
       the bottom of the subnormal range. Checked against System.Half.
-- [ ] float16 in PACKED storage — 2 bytes per array element and struct
-      field. It stores as an i32 today, so the size win is not there yet,
-      and that win is the whole point for vertex and texture buffers.
+- [x] float16 ARRAYS are packed: `(array (mut i16))`, 2 bytes per element,
+      reads via `array.get_u`. The size win the type exists for.
+- [ ] a half FIELD still stores as i32 — packing it means `struct.get_u`
+      at every field-read site for a per-field saving that rarely matters;
+      do it if a struct-of-halves ever shows up hot
 - [ ] uint64, and the smaller widths (int8/16, byte). No demand yet.
 - [ ] `decimal` — DEFERRED, deliberately. wasm has four numeric types and
       none of them is decimal, so it would be a software bignum: a 96-bit

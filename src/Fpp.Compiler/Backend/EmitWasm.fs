@@ -153,7 +153,12 @@ let emit (decls : Decl list) : EmitResult =
     // flat-array element classification: primitive kind or a struct name
     let primKindOf (tyName : string) : string =
         match tyName with
-        | "int" | "bool" | "char" | "float16" -> "i"
+        | "int" | "bool" | "char" -> "i"
+        // an ARRAY of halves is packed: wasm-GC has i16 element storage,
+        // and 2 bytes per element is the reason the type exists. (A half
+        // FIELD still stores as i32 — packing it would touch every
+        // struct.get site for a per-field saving that does not matter.)
+        | "float16" -> "h"
         | "float" -> "f"
         | "float32" -> "s"
         | "int64" -> "l"
@@ -1300,7 +1305,8 @@ let emit (decls : Decl list) : EmitResult =
             if nm = "string" then
                 "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif pk <> "" then
-                "(call " + boxOfKind pk + " (array.get " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") " + unwrapI32 (recur i) + "))"
+                let getOp = if pk = "h" then "array.get_u " else "array.get "
+                "(call " + boxOfKind pk + " (" + getOp + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif isPod nm then
                 let placed, _, wd = (dictTryFind podLayout nm).Value
                 let al = newLocal "pa"
@@ -1746,6 +1752,7 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $parr_f (array (mut f64)))"
     line "  (type $parr_s (array (mut f32)))"
     line "  (type $parr_l (array (mut i64)))"
+    line "  (type $parr_h (array (mut i16)))"
     line "  (type $pk (array (mut i64)))"
     // POD array value = handle: storage (null while pinned), ptr, words
     line "  (type $hnd (struct (field (mut (ref null $pk))) (field (mut i32)) (field (mut i32))))"
@@ -2150,6 +2157,8 @@ TUPLE_EQ
       (then (return (array.len (ref.cast (ref $parr_s) (local.get $v))))))
     (if (ref.test (ref $parr_l) (local.get $v))
       (then (return (array.len (ref.cast (ref $parr_l) (local.get $v))))))
+    (if (ref.test (ref $parr_h) (local.get $v))
+      (then (return (array.len (ref.cast (ref $parr_h) (local.get $v))))))
 TUPLE_HASH
     (if (ref.test (ref $du0) (local.get $v))
       (then (return (i31.get_s (ref.cast (ref i31) (call_ref $v1 (local.get $v) (ref.cast (ref $v1)
