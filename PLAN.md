@@ -111,6 +111,17 @@ Two real bugs found by pushing on this file, both fixed:
 - a cast or type test named its target by the LAST identifier of the type,
   so `x :?> MapLeaf<'K, 'V>` tried to downcast to `V` (68 errors).
 
+### HKT — follows directly from the class layer
+Design: DESIGN.md ("Higher-kinded types"), syntax now consistent with the
+class decisions. The class machinery is kind-agnostic, so HKT adds:
+- kinds declared by shape (`'m<_>`), checked at application — a small pass,
+  no kind inference
+- constructors as type arguments; unification decomposes the OUTERMOST
+  application only, which is what keeps it first-order. No type-level
+  lambdas; partial application is a trailing `_` run only
+- monomorphization unchanged in character: a known constructor stamps, a
+  variable one takes the dictionary — the same Stamp/Canon split
+
 ### Typeclasses — the numeric hierarchy is the first client
 Design: DESIGN.md ("Numeric classes and operators"). Decided:
 - operators are two-parameter classes with an associated `Result`, the Rust

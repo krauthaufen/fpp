@@ -85,25 +85,42 @@ constructor of one argument, `'t<_<_>, _>` takes a constructor and a type
 (monad transformers). Kinds capped at rank ~2 in v1 for the sake of error
 messages.
 
-```fsharp
-type Functor<'f<_>> =
-    static abstract Map : ('a -> 'b) * 'f<'a> -> 'f<'b>
+The class layer is kind-agnostic: a class parameter carries a kind, and
+everything else — free-standing instances, `when` constraints, coherence,
+the orphan rule, associated types — applies unchanged one level up.
 
-type Monad<'m<_>> =
-    inherit Functor<'m>
-    static abstract Return : 'a -> 'm<'a>
-    static abstract Bind   : 'm<'a> * ('a -> 'm<'b>) -> 'm<'b>
+```
+class Functor<'f<_>>
+    static map : ('a -> 'b) -> 'f<'a> -> 'f<'b>
+
+class Monad<'m<_>> when Functor<'m>
+    static ret  : 'a -> 'm<'a>
+    static bind : 'm<'a> -> ('a -> 'm<'b>) -> 'm<'b>
+
+instance Functor<Option>
+    static map f x = match x with Some v -> Some (f v) | None -> None
 ```
 
-- Bare unapplied constructors become legal type arguments:
-  `interface Monad<Option>`. Kind-checked (`Option : * -> *`).
-- Constraint form mirrors the existing constraint family: `when 'm : Monad`.
-  Statics on type variables use the F# 7 generic-math call form `'m.Bind(...)`.
+- Bare unapplied constructors are legal type arguments:
+  `instance Monad<Option>`, kind-checked (`Option : * -> *`).
+- Constraints are class applications like every other: `when Monad<'m>`.
+  Members are in scope as ordinary functions resolved by the constraint —
+  `bind m f`, not `'m.Bind(m, f)`. This is the same rule that lets `(+)`
+  resolve through `Add<'a,'b>` without qualification; a class method should
+  not be spelled differently from a class operator.
 - **No type-level lambdas** (keeps higher-order unification decidable;
   inference unifies on constructor spines only). Partial application is a
   trailing run of `_` only: `Result<'e, _>` yes, `Result<_, 'e>` no.
 - Quantified constraints (`forall 'a. 'm<'a> :> seq<'a>`) are out of v1;
-  express the same thing as a superclass interface providing a view.
+  express the same thing as a superclass class providing a view.
+- Monomorphization extends one level up, unchanged in character: a use at a
+  known constructor stamps a copy (`map` at `'f = list`), and a use where
+  the constructor is itself variable takes the dictionary. That is the same
+  Stamp/Canon split tier-1 already applies to type arguments — a
+  constructor argument classifies exactly like a type argument.
+- Kind checking is a small separate pass, not part of type inference:
+  kinds are declared by shape in the parameter list and checked at
+  application, so there is no kind INFERENCE to get wrong.
 
 ## Typeclasses
 
