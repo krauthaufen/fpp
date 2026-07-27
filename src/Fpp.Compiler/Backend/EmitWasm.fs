@@ -682,6 +682,13 @@ let emit (decls : Decl list) : EmitResult =
         // int/uint32 conversions: same 32-bit payload, different reading;
         // from a wider or floating type they narrow explicitly
         // conversions whose source type inference resolved
+        | EApp (EUnknown pd, [ a ]) when
+            (pd.StartsWith "pad0#" || pd.StartsWith "padl#" || pd.StartsWith "padr#") ->
+            let width = pd.Substring 5
+            let ch = if pd.StartsWith "pad0#" then "48" else "32"
+            let left = if pd.StartsWith "padl#" then "1" else "0"
+            "(call $strPad (ref.cast (ref $str) " + recur a + ") (i32.const " + width
+            + ") (i32.const " + ch + ") (i32.const " + left + "))"
         | EApp (EUnknown n, [ a ]) when n.Contains "#" ->
             let target = n.Substring (0, n.IndexOf "#")
             let src = n.Substring (n.IndexOf "#" + 1)
@@ -692,6 +699,19 @@ let emit (decls : Decl list) : EmitResult =
                 | "s" -> "(call $tos " + recur a + ")"
                 | _ -> unwrapI32 (recur a)
             (match target, src with
+             | "string", "t" -> recur a
+             | "string", "f" -> "(call $ftoa " + raw + ")"
+             | "string", "s" -> "(call $ftoa (f64.promote_f32 " + raw + "))"
+             | "string", "l" -> "(call $ltoa " + raw + ")"
+             | "string", "w" -> "(call $ultoa (i64.extend_i32_u " + raw + "))"
+             | "string", "h" -> "(call $ftoa (f64.promote_f32 (call $h2f " + raw + ")))"
+             // .NET Boolean.ToString: "True"/"False", capital first
+             | "string", "b" ->
+                 "(if (result anyref) (i32.eqz " + raw + ")"
+                 + " (then (array.new_fixed $str 5 (i32.const 70) (i32.const 97) (i32.const 108) (i32.const 115) (i32.const 101)))"
+                 + " (else (array.new_fixed $str 4 (i32.const 84) (i32.const 114) (i32.const 117) (i32.const 101))))"
+             | "string", "c" -> "(array.new $str " + raw + " (i32.const 1))"
+             | "string", _ -> "(call $itoa " + raw + ")"
              // a half is its bit pattern, so every conversion goes through
              // f32 — the one format that holds every f16 value exactly
              | "float16", "h" -> recur a
@@ -732,11 +752,33 @@ let emit (decls : Decl list) : EmitResult =
              | _ -> recur a)
         | EApp (EUnknown "string", [ a ]) ->
             (match kindOf a with
-             | "f" | "s" | "l" ->
-                 vecAdd errors "string conversion is only defined for integers so far"
-                 "(ref.i31 (i32.const 0))"
+             | "f" -> "(call $ftoa (call $tof " + recur a + "))"
+             | "s" -> "(call $ftoa (f64.promote_f32 (call $tos " + recur a + ")))"
+             | "l" -> "(call $ltoa (call $tol " + recur a + "))"
              | _ -> "(call $itoa " + unwrapI32 (recur a) + ")")
         | EApp (EUnknown "isNull", [ a ]) -> boolWat ("(ref.is_null " + recur a + ")")
+        | EApp (EUnknown "prints", [ a ]) ->
+            "(block (result anyref) (call $prints (ref.cast (ref $str) " + recur a + ")) (ref.i31 (i32.const 0)))"
+        | EApp (EUnknown "showv", [ a ]) -> "(call $showv " + recur a + ")"
+
+        | EApp (EUnknown "hexlower", [ a ]) ->
+            "(call $itobase " + unwrapI32 (recur a) + " (i32.const 16) (i32.const 0))"
+        | EApp (EUnknown "hexupper", [ a ]) ->
+            "(call $itobase " + unwrapI32 (recur a) + " (i32.const 16) (i32.const 1))"
+        | EApp (EUnknown "octal", [ a ]) ->
+            "(call $itobase " + unwrapI32 (recur a) + " (i32.const 8) (i32.const 0))"
+        | EApp (EUnknown "fixed6", [ a ]) ->
+            "(call $ftoa6 (call $tof " + recur a + "))"
+        | EApp (EUnknown "printb", [ a ]) ->
+            // print goes through %O in the oracle prelude, and .NET spells
+            // Boolean.ToString with a capital
+            "(block (result anyref) (if (i32.eqz " + unwrapI32 (recur a) + ")"
+            + " (then (call $prints (array.new_fixed $str 5 (i32.const 70) (i32.const 97) (i32.const 108) (i32.const 115) (i32.const 101))))"
+            + " (else (call $prints (array.new_fixed $str 4 (i32.const 84) (i32.const 114) (i32.const 117) (i32.const 101)))))"
+            + " (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
+        | EApp (EUnknown "printc", [ a ]) ->
+            "(block (result anyref) (call $putc " + unwrapI32 (recur a) + ")"
+            + " (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "printh", [ a ]) ->
             // a half is an i31 at runtime, so printing needs the STATIC type
             // to know it is not an integer
@@ -2463,29 +2505,62 @@ TUPLE_HASH
                 (i64.shr_s (i64.shl (local.get $n) (i64.const 33)) (i64.const 33)))
       (then (ref.i31 (i32.wrap_i64 (local.get $n))))
       (else (struct.new $boxl (local.get $n)))))
-  (func $printl (param $n i64)
+  ;; ---- number-to-string: the string builders are the PRIMARY
+  ;; implementations; the printers print their result ----
+  (func $sput (param $s (ref $str)) (param $p i32) (param $c i32) (result i32)
+    (array.set $str (local.get $s) (local.get $p) (local.get $c))
+    (i32.add (local.get $p) (i32.const 1)))
+  ;; digits of an i64 MAGNITUDE, unsigned — `0 - min` wraps to min, whose
+  ;; unsigned value is exactly the magnitude, so negation never overflows
+  (func $lput (param $s (ref $str)) (param $p i32) (param $n i64) (result i32)
     (local $m i64)
+    (local.set $m (i64.div_u (local.get $n) (i64.const 10)))
+    (if (i64.gt_u (local.get $m) (i64.const 0))
+      (then (local.set $p (call $lput (local.get $s) (local.get $p) (local.get $m)))))
+    (call $sput (local.get $s) (local.get $p)
+      (i32.add (i32.const 48) (i32.wrap_i64 (i64.rem_u (local.get $n) (i64.const 10))))))
+  (func $strTake (param $s (ref $str)) (param $p i32) (result anyref)
+    (local $r (ref $str))
+    (local.set $r (array.new_default $str (local.get $p)))
+    (array.copy $str $str (local.get $r) (i32.const 0) (local.get $s) (i32.const 0) (local.get $p))
+    (local.get $r))
+  (func $ltoa (param $n i64) (result anyref)
+    (local $s (ref $str)) (local $p i32)
+    (local.set $s (array.new_default $str (i32.const 24)))
     (if (i64.lt_s (local.get $n) (i64.const 0))
-      (then (call $putc (i32.const 45))
-            (local.set $n (i64.sub (i64.const 0) (local.get $n)))))
-    (local.set $m (i64.div_s (local.get $n) (i64.const 10)))
-    (if (i64.gt_s (local.get $m) (i64.const 0)) (then (call $printl (local.get $m))))
-    (call $putc (i32.add (i32.const 48) (i32.wrap_i64 (i64.rem_s (local.get $n) (i64.const 10))))))
-  (func $printf64 (param $v f64)
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 45)))
+        (local.set $n (i64.sub (i64.const 0) (local.get $n)))))
+    (local.set $p (call $lput (local.get $s) (local.get $p) (local.get $n)))
+    (call $strTake (local.get $s) (local.get $p)))
+  (func $ultoa (param $n i64) (result anyref)
+    (local $s (ref $str)) (local $p i32)
+    (local.set $s (array.new_default $str (i32.const 24)))
+    (local.set $p (call $lput (local.get $s) (local.get $p) (local.get $n)))
+    (call $strTake (local.get $s) (local.get $p)))
+  (func $ftoa (param $v f64) (result anyref)
+    (local $s (ref $str)) (local $p i32)
     (local $ip f64) (local $frac f64) (local $k i32) (local $d i32) (local $e i32)
-    ;; NaN is the only value not equal to itself. Without these three guards
-    ;; the i64 truncation below TRAPS, so printing 1e30 killed the program.
+    (local.set $s (array.new_default $str (i32.const 40)))
+    ;; NaN is the only value not equal to itself
     (if (f64.ne (local.get $v) (local.get $v))
-      (then (call $putc (i32.const 78)) (call $putc (i32.const 97))
-            (call $putc (i32.const 78)) (return)))
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 78)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 97)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 78)))
+        (return (call $strTake (local.get $s) (local.get $p)))))
     (if (f64.lt (local.get $v) (f64.const 0))
-      (then (call $putc (i32.const 45))
-            (local.set $v (f64.neg (local.get $v)))))
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 45)))
+        (local.set $v (f64.neg (local.get $v)))))
     ;; .NET prints U+221E, not the word — so this stays oracle-checkable
     (if (f64.eq (local.get $v) (f64.const inf))
-      (then (call $putc (i32.const 226)) (call $putc (i32.const 136))
-            (call $putc (i32.const 158)) (return)))
-    ;; past what an i64 holds, normalize into [1, 10) and print an exponent
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 226)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 136)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 158)))
+        (return (call $strTake (local.get $s) (local.get $p)))))
+    ;; past what an i64 holds, normalize into [1, 10) and add an exponent
     (if (f64.ge (local.get $v) (f64.const 1e18))
       (then
         (block $scaled (loop $go
@@ -2494,24 +2569,112 @@ TUPLE_HASH
           (local.set $e (i32.add (local.get $e) (i32.const 1)))
           (br $go)))))
     (local.set $ip (f64.floor (local.get $v)))
-    (call $printl (i64.trunc_f64_s (local.get $ip)))
+    (local.set $p (call $lput (local.get $s) (local.get $p) (i64.trunc_f64_s (local.get $ip))))
     (local.set $frac (f64.sub (local.get $v) (local.get $ip)))
     (if (f64.gt (local.get $frac) (f64.const 0))
       (then
-        (call $putc (i32.const 46))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 46)))
         (block $done
           (loop $go
             (br_if $done (i32.ge_s (local.get $k) (i32.const 15)))
             (local.set $frac (f64.mul (local.get $frac) (f64.const 10)))
             (local.set $d (i32.trunc_f64_s (f64.floor (local.get $frac))))
-            (call $putc (i32.add (i32.const 48) (local.get $d)))
+            (local.set $p (call $sput (local.get $s) (local.get $p) (i32.add (i32.const 48) (local.get $d))))
             (local.set $frac (f64.sub (local.get $frac) (f64.floor (local.get $frac))))
             (br_if $done (f64.eq (local.get $frac) (f64.const 0)))
             (local.set $k (i32.add (local.get $k) (i32.const 1)))
             (br $go)))))
     (if (i32.ne (local.get $e) (i32.const 0))
-      (then (call $putc (i32.const 69)) (call $putc (i32.const 43))
-            (call $printl (i64.extend_i32_s (local.get $e))))))
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 69)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 43)))
+        (local.set $p (call $lput (local.get $s) (local.get $p) (i64.extend_i32_u (local.get $e))))))
+    (call $strTake (local.get $s) (local.get $p)))
+  ;; %f is .NET's fixed-six-decimals form
+  (func $ftoa6 (param $v f64) (result anyref)
+    (local $s (ref $str)) (local $p i32) (local $ip f64) (local $frac f64)
+    (local $k i32) (local $d i32)
+    (local.set $s (array.new_default $str (i32.const 40)))
+    (if (f64.ne (local.get $v) (local.get $v))
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 78)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 97)))
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 78)))
+        (return (call $strTake (local.get $s) (local.get $p)))))
+    (if (f64.lt (local.get $v) (f64.const 0))
+      (then
+        (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 45)))
+        (local.set $v (f64.neg (local.get $v)))))
+    (if (f64.ge (local.get $v) (f64.const 1e18))
+      (then (return (call $ftoa (local.get $v)))))
+    ;; round at the sixth decimal first, so 0.0000005 carries
+    (local.set $v (f64.add (local.get $v) (f64.const 5e-7)))
+    (local.set $ip (f64.floor (local.get $v)))
+    (local.set $p (call $lput (local.get $s) (local.get $p) (i64.trunc_f64_s (local.get $ip))))
+    (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 46)))
+    (local.set $frac (f64.sub (local.get $v) (local.get $ip)))
+    (block $done (loop $go
+      (br_if $done (i32.ge_s (local.get $k) (i32.const 6)))
+      (local.set $frac (f64.mul (local.get $frac) (f64.const 10)))
+      (local.set $d (i32.trunc_f64_s (f64.floor (local.get $frac))))
+      (local.set $p (call $sput (local.get $s) (local.get $p) (i32.add (i32.const 48) (local.get $d))))
+      (local.set $frac (f64.sub (local.get $frac) (f64.floor (local.get $frac))))
+      (local.set $k (i32.add (local.get $k) (i32.const 1)))
+      (br $go)))
+    (call $strTake (local.get $s) (local.get $p)))
+  ;; hex and octal digits of an i64 magnitude
+  (func $xput (param $s (ref $str)) (param $p i32) (param $n i64) (param $base i64) (param $upper i32) (result i32)
+    (local $m i64) (local $d i32)
+    (local.set $m (i64.div_u (local.get $n) (local.get $base)))
+    (if (i64.gt_u (local.get $m) (i64.const 0))
+      (then (local.set $p (call $xput (local.get $s) (local.get $p) (local.get $m) (local.get $base) (local.get $upper)))))
+    (local.set $d (i32.wrap_i64 (i64.rem_u (local.get $n) (local.get $base))))
+    (call $sput (local.get $s) (local.get $p)
+      (if (result i32) (i32.lt_u (local.get $d) (i32.const 10))
+        (then (i32.add (i32.const 48) (local.get $d)))
+        (else (i32.add (select (i32.const 55) (i32.const 87) (local.get $upper)) (local.get $d))))))
+  (func $itobase (param $n i32) (param $base i32) (param $upper i32) (result anyref)
+    (local $s (ref $str)) (local $p i32)
+    (local.set $s (array.new_default $str (i32.const 24)))
+    (local.set $p (call $xput (local.get $s) (local.get $p)
+                    (i64.and (i64.extend_i32_u (local.get $n)) (i64.const 0xffffffff))
+                    (i64.extend_i32_u (local.get $base)) (local.get $upper)))
+    (call $strTake (local.get $s) (local.get $p)))
+  ;; %A at a hole whose static type is unknown: dispatch on the runtime
+  ;; representation, best effort (records and unions show as "?")
+  (func $showv (param $v anyref) (result anyref)
+    (if (ref.is_null (local.get $v))
+      (then (return (array.new_fixed $str 4 (i32.const 110) (i32.const 117) (i32.const 108) (i32.const 108)))))
+    (if (ref.test (ref i31) (local.get $v))
+      (then (return (call $itoa (i31.get_s (ref.cast (ref i31) (local.get $v)))))))
+    (if (ref.test (ref $boxi) (local.get $v))
+      (then (return (call $itoa (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v)))))))
+    (if (ref.test (ref $boxl) (local.get $v))
+      (then (return (call $ltoa (struct.get $boxl 0 (ref.cast (ref $boxl) (local.get $v)))))))
+    (if (ref.test (ref $boxf) (local.get $v))
+      (then (return (call $ftoa (struct.get $boxf 0 (ref.cast (ref $boxf) (local.get $v)))))))
+    (if (ref.test (ref $boxs) (local.get $v))
+      (then (return (call $ftoa (f64.promote_f32 (struct.get $boxs 0 (ref.cast (ref $boxs) (local.get $v))))))))
+    (if (ref.test (ref $str) (local.get $v))
+      (then
+        ;; %A quotes strings, as F# does
+        (return (call $strcat
+          (ref.cast (ref $str) (call $strcat (array.new_fixed $str 1 (i32.const 34))
+                                             (ref.cast (ref $str) (local.get $v))))
+          (array.new_fixed $str 1 (i32.const 34))))))
+    (array.new_fixed $str 1 (i32.const 63)))
+  (func $strPad (param $v (ref $str)) (param $w i32) (param $c i32) (param $left i32) (result anyref)
+    (local $n i32) (local $r (ref $str)) (local $off i32)
+    (local.set $n (array.len (local.get $v)))
+    (if (i32.ge_u (local.get $n) (local.get $w)) (then (return (local.get $v))))
+    (local.set $r (array.new $str (local.get $c) (local.get $w)))
+    (local.set $off (select (i32.const 0) (i32.sub (local.get $w) (local.get $n)) (local.get $left)))
+    (array.copy $str $str (local.get $r) (local.get $off) (local.get $v) (i32.const 0) (local.get $n))
+    (local.get $r))
+  (func $printl (param $n i64)
+    (call $prints (ref.cast (ref $str) (call $ltoa (local.get $n)))))
+  (func $printf64 (param $v f64)
+    (call $prints (ref.cast (ref $str) (call $ftoa (local.get $v)))))
   (func $ofi (param $n i32) (result anyref)
     (if (result anyref) (i32.eq (local.get $n) (i32.shr_s (i32.shl (local.get $n) (i32.const 1)) (i32.const 1)))
       (then (ref.i31 (local.get $n)))

@@ -868,6 +868,34 @@ let oracleTests =
             "let b = print (0.0 - 1.0 / 0.0)"
             "let c = print (0.0 / 0.0)"
         ]
+        oracle "the printf family, byte-exact against F#" [
+            "let a = print (sprintf \"x=%d y=%s\" 42 \"hi\")"
+            "let b = printfn \"%d%% of %s\" 50 \"cases\""
+            "let c = printfn \"%b and %b\" true false"
+            "let d = printfn \"pi=%f\" 3.14159265"
+            "let e = printfn \"f=%f\" 2.0"
+            "let f = printfn \"hex=%x HEX=%X oct=%o\" 255 255 8"
+            "let g = printfn \"%A %A %A %A\" 1 2.5 \"s\" 'c'"
+            "let h = printfn \"u=%u\" 4000000000u"
+            "let i = printf \"no\""
+            "let j = printfn \" newline\""
+        ]
+        oracle "format width and padding flags" [
+            "let a = printfn \"[%02x]\" 7"
+            "let b = printfn \"[%5d]\" 42"
+            "let c = printfn \"[%-5d]\" 42"
+            "let d = printfn \"[%08d]\" 123"
+            "let e = printfn \"[%3s]\" \"ab\""
+        ]
+        oracle "string conversions match .NET" [
+            "let a = print (string 42)"
+            "let b = print (string 1.5)"
+            "let c = print (string 123456789012345L)"
+            "let d = print (string true)"
+            "let e = print (string 'x')"
+            "let f = print (string 4000000000u)"
+            "let g = print (string (0.0 - 0.5))"
+        ]
         oracle "string ordering is ordinal, like F#" [
             "let cmp a b ="
             "    if a < b then \"lt\" elif a > b then \"gt\" else \"eq\""

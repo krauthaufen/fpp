@@ -922,7 +922,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -935,6 +935,60 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | Some pt -> vecAdd opKindsRaw (pt.Offset, exprType (GNode onlyArg))
                            | None -> ())
                       | _ -> ())
+                     // the printf family: the format literal IS the type —
+                     // each hole a curried parameter, its resolved kind
+                     // recorded at a synthetic offset inside the literal for
+                     // the expansion to read. The application may be flat
+                     // (`sprintf fmt a b` in one AppExpr), so the remaining
+                     // arguments unify here.
+                     let formatFamily =
+                         match head.NodeKind, args with
+                         | IdentExpr, fmtArg :: rest ->
+                             (match tokensOf head |> List.tryHead with
+                              | Some t when List.contains t.Text [ "sprintf"; "printf"; "printfn"; "failwithf" ]
+                                            && (dictTryFind useDefs t.Offset).IsNone ->
+                                  (match Green.tokens (GNode fmtArg) |> List.tryHead with
+                                   | Some ft when ft.Kind = StringLit ->
+                                       let raw = ft.Text.Substring (1, ft.Text.Length - 2)
+                                       (match Format.parse raw with
+                                        | Ok segs ->
+                                            let holeTys =
+                                                Format.holes segs
+                                                |> List.mapi (fun i (c, _, _, _) ->
+                                                    let ty =
+                                                        match c with
+                                                        | 'd' | 'i' | 'x' | 'X' | 'o' -> tInt
+                                                        | 'u' -> tUInt
+                                                        | 's' -> tString
+                                                        | 'c' -> tChar
+                                                        | 'b' -> tBool
+                                                        | 'f' -> tFloat
+                                                        | _ -> st.Fresh ()   // %A takes anything
+                                                    vecAdd opKindsRaw (ft.Offset + 1 + i, ty)
+                                                    ty)
+                                            let ret =
+                                                match t.Text with
+                                                | "sprintf" -> tString
+                                                | "failwithf" -> st.Fresh ()
+                                                | _ -> tUnit
+                                            let restExprs = rest |> List.filter (fun m -> isExprish m.NodeKind)
+                                            let restTys = restExprs |> List.map (fun a -> exprType (GNode a))
+                                            let applied = List.truncate restTys.Length holeTys
+                                            if restTys.Length <= holeTys.Length then
+                                                List.iter2 (unifyAt t.Offset) applied restTys
+                                            let remaining = List.skip (min restTys.Length holeTys.Length) holeTys
+                                            Some (List.foldBack (fun h acc -> TFun (h, acc)) remaining ret)
+                                        | Error msg ->
+                                            vecAdd diags (ft.Offset, msg)
+                                            Some (st.Fresh ()))
+                                   | _ ->
+                                       vecAdd diags (t.Offset, "a format string must be a literal")
+                                       Some (st.Fresh ()))
+                              | _ -> None)
+                         | _ -> None
+                     match formatFamily with
+                     | Some t -> t
+                     | None ->
                      // numeric conversions are primitives, not functions
                      let conversion =
                          match head.NodeKind, args with
@@ -958,6 +1012,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "string" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tString
+
                               | Some t when t.Text = "isNull" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tBool
@@ -2373,6 +2428,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon ("int64", []) -> "l"
         | TCon ("uint32", []) -> "w"
         | TCon ("string", []) -> "t"
+        // conversions and print need these; operator suffixes filter them
+        | TCon ("bool", []) -> "b"
+        | TCon ("char", []) -> "c"
         | _ -> ""
 
     { Diagnostics = vecToList diags

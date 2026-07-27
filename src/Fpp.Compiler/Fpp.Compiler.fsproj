@@ -14,6 +14,7 @@
     <Compile Include="Syntax/Parser.fs" />
     <Compile Include="Analysis/Resolve.fs" />
     <Compile Include="Analysis/Types.fs" />
+    <Compile Include="Analysis/Format.fs" />
     <Compile Include="Analysis/Classes.fs" />
     <Compile Include="Analysis/Infer.fs" />
     <Compile Include="Core/Core.fs" />

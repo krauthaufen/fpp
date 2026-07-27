@@ -306,7 +306,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
@@ -325,7 +325,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some t ->
                           t.Text = "print"
                           && (match dictTryFind opKinds t.Offset with
-                              | Some "w" | Some "h" -> true
+                              | Some "w" | Some "h" | Some "b" | Some "c" -> true
                               | _ -> false)
                       | None -> false)
                  | _ -> false) ->
@@ -333,9 +333,126 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ head; a ] ->
                      let t = (tokensOf head |> List.head)
-                     let fn = if (dictTryFind opKinds t.Offset) = Some "h" then "printh" else "printu"
+                     let fn =
+                         match dictTryFind opKinds t.Offset with
+                         | Some "h" -> "printh"
+                         | Some "b" -> "printb"
+                         | Some "c" -> "printc"
+                         | _ -> "printu"
                      EApp (EUnknown fn, [ lowerExpr (GNode a) ])
                  | _ -> note (offsetOf n) "print shape")
+            | AppExpr when
+                // the printf family, fully applied: flatten the curried
+                // spine down to the ident and expand at COMPILE TIME
+                (let rec spineHead (m : GreenNode) =
+                    match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
+                    | h :: _ when h.NodeKind = AppExpr -> spineHead h
+                    | h :: _ when h.NodeKind = IdentExpr -> Some h
+                    | _ -> None
+                 match spineHead n with
+                 | Some h ->
+                     (match tokensOf h |> List.tryHead with
+                      | Some t ->
+                          List.contains t.Text [ "sprintf"; "printf"; "printfn"; "failwithf" ]
+                          && (dictTryFind useDefs t.Offset).IsNone
+                      | None -> false)
+                 | None -> false) ->
+                // collect the argument spine innermost-first
+                let rec collect (m : GreenNode) (acc : GreenNode list) : GreenNode list =
+                    match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
+                    | h :: rest when h.NodeKind = AppExpr -> collect h (rest @ acc)
+                    | _ :: rest -> rest @ acc
+                    | [] -> acc
+                let allArgs = collect n []
+                let headIdent =
+                    let rec sh (m : GreenNode) =
+                        match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
+                        | h :: _ when h.NodeKind = AppExpr -> sh h
+                        | h :: _ -> h
+                        | [] -> m
+                    sh n
+                let fn = (tokensOf headIdent |> List.head).Text
+                (match allArgs with
+                 | fmtArg :: holeArgs ->
+                     (match Green.tokens (GNode fmtArg) |> List.tryHead with
+                      | Some ft when ft.Kind = StringLit ->
+                          let raw = ft.Text.Substring (1, ft.Text.Length - 2)
+                          (match Fpp.Analysis.Format.parse raw with
+                           | Ok segs ->
+                               let holes = Fpp.Analysis.Format.holes segs
+                               if List.length holes <> List.length holeArgs then
+                                   note (offsetOf n) "a format must be applied to all its arguments"
+                               else
+                               let kindAt (i : int) =
+                                   match dictTryFind opKinds (ft.Offset + 1 + i) with
+                                   | Some k -> k
+                                   | None -> ""
+                               // the one-character string holding a double
+                               // quote: its literal token is "\""
+                               let dquote = ELit (LString "\"\\\"\"")
+                               let quoted (e : Expr) =
+                                   EPrim ("+t", [ EPrim ("+t", [ dquote; e ]); dquote ])
+                               let boolWords lower =
+                                   if lower then "\"true\"", "\"false\"" else "\"True\"", "\"False\""
+                               let render (i : int) (c : char) (e : Expr) : Expr =
+                                   let k = kindAt i
+                                   match c with
+                                   | 's' -> e
+                                   | 'c' -> EApp (EUnknown "string#c", [ e ])
+                                   | 'b' ->
+                                       let tw, fw = boolWords true
+                                       EIf (e, ELit (LString tw), ELit (LString fw))
+                                   | 'x' -> EApp (EUnknown "hexlower", [ e ])
+                                   | 'X' -> EApp (EUnknown "hexupper", [ e ])
+                                   | 'o' -> EApp (EUnknown "octal", [ e ])
+                                   | 'f' -> EApp (EUnknown "fixed6", [ e ])
+                                   | 'u' -> EApp (EUnknown "string#w", [ e ])
+                                   | 'A' ->
+                                       (match k with
+                                        | "t" -> quoted e
+                                        | "b" ->
+                                            let tw, fw = boolWords true
+                                            EIf (e, ELit (LString tw), ELit (LString fw))
+                                        | "c" ->
+                                            EPrim ("+t", [ EPrim ("+t", [ ELit (LString "\"'\""); EApp (EUnknown "string#c", [ e ]) ])
+                                                           ELit (LString "\"'\"") ])
+                                        | "f" | "s" | "l" | "w" | "h" -> EApp (EUnknown ("string#" + k), [ e ])
+                                        // int and statically-unknown share "":
+                                        // the runtime dispatch answers both
+                                        | _ -> EApp (EUnknown "showv", [ e ]))
+                                   | _ ->   // d, i
+                                       EApp (EUnknown ("string#" + k), [ e ])
+                               let mutable hi = 0
+                               let pieces =
+                                   segs |> List.map (fun seg ->
+                                       match seg with
+                                       | Fpp.Analysis.Format.Text t2 -> ELit (LString ("\"" + t2 + "\""))
+                                       | Fpp.Analysis.Format.Hole (c, width, zero, left) ->
+                                           let e = lowerExpr (GNode (List.item hi holeArgs))
+                                           let r = render hi c e
+                                           hi <- hi + 1
+                                           if width = 0 then r
+                                           else
+                                               // pad to the minimum width;
+                                               // zeros only make sense on the
+                                               // right-justified numeric side
+                                               let mode =
+                                                   if left then "padl"
+                                                   elif zero then "pad0"
+                                                   else "padr"
+                                               EApp (EUnknown (mode + "#" + string width), [ r ]))
+                               let total =
+                                   match pieces with
+                                   | [] -> ELit (LString "\"\"")
+                                   | first :: rest -> List.fold (fun acc p -> EPrim ("+t", [ acc; p ])) first rest
+                               (match fn with
+                                | "sprintf" -> total
+                                | "printf" -> EApp (EUnknown "prints", [ total ])
+                                | "printfn" -> EApp (EUnknown "prints", [ EPrim ("+t", [ total; ELit (LString "\"\\n\"") ]) ])
+                                | _ -> EApp (EUnknown "failwith", [ total ]))
+                           | Error msg -> note ft.Offset msg)
+                      | _ -> note (offsetOf n) "a format string must be a literal")
+                 | [] -> note (offsetOf n) "format application shape")
             | AppExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: args ->
@@ -459,6 +576,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               if not suffixable then ""
                               else
                                   match dictTryFind opKinds op.Offset with
+                                  // bool and char exist for conversions and
+                                  // print only; as operands they are ints
+                                  | Some "b" | Some "c" -> ""
                                   | Some k -> k
                                   | None ->
                                       // no primitive kind: either a type
@@ -490,6 +610,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
                      let suffix =
                          match dictTryFind opKinds op.Offset with
+                         | Some "b" | Some "c" -> ""
                          | Some k -> k
                          | None ->
                              // as for a binary operator: a type variable or a
