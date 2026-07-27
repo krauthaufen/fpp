@@ -84,9 +84,10 @@ On the acceptance target: the ported file (4130 lines) **parses with zero
 diagnostics, has 3 type errors, and lowers with 11 notes**.
 
 `EmitProgram` returns early on those, so to find the REAL remaining set the
-emitter was run directly (`emitforce` in the scratch harness). It reports
-**87 errors**, and the split matters: a minority are missing stdlib surface.
-The rest are compiler gaps:
+emitter was run directly (`emitforce` in the scratch harness). It reported
+**87 errors** at first measurement; after the class layer, the resolver
+fixes and the widening work it is **6 diagnostics / 17 emit errors**, nearly
+all member overloading. The split at first measurement:
 
 - [x] a TYPE and a MODULE may share a name — done. Types have their own
       namespace, a dotted spine that resolves qualified IS qualified, and a
@@ -94,7 +95,21 @@ The rest are compiler gaps:
       119 -> 87 errors.
 - [ ] type tests and downcasts against BUILTIN collections: `:? array<'K>`,
       `:? list<'K>` need a runtime representation test, not a class id (12)
-- [ ] MEMBER overloading (constructors are done; methods are not)
+- [ ] MEMBER overloading (constructors are done; methods are not) — now
+      the DOMINANT remainder: 4 of the 6 acceptance diagnostics are
+      overloaded members (CopyTo per tuple flavour, Fold with/without a
+      resolver)
+- [x] ctor arguments widen to a declared base, including inside the
+      argument TUPLE (unifyArg now recurses into tuple components)
+- [x] explicit type application in expressions: the lookahead accepts
+      `struct(...)` types, and the written arguments pin the callee's
+      freshened instantiation vars — `Array.zeroCreate<struct('K * 'V)>`
+      types without a downstream use
+- [x] `Array.zeroCreate`, lowered to wasm's `array.new_default` (numeric
+      zeros, null refs — the zero fill IS the default fill)
+- [x] a nested local no longer exports over a module-level binding of the
+      same name; qualified expression spines prefer a TYPE over a module
+      sharing its full name (constructor calls through `Impl.MapLinked`)
 - [ ] the enumerator protocol so `for e in <seq>` lowers at all: `seq`/
       `IEnumerable`/`IEnumerator` as prelude interfaces, arrays and lists
       implementing them, `for-in` desugaring to GetEnumerator/MoveNext

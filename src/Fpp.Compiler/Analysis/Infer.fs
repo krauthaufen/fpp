@@ -962,6 +962,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some t -> t.Offset
                          | None -> 0
+                     // explicit type application `zeroCreate<struct(int*int)>`:
+                     // typing the head recorded its freshened quantified vars
+                     // under the name token, in scheme order — the written
+                     // arguments pin exactly those
+                     (match args |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                      | Some tp ->
+                          let written =
+                              nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind)
+                              |> List.map (typeFromNode (dictNew ()))
+                          (match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                           | Some ht ->
+                               let fresh =
+                                   vecToList instRaw |> List.rev
+                                   |> List.tryPick (fun (o, fs) -> if o = ht.Offset then Some fs else None)
+                               (match fresh with
+                                | Some fs when fs.Length = written.Length ->
+                                    List.iter2 (unifyAt ht.Offset) fs written
+                                | _ -> ())
+                           | None -> ())
+                      | None -> ())
                      let mutable firstArg = true
                      let mutable firstArgTy = None
                      for a in args do
