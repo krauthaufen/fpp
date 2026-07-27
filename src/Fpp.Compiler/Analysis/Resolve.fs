@@ -87,6 +87,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         let full = if modulePath = "" then name else modulePath + "." + name
         vecAdd exports (full, d)
         dictSet ownExports full d
+        // a type and a module may share a full name (`type MapLinked` and
+        // `module MapLinked`); the plain key holds whichever came last, so
+        // the type ALSO lives under its own namespace key
+        if d.Kind = DefType then
+            vecAdd exports ("type " + full, d)
+            dictSet ownExports ("type " + full) d
 
     let exportDef (d : Definition) : unit = exportUnder d.Name d
 
@@ -116,6 +122,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | Some d -> Some d
             | None -> dictTryFind imports full)
 
+    /// As findQualified, but for a name in a position where a TYPE is meant
+    /// (a dotted type annotation, or a constructor call): the type namespace
+    /// is consulted first, so a module sharing the name cannot shadow it.
+    let findQualifiedType (dotted : string) : Definition option =
+        bases ()
+        |> List.tryPick (fun b ->
+            let full = if b = "" then dotted else b + "." + dotted
+            match dictTryFind ownExports ("type " + full) with
+            | Some d -> Some d
+            | None ->
+                match dictTryFind imports ("type " + full) with
+                | Some d -> Some d
+                | None ->
+                    match dictTryFind ownExports full with
+                    | Some d -> Some d
+                    | None -> dictTryFind imports full)
+
     /// Local environment first, then opened/imported modules.
     let lookupValue (env : Env) (name : string) : Definition option =
         match Map.tryFind name env with
@@ -133,7 +156,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | None ->
             match Map.tryFind name env with
             | Some d when d.Kind = DefType -> Some d
-            | _ -> findQualified name
+            | _ -> findQualifiedType name
 
     let tryRecord (env : Env) (t : Token) : unit =
         // A bare name in expression position is a value or a constructor,
@@ -202,7 +225,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                       | _ -> ())
                  | many when not (List.isEmpty many) ->
                      let dotted = many |> List.map (fun t -> t.Text) |> String.concat "."
-                     (match findQualified dotted with
+                     (match findQualifiedType dotted with
                       | Some d when d.Kind = DefType -> record (List.last many) d
                       | _ -> ())
                  | _ -> ())
@@ -310,7 +333,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      // qualified access: the spine names something real, and
                      // the head is not a local shadowing it
                      let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
-                     (match findQualified dotted with
+                     let picked =
+                         match findQualified dotted with
+                         // a module is never a value: if a type shares the
+                         // full name, the spine means its constructor
+                         | Some d when d.Kind = DefModule ->
+                             (match findQualifiedType dotted with
+                              | Some ty when ty.Kind = DefType -> Some ty
+                              | _ -> Some d)
+                         | other -> other
+                     (match picked with
                       | Some d ->
                           record (List.last spine) d
                           tryRecord env head
@@ -421,9 +453,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         let isDestructure =
             vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
         let defsBefore = vecLen defs
+        // Only what the BINDING ITSELF introduces is exported — the snapshot
+        // is taken after binding the patterns and before walking the body.
+        // Sweeping to the end of the body instead exported every nested
+        // local: a `let struct(exists, _) = ...` deep inside a function in
+        // module SetNode overwrote the module's own `exists` under the very
+        // same dotted name.
+        let mutable defsBound = defsBefore
         let result =
             if isDestructure then
                 let envAll = List.fold (bindPat DefLet) env pats
+                defsBound <- vecLen defs
                 local (fun () ->
                     for c in vecToList after do
                         walkExpr env c |> ignore)
@@ -433,6 +473,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 | [] -> env
                 | namePat :: paramPats ->
                     let envWithName = bindPat DefLet env namePat
+                    defsBound <- vecLen defs
                     let bodyBase = if isRec then envWithName else env
                     local (fun () ->
                         let bodyEnv = List.fold (bindPat DefParam) bodyBase paramPats
@@ -440,7 +481,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                             walkExpr bodyEnv c |> ignore)
                     envWithName
         if exportHere then
-            for i in defsBefore .. vecLen defs - 1 do
+            for i in defsBefore .. defsBound - 1 do
                 let d = vecGet defs i
                 if d.Kind = DefLet then exportDef d
         result

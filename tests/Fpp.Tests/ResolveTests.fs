@@ -124,3 +124,48 @@ let resolveLspTests =
             Expect.isGreaterThan total 1000 "resolution does real work on the compiler itself"
         }
     ]
+
+[<Tests>]
+let exportHygieneTests =
+    testList "resolver: export hygiene" [
+        test "a nested local never shadows a module export of the same name" {
+            // a `let struct(exists, _) = ...` INSIDE a function exported
+            // itself over the module-level `exists`, so a later qualified
+            // call resolved to a bool local three functions away
+            let src =
+                String.concat "\n" [
+                    "module M"
+                    "module Impl ="
+                    "    let exists (p : int -> bool) (n : int) = p n"
+                    "    let other () ="
+                    "        let struct(exists, op) = struct(true, 1)"
+                    "        if exists then op else 0"
+                    "let a = print (if Impl.exists (fun x -> x > 1) 3 then 1 else 0)"
+                    "" ]
+            let p = Fpp.Syntax.Parser.parse src
+            let b = Fpp.Analysis.Resolve.resolve "t" (Fpp.Prelude.dictNew ()) p.Root
+            let exported =
+                b.Exports
+                |> List.filter (fun (full, _) -> full = "M.Impl.exists")
+                |> List.map (fun (_, d) -> d.Offset)
+            Expect.hasLength exported 1 "exactly one export under the name"
+        }
+        test "a qualified constructor wins over a module sharing the name" {
+            let src =
+                String.concat "\n" [
+                    "module M"
+                    "module Impl ="
+                    "    type Node<'K>(v : 'K) ="
+                    "        member x.V = v"
+                    "    module Node ="
+                    "        let get (n : Node<'K>) = n.V"
+                    "let n = Impl.Node(42)"
+                    "let a = print (Impl.Node.get n)"
+                    "" ]
+            let ws = Fpp.Workspace()
+            ws.SetFileText "t.fpp" src
+            Expect.isEmpty (ws.Diagnostics "t.fpp") "clean"
+            let _, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "the spine means the constructor, not the module"
+        }
+    ]
