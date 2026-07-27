@@ -905,3 +905,54 @@ let interopSurfaceTests =
             Expect.equal out "1\n0\n-1\n" "dispatches Contains through the interface"
         }
     ]
+
+[<Tests>]
+let genericArrayTests =
+    testList "generic arrays and the value restriction" [
+        test "a generic module function can build and fill arrays at any element type" {
+            // `let a = Array.zeroCreate n` is an APPLICATION: the value
+            // restriction keeps it monomorphic, tied to the enclosing 'a, so
+            // the stamper knows every array op's element type per copy
+            let out =
+                run [ "module A ="
+                      "    let ofList (xs : 'a list) : 'a[] ="
+                      "        let mutable n = 0"
+                      "        for _ in xs do n <- n + 1"
+                      "        let a = Array.zeroCreate n"
+                      "        let mutable i = 0"
+                      "        for x in xs do"
+                      "            a.[i] <- x"
+                      "            i <- i + 1"
+                      "        a"
+                      "let a = A.ofList [ 1; 2; 3 ]"
+                      "let p = print a.[2]"
+                      "let b = A.ofList [ \"x\"; \"y\" ]"
+                      "let q = print b.[1]"
+                      "let c = A.ofList [ 1.5; 2.5 ]"
+                      "let r = print c.[0]" ]
+            Expect.equal out "3\ny\n1.5\n" "int, string and float element stamps all run"
+        }
+        test "string arrays and string char access do not collide" {
+            // `b.[i]` on string[] reads an ELEMENT; `s.[i]` on string reads
+            // a CHAR — the marker for the receiver-is-string case is a
+            // sentinel precisely so these two stay apart
+            let out =
+                run [ "let b = [| \"hello\"; \"world\" |]"
+                      "let s = b.[1]"
+                      "let p = print s"
+                      "let q = print s.[0]"
+                      "let r = print b.Length"
+                      "let t = print s.Length" ]
+            Expect.equal out "world\nw\n2\n5\n" "element read, char read, both lengths"
+        }
+        test "local non-values stay monomorphic, local values still generalize" {
+            let out =
+                run [ "let go () ="
+                      "    let empty = []"          // a VALUE: generalizes
+                      "    let one = 1 :: empty"
+                      "    let s = \"a\" :: empty"  // same empty, other type
+                      "    print (Seq.length one + Seq.length s)"
+                      "let a = go ()" ]
+            Expect.equal out "2\n" "the [] literal is still polymorphic locally"
+        }
+    ]

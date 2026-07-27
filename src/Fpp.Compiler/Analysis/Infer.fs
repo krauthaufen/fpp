@@ -1499,8 +1499,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None -> ())
                      e
                  | Some (TCon ("string", [])) ->
+                     // the marker means "the RECEIVER is a string", which is
+                     // not the same thing as an array whose ELEMENTS are
+                     // strings — a sentinel keeps the two apart
                      (match Green.tokens (GNode n) |> List.tryHead with
-                      | Some t -> vecAdd arrKindsRaw (t.Offset, tString)
+                      | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
                       | None -> ())
                      tChar
                  | _ -> st.Fresh ())
@@ -1615,8 +1618,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | None -> ())
                           tInt
                       | Some (TCon ("string", [])), Some nm when nm.Text = "Length" ->
+                          // sentinel: string RECEIVER, not string elements
                           (match Green.tokens (GNode n) |> List.tryHead with
-                           | Some t -> vecAdd arrKindsRaw (t.Offset, tString)
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
                            | None -> ())
                           tInt
                       | _ ->
@@ -1865,9 +1869,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // acc = mempty` lost its tie to the annotation this way
             let isMutable =
                 tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "mutable")
+            // the value restriction, FULL form: a parameterless binding
+            // whose right-hand side is expansive (an application, a match —
+            // anything that COMPUTES) must stay monomorphic. Generalizing
+            // `let a = Array.zeroCreate n` hands every use a fresh variable:
+            // the writes and the reads stop agreeing on the element type,
+            // and inside a generic body the stamper can no longer tie the
+            // array's layout to the enclosing instantiation
+            let rec nonExpansive (c : Green) =
+                match c with
+                | GToken _ -> true
+                | GNode m ->
+                    match m.NodeKind with
+                    | LiteralExpr | IdentExpr | LambdaExpr | ObjExpr -> true
+                    | ListExpr | ArrayExpr | TupleExpr | StructTupleExpr | ParenExpr ->
+                        m.Children |> List.forall nonExpansive
+                    | _ -> false
+            let expansiveValue =
+                paramPats.IsEmpty
+                && (let body =
+                        match vecToList after, hasIn with
+                        | b :: _, true -> Some b
+                        | xs, _ -> List.tryLast xs
+                    match body with
+                    | Some b -> not (nonExpansive b)
+                    | None -> false)
             (match Green.tokens (GNode namePat) |> List.tryFind (fun t -> t.Kind = Ident) with
              | Some t when (dictTryFind defsAt t.Offset).IsSome ->
-                 if isMutable then setScheme t.Offset (mono funTy)
+                 if isMutable || expansiveValue then setScheme t.Offset (mono funTy)
                  else setScheme t.Offset (generalizeBinding declared funTy)
              | _ -> ())
             // `let x = e in body` evaluates to the continuation

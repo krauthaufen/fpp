@@ -17,6 +17,10 @@ type EmitResult =
 
 let emit (decls : Decl list) : EmitResult =
     let errors = vecNew<string> ()
+    // which top-level function is being emitted, so errors can say WHERE
+    let mutable currentFn = ""
+    let emitError (msg : string) =
+        vecAdd errors (if currentFn = "" then msg else msg + " [in " + currentFn + "]")
     let sb = System.Text.StringBuilder()
     let line (s : string) = sb.AppendLine s |> ignore
 
@@ -658,10 +662,10 @@ let emit (decls : Decl list) : EmitResult =
                      | None, Some gname ->
                          "(global.get " + gname + ")"
                      | _ ->
-                         vecAdd errors ("unbound variable " + v.Name)
+                         emitError ("unbound variable " + v.Name)
                          "(ref.i31 (i32.const 0))")
         | EUnknown n ->
-            vecAdd errors ("unknown name reaches emission: " + n)
+            emitError ("unknown name reaches emission: " + n)
             "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "create", _), [ _; _ ]) ->
             vecAdd errors "Array.create needs a statically known element type"
@@ -1348,7 +1352,7 @@ let emit (decls : Decl list) : EmitResult =
                  "(block (result anyref) (struct.set $r_" + rn + " " + string idx
                  + " (ref.cast (ref $r_" + rn + ") " + recur r + ") " + stored + ") (ref.i31 (i32.const 0)))"
              | None ->
-                 vecAdd errors ("unknown field " + fname)
+                 emitError ("unknown field " + fname)
                  "(ref.i31 (i32.const 0))")
         | EField (r, fname, owner) ->
             (match fieldSlot owner fname with
@@ -1359,7 +1363,7 @@ let emit (decls : Decl list) : EmitResult =
                   | "l" -> "(call $ofl " + raw + ")" | "i" -> "(call $ofi " + raw + ")"
                   | _ -> raw)
              | None ->
-                 vecAdd errors ("unknown field " + fname)
+                 emitError ("unknown field " + fname)
                  "(ref.i31 (i32.const 0))")
         | ESeq xs ->
             (match List.rev xs with
@@ -1426,7 +1430,8 @@ let emit (decls : Decl list) : EmitResult =
             if nm = "$ref" then
                 // a uniform reference element (tuples, functions): plain $arr
                 "(array.get $arr (ref.cast (ref $arr) " + recur a + ") " + unwrapI32 (recur i) + ")"
-            elif nm = "string" then
+            elif nm = "$str" then
+                // char access on a STRING receiver (the "$str" sentinel)
                 "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif pk <> "" then
                 let getOp = if pk = "h" then "array.get_u " else "array.get "
@@ -1453,8 +1458,12 @@ let emit (decls : Decl list) : EmitResult =
                     | _ -> "(array.get $arr " + src + " " + idx + ")"
                 "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) "
                 + "(struct.new $r_" + nm + " " + (fs |> List.mapi (fun fi (_, k) -> getF fi k) |> String.concat " ") + "))"
+            elif nm <> "" && not (nm.StartsWith "#") then
+                // any other KNOWN element type is a boxed reference: string,
+                // class, list, function — all live in a uniform $arr
+                "(array.get $arr (ref.cast (ref $arr) " + recur a + ") " + unwrapI32 (recur i) + ")"
             else
-                vecAdd errors "array read needs a statically known element type (specialization pending)"
+                emitError ("array read needs a statically known element type (got '" + nm + "')")
                 "(ref.i31 (i32.const 0))"
         | EIndexSet (nm, a, i, v) ->
             let pk = primKindOf nm
@@ -1490,8 +1499,12 @@ let emit (decls : Decl list) : EmitResult =
                     | _ -> "(array.set $arr " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
                 "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) (local.set " + vl + " " + recur v + ") "
                 + (fs |> List.mapi (fun fi (_, k) -> setF fi k) |> String.concat " ") + " (ref.i31 (i32.const 0)))"
+            elif nm <> "" && not (nm.StartsWith "#") then
+                // boxed reference elements: a uniform $arr, no unboxing
+                "(block (result anyref) (array.set $arr (ref.cast (ref $arr) " + recur a + ") "
+                + unwrapI32 (recur i) + " " + recur v + ") (ref.i31 (i32.const 0)))"
             else
-                vecAdd errors "array write needs a statically known element type (specialization pending)"
+                emitError ("array write needs a statically known element type (got '" + nm + "')")
                 "(ref.i31 (i32.const 0))"
         | EArrayPin (nm, a) ->
             if isPod nm then "(call $ofi (call $pinh " + recur a + "))"
@@ -1507,7 +1520,8 @@ let emit (decls : Decl list) : EmitResult =
             let pk = primKindOf nm
             if nm = "$ref" then
                 "(call $ofi (array.len (ref.cast (ref $arr) " + recur a + ")))"
-            elif nm = "string" then
+            elif nm = "$str" then
+                // .Length on a STRING receiver (the "$str" sentinel)
                 "(call $ofi (array.len (ref.cast (ref $str) " + recur a + ")))"
             elif pk <> "" then
                 "(call $ofi (array.len (ref.cast (ref " + parrOf pk + ") " + recur a + ")))"
@@ -1516,8 +1530,11 @@ let emit (decls : Decl list) : EmitResult =
                 "(call $ofi (i32.div_u " + hLen (recur a) + " (i32.const " + string wd + ")))"
             elif isStructName nm then
                 "(call $ofi (array.len (struct.get $sarr_" + nm + " 0 (ref.cast (ref $sarr_" + nm + ") " + recur a + "))))"
+            elif nm <> "" && not (nm.StartsWith "#") then
+                // boxed reference elements live in a uniform $arr
+                "(call $ofi (array.len (ref.cast (ref $arr) " + recur a + ")))"
             else
-                vecAdd errors "length needs a statically known element type"
+                emitError ("length needs a statically known element type (got '" + nm + "')")
                 "(ref.i31 (i32.const 0))"
         | EArrayCreate (nm, n, EUnknown "$zero") ->
             // Array.zeroCreate: wasm's array.new_default IS the zero fill —
@@ -2911,6 +2928,7 @@ TUPLE_HASH
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
+            currentFn <- v.Name
             let pks, rk =
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
@@ -2950,6 +2968,7 @@ TUPLE_HASH
                 line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + wasmTyOf rk + ") " + localDecls + " " + bodyW + ")")
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
+            currentFn <- v.Name
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string * string> ()
