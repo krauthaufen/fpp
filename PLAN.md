@@ -95,10 +95,22 @@ all member overloading. The split at first measurement:
       119 -> 87 errors.
 - [ ] type tests and downcasts against BUILTIN collections: `:? array<'K>`,
       `:? list<'K>` need a runtime representation test, not a class id (12)
-- [ ] MEMBER overloading (constructors are done; methods are not) — now
-      the DOMINANT remainder: 4 of the 6 acceptance diagnostics are
-      overloaded members (CopyTo per tuple flavour, Fold with/without a
-      resolver)
+- [x] MEMBER overloading — instance AND static. Overloads register under
+      ordinal keys ("HashMap.CopyTo#2", declaration order, resolver and
+      inference assigning the same ordinals). Selection happens in the
+      parked-dot retry — which runs after the whole file is typed, so the
+      call's argument shape is visible through the access's result var — by
+      a non-committing structural test, EXACT fits ranked above ones that
+      need the supertype allowance (or Equals(obj) always wins). An
+      uninformative set stays parked; a final forced pass breaks true ties
+      in declaration order. Statics park with a synthetic receiver. The
+      chosen ordinal rides to Lower in the MemberSites owner tag
+- [x] `f<T> x` nests as `(f<T>) x` — Lower strips the pure type application
+      so its builtin/member special cases see their shape (zeroCreate fell
+      into the C-ABI extern path)
+- [x] `.Length` where the element type is not statically known called a
+      runtime helper that was never DEFINED — any module reaching it failed
+      validation. `$lenv` now exists
 - [x] ctor arguments widen to a declared base, including inside the
       argument TUPLE (unifyArg now recurses into tuple components)
 - [x] explicit type application in expressions: the lookahead accepts
@@ -112,7 +124,10 @@ all member overloading. The split at first measurement:
       sharing its full name (constructor calls through `Impl.MapLinked`)
 - [ ] the enumerator protocol so `for e in <seq>` lowers at all: `seq`/
       `IEnumerable`/`IEnumerator` as prelude interfaces, arrays and lists
-      implementing them, `for-in` desugaring to GetEnumerator/MoveNext
+      implementing them, `for-in` desugaring to GetEnumerator/MoveNext.
+      NOW THE WHOLE REMAINDER: after overloading landed, the acceptance
+      file is 1 diagnostic (Set widening to seq) + 11 for-in/for-loop
+      lowering notes, nothing else
 - [ ] then the genuine stdlib: `Seq.*`, `sprintf`, `String.concat`,
       `Array.zeroCreate`, `KeyValuePair`
 

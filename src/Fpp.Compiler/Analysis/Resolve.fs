@@ -519,7 +519,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         let declareMember (name : Token) =
             if isValDecl then define DefField name |> ignore else
             let d = define DefMember name
-            dictSet memberDefs (owner + "." + name.Text) d
+            // an OVERLOAD keeps its own entry under an ordinal suffix; the
+            // plain key stays with the first declaration, so everything that
+            // knows nothing of overloading keeps working
+            let key = owner + "." + name.Text
+            if (dictTryFind memberDefs key).IsNone then dictSet memberDefs key d
+            else
+                let mutable k = 2
+                while (dictTryFind memberDefs (key + "#" + string k)).IsSome do k <- k + 1
+                dictSet memberDefs (key + "#" + string k) d
             let prior = match dictTryFind membersByName name.Text with Some l -> l | None -> []
             dictSet membersByName name.Text (prior @ [ d ])
         match vecToList idents with

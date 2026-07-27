@@ -494,3 +494,69 @@ let userInstanceTests =
             Expect.contains msgs "instance Add must implement (+)" "an empty instance is not a primitive one"
         }
     ]
+
+[<Tests>]
+let overloadTests =
+    testList "member overloading" [
+        test "overloads select by arity" {
+            let out =
+                run [ "type Calc(bias : int) ="
+                      "    member x.Add(a : int) = a + bias"
+                      "    member x.Add(a : int, b : int) = a + b + bias"
+                      "let c = Calc(100)"
+                      "let p = print (c.Add 5)"
+                      "let q = print (c.Add(5, 6))" ]
+            Expect.equal out "105\n111\n" "one and two arguments reach different bodies"
+        }
+        test "overloads select by argument type" {
+            let out =
+                run [ "type Printer() ="
+                      "    member x.Show(v : int) = print v"
+                      "    member x.Show(v : string) = print v"
+                      "let p = Printer()"
+                      "let a = p.Show 42"
+                      "let b = p.Show \"hi\"" ]
+            Expect.equal out "42\nhi\n" "the argument's type picks the body"
+        }
+        test "overloads distinguish tuple flavours — the acceptance-file case" {
+            let out =
+                run [ "type Sink() ="
+                      "    member x.CopyTo(dst : (int * int)[], i : int) = print 1"
+                      "    member x.CopyTo(dst : struct(int * int)[], i : int) = print 2"
+                      "let s = Sink()"
+                      "let refArr : (int * int)[] = [| (1, 2) |]"
+                      "let a = s.CopyTo(refArr, 0)"
+                      "let structArr = Array.zeroCreate<struct(int * int)> 1"
+                      "let b = s.CopyTo(structArr, 0)" ]
+            Expect.equal out "1\n2\n" "a ref tuple array and a struct tuple array are different overloads"
+        }
+        test "an exact overload beats one that fits by widening" {
+            // Equals(obj) fits EVERY call once obj widens; without ranking it
+            // always won and Equals(Box) was unreachable
+            let out =
+                run [ "type Box(v : int) ="
+                      "    member x.V = v"
+                      "    member x.Same(o : obj) = print 0"
+                      "    member x.Same(o : Box) = print o.V"
+                      "let b = Box(7)"
+                      "let a = b.Same (Box 42)" ]
+            Expect.equal out "42\n" "the specific overload wins"
+        }
+        test "STATIC overloads select too" {
+            let out =
+                run [ "type Make() ="
+                      "    static member Of(v : int) = v + 1"
+                      "    static member Of(v : string, k : int) = k"
+                      "let a = print (Make.Of 41)"
+                      "let b = print (Make.Of(\"x\", 9))" ]
+            Expect.equal out "42\n9\n" "statics park and select like instance members"
+        }
+        test ".Length works where the element type is not statically known" {
+            // the generic length helper was CALLED but never DEFINED, so any
+            // module reaching it failed validation
+            let out =
+                run [ "let xs : (int * int)[] = [| (1, 2); (3, 4) |]"
+                      "let a = print xs.Length" ]
+            Expect.equal out "2\n" "ref-element arrays answer Length"
+        }
+    ]

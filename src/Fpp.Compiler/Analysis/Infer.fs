@@ -254,18 +254,63 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// surrounding expression has been solved
     let pendingCasts = vecNew<int * Type> ()
 
+    /// Register a member's FieldInfo. A second declaration under the same
+    /// name is an OVERLOAD: it keeps its own entry under an ordinal suffix
+    /// ("HashMap.CopyTo#2"), assigned in declaration order — the same order
+    /// the resolver assigns, so the two suffixes name the same definition.
+    let registerField (key : string) (fi : FieldInfo) : unit =
+        if (dictTryFind fields key).IsNone then dictSet fields key fi
+        else
+            let mutable k = 2
+            while (dictTryFind fields (key + "#" + string k)).IsSome do k <- k + 1
+            dictSet fields (key + "#" + string k) fi
+
+    /// A member's overload set, with the ordinal that reaches each entry
+    /// (0 = the plain key).
+    let fieldCandidates (key : string) : (int * FieldInfo) list =
+        match dictTryFind fields key with
+        | None -> []
+        | Some first ->
+            let rest =
+                List.unfold
+                    (fun k ->
+                        match dictTryFind fields (key + "#" + string k) with
+                        | Some fi -> Some ((k, fi), k + 1)
+                        | None -> None)
+                    2
+            (0, first) :: rest
+
+    /// Could a member of this type serve a use already constrained to that
+    /// shape? Purely structural and non-committing — this picks among
+    /// OVERLOADS, and a trial unification would corrupt the losers. Any
+    /// variable is a wildcard; only concrete structure discriminates, which
+    /// is exactly what overloads differ by (a struct tuple against a ref
+    /// tuple, one arity against another).
+    /// `strict` refuses the supertype allowance: `Equals : obj -> bool`
+    /// fits EVERY call once obj widens, so exact fits must outrank widened
+    /// ones or the most general overload always wins.
+    let rec shapeFits (strict : bool) (cand : Type) (actual : Type) : bool =
+        match prune cand, prune actual with
+        | TVar _, _ | _, TVar _ -> true
+        | TCon (c, ca), TCon (a, aa) ->
+            (c = a || (not strict && isSupertypeOf c a))
+            && (ca.Length <> aa.Length || List.forall2 (shapeFits strict) ca aa)
+        | TFun (a1, b1), TFun (a2, b2) -> shapeFits strict a1 a2 && shapeFits strict b1 b2
+        | TTuple xs, TTuple ys -> xs.Length = ys.Length && List.forall2 (shapeFits strict) xs ys
+        | _ -> false
+
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
-    let tryResolveDot (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+    let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
         // members are inherited: walk up the base chain to the type that
         // actually declares this one, and bind to THAT declaration
         // Walk to the type that declares this member, carrying the receiver's
         // type arguments up through each `inherit` so a generic base is
         // instantiated the way the derived class instantiated it.
-        let rec declaringOwner (tn : string) (args : Type list) : (FieldInfo * string * Type list) option =
-            match dictTryFind fields (tn + "." + name) with
-            | Some fi -> Some (fi, tn, args)
-            | None ->
+        let rec declaringOwner (tn : string) (args : Type list) : ((int * FieldInfo) list * string * Type list) option =
+            match fieldCandidates (tn + "." + name) with
+            | (_ :: _) as cs -> Some (cs, tn, args)
+            | [] ->
                 match dictTryFind bases tn with
                 | Some (ps, baseTy) ->
                     let subst = dictNew<int, Type> ()
@@ -283,7 +328,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // inherited member the declared self is the base, and unifying it
         // with the receiver would demand a subtyping the unifier has no
         // notion of. Type arguments are unified, never the nominal head.
-        let tracked (tn : string) (args : Type list) (fi : FieldInfo) : bool =
+        let tracked (ownerTag : string) (tn : string) (args : Type list) (fi : FieldInfo) : bool =
             match fi.DefKey with
             | Some (dp, doff) when dp = path && not fi.IsStatic && fi.TypeName = tn ->
                 (match dictTryFind defSchemes doff with
@@ -295,7 +340,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                List.iter2 (unifyAt offset) sargs args
                                unifyAt offset result memT
                                if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
-                               vecAdd memberSitesRaw (offset, fi.TypeName)
+                               vecAdd memberSitesRaw (offset, ownerTag)
                                true
                            | _ -> false)
                       | _ -> false)
@@ -304,16 +349,48 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match prune recvTy with
         | TCon (tn, args) ->
             (match declaringOwner tn args with
-             | Some (fi, own, ownArgs) when own = tn && tracked tn args fi -> true
-             | Some (fi, _, ownArgs) when fi.Params.Length = ownArgs.Length ->
-                 let subst = dictNew<int, Type> ()
-                 List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
-                 for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
-                 unifyAt offset result (substVars subst fi.FieldType)
-                 vecAdd memberSitesRaw (offset, fi.TypeName)
-                 if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
-                 true
-             | _ -> true)   // receiver known, no such member: retrying cannot help
+             | Some (cands, own, ownArgs) ->
+                 // one candidate is today's path; several are an overload
+                 // set, filtered by the shape the use site has ALREADY been
+                 // constrained to (the retry runs after the whole file is
+                 // typed, so a call's arguments are visible through `result`)
+                 // With several candidates, the use site has to have taken
+                 // SHAPE before choosing means anything — an access resolves
+                 // eagerly, before its application has constrained `result`,
+                 // and everything fits an unconstrained variable. So an
+                 // uninformative overload set stays parked; the retry runs
+                 // after the whole file is typed, and a final FORCED pass
+                 // breaks genuine ties in declaration order.
+                 let informative =
+                     match prune result with
+                     | TVar _ -> false
+                     | _ -> true
+                 if List.length cands > 1 && not informative && not force then false else
+                 let ord, fi =
+                     match cands with
+                     | [ one ] -> one
+                     | many ->
+                         (match many |> List.filter (fun (_, c) -> shapeFits true c.FieldType result) with
+                          | picked :: _ -> picked
+                          | [] ->
+                              match many |> List.filter (fun (_, c) -> shapeFits false c.FieldType result) with
+                              | picked :: _ -> picked
+                              // none fit: bind the first so the mismatch
+                              // surfaces at THIS use with both types named
+                              | [] -> List.head many)
+                 let ownerTag =
+                     if ord = 0 then fi.TypeName else fi.TypeName + "#" + string ord
+                 if own = tn && tracked ownerTag tn args fi then true
+                 elif fi.Params.Length = ownArgs.Length then
+                     let subst = dictNew<int, Type> ()
+                     List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
+                     for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                     unifyAt offset result (substVars subst fi.FieldType)
+                     vecAdd memberSitesRaw (offset, ownerTag)
+                     if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
+                     true
+                 else true
+             | None -> true)   // receiver known, no such member: retrying cannot help
         | _ -> false
 
     let nodesOf (n : GreenNode) : GreenNode list =
@@ -1365,12 +1442,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | None -> None
                 match staticOwner, lastIdent with
                 | Some tn, Some name when (dictTryFind fields (tn + "." + name.Text)).IsSome ->
-                    let fi = (dictTryFind fields (tn + "." + name.Text)).Value
-                    let subst = dictNew<int, Type> ()
-                    for pv in fi.Params do dictSet subst pv.Id (st.Fresh ())
-                    for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
-                    vecAdd memberSitesRaw (name.Offset, tn)
-                    substVars subst fi.FieldType
+                    (match fieldCandidates (tn + "." + name.Text) with
+                     | [ (_, fi) ] ->
+                         let subst = dictNew<int, Type> ()
+                         for pv in fi.Params do dictSet subst pv.Id (st.Fresh ())
+                         for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
+                         vecAdd memberSitesRaw (name.Offset, tn)
+                         substVars subst fi.FieldType
+                     | (_, first) :: _ ->
+                         // STATIC overloads park like instance ones: at this
+                         // moment the application has not been typed, so
+                         // nothing distinguishes the candidates yet. A
+                         // synthetic receiver carries the owner to the retry.
+                         let result = st.Fresh ()
+                         let recv = TCon (tn, first.Params |> List.map (fun _ -> st.Fresh ()))
+                         vecAdd pendingDots (name.Offset, recv, result, name.Text)
+                         result
+                     | [] -> st.Fresh ())
                 | _ ->
                 (match qualified with
                  | Some d ->
@@ -1424,7 +1512,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match lhsTy, lastIdent with
                       | Some lt, Some name ->
                           let result = st.Fresh ()
-                          if not (tryResolveDot name.Offset lt result name.Text) then
+                          if not (tryResolveDot false name.Offset lt result name.Text) then
                               vecAdd pendingDots (name.Offset, lt, result, name.Text)
                           result
                       | _ -> st.Fresh ()))
@@ -1933,7 +2021,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 freeVars memberTy
                 |> List.distinctBy (fun v -> v.Id)
                 |> List.filter (fun v -> not (Set.contains v.Id classIds))
-            dictSet fields (tyName + "." + t.Text)
+            registerField (tyName + "." + t.Text)
                 { TypeName = tyName; Params = classParams; Quantified = quantified
                   FieldType = memberTy
                   DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
@@ -2208,9 +2296,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         progress <- false
         let still = vecNew<int * Type * Type * string> ()
         for offset, recvTy, result, name in parked do
-            if tryResolveDot offset recvTy result name then progress <- true
+            if tryResolveDot false offset recvTy result name then progress <- true
             else vecAdd still (offset, recvTy, result, name)
         parked <- vecToList still
+    // a use that never took shape (the member passed as a VALUE, say) can
+    // wait no longer: force the tie, which binds in declaration order
+    for offset, recvTy, result, name in parked do
+        tryResolveDot true offset recvTy result name |> ignore
     // record literals: name the instantiation once everything is solved
     for offset, ty in vecToList pendingRecords do
         vecAdd fieldOwnersRaw (offset, instName ty)

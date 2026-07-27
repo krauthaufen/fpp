@@ -124,8 +124,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let memberAt (t : Token) : (string * Resolve.Definition) option =
         match dictTryFind memberSites t.Offset with
         | Some owner ->
-            (match dictTryFind memberIndex (owner + "." + t.Text) with
-             | Some d -> Some (owner, d)
+            // "HashMap#2" names the second OVERLOAD of the member on
+            // HashMap; the ordinal composes into the index key
+            let hash = owner.IndexOf "#"
+            let key =
+                if hash < 0 then owner + "." + t.Text
+                else owner.Substring (0, hash) + "." + t.Text + owner.Substring hash
+            let plainOwner = if hash < 0 then owner else owner.Substring (0, hash)
+            (match dictTryFind memberIndex key with
+             | Some d -> Some (plainOwner, d)
              | None -> None)
         | None -> None
 
@@ -332,6 +339,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | AppExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: args ->
+                     // `f<T> x` nests as `(f<T>) x`; the type application is
+                     // inference's business and already spent, so the HEAD for
+                     // lowering is the plain callee — otherwise the builtin
+                     // and member special cases below never see their shape
+                     let head =
+                         if head.NodeKind = AppExpr
+                            && (nodesOf head |> List.exists (fun x -> x.NodeKind = TyParams))
+                            && (nodesOf head |> List.filter (fun x -> isExprish x.NodeKind) |> List.length) = 1 then
+                             (nodesOf head |> List.filter (fun x -> isExprish x.NodeKind)).Head
+                         else head
                      let f = lowerExpr (GNode head)
                      let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
                      // a type with several constructors: inference chose one
