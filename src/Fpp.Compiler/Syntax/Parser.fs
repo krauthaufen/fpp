@@ -507,6 +507,12 @@ let parse (src : string) : ParseResult =
             elif s.IsOp "<" && isAdjacentTo e && looksLikeTypeArgs () then
                 // explicit generic application: GetValue<string>, vecNew<Green>
                 e <- Green.node AppExpr [ e; Green.node TyParams (parseAngleArgs ctx) ]
+            elif s.Is LParen && isAdjacentTo e then
+                // F#'s high-precedence application: an atom IMMEDIATELY
+                // followed by `(` binds tighter than juxtaposition, so
+                // `C(1).Get()` chains the dot onto the call — without this
+                // the postfix loop never saw past the constructor
+                e <- Green.node AppExpr [ e; parseAtom ctx ]
             else go <- false
         e
 

@@ -381,7 +381,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  let ownerTag =
                      if ord = 0 then fi.TypeName else fi.TypeName + "#" + string ord
                  if own = tn && tracked ownerTag tn args fi then true
-                 elif fi.Params.Length = ownArgs.Length then
+                 elif fi.Params.Length = ownArgs.Length || (fi.IsStatic && List.isEmpty ownArgs) then
+                     // a STATIC access parked before its declaration carries
+                     // no receiver arguments; freshen the class parameters
+                     let ownArgs =
+                         if fi.Params.Length = ownArgs.Length then ownArgs
+                         else fi.Params |> List.map (fun _ -> st.Fresh ())
                      let subst = dictNew<int, Type> ()
                      List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst pv.Id a)
                      for qv in fi.Quantified do dictSet subst qv.Id (st.Fresh ())
@@ -1530,7 +1535,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // application: `Comparer.Instance` or `Comparer<int>.Instance`
                     let headIdent (h : GreenNode) =
                         if h.NodeKind = IdentExpr then tokensOf h |> List.tryFind (fun t -> t.Kind = Ident)
-                        elif h.NodeKind = AppExpr then
+                        elif h.NodeKind = AppExpr
+                             && (nodesOf h |> List.forall (fun m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams)) then
+                            // only a PURE type application: `C(args).M` is an
+                            // instance access, and seeing through the call
+                            // typed it as a static
                             match nodesOf h |> List.tryHead with
                             | Some inner when inner.NodeKind = IdentExpr ->
                                 tokensOf inner |> List.tryFind (fun t -> t.Kind = Ident)
@@ -1613,9 +1622,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ ->
                      match lhsTy, lastIdent with
                       | Some lt, Some name ->
+                          // when the head names a TYPE, this is a static
+                          // member used above its declaration (nothing else
+                          // reached here) — park on the OWNER, not on the
+                          // meaningless type-in-expression-position value
+                          let recv =
+                              match staticOwner with
+                              | Some tn -> TCon (tn, [])
+                              | None -> lt
                           let result = st.Fresh ()
-                          if not (tryResolveDot false name.Offset lt result name.Text) then
-                              vecAdd pendingDots (name.Offset, lt, result, name.Text)
+                          if not (tryResolveDot false name.Offset recv result name.Text) then
+                              vecAdd pendingDots (name.Offset, recv, result, name.Text)
                           result
                       | _ -> st.Fresh ()))
             | ForExpr | WhileExpr ->

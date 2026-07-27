@@ -855,3 +855,53 @@ let typeTestTests =
             Expect.equal out "won\n" "$ref element indexing"
         }
     ]
+
+[<Tests>]
+let interopSurfaceTests =
+    testList "read contracts and chained calls" [
+        test "high-precedence application: C(1).Get() chains" {
+            let out =
+                run [ "type C(v : int) ="
+                      "    member x.Get() = v + 1"
+                      "    member x.Plus(k : int) = v + k"
+                      "let a = print (C(1).Get())"
+                      "let b = print (C(1).Plus 5)"
+                      "let c = print (C(9).Get() + C(1).Get())" ]
+            Expect.equal out "2\n6\n12\n" "the dot chains onto the call"
+        }
+        test "a static member is usable above its declaration" {
+            let out =
+                run [ "type HS(v : int) ="
+                      "    member x.UseIt(o : seq<int>) = (HS.Build o).V"
+                      "    member x.V = v"
+                      "    static member Build(o : seq<int>) ="
+                      "        let mutable n = 0"
+                      "        for e in o do n <- n + e"
+                      "        HS(n)"
+                      "let h = HS(0)"
+                      "let a = print (h.UseIt [ 1; 2; 3 ])" ]
+            Expect.equal out "6\n" "forward references park until the class is complete"
+        }
+        test "ISet is a read contract the type test can find" {
+            let out =
+                run [ "type Tiny(v : int) ="
+                      "    member x.Has(k : int) = k = v"
+                      "    interface ISet<int> with"
+                      "        member x.Count = 1"
+                      "        member x.Contains(item) = x.Has item"
+                      "        member x.Overlaps(o : seq<int>) = false"
+                      "        member x.SetEquals(o : seq<int>) = false"
+                      "        member x.IsSubsetOf(o : seq<int>) = false"
+                      "        member x.IsProperSubsetOf(o : seq<int>) = false"
+                      "        member x.IsSupersetOf(o : seq<int>) = false"
+                      "        member x.IsProperSupersetOf(o : seq<int>) = false"
+                      "let probe (o : obj) ="
+                      "    match o with"
+                      "    | :? ISet<int> as s -> if s.Contains 7 then 1 else 0"
+                      "    | _ -> -1"
+                      "let a = print (probe (Tiny 7 :> obj))"
+                      "let b = print (probe (Tiny 8 :> obj))"
+                      "let c = print (probe (5 :> obj))" ]
+            Expect.equal out "1\n0\n-1\n" "dispatches Contains through the interface"
+        }
+    ]

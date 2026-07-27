@@ -131,6 +131,53 @@ def dotnet_exception_ctors(src):
         "KeyNotFoundException()",
         'KeyNotFoundException("The given key was not present in the dictionary.")')
 
+def drop_dotnet_interop_interfaces(src):
+    """The non-generic System.Collections interfaces and the mutable
+    collection contracts (ICollection, and ISet's mutators) are .NET
+    interop whose implementations all throw. The read side survives as
+    prelude interfaces; ISet gains the Contains/Count forwards that .NET
+    reaches through interface inheritance."""
+    out = []
+    lines = src.split("\n")
+    i = 0
+    def indent(l):
+        return len(l) - len(l.lstrip())
+    drop_headers = (
+        "interface System.Collections.IEnumerable ",
+        "interface System.Collections.IEnumerable\n",
+        "interface System.Collections.IEnumerator ",
+        "interface System.Collections.Generic.ICollection<",
+    )
+    iset_mutators = ("member x.Add(", "member x.ExceptWith(", "member x.UnionWith(",
+                     "member x.IntersectWith(", "member x.SymmetricExceptWith(")
+    while i < len(lines):
+        line = lines[i]
+        t = line.strip()
+        header = (t.startswith("interface System.Collections.IEnumerable")
+                  or t.startswith("interface System.Collections.IEnumerator")
+                  or t.startswith("interface System.Collections.Generic.ICollection<"))
+        if header:
+            base = indent(line)
+            i += 1
+            while i < len(lines) and (lines[i].strip() == "" or indent(lines[i]) > base):
+                i += 1
+            continue
+        if t.startswith("interface System.Collections.Generic.ISet<"):
+            base = indent(line)
+            out.append(line)
+            pad = " " * (base + 4)
+            out.append(pad + "member x.Count = x.Count")
+            out.append(pad + "member x.Contains(item) = x.Contains item")
+            i += 1
+            while i < len(lines) and (lines[i].strip() == "" or indent(lines[i]) > base):
+                if not any(lines[i].strip().startswith(m) for m in iset_mutators):
+                    out.append(lines[i])
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
 src = open(sys.argv[1]).read()
 open(sys.argv[2], "w").write(
-    dotnet_exception_ctors(drop_fsharp_core_set_bridges(strip_attrs(port_closures(pick_branch(src))))))
+    drop_dotnet_interop_interfaces(dotnet_exception_ctors(drop_fsharp_core_set_bridges(strip_attrs(port_closures(pick_branch(src)))))))

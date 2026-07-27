@@ -159,13 +159,23 @@ type silently mis-unified, and in the acceptance file that corrupted the
 class-level 'V across members until an occurs check finally tripped three
 members later. All three phases now detect the flat-paren destructure.
 
-With 0 diagnostics the emission runs deeper: 30 errors now visible that
-the early return had hidden. The families: `:? ISet` where ISet is
-IMPLEMENTED but never DECLARED (the interface test requires a
-declaration; accept implemented-only interfaces), `static let` fields in
-the [<Struct>] HashMap (valueTupleGetter unbound), and more
-downstream-of-a-broken-piece member corners (OfSeq/exists/Contains).
-Next session's list; harnesses in the scratchpad.
+The mscorlib interfaces are settled BY KIND: the read contracts
+(IReadOnlyCollection, IEquatable, ISet's query side) are prelude
+interfaces — genuinely meaningful for immutable collections — and the
+mutation interop (ICollection, ISet's ExceptWith family, the non-generic
+System.Collections enumerators) is dropped by the port script, which also
+flattens .NET's interface inheritance by injecting ISet's Contains/Count
+forwards. Fixed alongside, each pinned:
+- F#'s HIGH-PRECEDENCE APPLICATION: `C(1).Get()` — the parser never chained
+  a postfix dot past a call, and both Lower and Infer then treated
+  `C(args).M` as a STATIC access, silently dropping the receiver (compiled
+  clean, read garbage at runtime)
+- a static member used ABOVE its declaration in the same class parks on
+  the owner type until the fields table is complete
+Emit tail: 30 -> 23 — the remainder sits in HashSet's overloaded
+SetEquals/IsSubsetOf family (forward statics inside overloaded members)
+plus valueTupleGetter/KeyValuePairDebugFriendly corners; the minimal
+repros of each ingredient pass individually.
 
 ### Acceptance emit status after the stdlib layer
 61 -> 36 emit errors. Lists and arrays are genuine seqs AT RUNTIME: the

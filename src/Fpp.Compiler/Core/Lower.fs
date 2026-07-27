@@ -104,11 +104,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> Option.map (fun t -> t.Text)
 
     /// `C.Foo` where C names a type: a static member, so no receiver.
+    /// `C(args).Foo` is NOT static — the call built an instance, and seeing
+    /// through it here silently dropped the receiver. Only a pure type
+    /// application (`Comparer<int>.Instance`) is looked through.
     let isStaticUse (n : GreenNode) : bool =
         let rec headIdent (h : GreenNode) =
             if h.NodeKind = IdentExpr then
                 h.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
-            elif h.NodeKind = AppExpr then
+            elif h.NodeKind = AppExpr
+                 && (h.Children
+                     |> List.forall (fun c ->
+                         match c with
+                         | GNode m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams
+                         | GToken _ -> true)) then
                 match h.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
                 | Some inner -> headIdent inner
                 | None -> None

@@ -500,6 +500,25 @@ instance Rem<~T~, ~T~>
             "type IEnumerable<'a> ="
             "    abstract member GetEnumerator : unit -> IEnumerator<'a>"
             "type seq<'a> = IEnumerable<'a>"
+            // The READ contracts of the .NET collection interfaces — the
+            // side that makes sense for immutable collections. The mutable
+            // half (ICollection.Add, ISet.ExceptWith, ...) is interop noise
+            // whose implementations all throw, and the port drops it.
+            // .NET reaches Contains/Count through interface INHERITANCE,
+            // which these declarations flatten.
+            "type IReadOnlyCollection<'a> ="
+            "    abstract member Count : int"
+            "type IEquatable<'a> ="
+            "    abstract member Equals : 'a -> bool"
+            "type ISet<'a> ="
+            "    abstract member Count : int"
+            "    abstract member Contains : 'a -> bool"
+            "    abstract member Overlaps : seq<'a> -> bool"
+            "    abstract member SetEquals : seq<'a> -> bool"
+            "    abstract member IsSubsetOf : seq<'a> -> bool"
+            "    abstract member IsProperSubsetOf : seq<'a> -> bool"
+            "    abstract member IsSupersetOf : seq<'a> -> bool"
+            "    abstract member IsProperSupersetOf : seq<'a> -> bool"
             "type Option<'a> ="
             "    | None"
             "    | Some of 'a"

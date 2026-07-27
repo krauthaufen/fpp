@@ -3053,11 +3053,6 @@ type HashSetEnumerator<'K> =
         x.Next <- null
         x.Value <- Unchecked.defaultof<_>
 
-    interface System.Collections.IEnumerator with
-        member x.MoveNext() = x.MoveNext()
-        member x.Reset() = x.Reset()
-        member x.Current = x.Current :> obj
-
     interface System.Collections.Generic.IEnumerator<'K> with
         member x.Current = x.Current
         member x.Dispose() = x.Dispose()
@@ -3123,11 +3118,6 @@ type HashMapEnumerator<'K, 'V, 'T> =
         x.Next <- null
         x.Value <- Unchecked.defaultof<_>
 
-    interface System.Collections.IEnumerator with
-        member x.MoveNext() = x.MoveNext()
-        member x.Reset() = x.Reset()
-        member x.Current = x.Current :> obj
-
     interface System.Collections.Generic.IEnumerator<'T> with
         member x.Current = x.Current
         member x.Dispose() = x.Dispose()
@@ -3145,7 +3135,6 @@ type HashMapEnumerator<'K, 'V, 'T> =
 
 type internal HashMapEnumerable<'K, 'V, 'T>(root : SetNode<'K>, mapping : ('K -> 'V -> 'T)) =
     member x.GetEnumerator() = new HashMapEnumerator<_,_,_>(root, mapping)
-    interface System.Collections.IEnumerable with member x.GetEnumerator() = x.GetEnumerator() :> _
     interface System.Collections.Generic.IEnumerable<'T> with member x.GetEnumerator() = x.GetEnumerator() :> _
 
 [<Struct>]
@@ -3443,28 +3432,14 @@ type HashSet<'K> internal(comparer : IEqualityComparer<'K>, root : SetNode<'K>) 
         arr
     member x.GetEnumerator() = new HashSetEnumerator<'K>(root)
 
-    interface System.Collections.IEnumerable with
-        member x.GetEnumerator() = x.GetEnumerator() :> _
     interface System.Collections.Generic.IEnumerable<'K> with
         member x.GetEnumerator() = x.GetEnumerator() :> _
 
     interface System.Collections.Generic.IReadOnlyCollection<'K> with
         member x.Count = x.Count
-    interface System.Collections.Generic.ICollection<'K> with
-        member x.Count = x.Count
-        member x.IsReadOnly = true
-        member x.Add _ = failwith "readonly"
-        member x.Remove _ = failwith "readonly"
-        member x.Clear() = failwith "readonly"
-        member x.Contains(item : 'K) = x.Contains item
-        member x.CopyTo(arr : 'K[], index : int) = x.CopyTo(arr, index)
-
     interface System.Collections.Generic.ISet<'K> with
-        member x.Add(_) = failwith "readonly"
-        member x.ExceptWith(_) = failwith "readonly"
-        member x.UnionWith(_) = failwith "readonly"
-        member x.IntersectWith(_) = failwith "readonly"
-        member x.SymmetricExceptWith(_) = failwith "readonly"
+        member x.Count = x.Count
+        member x.Contains(item) = x.Contains item
         member x.Overlaps(other : seq<'K>) = x.Overlaps other
         member x.SetEquals(other : seq<'K>) = x.SetEquals other
         member x.IsSubsetOf (other : seq<'K>) = x.IsSubsetOf other
@@ -3773,24 +3748,10 @@ and [<Struct>]
     member x.GetEnumerator() = new HashMapEnumerator<'K, 'V, _>(root, tupleGetter)
     member x.GetStructEnumerator() = new HashMapEnumerator<'K, 'V, _>(root, valueTupleGetter)
 
-    interface System.Collections.IEnumerable with
-        member x.GetEnumerator() = x.GetEnumerator() :> _
     interface System.Collections.Generic.IEnumerable<'K * 'V> with
         member x.GetEnumerator() = x.GetEnumerator() :> _
     interface System.Collections.Generic.IReadOnlyCollection<'K * 'V> with
         member x.Count = x.Count
-    interface System.Collections.Generic.ICollection<'K * 'V> with
-        member x.IsReadOnly = true
-        member x.Add(_) = failwith "readonly"
-        member x.Remove(_) = failwith "readonly"
-        member x.Clear() = failwith "readonly"
-        member x.Contains((k, v)) =
-            match x.TryFindV k with
-            | ValueSome vv -> DefaultEquality.equals vv v
-            | ValueNone -> false
-        member x.Count = x.Count
-        member x.CopyTo(dst : ('K * 'V)[], index : int) = x.CopyTo(dst, index)
-
 and [<Sealed>] internal HashMapProxy<'K, 'V>(map : HashMap<'K, 'V>) =
     member x.Items = 
         map.ToSeqV() 
