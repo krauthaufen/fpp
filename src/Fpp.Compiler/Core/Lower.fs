@@ -378,6 +378,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | EVar (bv, _), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayUnpin (nm, pa)
+                      | EVar (bv, _), [ cn ] when bv.Name = "zeroCreate" && bv.Path = "(builtin)" ->
+                          let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
+                          // the zero value is per-representation, so the
+                          // marker survives to the emitter, which knows it
+                          EArrayCreate (nm, cn, EUnknown "$zero")
                       | EVar (bv, _), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with

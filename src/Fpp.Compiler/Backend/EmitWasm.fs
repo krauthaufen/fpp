@@ -1390,6 +1390,28 @@ let emit (decls : Decl list) : EmitResult =
             else
                 vecAdd errors "length needs a statically known element type"
                 "(ref.i31 (i32.const 0))"
+        | EArrayCreate (nm, n, EUnknown "$zero") ->
+            // Array.zeroCreate: wasm's array.new_default IS the zero fill —
+            // numeric zeros, null refs — so no loop and no value operand
+            let pk = primKindOf nm
+            if pk <> "" then
+                "(array.new_default " + parrOf pk + " " + unwrapI32 (recur n) + ")"
+            elif isPod nm then
+                let _, _, wd = (dictTryFind podLayout nm).Value
+                "(struct.new $hnd (array.new_default $pk (i32.mul " + unwrapI32 (recur n)
+                + " (i32.const " + string wd + "))) (i32.const 0) (i32.const 0))"
+            elif isStructName nm then
+                let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = nm then Some fs else None)
+                let nl = newTypedLocal "zn" "i32"
+                let mk (k : string) =
+                    match k with
+                    | "f" | "s" | "l" | "i" | "h" -> "(array.new_default " + parrOf k + " (local.get " + nl + "))"
+                    | _ -> "(array.new_default $arr (local.get " + nl + "))"
+                "(block (result anyref) (local.set " + nl + " " + unwrapI32 (recur n) + ") "
+                + "(struct.new $sarr_" + nm + " " + (fs |> List.map (fun (_, k) -> mk k) |> String.concat " ") + "))"
+            else
+                // a reference element zero-fills with nulls
+                "(array.new_default $arr " + unwrapI32 (recur n) + ")"
         | EArrayCreate (nm, n, v) ->
             let pk = primKindOf nm
             if pk <> "" then

@@ -210,11 +210,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Unify an argument against a parameter, allowing the argument to be a
     /// subtype — F# inserts the upcast, and the representation is identical.
-    let unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
+    let rec unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
         match prune paramTy, prune argTy with
         | TCon (p, pa), TCon (a, aa) when p <> a && isSupertypeOf p a ->
             // widening: only the type arguments they share need to agree
             if pa.Length = aa.Length then List.iter2 (unifyAt offset) pa aa
+        // a multi-argument member packs its arguments into a tuple, and each
+        // POSITION widens independently — `M(cmp, leaf)` against
+        // `(IEqualityComparer * SetNode)` must accept a MapLeaf second
+        | TTuple ps, TTuple has when ps.Length = has.Length ->
+            List.iter2 (unifyArg offset) ps has
         | _ -> unifyAt offset paramTy argTy
 
     /// The name of a type at its instantiation. A name still mentioning a
@@ -913,15 +918,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | [] -> tUnit
                              | [ one ] -> one
                              | many -> TTuple many
+                         // A trial must not commit — plain unify links type
+                         // variables it touches, corrupting the later trials
+                         // — and it must allow a SUBCLASS where the parameter
+                         // declares a base, since F# widens ctor arguments
+                         // like any others. So selection is a pure structural
+                         // test, and only the chosen overload unifies.
+                         let rec couldAccept (dom : Type) (arg : Type) : bool =
+                             match prune dom, prune arg with
+                             | TVar _, _ | _, TVar _ -> true
+                             | TCon (d, da), TCon (a, aa) ->
+                                 (d = a || isSupertypeOf d a)
+                                 && (da.Length <> aa.Length || List.forall2 couldAccept da aa)
+                             | TFun (a1, b1), TFun (a2, b2) -> couldAccept a1 a2 && couldAccept b1 b2
+                             | TTuple xs, TTuple ys ->
+                                 xs.Length = ys.Length && List.forall2 couldAccept xs ys
+                             | _ -> false
                          let fits (sch : Scheme) =
                              match prune (st.Instantiate sch) with
                              | TFun (dom, res) ->
-                                 // a trial unification on a private copy:
-                                 // committing here would corrupt the others
-                                 let probe = st.Instantiate { Quantified = []; Constraints = []; Body = argTy }
-                                 (match unify (st.Instantiate { Quantified = []; Constraints = []; Body = dom }) probe with
-                                  | None -> Some res
-                                  | Some _ -> None)
+                                 if couldAccept dom argTy then Some res else None
                              | _ -> None
                          let chosen =
                              cs |> List.tryPick (fun (o, sch) -> fits sch |> Option.map (fun _ -> o, sch))
@@ -929,7 +945,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | Some (o, sch) ->
                               vecAdd ctorSitesRaw (ht.Offset, o)
                               (match prune (st.Instantiate sch) with
-                               | TFun (dom, res) -> unifyAt ht.Offset dom argTy; res
+                               | TFun (dom, res) ->
+                                   // widen per argument, not on the tuple
+                                   (match prune dom, prune argTy with
+                                    | TTuple ds, TTuple has when ds.Length = has.Length ->
+                                        List.iter2 (unifyArg ht.Offset) ds has
+                                    | d, a -> unifyArg ht.Offset d a)
+                                   res
                                | other -> other)
                           | None ->
                               vecAdd diags (ht.Offset, "no constructor of " + ht.Text + " accepts these arguments")

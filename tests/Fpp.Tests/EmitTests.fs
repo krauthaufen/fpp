@@ -226,3 +226,43 @@ let emitTests =
             Expect.equal out "first\nsecond\nsame\n-42\n" "output"
         }
     ]
+
+[<Tests>]
+let acceptanceProgressTests =
+    testList "acceptance-file mechanisms" [
+        test "ctor arguments widen to a declared base, in tuples too" {
+            let ws = Fpp.Workspace()
+            ws.SetFileText "t.fpp" (String.concat "\n" [
+                "module M"
+                "type Node<'K>(v : 'K) ="
+                "    member x.V = v"
+                "type Leaf<'K, 'V>(k : 'K, value : 'V) ="
+                "    inherit Node<'K>(k)"
+                "type Holder<'K, 'V>(tag : int, root : Node<'K>) ="
+                "    member x.Tag = tag"
+                "    member x.Root = root"
+                "    static member Single(k : 'K, v : 'V) ="
+                "        Holder<'K, 'V>(1, Leaf(k, v))"
+                "let h = Holder<int, string>.Single(2, \"x\")"
+                "let a = print h.Root.V"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "t.fpp") "clean"
+            let _, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "the second tuple slot widened Leaf to Node"
+        }
+        test "Array.zeroCreate with an explicit struct-tuple type argument" {
+            let ws = Fpp.Workspace()
+            ws.SetFileText "t.fpp" (String.concat "\n" [
+                "module M"
+                "let xs = Array.zeroCreate<struct(int * int)> 3"
+                "let ints = Array.zeroCreate<int> 4"
+                "let a = print xs.Length"
+                "let b = print ints.Length"
+                "let c = print ints.[2]"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "t.fpp") "type application parses, struct included"
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "emits"
+            Expect.stringContains wat "array.new_default" "zero fill is the default fill"
+        }
+    ]

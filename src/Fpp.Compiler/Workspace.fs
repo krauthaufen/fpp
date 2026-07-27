@@ -521,6 +521,7 @@ instance Rem<~T~, ~T~>
             "            member _.GetHashCode a = hash a }"
             "module Array ="
             "    extern let create : int -> 'a -> 'a[]"
+            "    extern let zeroCreate : int -> 'a[]"
             "    extern let pin : 'a[] -> int"
             "    extern let unpin : 'a[] -> int"
             ""

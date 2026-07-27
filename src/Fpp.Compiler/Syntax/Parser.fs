@@ -542,6 +542,8 @@ let parse (src : string) : ParseResult =
                     elif t.Text = "'" || t.Text = "." || t.Text = "*" || t.Text = "->" then scan (k + 1) depth
                     else false
                 | Ident -> scan (k + 1) depth
+                // `zeroCreate<struct('K * 'V)>` — a struct-tuple type
+                | Keyword when t.Text = "struct" -> scan (k + 1) depth
                 | Comma -> scan (k + 1) depth
                 | LBracket | RBracket -> scan (k + 1) depth   // int[]
                 | LParen | RParen -> scan (k + 1) depth       // (string * int) list
