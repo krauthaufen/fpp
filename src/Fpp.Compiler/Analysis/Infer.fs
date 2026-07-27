@@ -713,8 +713,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let literalType (t : Token) : Type =
         match t.Kind with
         | IntLit ->
-            // integer literal suffixes: 5L is int64, 5u is uint32
+            // integer literal suffixes: 5L int64, 5u uint32, 5uy byte, 5y sbyte
             if t.Text.EndsWith "L" then TCon ("int64", [])
+            elif t.Text.EndsWith "uy" then TCon ("byte", [])
+            elif t.Text.EndsWith "y" then TCon ("sbyte", [])
             elif t.Text.EndsWith "u" || t.Text.EndsWith "U" then tUInt
             else tInt
         | FloatLit ->
@@ -957,8 +959,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                 |> List.mapi (fun i (c, _, _, _) ->
                                                     let ty =
                                                         match c with
-                                                        | 'd' | 'i' | 'x' | 'X' | 'o' -> tInt
-                                                        | 'u' -> tUInt
+                                                        // any integer width, decided by
+                                                        // the recorded kind at expansion
+                                                        | 'd' | 'i' | 'x' | 'X' | 'o' | 'u' -> st.Fresh ()
                                                         | 's' -> tString
                                                         | 'c' -> tChar
                                                         | 'b' -> tBool
@@ -1596,10 +1599,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> st.Fresh ()))
             | ForExpr | WhileExpr ->
                 let fvars = dictNew<string, Type> ()
+                // the source and the binder are typed HERE, once — the
+                // general loop below must not re-type them, or the binder's
+                // freshly re-created scheme orphans the element unification
+                // and every constraint on it
+                let mutable handled : GreenNode list = []
                 // `for x in arr do`: bind x to the element type and record
                 // the collection's element name for lowering
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | coll :: _ when n.NodeKind = ForExpr ->
+                     handled <- coll :: handled
+                     (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                      | Some ip -> handled <- ip :: handled
+                      | None -> ())
                      let ct = exprType (GNode coll)
                      (match prune ct with
                       | TCon ("array", [ e ]) ->
@@ -1644,10 +1656,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
                            | Some ip -> unify (patType fvars ip) cTy |> ignore
                            | None -> ())
-                      | _ -> ())
+                      | _ ->
+                          // neither array, list nor protocol: still bind the
+                          // pattern so the body sees its names
+                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                           | Some ip -> patType fvars ip |> ignore
+                           | None -> ()))
                  | _ -> ())
                 for m in nodesOf n do
-                    if isPatKind m.NodeKind then patType fvars m |> ignore
+                    if List.exists (fun h -> System.Object.ReferenceEquals (h, m)) handled then ()
+                    elif isPatKind m.NodeKind then patType fvars m |> ignore
                     elif isExprish m.NodeKind then exprType (GNode m) |> ignore
                 tUnit
             | RecordExpr ->

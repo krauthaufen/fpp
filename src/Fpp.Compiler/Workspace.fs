@@ -432,8 +432,12 @@ instance Rem<~T~, ~T~>
                       "    static min a b = if a < b then a else b"
                       "    static max a b = if a > b then a else b" ]
                 ])
-            // strings and chars order, they just do not do arithmetic
-            [ "instance Ordered<string>"
+            // strings and chars order, they just do not do arithmetic —
+            // and so do the byte widths, whose arithmetic (wrapping at the
+            // width) is NOT declared until it can wrap correctly
+            [ "instance Ordered<byte>"
+              "instance Ordered<sbyte>"
+              "instance Ordered<string>"
               "instance Ordered<char>"
               "instance MinMax<string>"
               "    static min a b = if a < b then a else b"

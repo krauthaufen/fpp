@@ -409,11 +409,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    | 'b' ->
                                        let tw, fw = boolWords true
                                        EIf (e, ELit (LString tw), ELit (LString fw))
-                                   | 'x' -> EApp (EUnknown "hexlower", [ e ])
-                                   | 'X' -> EApp (EUnknown "hexupper", [ e ])
-                                   | 'o' -> EApp (EUnknown "octal", [ e ])
+                                   | 'x' | 'X' | 'o' ->
+                                       let fn =
+                                           (if c = 'x' then "hexlower" elif c = 'X' then "hexupper" else "octal")
+                                           + (if k = "l" then "64" else "")
+                                       EApp (EUnknown fn, [ e ])
                                    | 'f' -> EApp (EUnknown "fixed6", [ e ])
-                                   | 'u' -> EApp (EUnknown "string#w", [ e ])
+                                   | 'u' ->
+                                       (match k with
+                                        | "l" -> EApp (EUnknown "string#l", [ e ])
+                                        | _ -> EApp (EUnknown "string#w", [ e ]))
                                    | 'A' ->
                                        (match k with
                                         | "t" -> quoted e

@@ -1,0 +1,5 @@
+# compile order is semantic: vec.fpp's exports flow into main.fpp
+name playground
+out  playground.wat
+src  vec.fpp
+src  main.fpp

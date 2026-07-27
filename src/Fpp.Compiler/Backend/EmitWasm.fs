@@ -767,6 +767,10 @@ let emit (decls : Decl list) : EmitResult =
             "(call $itobase " + unwrapI32 (recur a) + " (i32.const 16) (i32.const 1))"
         | EApp (EUnknown "octal", [ a ]) ->
             "(call $itobase " + unwrapI32 (recur a) + " (i32.const 8) (i32.const 0))"
+        | EApp (EUnknown fn, [ a ]) when fn = "hexlower64" || fn = "hexupper64" || fn = "octal64" ->
+            let base_ = if fn = "octal64" then "8" else "16"
+            let upper = if fn = "hexupper64" then "1" else "0"
+            "(call $ltobase (call $tol " + recur a + ") (i64.const " + base_ + ") (i32.const " + upper + "))"
         | EApp (EUnknown "fixed6", [ a ]) ->
             "(call $ftoa6 (call $tof " + recur a + "))"
         | EApp (EUnknown "printb", [ a ]) ->
@@ -2654,6 +2658,11 @@ TUPLE_HASH
       (if (result i32) (i32.lt_u (local.get $d) (i32.const 10))
         (then (i32.add (i32.const 48) (local.get $d)))
         (else (i32.add (select (i32.const 55) (i32.const 87) (local.get $upper)) (local.get $d))))))
+  (func $ltobase (param $n i64) (param $base i64) (param $upper i32) (result anyref)
+    (local $s (ref $str)) (local $p i32)
+    (local.set $s (array.new_default $str (i32.const 24)))
+    (local.set $p (call $xput (local.get $s) (i32.const 0) (local.get $n) (local.get $base) (local.get $upper)))
+    (call $strTake (local.get $s) (local.get $p)))
   (func $itobase (param $n i32) (param $base i32) (param $upper i32) (result anyref)
     (local $s (ref $str)) (local $p i32)
     (local.set $s (array.new_default $str (i32.const 24)))
