@@ -1302,7 +1302,10 @@ let emit (decls : Decl list) : EmitResult =
                 "(array.new_fixed $arr " + string xs.Length + " " + String.concat " " (List.map recur xs) + ")"
         | EIndex (nm, a, i) ->
             let pk = primKindOf nm
-            if nm = "string" then
+            if nm = "$ref" then
+                // a uniform reference element (tuples, functions): plain $arr
+                "(array.get $arr (ref.cast (ref $arr) " + recur a + ") " + unwrapI32 (recur i) + ")"
+            elif nm = "string" then
                 "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif pk <> "" then
                 let getOp = if pk = "h" then "array.get_u " else "array.get "
@@ -1334,7 +1337,10 @@ let emit (decls : Decl list) : EmitResult =
                 "(ref.i31 (i32.const 0))"
         | EIndexSet (nm, a, i, v) ->
             let pk = primKindOf nm
-            if pk <> "" then
+            if nm = "$ref" then
+                "(block (result anyref) (array.set $arr (ref.cast (ref $arr) " + recur a + ") "
+                + unwrapI32 (recur i) + " " + recur v + ") (ref.i31 (i32.const 0)))"
+            elif pk <> "" then
                 "(block (result anyref) (array.set " + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") "
                 + unwrapI32 (recur i) + " (call " + unboxOfKind pk + " " + recur v + ")) (ref.i31 (i32.const 0)))"
             elif isPod nm then
@@ -1378,7 +1384,9 @@ let emit (decls : Decl list) : EmitResult =
                 "(ref.i31 (i32.const 0))"
         | EArrayLen (nm, a) ->
             let pk = primKindOf nm
-            if nm = "string" then
+            if nm = "$ref" then
+                "(call $ofi (array.len (ref.cast (ref $arr) " + recur a + ")))"
+            elif nm = "string" then
                 "(call $ofi (array.len (ref.cast (ref $str) " + recur a + ")))"
             elif pk <> "" then
                 "(call $ofi (array.len (ref.cast (ref " + parrOf pk + ") " + recur a + ")))"

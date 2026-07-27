@@ -560,3 +560,79 @@ let overloadTests =
             Expect.equal out "2\n" "ref-element arrays answer Length"
         }
     ]
+
+[<Tests>]
+let enumeratorTests =
+    testList "the enumerator protocol" [
+        test "for-in is structural: any GetEnumerator/MoveNext/Current shape" {
+            let out =
+                run [ "type Counter(n : int) ="
+                      "    let mutable i = 0"
+                      "    member x.MoveNext() ="
+                      "        i <- i + 1"
+                      "        i <= n"
+                      "    member x.Current = i * 10"
+                      "type Counting(n : int) ="
+                      "    member x.GetEnumerator() = Counter(n)"
+                      "let go ="
+                      "    for v in Counting(3) do"
+                      "        print v" ]
+            Expect.equal out "10\n20\n30\n" "no interface required, as in F#"
+        }
+        test "a seq parameter enumerates through the vtable" {
+            let out =
+                run [ "type RngEn(n : int) ="
+                      "    let mutable i = 0"
+                      "    interface IEnumerator<int> with"
+                      "        member e.MoveNext() ="
+                      "            i <- i + 1"
+                      "            i <= n"
+                      "        member e.Current = i * 7"
+                      "type Rng(n : int) ="
+                      "    interface IEnumerable<int> with"
+                      "        member x.GetEnumerator() = RngEn(n) :> IEnumerator<int>"
+                      "let total (xs : seq<int>) ="
+                      "    let mutable s = 0"
+                      "    for v in xs do"
+                      "        s <- s + v"
+                      "    s"
+                      "let a = print (total (Rng 3 :> IEnumerable<int>))" ]
+            Expect.equal out "42\n" "the concrete type is unknown at the loop"
+        }
+        test "for-in walks lists, destructuring included" {
+            let out =
+                run [ "let xs = [ 3; 4; 5 ]"
+                      "let go ="
+                      "    for x in xs do print x"
+                      "let pairs = [ (1, 10); (2, 20) ]"
+                      "let go2 ="
+                      "    for (a, b) in pairs do print (a * b)" ]
+            Expect.equal out "3\n4\n5\n10\n40\n" "a cons walk, and the binder may destructure"
+        }
+        test "for-in destructures tuple-element arrays" {
+            let out =
+                run [ "let xs : (int * int)[] = [| (2, 30); (4, 50) |]"
+                      "let go ="
+                      "    for (a, b) in xs do print (a + b)" ]
+            Expect.equal out "32\n54\n" "a uniform-reference element array indexes plainly"
+        }
+        test "new-expressions have the type they construct" {
+            // `new X<T>(args)` typed as a fresh variable, which left every
+            // new-built enumerator opaque to the protocol
+            let out =
+                run [ "type Box<'a>(v : 'a) ="
+                      "    member x.V = v"
+                      "let b = new Box<int>(41)"
+                      "let a = print (b.V + 1)" ]
+            Expect.equal out "42\n" "new X(...) IS X(...)"
+        }
+        test "a member declared LATER in the class binds from an earlier body" {
+            let out =
+                run [ "type T() ="
+                      "    member x.UseIt() = x.Later() + 1"
+                      "    member x.Later() = 41"
+                      "let t = T()"
+                      "let a = print (t.UseIt())" ]
+            Expect.equal out "42\n" "resolution waits for the fields table to be complete"
+        }
+    ]

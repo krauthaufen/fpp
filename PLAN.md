@@ -122,12 +122,34 @@ all member overloading. The split at first measurement:
 - [x] a nested local no longer exports over a module-level binding of the
       same name; qualified expression spines prefer a TYPE over a module
       sharing its full name (constructor calls through `Impl.MapLinked`)
-- [ ] the enumerator protocol so `for e in <seq>` lowers at all: `seq`/
-      `IEnumerable`/`IEnumerator` as prelude interfaces, arrays and lists
-      implementing them, `for-in` desugaring to GetEnumerator/MoveNext.
-      NOW THE WHOLE REMAINDER: after overloading landed, the acceptance
-      file is 1 diagnostic (Set widening to seq) + 11 for-in/for-loop
-      lowering notes, nothing else
+- [x] the enumerator protocol. `for x in e` is STRUCTURAL, as in F#: any
+      GetEnumerator/MoveNext/Current shape enumerates, no interface needed.
+      The desugar creates three member accesses at SYNTHETIC offsets
+      (30/40/50M + the loop's own), parks them with everything else, and the
+      lowering derives the same offsets and reads what they bound to —
+      interface members dispatch through the vtable, concrete ones call the
+      lifted function. `IEnumerator`/`IEnumerable` are prelude interfaces
+      and `seq` aliases IEnumerable, so a seq parameter enumerates without
+      knowing the concrete type. Lists walk their cons cells; arrays keep
+      the indexed loop; both accept destructuring binders. Fixed on the way:
+      `new X<T>(args)` typed as a fresh variable (every new-built enumerator
+      was opaque), and "no such member" during the MAIN pass silently
+      unbound members declared later in the same class — the fields table is
+      only complete once the retries run
+- [x] arrays of TUPLES (a uniform-reference element) index as plain $arr —
+      previously unnameable, so `for (k, v) in pairs` over an array of
+      pairs could not lower
+- [x] ofSet/toSet dropped by the port script: they bridge to FSharp.Core's
+      Set, a type that lives outside the file being ported
+
+### ACCEPTANCE MILESTONE: the whole file front-ends clean
+`reference-HashCollections.ported.fs.txt` (4130 lines): **0 diagnostics,
+0 lowering notes**. First error line 24 at the start; the journey ran
+24 -> 184 -> 530 -> 855 -> 3168 -> clean. What remains is the EMIT phase:
+61 errors, all stdlib surface (`sprintf`, `String.concat`,
+`Object.ReferenceEquals`) plus array-write specialization in generic
+bodies — "compiling and running" now means the backend tail, not the
+language.
 - [ ] then the genuine stdlib: `Seq.*`, `sprintf`, `String.concat`,
       `Array.zeroCreate`, `KeyValuePair`
 

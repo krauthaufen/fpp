@@ -811,24 +811,79 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
                                 ESeq [ lowerExpr (GNode body)
                                        EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
-                      | PVar (iv, isch), coll ->
-                          // for x in arr do body  ==>  indexed while loop
-                          let nm =
-                              match dictTryFind arrKinds (offsetOf range) with
-                              | Some x -> x
-                              | None -> ""
-                          if nm = "" then note (offsetOf n) "for-in (unknown element type)"
-                          else
-                              let av = { Path = iv.Path; Offset = iv.Offset + 2000000; Name = "_arr" }
-                              let ix = { Path = iv.Path; Offset = iv.Offset + 3000000; Name = "_ix" }
-                              let ish = mono (TCon ("int", []))
-                              ELet (false, av, isch, coll,
-                                ELet (false, ix, ish, ELit (LInt "0"),
-                                  EWhile (EPrim ("<", [ EVar (ix, ish); EArrayLen (nm, EVar (av, isch)) ]),
-                                    ELet (false, iv, isch, EIndex (nm, EVar (av, isch), EVar (ix, ish)),
-                                      ESeq [ lowerExpr (GNode body)
-                                             EAssign (ix, EPrim ("+", [ EVar (ix, ish); ELit (LInt "1") ])) ]))))
-                      | _, _ -> note (offsetOf n) "for loop (non-range)")
+                      | pat, coll when (dictTryFind arrKinds (offsetOf range)) = Some "list" ->
+                          // for x in xs (a LIST): a cons walk. The binder may
+                          // destructure, so the element binds through the
+                          // cons pattern itself.
+                          let anon = mono (TCon ("?", []))
+                          let restV = { Path = path; Offset = offsetOf n + 5000000; Name = "_rest" }
+                          let tailV = { Path = path; Offset = offsetOf n + 6000000; Name = "_tail" }
+                          let notNull (e : Expr) =
+                              EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+                          ELet (false, restV, anon, coll,
+                            EWhile (notNull (EVar (restV, anon)),
+                              EMatch (EVar (restV, anon),
+                                [ PCons (pat, PVar (tailV, anon)), None,
+                                    ESeq [ lowerExpr (GNode body)
+                                           EAssign (restV, EVar (tailV, anon)) ]
+                                  PWild, None, ELit LUnit ])))
+                      | pat, coll when
+                            (dictTryFind arrKinds (offsetOf range)).IsSome
+                            // arrKinds also holds plain application results,
+                            // so the ARRAY path only applies when inference
+                            // did NOT bind the protocol's synthetic access
+                            && (dictTryFind memberSites (30000000 + offsetOf n)).IsNone ->
+                          // for x in arr do body  ==>  indexed while loop;
+                          // a destructuring binder matches the element
+                          let nm = (dictTryFind arrKinds (offsetOf range)).Value
+                          let anon = mono (TCon ("?", []))
+                          let av = { Path = path; Offset = offsetOf n + 2000000; Name = "_arr" }
+                          let ix = { Path = path; Offset = offsetOf n + 3000000; Name = "_ix" }
+                          let ish = mono (TCon ("int", []))
+                          let elem = EIndex (nm, EVar (av, anon), EVar (ix, ish))
+                          let inner =
+                              match pat with
+                              | PVar (iv, isch) -> ELet (false, iv, isch, elem, lowerExpr (GNode body))
+                              | p -> EMatch (elem, [ p, None, lowerExpr (GNode body) ])
+                          ELet (false, av, anon, coll,
+                            ELet (false, ix, ish, ELit (LInt "0"),
+                              EWhile (EPrim ("<", [ EVar (ix, ish); EArrayLen (nm, EVar (av, anon)) ]),
+                                ESeq [ inner
+                                       EAssign (ix, EPrim ("+", [ EVar (ix, ish); ELit (LInt "1") ])) ])))
+                      | pat, coll ->
+                          // the enumerator protocol. Inference bound three
+                          // member accesses at synthetic offsets derived from
+                          // the loop's first token; each is either an
+                          // interface method (vtable dispatch) or a concrete
+                          // member (a lifted function).
+                          let fo = offsetOf n
+                          let synth (txt : string) (base_ : int) : Token =
+                              { Kind = Ident; Text = txt; Leading = []; Trailing = []; Offset = base_ + fo }
+                          let call (t : Token) (recv : Expr) (withUnit : bool) : Expr option =
+                              if (memberAt t).IsNone then None
+                              else
+                                  let owner, d = (memberAt t).Value
+                                  let args = if withUnit then [ ELit LUnit ] else []
+                                  match dictTryFind ifaces owner with
+                                  | Some ms when ms |> List.exists (fun (m, _) -> m = t.Text) ->
+                                      Some (EIfaceCall (owner, t.Text, recv, args))
+                                  | _ -> Some (EApp (EVar (varIdOf d, schemeOf d), recv :: args))
+                          let anon = mono (TCon ("?", []))
+                          let enV = { Path = path; Offset = fo + 4000000; Name = "_en" }
+                          (match call (synth "GetEnumerator" 30000000) (lowerExpr (GNode range)) true,
+                                 call (synth "MoveNext" 40000000) (EVar (enV, anon)) true,
+                                 call (synth "Current" 50000000) (EVar (enV, anon)) false with
+                           | Some g, Some m, Some c ->
+                               let inner =
+                                   match pat with
+                                   | PVar (iv, isch) ->
+                                       ELet (false, iv, isch, c, lowerExpr (GNode body))
+                                   | p ->
+                                       // tuple and struct-tuple binders
+                                       // destructure the current element
+                                       EMatch (c, [ p, None, lowerExpr (GNode body) ])
+                               ELet (false, enV, anon, g, EWhile (m, inner))
+                           | _ -> note (offsetOf n) "for-in (no GetEnumerator on the source)"))
                  | _ -> note (offsetOf n) "for loop shape")
             | WhileExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

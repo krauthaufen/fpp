@@ -486,6 +486,16 @@ instance Rem<~T~, ~T~>
 
     let source =
         String.concat "\n" (numericClasses @ numericInstances @ [
+            // the enumerator protocol. `for x in e` is STRUCTURAL, as in
+            // F# — any GetEnumerator/MoveNext/Current shape enumerates — and
+            // these interfaces are what a `seq<'a>` parameter dispatches
+            // through when the concrete type is unknown.
+            "type IEnumerator<'a> ="
+            "    abstract member MoveNext : unit -> bool"
+            "    abstract member Current : 'a"
+            "type IEnumerable<'a> ="
+            "    abstract member GetEnumerator : unit -> IEnumerator<'a>"
+            "type seq<'a> = IEnumerable<'a>"
             "type Option<'a> ="
             "    | None"
             "    | Some of 'a"

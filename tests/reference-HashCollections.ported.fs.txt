@@ -3822,7 +3822,6 @@ module HashSet =
     let inline ofSeq (elements : seq<'T>) = HashSet.OfSeq elements
     /// Creates a set with all entries from the Set.
     /// `O(N)`
-    let inline ofSet (set: Set<'T>) = HashSet.OfSeq set
     /// Creates a set with all entries from the list.
     /// `O(N)`
     let inline ofList (elements : list<'T>) = HashSet.OfList elements
@@ -3893,9 +3892,6 @@ module HashSet =
     let inline toArray (set : HashSet<'K>) = set.ToArray()
     /// Creates a Set holding all entries contained in the HashSet.
     /// `O(N * log N)`
-    let inline toSet (set: HashSet<'T>) =
-        set |> Set.ofSeq
-
     /// Creates a new set containing all elements from set1 and set2.
     /// `O(N + M)`  
     let inline union (set1 : HashSet<'T>) (set2 : HashSet<'T>) = set1.UnionWith set2

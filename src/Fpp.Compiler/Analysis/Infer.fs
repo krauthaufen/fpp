@@ -390,7 +390,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
                      true
                  else true
-             | None -> true)   // receiver known, no such member: retrying cannot help
+             | None ->
+                 // "no such member" is only meaningful once the FIELDS table
+                 // is complete — during the main pass a member declared later
+                 // in the same class has not registered yet, and giving up
+                 // here silently unbound `for e in x` over self. Stay parked;
+                 // the forced pass concedes.
+                 force)
         | _ -> false
 
     let nodesOf (n : GreenNode) : GreenNode list =
@@ -1185,6 +1191,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match inner with
                       | [ i ] -> i
                       | _ -> tInt)
+                 | Some t when t.Text = "new" ->
+                     // `new X(args)` IS `X(args)`; the inner application was
+                     // typed above, and dropping it for a fresh var left every
+                     // `new`-built enumerator with an unknown type
+                     (match inner with
+                      | [ i ] -> i
+                      | _ -> st.Fresh ())
                  | Some t when t.Text = "-" || t.Text = "+" ->
                      (match inner with
                       | [ i ] ->
@@ -1530,6 +1543,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | None -> ())
                           (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
                            | Some ip -> unify (patType fvars ip) e |> ignore
+                           | None -> ())
+                      | TCon ("list", [ e ]) ->
+                          // a cons walk, not the protocol: the marker is the
+                          // recorded element type, exactly as for arrays
+                          (match Green.tokens (GNode coll) |> List.tryHead with
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, ct)
+                           | None -> ())
+                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                           | Some ip -> unify (patType fvars ip) e |> ignore
+                           | None -> ())
+                      | TCon (tn, _) when tn <> "string" ->
+                          // the enumerator protocol: three member accesses
+                          // that have no tokens of their own, parked at
+                          // SYNTHETIC offsets derived from the loop's — the
+                          // lowering derives the same three and reads what
+                          // they bound to
+                          ignore tn
+                          let fo =
+                              match Green.tokens (GNode n) |> List.tryHead with
+                              | Some t -> t.Offset
+                              | None -> 0
+                          let enTy = st.Fresh ()
+                          let gTy = st.Fresh ()
+                          if not (tryResolveDot false (30000000 + fo) ct gTy "GetEnumerator") then
+                              vecAdd pendingDots (30000000 + fo, ct, gTy, "GetEnumerator")
+                          unify gTy (TFun (tUnit, enTy)) |> ignore
+                          let mTy = st.Fresh ()
+                          if not (tryResolveDot false (40000000 + fo) enTy mTy "MoveNext") then
+                              vecAdd pendingDots (40000000 + fo, enTy, mTy, "MoveNext")
+                          unify mTy (TFun (tUnit, tBool)) |> ignore
+                          let cTy = st.Fresh ()
+                          if not (tryResolveDot false (50000000 + fo) enTy cTy "Current") then
+                              vecAdd pendingDots (50000000 + fo, enTy, cTy, "Current")
+                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                           | Some ip -> unify (patType fvars ip) cTy |> ignore
                            | None -> ())
                       | _ -> ())
                  | _ -> ())
@@ -2374,7 +2422,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // element type is the enclosing binding's type variable:
                 // name it so stamping substitutes the real element type
                 | TVar v -> Some ("#" + string v.Id)
-                | _ -> None
+                // tuples and functions are uniform references: the array is
+                // a plain anyref array whatever they are
+                | _ -> Some "$ref"
             match prune ty with
             | TCon ("array", [ e ]) -> nameOf e |> Option.map (fun n -> off, n)
             | TCon (_, _) -> Some (off, instName ty)

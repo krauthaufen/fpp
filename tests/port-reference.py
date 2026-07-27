@@ -103,5 +103,27 @@ def pick_branch(src):
             out.append(line)
     return "\n".join(out)
 
+def drop_fsharp_core_set_bridges(src):
+    """ofSet/toSet convert to and from FSharp.Core's Set — a type the port
+    cannot carry (it lives in FSharp.Core, not in this file). Drop the two
+    bridge functions, comments included."""
+    out = []
+    skip = False
+    for line in src.split("\n"):
+        t = line.strip()
+        if t.startswith("let inline ofSet") or t.startswith("let inline toSet"):
+            skip = True
+            # their doc comments directly above are already emitted; harmless
+            continue
+        if skip:
+            # a bridge body is short and more-indented; the next let/member
+            # at the same or lower indent ends it
+            if t == "" or line.startswith(" " * 8):
+                continue
+            skip = False
+        out.append(line)
+    return "\n".join(out)
+
 src = open(sys.argv[1]).read()
-open(sys.argv[2], "w").write(strip_attrs(port_closures(pick_branch(src))))
+open(sys.argv[2], "w").write(
+    drop_fsharp_core_set_bridges(strip_attrs(port_closures(pick_branch(src)))))
