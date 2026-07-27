@@ -23,6 +23,7 @@
     <Compile Include="PluginTests.fs" />
     <Compile Include="LinkTests.fs" />
     <Compile Include="FfiTests.fs" />
+    <Compile Include="BootstrapTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

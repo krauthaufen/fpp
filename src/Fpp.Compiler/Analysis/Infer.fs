@@ -85,6 +85,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let opKindsRaw = vecNew<int * Type> ()
     let arrKindsRaw = vecNew<int * Type> ()
     let instRaw = vecNew<int * Type list> ()
+    // index expressions whose RECEIVER is an array: `a.[i] <- v` may tie the
+    // value to the element type, which a member setter's shape may not
+    let arrIndexTargets = dictNew<int, bool> ()
     let defSchemes = dictNew<int, Scheme> ()
     let defTypes = vecNew<int * int * Type> ()
 
@@ -1345,7 +1348,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // to a SETTER shape the dot machinery still
                           // mistypes, and unifying through that poisons the
                           // value's type far from the assignment
-                          if op.Text = "<-" && l.NodeKind = IdentExpr then
+                          // an ARRAY index target is safe for the same reason
+                          // a variable is: the target type IS the element
+                          // type, so `a.[i] <- x` is what tells a generic
+                          // element what it holds
+                          let isArrayIndex =
+                              l.NodeKind = DotExpr
+                              && (nodesOf l |> List.exists (fun m -> m.NodeKind = ListExpr))
+                              && (match Green.tokens (GNode l) |> List.tryHead with
+                                  | Some t -> (dictTryFind arrIndexTargets t.Offset).IsSome
+                                  | None -> false)
+                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex) then
                               unifyArg op.Offset lt rt
                           tUnit
                       | _ -> st.Fresh ())
@@ -1641,7 +1654,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match lhsTy |> Option.map prune with
                  | Some (TCon ("array", [ e ])) ->
                      (match Green.tokens (GNode n) |> List.tryHead with
-                      | Some t -> vecAdd arrKindsRaw (t.Offset, e)
+                      | Some t ->
+                          vecAdd arrKindsRaw (t.Offset, e)
+                          dictSet arrIndexTargets t.Offset true
                       | None -> ())
                      e
                  | Some (TCon ("string", [])) ->

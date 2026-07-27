@@ -637,6 +637,10 @@ type KeyValuePair<'K, 'V>(key : 'K, value : 'V) =
     member x.Value = value
 // ---- String: the F# String module ----
 module String =
+    extern let strsub : string -> int -> int -> string
+    /// `sub s start count` — the slice, copied. A primitive because building
+    /// it out of concatenation is quadratic, and the lexer lives on it.
+    let sub (s : string) (start : int) (count : int) : string = strsub s start count
     let length (s : string) = s.Length
     let concat (sep : string) (strings : seq<string>) =
         let mutable acc = ""
@@ -1490,3 +1494,97 @@ module Seq =
     let sort (xs : seq<'a>) : seq<'a> when Ordered<'a> = sortWith compare xs
     let sortBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
+
+// ---- Set: the F# Set module ----
+// Comparison-ordered like F#'s, but backed by a sorted array rather than a
+// tree: membership is a binary search, and the structure-sharing a tree buys
+// on `add`/`remove` is traded for a copy. Persistent either way — a Set value
+// is never mutated once built.
+type Set<'a> = { SetItems : 'a[] }
+
+module Set =
+    /// index of `x`, or -(insertion point) - 1 when absent
+    let private search (s : Set<'a>) (x : 'a) : int when Ordered<'a> =
+        let mutable lo = 0
+        let mutable hi = s.SetItems.Length - 1
+        let mutable found = -1
+        while found < 0 && lo <= hi do
+            let mid = lo + (hi - lo) / 2
+            let c = compare s.SetItems.[mid] x
+            if c = 0 then found <- mid
+            elif c < 0 then lo <- mid + 1
+            else hi <- mid - 1
+        if found >= 0 then found else -lo - 1
+
+    let count (s : Set<'a>) : int = s.SetItems.Length
+    let isEmpty (s : Set<'a>) : bool = s.SetItems.Length = 0
+    let toArray (s : Set<'a>) : 'a[] = Array.copy s.SetItems
+    let toList (s : Set<'a>) : 'a list = Array.toList s.SetItems
+    let toSeq (s : Set<'a>) : seq<'a> = Array.toSeq (Array.copy s.SetItems)
+    let contains (x : 'a) (s : Set<'a>) : bool when Ordered<'a> = search s x >= 0
+
+    let ofArray (xs : 'a[]) : Set<'a> when Ordered<'a> =
+        let sorted = Array.sort xs
+        let items : 'a[] = Array.zeroCreate sorted.Length
+        let mutable n = 0
+        let mutable i = 0
+        while i < sorted.Length do
+            if n = 0 || compare items.[n - 1] sorted.[i] <> 0 then
+                items.[n] <- sorted.[i]
+                n <- n + 1
+            i <- i + 1
+        { SetItems = Array.sub items 0 n }
+
+    let ofList (xs : 'a list) : Set<'a> when Ordered<'a> = ofArray (List.toArray xs)
+    let ofSeq (xs : seq<'a>) : Set<'a> when Ordered<'a> = ofArray (Array.ofSeq xs)
+    let singleton (x : 'a) : Set<'a> = { SetItems = Array.create 1 x }
+    let empty (u : unit) : Set<'a> = { SetItems = Array.zeroCreate 0 }
+
+    let add (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        let at = search s x
+        if at >= 0 then s
+        else
+            let ip = -at - 1
+            let items : 'a[] = Array.zeroCreate (s.SetItems.Length + 1)
+            let mutable i = 0
+            while i < ip do
+                items.[i] <- s.SetItems.[i]
+                i <- i + 1
+            items.[ip] <- x
+            while i < s.SetItems.Length do
+                items.[i + 1] <- s.SetItems.[i]
+                i <- i + 1
+            { SetItems = items }
+
+    let remove (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        let at = search s x
+        if at < 0 then s
+        else
+            let items : 'a[] = Array.zeroCreate (s.SetItems.Length - 1)
+            let mutable i = 0
+            while i < at do
+                items.[i] <- s.SetItems.[i]
+                i <- i + 1
+            while i < s.SetItems.Length - 1 do
+                items.[i] <- s.SetItems.[i + 1]
+                i <- i + 1
+            { SetItems = items }
+
+    let filter (p : 'a -> bool) (s : Set<'a>) : Set<'a> = { SetItems = Array.filter p s.SetItems }
+    let exists (p : 'a -> bool) (s : Set<'a>) : bool = Array.exists p s.SetItems
+    let forall (p : 'a -> bool) (s : Set<'a>) : bool = Array.forall p s.SetItems
+    let iter (f : 'a -> unit) (s : Set<'a>) : unit = Array.iter f s.SetItems
+    let fold (f : 'b -> 'a -> 'b) (state : 'b) (s : Set<'a>) : 'b = Array.fold f state s.SetItems
+    let map (f : 'a -> 'b) (s : Set<'a>) : Set<'b> when Ordered<'b> = ofArray (Array.map f s.SetItems)
+    let minElement (s : Set<'a>) : 'a = s.SetItems.[0]
+    let maxElement (s : Set<'a>) : 'a = s.SetItems.[s.SetItems.Length - 1]
+
+    let union (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        ofArray (Array.append a.SetItems b.SetItems)
+    let difference (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        { SetItems = Array.filter (fun x -> search b x < 0) a.SetItems }
+    let intersect (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        { SetItems = Array.filter (fun x -> search b x >= 0) a.SetItems }
+    let isSubset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
+        Array.forall (fun x -> search b x >= 0) a.SetItems
+    let isSuperset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> = isSubset b a

@@ -591,6 +591,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayUnpin (nm, pa)
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
+                          // the string slice: a primitive, not an FFI import
+                          EApp (EUnknown "strsub", [ ss; sst; sln ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ cn ] when bv.Name = "zeroCreate" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           // the zero value is per-representation, so the

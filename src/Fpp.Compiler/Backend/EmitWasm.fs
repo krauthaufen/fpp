@@ -675,6 +675,9 @@ let emit (decls : Decl list) : EmitResult =
             "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "length", _), [ a ]) ->
             "(call $lenv " + recur a + ")"
+        | EApp (EUnknown "strsub", [ s; start; len ]) ->
+            "(call $strsub (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur start)
+            + " " + unwrapI32 (recur len) + ")"
         | EApp (EUnknown "memLoadF64", [ a ]) ->
             "(call $off (f64.load (call $toi " + recur a + ")))"
         | EApp (EUnknown "memStoreF32", [ a; v ]) ->
@@ -2494,6 +2497,15 @@ TUPLE_HASH
         (br_if $done (i32.lt_s (local.get $i) (local.get $neg)))
         (br $go)))
     (local.get $s))
+  (func $strsub (param $s (ref $str)) (param $start i32) (param $len i32) (result anyref)
+    (local $r (ref $str)) (local $i i32)
+    (local.set $r (array.new_default $str (local.get $len)))
+    (block $d (loop $l
+      (br_if $d (i32.ge_u (local.get $i) (local.get $len)))
+      (array.set $str (local.get $r) (local.get $i)
+        (array.get_u $str (local.get $s) (i32.add (local.get $start) (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))
+    (local.get $r))
   (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
     (local $r (ref $str)) (local $i i32) (local $la i32)
     (local.set $la (array.len (local.get $a)))

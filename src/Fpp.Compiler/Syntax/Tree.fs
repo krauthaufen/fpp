@@ -139,10 +139,11 @@ module Red =
     /// Children with their absolute positions (full-width, trivia included).
     let children (nd : SyntaxNode) : (Green * int) list =
         let mutable pos = nd.Position
-        [ for c in nd.Green.Children do
-            let p = pos
+        let acc = vecNew<Green * int> ()
+        for c in nd.Green.Children do
+            vecAdd acc (c, pos)
             pos <- pos + Green.width c
-            yield c, p ]
+        vecToList acc
 
     let childNodes (nd : SyntaxNode) : SyntaxNode list =
         children nd

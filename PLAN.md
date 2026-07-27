@@ -774,6 +774,54 @@ compiles the 4130-line reference file plus usage and diffs wasmtime's
 output. Suite 354 green. Still parked: `HashMap [ (1, "a") ]` seq-ctor,
 top-level `let x, y = ...` destructure.
 
+### Stage 0 lands: the lexer compiles itself and runs
+The harness exists and the first prefix is green. `stdlib/bootstrap.fpp` is
+the F++ half of the bootstrap seam — the same surface `src/Fpp.Compiler/
+Prelude.fs` gives .NET (Vec, Dict, the string and char helpers), written in
+F++ over arrays: Vec is a doubling array, Dict an open-addressed index over
+insertion-ordered entry arrays, so `dictPairs` is deterministic. The prefix
+substitutes it for `Prelude.fs` and adds `Tokens.fs`, `Tree.fs`, `Lexer.fs`;
+all four emit with zero errors and the module runs under wasmtime.
+
+Emission alone is a WEAK gate — dead-code elimination drops what nobody
+calls, so an unused file "passes" having emitted almost nothing. The gate
+that counts is a driver: `tests/bootstrap/lexdrive.fpp` lexes a source
+string with the emitted lexer and prints kinds, texts, offsets, trivia
+counts and the round-trip witness; the Expecto test compares that output
+against the SAME program run by the dotnet-hosted lexer. They agree.
+`tests/bootstrap/preludedrive.fpp` does the same for the seam itself.
+`tests/bootstrap/frontier.fsx` grows the prefix file by file and reports
+where it stops.
+
+Four gaps closed on the way:
+- **`a.[i] <- v` never constrained the element type.** Assignment only
+  unified through a plain variable target, deliberately, because a dot
+  target can be a member setter whose shape would poison the value's type.
+  An ARRAY index is not that case: the target type IS the element type. The
+  index inference now marks array-receiver sites, and assignment ties them.
+  Without it every generic container written in F++ (`v.Items.[i] <- x`)
+  emitted "array write needs a statically known element type".
+- **No string slice.** `String.sub` is a primitive (`$strsub`, one
+  `array.copy`-style loop) rather than a library function, because building
+  a slice out of concatenation is quadratic and the lexer lives on it.
+- **No `Set`.** The prelude has one now: comparison-ordered like F#'s, but a
+  sorted array with binary-search membership instead of a tree — persistent
+  either way, `add`/`remove` copy. The compiler only ever asks it for
+  `ofList` and `contains`.
+- **List comprehensions do not lower** (7 sites compiler-wide). `Tree.fs`'s
+  `Red.children` was rewritten into the explicit accumulation it desugars
+  to; the remaining six are in `Link.fs` and `EmitWasm.fs`. Lowering
+  comprehensions properly — `for`/`if`/`yield` into a Vec accumulation — is
+  the better fix and is still open.
+
+**Where the frontier stops: `Analysis/Types.fs`.** It reaches past the seam
+straight into `System.Collections.Generic` — `HashSet`, `Dictionary`, `List`
+and an `IEqualityComparer` object expression over `HashIdentity.Reference`
+for cycle detection. Those must route through `Prelude` like everything
+else, which means the seam grows a reference-identity set and map (`refEq`
+already exists as a primitive on the F++ side, `HashIdentity.Reference` on
+the .NET side). `Infer.fs` and `Format.fs` have the same violation.
+
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they
 do not run the result. The next step is a harness that takes the
