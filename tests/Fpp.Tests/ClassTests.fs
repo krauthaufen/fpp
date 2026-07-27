@@ -319,6 +319,34 @@ let userInstanceTests =
             let out = run (v2d @ [ "let z : V2d = Zero"; "let a = print z.X"; "let b = print (z + One).X" ])
             Expect.equal out "0\n1\n" "a class member is a name for what the instance provides"
         }
+        test "min and max are componentwise on a vector, with no total order" {
+            // the point of keeping MinMax off Ordered: a vector has a
+            // componentwise minimum but no `compare`, and asking for one
+            // would have been a lie
+            let out =
+                run (v2d @
+                     [ "instance MinMax<V2d>"
+                       "    static min a b = { X = min a.X b.X; Y = min a.Y b.Y }"
+                       "    static max a b = { X = max a.X b.X; Y = max a.Y b.Y }"
+                       "let p = { X = 1.0; Y = 5.0 }"
+                       "let q = { X = 4.0; Y = 2.0 }"
+                       "let a = print (min p q).X"
+                       "let b = print (min p q).Y"
+                       "let c = print (max p q).X"
+                       "let d = print (max p q).Y" ])
+            Expect.equal out "1\n2\n4\n5\n" "each component taken separately"
+        }
+        test "generic code over MinMax alone runs at both a scalar and a vector" {
+            let out =
+                run (v2d @
+                     [ "instance MinMax<V2d>"
+                       "    static min a b = { X = min a.X b.X; Y = min a.Y b.Y }"
+                       "    static max a b = { X = max a.X b.X; Y = max a.Y b.Y }"
+                       "let clamp (lo : 'a) (hi : 'a) (v : 'a) : 'a when MinMax<'a> = max lo (min hi v)"
+                       "let a = print (clamp 0 10 42)"
+                       "let b = print (clamp { X = 1.0; Y = 5.0 } { X = 4.0; Y = 2.0 } { X = 9.0; Y = 9.0 }).X" ])
+            Expect.equal out "10\n4\n" "one body, a scalar instance and a vector one"
+        }
         test "an instance must implement its class" {
             let msgs =
                 diagnostics
