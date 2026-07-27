@@ -159,8 +159,42 @@ Design: DESIGN.md ("Numeric classes and operators"). Decided:
 - instances are free-standing (Haskell-style); `static member (+)` is sugar
   for the homogeneous case
 - one operator symbol maps to exactly one class
-Open: `static member (+)` in member position needs parser support — the same
-work serves user-defined operators and instance declarations.
+**Built.** The numeric tower is real and runs. What landed:
+- [x] `class` / `instance` declarations, operator member names (`(+)` fuses
+      into one identifier token, and the lexer carves `(*)` out of the
+      block-comment rule as F# does), `when` constraints on classes,
+      instances and `let` bindings
+- [x] a class member IS a constrained scheme — so associated types never
+      enter `Type`, and unification was not touched at all. The solver is a
+      store of wanted constraints run to fixpoint next to the existing HM
+- [x] one-way instance matching, improvement when exactly one candidate
+      survives (including on the ASSOCIATED TYPE, which is what keeps
+      `a + b + 1` at `int -> int -> int`), superclass entailment from a
+      declared `when`, numeric defaulting to int
+- [x] Add/Sub/Mul/Div/Rem plus Num/Fractional/Integral with Zero/One, and
+      an instance of each for int, int64, uint32, float, float32 (`+` for
+      string). Primitive instances declare no bodies: the backend emits the
+      machine instruction, which is the design's "the instance is known
+      statically and inlined" spelled out
+- [x] user instances with bodies, homogeneous and heterogeneous
+      (`Mul<float, V2d>`) — an instance member is an ordinary top-level
+      function
+- [x] a body left generic over its operand type is STAMPED per
+      instantiation, reusing the layout-dependent machinery. This fixed a
+      real bug: `let add a b = a + b` used at float emitted `i32.add` and
+      trapped
+Open:
+- [ ] the operator-notation sugar (`'a + 'b` for `Add<'a,'b>.Result`) —
+      contexts are inferred and stored, but printed nominally
+- [ ] constraint-set simplification (dedup, drop superclass-entailed) before
+      display
+- [ ] the orphan rule and the coherence check are not enforced; two exact
+      matches currently refuse to choose rather than being rejected at
+      declaration
+- [ ] the decreasing-instance check for termination
+- [ ] a heterogeneous instance reached from inside a generic body: the
+      stamped operator carries one operand type, so only the homogeneous
+      case resolves there
 
 ### Numeric tower
 - [x] int, int64, float, float32, uint32: literals, arithmetic, comparison,

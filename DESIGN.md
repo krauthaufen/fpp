@@ -427,6 +427,46 @@ already resolved statically by inference and emitted as machine
 instructions; under the class formulation that is not a special case but
 the instance being known statically and inlined.
 
+**What the implementation settled.** The tower above is built. Three things
+were decided by writing it rather than by the design, and they belong here:
+
+*A class member is an ordinary constrained scheme.* `(*)` in
+`class Mul<'a,'b>` has type `'a -> 'b -> 'r` with the context
+`Mul<'a,'b> with Result = 'r`. An associated type therefore never enters
+`Type` as a projection — it is a variable the constraint ties down. That is
+what let the whole layer land without touching unification: inference stays
+the first-order HM it already was, plus a store of wanted constraints
+solved to fixpoint.
+
+*Improvement runs from the result too.* Selection considers the
+associated-type bindings the use site already knows, not only the operand
+types. `a + b + 1` is `int -> int -> int` because only `Add<int,int>` has
+`Result = int` — without that rule it would infer
+`'a -> 'b -> int   when Add<'a,'b> = int`, which is correct, general, and
+useless to read. The rule is the same "exactly one candidate survives, so
+committing is forced" test, applied to one more column.
+
+*Numeric defaulting stays.* A constraint nothing in the program ever pins
+down resolves at `int`, as in F#. `Zero + One` has to mean something.
+
+*A generic body is stamped per instantiation.* A function left generic over
+an operand type is monomorphized exactly as a layout-dependent one is — the
+operator resolves in the specialized copy, so it emits the right machine
+instruction rather than the integer one. This was not a new mechanism:
+"cannot be shared across instantiations" already had a name here.
+
+*A primitive instance has no bodies.* `instance Add<int,int>` binds its
+associated type and stops; the backend emits the operation. Only the
+prelude may declare an instance that way — anywhere else, a missing member
+is an error. So `1.5 % 2.0` is a missing `Rem<float,float>` instance
+(wasm has no float remainder) rather than a backend failure, which is where
+that error belongs.
+
+One syntactic concession: in a `let`, `when C<'a> = 'a` is not accepted,
+because the `=` would race the binding's own. `with Result = 'a` is
+unambiguous and works everywhere; the shorthand is for class and instance
+declarations, where nothing competes for the token.
+
 ## Identity: hashing and equality on every type
 
 Every value can be hashed and compared. Today that is a runtime walk
