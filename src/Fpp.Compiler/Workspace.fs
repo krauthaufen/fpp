@@ -224,7 +224,9 @@ type ProjectResults =
       /// derived class -> (its own type params, its base type), project-wide
       Bases : Fpp.Prelude.Dict<string, Analysis.Types.Var list * Analysis.Types.Type>
       /// "TypeName.MemberName" -> definition, project-wide
-      Members : Fpp.Prelude.Dict<string, Analysis.Resolve.Definition> }
+      Members : Fpp.Prelude.Dict<string, Analysis.Resolve.Definition>
+      /// classes and their instances, project-wide
+      Classes : Analysis.Classes.Tables }
 
 type Workspace() =
     let db = Db()
@@ -340,7 +342,8 @@ type Workspace() =
                          | None -> ())
                         dictSet impls n (cimpls |> List.map fst)
                     | _ -> ()
-            { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases; Members = members })
+            { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
+              Members = members; Classes = classes })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with
@@ -432,7 +435,19 @@ type Workspace() =
                     | Fpp.Core.Ir.DRecord (n, _, _, true) -> Some n
                     | _ -> None)
             let isStruct (n : string) = List.contains n structNames
-            let mono0, monoErrs = Fpp.Core.Link.monomorphize isStruct program
+            // an instance member is the operator's implementation once
+            // stamping has made the operand type concrete
+            let instanceFns = dictNew<string, Fpp.Core.Ir.VarId> ()
+            for cls, insts in dictPairs r.Classes.Instances do
+                for i in vecToList insts do
+                    let heads = i.Head |> List.map Analysis.Types.typeConName
+                    for m, im in i.Members do
+                        // operators only: other members are reached by name
+                        if m.StartsWith "(" && m.EndsWith ")" then
+                            dictSet instanceFns
+                                (cls + "@" + String.concat "@" heads)
+                                { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+            let mono0, monoErrs = Fpp.Core.Link.monomorphizeWith isStruct instanceFns program
             // stamped clones have concrete instantiations, so record layouts
             // can only be settled once monomorphization has run
             let mono = Fpp.Core.Link.stampRecords mono0

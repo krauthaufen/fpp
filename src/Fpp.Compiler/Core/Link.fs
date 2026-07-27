@@ -1,6 +1,7 @@
 module Fpp.Core.Link
 
 open Fpp.Prelude
+open Fpp.Analysis
 open Fpp.Analysis.Types
 open Fpp.Core.Ir
 
@@ -180,7 +181,10 @@ let stampRecords (decls : Decl list) : Decl list =
 
 /// Stamp one specialized copy per struct instantiation, rewrite the calls,
 /// and report anything that cannot be classified.
-let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
+/// `instanceFns` maps "Class@T1@T2" to the function an instance supplies,
+/// so an operator inside a body stamped at a user type becomes a call to it.
+let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string, VarId>)
+                     (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
     let bodies = dictNew<string * int, bool * VarId * Scheme * Expr> ()
     for d in decls do
@@ -334,7 +338,22 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                           EVar (v, sch)))
             | EPrim (op, xs) ->
                 (match opTypeName op with
-                 | Some n -> EPrim (withOpType op (substName subst n), xs)
+                 | Some n ->
+                     let resolved = withOpType op (substName subst n)
+                     // still named: the operand type has an instance with a
+                     // body, so the operator is a call to it. Only the
+                     // homogeneous case is reachable here — a heterogeneous
+                     // use is never generic in both operands at once.
+                     (match opTypeName resolved with
+                      | Some tn ->
+                          let cls =
+                              match Classes.operatorClass (resolved.Substring (0, resolved.IndexOf "@")) with
+                              | Some c -> c
+                              | None -> ""
+                          (match dictTryFind instanceFns (cls + "@" + tn + "@" + tn) with
+                           | Some fn -> EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                           | None -> EPrim (resolved, xs))
+                      | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
             | EField (x, fn, o) -> EField (x, fn, substName subst o)
@@ -540,3 +559,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | DLet (_, v, _, ELam _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | _ -> true)
+
+/// Monomorphize with no user instances in play.
+let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
+    monomorphizeWith isStructName (dictNew ()) decls

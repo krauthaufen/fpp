@@ -917,7 +917,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match Classes.operatorClass op.Text with
                            | Some cls when (dictTryFind classes.Classes cls).IsSome ->
                                let res = st.Fresh ()
-                               addWanted op.Offset { Class = cls; Args = [ lt; rt ]; Assoc = [ "Result", res ] }
+                               let c = { Class = cls; Args = [ lt; rt ]; Assoc = [ "Result", res ] }
+                               addWanted op.Offset c
+                               // if this resolves to an instance with a body,
+                               // the operator IS a call to it
+                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c)
                                // solve eagerly: with one operand known the
                                // choice is often already forced, and fixing
                                // it here keeps later inference honest
@@ -1777,31 +1781,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   IsStatic = isStatic }
         | None -> ()
 
-    and inferDecl (g : Green) : unit =
-        match g with
-        | GToken _ -> ()
-        | GNode n ->
-            match n.NodeKind with
-            | LetDecl -> inferLet n |> ignore
-            | TypeDecl -> inferTypeDecl n
-            | ModuleDef ->
-                for c in n.Children do inferDecl c
-            | AttributeList ->
-                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
-                    pendingStructAttr <- true
-            | ModuleHeader | OpenDecl -> ()
-            // read before any body, in their own pass
-            | ClassDecl | InstanceDecl -> ()
-            | _ -> exprType g |> ignore
-
-    // ---- class and instance declarations -----------------------------------
-    // Both are read before any body is inferred: a class member may be used
-    // above its declaration, and an instance must be selectable from
-    // anywhere in the file.
-
     /// An instance member is an ordinary function; the only extra work is
     /// pinning its type to the signature the class declared, at this head.
-    let inferInstanceMember (expected : Type option) (t : Token) (m : GreenNode) : unit =
+    and inferInstanceMember (expected : Type option) (t : Token) (m : GreenNode) : unit =
         st.EnterLevel ()
         let mvars = dictNew<string, Type> ()
         let pats = nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind)
@@ -1822,6 +1804,73 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             setScheme t.Offset
                 { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id)
                   Constraints = []; Body = defTy }
+
+    /// Type an instance's bodies. Separate from registering it, because a
+    /// body may mention a type declared further down the file, while the
+    /// instance TABLE has to exist before any body anywhere is checked.
+    and inferInstanceBodies (n : GreenNode) : unit =
+        let vars = dictNew<string, Type> ()
+        match classHead vars n with
+        | None -> ()
+        | Some (name, args) ->
+            let members = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+            let assoc =
+                members |> List.filter isAssocDecl
+                |> List.choose (fun m ->
+                    match memberNameOf m, nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                    | Some t, Some tn -> Some (t.Text, typeFromNode vars tn)
+                    | _ -> None)
+            let bodied = members |> List.filter (fun m -> not (isAssocDecl m) && hasBody m)
+            match dictTryFind classes.Classes name with
+            | None -> ()
+            | Some cd ->
+                for m in bodied do
+                    match memberNameOf m with
+                    | None -> ()
+                    | Some t ->
+                        // the member's declared type, at THIS instance's head
+                        let expected =
+                            match cd.Members |> List.tryFind (fun (mn, _) -> mn = t.Text) with
+                            | Some (_, sch) ->
+                                let ty, cs = st.InstantiateC sch
+                                // pin the class parameters to the head, and
+                                // the associated types to what we bound
+                                for c in cs do
+                                    if c.Class = name && c.Args.Length = args.Length then
+                                        List.iter2 (unifyAt t.Offset) c.Args args
+                                        for an, av in c.Assoc do
+                                            match assoc |> List.tryFind (fun (bn, _) -> bn = an) with
+                                            | Some (_, bt) -> unifyAt t.Offset av bt
+                                            | None -> ()
+                                Some ty
+                            | None ->
+                                vecAdd diags (t.Offset, "class " + name + " has no member " + t.Text)
+                                None
+                        inferInstanceMember expected t m
+
+    and inferDecl (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            match n.NodeKind with
+            | LetDecl -> inferLet n |> ignore
+            | TypeDecl -> inferTypeDecl n
+            | ModuleDef ->
+                for c in n.Children do inferDecl c
+            | AttributeList ->
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
+                    pendingStructAttr <- true
+            | ModuleHeader | OpenDecl -> ()
+            // the tables are read before any body; only the bodies are
+            // typed here, in declaration order like everything else
+            | ClassDecl -> ()
+            | InstanceDecl -> inferInstanceBodies n
+            | _ -> exprType g |> ignore
+
+    // ---- class and instance declarations -----------------------------------
+    // Both are read before any body is inferred: a class member may be used
+    // above its declaration, and an instance must be selectable from
+    // anywhere in the file.
 
     let inferClassDecl (n : GreenNode) : unit =
         let vars = dictNew<string, Type> ()
@@ -1897,8 +1946,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               MName = t.Text; MTakesUnit = takesUnit }))
                   Builtin = builtin; Path = path; Offset = offset }
             Classes.addInstance classes inst
-            // check the instance against its class, then type each body
-            // against the member signature at this head
             match dictTryFind classes.Classes name with
             | None -> vecAdd diags (offset, "unknown class " + name)
             | Some cd ->
@@ -1911,29 +1958,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     for m, _ in cd.Members do
                         if not (inst.Members |> List.exists (fun (mn, _) -> mn = m)) then
                             vecAdd diags (offset, "instance " + name + " must implement " + m)
-                for m in bodied do
-                    match memberNameOf m with
-                    | None -> ()
-                    | Some t ->
-                        // the member's declared type, at THIS instance's head
-                        let expected =
-                            match cd.Members |> List.tryFind (fun (mn, _) -> mn = t.Text) with
-                            | Some (_, sch) ->
-                                let ty, cs = st.InstantiateC sch
-                                // pin the class parameters to the head, and
-                                // the associated types to what we bound
-                                for c in cs do
-                                    if c.Class = name && c.Args.Length = args.Length then
-                                        List.iter2 (unifyAt t.Offset) c.Args args
-                                        for an, av in c.Assoc do
-                                            match assoc |> List.tryFind (fun (bn, _) -> bn = an) with
-                                            | Some (_, bt) -> unifyAt t.Offset av bt
-                                            | None -> ()
-                                Some ty
-                            | None ->
-                                vecAdd diags (t.Offset, "class " + name + " has no member " + t.Text)
-                                None
-                        inferInstanceMember expected t m
 
     // Which interfaces each type implements has to be known BEFORE any
     // body is checked: a type's own members may narrow to it (`:? HashSet`
