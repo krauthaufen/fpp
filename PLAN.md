@@ -142,6 +142,31 @@ all member overloading. The split at first measurement:
 - [x] ofSet/toSet dropped by the port script: they bridge to FSharp.Core's
       Set, a type that lives outside the file being ported
 
+### Acceptance: ONE error left in the whole file
+Type tests landed: `:? list`/`:? array`/`:? string` are representation
+tests (null MATCHES `:? list` — nil is a null reference; noted with the
+other representation decisions), an INTERFACE test is a class-id check
+over its implementors, and every class-id read is guarded — a non-object
+answers false instead of trapping (`(box 5) :? HashSet` was a crash).
+Downcasts to interfaces/builtins check the same way. The 36 emit errors
+collapsed to ONE: most "unknown field" errors were downstream of type
+tests failing earlier in the same member.
+
+The occurs corruption is FIXED, and it was a beauty: `let (k, v) = e`
+parses as one FLAT ParenPat (no TuplePat node, just a comma), and every
+phase treated it as a SIMPLE binding named k — v never bound, the tuple
+type silently mis-unified, and in the acceptance file that corrupted the
+class-level 'V across members until an occurs check finally tripped three
+members later. All three phases now detect the flat-paren destructure.
+
+With 0 diagnostics the emission runs deeper: 30 errors now visible that
+the early return had hidden. The families: `:? ISet` where ISet is
+IMPLEMENTED but never DECLARED (the interface test requires a
+declaration; accept implemented-only interfaces), `static let` fields in
+the [<Struct>] HashMap (valueTupleGetter unbound), and more
+downstream-of-a-broken-piece member corners (OfSeq/exists/Contains).
+Next session's list; harnesses in the scratchpad.
+
 ### Acceptance emit status after the stdlib layer
 61 -> 36 emit errors. Lists and arrays are genuine seqs AT RUNTIME: the
 IEnumerable/IEnumerator dispatch sites pre-test the representation and

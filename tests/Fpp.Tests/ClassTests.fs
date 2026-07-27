@@ -775,3 +775,83 @@ let userClassTests =
             ignore inf
         }
     ]
+
+[<Tests>]
+let typeTestTests =
+    testList "type tests against builtins and interfaces" [
+        test "builtin collections answer :? by representation" {
+            let out =
+                run [ "let show (o : obj) ="
+                      "    if o :? list<int> then \"list\""
+                      "    elif o :? array<int> then \"array\""
+                      "    elif o :? string then \"string\""
+                      "    else \"other\""
+                      "let a = print (show ([ 1; 2 ] :> obj))"
+                      "let b = print (show ([| 1 |] :> obj))"
+                      "let c = print (show (\"s\" :> obj))"
+                      "let d = print (show (42 :> obj))"
+                      "let e = print (show (([] : int list) :> obj))" ]
+            // nil is a null reference, so the empty list still answers list
+            Expect.equal out "list\narray\nstring\nother\nlist\n" "representation tests"
+        }
+        test "a class test on a non-object answers false, not a trap" {
+            let out =
+                run [ "type Box(v : int) ="
+                      "    member x.V = v"
+                      "let test (o : obj) = if o :? Box then 1 else 0"
+                      "let a = print (test (Box 1 :> obj))"
+                      "let b = print (test (5 :> obj))"
+                      "let c = print (test (\"s\" :> obj))" ]
+            Expect.equal out "1\n0\n0\n" "a question, not a crash"
+        }
+        test "an interface test checks the implementors" {
+            let out =
+                run [ "type IShape ="
+                      "    abstract member Area : float"
+                      "type Circle(r : float) ="
+                      "    interface IShape with"
+                      "        member x.Area = 3.0 * r * r"
+                      "type Other() ="
+                      "    member x.Nope = 1"
+                      "let test (o : obj) = if o :? IShape then 1 else 0"
+                      "let a = print (test (Circle 1.0 :> obj))"
+                      "let b = print (test (Other() :> obj))"
+                      "let c = print (test (7 :> obj))" ]
+            Expect.equal out "1\n0\n0\n" "classes implementing it, and nothing else"
+        }
+        test "pattern-position tests match the expression form" {
+            let out =
+                run [ "let classify (o : obj) ="
+                      "    match o with"
+                      "    | :? list<int> -> \"list\""
+                      "    | :? string as s -> s"
+                      "    | :? array<int> -> \"array\""
+                      "    | _ -> \"other\""
+                      "let a = print (classify ([ 1 ] :> obj))"
+                      "let b = print (classify (\"hi\" :> obj))"
+                      "let c = print (classify ([| 2 |] :> obj))"
+                      "let d = print (classify (9 :> obj))" ]
+            Expect.equal out "list\nhi\narray\nother\n" "same answers in a match"
+        }
+        test "a parenthesized destructure binds ALL its names" {
+            // `let (k, v) = e` parses as one FLAT ParenPat — no TuplePat,
+            // just a comma — and every phase treated it as a simple binding
+            // named k: v was never bound, and the mistyping silently
+            // corrupted enclosing type variables
+            let out =
+                run [ "let f () ="
+                      "    let (k, v) = (1, \"a\")"
+                      "    v + string k"
+                      "let a = print (f ())" ]
+            Expect.equal out "a1\n" "both names, correctly typed"
+        }
+        test "destructuring an indexed tuple element" {
+            // the index site records the ELEMENT type; tuples are uniform refs
+            let out =
+                run [ "let f (elements : (int * string)[]) ="
+                      "    let (k, v) = elements.[0]"
+                      "    v"
+                      "let a = print (f [| (1, \"won\") |])" ]
+            Expect.equal out "won\n" "$ref element indexing"
+        }
+    ]

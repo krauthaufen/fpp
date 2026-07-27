@@ -1783,9 +1783,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             vecToList before
             |> List.tryPick (fun c -> match c with GNode t when isTypeKind t.NodeKind -> Some (typeFromNode vars t) | _ -> None)
         let isDestructure =
-            // `let struct(a, b) = e` binds several names, like `let a, b = e`
             (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
-            || (match pats with [ p ] -> p.NodeKind = StructTuplePat | _ -> false)
+            // `let (k, v) = e` — the parens hide the comma from the token
+            // scan, and treating it as a SIMPLE binding bound only k
+            || (match pats with
+                | [ p ] when p.NodeKind = ParenPat ->
+                    p.Children
+                    |> List.exists (fun c ->
+                        match c with
+                        // the parens hold a FLAT comma-separated pattern
+                        | GToken t -> t.Kind = Comma
+                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat)
+                | [ p ] -> p.NodeKind = StructTuplePat
+                | _ -> false)
         match pats with
         | [] ->
             for c in vecToList after do exprType c |> ignore
@@ -2543,4 +2553,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | TCon ("array", [ e ]) -> nameOf e |> Option.map (fun n -> off, n)
             | TCon (_, _) -> Some (off, instName ty)
             | TVar v -> Some (off, "#" + string v.Id)
+            // an index site records the ELEMENT type directly; a tuple or
+            // function element is a uniform reference
+            | TTuple _ | TFun _ -> Some (off, "$ref")
             | _ -> None) }

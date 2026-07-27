@@ -451,7 +451,19 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode p when p.NodeKind = WhenDecl -> walkType env c
             | _ -> ()
         let isDestructure =
-            vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
+            (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
+            // `let (k, v) = e` — the parens hide the comma from the token
+            // scan, and treating it as a SIMPLE binding bound only k
+            || (match pats with
+                | [ GNode p ] when p.NodeKind = ParenPat ->
+                    p.Children
+                    |> List.exists (fun c ->
+                        match c with
+                        // the parens hold a FLAT comma-separated pattern
+                        | GToken t -> t.Kind = Comma
+                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat)
+                | [ GNode p ] -> p.NodeKind = StructTuplePat
+                | _ -> false)
         let defsBefore = vecLen defs
         // Only what the BINDING ITSELF introduces is exported — the snapshot
         // is taken after binding the patterns and before walking the body.

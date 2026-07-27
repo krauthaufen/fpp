@@ -1244,25 +1244,82 @@ let emit (decls : Decl list) : EmitResult =
                  vecAdd errors ("no dispatch slot for " + iface + "." + mname)
                  "(ref.i31 (i32.const 0))")
         | ETypeTest (tn, e) ->
-            if not (isObjRecord tn) then
-                vecAdd errors ("cannot type-test against " + tn + ": not a class")
-                "(ref.i31 (i32.const 0))"
-            else
-                let t = newLocal "q"
-                let idOf =
-                    "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
-                let test =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
+            // Which representations satisfy `x :? tn`?
+            //   list/array/string -> a representation test (they carry no
+            //     descriptor); an INTERFACE -> the classes implementing it;
+            //     a class -> itself and its subclasses.
+            // The class-id read is GUARDED: a non-object answers false, it
+            // does not trap — `(box 5) :? HashSet` is a question, not a bug.
+            let t = newLocal "q"
+            let v = "(local.get " + t + ")"
+            let wrap (test : string) =
+                "(block (result anyref) (local.set " + t + " " + recur e + ") (call $ofi " + test + "))"
+            let idOf =
+                "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
+            let classIdTest (classes : string list) =
+                let hit =
+                    match classes |> List.filter isObjRecord
+                          |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
                     | [] -> "(i32.const 0)"
                     | [ one ] -> one
                     | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
-                "(block (result anyref) (local.set " + t + " " + recur e + ") (call $ofi " + test + "))"
+                "(if (result i32) (ref.test (ref $obj) " + v + ") (then " + hit + ") (else (i32.const 0)))"
+            let implementorsOf (iface : string) =
+                classImpls
+                |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> i = iface))
+                |> List.collect (fun (cn, _) -> subclassesOf cn)
+                |> List.distinct
+            if tn = "list" then
+                // nil is a null reference, so null tests as the empty list
+                // (recorded with the other representation decisions)
+                wrap ("(i32.or (ref.is_null " + v + ") (ref.test (ref $cons) " + v + "))")
+            elif tn = "array" then wrap ("(call $isArrayRep " + v + ")")
+            elif tn = "string" then wrap ("(ref.test (ref $str) " + v + ")")
+            elif isObjRecord tn then wrap (classIdTest (subclassesOf tn))
+            elif interfaceDecls |> List.exists (fun (i, _) -> i = tn) then
+                wrap (classIdTest (implementorsOf tn))
+            else
+                vecAdd errors ("cannot type-test against " + tn + ": not a class")
+                "(ref.i31 (i32.const 0))"
         | ECast (_, e, false) ->
             // widening to an interface or base class: representation is
             // unchanged, so there is nothing to do at runtime
             recur e
         | ECast (tn, e, true) ->
-            if not (isObjRecord tn) then
+            let interfaceTarget = interfaceDecls |> List.exists (fun (i, _) -> i = tn)
+            let builtinTarget = tn = "list" || tn = "array" || tn = "string" || tn = "seq" || tn = "IEnumerable"
+            if interfaceTarget || builtinTarget then
+                // the representation is uniform, so a downcast to an
+                // interface or builtin only CHECKS; lists/arrays/seqs accept
+                // their representations (an interface target additionally
+                // accepts them for the seq family, where they qualify)
+                let t = newLocal "c"
+                let v = "(local.get " + t + ")"
+                let ok =
+                    if tn = "list" then "(i32.or (ref.is_null " + v + ") (ref.test (ref $cons) " + v + "))"
+                    elif tn = "array" then "(call $isArrayRep " + v + ")"
+                    elif tn = "string" then "(ref.test (ref $str) " + v + ")"
+                    elif tn = "seq" || tn = "IEnumerable" then
+                        // anything enumerable: builtin reps or an object
+                        "(i32.or (call $isBuiltinSeq " + v + ") (ref.test (ref $obj) " + v + "))"
+                    else
+                        let idOf =
+                            "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
+                        let hits =
+                            classImpls
+                            |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> i = tn))
+                            |> List.collect (fun (cn, _) -> subclassesOf cn)
+                            |> List.distinct
+                            |> List.filter isObjRecord
+                            |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))")
+                        let hit = match hits with [] -> "(i32.const 0)" | [ one ] -> one | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
+                        "(if (result i32) (ref.test (ref $obj) " + v + ") (then " + hit + ") (else (i32.const 0)))"
+                "(block (result anyref) (local.set " + t + " " + recur e + ") "
+                + "(if (result anyref) " + ok + " "
+                + "(then " + v + ") "
+                + "(else (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "InvalidCast").Value
+                + ") " + recur (ELit (LString ("\"invalid cast to " + tn + "\""))) + ")))))"
+            elif not (isObjRecord tn) then
                 vecAdd errors ("cannot downcast to " + tn + ": not a class")
                 "(ref.i31 (i32.const 0))"
             else
@@ -1694,20 +1751,37 @@ let emit (decls : Decl list) : EmitResult =
         | PLit LNull ->
             app ("(br_if " + failLbl + " (i32.eqz (ref.is_null " + v + ")))")
         | PTypeTest tn ->
-            // the same class-id check a `:?` expression performs
-            if not (isObjRecord tn) then
-                vecAdd errors ("cannot type-test against " + tn + ": not a class")
-            else
-                let idOf =
-                    "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
-                let test =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
+            // the same checks a `:?` expression performs, in pattern form
+            let idOf =
+                "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) " + v + "))))"
+            let classIdTest (classes : string list) =
+                let hit =
+                    match classes |> List.filter isObjRecord
+                          |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
                     | [] -> "(i32.const 0)"
                     | [ one ] -> one
                     | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
-                // a null reference is not an instance of anything
+                "(if (result i32) (ref.test (ref $obj) " + v + ") (then " + hit + ") (else (i32.const 0)))"
+            let implementorsOf (iface : string) =
+                classImpls
+                |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> i = iface))
+                |> List.collect (fun (cn, _) -> subclassesOf cn)
+                |> List.distinct
+            if tn = "list" then
+                // nil is a null reference: null MATCHES `:? list`
+                app ("(br_if " + failLbl + " (i32.eqz (i32.or (ref.is_null " + v + ") (ref.test (ref $cons) " + v + "))))")
+            elif tn = "array" then
+                app ("(br_if " + failLbl + " (i32.eqz (call $isArrayRep " + v + ")))")
+            elif tn = "string" then
+                app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref $str) " + v + ")))")
+            elif isObjRecord tn then
                 app ("(br_if " + failLbl + " (ref.is_null " + v + "))")
-                app ("(br_if " + failLbl + " (i32.eqz " + test + "))")
+                app ("(br_if " + failLbl + " (i32.eqz " + classIdTest (subclassesOf tn) + "))")
+            elif interfaceDecls |> List.exists (fun (i, _) -> i = tn) then
+                app ("(br_if " + failLbl + " (ref.is_null " + v + "))")
+                app ("(br_if " + failLbl + " (i32.eqz " + classIdTest (implementorsOf tn) + "))")
+            else
+                vecAdd errors ("cannot type-test against " + tn + ": not a class")
         | PLit (LString raw) ->
             let lit = compileExpr locals extraLocals freeEnv false (ELit (LString raw))
             app ("(br_if " + failLbl + " (i32.eqz " + unwrapI32 ("(call $equal " + v + " " + lit + ")") + "))")
@@ -2704,6 +2778,13 @@ TUPLE_HASH
               (i32.or (ref.test (ref $parr_s) (local.get $v))
                 (i32.or (ref.test (ref $parr_l) (local.get $v))
                         (ref.test (ref $parr_h) (local.get $v))))))))))
+  (func $isArrayRep (param $v anyref) (result i32)
+    (i32.or (ref.test (ref $arr) (local.get $v))
+      (i32.or (ref.test (ref $parr_i) (local.get $v))
+        (i32.or (ref.test (ref $parr_f) (local.get $v))
+          (i32.or (ref.test (ref $parr_s) (local.get $v))
+            (i32.or (ref.test (ref $parr_l) (local.get $v))
+                    (ref.test (ref $parr_h) (local.get $v))))))))
   (func $iterNew (param $v anyref) (result anyref)
     (if (result anyref)
         (i32.or (ref.is_null (local.get $v)) (ref.test (ref $cons) (local.get $v)))

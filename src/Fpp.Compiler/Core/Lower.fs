@@ -1277,7 +1277,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             vecToList before
             |> List.choose (fun c -> match c with GNode p when isPatKind p.NodeKind -> Some p | _ -> None)
         let isDestructure =
-            vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
+            (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
+            // `let (k, v) = e` — the parens hide the comma from the token
+            // scan, and treating it as a SIMPLE binding bound only k
+            || (match pats with
+                | [ p ] when p.NodeKind = ParenPat ->
+                    p.Children
+                    |> List.exists (fun c ->
+                        match c with
+                        // the parens hold a FLAT comma-separated pattern
+                        | GToken t -> t.Kind = Comma
+                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat)
+                | [ p ] -> p.NodeKind = StructTuplePat
+                | _ -> false)
         let bodyExprs =
             vecToList after
             |> List.choose (fun c -> match c with GNode m when isExprish m.NodeKind -> Some m | _ -> None)
@@ -1304,8 +1316,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 Some (StructLet (binders, tn, lowerBlock rhsExprs, cont))
         | _ ->
         if isDestructure then
-            match pats with
+            // `let (k, v) = e` carries ONE flat ParenPat; the tuple pattern
+            // is its comma-separated inner pats
+            let flat =
+                match pats with
+                | [ p ] when p.NodeKind = ParenPat ->
+                    p.Children |> List.choose (fun c -> match c with GNode m when isPatKind m.NodeKind -> Some m | _ -> None)
+                | ps -> ps
+            match flat with
             | [] -> None
+            | [ one ] -> Some (DestructureLet (lowerPat one, lowerBlock rhsExprs, cont))
             | ps -> Some (DestructureLet (PTuple (List.map lowerPat ps), lowerBlock rhsExprs, cont))
         else
         match pats with
