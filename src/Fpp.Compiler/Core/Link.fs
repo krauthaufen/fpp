@@ -24,6 +24,29 @@ let classify (isStructName : string -> bool) (inst : string list) : Classificati
     else Canon
 
 /// substitute a symbolic element/type name ("#id") with the concrete one
+/// An arithmetic prim carries the operand TYPE when it is not one of the
+/// primitives the backend spells with a suffix letter — either a type
+/// variable of the enclosing binding (`+@#7`) or a named type. Stamping
+/// substitutes the variable; this then turns the name back into the letter
+/// the emitter understands.
+let private opTypeName (op : string) : string option =
+    let i = op.IndexOf "@"
+    if i < 0 then None else Some (op.Substring (i + 1))
+
+let private withOpType (op : string) (name : string) : string =
+    let i = op.IndexOf "@"
+    let baseOp = if i < 0 then op else op.Substring (0, i)
+    match name with
+    | "float" -> baseOp + "f"
+    | "float32" -> baseOp + "s"
+    | "int64" -> baseOp + "l"
+    | "uint32" -> baseOp + "w"
+    | "string" -> baseOp + "t"
+    | "int" | "char" | "bool" -> baseOp
+    // a type whose instance has a body: still unresolved here, and emission
+    // reports it rather than silently running the integer path
+    | other -> baseOp + "@" + other
+
 let private substName (subst : Dict<string, string>) (n : string) =
     if n.StartsWith "#" then
         match dictTryFind subst n with
@@ -46,7 +69,7 @@ let private substScheme (inst : string list) (sch : Scheme) : Scheme =
             | TCon (n, args) -> TCon (n, List.map go args)
             | TFun (a, b) -> TFun (go a, go b)
             | TTuple ts -> TTuple (List.map go ts)
-        { Quantified = []; Body = go sch.Body }
+        { Quantified = []; Constraints = []; Body = go sch.Body }
 
 let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
     let r = mapExpr f
@@ -184,7 +207,11 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
         | ELet (_, _, _, r, b) -> usesLayoutVar r || usesLayoutVar b
         | EIf (a, b, c) -> anyOf [ a; b; c ]
         | EMatch (s, cs) -> usesLayoutVar s || (cs |> List.exists (fun (_, _, b) -> usesLayoutVar b))
-        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> anyOf xs
+        | ETuple xs | EListLit xs | ESeq xs -> anyOf xs
+        // an operator at a type variable cannot be shared either: the
+        // instance — and so the machine instruction — differs per type
+        | EPrim (op, xs) ->
+            (match opTypeName op with Some n -> symbolic n | None -> false) || anyOf xs
         | ECtor (_, _, xs) -> anyOf xs
         // a record whose NAME still mentions a type variable has no layout
         // yet, so code building it must be stamped just like an array op
@@ -305,6 +332,10 @@ let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list
                                  + String.concat ", " i + "> in " + owner
                                  + ": the body is not available for stamping")
                           EVar (v, sch)))
+            | EPrim (op, xs) ->
+                (match opTypeName op with
+                 | Some n -> EPrim (withOpType op (substName subst n), xs)
+                 | None -> EPrim (op, xs))
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
             | EField (x, fn, o) -> EField (x, fn, substName subst o)
             | EFieldSet (x, fn, o, v) -> EFieldSet (x, fn, substName subst o, v)

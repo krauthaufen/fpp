@@ -85,8 +85,13 @@ let rec private encTy (t : Type) : Sx =
     | TFun (a, b) -> L [ A "f"; encTy a; encTy b ]
     | TTuple ts -> L (A "t" :: List.map encTy ts)
 
+let private encConstraint (c : Constraint) : Sx =
+    L [ A "k"; S c.Class; L (List.map encTy c.Args)
+        L (c.Assoc |> List.map (fun (n, t) -> L [ S n; encTy t ])) ]
+
 let private encScheme (s : Scheme) : Sx =
-    L [ A "s"; L (s.Quantified |> List.map (fun v -> A (string v.Id))); encTy s.Body ]
+    L [ A "s"; L (s.Quantified |> List.map (fun v -> A (string v.Id))); encTy s.Body
+        L (List.map encConstraint s.Constraints) ]
 
 let private encVarId (v : VarId) : Sx = L [ S v.Path; A (string v.Offset); S v.Name ]
 
@@ -215,10 +220,19 @@ let rec private decTy (x : Sx) : Type =
     | L (A "t" :: ts) -> TTuple (List.map decTy ts)
     | _ -> TCon ("?", [])
 
+let private decConstraint (x : Sx) : Constraint option =
+    match x with
+    | L [ A "k"; S cls; L args; L assoc ] ->
+        Some { Class = cls
+               Args = List.map decTy args
+               Assoc = assoc |> List.choose (fun a -> match a with L [ S n; t ] -> Some (n, decTy t) | _ -> None) }
+    | _ -> None
+
 let private decScheme (x : Sx) : Scheme =
     match x with
-    | L [ A "s"; L qs; body ] ->
+    | L [ A "s"; L qs; body; L cs ] ->
         { Quantified = qs |> List.choose (fun q -> match q with A id -> Some (varById id) | _ -> None)
+          Constraints = List.choose decConstraint cs
           Body = decTy body }
     | _ -> mono (TCon ("?", []))
 

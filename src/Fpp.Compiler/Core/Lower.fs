@@ -23,7 +23,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (memberSites : Dict<int, string>) (fieldOwners : Dict<int, string>)
           (ctorSites : Dict<int, int>)
           (projectMembers : Dict<string, Resolve.Definition>)
-          (ifaces : Dict<string, (string * int) list>) : LowerResult =
+          (ifaces : Dict<string, (string * int) list>)
+          (classUses : Dict<int, Fpp.Analysis.Classes.InstMember>)
+          (opTypes : Dict<int, string>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -59,6 +61,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     elif m.NodeKind = InterfaceImpl then
                         m.Children |> List.iter (fun c -> match c with GNode x -> collectMembers x | _ -> ())
                 n.Children |> List.iter (fun c -> match c with GNode m -> collectMembers m | _ -> ())
+            | InstanceDecl ->
+                // an instance member is a top-level function like any other
+                for c in n.Children do
+                    match c with
+                    | GNode m when m.NodeKind = MemberDecl ->
+                        (match m.Children |> List.choose (fun x -> match x with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                         | [ nm ] -> dictSet topLevelDefs nm.Offset true
+                         | _ -> ())
+                    | _ -> ()
             | ModuleDef -> n.Children |> List.iter collectTop
             | _ -> ()
     root.Children |> List.iter collectTop
@@ -247,7 +258,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | IdentExpr ->
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                  | Some t ->
-                     (match dictTryFind useDefs t.Offset with
+                     (match dictTryFind classUses t.Offset with
+                      // a class member (`Zero`) is a name for whatever the
+                      // selected instance provides
+                      | Some im ->
+                          let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                          let sch = mono (TCon ("?", []))
+                          if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
+                      | None ->
+                     match dictTryFind useDefs t.Offset with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
                       | Some d when currentSelf.IsSome
                                     && (dictTryFind fieldOfVar (d.Path, d.Offset) |> Option.map fst) = Some currentClass ->
@@ -403,8 +422,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               else
                                   match dictTryFind opKinds op.Offset with
                                   | Some k -> k
-                                  | None -> ""
-                          EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
+                                  | None ->
+                                      // no primitive kind: either a type
+                                      // variable of the enclosing binding, or
+                                      // a type whose instance carries a body.
+                                      // Both are named, and resolved after
+                                      // monomorphization has made them
+                                      // concrete.
+                                      match dictTryFind opTypes op.Offset with
+                                      | Some t when t <> "" && t <> "int" && t <> "char" && t <> "bool" ->
+                                          "@" + t
+                                      | _ -> ""
+                          // an operator whose instance has a body is an
+                          // ordinary call to that body
+                          match dictTryFind classUses op.Offset with
+                          | Some im ->
+                              EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
+                                    [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                          | None ->
+                              EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
                  | _ -> note (offsetOf n) "operator shape")
             | PrefixExpr ->
                 (match tokensOf n |> List.tryHead, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
@@ -1328,6 +1364,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | TypeDecl ->
                 lowerTypeDecl n
                 pendingStruct <- false
+            // a class declares signatures only; an instance's members are
+            // ordinary top-level functions, reached through the class
+            | ClassDecl -> ()
+            | InstanceDecl ->
+                for c in nodesOf n do
+                    if c.NodeKind = MemberDecl
+                       && not (tokensOf c |> List.exists (fun t -> t.Kind = Keyword && t.Text = "type")) then
+                        liftPlainMember "instance" c |> ignore
             | ModuleDef -> nodesOf n |> List.iter (fun m -> lowerDecl (GNode m))
             | AttributeList ->
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then

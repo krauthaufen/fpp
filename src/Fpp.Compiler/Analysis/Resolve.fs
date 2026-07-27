@@ -413,6 +413,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         for c in vecToList before do
             match c with
             | GNode p when isTypeKind p.NodeKind -> walkType env c
+            // declared constraints: `let f x : 'a when Num<'a> = ...`
+            | GNode p when p.NodeKind = WhenDecl -> walkType env c
             | _ -> ()
         let isDestructure =
             vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false)
@@ -600,6 +602,61 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | _ -> ()
         outer
 
+    /// `class C<'a>` — the class name lives in the type namespace, and its
+    /// members become ordinary values in scope. `Zero` and `(+)` are looked
+    /// up exactly like any other binding; what makes them special is only
+    /// that their schemes carry a constraint.
+    and walkClassDecl (env : Env) (n : GreenNode) : Env =
+        let exportHere = atExportLevel
+        let mutable outer = env
+        (match firstIdentToken n.Children with
+         | Some t ->
+             let d = define DefType t
+             outer <- Map.add t.Text d outer
+             outer <- Map.add (typeKey t.Text) d outer
+             if exportHere then exportDef d
+         | None -> ())
+        for c in n.Children do
+            match c with
+            | GNode m when m.NodeKind = MemberDecl ->
+                // `type Result` declares an associated type, not a value
+                if not (hasKwChild "type" m.Children) then
+                    match firstIdentToken m.Children with
+                    | Some t ->
+                        let d = define DefLet t
+                        outer <- Map.add t.Text d outer
+                        if exportHere then exportDef d
+                    | None -> ()
+                for x in m.Children do
+                    match x with
+                    | GNode ty when isTypeKind ty.NodeKind -> walkType outer x
+                    | _ -> ()
+            | GNode w when w.NodeKind = WhenDecl -> walkType outer c
+            | GNode ty when isTypeKind ty.NodeKind -> walkType outer c
+            | _ -> ()
+        outer
+
+    /// `instance C<int, int>` — free-standing, so it introduces no names of
+    /// its own. Its members are reached only by resolving the class.
+    and walkInstanceDecl (env : Env) (n : GreenNode) : Env =
+        let owner =
+            match Green.tokens (GNode n) |> List.tryHead with
+            | Some t -> "instance@" + string t.Offset
+            | None -> "instance@?"
+        for c in n.Children do
+            match c with
+            | GNode m when m.NodeKind = MemberDecl ->
+                if hasKwChild "type" m.Children then
+                    for x in m.Children do
+                        match x with
+                        | GNode ty when isTypeKind ty.NodeKind -> walkType env x
+                        | _ -> ()
+                else walkMember owner env m
+            | GNode w when w.NodeKind = WhenDecl -> walkType env c
+            | GNode ty when isTypeKind ty.NodeKind -> walkType env c
+            | _ -> ()
+        env
+
     and walkDecl (env : Env) (g : Green) : Env =
         match g with
         | GToken _ -> env
@@ -607,6 +664,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             match n.NodeKind with
             | LetDecl -> walkLet env n
             | TypeDecl -> walkTypeDecl env n
+            | ClassDecl -> walkClassDecl env n
+            | InstanceDecl -> walkInstanceDecl env n
             | ModuleDef ->
                 let mutable outer = env
                 let nameToks =

@@ -880,7 +880,7 @@ let parse (src : string) : ParseResult =
             vecAdd acc (parseType letCol)
             // declared constraints: `let solve ... : Vector<'a> when Fractional<'a> = ...`
             while s.IsKw "when" && (s.SameLine || s.CurCol > letCol) do
-                vecAdd acc (parseWhen letCol)
+                vecAdd acc (parseWhen false letCol)
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"
@@ -1201,14 +1201,19 @@ let parse (src : string) : ParseResult =
 
     /// One constraint: `when C<'a>`, `when C<'a> with Result = 'a`, or the
     /// single-associated-type shorthand `when C<'a> = 'a`.
-    and parseWhen (col : int) : Green =
+    /// `allowEq` is off in a `let`, where a trailing `=` opens the body
+    /// rather than fixing an associated type. `with Result = 'a` still
+    /// works there, and is unambiguous.
+    and parseWhen (allowEq : bool) (col : int) : Green =
         let acc = vecNew<Green> ()
         vecAdd acc (s.Bump ())   // when
         vecAdd acc (parseClassHead col)
+        let mutable sawWith = false
         if s.IsKw "with" then
+            sawWith <- true
             vecAdd acc (s.Bump ())
             if s.Is Ident then vecAdd acc (s.Bump ())
-        if s.IsOp "=" then
+        if s.IsOp "=" && (allowEq || sawWith) then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseType col)
         Green.node WhenDecl (vecToList acc)
@@ -1222,14 +1227,14 @@ let parse (src : string) : ParseResult =
         vecAdd acc (s.Bump ())   // class / instance
         vecAdd acc (parseClassHead col)
         while s.IsKw "when" && (s.SameLine || s.CurCol > col) do
-            vecAdd acc (parseWhen col)
+            vecAdd acc (parseWhen true col)
         if s.IsOp "=" then vecAdd acc (s.Bump ())
         let mutable go = true
         while go && not s.AtEof && not s.SameLine && s.CurCol > col do
             let mark = s.Mark
             // `type Result` declares (or binds) an associated type; inside a
             // class body it needs no `static abstract` ceremony
-            if s.IsKw "when" then vecAdd acc (parseWhen col)
+            if s.IsKw "when" then vecAdd acc (parseWhen true col)
             elif s.IsKw "type" || isMemberStart () then vecAdd acc (parseMember ())
             else go <- false
             if s.Mark = mark then go <- false

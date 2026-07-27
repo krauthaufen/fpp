@@ -111,8 +111,69 @@ module private Outline =
 /// under bare names. `option<'a>` aliases the nominal `Option<'a>` so
 /// postfix `'v option` and constructor results unify.
 module Builtin =
+
+    /// The numeric tower. Operators are two-parameter classes with an
+    /// associated result — the shape that makes `M * v` ordinary rather than
+    /// special — and the closed classes on top are what generic code
+    /// constrains against so an unannotated routine does not infer a chain
+    /// of unreduced projections.
+    let private numericClasses =
+        let opClass (cls : string) (op : string) =
+            [ "class " + cls + "<'a, 'b>"
+              "    type Result"
+              "    static (" + op + ") : 'a -> 'b -> Result" ]
+        List.concat [
+            opClass "Add" "+"
+            opClass "Sub" "-"
+            opClass "Mul" "*"
+            opClass "Div" "/"
+            opClass "Rem" "%"
+            [ "class Num<'a>"
+              "    when Add<'a, 'a> = 'a"
+              "    when Sub<'a, 'a> = 'a"
+              "    when Mul<'a, 'a> = 'a"
+              "    static Zero : 'a"
+              "    static One : 'a"
+              "class Fractional<'a>"
+              "    when Num<'a>"
+              "    when Div<'a, 'a> = 'a"
+              "class Integral<'a>"
+              "    when Num<'a>"
+              "    when Div<'a, 'a> = 'a"
+              "    when Rem<'a, 'a> = 'a" ]
+        ]
+
+    /// The primitive instances. They bind their associated type and stop
+    /// there: the backend emits these as machine instructions, so there is
+    /// no body to write. Only the prelude may declare an instance this way.
+    let private numericInstances =
+        // (type, zero literal, one literal, has a remainder operation)
+        let numerics =
+            [ "int", "0", "1", true
+              "int64", "0L", "1L", true
+              "uint32", "0u", "1u", true
+              "float", "0.0", "1.0", false
+              "float32", "0.0f", "1.0f", false ]
+        List.concat [
+            // string concatenation is `+` like any other addition
+            [ "instance Add<string, string>"
+              "    type Result = string" ]
+            numerics |> List.collect (fun (t, zero, one, hasRem) ->
+                List.concat [
+                    [ "Add"; "Sub"; "Mul"; "Div" ] @ (if hasRem then [ "Rem" ] else [])
+                    |> List.collect (fun cls ->
+                        [ "instance " + cls + "<" + t + ", " + t + ">"
+                          "    type Result = " + t ])
+                    [ "instance Num<" + t + ">"
+                      "    static Zero = " + zero
+                      "    static One = " + one ]
+                    (if hasRem then [ "instance Integral<" + t + ">" ]
+                     else [ "instance Fractional<" + t + ">" ])
+                ])
+        ]
+
     let source =
-        String.concat "\n" [
+        String.concat "\n" (numericClasses @ numericInstances @ [
             "type Option<'a> ="
             "    | None"
             "    | Some of 'a"
@@ -151,9 +212,9 @@ module Builtin =
             "    extern let pin : 'a[] -> int"
             "    extern let unpin : 'a[] -> int"
             ""
-        ]
+        ])
 
-    let path = "(builtin)"
+    let path = Analysis.Classes.builtinPath
 
 type ProjectResults =
     { Files : Fpp.Prelude.Dict<string, Analysis.Resolve.BindResult * Analysis.Infer.InferResult>
@@ -242,6 +303,9 @@ type Workspace() =
             let impls = dictNew<string, string list> ()
             let structTypes = dictNew<string, bool> ()
             let ctors = dictNew<string, (int * Analysis.Types.Scheme) list> ()
+            // classes and instances are project-wide: the prelude declares
+            // the numeric tower, every later file may extend it
+            let classes = Analysis.Classes.newTables ()
             // members are looked up by "Type.Member" across the whole
             // project, not just the file that declares them
             let members = dictNew<string, Analysis.Resolve.Definition> ()
@@ -251,7 +315,7 @@ type Workspace() =
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
             for k, d in bb.Members do dictSet members k d
-            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes ctors |> ignore
+            Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes ctors classes |> ignore
             // linked libraries: exports feed the resolver, schemes feed inference
             for _, text in this.Libraries do
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
@@ -262,7 +326,7 @@ type Workspace() =
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
                 for k, d in b.Members do dictSet members k d
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls structTypes ctors
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls structTypes ctors classes
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core
             for _, text in this.Libraries do
@@ -284,6 +348,7 @@ type Workspace() =
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
                 (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
+                (Analysis.Classes.newTables ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =
         db.MemoT "diagnostics" path (fun () ->
@@ -330,7 +395,11 @@ type Workspace() =
                 for off, o in inf.FieldOwners do dictSet fo off o
                 let cs = dictNew<int, int> ()
                 for off, o in inf.CtorSites do dictSet cs off o
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces
+                let cu = dictNew<int, Analysis.Classes.InstMember> ()
+                for off, m in inf.ClassUses do dictSet cu off m
+                let ot = dictNew<int, string> ()
+                for off, t in inf.OpTypes do dictSet ot off t
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
@@ -341,7 +410,7 @@ type Workspace() =
         // builtin decls (Option etc.) come first
         let bp = Parser.parse Builtin.source
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
-        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Members r.Interfaces
+        let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Members r.Interfaces (dictNew ()) (dictNew ())
         for d in blow.Decls do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
@@ -397,7 +466,11 @@ type Workspace() =
                 for off, o in inf.FieldOwners do dictSet fo off o
                 let cs = dictNew<int, int> ()
                 for off, o in inf.CtorSites do dictSet cs off o
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces
+                let cu = dictNew<int, Analysis.Classes.InstMember> ()
+                for off, m in inf.ClassUses do dictSet cu off m
+                let ot = dictNew<int, string> ()
+                for off, t in inf.OpTypes do dictSet ot off t
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -424,7 +497,11 @@ type Workspace() =
             for off, o in inf.FieldOwners do dictSet fo off o
             let cs = dictNew<int, int> ()
             for off, o in inf.CtorSites do dictSet cs off o
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces
+            let cu = dictNew<int, Analysis.Classes.InstMember> ()
+            for off, m in inf.ClassUses do dictSet cu off m
+            let ot = dictNew<int, string> ()
+            for off, t in inf.OpTypes do dictSet ot off t
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu ot
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

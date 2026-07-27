@@ -19,11 +19,23 @@ and Type =
     | TFun of Type * Type
     | TTuple of Type list
 
+/// A class applied to types, optionally equating its associated types:
+/// `Add<'a,'b> with Result = 'a` is
+/// `{ Class = "Add"; Args = ['a; 'b]; Assoc = [("Result", 'a)] }`.
+/// A constraint is never a type — it can only appear in a scheme's context,
+/// which is why `Type` has no case for it.
+and Constraint =
+    { Class : string
+      Args : Type list
+      Assoc : (string * Type) list }
+
 type Scheme =
     { Quantified : Var list
+      /// residual class constraints: what the caller must satisfy
+      Constraints : Constraint list
       Body : Type }
 
-let mono (t : Type) : Scheme = { Quantified = []; Body = t }
+let mono (t : Type) : Scheme = { Quantified = []; Constraints = []; Body = t }
 
 let tInt = TCon ("int", [])
 let tUInt = TCon ("uint32", [])
@@ -58,6 +70,12 @@ let rec typeConName (t : Type) : string =
     | TCon (n, args) -> n + "$<" + String.concat "." (List.map typeConName args) + ">"
     | TVar v -> "#" + string v.Id
     | _ -> ""
+
+/// Map every type inside a constraint.
+let mapConstraint (f : Type -> Type) (c : Constraint) : Constraint =
+    { Class = c.Class
+      Args = List.map f c.Args
+      Assoc = c.Assoc |> List.map (fun (n, t) -> n, f t) }
 
 let rec freeVars (t : Type) : Var list =
     match prune t with
@@ -105,6 +123,46 @@ let typeString (t : Type) : string =
             if atom then "(" + s + ")" else s
     go false t
 
+let constraintVars (c : Constraint) : Var list =
+    List.collect freeVars c.Args @ List.collect (fun (_, t) -> freeVars t) c.Assoc
+
+/// `Add<'a, 'b> with Result = 'c`, using the same per-call variable naming
+/// as `typeString` would — callers that need names to agree across a
+/// signature and its context must render them together.
+let constraintStringWith (nameOf : Type -> string) (c : Constraint) : string =
+    c.Class + "<" + String.concat ", " (List.map nameOf c.Args) + ">"
+    + (match c.Assoc with
+       | [] -> ""
+       | eqs -> " with " + String.concat ", " (eqs |> List.map (fun (n, t) -> n + " = " + nameOf t)))
+
+/// A scheme rendered with its context: `'a -> 'a   when Num<'a>`.
+let schemeString (sch : Scheme) : string =
+    // one naming pass over body and context together, so 'a means 'a in both
+    let names = dictNew<int, string> ()
+    let rec collect (t : Type) : unit =
+        match prune t with
+        | TVar v -> if (dictTryFind names v.Id).IsNone then dictSet names v.Id ("'" + string (char (int 'a' + names.Count)))
+        | TCon (_, args) -> List.iter collect args
+        | TFun (a, b) -> collect a; collect b
+        | TTuple ts -> List.iter collect ts
+    collect sch.Body
+    for c in sch.Constraints do List.iter collect (constraintVars c |> List.map TVar)
+    let rec go (atom : bool) (t : Type) : string =
+        match prune t with
+        | TVar v -> (match dictTryFind names v.Id with Some n -> n | None -> "'?")
+        | TCon (n, []) -> n
+        | TCon (n, args) -> n + "<" + String.concat ", " (List.map (go false) args) + ">"
+        | TFun (a, b) ->
+            let s = go true a + " -> " + go false b
+            if atom then "(" + s + ")" else s
+        | TTuple ts ->
+            let s = String.concat " * " (List.map (go true) ts)
+            if atom then "(" + s + ")" else s
+    go false sch.Body
+    + (match sch.Constraints with
+       | [] -> ""
+       | cs -> "   when " + String.concat ", " (cs |> List.map (constraintStringWith (go false))))
+
 /// Structural unification. Returns an error message on mismatch, None on
 /// success. Partial effects on failure are acceptable — the tree is only
 /// used for diagnostics and hover after errors.
@@ -150,16 +208,34 @@ type TypeState() =
         nextId <- nextId + 1
         TVar { Id = nextId; Level = level; Link = None }
 
-    /// Quantify variables deeper than the current level.
-    member _.Generalize (t : Type) : Scheme =
+    /// Quantify variables deeper than the current level. A constraint is
+    /// carried into the scheme when it mentions a quantified variable — the
+    /// caller is the one who will have to discharge it.
+    member _.GeneralizeWith (cs : Constraint list) (t : Type) : Scheme =
         let qs =
             freeVars t
             |> List.filter (fun v -> v.Level > level)
             |> List.distinctBy (fun v -> v.Id)
-        { Quantified = qs; Body = t }
+        let quantified = qs |> List.map (fun v -> v.Id) |> Set.ofList
+        let kept =
+            cs |> List.filter (fun c ->
+                constraintVars c |> List.exists (fun v -> Set.contains v.Id quantified))
+        // a variable that ONLY appears in the context (an associated-type
+        // result, say) is still part of the scheme: it has to be freshened
+        // per use or two call sites would share it
+        let extra =
+            kept
+            |> List.collect constraintVars
+            |> List.filter (fun v -> v.Level > level && not (Set.contains v.Id quantified))
+            |> List.distinctBy (fun v -> v.Id)
+        { Quantified = qs @ extra; Constraints = kept; Body = t }
 
-    member this.Instantiate (s : Scheme) : Type =
-        if List.isEmpty s.Quantified then s.Body
+    member this.Generalize (t : Type) : Scheme = this.GeneralizeWith [] t
+
+    /// Instantiate, also freshening the context. Returns the constraints the
+    /// use site now owes.
+    member this.InstantiateC (s : Scheme) : Type * Constraint list =
+        if List.isEmpty s.Quantified then s.Body, s.Constraints
         else
             let subst = dictNew<int, Type> ()
             for v in s.Quantified do dictSet subst v.Id (this.Fresh ())
@@ -172,4 +248,6 @@ type TypeState() =
                 | TCon (n, args) -> TCon (n, List.map go args)
                 | TFun (a, b) -> TFun (go a, go b)
                 | TTuple ts -> TTuple (List.map go ts)
-            go s.Body
+            go s.Body, List.map (mapConstraint go) s.Constraints
+
+    member this.Instantiate (s : Scheme) : Type = fst (this.InstantiateC s)
