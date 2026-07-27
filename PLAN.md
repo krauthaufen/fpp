@@ -711,6 +711,46 @@ again. Still red: the LOWERING gate — 27 lint errors in the lowered core of
 Infer/Lower/EmitWasm/Workspace, all from constructs added today; each is a
 small lowering-imprecision hunt.
 
+### Self-application fully green: the lowering gate closed
+The last 28 lint errors came from three causes, not 28.
+
+**Curried lambda parameters were collapsed into one tuple (16 sites).**
+`fun i (f, k) -> ..` lowered to `fun _arg -> match _arg with (i, (f, k)) -> ..`:
+`paramBinds` gives up on ALL binders as soon as ONE parameter is structured,
+and the lambda case then tupled them. Every `List.mapi`/`iteri`/`foldBack`
+with a destructuring parameter therefore had the wrong arity, which is
+exactly what the lint reported (`int vs 'a * (string * string)`).
+`paramBindsCurried` now lowers per parameter: simple ones stay binders,
+structured ones destructure their own synthetic `_arg` inside the body, so
+the arity survives. This is a real elaboration fix, not a source rewrite.
+
+**The lint monomorphized top-level bindings (9 sites).** After checking a
+`DLet` it stored the decl's instantiated type in `env`, so every later use in
+the same file shared ONE monotype: `BuiltinCache.copyDict` unified with
+`Dict<string, Definition>` at its first use and every other use of the nine
+cached dicts failed. Uses of an already-checked top level now re-instantiate
+its scheme (`generalized` set); recursive uses inside the decl's own body
+stay monomorphic, as before.
+
+**`dict.[k] <- v` lowers as an ARRAY index-set (2 sites).** The core IR has no
+dict-index form, so the memo tables in `Types.InstantiateC` and
+`Infer.substVars` demanded `int` keys. Rewritten into the subset as
+`dictSet memo p r` — the Prelude call the rest of the compiler already uses.
+
+All four self-application gates now pass at zero: parse, project, inference,
+and lowering (283 decls, lint-clean). Acceptance unchanged: 0 diagnostics /
+0 notes / 0 emit errors, and the emitted wasm still runs. Suite 353/353.
+
+### Next: stage-0/stage-1 bootstrap harness
+The self-application gates prove the front end ACCEPTS its own sources; they
+do not run the result. The next step is a harness that takes the
+dotnet-built compiler and emits wasm for a growing prefix of its own files —
+starting with the leaves that need no .NET interop (`Prelude`, `Tokens`,
+`Tree`, `Lexer`), each file gated on "emits 0 errors AND the emitted module
+instantiates". Files that need host services (file IO in `Workspace`,
+`Project`) come last and need an import surface decided first. Full
+bootstrap (stage-1 compiling stage-2) is NOT in scope until every file emits.
+
 ### The prelude is a real source file now
 `stdlib/prelude.fpp` (1492 lines of actual F++, editor support and all),
 embedded into Fpp.Compiler as a resource at build time; `Builtin.source`

@@ -187,7 +187,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TCon (c, xs) -> TCon (c, List.map go xs)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
-                memo.[p] <- r
+                dictSet memo p r
                 r
         go t
 

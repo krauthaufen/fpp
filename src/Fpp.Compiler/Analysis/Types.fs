@@ -330,7 +330,7 @@ type TypeState() =
                         | TCon (n, args) -> TCon (n, List.map go args)
                         | TFun (a, b) -> TFun (go a, go b)
                         | TTuple ts -> TTuple (List.map go ts)
-                    memo.[p] <- r
+                    dictSet memo p r
                     r
             go s.Body, List.map (mapConstraint go) s.Constraints
 

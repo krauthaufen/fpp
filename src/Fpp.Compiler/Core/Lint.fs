@@ -13,6 +13,10 @@ let lint (decls : Decl list) : string list =
     let errors = vecNew<string> ()
     // local binder types by (path, offset)
     let env = dictNew<string * int, Type> ()
+    // top-level bindings already checked: their uses re-instantiate the
+    // declared scheme instead of sharing one monotype, so a polymorphic
+    // helper may be used at several types further down the file
+    let generalized = dictNew<string * int, bool> ()
 
     let keyOf (v : VarId) = v.Path, v.Offset
 
@@ -127,6 +131,7 @@ let lint (decls : Decl list) : string list =
         match e with
         | ELit l -> litType l
         | EVarI (v, sch, _) -> exprType (EVar (v, sch))
+        | EVar (v, sch) when (dictTryFind generalized (keyOf v)).IsSome -> freshInstance sch
         | EVar (v, sch) ->
             (match dictTryFind env (keyOf v) with
              | Some t -> t                     // local binder
@@ -282,7 +287,7 @@ let lint (decls : Decl list) : string list =
             if isRec then dictSet env (keyOf v) declared
             let rt = exprType rhs
             unifyC ("top-level " + v.Name) declared rt
-            dictSet env (keyOf v) declared
+            dictSet generalized (keyOf v) true
         | DExtern _ | DUnion _ | DRecord _ | DInterface _ | DClass _ | DEnum _ | DMembers _ -> ()
 
     vecToList errors

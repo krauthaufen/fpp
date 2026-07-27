@@ -268,6 +268,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         else
             [], binds |> List.map snd
 
+    /// Curried parameter lowering: every parameter keeps its own binder, and a
+    /// structured one destructures a synthetic argument inside the body. Unlike
+    /// `paramBinds` this never collapses `fun i (a, b) -> ..` into a single
+    /// tupled argument, so the arity survives into the core term.
+    let paramBindsCurried (pats : GreenNode list) (body : Expr) : (VarId * Scheme) list * Expr =
+        let mutable bodyW = body
+        let binds =
+            pats
+            |> List.map (fun p ->
+                match lowerPat p with
+                | PVar (v, s) -> v, s
+                | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
+                | other ->
+                    let arg = { Path = path; Offset = offsetOf p + 660000; Name = "_arg" }
+                    let sch = mono (TCon ("?", []))
+                    bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
+                    arg, sch)
+        binds, bodyW
+
     let rec lowerExpr (g : Green) : Expr =
         match g with
         | GToken t ->
@@ -772,15 +791,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     arg, sch)
                     ELam (binds, bodyW)
                 else
-                (match paramBinds pats with
-                 | binds, [] -> ELam (binds, bodyE)
-                 | _, structuredPats ->
-                     // structured lambda params: match on a synthetic arg
-                     let arg = { Path = path; Offset = offsetOf n + 600000; Name = "_arg" }
-                     let sch = mono (TCon ("?", []))
-                     (match structuredPats with
-                      | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, bodyE ]))
-                      | ps -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ PTuple ps, None, bodyE ]))))
+                let binds, bodyW = paramBindsCurried pats bodyE
+                ELam (binds, bodyW)
             | IfExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | cond :: rest ->
