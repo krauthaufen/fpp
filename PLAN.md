@@ -814,7 +814,36 @@ Four gaps closed on the way:
   comprehensions properly — `for`/`if`/`yield` into a Vec accumulation — is
   the better fix and is still open.
 
-**Where the frontier stops: `Analysis/Types.fs`.** It reaches past the seam
+**The parser stage needs closures with CELLS.** `tests/bootstrap/
+parsedrive.fpp` (parses a source string with the emitted parser, prints a
+paren/dot shape fingerprint of the tree, the round-trip witness and the
+diagnostics, and does it again for deliberately broken input) does not emit
+yet: 102 errors, and every one of them is one of exactly two causes.
+
+- **Mutually recursive LOCAL functions.** `let rec even ... and odd ...`
+  inside a function: `odd` is unresolved at its use inside `even`, so
+  lowering emits `EUnknown` and the emitter reports "unknown name reaches
+  emission: odd". Top level works only because globals are resolved by name
+  regardless of order. Locals lower to NESTED `ELet`s, which gives the
+  second binding sight of the first and never the reverse. Needs sibling
+  scope in `Resolve` for an `and` group, a group form through `Lower`, and
+  the knot tied at emission — the self-marker patch (`$selfmark`, "tie the
+  recursive knot") already does this for ONE closure and generalizes to a
+  group with one marker each.
+- **A captured mutable local.** `let mutable acc = 0` assigned from inside a
+  nested function: "assignment to unknown acc". Mutable locals are wasm
+  locals and closure conversion copies free variables BY VALUE into the env
+  cons-chain, so the closure writes to a copy. Captured-and-assigned locals
+  need to become one-field mutable cells: allocated in the enclosing frame,
+  read/written through `struct.get`/`struct.set`, and captured by
+  reference — which the existing by-value capture then does correctly,
+  since what it copies is the cell.
+
+Minimal repros for both, ready to grow into tests, are 12 lines each:
+`let rec even k = if k = 0 then true else odd (k - 1) and odd k = ...` and
+`let counter n = let mutable acc = 0 in let bump k = acc <- acc + k in ...`.
+
+**Where the frontier stops without a driver: `Analysis/Types.fs`.** It reaches past the seam
 straight into `System.Collections.Generic` — `HashSet`, `Dictionary`, `List`
 and an `IEqualityComparer` object expression over `HashIdentity.Reference`
 for cycle detection. Those must route through `Prelude` like everything
