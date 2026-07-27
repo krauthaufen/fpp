@@ -115,7 +115,8 @@ type Server(ws : Workspace) =
                     "textDocumentSync", jint 1   // full-document sync
                     "documentSymbolProvider", jbool true
                     "definitionProvider", jbool true
-                    "hoverProvider", jbool true ]
+                    "hoverProvider", jbool true
+                    "completionProvider", jobj [ "triggerCharacters", jarr [ jstr "." ] ] ]
                 "serverInfo", jobj [ "name", jstr "fpp-lsp"; "version", jstr "0.1" ] ])
         | "initialized" -> []
         | "textDocument/didOpen" ->
@@ -158,8 +159,29 @@ type Server(ws : Workspace) =
             let offset = (if line < starts.Length then starts.[line] else 0) + ch
             match ws.HoverAt path offset with
             | Some text ->
-                respond (jobj [ "contents", jobj [ "kind", jstr "markdown"; "value", jstr text ] ])
+                // a fenced block, so the editor syntax-highlights the
+                // signature instead of showing backticks
+                let md = "```fpp\n" + text.Replace("`", "") + "\n```"
+                respond (jobj [ "contents", jobj [ "kind", jstr "markdown"; "value", jstr md ] ])
             | None -> respond null
+        | "textDocument/completion" ->
+            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            this.EnsureProject path
+            let items =
+                ws.Completions path
+                |> List.map (fun (label, kind, ty, full) ->
+                    jobj [ "label", jstr label
+                           // LSP CompletionItemKind: 6 Variable, 7 Class,
+                           // 22 Struct, 21 Constant, 9 Module, 2 Method
+                           "kind", jint (match kind with
+                                         | "type" -> 7
+                                         | "module" -> 9
+                                         | "union case" -> 21
+                                         | "member" -> 2
+                                         | _ -> 6)
+                           "detail", jstr (if ty = "" then full else ty)
+                           "documentation", jstr full ])
+            respond (jarr items)
         | "shutdown" -> respond null
         | "exit" ->
             exitRequested <- true

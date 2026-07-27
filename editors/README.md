@@ -1,8 +1,12 @@
 # Editor support
 
 One language server (`src/Fpp.Lsp`, stdio LSP) behind every editor. It
-offers diagnostics, hover types, go-to-definition and document symbols
-today; everything below is a different way of launching the same process.
+offers diagnostics, hover types (rendered with their class constraints),
+completion, go-to-definition across files, and document symbols; everything
+below is a different way of launching the same process.
+
+It runs wherever .NET does — macOS, Linux and Windows alike — since the
+server is a plain stdio program and the extension only has to start it.
 
 ## Projects
 
@@ -36,7 +40,7 @@ cd editors/vscode
 npm install
 npx tsc -p ./                       # or: npm run compile
 npx @vscode/vsce package --allow-missing-repository
-code --install-extension fpp-0.1.0.vsix
+code --install-extension fpp-0.2.0.vsix
 ```
 
 By default it launches the server with `dotnet run --project
@@ -84,7 +88,8 @@ written. If you want it, say so and it can be scaffolded — it is perhaps
 ## What is and is not verified
 
 Tested in CI: the manifest format, project discovery from an opened file,
-cross-file go-to-definition, and the server's stdio framing.
+cross-file go-to-definition, completion contents, and the server's stdio
+framing.
 
 Not tested automatically: the editors themselves. The VS Code extension
 compiles and packages, and the server it launches is exercised directly over

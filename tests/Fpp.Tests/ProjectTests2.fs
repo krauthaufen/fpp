@@ -106,6 +106,27 @@ let lspProjectTests =
             | other -> failtestf "expected one publishDiagnostics, got %d" (List.length other)
             System.IO.Directory.Delete (dir, true)
         }
+        test "completion offers the numeric tower with its constraints" {
+            let dir = scratch "lspc" (("demo.fppproj", manifest) :: sources)
+            let ws = Workspace()
+            ws.LoadProject (System.IO.Path.Combine (dir, "demo.fppproj")) |> ignore
+            let items = ws.Completions (System.IO.Path.Combine (dir, "main.fpp"))
+            let find (n : string) = items |> List.tryFind (fun (l, _, _, _) -> l = n)
+            // the prelude's classes and members are in scope without an open
+            Expect.isSome (find "sqrt") "sqrt offered"
+            Expect.isSome (find "compare") "compare offered"
+            Expect.isSome (find "Zero") "Zero offered"
+            // the type carries the class context, which is the useful part
+            match find "min" with
+            | Some (_, _, ty, _) -> Expect.stringContains ty "MinMax" "min shows its constraint"
+            | None -> failtest "min not offered"
+            // a definition exported under two names appears ONCE
+            let zeros = items |> List.filter (fun (l, _, _, _) -> l = "Zero")
+            Expect.hasLength zeros 1 "class members are not offered twice"
+            // and the project's own bindings are there
+            Expect.isSome (find "double") "the project's own function"
+            System.IO.Directory.Delete (dir, true)
+        }
         test "go to definition crosses files and answers with a uri" {
             let dir = scratch "lspdef" (("demo.fppproj", manifest) :: sources)
             let ws = Workspace()

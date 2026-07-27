@@ -887,6 +887,38 @@ type Workspace() =
             r.Definitions
             |> List.tryFind (fun d -> offset >= d.Offset && offset < d.Offset + d.Length)
 
+    /// Completion candidates: everything the project EXPORTS, plus this
+    /// file's own definitions. Not scope-aware — a local from another
+    /// binding can still appear — but every entry is real and carries its
+    /// generalized type, which is the part that makes a list worth reading.
+    /// Returns (label, kind, type, qualified name).
+    member this.Completions (path : string) : (string * string * string * string) list =
+        let r = this.ProjectCheck ()
+        let seen = dictNew<string, bool> ()
+        let out = vecNew<string * string * string * string> ()
+        let typeOf (d : Analysis.Resolve.Definition) =
+            match dictTryFind r.Schemes (d.Path + ":" + string d.Offset) with
+            | Some sch -> Analysis.Types.schemeString sch
+            | None -> ""
+        let offer (label : string) (full : string) (d : Analysis.Resolve.Definition) =
+            // a class member is exported twice, bare and as `Class.Member`;
+            // one entry per DEFINITION, not per spelling
+            let key = label + "/" + d.Path + ":" + string d.Offset
+            if (dictTryFind seen key).IsNone then
+                dictSet seen key true
+                vecAdd out (label, Analysis.Resolve.kindLabel d.Kind, typeOf d, full)
+        // the prelude first, so the numeric classes and their members are
+        // offered in a project that has not opened anything
+        let bp = Parser.parse Builtin.source
+        let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
+        for full, d in bb.Exports do offer d.Name full d
+        for _, (b : Analysis.Resolve.BindResult, _) in dictPairs r.Files do
+            for full, d in b.Exports do offer d.Name full d
+        match dictTryFind r.Files path with
+        | Some (b, _) -> for d in b.Definitions do offer d.Name d.Name d
+        | None -> ()
+        vecToList out
+
     member this.HoverAt (path : string) (offset : int) : string option =
         this.DefinitionAt path offset
         |> Option.map (fun d ->

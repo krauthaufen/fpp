@@ -1,8 +1,8 @@
 {
   "name": "fpp",
   "displayName": "F++",
-  "description": "F++ language support: diagnostics, hover types, go to definition, outline.",
-  "version": "0.1.0",
+  "description": "F++ language support: diagnostics, hover types with class constraints, completion, go to definition, outline.",
+  "version": "0.2.0",
   "publisher": "fpp",
   "license": "MIT",
   "engines": {
