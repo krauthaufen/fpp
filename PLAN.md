@@ -818,7 +818,8 @@ Four gaps closed on the way:
 parsedrive.fpp` (parses a source string with the emitted parser, prints a
 paren/dot shape fingerprint of the tree, the round-trip witness and the
 diagnostics, and does it again for deliberately broken input) does not emit
-yet: 102 errors, and every one of them is one of exactly two causes.
+yet. It was 102 errors from exactly two causes; the second is fixed, so 93
+remain, all of them the first.
 
 - **Mutually recursive LOCAL functions.** `let rec even ... and odd ...`
   inside a function: `odd` is unresolved at its use inside `even`, so
@@ -830,14 +831,18 @@ yet: 102 errors, and every one of them is one of exactly two causes.
   the knot tied at emission — the self-marker patch (`$selfmark`, "tie the
   recursive knot") already does this for ONE closure and generalizes to a
   group with one marker each.
-- **A captured mutable local.** `let mutable acc = 0` assigned from inside a
-  nested function: "assignment to unknown acc". Mutable locals are wasm
-  locals and closure conversion copies free variables BY VALUE into the env
-  cons-chain, so the closure writes to a copy. Captured-and-assigned locals
-  need to become one-field mutable cells: allocated in the enclosing frame,
-  read/written through `struct.get`/`struct.set`, and captured by
-  reference — which the existing by-value capture then does correctly,
-  since what it copies is the cell.
+- ~~**A captured mutable local.**~~ FIXED. Mutable locals are wasm locals and
+  closure conversion copies free variables BY VALUE, so a closure used to
+  write to a copy ("assignment to unknown acc"). A local that is let-bound,
+  assigned, and mentioned inside a lambda is now a one-field `$cell`:
+  allocated in the frame, read and written through `struct.get`/`struct.set`,
+  and captured AS the cell, so the frame and every closure over it write the
+  same slot. The decision is per binding, so all uses agree; a top-level
+  function's own parameter lambdas do not count as a capture boundary (its
+  body compiles into a wasm function whose locals really are locals), which
+  is what keeps unboxed float loops unboxed. Pinned by four tests: a counter
+  that outlives its frame, two closures over one cell, a lambda handed to
+  `List.iter`, and a cell-count baseline for the uncaptured case.
 
 Minimal repros for both, ready to grow into tests, are 12 lines each:
 `let rec even k = if k = 0 then true else odd (k - 1) and odd k = ...` and

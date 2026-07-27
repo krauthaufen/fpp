@@ -266,3 +266,79 @@ let acceptanceProgressTests =
             Expect.stringContains wat "array.new_default" "zero fill is the default fill"
         }
     ]
+
+[<Tests>]
+let capturedMutableTests =
+    // Closure conversion copies the environment by value, so a mutable a
+    // closure WRITES to has to be a shared cell. These pin the sharing.
+    testList "captured mutable locals" [
+        test "a closure keeps writing the cell after the frame is gone" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let makeCounter (start : int) : unit -> int ="
+                    "    let mutable n = start"
+                    "    fun () ->"
+                    "        n <- n + 1"
+                    "        n"
+                    "let c = makeCounter 10"
+                    "let a1 = print (string (c ()))"
+                    "let a2 = print (string (c ()))"
+                    "let a3 = print (string (c ()))"
+                    "" ])
+            Expect.equal out "11\n12\n13\n" "the counter counts"
+        }
+        test "two closures share one cell" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let pair (u : unit) : (int -> unit) * (unit -> int) ="
+                    "    let mutable acc = 0"
+                    "    (fun k -> acc <- acc + k), (fun () -> acc)"
+                    "let ps = pair ()"
+                    "let r ="
+                    "    match ps with"
+                    "    | (add, get) ->"
+                    "        add 5"
+                    "        add 7"
+                    "        print (string (get ()))"
+                    "" ])
+            Expect.equal out "12\n" "the writer and the reader see the same box"
+        }
+        test "a lambda handed to a higher-order function writes the frame's local" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let sumOf (xs : int list) : int ="
+                    "    let mutable s = 0"
+                    "    List.iter (fun x -> s <- s + x) xs"
+                    "    s"
+                    "let d1 = print (string (sumOf [ 1; 2; 3; 4 ]))"
+                    "" ])
+            Expect.equal out "10\n" "List.iter accumulates into the caller's mutable"
+        }
+        test "a mutable nobody captures stays a plain local" {
+            // the prelude has captured mutables of its own, so the question
+            // is whether THIS program adds a cell — count against a baseline
+            let cells (src : string) =
+                let ws = Fpp.Workspace()
+                ws.SetFileText "t.fpp" src
+                let wat, errs = ws.EmitProgram ()
+                Expect.isEmpty errs "emits"
+                wat.Split([| "struct.new $cell" |], System.StringSplitOptions.None).Length - 1
+            let baseline = cells "module M\nlet z = print \"hi\"\n"
+            let withLoop =
+                cells (String.concat "\n" [
+                    "module M"
+                    "let plain (n : int) : float ="
+                    "    let mutable f = 0.5"
+                    "    let mutable i = 0"
+                    "    while i < n do"
+                    "        f <- f + 1.5"
+                    "        i <- i + 1"
+                    "    f"
+                    "let f1 = print (string (plain 4))"
+                    "" ])
+            Expect.equal withLoop baseline "no cell where nothing captures"
+        }
+    ]

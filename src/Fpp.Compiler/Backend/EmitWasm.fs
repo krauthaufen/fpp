@@ -516,6 +516,77 @@ let emit (decls : Decl list) : EmitResult =
     // single-payload constructors used as first-class functions
     let ctorAsFn = vecNew<string> ()
 
+    // Mutable locals that a closure captures. Capture copies the environment
+    // BY VALUE, so a mutable the closure writes to has to be a shared box:
+    // the local holds a one-field cell, reads dereference it, and the copy
+    // that lands in the closure's env is a copy of the reference.
+    let cellVars = dictNew<string * int, bool> ()
+    let cellRead (w : string) = "(struct.get $cell 0 (ref.cast (ref $cell) " + w + "))"
+
+    // A local becomes a cell when it is let-bound, assigned somewhere, and
+    // mentioned inside a lambda. The test is per BINDING, so every read and
+    // write of it agrees on the representation; a variable bound inside the
+    // lambda that mentions it costs one needless allocation and nothing else.
+    let cellScan () =
+        let letBound = dictNew<string * int, bool> ()
+        let assigned = dictNew<string * int, bool> ()
+        let inLambda = dictNew<string * int, bool> ()
+        let rec go (depth : int) (e : Expr) =
+            let g = go depth
+            match e with
+            | EVar (v, _) | EVarI (v, _, _) ->
+                if depth > 0 then dictSet inLambda (v.Path, v.Offset) true
+            | ELam (_, b) -> go (depth + 1) b
+            | EAssign (v, x) ->
+                dictSet assigned (v.Path, v.Offset) true
+                if depth > 0 then dictSet inLambda (v.Path, v.Offset) true
+                g x
+            | ELet (_, v, _, r, b) ->
+                dictSet letBound (v.Path, v.Offset) true
+                g r
+                g b
+            | EApp (f, args) -> g f; List.iter g args
+            | EIf (a, b, c) -> g a; g b; g c
+            | EMatch (s, cs) ->
+                g s
+                for _, gd, b in cs do
+                    (match gd with Some gd -> g gd | None -> ())
+                    g b
+            | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter g xs
+            | ECtor (_, _, xs) -> List.iter g xs
+            | ERecord (_, fs) -> for _, v in fs do g v
+            | EField (r, _, _) -> g r
+            | EFieldSet (r, _, _, v) -> g r; g v
+            | EWhile (c, b) -> g c; g b
+            | EArray (_, xs) -> List.iter g xs
+            | EIndex (_, a, i) -> g a; g i
+            | EIndexSet (_, a, i, v) -> g a; g i; g v
+            | EArrayLen (_, a) -> g a
+            | EArrayCreate (_, n, v) -> g n; g v
+            | EArrayPin (_, a) -> g a
+            | EArrayUnpin (_, a) -> g a
+            | ETry (b, cs) ->
+                g b
+                for _, gd, x in cs do
+                    (match gd with Some gd -> g gd | None -> ())
+                    g x
+            | _ -> ()
+        // a top-level function's own parameter lambdas ARE the function, not
+        // a capture boundary — its body compiles into a wasm function whose
+        // locals are locals
+        let rec skipParams (e : Expr) =
+            match e with
+            | ELam (_, b) -> skipParams b
+            | _ -> e
+        for d in decls do
+            match d with
+            | DLet (_, _, _, e) -> go 0 (skipParams e)
+            | _ -> ()
+        for k, _ in dictPairs assigned do
+            if (dictTryFind letBound k).IsSome && (dictTryFind inLambda k).IsSome then
+                dictSet cellVars k true
+    cellScan ()
+
     let boolWat (w : string) = "(ref.i31 " + w + ")"
     let unwrapI32 (w : string) = "(call $toi " + w + ")"
     let intWat (w : string) = "(call $ofi " + w + ")"
@@ -645,6 +716,10 @@ let emit (decls : Decl list) : EmitResult =
             let key = (v.Path, v.Offset)
             (match dictTryFind locals key with
              | Some l ->
+                 // a captured mutable lives in a cell: the local holds the
+                 // cell, and reading it is a dereference
+                 if (dictTryFind cellVars key).IsSome then cellRead ("(local.get " + l + ")")
+                 else
                  (match dictTryFind localKinds key with
                   | Some k when k <> "u" -> boxK k ("(local.get " + l + ")")
                   | _ -> "(local.get " + l + ")")
@@ -655,7 +730,10 @@ let emit (decls : Decl list) : EmitResult =
                      let mutable w = "(local.get $env)"
                      for _ in 1 .. idx do
                          w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
-                     "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                     let slot = "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                     // the env slot holds the CELL, shared with the frame
+                     // that owns it — that sharing is the whole point
+                     if (dictTryFind cellVars key).IsSome then cellRead slot else slot
                  | None ->
                      match dictTryFind topArity key, dictTryFind topName key with
                      | Some arity, Some fname ->
@@ -882,6 +960,13 @@ let emit (decls : Decl list) : EmitResult =
             "(block (result anyref) (local.set " + l + " (global.get $selfmark)) "
             + "(local.set " + l + " " + cloW + ") "
             + "(call $patchself (local.get " + l + ")) " + recurT body + ")"
+        | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
+            // captured mutable: the frame holds the cell, not the value
+            let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+            let r = recur rhs
+            dictSet locals (v.Path, v.Offset) l
+            "(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) "
+            + recurT body + ")"
         | ELet (_, v, _, rhs, body) ->
             let k = kindOf rhs
             let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
@@ -1400,6 +1485,24 @@ let emit (decls : Decl list) : EmitResult =
             "(block (result anyref) (block $brk" + lbl + " (loop $cont" + lbl + " "
             + "(br_if $brk" + lbl + " (i32.eqz " + unwrapI32 (recur c) + ")) "
             + "(drop " + recur b + ") (br $cont" + lbl + "))) (ref.i31 (i32.const 0)))"
+        | EAssign (v, e) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
+            // the cell may live in this frame or in the closure's env; both
+            // reads yield the same cell, and the write goes through it
+            let cell =
+                match dictTryFind locals (v.Path, v.Offset) with
+                | Some l -> "(local.get " + l + ")"
+                | None ->
+                    match dictTryFind freeEnv (v.Path, v.Offset) with
+                    | Some idx ->
+                        let mutable w = "(local.get $env)"
+                        for _ in 1 .. idx do
+                            w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
+                        "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                    | None ->
+                        emitError ("assignment to unknown " + v.Name)
+                        "(ref.i31 (i32.const 0))"
+            "(block (result anyref) (struct.set $cell 0 (ref.cast (ref $cell) " + cell + ") "
+            + recur e + ") (ref.i31 (i32.const 0)))"
         | EAssign (v, e) ->
             (match dictTryFind locals (v.Path, v.Offset) with
              | Some l ->
@@ -1937,9 +2040,25 @@ let emit (decls : Decl list) : EmitResult =
              + localDecls + " " + bodyW + ")")
         // build the env chain from the enclosing scope (reverse order so
         // index i is reached by i cdr steps)
+        // a cell is captured AS the cell — dereferencing here would copy the
+        // value and the closure's writes would be lost
+        let captureW (k : string * int) =
+            if (dictTryFind cellVars k).IsSome then
+                match dictTryFind outerLocals k with
+                | Some l -> "(local.get " + l + ")"
+                | None ->
+                    match dictTryFind outerFree k with
+                    | Some idx ->
+                        let mutable w = "(local.get $env)"
+                        for _ in 1 .. idx do
+                            w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
+                        "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                    | None -> "(ref.null any)"
+            else
+                recurOuter (EVar ({ Path = fst k; Offset = snd k; Name = "_free" }, Fpp.Analysis.Types.mono (Fpp.Analysis.Types.TCon ("?", []))))
         let envW =
             List.foldBack
-                (fun k acc -> "(struct.new $cons " + recurOuter (EVar ({ Path = fst k; Offset = snd k; Name = "_free" }, Fpp.Analysis.Types.mono (Fpp.Analysis.Types.TCon ("?", [])))) + " " + acc + ")")
+                (fun k acc -> "(struct.new $cons " + captureW k + " " + acc + ")")
                 freeList "(ref.null any)"
         "(struct.new $clo (ref.func " + fname + ") " + envW + ")"
 
@@ -1948,6 +2067,9 @@ let emit (decls : Decl list) : EmitResult =
     line "(module"
     line "  (type $u1 (func (param anyref anyref) (result anyref)))"
     line "  (type $clo (struct (field (ref $u1)) (field anyref)))"
+    // one mutable slot: a mutable local that a closure captures lives here,
+    // so the frame and the closure write to the same place
+    line "  (type $cell (struct (field (mut anyref))))"
     line "  (type $cons (struct (field (mut anyref)) (field (mut anyref))))"
     line "  (type $str (array (mut i8)))"
     line "  (type $boxf (struct (field f64)))"
