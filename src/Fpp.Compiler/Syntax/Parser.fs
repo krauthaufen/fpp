@@ -496,7 +496,10 @@ let parse (src : string) : ParseResult =
         while go do
             if s.IsOp "." && s.SameLine then
                 let dot = s.Bump ()
-                if s.Is Ident then e <- Green.node DotExpr [ e; dot; s.Bump () ]
+                // `Add.(+)` names a class' operator member — the same fused
+                // identifier the declaration used
+                if atOperatorName () then e <- Green.node DotExpr [ e; dot; bumpOperatorName () ]
+                elif s.Is Ident then e <- Green.node DotExpr [ e; dot; s.Bump () ]
                 elif s.Is LBracket then e <- Green.node DotExpr [ e; dot; parseAtom ctx ]   // x.[i]
                 else
                     s.Diag "expected member name after '.'"

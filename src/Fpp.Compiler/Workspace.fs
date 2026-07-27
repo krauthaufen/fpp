@@ -415,6 +415,9 @@ type Workspace() =
         let bb = Analysis.Resolve.resolve Builtin.path (dictNew ()) bp.Root
         let blow = Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) r.Members r.Interfaces (dictNew ()) (dictNew ())
         for d in blow.Decls do vecAdd allDecls d
+        // one function per primitive instance member, so `Add.(+)` denotes
+        // something callable even where `a + b` is a machine instruction
+        for d in Fpp.Core.Link.builtinInstanceWrappers r.Classes do vecAdd allDecls d
         for path in this.ProjectFiles do
             lowerOne path (this.ParseFile path).Root
         // linked library declarations join the program before emission

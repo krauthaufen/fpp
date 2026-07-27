@@ -406,7 +406,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let classUsesRaw = vecNew<int * Classes.InstMember> ()
     /// class-member uses parked until solving finishes: the instance is
     /// often only pinned down by a later unification
-    let pendingClassUses = vecNew<int * string * Constraint> ()
+    /// (offset, member, constraint, byName). A use written as a NAME
+    /// (`Add.(+)`) must denote a function even at a primitive instance; one
+    /// written as an operator (`a + b`) emits the instruction instead.
+    let pendingClassUses = vecNew<int * string * Constraint * bool> ()
     /// operator offset -> the left operand's type, for the backend
     let opTypesRaw = vecNew<int * Type> ()
 
@@ -492,10 +495,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         wanted <- wanted |> List.filter (fun (_, c) -> not (moved c))
         sch
 
-    let instanceMember (c : Constraint) (memberName : string) : Classes.InstMember option =
+    let instanceMember (byName : bool) (c : Constraint) (memberName : string) : Classes.InstMember option =
         match Classes.select classes c.Class c.Args c.Assoc with
         | Classes.Solved (inst, _) ->
-            inst.Members |> List.tryPick (fun (m, k) -> if m = memberName then Some k else None)
+            match inst.Members |> List.tryPick (fun (m, k) -> if m = memberName then Some k else None) with
+            | Some k -> Some k
+            | None when byName && inst.Builtin -> Some (Classes.wrapperMember inst memberName)
+            | None -> None
         | _ -> None
 
     /// The head of `class C<'a,'b>` / `instance C<int,int>`: the class name
@@ -746,7 +752,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               match dictTryFind classes.MemberOwner t.Text with
                               | Some cls ->
                                   (match cs |> List.tryFind (fun c -> c.Class = cls) with
-                                   | Some c -> vecAdd pendingClassUses (t.Offset, t.Text, c)
+                                   | Some c -> vecAdd pendingClassUses (t.Offset, t.Text, c, true)
                                    | None -> ())
                               | None -> ()
                           (match schemeOfDef d with
@@ -921,7 +927,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                addWanted op.Offset c
                                // if this resolves to an instance with a body,
                                // the operator IS a call to it
-                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c)
+                               vecAdd pendingClassUses (op.Offset, Classes.operatorMember op.Text, c, false)
                                // solve eagerly: with one operand known the
                                // choice is often already forced, and fixing
                                // it here keeps later inference honest
@@ -1235,13 +1241,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match qualified with
                  | Some d ->
                      // qualified use (Module.fn): record its instantiation too
+                     let oweAt (tk : Token) (cs : Constraint list) : unit =
+                         for c in cs do addWanted tk.Offset c
+                         // `Num.Zero` binds to an instance member exactly as
+                         // the bare `Zero` does — the qualification only says
+                         // which class, never which instance
+                         match dictTryFind classes.MemberOwner d.Name with
+                         | Some cls ->
+                             (match cs |> List.tryFind (fun c -> c.Class = cls) with
+                              | Some c -> vecAdd pendingClassUses (tk.Offset, d.Name, c, true)
+                              | None -> ())
+                         | None -> ()
                      (match schemeOfDef d, lastIdent with
                       | Some sc, Some tk when not (List.isEmpty sc.Quantified) && d.Path = path ->
                           let ty, fresh, cs = instantiateTracked sc
-                          for c in cs do addWanted tk.Offset c
+                          oweAt tk cs
                           vecAdd instRaw (tk.Offset, fresh)
                           ty
                       | _ ->
+                          match instantiateFor d, lastIdent with
+                          | Some (t, cs), Some tk -> oweAt tk cs; t
+                          | _ ->
                           match instantiateFor d with
                           | Some (t, _) -> t
                           | None -> st.Fresh ())
@@ -2021,8 +2041,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // a class-member use binds to an instance member only once solving has
     // settled; a builtin instance has no member to bind to, which is exactly
     // when the backend emits the operation itself
-    for offset, name, c in vecToList pendingClassUses do
-        match instanceMember c name with
+    for offset, name, c, byName in vecToList pendingClassUses do
+        match instanceMember byName c name with
         | Some key -> vecAdd classUsesRaw (offset, key)
         | None -> ()
 

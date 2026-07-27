@@ -100,6 +100,22 @@ let operatorClass (op : string) : string option =
 /// The member name a class uses for its operator, given the symbol.
 let operatorMember (op : string) : string = "(" + op + ")"
 
+/// The operator symbol a member name spells, if it is one.
+let memberOperator (m : string) : string option =
+    if m.Length > 2 && m.StartsWith "(" && m.EndsWith ")" then Some (m.Substring (1, m.Length - 2))
+    else None
+
+/// A primitive instance has no body, because `a + b` emits a machine
+/// instruction. But `Add.(+)` NAMES the member, and a name has to denote
+/// something callable — so one wrapper function is generated per primitive
+/// instance member. Ordinary operator uses never reach it, and dead-code
+/// elimination drops the ones nobody named.
+let wrapperMember (i : InstanceDef) (memberName : string) : InstMember =
+    { MPath = i.Path
+      MOffset = 2000000 + i.Offset * 8
+      MName = memberName
+      MTakesUnit = false }
+
 // ---- matching -------------------------------------------------------------
 
 let rec private sameType (a : Type) (b : Type) : bool =

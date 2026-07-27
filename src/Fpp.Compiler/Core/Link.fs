@@ -560,6 +560,33 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | _ -> true)
 
+/// The bodies of the primitive instances. `instance Add<int,int>` declares
+/// no member because `a + b` compiles to `i32.add`, but `Add.(+)` names the
+/// member, and a name must denote a function. Generated here rather than
+/// written in the prelude, because a prelude body would have to spell the
+/// operator that this very instance defines.
+let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
+    [ for cls, insts in dictPairs classes.Instances do
+        match dictTryFind classes.Classes cls with
+        | None -> ()
+        | Some cd ->
+            for i in vecToList insts do
+                if i.Builtin then
+                    for m, msch in cd.Members do
+                        match Classes.memberOperator m, i.Head, i.Assoc with
+                        | Some op, [ l; r ], [ (_, res) ] ->
+                            let im = Classes.wrapperMember i m
+                            let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                            let ps =
+                                [ { Path = im.MPath; Offset = im.MOffset + 1; Name = "a" }, mono l
+                                  { Path = im.MPath; Offset = im.MOffset + 2; Name = "b" }, mono r ]
+                            let sch = mono (TFun (l, TFun (r, res)))
+                            let args = ps |> List.map (fun (pv, psch) -> EVar (pv, psch))
+                            ignore msch
+                            yield DLet (false, v, sch,
+                                        ELam (ps, EPrim (withOpType (op + "@") (typeConName l), args)))
+                        | _ -> () ]
+
 /// Monomorphize with no user instances in play.
 let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
     monomorphizeWith isStructName (dictNew ()) decls

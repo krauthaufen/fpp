@@ -135,6 +135,31 @@ let genericMathTests =
     ]
 
 [<Tests>]
+let qualificationTests =
+    testList "classes: qualified members" [
+        test "a member can always be named through its class" {
+            let out =
+                run [ "let a = print (Num.Zero + Num.One)"
+                      "let b = print (Add.(+) 3 4)"
+                      "let c = print (Mul.(*) 2.5 4.0)" ]
+            // the qualification says which CLASS; the instance is still
+            // whatever the operand types select
+            Expect.equal out "1\n7\n10\n" "class-qualified names resolve like bare ones"
+        }
+        test "qualification survives at a user instance" {
+            let out =
+                run (v2d @
+                     [ "let z : V2d = Num.One"
+                       "let a = print (Add.(+) z z).X" ])
+            Expect.equal out "2\n" "the operator member is the instance's body"
+        }
+        test "a qualified member still picks the instance by type" {
+            let out = run (v2d @ [ "let z : V2d = Num.Zero"; "let a = print z.Y" ])
+            Expect.equal out "0\n" "Num.Zero at V2d is the user instance's Zero"
+        }
+    ]
+
+[<Tests>]
 let userInstanceTests =
     testList "classes: user instances" [
         test "a type gains the operators by declaring instances" {

@@ -717,7 +717,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.tryHead, Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some lhs, Some name ->
                      // qualified value (resolver linked it) or field access
-                     (match dictTryFind useDefs name.Offset |> Option.filter (fun d -> d.Kind <> Resolve.DefMember) with
+                     (match dictTryFind classUses name.Offset with
+                      // `Num.Zero` — the class says which member, the
+                      // instance says which body
+                      | Some im ->
+                          let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                          let sch = mono (TCon ("?", []))
+                          if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
+                      | None ->
+                     match dictTryFind useDefs name.Offset |> Option.filter (fun d -> d.Kind <> Resolve.DefMember) with
                       | Some d when d.Kind = Resolve.DefCase -> ECtor (d.Name, schemeOf d, [])
                       | Some d ->
                           (match dictTryFind instSites name.Offset with

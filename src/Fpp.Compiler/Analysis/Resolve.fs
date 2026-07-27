@@ -83,10 +83,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let record (t : Token) (d : Definition) : unit =
         vecAdd uses { UseOffset = t.Offset; UseLength = strLen t.Text; Def = d }
 
-    let exportDef (d : Definition) : unit =
-        let full = if modulePath = "" then d.Name else modulePath + "." + d.Name
+    let exportUnder (name : string) (d : Definition) : unit =
+        let full = if modulePath = "" then name else modulePath + "." + name
         vecAdd exports (full, d)
         dictSet ownExports full d
+
+    let exportDef (d : Definition) : unit = exportUnder d.Name d
 
     /// Bases to try when qualifying a name. F# shadowing: the LAST `open`
     /// wins among competing candidates, so opens are consulted in reverse
@@ -609,7 +611,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     and walkClassDecl (env : Env) (n : GreenNode) : Env =
         let exportHere = atExportLevel
         let mutable outer = env
-        (match firstIdentToken n.Children with
+        // the name sits inside the head type (`class Num<'a>` parses the head
+        // as an application), not as a direct token child
+        let nameTok =
+            n.Children
+            |> List.tryPick (fun c ->
+                match c with
+                | GNode ty when isTypeKind ty.NodeKind ->
+                    Green.tokens c |> List.tryFind (fun t -> t.Kind = Ident)
+                | _ -> None)
+        let className = match nameTok with Some t -> t.Text | None -> "?"
+        (match nameTok with
          | Some t ->
              let d = define DefType t
              outer <- Map.add t.Text d outer
@@ -625,7 +637,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     | Some t ->
                         let d = define DefLet t
                         outer <- Map.add t.Text d outer
-                        if exportHere then exportDef d
+                        if exportHere then
+                            exportDef d
+                            // also under `Class.Member`, so every member has
+                            // a spelling that cannot be shadowed or confused
+                            // with another class' member of the same name
+                            exportUnder (className + "." + t.Text) d
                     | None -> ()
                 for x in m.Children do
                     match x with
