@@ -246,6 +246,17 @@ Docs: editors/README.md.
       structural equality and hashing. Conversions dispatch on the type
       INFERENCE resolved, not the backend's kind analysis — the latter
       cannot see through a global.
+- [x] float16. wasm has no f16 either, so a half is its 16-BIT PATTERN in an
+      i31 — allocation-free, like an int — and every operation widens to f32,
+      works there, and rounds back ONCE. That single rounding is correct:
+      double rounding is innocuous at 2p+2 bits and f32's 24 is exactly the
+      bound for f16's 11, so arithmetic is bit-identical to native hardware.
+      Conversion from DOUBLE goes straight to f16 ($f2h64) rather than
+      through f32, which would round twice and is observably different at
+      the bottom of the subnormal range. Checked against System.Half.
+- [ ] float16 in PACKED storage — 2 bytes per array element and struct
+      field. It stores as an i32 today, so the size win is not there yet,
+      and that win is the whole point for vertex and texture buffers.
 - [ ] uint64, and the smaller widths (int8/16, byte). No demand yet.
 - [ ] `decimal` — DEFERRED, deliberately. wasm has four numeric types and
       none of them is decimal, so it would be a software bignum: a 96-bit

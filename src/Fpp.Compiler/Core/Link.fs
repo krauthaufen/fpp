@@ -40,6 +40,7 @@ let private withOpType (op : string) (name : string) : string =
     match name with
     | "float" -> baseOp + "f"
     | "float32" -> baseOp + "s"
+    | "float16" -> baseOp + "h"
     | "int64" -> baseOp + "l"
     | "uint32" -> baseOp + "w"
     | "string" -> baseOp + "t"

@@ -444,6 +444,44 @@ instance Rem<~T~, ~T~>
             // the transcendentals, and the float remainder they need
             floatingInstance "float" "F" ""
             floatingInstance "float32" "F32" "f"
+            // float16: every operation widens to f32, works there and rounds
+            // back once, which is the correctly-rounded half. The backend
+            // supplies the arithmetic; the transcendentals borrow float32's.
+            [ "instance Add<float16, float16>"
+              "    type Result = float16"
+              "instance Sub<float16, float16>"
+              "    type Result = float16"
+              "instance Mul<float16, float16>"
+              "    type Result = float16"
+              "instance Div<float16, float16>"
+              "    type Result = float16"
+              "instance Rem<float16, float16>"
+              "    type Result = float16"
+              "    static (%) a b = a - b * truncate (a / b)"
+              "instance Ordered<float16>"
+              "instance Neg<float16>"
+              "instance Abs<float16>"
+              "instance MinMax<float16>"
+              "    static min a b = if a < b then a else b"
+              "    static max a b = if a > b then a else b"
+              "instance Num<float16>"
+              "    static Zero = 0.0h"
+              "    static One = 1.0h"
+              "instance Fractional<float16>"
+              "instance Floating<float16>"
+              "    static exp x = float16 (exp (float32 x))"
+              "    static log x = float16 (log (float32 x))"
+              "    static sin x = float16 (sin (float32 x))"
+              "    static cos x = float16 (cos (float32 x))"
+              "    static tan x = float16 (tan (float32 x))"
+              "    static sinh x = float16 (sinh (float32 x))"
+              "    static cosh x = float16 (cosh (float32 x))"
+              "    static tanh x = float16 (tanh (float32 x))"
+              "    static asin x = float16 (asin (float32 x))"
+              "    static acos x = float16 (acos (float32 x))"
+              "    static atan x = float16 (atan (float32 x))"
+              "    static atan2 y x = float16 (atan2 (float32 y) (float32 x))"
+              "    static pow a b = float16 (pow (float32 a) (float32 b))" ]
         ]
 
     let source =

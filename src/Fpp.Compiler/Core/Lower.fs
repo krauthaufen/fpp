@@ -299,27 +299,35 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16" ]
                           && (dictTryFind useDefs t.Offset).IsNone
-                          && (dictTryFind opKinds t.Offset).IsSome
                       | None -> false)
                  | _ -> false) ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ head; a ] ->
                      let t = (tokensOf head |> List.head)
-                     let k = (dictTryFind opKinds t.Offset).Value
+                     // no entry means the source is int, which is the kind
+                     // OpKinds leaves out
+                     let k = match dictTryFind opKinds t.Offset with Some x -> x | None -> ""
                      EApp (EUnknown (t.Text + "#" + k), [ lowerExpr (GNode a) ])
                  | _ -> note (offsetOf n) "conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
-                      | Some t -> t.Text = "print" && (dictTryFind opKinds t.Offset) = Some "w"
+                      | Some t ->
+                          t.Text = "print"
+                          && (match dictTryFind opKinds t.Offset with
+                              | Some "w" | Some "h" -> true
+                              | _ -> false)
                       | None -> false)
                  | _ -> false) ->
                 // an unsigned value prints unsigned
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
-                 | [ _; a ] -> EApp (EUnknown "printu", [ lowerExpr (GNode a) ])
+                 | [ head; a ] ->
+                     let t = (tokensOf head |> List.head)
+                     let fn = if (dictTryFind opKinds t.Offset) = Some "h" then "printh" else "printu"
+                     EApp (EUnknown fn, [ lowerExpr (GNode a) ])
                  | _ -> note (offsetOf n) "print shape")
             | AppExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

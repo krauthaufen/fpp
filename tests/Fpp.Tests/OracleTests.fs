@@ -861,6 +861,13 @@ let oracleTests =
             "let a = print (sum [1; 2; 3; 4; 5])"
             "let b = print (sum (rev [] [10; 20; 30]))"
         ]
+        oracle "infinity and NaN print, rather than trapping" [
+            // the float printer truncated to i64, so these three killed the
+            // program instead of printing
+            "let a = print (1.0 / 0.0)"
+            "let b = print (0.0 - 1.0 / 0.0)"
+            "let c = print (0.0 / 0.0)"
+        ]
         oracle "string ordering is ordinal, like F#" [
             "let cmp a b ="
             "    if a < b then \"lt\" elif a > b then \"gt\" else \"eq\""

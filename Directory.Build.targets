@@ -1,0 +1,15 @@
+<Project>
+
+  <!-- `dotnet test` drives the VSTest target. Expecto has no VSTest adapter
+       that works on this toolchain, and WITHOUT one `dotnet test` discovers
+       nothing, runs nothing, and reports success — a green CI over an
+       untested tree, which is the worst of the available failures.
+
+       Overriding the target here (Directory.Build.targets is imported after
+       the SDK's own targets, so this definition wins) makes `dotnet test`
+       run the real Expecto suite and propagate its exit code. -->
+  <Target Name="VSTest" DependsOnTargets="Build" Condition="'$(IsTestProject)' == 'true'">
+    <Exec Command="dotnet &quot;$(TargetPath)&quot;" />
+  </Target>
+
+</Project>

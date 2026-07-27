@@ -20,6 +20,7 @@ type InferResult =
       /// definition offset, length, pretty-printed type
       DefTypes : (int * int * string) list
       /// operator token offset -> resolved kind: "f"=float "s"=float32
+      /// "h"=float16
       /// "l"=int64 "t"=string ""=int/other — drives typed prim emission
       OpKinds : (int * string) list
       /// array-site offset -> element type name (for flat struct arrays)
@@ -629,7 +630,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             elif t.Text.EndsWith "u" || t.Text.EndsWith "U" then tUInt
             else tInt
         | FloatLit ->
-            if t.Text.EndsWith "f" || t.Text.EndsWith "F" then TCon ("float32", []) else tFloat
+            // `1.5h` is a half — F# has no such literal, so the spelling is
+            // ours; `f` keeps its F# meaning
+            if t.Text.EndsWith "h" || t.Text.EndsWith "H" then TCon ("float16", [])
+            elif t.Text.EndsWith "f" || t.Text.EndsWith "F" then TCon ("float32", [])
+            else tFloat
         | StringLit -> tString
         | CharLit -> tChar
         | Keyword when t.Text = "true" || t.Text = "false" -> tBool
@@ -829,7 +834,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -854,6 +859,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
+                              // widening and narrowing between float widths
+                              | Some t when List.contains t.Text [ "float"; "float32"; "float16" ]
+                                            && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon (t.Text, []))
                               | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (TCon ("int64", []))
@@ -2177,6 +2187,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match prune t with
         | TCon ("float", []) -> "f"
         | TCon ("float32", []) -> "s"
+        | TCon ("float16", []) -> "h"
         | TCon ("int64", []) -> "l"
         | TCon ("uint32", []) -> "w"
         | TCon ("string", []) -> "t"

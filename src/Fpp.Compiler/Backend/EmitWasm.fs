@@ -140,7 +140,8 @@ let emit (decls : Decl list) : EmitResult =
         | "float" -> "f"
         | "float32" -> "s"
         | "int64" -> "l"
-        | "int" | "bool" | "char" -> "i"
+        // a half is carried as its bit pattern, so it stores like an int
+        | "int" | "bool" | "char" | "float16" -> "i"
         | n when List.contains n structNamesOf -> "S:" + n
         | _ -> "r"
     let mutable structNameList : string list = []
@@ -152,7 +153,7 @@ let emit (decls : Decl list) : EmitResult =
     // flat-array element classification: primitive kind or a struct name
     let primKindOf (tyName : string) : string =
         match tyName with
-        | "int" | "bool" | "char" -> "i"
+        | "int" | "bool" | "char" | "float16" -> "i"
         | "float" -> "f"
         | "float32" -> "s"
         | "int64" -> "l"
@@ -515,7 +516,11 @@ let emit (decls : Decl list) : EmitResult =
     let suffixedOps = [ "+"; "-"; "*"; "/"; "%" ]
     let rec kindOf (e : Expr) : string =
         match e with
-        | ELit (LFloat t) -> if t.EndsWith "f" || t.EndsWith "F" then "s" else "f"
+        | ELit (LFloat t) ->
+            // a half is an i31 bit pattern, so it is uniform like an int
+            if t.EndsWith "h" || t.EndsWith "H" then "u"
+            elif t.EndsWith "f" || t.EndsWith "F" then "s"
+            else "f"
         | ELit (LInt t) -> if t.EndsWith "L" then "l" else "u"
         | EVar (v, _) ->
             (match dictTryFind localKinds (v.Path, v.Offset) with
@@ -601,8 +606,18 @@ let emit (decls : Decl list) : EmitResult =
         | ELit LUnit -> "(ref.i31 (i32.const 0))"
         | ELit (LChar raw) -> "(ref.i31 (i32.const " + string (charCode raw) + "))"
         | ELit (LFloat s) ->
-            let num = s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = 'e')
-            if s.EndsWith "f" || s.EndsWith "F" then
+            // keep everything a wasm float constant may contain, and drop
+            // only the F++ width suffix. `E` and `e+` were being filtered
+            // out, which silently produced `1.0E5` -> `1.05`.
+            let num = s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E')
+            if s.EndsWith "h" || s.EndsWith "H" then
+                // a half literal is rounded ONCE, here, and emitted as the
+                // bit pattern it becomes — no runtime conversion
+                let v = System.Double.Parse (num, System.Globalization.CultureInfo.InvariantCulture)
+                let bits =
+                    int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
+                "(ref.i31 (i32.const " + string bits + "))"
+            elif s.EndsWith "f" || s.EndsWith "F" then
                 "(struct.new $boxs (f32.const " + num + "))"
             else
                 "(struct.new $boxf (f64.const " + num + "))"
@@ -672,6 +687,25 @@ let emit (decls : Decl list) : EmitResult =
                 | "s" -> "(call $tos " + recur a + ")"
                 | _ -> unwrapI32 (recur a)
             (match target, src with
+             // a half is its bit pattern, so every conversion goes through
+             // f32 — the one format that holds every f16 value exactly
+             | "float16", "h" -> recur a
+             | "float16", "f" -> intWat ("(call $f2h64 " + raw + ")")
+             | "float16", "s" -> intWat ("(call $f2h " + raw + ")")
+             | "float16", "l" -> intWat ("(call $f2h (f32.convert_i64_s " + raw + "))")
+             | "float16", _ -> intWat ("(call $f2h (f32.convert_i32_s " + raw + "))")
+             | "float", "h" -> "(call $off (f64.promote_f32 (call $h2f " + raw + ")))"
+             | "float32", "h" -> "(call $oss (call $h2f " + raw + "))"
+             | "int64", "h" -> "(call $ofl (i64.trunc_f32_s (call $h2f " + raw + ")))"
+             | _, "h" -> "(call $ofi (i32.trunc_f32_s (call $h2f " + raw + ")))"
+             | "float", "f" -> recur a
+             | "float", "s" -> "(call $off (f64.promote_f32 " + raw + "))"
+             | "float", "l" -> "(call $off (f64.convert_i64_s " + raw + "))"
+             | "float", _ -> "(call $off (f64.convert_i32_s " + raw + "))"
+             | "float32", "s" -> recur a
+             | "float32", "f" -> "(call $oss (f32.demote_f64 " + raw + "))"
+             | "float32", "l" -> "(call $oss (f32.convert_i64_s " + raw + "))"
+             | "float32", _ -> "(call $oss (f32.convert_i32_s " + raw + "))"
              | "int64", "l" -> recur a
              | "int64", ("f" | "s") -> "(call $ofl (i64.trunc_f" + (if src = "f" then "64" else "32") + "_s " + raw + "))"
              | "int64", _ -> "(call $ofl (i64.extend_i32_s " + raw + "))"
@@ -698,6 +732,11 @@ let emit (decls : Decl list) : EmitResult =
                  "(ref.i31 (i32.const 0))"
              | _ -> "(call $itoa " + unwrapI32 (recur a) + ")")
         | EApp (EUnknown "isNull", [ a ]) -> boolWat ("(ref.is_null " + recur a + ")")
+        | EApp (EUnknown "printh", [ a ]) ->
+            // a half is an i31 at runtime, so printing needs the STATIC type
+            // to know it is not an integer
+            "(block (result anyref) (call $printval (call $oss (call $h2f " + unwrapI32 (recur a) + ")))"
+            + " (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "printu", [ a ]) ->
             "(block (result anyref) (call $printu " + recur a + ") (call $putc (i32.const 10)) (ref.i31 (i32.const 0)))"
         | EApp (EUnknown "print", [ a ]) ->
@@ -875,6 +914,32 @@ let emit (decls : Decl list) : EmitResult =
                     boolWat ("(" + instr + " " + wa + " " + wb + ")")
                 else
                     "(call " + box_ + " (" + instr + " " + wa + " " + wb + "))"
+        // float16: widen, operate in f32, round back. One rounding, and
+        // therefore the correctly-rounded f16 answer.
+        | EPrim (op, [ a; b ]) when
+            op.EndsWith "h" && op.Length > 1
+            && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "<"; ">"; "<="; ">=" ] ->
+            let baseOp = op.Substring (0, op.Length - 1)
+            let wa = "(call $h2f " + unwrapI32 (recur a) + ")"
+            let wb = "(call $h2f " + unwrapI32 (recur b) + ")"
+            (match baseOp with
+             | "+" -> intWat ("(call $f2h (f32.add " + wa + " " + wb + "))")
+             | "-" -> intWat ("(call $f2h (f32.sub " + wa + " " + wb + "))")
+             | "*" -> intWat ("(call $f2h (f32.mul " + wa + " " + wb + "))")
+             | "/" -> intWat ("(call $f2h (f32.div " + wa + " " + wb + "))")
+             | "<" -> boolWat ("(f32.lt " + wa + " " + wb + ")")
+             | ">" -> boolWat ("(f32.gt " + wa + " " + wb + ")")
+             | "<=" -> boolWat ("(f32.le " + wa + " " + wb + ")")
+             | _ -> boolWat ("(f32.ge " + wa + " " + wb + ")"))
+        | EPrim (("sqrth" | "absh" | "truncateh" | "u-h") as op, [ a ]) ->
+            let w = "(call $h2f " + unwrapI32 (recur a) + ")"
+            let instr =
+                match op with
+                | "sqrth" -> "f32.sqrt"
+                | "absh" -> "f32.abs"
+                | "truncateh" -> "f32.trunc"
+                | _ -> "f32.neg"
+            intWat ("(call $f2h (" + instr + " " + w + "))")
         // unary machine instructions the numeric classes expose by name.
         // `abs` is the INSTRUCTION rather than `if x < 0 then -x`, because
         // that form gets -0.0 and NaN wrong.
@@ -2207,6 +2272,102 @@ TUPLE_HASH
       (array.set $str (local.get $r) (i32.add (local.get $la) (local.get $i)) (array.get_u $str (local.get $b) (local.get $i)))
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l2)))
     (local.get $r))
+  ;; ---- float16 ----------------------------------------------------------
+  ;; wasm has no f16, so a half is carried as its 16 BIT PATTERN in an i31 —
+  ;; allocation-free, like an int — and every operation widens to f32, works
+  ;; there, and rounds back. That single rounding is CORRECT: f32 carries 24
+  ;; significand bits and f16 needs 11, and double rounding is innocuous once
+  ;; the wider format has at least 2p+2, which 24 exactly is. So +, -, *, /
+  ;; and sqrt on halves agree bit-for-bit with native f16 hardware.
+  (func $h2f (param $h i32) (result f32)
+    (local $exp i32) (local $man i32) (local $sgn f32)
+    (local.set $exp (i32.and (i32.shr_u (local.get $h) (i32.const 10)) (i32.const 0x1f)))
+    (local.set $man (i32.and (local.get $h) (i32.const 0x3ff)))
+    (local.set $sgn (select (f32.const -1) (f32.const 1)
+                            (i32.and (i32.shr_u (local.get $h) (i32.const 15)) (i32.const 1))))
+    (if (i32.eq (local.get $exp) (i32.const 0))
+      (then
+        ;; zero or subnormal: the value is mantissa * 2^-24, exact in f32
+        (return (f32.mul (local.get $sgn)
+                         (f32.mul (f32.convert_i32_u (local.get $man))
+                                  (f32.const 0x1p-24))))))
+    (if (i32.eq (local.get $exp) (i32.const 0x1f))
+      (then
+        ;; infinity or NaN: rebuild with f32's exponent and a shifted payload
+        (return (f32.reinterpret_i32
+                  (i32.or (i32.shl (i32.and (i32.shr_u (local.get $h) (i32.const 15)) (i32.const 1))
+                                   (i32.const 31))
+                          (i32.or (i32.const 0x7f800000)
+                                  (i32.shl (local.get $man) (i32.const 13))))))))
+    (f32.reinterpret_i32
+      (i32.or (i32.shl (i32.and (i32.shr_u (local.get $h) (i32.const 15)) (i32.const 1)) (i32.const 31))
+              (i32.or (i32.shl (i32.add (local.get $exp) (i32.const 112)) (i32.const 23))
+                      (i32.shl (local.get $man) (i32.const 13))))))
+  ;; round-to-nearest-even, including the subnormal range, where adding a
+  ;; magic constant makes the float unit do the rounding for us
+  (func $f2h (param $f f32) (result i32)
+    (local $u i32) (local $sign i32) (local $o i32)
+    (local.set $u (i32.reinterpret_f32 (local.get $f)))
+    (local.set $sign (i32.and (local.get $u) (i32.const 0x80000000)))
+    (local.set $u (i32.xor (local.get $u) (local.get $sign)))
+    (if (i32.ge_u (local.get $u) (i32.const 0x47800000))
+      (then
+        ;; NaN keeps a payload bit so it stays a NaN; anything else saturates
+        (local.set $o (select (i32.const 0x7e00) (i32.const 0x7c00)
+                              (i32.gt_u (local.get $u) (i32.const 0x7f800000)))))
+      (else
+        (if (i32.lt_u (local.get $u) (i32.const 0x38800000))
+          (then
+            (local.set $o
+              (i32.sub (i32.reinterpret_f32
+                         (f32.add (f32.reinterpret_i32 (local.get $u)) (f32.const 0.5)))
+                       (i32.const 0x3f000000))))
+          (else
+            ;; ties-to-even: bias by half an ulp, plus one when already odd
+            (local.set $u
+              (i32.add (local.get $u)
+                       (i32.add (i32.const 0xfff)
+                                (i32.and (i32.shr_u (local.get $u) (i32.const 13)) (i32.const 1)))))
+            ;; shift into place AND rebias: f32 biases by 127, f16 by 15,
+            ;; so the exponent field moves down by (127-15) << 10
+            (local.set $o (i32.sub (i32.shr_u (local.get $u) (i32.const 13))
+                                   (i32.const 0x1c000)))))))
+    (i32.or (i32.shr_u (local.get $sign) (i32.const 16)) (local.get $o)))
+  ;; double -> half in ONE step. Going through f32 would round twice, and
+  ;; that is observable: 2.98023224e-08 sits just above the tie between 0 and
+  ;; the smallest subnormal half, but is exactly the tie once narrowed to f32,
+  ;; so the two routes disagree.
+  (func $f2h64 (param $v f64) (result i32)
+    (local $u i64) (local $mag i64) (local $sign i32) (local $o i32)
+    (local.set $u (i64.reinterpret_f64 (local.get $v)))
+    (local.set $sign (i32.wrap_i64
+                       (i64.shr_u (i64.and (local.get $u) (i64.const 0x8000000000000000))
+                                  (i64.const 48))))
+    (local.set $mag (i64.and (local.get $u) (i64.const 0x7fffffffffffffff)))
+    (if (i64.ge_u (local.get $mag) (i64.const 0x40f0000000000000))
+      (then
+        (local.set $o (select (i32.const 0x7e00) (i32.const 0x7c00)
+                              (i64.gt_u (local.get $mag) (i64.const 0x7ff0000000000000)))))
+      (else
+        (if (i64.lt_u (local.get $mag) (i64.const 0x3f10000000000000))
+          (then
+            ;; adding 2^28 puts the half's last bit at the double's last bit,
+            ;; so the float unit does the rounding
+            (local.set $o
+              (i32.wrap_i64
+                (i64.sub (i64.reinterpret_f64
+                           (f64.add (f64.reinterpret_i64 (local.get $mag)) (f64.const 268435456)))
+                         (i64.const 0x41b0000000000000)))))
+          (else
+            ;; ties-to-even at bit 42, then rebias 1023 -> 15
+            (local.set $mag
+              (i64.add (local.get $mag)
+                       (i64.add (i64.const 0x1ffffffffff)
+                                (i64.and (i64.shr_u (local.get $mag) (i64.const 42)) (i64.const 1)))))
+            (local.set $o
+              (i32.wrap_i64 (i64.sub (i64.shr_u (local.get $mag) (i64.const 42))
+                                     (i64.const 1032192))))))))
+    (i32.or (local.get $sign) (local.get $o)))
   (func $strcmp (param $a (ref $str)) (param $b (ref $str)) (result i32)
     (local $i i32) (local $la i32) (local $lb i32) (local $ca i32) (local $cb i32)
     (local.set $la (array.len (local.get $a)))
@@ -2253,10 +2414,27 @@ TUPLE_HASH
     (if (i64.gt_s (local.get $m) (i64.const 0)) (then (call $printl (local.get $m))))
     (call $putc (i32.add (i32.const 48) (i32.wrap_i64 (i64.rem_s (local.get $n) (i64.const 10))))))
   (func $printf64 (param $v f64)
-    (local $ip f64) (local $frac f64) (local $k i32) (local $d i32)
+    (local $ip f64) (local $frac f64) (local $k i32) (local $d i32) (local $e i32)
+    ;; NaN is the only value not equal to itself. Without these three guards
+    ;; the i64 truncation below TRAPS, so printing 1e30 killed the program.
+    (if (f64.ne (local.get $v) (local.get $v))
+      (then (call $putc (i32.const 78)) (call $putc (i32.const 97))
+            (call $putc (i32.const 78)) (return)))
     (if (f64.lt (local.get $v) (f64.const 0))
       (then (call $putc (i32.const 45))
             (local.set $v (f64.neg (local.get $v)))))
+    ;; .NET prints U+221E, not the word — so this stays oracle-checkable
+    (if (f64.eq (local.get $v) (f64.const inf))
+      (then (call $putc (i32.const 226)) (call $putc (i32.const 136))
+            (call $putc (i32.const 158)) (return)))
+    ;; past what an i64 holds, normalize into [1, 10) and print an exponent
+    (if (f64.ge (local.get $v) (f64.const 1e18))
+      (then
+        (block $scaled (loop $go
+          (br_if $scaled (f64.lt (local.get $v) (f64.const 10)))
+          (local.set $v (f64.div (local.get $v) (f64.const 10)))
+          (local.set $e (i32.add (local.get $e) (i32.const 1)))
+          (br $go)))))
     (local.set $ip (f64.floor (local.get $v)))
     (call $printl (i64.trunc_f64_s (local.get $ip)))
     (local.set $frac (f64.sub (local.get $v) (local.get $ip)))
@@ -2272,7 +2450,10 @@ TUPLE_HASH
             (local.set $frac (f64.sub (local.get $frac) (f64.floor (local.get $frac))))
             (br_if $done (f64.eq (local.get $frac) (f64.const 0)))
             (local.set $k (i32.add (local.get $k) (i32.const 1)))
-            (br $go))))))
+            (br $go)))))
+    (if (i32.ne (local.get $e) (i32.const 0))
+      (then (call $putc (i32.const 69)) (call $putc (i32.const 43))
+            (call $printl (i64.extend_i32_s (local.get $e))))))
   (func $ofi (param $n i32) (result anyref)
     (if (result anyref) (i32.eq (local.get $n) (i32.shr_s (i32.shl (local.get $n) (i32.const 1)) (i32.const 1)))
       (then (ref.i31 (local.get $n)))

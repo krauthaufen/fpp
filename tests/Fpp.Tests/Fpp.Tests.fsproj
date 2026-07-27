@@ -3,6 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
+    <IsTestProject>true</IsTestProject>
   </PropertyGroup>
 
   <ItemGroup>
@@ -33,5 +34,13 @@
     <ProjectReference Include="../../src/Fpp.Compiler/Fpp.Compiler.fsproj" />
     <ProjectReference Include="../../src/Fpp.Lsp/Fpp.Lsp.fsproj" />
   </ItemGroup>
+
+  <!-- `dotnet test` drives the VSTest target. Expecto has no VSTest
+       adapter that works here, and without one `dotnet test` runs NOTHING
+       and reports success — a green CI over an untested tree. Overriding the
+       target runs the real suite and propagates its exit code. -->
+  <Target Name="VSTest" DependsOnTargets="Build">
+    <Exec Command="dotnet &quot;$(TargetPath)&quot; $(VSTestTestCaseFilter)" />
+  </Target>
 
 </Project>

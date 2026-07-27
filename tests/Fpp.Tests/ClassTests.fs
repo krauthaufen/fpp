@@ -171,7 +171,13 @@ let private floats (lines : string list) : float list =
     run lines |> fun out ->
         out.Split '\n'
         |> Array.filter (fun l -> l.Trim() <> "")
-        |> Array.map (fun l -> System.Double.Parse (l, System.Globalization.CultureInfo.InvariantCulture))
+        |> Array.map (fun l ->
+            // the printer emits .NET's own glyphs for the special values
+            match l.Trim() with
+            | "\u221e" -> System.Double.PositiveInfinity
+            | "-\u221e" -> System.Double.NegativeInfinity
+            | "NaN" -> nan
+            | t -> System.Double.Parse (t, System.Globalization.CultureInfo.InvariantCulture))
         |> Array.toList
 
 let private closeTo (name : string) (got : float) (want : float) =
@@ -254,6 +260,104 @@ let mathSurfaceTests =
                       "let a = print (hyp 3.0 4.0)"
                       "let b = print (hyp 3.0f 4.0f)" ]
             Expect.equal out "5\n5\n" "stamped per width"
+        }
+    ]
+
+[<Tests>]
+let float16Tests =
+    testList "float16" [
+        test "halves round exactly as System.Half does" {
+            // normals, subnormals, exact ties, and the 65520 overflow edge
+            let vals =
+                [ "0.0"; "1.0"; "1.5"; "2.25"; "3.75"; "-1.0"; "-0.5"
+                  "65504.0"; "65519.0"
+                  "6.103515625e-05"; "6.0e-05"; "5.96046448e-08"
+                  // just above the tie between zero and the smallest
+                  // subnormal — it disagrees if the conversion rounds twice
+                  "2.98023224e-08"; "2.9802322387695312e-08"
+                  "1.5e-08"; "1.0009765625"; "1.00048828125"
+                  "0.1"; "0.2"; "0.3"; "12345.0"; "-12345.0" ]
+            let got =
+                floats (vals |> List.mapi (fun i v -> "let v" + string i + " = print (float32 (float16 (" + v + ")))"))
+            let want =
+                vals |> List.map (fun v ->
+                    let d = System.Double.Parse (v, System.Globalization.CultureInfo.InvariantCulture)
+                    float (float32 (System.Half.op_Explicit d : System.Half)))
+            // `print` emits 15 decimal places, so a subnormal half is
+            // limited by the FORMAT, not by the conversion. Adjacent halves
+            // are 6e-8 apart at their closest, so this still pins the
+            // rounding to the correct neighbour.
+            List.iteri
+                (fun i (g, w : float) ->
+                    Expect.isLessThan (abs (g - w)) (1e-15 + 1e-9 * abs w)
+                        ("value " + string i + ": got " + string g + ", want " + string w))
+                (List.zip got want)
+        }
+        test "overflow saturates to infinity, and printing it does not trap" {
+            // 65520 is exactly halfway between the largest half and 65536,
+            // so ties-to-even rounds it UP and out of range
+            Expect.equal (run [ "let a = print (float32 (float16 65520.0))"
+                                "let b = print (float32 (float16 70000.0))"
+                                "let c = print (float32 (float16 (0.0 - 70000.0)))" ])
+                "\u221e\n\u221e\n-\u221e\n" "saturates, and prints as .NET does"
+        }
+        test "arithmetic is the correctly-rounded half, not an approximation" {
+            // f32 carries 24 significand bits and a half needs 11; double
+            // rounding is innocuous at 2p+2, so computing in f32 and rounding
+            // ONCE gives exactly what native f16 hardware would
+            let pairs = [ 1.0, 3.0; 1.5, 2.25; 0.1, 0.2; 1000.0, 0.001; 65504.0, 65504.0; -3.5, 1.25 ]
+            let ops = [ "+"; "-"; "*"; "/" ]
+            let lit (v : float) =
+                let s = v.ToString ("R", System.Globalization.CultureInfo.InvariantCulture)
+                if s.Contains "." || s.Contains "E" then s else s + ".0"
+            let lines =
+                [ for i, (a, b) in List.indexed pairs do
+                    for j, op in List.indexed ops do
+                      yield "let v" + string i + "_" + string j
+                            + " = print (float32 (" + lit a + "h " + op + " " + lit b + "h))" ]
+            let got = floats lines
+            let half (v : float) : System.Half = System.Half.op_Explicit v
+            let want =
+                [ for a, b in pairs do
+                    for op in ops do
+                      let x, y = half a, half b
+                      let r = match op with
+                              | "+" -> x + y
+                              | "-" -> x - y
+                              | "*" -> x * y
+                              | _ -> x / y
+                      yield float (float32 r) ]
+            Expect.equal got want "every operation matches System.Half"
+        }
+        test "a half is an i31 at runtime, so it costs no allocation" {
+            let wat, errors = compile [ "let a = print (float32 (1.5h + 2.25h))" ]
+            Expect.isEmpty errors "compiles"
+            // the literal is folded to its bit pattern at compile time
+            Expect.stringContains wat "(ref.i31 (i32.const 15872))" "1.5h is its 16 bits, unboxed"
+        }
+        test "halves get the whole class surface" {
+            let out =
+                run [ "let a = print (float32 (sqrt 16.0h))"
+                      "let b = print (float32 (abs (0.0h - 3.5h)))"
+                      "let c = print (float32 (min 1.5h 2.5h))"
+                      "let d = print (float32 (max 1.5h 2.5h))"
+                      "let e = print (if 1.5h < 2.5h then 1 else 0)"
+                      "let f = print (compare 2.5h 1.5h)"
+                      "let g = print (float32 (Zero + One : float16))" ]
+            Expect.equal out "4\n3.5\n1.5\n2.5\n1\n1\n1\n" "same classes, an f32-backed instance"
+        }
+        test "generic code runs at the half width too" {
+            let out =
+                run [ "let hyp (a : 'a) (b : 'a) : 'a when Floating<'a> = sqrt (a * a + b * b)"
+                      "let a = print (hyp 3.0 4.0)"
+                      "let b = print (hyp 3.0f 4.0f)"
+                      "let c = print (float32 (hyp 3.0h 4.0h))" ]
+            Expect.equal out "5\n5\n5\n" "one body, three widths"
+        }
+        test "an E-exponent literal survives emission" {
+            // the emitter dropped `E` and `+` from float literals, turning
+            // 1.0E5 into 1.05
+            Expect.equal (run [ "let a = print 1.0E5"; "let b = print 2.0e+3" ]) "100000\n2000\n" "exponent kept"
         }
     ]
 
