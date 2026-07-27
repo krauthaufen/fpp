@@ -537,6 +537,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some x -> x
                               | None -> ""
                           EArrayCreate (nm, cn, cv)
+                      // System.Object.ReferenceEquals(a, b): the identity
+                      // primitive, however the namespace is spelled
+                      | EField (EField (EUnknown "System", "Object", _), "ReferenceEquals", _), [ ETuple [ ra; rb ] ]
+                      | EField (EUnknown "Object", "ReferenceEquals", _), [ ETuple [ ra; rb ] ] ->
+                          EApp (EUnknown "refEq", [ ra; rb ])
                       | EField (EUnknown "Array", "create", _), [ cn; cv ] ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with

@@ -143,7 +143,11 @@ all member overloading. The split at first measurement:
       Set, a type that lives outside the file being ported
 
 ### Acceptance emit status after the stdlib layer
-61 -> 37 emit errors. The tail: type tests against BUILTIN collections
+61 -> 36 emit errors. Lists and arrays are genuine seqs AT RUNTIME: the
+IEnumerable/IEnumerator dispatch sites pre-test the representation and
+route to a built-in iterator ($iter walks cons chains and indexes any
+array kind), so a list literal flows through a lazy Seq pipeline and into
+String.concat. The tail: type tests against BUILTIN collections
 (`:? list`/`:? array`/`:? ISet`, 12 — a designed feature, representation
 tests not class ids), a resolution corner where `HashSet.OfSeq` inside the
 class's own ISet impl fails to bind, and array-write specialization in two

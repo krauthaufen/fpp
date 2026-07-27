@@ -636,3 +636,71 @@ let enumeratorTests =
             Expect.equal out "42\n" "resolution waits for the fields table to be complete"
         }
     ]
+
+[<Tests>]
+let stdlibCoreTests =
+    testList "stdlib as core" [
+        test "lazy Seq combinators over a user enumerable" {
+            let out =
+                run [ "type RngEn(n : int) ="
+                      "    let mutable i = 0"
+                      "    interface IEnumerator<int> with"
+                      "        member e.MoveNext() ="
+                      "            i <- i + 1"
+                      "            i <= n"
+                      "        member e.Current = i"
+                      "type Rng(n : int) ="
+                      "    interface IEnumerable<int> with"
+                      "        member x.GetEnumerator() = RngEn(n) :> IEnumerator<int>"
+                      "let src = Rng 6 :> seq<int>"
+                      "let a = printfn \"%d\" (Seq.length src)"
+                      "let b = printfn \"%d\" (src |> Seq.map (fun v -> v * 10) |> Seq.fold (fun s v -> s + v) 0)"
+                      "let c = printfn \"%d\" (src |> Seq.filter (fun v -> v % 2 = 0) |> Seq.length)"
+                      "let d = printfn \"%d\" (src |> Seq.truncate 3 |> Seq.length)"
+                      "let e = printfn \"%b\" (src |> Seq.exists (fun v -> v = 5))"
+                      "let f = printfn \"%b\" (src |> Seq.forall (fun v -> v < 5))" ]
+            Expect.equal out "6\n210\n3\n3\ntrue\nfalse\n" "the pipeline is lazy and correct"
+        }
+        test "a partially applied format flows through a lazy map" {
+            // the acceptance file does exactly this to render its elements
+            let out =
+                run [ "let s = [ 1; 2; 3 ] |> Seq.map (sprintf \"%A\") |> String.concat \"; \""
+                      "let a = printfn \"[%s]\" s" ]
+            Expect.equal out "[1; 2; 3]\n" "sprintf with missing arguments is a function"
+        }
+        test "the String module" {
+            let out =
+                run [ "let a = printfn \"%s\" (String.concat \"-\" [ \"x\"; \"y\"; \"z\" ])"
+                      "let b = printfn \"%s\" (String.replicate 3 \"ab\")"
+                      "let c = printfn \"%s\" (String.map (fun ch -> if ch = 'a' then 'A' else ch) \"banana\")"
+                      "let d = printfn \"%d\" (String.length \"hello\")"
+                      "let e = printfn \"%b\" (String.exists (fun ch -> ch = 'n') \"banana\")"
+                      "let f = printfn \"%b\" (String.forall (fun ch -> ch = 'n') \"banana\")" ]
+            Expect.equal out "x-y-z\nababab\nbAnAnA\n5\ntrue\nfalse\n" "the module surface"
+        }
+        test "KeyValuePair is a struct with Key and Value" {
+            Expect.equal (run [ "let kv = KeyValuePair(1, \"one\")"
+                                "let a = printfn \"%d=%s\" kv.Key kv.Value" ])
+                "1=one\n" "constructs and reads"
+        }
+        test "Object.ReferenceEquals is the identity primitive" {
+            let out =
+                run [ "type Box(v : int) ="
+                      "    member x.V = v"
+                      "let b1 = Box(1)"
+                      "let b2 = Box(1)"
+                      "let a = printfn \"%b\" (System.Object.ReferenceEquals(b1, b1))"
+                      "let b = printfn \"%b\" (System.Object.ReferenceEquals(b1, b2))" ]
+            Expect.equal out "true\nfalse\n" "identity, not structure"
+        }
+        test "raising the collections exception carries its message" {
+            let out =
+                run [ "let f () ="
+                      "    try"
+                      "        raise (KeyNotFoundException \"missing!\")"
+                      "    with"
+                      "    | KeyNotFoundException m -> printfn \"caught %s\" m"
+                      "let a = f ()" ]
+            Expect.equal out "caught missing!\n" "throw and catch"
+        }
+    ]

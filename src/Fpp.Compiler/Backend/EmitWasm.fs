@@ -1214,10 +1214,28 @@ let emit (decls : Decl list) : EmitResult =
                  let ft = "$v" + string arity
                  let dsc =
                      "(struct.get $desc 1 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
-                 "(block (result anyref) (local.set " + t + " " + recur recv + ") "
-                 + "(call_ref " + ft + " (local.get " + t + ") "
-                 + String.concat " " (List.map recur args) + " "
-                 + "(ref.cast (ref " + ft + ") (array.get $vt " + dsc + " (i32.const " + string slot + ")))))"
+                 let dispatch =
+                     "(call_ref " + ft + " (local.get " + t + ") "
+                     + String.concat " " (List.map recur args) + " "
+                     + "(ref.cast (ref " + ft + ") (array.get $vt " + dsc + " (i32.const " + string slot + "))))"
+                 // lists and arrays ARE seqs, but carry no vtable: the
+                 // enumeration protocol pre-tests their representation and
+                 // routes to the built-in iterators
+                 if iface = "IEnumerable" && mname = "GetEnumerator" then
+                     "(block (result anyref) (local.set " + t + " " + recur recv + ") "
+                     + "(if (result anyref) (call $isBuiltinSeq (local.get " + t + "))"
+                     + " (then (call $iterNew (local.get " + t + ")))"
+                     + " (else " + dispatch + ")))"
+                 elif iface = "IEnumerator" && (mname = "MoveNext" || mname = "Current") then
+                     let builtin =
+                         if mname = "MoveNext" then "(call $iterNext (local.get " + t + "))"
+                         else "(call $iterCur (local.get " + t + "))"
+                     "(block (result anyref) (local.set " + t + " " + recur recv + ") "
+                     + "(if (result anyref) (ref.test (ref $iter) (local.get " + t + "))"
+                     + " (then " + builtin + ")"
+                     + " (else " + dispatch + ")))"
+                 else
+                     "(block (result anyref) (local.set " + t + " " + recur recv + ") " + dispatch + ")"
              | None ->
                  vecAdd errors ("no dispatch slot for " + iface + "." + mname)
                  "(ref.i31 (i32.const 0))")
@@ -1825,6 +1843,9 @@ let emit (decls : Decl list) : EmitResult =
     line "  (type $parr_s (array (mut f32)))"
     line "  (type $parr_l (array (mut i64)))"
     line "  (type $parr_h (array (mut i16)))"
+    // the built-in seq iterator: (mode, a, b, index) — mode 0 walks a cons
+    // chain in (a=current, b=rest), mode 1 indexes an array in (a, index)
+    line "  (type $iter (struct (field i32) (field (mut anyref)) (field (mut anyref)) (field (mut i32))))"
     line "  (type $pk (array (mut i64)))"
     // POD array value = handle: storage (null while pinned), ptr, words
     line "  (type $hnd (struct (field (mut (ref null $pk))) (field (mut i32)) (field (mut i32))))"
@@ -2663,6 +2684,69 @@ TUPLE_HASH
                                              (ref.cast (ref $str) (local.get $v))))
           (array.new_fixed $str 1 (i32.const 34))))))
     (array.new_fixed $str 1 (i32.const 63)))
+  ;; the built-in iterator: mode 0 = list (cur/rest in the two anyref
+  ;; slots), mode 1 = array (source + index)
+  (func $isBuiltinSeq (param $v anyref) (result i32)
+    (i32.or (ref.is_null (local.get $v))
+      (i32.or (ref.test (ref $cons) (local.get $v))
+        (i32.or (ref.test (ref $arr) (local.get $v))
+          (i32.or (ref.test (ref $parr_i) (local.get $v))
+            (i32.or (ref.test (ref $parr_f) (local.get $v))
+              (i32.or (ref.test (ref $parr_s) (local.get $v))
+                (i32.or (ref.test (ref $parr_l) (local.get $v))
+                        (ref.test (ref $parr_h) (local.get $v))))))))))
+  (func $iterNew (param $v anyref) (result anyref)
+    (if (result anyref)
+        (i32.or (ref.is_null (local.get $v)) (ref.test (ref $cons) (local.get $v)))
+      (then (struct.new $iter (i32.const 0) (ref.null any) (local.get $v) (i32.const 0)))
+      (else (struct.new $iter (i32.const 1) (local.get $v) (ref.null any) (i32.const 0)))))
+  ;; one element of ANY array representation, boxed uniformly
+  (func $arrGetAny (param $v anyref) (param $i i32) (result anyref)
+    (if (ref.test (ref $arr) (local.get $v))
+      (then (return (array.get $arr (ref.cast (ref $arr) (local.get $v)) (local.get $i)))))
+    (if (ref.test (ref $parr_i) (local.get $v))
+      (then (return (call $ofi (array.get $parr_i (ref.cast (ref $parr_i) (local.get $v)) (local.get $i))))))
+    (if (ref.test (ref $parr_f) (local.get $v))
+      (then (return (call $off (array.get $parr_f (ref.cast (ref $parr_f) (local.get $v)) (local.get $i))))))
+    (if (ref.test (ref $parr_s) (local.get $v))
+      (then (return (call $oss (array.get $parr_s (ref.cast (ref $parr_s) (local.get $v)) (local.get $i))))))
+    (if (ref.test (ref $parr_l) (local.get $v))
+      (then (return (call $ofl (array.get $parr_l (ref.cast (ref $parr_l) (local.get $v)) (local.get $i))))))
+    (if (ref.test (ref $parr_h) (local.get $v))
+      (then (return (call $ofi (array.get_u $parr_h (ref.cast (ref $parr_h) (local.get $v)) (local.get $i))))))
+    (ref.i31 (i32.const 0)))
+  (func $iterNext (param $st anyref) (result anyref)
+    (local $it (ref $iter)) (local $rest anyref) (local $i i32)
+    (local.set $it (ref.cast (ref $iter) (local.get $st)))
+    (if (result anyref) (i32.eqz (struct.get $iter 0 (local.get $it)))
+      (then
+        ;; list: advance the cons chain
+        (local.set $rest (struct.get $iter 2 (local.get $it)))
+        (if (result anyref) (ref.is_null (local.get $rest))
+          (then (ref.i31 (i32.const 0)))
+          (else
+            (struct.set $iter 1 (local.get $it)
+              (struct.get $cons 0 (ref.cast (ref $cons) (local.get $rest))))
+            (struct.set $iter 2 (local.get $it)
+              (struct.get $cons 1 (ref.cast (ref $cons) (local.get $rest))))
+            (ref.i31 (i32.const 1)))))
+      (else
+        ;; array: bump the index
+        (local.set $i (struct.get $iter 3 (local.get $it)))
+        (if (result anyref)
+            (i32.ge_s (local.get $i)
+              (i31.get_s (ref.cast (ref i31) (call $lenv (struct.get $iter 1 (local.get $it))))))
+          (then (ref.i31 (i32.const 0)))
+          (else
+            (struct.set $iter 3 (local.get $it) (i32.add (local.get $i) (i32.const 1)))
+            (ref.i31 (i32.const 1)))))))
+  (func $iterCur (param $st anyref) (result anyref)
+    (local $it (ref $iter))
+    (local.set $it (ref.cast (ref $iter) (local.get $st)))
+    (if (result anyref) (i32.eqz (struct.get $iter 0 (local.get $it)))
+      (then (struct.get $iter 1 (local.get $it)))
+      (else (call $arrGetAny (struct.get $iter 1 (local.get $it))
+                             (i32.sub (struct.get $iter 3 (local.get $it)) (i32.const 1))))))
   (func $strPad (param $v (ref $str)) (param $w i32) (param $c i32) (param $left i32) (result anyref)
     (local $n i32) (local $r (ref $str)) (local $off i32)
     (local.set $n (array.len (local.get $v)))
