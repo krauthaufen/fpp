@@ -188,7 +188,7 @@ let stampRecords (decls : Decl list) : Decl list =
 /// and report anything that cannot be classified.
 /// `instanceFns` maps "Class@T1@T2" to the function an instance supplies,
 /// so an operator inside a body stamped at a user type becomes a call to it.
-let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string, VarId>)
+let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool>)
                      (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
     let bodies = dictNew<string * int, bool * VarId * Scheme * Expr> ()
@@ -377,7 +377,8 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                           let mem = Classes.operatorMemberName baseOp
                           let key2 = instanceKey cls mem [ tn; tn ]
                           let key1 = instanceKey cls mem [ tn ]
-                          let asCall (fn : VarId) =
+                          let asCall (fnp : VarId * bool) =
+                              let fn, _ = fnp
                               let call = EApp (EVar (fn, mono (TCon ("?", []))), xs)
                               // ordering has one operation; the predicates
                               // test its result
@@ -399,7 +400,11 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                      let byOne = dictTryFind instanceFns (instanceKey cls memberName [ tn ])
                      let byTwo = dictTryFind instanceFns (instanceKey cls memberName [ tn; tn ])
                      (match (match byOne with Some _ -> byOne | None -> byTwo) with
-                      | Some fn -> EVar (fn, mono (TCon ("?", [])))
+                      | Some (fn, takesUnit) ->
+                          // a value-like member (`static mempty = ...`) lifts
+                          // as a function of unit, so the NAME applies it
+                          if takesUnit then EApp (EVar (fn, mono (TCon ("?", []))), [ ELit LUnit ])
+                          else EVar (fn, mono (TCon ("?", [])))
                       | None -> EUnknown ("$class:" + cls + ":" + memberName + ":" + tn))
                  | _ -> EUnknown n)
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
@@ -674,8 +679,8 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
 /// instance wrote, plus the wrappers generated for the primitive ones. This
 /// is what a use site resolves against once monomorphization has made the
 /// type concrete.
-let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId> =
-    let table = dictNew<string, VarId> ()
+let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
+    let table = dictNew<string, VarId * bool> ()
     for cls, insts in dictPairs classes.Instances do
         match dictTryFind classes.Classes cls with
         | None -> ()
@@ -685,11 +690,14 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId> =
                 for index, (m, _) in List.indexed cd.Members do
                     let key = instanceKey cls m heads
                     match i.Members |> List.tryPick (fun (mn, im) -> if mn = m then Some im else None) with
-                    | Some im -> dictSet table key { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                    | Some im ->
+                        dictSet table key
+                            ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit)
                     | None ->
                         if i.Builtin then
                             let im = Classes.wrapperMember i index m
-                            dictSet table key { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+                            dictSet table key
+                                ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit)
     table
 
 /// Monomorphize with no user instances in play.

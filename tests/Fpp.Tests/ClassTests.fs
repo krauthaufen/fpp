@@ -704,3 +704,74 @@ let stdlibCoreTests =
             Expect.equal out "caught missing!\n" "throw and catch"
         }
     ]
+
+[<Tests>]
+let userClassTests =
+    testList "user-defined typeclasses" [
+        test "a declared class folds three types from one body" {
+            // the playground's Monoid, end to end: mempty is a value-like
+            // member (unit-lifted, applied at the name), combine a function,
+            // and the generic body stamps per instance
+            let out =
+                run [ "class Monoid<'a>"
+                      "    static mempty : 'a"
+                      "    static combine : 'a -> 'a -> 'a"
+                      "instance Monoid<int>"
+                      "    static mempty = 0"
+                      "    static combine a b = a + b"
+                      "instance Monoid<string>"
+                      "    static mempty = \"\""
+                      "    static combine a b = a + b"
+                      "let mconcat (xs : 'a list) : 'a when Monoid<'a> ="
+                      "    let mutable acc = mempty"
+                      "    for x in xs do"
+                      "        acc <- combine acc x"
+                      "    acc"
+                      "let a = print (mconcat [ 1; 2; 3 ])"
+                      "let b = print (mconcat [ \"x\"; \"y\" ])" ]
+            Expect.equal out "6\nxy\n" "one fold, two instances"
+        }
+        test "an associated type decides the result at the instance" {
+            let out =
+                run [ "class Norm<'v>"
+                      "    type Scalar"
+                      "    static norm : 'v -> Scalar"
+                      "instance Norm<float>"
+                      "    type Scalar = float"
+                      "    static norm v = abs v"
+                      "instance Norm<int>"
+                      "    type Scalar = int"
+                      "    static norm v = abs v"
+                      "let a = print (norm (0.0 - 2.5))"
+                      "let b = print (norm (0 - 7))" ]
+            Expect.equal out "2.5\n7\n" "Scalar comes from the instance"
+        }
+        test "a mutable binding does not generalize" {
+            // the value restriction: quantifying a cell hands every read a
+            // fresh variable the writes can no longer reach — `let mutable
+            // acc = mempty` silently went int-only this way
+            let ws = Fpp.Workspace()
+            ws.SetFileText "t.fpp" (String.concat "\n" [
+                "module M"
+                "class Monoid<'a>"
+                "    static mempty : 'a"
+                "    static combine : 'a -> 'a -> 'a"
+                "instance Monoid<int>"
+                "    static mempty = 0"
+                "    static combine a b = a + b"
+                "let mconcat (xs : 'a list) : 'a when Monoid<'a> ="
+                "    let mutable acc = mempty"
+                "    for x in xs do"
+                "        acc <- combine acc x"
+                "    acc"
+                "" ])
+            let inf = ws.TypeCheck "t.fpp"
+            let src = System.String.Join ("\n", [| "module M" |])
+            ignore src
+            let hover = ws.HoverAt "t.fpp" ((ws.FileText "t.fpp").IndexOf "mconcat" + 1)
+            match hover with
+            | Some h -> Expect.stringContains h "Monoid<'a>" "stays generic under its class"
+            | None -> failtest "no hover"
+            ignore inf
+        }
+    ]

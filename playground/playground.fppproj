@@ -2,4 +2,5 @@
 name playground
 out  playground.wat
 src  vec.fpp
+src  classes.fpp
 src  main.fpp

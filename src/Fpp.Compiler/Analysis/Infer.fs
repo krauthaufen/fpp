@@ -606,8 +606,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Close a binding over its type AND its context. Whatever the body left
     /// unsolved becomes the caller's obligation; anything the binding itself
     /// declared with `when` is kept whether or not the body needed it.
+    /// > 0 while typing a nested let — those must neither solve nor move
+    /// the wanted pool, which belongs to the enclosing top-level binding
+    let mutable letDepth = 0
+
     let generalizeBinding (declared : Constraint list) (ty : Type) : Scheme =
+        if letDepth > 0 then
+            // a LOCAL binding: solving here is premature — `let acc = mempty`
+            // has not met the annotation that ties its variable down yet, and
+            // a lone instance would let improvement ground it. The wanteds
+            // stay pooled for the enclosing top-level binding.
+            st.Generalize ty
+        else
+        // solve UNDER the binding's declared context: without it, a lone
+        // instance lets improvement GROUND the annotated variable — a
+        // `when Monoid<'a>` function silently became int-only
+        let saved = givens
+        givens <- givens @ declared
         solveWanted ()
+        givens <- saved
         let sch = st.GeneralizeWith (declared @ List.map snd wanted) ty
         let moved (c : Constraint) =
             sch.Constraints |> List.exists (fun k -> System.Object.ReferenceEquals (k, c))
@@ -1398,7 +1415,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for m in nodesOf n do
                     last <- exprType (GNode m)
                 last
-            | LetDecl -> inferLet n
+            | LetDecl ->
+                letDepth <- letDepth + 1
+                let r = inferLet n
+                letDepth <- letDepth - 1
+                r
             | ObjExpr ->
                 // an anonymous class implementing one interface: type its
                 // members against a synthetic receiver, yield the interface
@@ -1810,10 +1831,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | None -> unify nameTy funTy |> ignore)
             ignore isRec   // rec already works: the name's tvar was bound before the body
             st.ExitLevel ()
-            // generalize and overwrite the monomorphic scheme
+            // generalize and overwrite the monomorphic scheme. A MUTABLE
+            // binding never generalizes (the value restriction): its cell is
+            // one location, and quantifying it hands every read a fresh copy
+            // of a variable the writes can no longer reach — `let mutable
+            // acc = mempty` lost its tie to the annotation this way
+            let isMutable =
+                tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "mutable")
             (match Green.tokens (GNode namePat) |> List.tryFind (fun t -> t.Kind = Ident) with
              | Some t when (dictTryFind defsAt t.Offset).IsSome ->
-                 setScheme t.Offset (generalizeBinding declared funTy)
+                 if isMutable then setScheme t.Offset (mono funTy)
+                 else setScheme t.Offset (generalizeBinding declared funTy)
              | _ -> ())
             // `let x = e in body` evaluates to the continuation
             if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)

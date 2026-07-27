@@ -1,6 +1,7 @@
 module Main
 
 open Vec
+open Classes
 
 // ---- generic math at three types from ONE definition -------------------
 // Hover `double`: its scheme shows the inferred Add constraint.
@@ -39,6 +40,19 @@ let seqDemo =
 
 // ---- hover `compare`, `min`, `sqrt`: constraints in the signature ------
 let ordDemo = printfn "compare 2 9    = %d" (compare 2 9)
+
+// ---- the playground's own typeclasses (classes.fpp) --------------------
+let c1 = printfn "%s" (describe "answer" 42)
+let c2 = printfn "%s" (describe "pi-ish" 3.14)
+let c3 = printfn "%s" (describe "ready" true)
+let c4 = printfn "%s" (describe "p" p)
+
+let m1 = printfn "mconcat ints   = %d" (mconcat [ 1; 2; 3; 4 ])
+let m2 = printfn "mconcat strs   = %s" (mconcat [ "a"; "b"; "c" ])
+let m3 = printfn "mconcat vecs   = (%f, %f)" (mconcat [ p; q ]).X (mconcat [ p; q ]).Y
+
+let n1 = printfn "norm p         = %f" (norm p)
+let n2 = printfn "norm -2.5      = %f" (norm (0.0 - 2.5))
 
 // Uncomment to watch diagnostics appear as you type:
 //let bad1 : int = "not an int"

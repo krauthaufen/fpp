@@ -32,7 +32,20 @@ unification trace.
 
 **Outline** — the symbols panel shows both modules' structure.
 
+**Your own typeclasses** — `classes.fpp` declares `Show`, `Monoid` and
+`Norm` (an associated type). Hover `describe` and `mconcat`: the
+constraints ride the inferred signatures. `mconcat` folds ints, strings
+and vectors from one body; `norm`'s result type is decided by the
+instance, not written at the use.
+
 ## Build and run
+
+```bash
+./playground/run.sh
+```
+
+or by hand:
+
 
 ```bash
 dotnet run --project src/Fpp.Cli -c Release -- build playground/playground.fppproj
