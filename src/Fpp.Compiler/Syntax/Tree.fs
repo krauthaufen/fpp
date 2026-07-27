@@ -21,6 +21,12 @@ type NodeKind =
     | AccessorDecl
     | InterfaceImpl
     | InheritDecl
+    /// `class C<'a, 'b>` — a typeclass declaration
+    | ClassDecl
+    /// `instance C<int, int>` — a free-standing instance
+    | InstanceDecl
+    /// `when C<'a> with Result = 'a` — one constraint
+    | WhenDecl
     // expressions
     | LiteralExpr
     | IdentExpr

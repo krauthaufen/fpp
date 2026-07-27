@@ -40,7 +40,9 @@ let tokenize (src : string) : Token list =
             let mutable i = pos
             while i < n && peek i <> '\n' && peek i <> '\r' do i <- i + 1
             Some ({ TriviaKind = LineComment; TriviaText = text pos i }, i)
-        elif c = '(' && peek (pos + 1) = '*' then
+        // `(*)` is the multiplication operator, not an unterminated comment —
+        // the same carve-out F# makes. Only this exact three-character run.
+        elif c = '(' && peek (pos + 1) = '*' && peek (pos + 2) <> ')' then
             let mutable i = pos + 2
             let mutable depth = 1
             while i < n && depth > 0 do

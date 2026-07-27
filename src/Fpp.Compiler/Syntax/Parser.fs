@@ -159,7 +159,10 @@ let parse (src : string) : ParseResult =
     let canStartDecl () =
         s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
         || s.IsKw "namespace" || s.IsKw "and" || s.IsKw "do" || s.IsKw "exception"
-        || s.IsKw "extern"
+        || s.IsKw "extern" || s.IsKw "instance"
+        // `class` also opens an F#-style `type X = class ... end`, which F++
+        // does not have, so at declaration position it is always a typeclass
+        || s.IsKw "class"
         || canStartExpr ()
         || (s.Is LBracket)   // attribute lists
 
@@ -169,6 +172,27 @@ let parse (src : string) : ParseResult =
         || s.IsKw "end" || s.IsKw "in" || s.IsKw "done" || s.IsKw "to" || s.IsKw "downto"
 
     let isCloser () = s.Is RParen || s.Is RBracket || s.Is RBrace || s.Is Comma || s.Is Semicolon
+
+    /// `(+)` in name position: three tokens with nothing between them. They
+    /// fuse into ONE identifier token spelled "(+)", so every downstream pass
+    /// sees an operator member as an ordinary name. Concatenation still
+    /// reproduces the source exactly, which is what losslessness requires —
+    /// hence the no-inner-trivia rule (`( + )` is not a name).
+    let atOperatorName () =
+        s.Is LParen && List.isEmpty s.Cur.Trailing
+        && (s.Peek 1).Kind = Operator
+        && List.isEmpty (s.Peek 1).Leading && List.isEmpty (s.Peek 1).Trailing
+        && (s.Peek 2).Kind = RParen && List.isEmpty (s.Peek 2).Leading
+
+    let bumpOperatorName () : Green =
+        let l = s.Cur
+        let op = s.Peek 1
+        let r = s.Peek 2
+        s.Bump () |> ignore
+        s.Bump () |> ignore
+        s.Bump () |> ignore
+        GToken { Kind = Ident; Text = "(" + op.Text + ")"
+                 Leading = l.Leading; Trailing = r.Trailing; Offset = l.Offset }
 
     /// A new line has begun and the current token sits at or left of `col`.
     // Inside brackets the offside rule is suspended: the closing bracket
@@ -854,6 +878,9 @@ let parse (src : string) : ParseResult =
         if s.IsOp ":" then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseType letCol)
+            // declared constraints: `let solve ... : Vector<'a> when Fractional<'a> = ...`
+            while s.IsKw "when" && (s.SameLine || s.CurCol > letCol) do
+                vecAdd acc (parseWhen letCol)
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"
@@ -976,9 +1003,13 @@ let parse (src : string) : ParseResult =
               || s.IsKw "inline" || s.IsKw "val" || s.IsKw "mutable" do
             vecAdd acc (s.Bump ())
         if s.IsKw "type" then
-            // associated type: `static abstract type State`
+            // associated type: declared `type Result`, bound in an instance
+            // by `type Result = int`
             vecAdd acc (s.Bump ())
             if s.Is Ident then vecAdd acc (s.Bump ())
+            if s.IsOp "=" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseType mcol)
         elif s.IsKw "new" then
             // an explicit constructor: `new(args) = { Field = ... }`
             vecAdd acc (s.Bump ())
@@ -993,11 +1024,13 @@ let parse (src : string) : ParseResult =
                     vecAdd acc (parseBlock mcol)
         else
             // [self .] name
-            if s.Is Ident then
+            if atOperatorName () then vecAdd acc (bumpOperatorName ())
+            elif s.Is Ident then
                 vecAdd acc (s.Bump ())
                 if s.IsOp "." && s.SameLine then
                     vecAdd acc (s.Bump ())
-                    if s.Is Ident then vecAdd acc (s.Bump ())
+                    if atOperatorName () then vecAdd acc (bumpOperatorName ())
+                    elif s.Is Ident then vecAdd acc (s.Bump ())
             else s.Diag "expected a member name"
             if s.IsOp "<" && s.SameLine && (s.Peek 1).Text = "'" then
                 vecAdd acc (Green.node TyParams (parseAngleArgs mcol))
@@ -1154,6 +1187,54 @@ let parse (src : string) : ParseResult =
         else s.Diag "expected a module path"
         Green.node OpenDecl (vecToList acc)
 
+    /// `Name<...>` in class-head position. Parsed by hand rather than through
+    /// parseType so a following `with` or `=` is not swallowed.
+    and parseClassHead (col : int) : Green =
+        if s.Is Ident then
+            let idt = s.Bump ()
+            if s.IsOp "<" && s.SameLine then
+                Green.node AppType (Green.node NamedType [ idt ] :: parseAngleArgs col)
+            else Green.node NamedType [ idt ]
+        else
+            s.Diag "expected a class name"
+            Green.node ErrorNode [ s.Bump () ]
+
+    /// One constraint: `when C<'a>`, `when C<'a> with Result = 'a`, or the
+    /// single-associated-type shorthand `when C<'a> = 'a`.
+    and parseWhen (col : int) : Green =
+        let acc = vecNew<Green> ()
+        vecAdd acc (s.Bump ())   // when
+        vecAdd acc (parseClassHead col)
+        if s.IsKw "with" then
+            vecAdd acc (s.Bump ())
+            if s.Is Ident then vecAdd acc (s.Bump ())
+        if s.IsOp "=" then
+            vecAdd acc (s.Bump ())
+            vecAdd acc (parseType col)
+        Green.node WhenDecl (vecToList acc)
+
+    /// `class C<'a,'b>` / `instance C<int,int>` — head, context, then a body
+    /// of associated types and members. Both shapes are identical; only the
+    /// keyword and what the body means differ.
+    and parseClassLike (kind : NodeKind) : Green =
+        let acc = vecNew<Green> ()
+        let col = s.CurCol
+        vecAdd acc (s.Bump ())   // class / instance
+        vecAdd acc (parseClassHead col)
+        while s.IsKw "when" && (s.SameLine || s.CurCol > col) do
+            vecAdd acc (parseWhen col)
+        if s.IsOp "=" then vecAdd acc (s.Bump ())
+        let mutable go = true
+        while go && not s.AtEof && not s.SameLine && s.CurCol > col do
+            let mark = s.Mark
+            // `type Result` declares (or binds) an associated type; inside a
+            // class body it needs no `static abstract` ceremony
+            if s.IsKw "when" then vecAdd acc (parseWhen col)
+            elif s.IsKw "type" || isMemberStart () then vecAdd acc (parseMember ())
+            else go <- false
+            if s.Mark = mark then go <- false
+        Green.node kind (vecToList acc)
+
     and parseDecl (ctx : int) : Green =
         if s.IsKw "extern" then
             // `extern let name : type` — a foreign import declaration
@@ -1169,6 +1250,8 @@ let parse (src : string) : ParseResult =
             // mutually-recursive continuation of whichever came last
             if lastMajor = "type" then parseTypeDecl ctx else parseLet ctx
         elif s.IsKw "type" then parseTypeDecl ctx
+        elif s.IsKw "class" then parseClassLike ClassDecl
+        elif s.IsKw "instance" then parseClassLike InstanceDecl
         elif s.IsKw "exception" then
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())

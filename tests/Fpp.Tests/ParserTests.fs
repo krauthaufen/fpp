@@ -56,11 +56,34 @@ let parserRoundTripTests =
         roundTrips "copy and update" "let q = { p with X = 2 }\n"
         roundTrips "ce body stays soup" "let t = test \"n\" { Expect.equal 1 1 \"e\" }\n"
         roundTrips "seq range stays soup" "let s = { 0 .. 10 }\n"
+        roundTrips "class decl" "class Mul<'a, 'b>\n    type Result\n    static (*) : 'a -> 'b -> Result\n"
+        roundTrips "class with superclass constraints" "class Fractional<'a>\n    when Add<'a, 'a> = 'a\n    when Mul<'a, 'a> with Result = 'a\n    static Zero : 'a\n    static One : 'a\n"
+        roundTrips "instance decl" "instance Mul<M44d, V4d>\n    type Result = V4d\n    static (*) m v = apply m v\n"
+        roundTrips "instance with context" "instance Add<V3d, V3d> when Fractional<'a>\n    type Result = V3d\n    static (+) a b = a\n"
+        roundTrips "constrained let" "let square (x : 'a) : 'a when Num<'a> = x * x\n"
+        roundTrips "comment still lexes as comment" "(* a comment *)\nlet x = 1\n"
     ]
 
 [<Tests>]
 let parserStructureTests =
     testList "parser structure" [
+        test "class and instance are their own declarations" {
+            let src = "class Add<'a, 'b>\n    type Result\n    static (+) : 'a -> 'b -> Result\ninstance Add<int, int>\n    type Result = int\n"
+            Expect.equal (nodesOf ClassDecl src |> List.length) 1 "one ClassDecl"
+            Expect.equal (nodesOf InstanceDecl src |> List.length) 1 "one InstanceDecl"
+        }
+        test "operator member name is one identifier token" {
+            let src = "class Mul<'a, 'b>\n    static (*) : 'a -> 'b -> Result\n"
+            let m = (nodesOf MemberDecl src).Head
+            let names =
+                m.Children
+                |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t.Text | _ -> None)
+            Expect.equal names [ "(*)" ] "the operator fuses into a single name token"
+        }
+        test "constraints parse as WhenDecl" {
+            let src = "class Fractional<'a>\n    when Add<'a, 'a> = 'a\n    when Mul<'a, 'a> with Result = 'a\n"
+            Expect.equal (nodesOf WhenDecl src |> List.length) 2 "two constraints"
+        }
         test "let produces LetDecl" {
             Expect.equal (nodesOf LetDecl "let x = 1\n" |> List.length) 1 "one LetDecl"
         }
