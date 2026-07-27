@@ -14,8 +14,10 @@ open Fpp.Core.Ir
 type private LetShape =
     | SimpleLet of bool * VarId * Scheme * Expr * Expr option
     | DestructureLet of Pat * Expr * Expr option
-    /// `let struct(a, b) = e`: bind the struct once, then read its fields
-    | StructLet of (VarId * Scheme) list * string * Expr * Expr option
+    /// `let struct(a, b) = e`: bind the struct once, then read its fields.
+    /// One slot per ELEMENT, empty where the element is a wildcard — a
+    /// binder list alone would renumber `struct(_, n)` as Item1.
+    | StructLet of (VarId * Scheme) option list * string * Expr * Expr option
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
@@ -286,6 +288,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
                     arg, sch)
         binds, bodyW
+
+    /// One slot per element of a `struct(...)` pattern, in source order:
+    /// `Some binder` for a named element, `None` for a wildcard or literal.
+    /// The POSITION is what names the field, so a dropped element still
+    /// takes its slot.
+    let structSlots (p : GreenNode) : (VarId * Scheme) option list =
+        let rec unwrap (m : GreenNode) =
+            if m.NodeKind = ParenPat || m.NodeKind = TuplePat then
+                nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) |> List.collect unwrap
+            else [ m ]
+        nodesOf p
+        |> List.filter (fun m -> isPatKind m.NodeKind)
+        |> List.collect unwrap
+        |> List.map (fun m ->
+            Green.tokens (GNode m)
+            |> List.filter (fun t -> t.Kind = Ident)
+            |> List.tryHead
+            |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
+            |> Option.map (fun d -> varIdOf d, schemeOf d))
 
     let rec lowerExpr (g : Green) : Expr =
         match g with
@@ -766,11 +787,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let binds =
                         pats |> List.map (fun p ->
                             if p.NodeKind = StructTuplePat then
-                                let binders =
-                                    Green.tokens (GNode p)
-                                    |> List.filter (fun t -> t.Kind = Ident)
-                                    |> List.choose (fun t -> dictTryFind defsAt t.Offset)
-                                    |> List.map (fun d -> varIdOf d, schemeOf d)
+                                let binders = structSlots p
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf p) with
                                     | Some o -> o
@@ -825,11 +842,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             | [ p ] when p.NodeKind = StructTuplePat ->
                                 // `| struct(a, b) ->`: bind the whole value,
                                 // then read its fields into the binders
-                                let binders =
-                                    Green.tokens (GNode p)
-                                    |> List.filter (fun t -> t.Kind = Ident)
-                                    |> List.choose (fun t -> dictTryFind defsAt t.Offset)
-                                    |> List.map (fun d -> varIdOf d, schemeOf d)
+                                let binders = structSlots p
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf p) with
                                     | Some o -> o
@@ -1368,19 +1381,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Expand `let struct(a, b) = rhs in body` into a struct binding plus
     /// one field read per binder — the struct itself is an ordinary value.
-    and structLetExpr (binders : (VarId * Scheme) list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
-        match binders with
+    and structLetExpr (slots : (VarId * Scheme) option list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
+        match slots |> List.choose id with
         | [] -> body
-        | (first, fsch) :: _ ->
+        | (first, _) :: _ ->
             let tmp = { Path = first.Path; Offset = first.Offset + 4000000; Name = "_st" }
             let tsch = mono (TCon (tn, []))
             let inner =
                 List.foldBack
-                    (fun (i, (v, vsch)) acc ->
-                        ELet (false, v, vsch, EField (EVar (tmp, tsch), "Item" + string (i + 1), tn), acc))
-                    (binders |> List.mapi (fun i b -> i, b))
+                    (fun (i, slot) acc ->
+                        match slot with
+                        | Some (v, vsch) ->
+                            ELet (false, v, vsch, EField (EVar (tmp, tsch), "Item" + string (i + 1), tn), acc)
+                        | None -> acc)
+                    (slots |> List.mapi (fun i b -> i, b))
                     body
-            ignore fsch
             ELet (false, tmp, tsch, rhs, inner)
 
     /// Classify and lower a LetDecl node.
@@ -1423,12 +1438,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `let struct(a, b) = rhs`
         match pats with
         | [ sp ] when sp.NodeKind = StructTuplePat ->
-            let binders =
-                Green.tokens (GNode sp)
-                |> List.filter (fun t -> t.Kind = Ident)
-                |> List.choose (fun t -> dictTryFind defsAt t.Offset)
-                |> List.map (fun d -> varIdOf d, schemeOf d)
-            if List.isEmpty binders then None
+            let binders = structSlots sp
+            if binders |> List.forall Option.isNone then None
             else
                 let tn =
                     match dictTryFind fieldOwners (offsetOf sp) with

@@ -741,6 +741,39 @@ All four self-application gates now pass at zero: parse, project, inference,
 and lowering (283 decls, lint-clean). Acceptance unchanged: 0 diagnostics /
 0 notes / 0 emit errors, and the emitted wasm still runs. Suite 353/353.
 
+### The collections WORK: acceptance file runs, pinned as a test
+The trap was four independent bugs, each hidden behind the last, all found
+by bisecting the real file rather than growing repros:
+
+- **Static creators were never a specialization demand.** The eager
+  single-candidate path for `Type.Member` recorded the member site but no
+  instantiation, so `HashSet.OfList` lowered to a bare `EVar` naming a
+  layout-dependent template that stamping had already removed ("unbound
+  variable OfList"). The parked overload path already did this; the eager
+  one now does too.
+- **Struct-tuple expressions were named too early.** `instName` ran at
+  inference time, freezing a type variable that later unification linked
+  away — so the clone's substitution missed it. They defer through
+  `pendingRecords` now, exactly like struct-tuple patterns.
+- **The stamper substituted whole names only.** A variable nested in a
+  composed name (`StructTuple2$<bool.SetNode$<#42>>`) survived into the
+  clone, which then named a record nobody declares; the emitter silently
+  fell back to another record with an `Item1` field and read the WRONG
+  slot. `substName` now substitutes every `#n` in the name.
+- **A wildcard in `struct(_, n)` shifted the field indices.** Binders were
+  collected from ident tokens, so `n` was read as `Item1`. Destructuring is
+  positional now: one slot per element, empty for wildcards.
+- **A downcast trapped on null.** `x :?> T` read the descriptor
+  unguarded; null now casts to null and a non-object raises InvalidCast
+  instead of trapping the module.
+
+The smoke program (18 assertions over `OfList`/`Add`/`Remove`/`Contains`/
+`IsSubsetOf`/`IntersectWith`/`Filter`/`Fold`/`Map`/`SetEquals`/`Overlaps`)
+prints the right answers and exits 0; it is pinned as an Expecto test that
+compiles the 4130-line reference file plus usage and diffs wasmtime's
+output. Suite 354 green. Still parked: `HashMap [ (1, "a") ]` seq-ctor,
+top-level `let x, y = ...` destructure.
+
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they
 do not run the result. The next step is a harness that takes the

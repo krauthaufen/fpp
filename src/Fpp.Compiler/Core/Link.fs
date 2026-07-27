@@ -53,12 +53,26 @@ let private withOpType (op : string) (name : string) : string =
 let instanceKey (cls : string) (memberName : string) (heads : string list) : string =
     cls + "|" + memberName + "|" + String.concat "@" heads
 
+/// A type variable can sit ANYWHERE in an instantiated name, not just be the
+/// whole of it: `StructTuple2$<bool.SetNode$<#42>>` is the struct a generic
+/// body builds, and a clone that only replaced whole-name variables would
+/// keep the `#42` and name a record that is never declared.
 let private substName (subst : Dict<string, string>) (n : string) =
-    if n.StartsWith "#" then
-        match dictTryFind subst n with
-        | Some concrete -> concrete
-        | None -> n
-    else n
+    if not (n.Contains "#") then n
+    else
+        let out = System.Text.StringBuilder ()
+        let mutable i = 0
+        while i < n.Length do
+            if n.[i] = '#' then
+                let start = i
+                i <- i + 1
+                while i < n.Length && System.Char.IsDigit n.[i] do i <- i + 1
+                let var = n.Substring (start, i - start)
+                out.Append (match dictTryFind subst var with Some c -> c | None -> var) |> ignore
+            else
+                out.Append n.[i] |> ignore
+                i <- i + 1
+        out.ToString ()
 
 let private mangleInst (name : string) (inst : string list) =
     name + "$" + String.concat "$" inst

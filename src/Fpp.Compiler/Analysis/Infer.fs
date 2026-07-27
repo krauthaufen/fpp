@@ -1601,8 +1601,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.collect unwrap
                 let ts = elems |> List.map (fun m -> exprType (GNode m))
                 let ty = TCon ("StructTuple" + string ts.Length, ts)
+                // like the pattern form: the element types are only settled
+                // once the whole file is solved, so naming the instantiation
+                // here would freeze a variable that later unification links
+                // away — and the stamper's substitution would then miss it
                 (match Green.tokens (GNode n) |> List.tryHead with
-                 | Some t -> vecAdd fieldOwnersRaw (t.Offset, instName ty)
+                 | Some t -> vecAdd pendingRecords (t.Offset, ty)
                  | None -> ())
                 ty
             | CastExpr when tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "downcast" || t.Text = "upcast")) ->
@@ -1704,6 +1708,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
                          for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
                          vecAdd memberSitesRaw (name.Offset, tn)
+                         // a same-file static member of a generic type is a
+                         // generic function once lifted, so this use is a
+                         // specialization demand — recorded in the definition
+                         // scheme's own variable order so the stamper's zip
+                         // lines up. Without it a layout-dependent static
+                         // emitted a bare EVar naming a template that
+                         // stamping had already removed.
+                         (match fi.DefKey with
+                          | Some (dp, doff) when dp = path ->
+                              (match dictTryFind defSchemes doff with
+                               | Some sch when not (List.isEmpty sch.Quantified) ->
+                                   let inst =
+                                       sch.Quantified
+                                       |> List.map (fun qv ->
+                                           match dictTryFind subst qv.Id with
+                                           | Some t -> t
+                                           | None -> st.Fresh ())
+                                   vecAdd instRaw (name.Offset, inst)
+                               | _ -> ())
+                          | _ -> ())
                          substVars subst fi.FieldType
                      | (_, first) :: _ ->
                          // STATIC overloads park like instance ones: at this

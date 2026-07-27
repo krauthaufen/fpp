@@ -1134,7 +1134,8 @@ let emit (decls : Decl list) : EmitResult =
                          match fields |> List.tryFind (fun (f, _) -> f = fname) with
                          | Some (_, v) -> unboxBy k (recur v)
                          | None ->
-                             vecAdd errors ("missing field " + fname + " in " + rn)
+                             emitError ("missing field " + fname + " in "
+                                        + (if tyName = rn then rn else rn + " (asked for " + tyName + ")"))
                              "(ref.i31 (i32.const 0))")
                  "(struct.new $r_" + rn + " " + String.concat " " vals + ")"
              | None ->
@@ -1330,8 +1331,10 @@ let emit (decls : Decl list) : EmitResult =
                             |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))")
                         let hit = match hits with [] -> "(i32.const 0)" | [ one ] -> one | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
                         "(if (result i32) (ref.test (ref $obj) " + v + ") (then " + hit + ") (else (i32.const 0)))"
+                // null casts to null, as it does everywhere: `x :?> T` on a
+                // null reference is null, not an error
                 "(block (result anyref) (local.set " + t + " " + recur e + ") "
-                + "(if (result anyref) " + ok + " "
+                + "(if (result anyref) (i32.or (ref.is_null " + v + ") " + ok + ") "
                 + "(then " + v + ") "
                 + "(else (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "InvalidCast").Value
                 + ") " + recur (ELit (LString ("\"invalid cast to " + tn + "\""))) + ")))))"
@@ -1342,14 +1345,19 @@ let emit (decls : Decl list) : EmitResult =
                 let t = newLocal "c"
                 let idOf =
                     "(struct.get $desc 0 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + ")))))"
-                // a downcast succeeds for the target class OR any subclass
+                // a downcast succeeds for the target class OR any subclass.
+                // The descriptor read is GUARDED and null passes through: a
+                // null reference casts to null, and a non-object answers the
+                // cast with InvalidCast rather than trapping.
                 let castTest =
-                    match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
-                    | [] -> "(i32.const 0)"
-                    | [ one ] -> one
-                    | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
+                    let hit =
+                        match subclassesOf tn |> List.map (fun c -> "(i32.eq " + idOf + " (i32.const " + string (descId c) + "))") with
+                        | [] -> "(i32.const 0)"
+                        | [ one ] -> one
+                        | many -> many |> List.reduce (fun a b -> "(i32.or " + a + " " + b + ")")
+                    "(if (result i32) (ref.test (ref $obj) (local.get " + t + ")) (then " + hit + ") (else (i32.const 0)))"
                 "(block (result anyref) (local.set " + t + " " + recur e + ") "
-                + "(if (result anyref) " + castTest + " "
+                + "(if (result anyref) (i32.or (ref.is_null (local.get " + t + ")) " + castTest + ") "
                 + "(then (local.get " + t + ")) "
                 + "(else (throw $fppexn (struct.new $du1 (i32.const " + string (dictTryFind caseTag "InvalidCast").Value
                 + ") " + recur (ELit (LString ("\"invalid cast to " + tn + "\""))) + "))))) "

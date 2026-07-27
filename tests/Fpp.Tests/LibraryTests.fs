@@ -105,3 +105,73 @@ let libraryTests =
             Expect.equal actual expected "F++ matches F# on the hashmap"
         }
     ]
+
+// The acceptance gate: the UNPORTED FSharp.Data.Adaptive HashCollections
+// source (4000+ lines, class hierarchies, bit-packed base state, struct
+// tuples, static creators) compiles AND its collections work at runtime.
+
+[<Tests>]
+let acceptanceTests =
+    testList "acceptance: HashCollections" [
+        test "reference HashCollections source runs HashSet and HashMap" {
+            let root = System.IO.Path.GetFullPath (__SOURCE_DIRECTORY__ + "/../..")
+            let src = System.IO.File.ReadAllText (root + "/tests/reference-HashCollections.ported.fs.txt")
+            let usage =
+                String.concat "\n" [
+                    ""
+                    "let s1 = HashSet.OfList [ 1; 2; 3; 4; 5 ]"
+                    "let p1 = print s1.Count"
+                    "let s2 = s1.Add 6"
+                    "let p2 = print s2.Count"
+                    "let p3 = print (if s2.Contains 6 then 1 else 0)"
+                    "let p4 = print (if s1.Contains 6 then 1 else 0)"
+                    "let s3 = s2.Remove 1"
+                    "let p5 = print s3.Count"
+                    "let p6 = print (if s1.IsSubsetOf s2 then 1 else 0)"
+                    "let p7 = print (if s2.IsProperSubsetOf s1 then 1 else 0)"
+                    "let inter = s1.IntersectWith (HashSet.OfList [ 4; 5; 6; 7 ])"
+                    "let p8 = print inter.Count"
+                    "let m1 = HashMap.OfList [ (1, \"one\"); (2, \"two\"); (3, \"three\") ]"
+                    "let p9 = print m1.Count"
+                    "let p10 = print (match m1.TryFind 2 with Some v -> v | None -> \"?\")"
+                    "let m2 = m1.Add(4, \"four\")"
+                    "let p11 = print m2.Count"
+                    "let m3 = m2.Remove 1"
+                    "let p12 = print (match m3.TryFind 1 with Some v -> v | None -> \"gone\")"
+                    "let p13 = print (m1.Fold((fun s k v -> s + k), 0))"
+                    "let sum = HashSet.OfList [ 10; 20; 30 ]"
+                    "let p14 = print (sum.Fold((fun s k -> s + k), 0))"
+                    "let evens = s1.Filter (fun k -> k % 2 = 0)"
+                    "let p15 = print evens.Count"
+                    "let mapped = m1.Map (fun k v -> String.length v)"
+                    "let p16 = print (match mapped.TryFind 3 with Some n -> n | None -> -1)"
+                    "let p17 = print (if s1.SetEquals (HashSet.OfArray [| 5; 4; 3; 2; 1 |]) then 1 else 0)"
+                    "let p18 = print (if s1.Overlaps ([ 5; 9 ] :> seq<int>) then 1 else 0)"
+                    "" ]
+            let ws = Workspace()
+            ws.SetFileText "HashCollections.fpp" (src + usage)
+            Expect.isEmpty (ws.Diagnostics "HashCollections.fpp") "type-checks"
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "compiles"
+            let tmp = System.IO.Path.GetTempFileName() + ".wat"
+            System.IO.File.WriteAllText(tmp, wat)
+            let psi =
+                let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+                System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "-W exceptions=y " + tmp)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            let actual, err, code =
+                use p = System.Diagnostics.Process.Start psi
+                let o = p.StandardOutput.ReadToEnd()
+                let e = p.StandardError.ReadToEnd()
+                p.WaitForExit()
+                o, e, p.ExitCode
+            System.IO.File.Delete tmp
+            Expect.equal code 0 ("runs without trapping: " + err)
+            let expected =
+                String.concat "\n"
+                    [ "5"; "6"; "1"; "0"; "5"; "1"; "0"; "2"
+                      "3"; "two"; "4"; "gone"; "6"; "60"; "2"; "5"; "1"; "1"; "" ]
+            Expect.equal (actual.Replace("\r\n", "\n")) expected "HashSet and HashMap answer correctly"
+        }
+    ]
