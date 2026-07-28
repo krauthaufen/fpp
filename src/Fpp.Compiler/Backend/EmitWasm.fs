@@ -1204,6 +1204,90 @@ let emit (decls : Decl list) : EmitResult =
             WasmBinary.emitStr bb " "
             compileInto bb locals extraLocals freeEnv false b
             WasmBinary.emitStr bb ")"
+        | ECast (_, inner, false) ->
+            // widening: representation unchanged, nothing at runtime
+            compileInto bb locals extraLocals freeEnv false inner
+        | ERecord (tyName, fields) when
+              (let rn0 =
+                  if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome then tyName
+                  else (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
+                        | Some (rn2, _, _) -> rn2
+                        | None -> "")
+               rn0 <> "" && (dictTryFind recordOrder rn0).IsSome
+               && not (isPod rn0) && not (isStructName rn0)) ->
+            let rn =
+                if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome then tyName
+                else (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
+                      | Some (rn2, _, _) -> rn2
+                      | None -> tyName)
+            let order = (dictTryFind recordOrder rn).Value
+            WasmBinary.emitStr bb ("(struct.new $r_" + rn + " ")
+            let mutable first = true
+            for fname, k in order do
+                if not first then WasmBinary.emitStr bb " "
+                first <- false
+                if fname = "__idhash" then WasmBinary.emitStr bb "(i32.const 0)"
+                elif fname = "__desc" && isObjRecord rn then WasmBinary.emitStr bb ("(global.get $desc_" + rn + ")")
+                else
+                    match fields |> List.tryFind (fun (f, _) -> f = fname) with
+                    | Some (_, v) ->
+                        if k = "f" || k = "s" || k = "l" || k = "i" then
+                            WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
+                            compileInto bb locals extraLocals freeEnv false v
+                            WasmBinary.emitStr bb ")"
+                        else compileInto bb locals extraLocals freeEnv false v
+                    | None ->
+                        emitError ("missing field " + fname + " in "
+                                   + (if tyName = rn then rn else rn + " (asked for " + tyName + ")"))
+                        WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
+            WasmBinary.emitStr bb ")"
+        | EField (r, fname, owner) when
+              (match e with
+               | EField (_, "Length", _) -> (dictTryFind fieldIndex "Length").IsSome
+               | _ -> true)
+              && (match r with EIndex _ | EField _ | EUnknown _ -> false | _ -> true)
+              && (match fieldSlot owner fname with Some (rn0, _, _) -> not (isPod rn0) && not (isStructName rn0) | None -> false)
+              && not (match r with EVar (v, _) -> (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome | _ -> false) ->
+            // the PLAIN field read; the POD/SoA/fusion shapes keep their
+            // string cases (guarded on receiver shape above)
+            let rn, idx, k = (fieldSlot owner fname).Value
+            if k = "f" || k = "s" || k = "l" || k = "i" then
+                WasmBinary.emitStr bb ("(call " + boxFn k + " ")
+            WasmBinary.emitStr bb ("(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") ")
+            compileInto bb locals extraLocals freeEnv false r
+            WasmBinary.emitStr bb "))"
+            if k = "f" || k = "s" || k = "l" || k = "i" then WasmBinary.emitStr bb ")"
+        | EFieldSet (r, fname, owner, v) when
+              (match fieldSlot owner fname with Some (rn0, _, _) -> not (isPod rn0) && not (isStructName rn0) | None -> false) ->
+            let rn, idx, k = (fieldSlot owner fname).Value
+            WasmBinary.emitStr bb ("(block (result anyref) (struct.set $r_" + rn + " " + string idx
+                                   + " (ref.cast (ref $r_" + rn + ") ")
+            compileInto bb locals extraLocals freeEnv false r
+            WasmBinary.emitStr bb ") "
+            if k = "f" || k = "s" || k = "l" || k = "i" then
+                WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
+                compileInto bb locals extraLocals freeEnv false v
+                WasmBinary.emitStr bb ")"
+            else compileInto bb locals extraLocals freeEnv false v
+            WasmBinary.emitStr bb ") (ref.i31 (i32.const 0)))"
+        | EIfaceCall (iface, mname, recv, args) when
+              (slotOf iface mname).IsSome
+              && not (iface = "IEnumerable" && mname = "GetEnumerator")
+              && not (iface = "IEnumerator" && (mname = "MoveNext" || mname = "Current")) ->
+            let slot = (slotOf iface mname).Value
+            let t =
+                let n = "$l" + string (vecLen extraLocals) + "_d"
+                vecAdd extraLocals (n, "anyref")
+                n
+            let arity = 1 + List.length args
+            let ft = "$v" + string arity
+            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + t + " ")
+            compileInto bb locals extraLocals freeEnv false recv
+            WasmBinary.emitStr bb (") (call_ref " + ft + " (local.get " + t + ") ")
+            for a in args do
+                compileInto bb locals extraLocals freeEnv false a
+                WasmBinary.emitStr bb " "
+            WasmBinary.emitStr bb ("(ref.cast (ref " + ft + ") (array.get $vt (struct.get $desc 1 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + "))))) (i32.const " + string slot + ")))))")
         | other -> WasmBinary.emitStr bb (compileExpr locals extraLocals freeEnv tail other)
 
     /// A function body through the buffer: ONE string materialization at the
