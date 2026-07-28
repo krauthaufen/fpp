@@ -118,31 +118,43 @@ let vecOfList (xs : 'a list) : Vec<'a> =
 type Dict<'k, 'v> =
     { mutable Keys : 'k[]
       mutable Vals : 'v[]
+      /// each entry's hash, kept beside it. A probe that lands on the wrong
+      /// entry is rejected on one int compare instead of a STRUCTURAL one:
+      /// the compiler's keys are mostly (path, offset) pairs, so the old
+      /// probe walked a string char by char to reject a collision. This is
+      /// what .NET's Dictionary does, and it was most of the gap between the
+      /// two halves on lookups.
+      mutable Hashes : int[]
       mutable Slots : int[]
       mutable Count : int }
 
 let dictNew<'k, 'v> () : Dict<'k, 'v> =
     { Keys = Array.zeroCreate 8; Vals = Array.zeroCreate 8
+      Hashes = Array.zeroCreate 8
       Slots = Array.zeroCreate 16; Count = 0 }
 
-let private dictSlot (d : Dict<'k, 'v>) (k : 'k) : int =
+let private dictSlotH (d : Dict<'k, 'v>) (k : 'k) (h : int) : int =
     // linear probing; the table is never full, so this terminates
     let mask = d.Slots.Length - 1
-    let mutable i = (hash k &&& 1073741823) &&& mask
+    let mutable i = h &&& mask
     let mutable found = -1
     while found < 0 do
         let e = d.Slots.[i]
         if e = 0 then found <- i
-        elif d.Keys.[e - 1] = k then found <- i
+        elif d.Hashes.[e - 1] = h && d.Keys.[e - 1] = k then found <- i
         else i <- (i + 1) &&& mask
     found
+
+let private dictSlot (d : Dict<'k, 'v>) (k : 'k) : int =
+    dictSlotH d k (hash k &&& 1073741823)
 
 let private dictRehash (d : Dict<'k, 'v>) : unit =
     let slots : int[] = Array.zeroCreate (d.Slots.Length * 2)
     let mask = slots.Length - 1
     let mutable e = 0
     while e < d.Count do
-        let mutable i = (hash d.Keys.[e] &&& 1073741823) &&& mask
+        // the stored hash: rehashing must not recompute what it already has
+        let mutable i = d.Hashes.[e] &&& mask
         while slots.[i] <> 0 do
             i <- (i + 1) &&& mask
         slots.[i] <- e + 1
@@ -150,22 +162,27 @@ let private dictRehash (d : Dict<'k, 'v>) : unit =
     d.Slots <- slots
 
 let dictSet (d : Dict<'k, 'v>) (k : 'k) (v : 'v) : unit =
-    let s = dictSlot d k
+    let h = hash k &&& 1073741823
+    let s = dictSlotH d k h
     let e = d.Slots.[s]
     if e > 0 then d.Vals.[e - 1] <- v
     else
         if d.Count >= d.Keys.Length then
             let keys : 'k[] = Array.zeroCreate (d.Keys.Length * 2)
             let vals : 'v[] = Array.zeroCreate (d.Vals.Length * 2)
+            let hs : int[] = Array.zeroCreate (d.Keys.Length * 2)
             let mutable i = 0
             while i < d.Count do
                 keys.[i] <- d.Keys.[i]
                 vals.[i] <- d.Vals.[i]
+                hs.[i] <- d.Hashes.[i]
                 i <- i + 1
             d.Keys <- keys
             d.Vals <- vals
+            d.Hashes <- hs
         d.Keys.[d.Count] <- k
         d.Vals.[d.Count] <- v
+        d.Hashes.[d.Count] <- h
         d.Count <- d.Count + 1
         // keep the load factor under a half: probes stay short and the
         // "never full" invariant `dictSlot` relies on holds
@@ -187,13 +204,14 @@ let dictRemove (d : Dict<'k, 'v>) (k : 'k) : unit =
         while i < d.Count - 1 do
             d.Keys.[i] <- d.Keys.[i + 1]
             d.Vals.[i] <- d.Vals.[i + 1]
+            d.Hashes.[i] <- d.Hashes.[i + 1]
             i <- i + 1
         d.Count <- d.Count - 1
         let slots : int[] = Array.zeroCreate d.Slots.Length
         let mask = slots.Length - 1
         let mutable j = 0
         while j < d.Count do
-            let mutable p = (hash d.Keys.[j] &&& 1073741823) &&& mask
+            let mutable p = d.Hashes.[j] &&& mask
             while slots.[p] <> 0 do
                 p <- (p + 1) &&& mask
             slots.[p] <- j + 1
