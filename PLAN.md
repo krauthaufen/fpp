@@ -2283,3 +2283,31 @@ stage-0 rewriting NOTHING (control build), which proved the corruption came
 from the pass merely EXECUTING in stage-1 — i.e. from how stage-0 compiled
 the pass's own code. That control-experiment shape is the fastest way to
 separate "my new pass is wrong" from "the compiler miscompiles my new pass".
+
+### THE ALLOCATION PLAN — supersedes "43s is near the floor", which was wrong
+The self-compile is nearly pure allocate-copy-discard, the one workload where
+.NET (gen0 bump alloc + memcpy) is at its best and wasm-GC (host-call strcat,
+copying collector) at its worst. The 10-20x is our allocation profile, not
+RyuJIT brilliance. Numbers:
+
+- `compileExpr` returns STRING: every parent concatenation COPIES its
+  children, so each output byte is copied O(depth) times — 6.2MB of output at
+  depth ~20-50 is ~200MB+ of copying — and the memo PINS every intermediate
+  subtree string live (the 1.5GB RSS, and why GC heap sizing bought 27s).
+- every `dictTryFind d (path, offset)` allocates a `$tup2` and hashes a
+  string; 1083 emitted sites, millions of executions.
+
+In leverage order, each gated byte-exactly by the fixpoint:
+1. **Rope emitter.** `type Wat = WS of string | WCat of Wat list`;
+   `compileExpr : ... -> Wat`; memo stores rope nodes (children SHARED, not
+   copied); ONE flatten into the Builder at the end. ~200 mechanical edits
+   (the type change enumerates them). Kills the O(depth) copying AND
+   collapses the live set. Also makes stage-0's native emit faster, and is
+   the substrate binary emission needs anyway.
+2. **Allocation-free dict keys.** Intern file paths to small ints once (the
+   compiler sees ~21 files); key = the pair packed as ints — or struct-tuple
+   keys once tuples-in-key-position get the struct representation. Either
+   removes the per-lookup `$tup2` + string hash.
+3. Remeasure. Expected order-of-magnitude: wasm side 36s -> ~10-15s, and the
+   6.6x native gap collapsing toward 2-3x. THEN revisit inlining, which
+   becomes worth switching on once call bodies stop allocating.
