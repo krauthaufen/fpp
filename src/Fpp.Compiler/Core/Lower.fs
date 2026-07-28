@@ -662,6 +662,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | EField (EField (EUnknown "System", "Object", _), "ReferenceEquals", _), [ ETuple [ ra; rb ] ]
                       | EField (EUnknown "Object", "ReferenceEquals", _), [ ETuple [ ra; rb ] ] ->
                           EApp (EUnknown "refEq", [ ra; rb ])
+                      // `obj.Equals (a, b)` is .NET's STRUCTURAL comparison,
+                      // which is what `=` already means here — including on
+                      // arrays, where both compare by reference
+                      | EField (EField (EUnknown "System", "Object", _), "Equals", _), [ ETuple [ ra; rb ] ]
+                      | EField (EUnknown "Object", "Equals", _), [ ETuple [ ra; rb ] ]
+                      | EField (EUnknown "obj", "Equals", _), [ ETuple [ ra; rb ] ] ->
+                          EPrim ("=", [ ra; rb ])
                       | EField (EUnknown "Array", "create", _), [ cn; cv ] ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with

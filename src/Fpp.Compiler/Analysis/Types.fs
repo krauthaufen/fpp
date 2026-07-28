@@ -69,6 +69,12 @@ let rec typeConName (t : Type) : string =
     // Pair<int, Pair<int,int>> -> Pair$<int.Pair$<int.int>>
     | TCon (n, args) -> n + "$<" + String.concat "." (List.map typeConName args) + ">"
     | TVar v -> "#" + string v.Id
+    // A tuple is a UNIFORM reference — the same conclusion arrays reached,
+    // where a tuple element makes the array a plain `$ref` array whatever it
+    // holds. So every tuple instantiation of a generic shares one body, and
+    // one name is what says so. Anonymous by design: `Dict<string * string>`
+    // and `Dict<int * bool>` have identical layout and identical code.
+    | TTuple _ -> "$ref"
     | _ -> ""
 
 /// Map every type inside a constraint.

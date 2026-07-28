@@ -359,16 +359,26 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                 if isTemplate then t else "obj"
                         else t)
                 let needsLayout = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+                // A demand with no NAME at all can never become one: stamping
+                // substitutes "#id" variables, and there is nothing to
+                // substitute. So it is an error even inside a template, where
+                // a symbolic demand would legitimately resolve per clone.
+                // Suppressing it there is what let a class member fail
+                // SILENTLY — the template is never emitted, every use was
+                // supposed to be stamped, and the member simply vanished.
+                let nameless = inst |> List.exists (fun t -> t = "")
                 let cls =
                     if needsLayout then
-                        if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then
+                        if nameless then
+                            Unclassifiable "the type argument has no name to specialize on"
+                        elif inst |> List.exists (fun t -> t.StartsWith "#") then
                             Unclassifiable "element layout is not statically known here"
                         else Stamp inst
                     else classify isStructName inst
                 (match cls with
                  | Canon -> EVar (v, sch)
                  | Unclassifiable why ->
-                     if not isTemplate then
+                     if not isTemplate || nameless then
                          vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
                      EVar (v, sch)
                  | Stamp i ->

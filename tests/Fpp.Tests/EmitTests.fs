@@ -638,3 +638,74 @@ let wildcardRangeTests =
             Expect.equal out "2,6,none\nTrue,False\n9,4\n" "map, bind, filter, isSome, defaultValue"
         }
     ]
+
+[<Tests>]
+let tupleSpecializationTests =
+    // A tuple is a UNIFORM reference, so a generic instantiated at one shares
+    // the canonical body — the same conclusion arrays reached. Before this,
+    // the stamper called it "layout is not statically known": an ERROR at top
+    // level, and SILENCE inside a class, where the member simply vanished
+    // from the module. Both paths are pinned.
+    //
+    // `Slot` is layout-dependent (it holds an array of its key type), which
+    // is what forces the stamper to have an opinion at all.
+    let slot =
+        [ "type Slot<'k, 'v> = { mutable Keys : 'k[]; mutable Vals : 'v[]; mutable N : int }"
+          "let slotNew<'k, 'v> () : Slot<'k, 'v> ="
+          "    { Keys = Array.zeroCreate 8; Vals = Array.zeroCreate 8; N = 0 }"
+          "let slotPut (s : Slot<'k, 'v>) (k : 'k) (v : 'v) : unit ="
+          "    s.Keys.[s.N] <- k"
+          "    s.Vals.[s.N] <- v"
+          "    s.N <- s.N + 1"
+          "let slotGet (s : Slot<'k, 'v>) (k : 'k) (fallback : 'v) : 'v ="
+          "    let mutable i = 0"
+          "    let mutable found = fallback"
+          "    while i < s.N do"
+          "        if s.Keys.[i] = k then found <- s.Vals.[i]"
+          "        i <- i + 1"
+          "    found" ]
+    testList "generics instantiated at a tuple" [
+        test "top level: a tuple-keyed table round-trips" {
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ slot @
+                    [ "let t : Slot<string * string, int> = slotNew ()"
+                      "let a = slotPut t (\"s\", \"a\") 1"
+                      "let b = slotPut t (\"s\", \"b\") 2"
+                      "let r1 = print (string (slotGet t (\"s\", \"b\") -1))"
+                      "let r2 = print (string (slotGet t (\"s\", \"zz\") -1))"
+                      "" ]))
+            Expect.equal out "2\n-1\n" "tuple keys are distinct and found"
+        }
+        test "class field: the members must still exist" {
+            // the regression this guards is not a wrong answer but a MISSING
+            // one — the class emitted nothing and every use was unbound
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ slot @
+                    [ "type Db() ="
+                      "    let t : Slot<string * string, int> = slotNew ()"
+                      "    member _.Put (q : string) (k : string) (v : int) : unit = slotPut t (q, k) v"
+                      "    member _.Get (q : string) (k : string) : int = slotGet t (q, k) -1"
+                      "let db = Db()"
+                      "let a = db.Put \"s\" \"a\" 7"
+                      "let r1 = print (string (db.Get \"s\" \"a\"))"
+                      "let r2 = print (string (db.Get \"s\" \"nope\"))"
+                      "" ]))
+            Expect.equal out "7\n-1\n" "the class's members are emitted and callable"
+        }
+        test "distinct tuple instantiations share one body without colliding" {
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ slot @
+                    [ "let a : Slot<string * string, int> = slotNew ()"
+                      "let b : Slot<int * bool, string> = slotNew ()"
+                      "let s1 = slotPut a (\"x\", \"y\") 1"
+                      "let s2 = slotPut b (2, true) \"two\""
+                      "let r1 = print (string (slotGet a (\"x\", \"y\") -1))"
+                      "let r2 = print (slotGet b (2, true) \"?\")"
+                      "let r3 = print (slotGet b (2, false) \"absent\")"
+                      "" ]))
+            Expect.equal out "1\ntwo\nabsent\n" "one shared body, two independent tables"
+        }
+    ]

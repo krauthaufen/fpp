@@ -22,6 +22,24 @@ let private prefix =
       root + "/src/Fpp.Compiler/Syntax/Lexer.fs"
       root + "/src/Fpp.Compiler/Syntax/Parser.fs" ]
 
+/// Everything that emits today, in project order. Growing THIS is the
+/// bootstrap; `prefix` stays the smaller set the syntax drivers need.
+let private wholeFrontier =
+    prefix
+    @ [ root + "/src/Fpp.Compiler/Analysis/Resolve.fs"
+        root + "/src/Fpp.Compiler/Analysis/Types.fs"
+        root + "/src/Fpp.Compiler/Analysis/Format.fs"
+        root + "/src/Fpp.Compiler/Analysis/Classes.fs"
+        root + "/src/Fpp.Compiler/Analysis/Infer.fs"
+        root + "/src/Fpp.Compiler/Core/Core.fs"
+        root + "/src/Fpp.Compiler/Core/Lower.fs"
+        root + "/src/Fpp.Compiler/Core/Lint.fs"
+        root + "/src/Fpp.Compiler/Core/Serialize.fs"
+        root + "/src/Fpp.Compiler/Core/Link.fs"
+        root + "/src/Fpp.Compiler/Core/Plugins.fs"
+        root + "/src/Fpp.Compiler/Backend/EmitWasm.fs"
+        root + "/src/Fpp.Compiler/Query.fs" ]
+
 let private runWasm (files : string list) : string =
     let ws = Workspace()
     for f in files do ws.SetFileText f (System.IO.File.ReadAllText f)
@@ -156,6 +174,29 @@ let private refOracle () =
     p (string (Prelude.refPairSetAdd ps a c))
     out.ToString ()
 
+// ---- the oracle for the query driver ----------------------------------
+// tests/bootstrap/querydrive.fpp under the hosted compiler's own Db.
+
+let private queryOracle () =
+    let out = System.Text.StringBuilder()
+    let p (s : string) = out.Append(s).Append('\n') |> ignore
+    let db = Query.Db()
+    db.SetInput "src" "a" (box "hello")
+    db.SetInput "src" "b" (box "world")
+    let lengthOf (k : string) : int =
+        db.MemoT<int> "len" k (fun () -> (unbox<string> (db.GetInput "src" k)).Length)
+    let both () : int = db.MemoT<int> "both" "" (fun () -> lengthOf "a" + lengthOf "b")
+    p (string (both ()))
+    p ("computes " + string db.ComputeCount)
+    p (string (both ()))
+    p ("computes " + string db.ComputeCount)
+    db.SetInput "src" "a" (box "hi")
+    p (string (both ()))
+    p ("computes " + string db.ComputeCount)
+    db.SetInput "src" "b" (box "world")
+    p (string (both ()))
+    out.ToString ()
+
 [<Tests>]
 let bootstrapTests =
     testList "stage-0 bootstrap" [
@@ -178,6 +219,10 @@ let bootstrapTests =
             let out = runWasm [ root + "/stdlib/bootstrap.fpp"
                                 root + "/tests/bootstrap/refdrive.fpp" ]
             Expect.equal out (refOracle ()) "the two halves of the seam disagree"
+        }
+        test "the emitted query engine memoizes, invalidates and cuts off" {
+            let out = runWasm (wholeFrontier @ [ root + "/tests/bootstrap/querydrive.fpp" ])
+            Expect.equal out (queryOracle ()) "emitted query engine disagrees with the hosted one"
         }
         test "the emitted bootstrap prelude behaves like the .NET seam" {
             let out = runWasm [ root + "/stdlib/bootstrap.fpp"

@@ -1070,7 +1070,41 @@ gaps closed on the way:
 - **`Option`** (map, bind, filter, forall, exists, iter, isSome, isNone,
   defaultValue, toList) and **`id`** joined the prelude.
 
-**Where it stops: `Query.fs`, and the cause is the stamper.** A generic
+**Fixed: tuple type arguments specialize as canon.** A tuple is a uniform
+reference — the conclusion arrays already reached, where a tuple element
+makes the array a plain `$ref` array whatever it holds — so every tuple
+instantiation of a generic SHARES one body, and one name is what says so.
+`typeConName` and the instantiation-site naming give `TTuple` (and `TFun`)
+the name `$ref`; the stamper then classifies them like any other reference
+type. `Dict<string * string, _>` and `Dict<int * bool, _>` compile to the
+same code and stay independent tables.
+
+**Fixed: an instantiation the stamper cannot perform is now REPORTED.** The
+silence had a specific cause. Errors were suppressed inside a *template* —
+the unstamped body of a layout-dependent generic — because a symbolic demand
+there legitimately resolves per clone. But a class member that touches such
+a field BECOMES a template, so its failure was suppressed too, and since a
+template is never emitted, the member simply vanished: the module linked and
+every use was unbound. The rule is finer now. A demand carrying a `#id`
+resolves in a clone and stays suppressed in a template; a demand with NO
+NAME can never be resolved by substitution, so it is an error wherever it
+occurs. Both paths — top level and class field — are pinned by tests, the
+class-field one guarding a MISSING function rather than a wrong answer.
+
+(Since every `Type` case now names itself, the nameless path is unreachable
+from source today. It stays as the rule that keeps it that way: the next
+type form that forgets to name itself gets an error instead of a hole.)
+
+**`obj.Equals (a, b)`** joins `ReferenceEquals` as an intercepted static: it
+is .NET's structural comparison, which is what `=` already means here —
+including on arrays, where both compare by reference.
+
+With those, `Query.fs` and `Project.fs` emit, and
+`tests/bootstrap/querydrive.fpp` is wired into the suite: the emitted query
+engine memoizes, invalidates on edit and cuts off early, agreeing with the
+hosted engine run over the same script. **The frontier is 19 of 20.**
+
+**Superseded — the original diagnosis, kept for the record:** A generic
 function cannot be specialized at a TUPLE type argument. Eight lines:
 
     let table : Dict<string * string, obj> = dictNew ()

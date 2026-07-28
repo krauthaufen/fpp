@@ -2869,6 +2869,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // instantiates at the ENCLOSING binding's type variable —
                 // name it so stamping can substitute the caller's argument
                 | TVar v -> "#" + string v.Id
+                // a tuple (or a function) is a uniform reference: it names
+                // itself so that every such instantiation SHARES one body,
+                // instead of arriving unnamed and looking layout-dependent
+                | TTuple _ | TFun _ -> "$ref"
                 | _ -> ""))
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
