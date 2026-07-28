@@ -547,37 +547,15 @@ let parseFloat (s : string) : float =
 /// relies on, so the bits come from the language rather than a host call.
 let halfBits (v : float) : int = float16Bits (float16 v)
 
-/// how many BYTES this text occupies as UTF-8
-let utf8Length (s : string) : int =
-    let mutable n = 0
-    let mutable i = 0
-    while i < s.Length do
-        let c = int s.[i]
-        if c < 0x80 then n <- n + 1
-        elif c < 0x800 then n <- n + 2
-        else n <- n + 3
-        i <- i + 1
-    n
+/// How many BYTES this text occupies. A string IS a byte sequence here —
+/// source is read as bytes, so there is nothing left to encode.
+let byteLength (s : string) : int = s.Length
 
-/// The same text as UTF-8 BYTES. Encodes the three ranges a source file can
-/// contain; a lone surrogate cannot appear in a well-formed string here.
-let utf8Bytes (s : string) : byte[] =
-    let out = Array.zeroCreate (utf8Length s)
-    let mutable j = 0
+/// The same text as BYTES.
+let stringBytes (s : string) : byte[] =
+    let out = Array.zeroCreate s.Length
     let mutable i = 0
     while i < s.Length do
-        let c = int s.[i]
-        if c < 0x80 then
-            out.[j] <- byte c
-            j <- j + 1
-        elif c < 0x800 then
-            out.[j] <- byte (0xC0 ||| (c >>> 6))
-            out.[j + 1] <- byte (0x80 ||| (c &&& 0x3F))
-            j <- j + 2
-        else
-            out.[j] <- byte (0xE0 ||| (c >>> 12))
-            out.[j + 1] <- byte (0x80 ||| ((c >>> 6) &&& 0x3F))
-            out.[j + 2] <- byte (0x80 ||| (c &&& 0x3F))
-            j <- j + 3
+        out.[i] <- byte s.[i]
         i <- i + 1
     out

@@ -819,7 +819,7 @@ let emit (decls : Decl list) : EmitResult =
         | ELit (LString raw) ->
             let bytes = unescape raw
             let id = internString bytes
-            "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (utf8Length bytes) + "))"
+            "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (byteLength bytes) + "))"
         | EVarI (v, sch, _) -> recur (EVar (v, sch))
         | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
             let rn, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
@@ -3805,7 +3805,7 @@ TUPLE_CMP
         sbText out
     vecToList strings
     |> List.iteri (fun i sdata ->
-        line ("  (data $d" + string i + " \"" + hexEscape (utf8Bytes sdata) + "\")"))
+        line ("  (data $d" + string i + " \"" + hexEscape (stringBytes sdata) + "\")"))
 
     // string accessors for host glue (JS reads/builds $str through these)
     line """  (func (export "str_len") (param $s anyref) (result i32)

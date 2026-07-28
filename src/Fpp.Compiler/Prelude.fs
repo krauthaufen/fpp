@@ -4,6 +4,17 @@ module Fpp.Prelude
 // F++; every runtime touchpoint goes through this module so that the F++
 // stdlib only ever has to reimplement this file to close the loop.
 
+/// Source is a sequence of BYTES, and every offset the compiler records —
+/// diagnostics, synthetic names built from a node's position — is a byte
+/// offset, because that is what the F++ half sees. Decoding UTF-8 into .NET
+/// chars silently renumbers everything after the first non-ASCII character:
+/// fifteen em dashes in the prelude's own comments moved an object
+/// expression's generated name by twelve, and stage-0 and stage-1 then
+/// disagreed about a type's name. Latin-1 is the identity byte->char map, so
+/// the two halves index the same way; the emitter escapes bytes on the way
+/// out, so text survives unchanged.
+let private latin1 = System.Text.Encoding.Latin1
+
 let inline strLen (s : string) : int = s.Length
 let inline charAt (s : string) (i : int) : char = s.[i]
 let inline substr (s : string) (start : int) (len : int) : string = s.Substring(start, len)
@@ -69,10 +80,13 @@ let parseFloat (s : string) : float =
 /// the IEEE half nearest `v`, as its 16 bits
 let halfBits (v : float) : int =
     int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
-/// how many BYTES this text occupies as UTF-8
-let utf8Length (s : string) : int = System.Text.Encoding.UTF8.GetByteCount s
-/// the same text as UTF-8 BYTES (data segments carry bytes, not chars)
-let utf8Bytes (s : string) : byte[] = System.Text.Encoding.UTF8.GetBytes s
+/// How many BYTES this text occupies. Source is read as bytes (see
+/// `hostReadText`), so a string IS its bytes and no re-encoding is wanted —
+/// encoding it as UTF-8 here turned one em dash already in the source into
+/// six bytes on the way out.
+let byteLength (s : string) : int = s.Length
+/// the same text as BYTES (data segments carry bytes, not chars)
+let stringBytes (s : string) : byte[] = latin1.GetBytes s
 
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count
@@ -177,17 +191,6 @@ let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
 // STRINGS only (null for "no result", newline-separated for a list) so any
 // host can satisfy them — a wasm preload module, a browser's in-memory map —
 // and wraps them into these signatures.
-
-/// Source is a sequence of BYTES, and every offset the compiler records —
-/// diagnostics, synthetic names built from a node's position — is a byte
-/// offset, because that is what the F++ half sees. Decoding UTF-8 into .NET
-/// chars silently renumbers everything after the first non-ASCII character:
-/// fifteen em dashes in the prelude's own comments moved an object
-/// expression's generated name by twelve, and stage-0 and stage-1 then
-/// disagreed about a type's name. Latin-1 is the identity byte->char map, so
-/// the two halves index the same way; the emitter escapes bytes on the way
-/// out, so text survives unchanged.
-let private latin1 = System.Text.Encoding.Latin1
 
 let hostReadText (path : string) : string option =
     if System.IO.File.Exists path then Some (latin1.GetString (System.IO.File.ReadAllBytes path))
