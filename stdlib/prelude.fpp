@@ -149,7 +149,13 @@ instance MinMax<float32>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
 instance Ordered<byte>
+instance MinMax<byte>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
 instance Ordered<sbyte>
+instance MinMax<sbyte>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
 instance Ordered<string>
 instance Ordered<char>
 instance MinMax<string>

@@ -195,6 +195,25 @@ let noBoxGate =
             Expect.equal out "42\n-17\n1912276171\n-250\n0.0125\n65\n"
                 "each conversion parses, and the i64 wraps on the way to int"
         }
+        test "byte and sbyte order as integers" {
+            // `byte` was missing from the operator suffix table, so `<@byte`
+            // went looking for an instance member and found the GENERATED
+            // `compare` — whose body is that very comparison. It recursed
+            // until the stack ran out.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    let a = byte 200"
+                    "    let b = byte 100"
+                    "    print (string (compare a b))"
+                    "    print (string (compare b a))"
+                    "    print (string (compare a a))"
+                    "    print (string (int (max a b)))"
+                    "    print (string (compare (sbyte -5) (sbyte 7)))"
+                    "" ])
+            Expect.equal out "1\n-1\n0\n200\n-1\n" "byte is unsigned, sbyte is signed, neither loops"
+        }
     ]
 
 [<Tests>]

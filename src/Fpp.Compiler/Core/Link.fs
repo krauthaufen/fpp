@@ -44,7 +44,11 @@ let private withOpType (op : string) (name : string) : string =
     | "int64" -> baseOp + "l"
     | "uint32" -> baseOp + "w"
     | "string" -> baseOp + "t"
-    | "int" | "char" | "bool" -> baseOp
+    // byte and sbyte are int-SHAPED: the value is already masked (or sign
+    // extended) into an i32, so every operator on them is the integer one.
+    // Leaving them out sent `<@byte` looking for an instance member — and
+    // found the generated `compare`, whose own body is that comparison.
+    | "int" | "char" | "bool" | "byte" | "sbyte" -> baseOp
     // a type whose instance has a body: still unresolved here, and emission
     // reports it rather than silently running the integer path
     | other -> baseOp + "@" + other
@@ -340,7 +344,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     // `isTemplate` marks the original body of a layout-dependent generic:
     // it is never emitted (every use is stamped, DCE drops it), so demands
     // that are still symbolic there are not errors — they resolve in clones.
-    let rewrite (owner : string) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
+    let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
             | EVarI (v, sch, inst0) ->
@@ -439,11 +443,23 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                               // ordering has one operation; the predicates
                               // test its result
                               if cls = "Ordered" then EPrim (baseOp, [ call; ELit (LInt "0") ]) else call
+                          // resolving to the function BEING rewritten turns
+                          // its own body into a call to itself. That is
+                          // exactly the shape of the generated `compare`,
+                          // whose body IS the two ordering primitives — so
+                          // for it the primitive stands, and a type the
+                          // backend cannot spell is reported at emission
+                          // rather than looping forever at runtime.
+                          let notSelf (fnp : VarId * bool) =
+                              let fn, _ = fnp
+                              (fn.Path, fn.Offset) <> ownerKey
                           (match dictTryFind instanceFns key2 with
-                           | Some fn -> asCall fn
+                           | Some fn when notSelf fn -> asCall fn
+                           | Some _ -> EPrim (resolved, xs)
                            | None ->
                                match dictTryFind instanceFns key1 with
-                               | Some fn -> asCall fn
+                               | Some fn when notSelf fn -> asCall fn
+                               | Some _ -> EPrim (resolved, xs)
                                | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
@@ -542,7 +558,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                 isFunction
                 && (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
                 && not (List.isEmpty sch.Quantified)
-            vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) isTemplate e))
+            vecAdd out (DLet (rc, v, sch, rewrite v.Name (v.Path, v.Offset) (dictNew ()) isTemplate e))
         | other -> vecAdd out other
 
     // transitive closure: stamping a clone may demand further stamps
@@ -574,7 +590,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
              let clone =
                  DLet (rc, nv, substScheme inst sch,
                        alphaRename (10000000 + (abs (hash mangled) % 1000000) * 10)
-                           (selfFix (rewrite mangled subst false e)))
+                           (selfFix (rewrite mangled selfKey subst false e)))
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1
