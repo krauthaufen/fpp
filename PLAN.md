@@ -2396,3 +2396,27 @@ each move gated by suite + fixpoint —
      binary, keep the text emitter as the debug path
 
 Seam gained `bytesString` (bytes -> string, Latin-1 identity both halves).
+
+### Brick 2 status: converted-then-reverted, and what the evening measured
+The ELet spine and EIf were converted into `compileInto` (byte-identical
+output, 420 tests, fixpoint closed at every step), plus a slice-memo variant
+(`refMapTryFind` -> `emitSlice` on re-mention). All of it WORKED; none of it
+is committed, for one reason: single-run self-host timings tonight scattered
+57s / 94s / 68s / 79s / 72s across configurations INCLUDING re-measuring the
+same code — the box has +/-15s of noise, and every per-step "regression" and
+"win" was inside it. Optimizing against that is astrology.
+
+Committed: the scaffold (ESeq + literals + compileToText), and `bytesString`
+as the IDENTITY in the F++ half — a byte[] and a string share one runtime
+representation (packed i8), so box/unbox lower to nothing; the char-by-char
+version it replaces allocated a string PER BYTE of every function body.
+
+For whoever continues (the conversion itself is proven mechanical):
+1. Measure with 3+ runs per configuration on a quiet box, or add a
+   wall-clock-free proxy (wasmtime fuel, or instruction counts via perf).
+2. Reapply the ELet/EIf conversion from this session's shape (it is in the
+   reflog and byte-identical); expand case by case per the checklist.
+3. Do NOT add the slice memo until a measured re-walk cost justifies it —
+   it pays a tuple + map insert per node for hits that may be rare. The
+   string-path memo already caps fallback subtrees.
+4. The endgame stays: all cases appended, then flip emitStr to opcode bytes.
