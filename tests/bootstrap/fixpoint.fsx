@@ -120,7 +120,7 @@ let generateHost (files : (string * string) list) : string =
     app "    (local $k i32)"
     app "    (local.set $k (call $which (local.get $p)))"
     files |> List.iteri (fun i (_, c) ->
-        let n = System.Text.Encoding.UTF8.GetByteCount c
+        let n = System.Text.Encoding.Latin1.GetByteCount c
         app (sprintf "    (if (i32.eq (local.get $k) (i32.const %d))" i)
         app (sprintf "      (then (return (array.new_data $str $c%d (i32.const 0) (i32.const %d)))))" i n))
     app "    (ref.null any))"
