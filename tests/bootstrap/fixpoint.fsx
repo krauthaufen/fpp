@@ -212,7 +212,37 @@ let report (expected : string) (actual : string) =
 
 // ---- go ------------------------------------------------------------------
 
-let corpusFiles = corpus |> List.map (fun p -> servedName p, readSource p)
+/// `self` is the REAL self-hosting gate: the corpus IS the compiler, so
+/// stage-1's answer must be stage-1's own text. Anything less compares the
+/// two stages on a program neither of them is.
+let selfHost = System.Environment.GetCommandLineArgs () |> Array.contains "self"
+
+let driverPath = root + "/tests/bootstrap/compiledrive.fpp"
+
+/// The names the corpus is SERVED under. In self mode they are the
+/// compiler's own files, which is what the driver must name too.
+let corpusNames =
+    if selfHost then (compilerFiles |> List.map servedName) @ [ servedName driverPath ]
+    else corpus |> List.map servedName
+
+/// The driver names the corpus; keep it and the host in step.
+let driverText =
+    let text = readSource driverPath
+    let names = corpusNames |> List.map (fun n -> "\"" + n + "\"")
+    text.Replace ("let corpus = [ \"corpus.fpp\" ]",
+                  "let corpus = [ " + String.concat "; " names + " ]")
+
+/// Stage-1's inputs, under the SAME served names the host uses. A file's
+/// name reaches the .wat (diagnostics, symbol prefixes), so naming a source
+/// by its absolute path here and by its basename there would make the two
+/// stages differ for no reason — and in self mode they are the same list.
+let stage1Source =
+    (compilerFiles |> List.map (fun f -> servedName f, readSource f))
+    @ [ servedName driverPath, driverText ]
+
+let corpusFiles =
+    if selfHost then stage1Source
+    else corpus |> List.map (fun p -> servedName p, readSource p)
 
 printfn "corpus: %s" (String.concat ", " (corpusFiles |> List.map fst))
 
@@ -224,16 +254,9 @@ printfn "stage-0 answer: %d bytes" expected.Length
 // this run is comparing against.
 if System.Environment.GetCommandLineArgs () |> Array.contains "stage0" then exit 0
 
-let stage1Source =
-    (compilerFiles |> List.map (fun f -> f, readSource f))
-    @ [ let d = root + "/tests/bootstrap/compiledrive.fpp"
-        // the driver names the corpus; keep it and the host in step
-        let text = readSource d
-        let names = corpusFiles |> List.map (fun (n, _) -> "\"" + n + "\"")
-        d, text.Replace ("let corpus = [ \"corpus.fpp\" ]",
-                         "let corpus = [ " + String.concat "; " names + " ]") ]
-
-let stage1 = emit "stage-1" stage1Source
+// in self mode stage-1 IS the expected answer: same sources, same names, so
+// emitting it twice would only prove that stage-0 is deterministic
+let stage1 = if selfHost then expected else emit "stage-1" stage1Source
 let stage1Path = scratch + "/stage1.wat"
 System.IO.File.WriteAllText (stage1Path, stage1)
 printfn "stage-1: %d bytes of wat" stage1.Length
