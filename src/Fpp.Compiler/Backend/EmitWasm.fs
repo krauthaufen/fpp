@@ -793,7 +793,26 @@ let emit (decls : Decl list) : EmitResult =
     // environment must never be reused in another
     // hashed SHALLOWLY on the node's constructor — identity decides equality,
     // so the hash only has to be stable and cheap (see the seam's RefMap)
-    let exprTag (x : Expr) : int =
+    /// The RefMap contract asks only for a hash that is STABLE and reads
+    /// immutable fields — and a constructor tag satisfies it. But stable is
+    /// not DISTRIBUTING: twenty-eight values over the tens of thousands of
+    /// subexpressions in one function turned the memo's open addressing into
+    /// a linear scan of one enormous cluster, and the scan grows with the
+    /// function. These read the same immutable fields and spread.
+    ///
+    /// Bounded on purpose: a string literal can be the whole runtime blob,
+    /// and hashing all of it on every lookup would cost more than the probing
+    /// it saves. Length plus the first few characters separates names.
+    let shortHash (s : string) : int =
+        let n = strLen s
+        let mutable h = n * 131
+        let mutable i = 0
+        while i < n && i < 8 do
+            h <- h * 31 + int (charAt s i)
+            i <- i + 1
+        h
+    /// the cheap constructor tag, used to mix a CHILD in without recursing
+    let kindTag (x : Expr) : int =
         match x with
         | EVar _ -> 1 | EVarI _ -> 2 | ELit _ -> 3 | ELam _ -> 4 | EApp _ -> 5
         | ELet _ -> 6 | EIf _ -> 7 | EMatch _ -> 8 | ETuple _ -> 9 | EListLit _ -> 10
@@ -802,6 +821,40 @@ let emit (decls : Decl list) : EmitResult =
         | EWhile _ -> 20 | EAssign _ -> 21 | EArray _ -> 22 | EIndex _ -> 23
         | EIndexSet _ -> 24 | EArrayLen _ -> 25 | EArrayCreate _ -> 26 | ETry _ -> 27
         | _ -> 28
+    let exprTag (x : Expr) : int =
+        match x with
+        | EVar (v, _) -> 1 + v.Offset * 29
+        | EVarI (v, _, _) -> 2 + v.Offset * 29
+        | ELit (LInt t) -> 3 + shortHash t * 29
+        | ELit (LFloat t) -> 4 + shortHash t * 29
+        | ELit (LString t) -> 5 + shortHash t * 29
+        | ELit (LChar t) -> 6 + shortHash t * 29
+        | ELit _ -> 7
+        | ELam (ps, b) -> 8 + List.length ps * 29 + kindTag b * 641
+        | EApp (f, args) -> 9 + List.length args * 29 + kindTag f * 641
+        | ELet (_, v, _, _, _) -> 10 + v.Offset * 29
+        | EIf (c, _, _) -> 11 + kindTag c * 29
+        | EMatch (sc, cs) -> 12 + List.length cs * 29 + kindTag sc * 641
+        | ETuple xs -> 13 + List.length xs * 29
+        | EListLit xs -> 14 + List.length xs * 29
+        | ESeq xs -> 15 + List.length xs * 29
+        | EPrim (op, xs) -> 16 + shortHash op * 29 + List.length xs * 641
+        | ECtor (n, _, xs) -> 17 + shortHash n * 29 + List.length xs * 641
+        | ERecord (n, fs) -> 18 + shortHash n * 29 + List.length fs * 641
+        | EField (r, fn, _) -> 19 + shortHash fn * 29 + kindTag r * 641
+        | EIfaceCall (_, m, _, args) -> 20 + shortHash m * 29 + List.length args * 641
+        | ECast (t, _, _) -> 21 + shortHash t * 29
+        | ETypeTest (t, _) -> 22 + shortHash t * 29
+        | EFieldSet (_, fn, _, _) -> 23 + shortHash fn * 29
+        | EWhile (c, _) -> 24 + kindTag c * 29
+        | EAssign (v, _) -> 25 + v.Offset * 29
+        | EArray (n, xs) -> 26 + shortHash n * 29 + List.length xs * 641
+        | EIndex (n, _, _) -> 27 + shortHash n * 29
+        | EIndexSet (n, _, _, _) -> 28 + shortHash n * 29
+        | EArrayLen (n, _) -> 29 + shortHash n * 29
+        | EArrayCreate (n, _, _) -> 30 + shortHash n * 29
+        | ETry (b, cs) -> 31 + List.length cs * 29 + kindTag b * 641
+        | _ -> 32
     let localsTag (_ : Dict<string * int, string>) : int = 0
     let ceMemos = refMapNew localsTag
     let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)

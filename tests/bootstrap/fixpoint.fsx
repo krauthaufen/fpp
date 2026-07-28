@@ -275,7 +275,14 @@ System.IO.File.WriteAllText (hostPath,
 // type walks, emission), and wasmtime's 1 MB default is not a statement about
 // the program — a native build gets far more.
 let out, err, code =
-    run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864 --preload env=" + hostPath + " " + stage1Path)
+    // A GB of GC heap up front. The compiler is a BATCH job that allocates
+    // hard and keeps little, so wasmtime's default heap collects constantly:
+    // nearly half the run was CopyingHeap::forward/scan_field. Sizing the
+    // heap to the job took the wasm side from 63s to 36s and changes nothing
+    // about the answer.
+    run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864"
+                  + " -O gc-heap-initial-size=1073741824 -O gc-heap-reservation=4294967296"
+                  + " --preload env=" + hostPath + " " + stage1Path)
 if code <> 0 then
     printfn "stage-1 failed to run (exit %d)" code
     printfn "%s" (err.Substring (0, min 2000 err.Length))
