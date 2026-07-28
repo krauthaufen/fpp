@@ -496,7 +496,7 @@ let emit (decls : Decl list) : EmitResult =
             else
                 sbAdd out (string c)
                 i <- i + 1
-        out.ToString()
+        sbText out
 
     let charCode (raw : string) : int =
         let s = unescape raw
@@ -1909,7 +1909,7 @@ let emit (decls : Decl list) : EmitResult =
                  | [ single ] ->
                      let tests = sbNew ()
                      compilePat locals extraLocals freeEnv tests lbl ("(local.get " + exn + ")") single
-                     sbAdd w (tests.ToString())
+                     sbAdd w (sbText tests)
                  | many ->
                      let hm = "$thave" + res + "_" + string i
                      // one slot map shared by all alternatives: they bind the
@@ -1925,7 +1925,7 @@ let emit (decls : Decl list) : EmitResult =
                          // introduced is the slot the others must reuse
                          for k, sl in dictPairs locals do
                              if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
-                         sbAdd w (tests.ToString())
+                         sbAdd w (sbText tests)
                          sbAdd w ("(br " + hm + ")) "))
                      sbAdd w ("(br " + lbl + ")) "))
                 (match guard with
@@ -1934,7 +1934,7 @@ let emit (decls : Decl list) : EmitResult =
                 sbAdd w ("(local.set " + res + " " + recur cbody + ") (br $tdone" + res + ") ")
                 sbAdd w (")"))
             sbAdd w (" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))")
-            w.ToString()
+            sbText w
         | EMatch (scrut, cases) ->
             let sl = newLocal "scrut"
             let res = newLocal "res"
@@ -1952,7 +1952,7 @@ let emit (decls : Decl list) : EmitResult =
                  | [ single ] ->
                      let tests = sbNew ()
                      compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") single
-                     sbAdd w (tests.ToString())
+                     sbAdd w (sbText tests)
                  | many ->
                      let hm = "$have" + res + "_" + string i
                      // one slot map shared by all alternatives: they bind the
@@ -1968,7 +1968,7 @@ let emit (decls : Decl list) : EmitResult =
                          // introduced is the slot the others must reuse
                          for k, sl in dictPairs locals do
                              if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
-                         sbAdd w (tests.ToString())
+                         sbAdd w (sbText tests)
                          sbAdd w ("(br " + hm + ")) "))
                      sbAdd w ("(br " + lbl + ")) "))
                 (match guard with
@@ -1978,7 +1978,7 @@ let emit (decls : Decl list) : EmitResult =
                 sbAdd w ("(local.set " + res + " " + recur body + ") (br $done" + res + ") ")
                 sbAdd w (")"))
             sbAdd w (" (unreachable)) (local.get " + res + "))")
-            w.ToString()
+            sbText w
 
     /// Emit tests (branching to failLbl on mismatch) and binds for a pattern
     /// against the value expression `v`.
@@ -3479,7 +3479,7 @@ TUPLE_HASH
         | DLet (_, v, _, ELam (ps, body)) ->
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
-            ceMemos.Clear ()
+            refMapClear ceMemos
             let pks, rk =
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
@@ -3520,7 +3520,7 @@ TUPLE_HASH
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
-            ceMemos.Clear ()
+            refMapClear ceMemos
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string * string> ()
@@ -3564,7 +3564,7 @@ TUPLE_HASH
             let c = char b
             if b >= 32uy && b < 127uy && c <> '"' && c <> '\\' then sbAdd out (string c)
             else sbAdd out ("\\" + (sprintf "%02x" b))
-        out.ToString()
+        sbText out
     vecToList strings
     |> List.iteri (fun i sdata ->
         line ("  (data $d" + string i + " \"" + hexEscape (System.Text.Encoding.UTF8.GetBytes sdata) + "\")"))

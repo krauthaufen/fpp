@@ -341,6 +341,12 @@ let private refMapRehash (m : RefMap<'k, 'v>) : unit =
         e <- e + 1
     m.MapSlots <- slots
 
+/// Drop every entry, keeping the table itself. Same contract as the .NET
+/// half's Clear: capacity may stay, the contents do not.
+let refMapClear (m : RefMap<'k, 'v>) : unit =
+    m.MapSlots <- Array.zeroCreate m.MapSlots.Length
+    m.MapCount <- 0
+
 let refMapSet (m : RefMap<'k, 'v>) (k : 'k) (v : 'v) : unit =
     let at = refMapSlot m k
     let e = m.MapSlots.[at]

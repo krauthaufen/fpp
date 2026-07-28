@@ -143,6 +143,7 @@ let refMapNew<'k, 'v when 'k : not struct> (h : 'k -> int) : RefMap<'k, 'v> =
 
 let inline refMapSet (m : RefMap<'k, 'v>) (k : 'k) (v : 'v) : unit = m.[k] <- v
 
+let inline refMapClear (m : RefMap<'k, 'v>) : unit = m.Clear ()
 let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
     match m.TryGetValue k with
     | true, v -> Some v

@@ -744,6 +744,30 @@ module String =
         while i < s.Length do
             f i s.[i]
             i <- i + 1
+    let filter (p : char -> bool) (s : string) : string =
+        let mutable acc = ""
+        let mutable i = 0
+        while i < s.Length do
+            if p s.[i] then acc <- acc + string s.[i]
+            i <- i + 1
+        acc
+    let collect (f : char -> string) (s : string) : string =
+        let mutable acc = ""
+        let mutable i = 0
+        while i < s.Length do
+            acc <- acc + f s.[i]
+            i <- i + 1
+        acc
+    let toArray (s : string) : char[] = Array.init s.Length (fun i -> s.[i])
+    let toList (s : string) : char list = List.init s.Length (fun i -> s.[i])
+    let ofArray (cs : char[]) : string =
+        let mutable acc = ""
+        for c in cs do acc <- acc + string c
+        acc
+    let ofList (cs : char list) : string =
+        let mutable acc = ""
+        for c in cs do acc <- acc + string c
+        acc
     let map (f : char -> char) (s : string) =
         let mutable acc = ""
         let mutable i = 0
