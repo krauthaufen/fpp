@@ -19,6 +19,12 @@ let emit (decls : Decl list) : EmitResult =
     let errors = vecNew<string> ()
     // which top-level function is being emitted, so errors can say WHERE
     let mutable currentFn = ""
+    /// The scalar kind the function being emitted RETURNS. A tail call has to
+    /// hand back exactly the caller's result type, so this is what decides
+    /// whether a call in tail position can be a `return_call` — not whether
+    /// the result is uniform. Getting that wrong turns every int-returning
+    /// tail call into an ordinary one, and deep recursion runs out of stack.
+    let mutable currentRetKind = "u"
     let emitError (msg : string) =
         vecAdd errors (if currentFn = "" then msg else msg + " [in " + currentFn + "]")
     let sb = sbNew ()
@@ -389,6 +395,17 @@ let emit (decls : Decl list) : EmitResult =
         | Fpp.Analysis.Types.TCon ("float", []) -> "f"
         | Fpp.Analysis.Types.TCon ("float32", []) -> "s"
         | Fpp.Analysis.Types.TCon ("int64", []) -> "l"
+        // `int` is a SCALAR like the others: its locals, parameters and
+        // returns carry a raw i32. Nothing here was ever boxed — an int
+        // rides i31, which is an immediate — but leaving it out of this
+        // table made every int local an `anyref`, so every read was a $toi
+        // and every write an $ofi. Float, float32 and int64 already got the
+        // raw treatment; this is the same machinery, extended.
+        //
+        // bool and char stay uniform on purpose: they are i31-shaped too,
+        // but they flow into conditions and char tests that read them as
+        // references, and the win is in the arithmetic.
+        | Fpp.Analysis.Types.TCon ("int", []) -> "i"
         | _ -> "u"
     // POD-struct positions in a signature: (paramStructs, resultStruct)
     let sigStructs = dictNew<string * int, string option list * string option> ()
@@ -736,7 +753,7 @@ let emit (decls : Decl list) : EmitResult =
             if t.EndsWith "h" || t.EndsWith "H" then "u"
             elif t.EndsWith "f" || t.EndsWith "F" then "s"
             else "f"
-        | ELit (LInt t) -> if t.EndsWith "L" then "l" else "u"
+        | ELit (LInt t) -> if t.EndsWith "L" then "l" else "i"
         | EVar (v, _) ->
             (match dictTryFind localKinds (v.Path, v.Offset) with
              | Some k -> k
@@ -744,6 +761,11 @@ let emit (decls : Decl list) : EmitResult =
         | EPrim (op, _) when op.Length > 1 && List.contains (op.Substring (0, op.Length - 1)) suffixedOps ->
             (let k = op.Substring (op.Length - 1)
              if k = "f" || k = "s" || k = "l" then k else "u")
+        // integer-only operators. `+` is NOT among them: bare `+` is the
+        // untyped one and may still be string concatenation, which is why it
+        // goes through $addv. The comparisons are missing for the opposite
+        // reason — they produce a bool, which stays uniform.
+        | EPrim (("-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"), _) -> "i"
         | EPrim ("u-f", _) -> "f"
         | EPrim ("u-s", _) -> "s"
         | EPrim ("u-l", _) -> "l"
@@ -785,15 +807,15 @@ let emit (decls : Decl list) : EmitResult =
         | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
     let wasmTyOf (k : string) =
         match k with
-        | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "anyref"
+        | "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | "i" -> "i32" | _ -> "anyref"
     let boxK (k : string) (w : string) =
         match k with
         | "f" -> "(call $off " + w + ")" | "s" -> "(call $oss " + w + ")"
-        | "l" -> "(call $ofl " + w + ")" | _ -> w
+        | "l" -> "(call $ofl " + w + ")" | "i" -> "(call $ofi " + w + ")" | _ -> w
     let unboxK (k : string) (w : string) =
         match k with
         | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
-        | "l" -> "(call $tol " + w + ")" | _ -> w
+        | "l" -> "(call $tol " + w + ")" | "i" -> "(call $toi " + w + ")" | _ -> w
 
     /// Compile one function body. `locals` maps (path,offset) to wasm local
     /// names; `extraLocals` collects locals to declare.
@@ -1243,12 +1265,22 @@ let emit (decls : Decl list) : EmitResult =
                 let wrapped =
                     List.zip pks args
                     |> List.map (fun (k, a) -> if k = "u" then recur a else unboxK k (recur a))
-                // tail calls need matching result types; a boxed result
-                // means the raw call cannot be a tail call
-                let opv = if rk = "u" then op else "call"
-                let call = "(" + opv + " " + fname + " " + String.concat " " wrapped + ")"
-                if rk = "u" then call else boxK rk call
-            | _ -> "(" + op + " " + fname + " " + String.concat " " (List.map recur args) + ")")
+                // A tail call returns the CALLER's result type, so it is
+                // legal exactly when the two kinds agree — and then the
+                // result must not be boxed, because there is no frame left
+                // to box it in. `return_call` is stack-polymorphic, so the
+                // surrounding uniform context still validates.
+                if tail && rk = currentRetKind then
+                    "(" + op + " " + fname + " " + String.concat " " wrapped + ")"
+                else
+                    let call = "(call " + fname + " " + String.concat " " wrapped + ")"
+                    if rk = "u" then call else boxK rk call
+            | _ ->
+                // no signature kinds for the callee, so it returns anyref
+                // like any uniform function — and a tail call to it is legal
+                // only from a function that also returns anyref
+                let opv = if tail && currentRetKind = "u" then op else "call"
+                "(" + opv + " " + fname + " " + String.concat " " (List.map recur args) + ")")
         | EApp (f, args) ->
             let mutable w = recur f
             for a in args do
@@ -2489,7 +2521,14 @@ let emit (decls : Decl list) : EmitResult =
         let innerFree = dictNew<string * int, int> ()
         freeList |> List.iteri (fun i k -> dictSet innerFree k i)
         let innerExtra = vecNew<string * string> ()
+        // A lifted lambda has the UNIFORM signature — anyref in, anyref out —
+        // whatever the function it was written inside returns. Its body is
+        // still in tail position, but against its OWN result type, so the
+        // enclosing function's kind must not leak in here.
+        let savedRet = currentRetKind
+        currentRetKind <- "u"
         let bodyW = compileExpr innerLocals innerExtra innerFree true body
+        currentRetKind <- savedRet
         let localDecls = vecToList innerExtra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
         vecAdd lifted
             ("(func " + fname + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) "
@@ -3859,6 +3898,7 @@ TUPLE_CMP
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
                 | None -> List.replicate ps.Length "u", "u"
+            currentRetKind <- rk
             let pss, rs =
                 match dictTryFind sigStructs (v.Path, v.Offset) with
                 | Some (a, b) -> a, b
@@ -3888,13 +3928,19 @@ TUPLE_CMP
                 let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
                 line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + resTys + ") " + localDecls + " " + bodyW + ")")
             | None ->
-                let bodyRaw = compileExpr locals extra (dictNew ()) (rk = "u") body
+                // the body IS in tail position whatever the result kind —
+                // whether a call there can be a `return_call` is decided at
+                // the call site, by whether the kinds agree. Gating it here
+                // on uniformity cost every int-returning function its tail
+                // calls the moment `int` became a scalar kind.
+                let bodyRaw = compileExpr locals extra (dictNew ()) true body
                 let bodyW = if rk = "u" then bodyRaw else unboxK rk bodyRaw
                 let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
                 line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + wasmTyOf rk + ") " + localDecls + " " + bodyW + ")")
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
+            currentRetKind <- "u"
             refMapClear ceMemos
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
@@ -3907,7 +3953,22 @@ TUPLE_CMP
         | _ -> ()
 
     // curry wrappers for functions used as values / partially applied
+    //
+    // A wrapper is the UNIFORM face of a function: it takes anyref and
+    // returns anyref, whatever the function underneath does. So it has to
+    // convert at the boundary — the moment `int` became a scalar kind, every
+    // wrapper for an int-taking function was handing anyref to an i32
+    // parameter, and the module failed to validate.
+    let kindsByName = dictNew<string, string list * string> ()
+    for (pth, off), nm in dictPairs topName do
+        match dictTryFind sigKinds (pth, off) with
+        | Some ks -> dictSet kindsByName nm ks
+        | None -> ()
     for fname, arity in vecToList wrappers do
+        let pks, rk =
+            match dictTryFind kindsByName fname with
+            | Some (p, r) when p.Length = arity -> p, r
+            | _ -> List.replicate arity "u", "u"
         for k in 0 .. arity - 1 do
             let wk = fname + ".w" + string k
             if k = arity - 1 then
@@ -3920,8 +3981,12 @@ TUPLE_CMP
                     "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
                 let args =
                     [ for j in 0 .. arity - 1 ->
-                        if j = k then "(local.get $a)" else argAt j ]
-                line ("  (func " + wk + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) (call " + fname + " " + String.concat " " args + "))")
+                        let raw = if j = k then "(local.get $a)" else argAt j
+                        let pk = List.item j pks
+                        if pk = "u" then raw else unboxK pk raw ]
+                let call = "(call " + fname + " " + String.concat " " args + ")"
+                let res = if rk = "u" then call else boxK rk call
+                line ("  (func " + wk + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) " + res + ")")
             else
                 line ("  (func " + wk + " (type $u1) (param $a anyref) (param $env anyref) (result anyref) (struct.new $clo (ref.func " + fname + ".w" + string (k + 1) + ") (struct.new $cons (local.get $a) (local.get $env))))")
 

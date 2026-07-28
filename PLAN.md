@@ -1893,3 +1893,48 @@ Inlining pays when it ENABLES something else — arithmetic that stays unboxed
 across the call, a constant that reaches a branch, a closure that stops being
 allocated. **An i32 scalar kind is the pass to write next**, and inlining turns on
 with it. Doing it in the other order is what this measurement rules out.
+
+### `int` is a scalar kind now — and it was worth almost nothing
+`scalarKindOfTy` maps `int` to `"i"`, `wasmTyOf` gives it `i32`, and
+`boxK`/`unboxK` route it through `$ofi`/`$toi`. Int locals, parameters and
+returns now carry a raw i32 exactly as float, float32 and int64 already did:
+
+    ;; before   (local $l0_s anyref)  (local.set $l0_s (call $ofi (i32.const 0)))
+    ;; after    (local $l0_s i32)     (local.set $l0_s (i32.const 0))
+
+Four things had to follow, and three were LATENT BUGS the change exposed:
+
+1. `kindOf` had to report `"i"` for int literals and the integer-only
+   operators. Bare `+` is deliberately excluded: it may still be string
+   concatenation, which is why it goes through `$addv`.
+2. **Tail calls were gated on the wrong thing.** The body was compiled with
+   `tail = (rk = "u")`, so ANY function with a non-uniform return kind lost
+   tail calls entirely — float and int64 functions had been losing them all
+   along. A tail call needs the callee's result type to match the CALLER's,
+   which is now what decides it (`currentRetKind`); the body is always in
+   tail position.
+3. The unknown-callee fallback emitted `return_call` without checking kinds
+   at all. Harmless while non-uniform returns had no tail position; a
+   validation error the moment they did.
+4. A lifted lambda has the uniform signature whatever it was written inside,
+   so `currentRetKind` must not leak into its body.
+
+**Measured: neutral.** Fixed corpus, 1475-1643ms against 1481-1636ms before;
+self-host 43s -> 45s; emitted bytes unchanged. The counts say why:
+
+    i32 locals   230 -> 614      (+167%)
+    $toi        7061 -> 6457     (-8.5%)
+    $ofi        1851 -> 1800     (-3%)
+
+The machinery works; the compiler just does not spend its time on integer
+arithmetic in local variables. Its ints live in DICT KEYS, TUPLES and DU
+PAYLOADS — uniform containers by construction — so 91% of the untagging is
+at container boundaries that a scalar kind cannot reach. Removing that means
+specialized containers (an `int`-keyed Dict with unboxed fields), which is
+the monomorphization story, not this one.
+
+Kept regardless: it is the right architecture, it fixes tail calls for every
+scalar-returning function, and it is the precondition for inlining to be
+worth switching on. But it is the THIRD optimization in a row to measure
+neutral, and the lesson is consistent — this compiler's time goes to
+allocation and data shuffling, not to arithmetic or call overhead.
