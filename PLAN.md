@@ -1641,3 +1641,29 @@ before emission works when the compiler runs as wasm; something in the
 monomorphizer's expression walk does not. That is the next thing to chase,
 and it is a miscompilation of the compiler by itself rather than a harness
 problem.
+
+### The self-miscompilation: where it is, and what is ruled out
+Stage-1 parses, resolves and infers correctly, then traps with a CAST FAILURE
+inside its own `EmitProgram -> monomorphizeWith -> mapExpr`. The frames are
+
+    mapExpr -> applyc -> mapExpr.w1 -> (trap)
+
+repeating, so the failure is in the CURRIED-WRAPPER path: `let r = mapExpr f`
+is a partial application, and `.w1` casts its `$env` to `$cons`.
+
+Ruled out by inspection (do not re-chase):
+- **Wrapper self-consistency.** w0 builds `cons(a, env)` and w1 reads it back;
+  the only producer of a `.w1` closure is w0, so the shape should match.
+- **Capture-env slot numbering.** `innerFree` assigns index i to freeList[i],
+  and the flat array is built in the same order — no off-by-one between the
+  build and the read.
+- **Knot-tying** was a real bug and IS fixed (committed): `$patchself` and
+  `$patchmark` scanned only the flat array, so a recursive function reached
+  through a partial application kept its own marker. Fixing it did not change
+  this trap, so it was a separate latent bug.
+
+Next step, with the wat in hand rather than by reasoning: dump stage-1's
+emitted `mapExpr`, `mapExpr.w0/.w1` and every construction site of a `.w1`
+closure, and find which one hands `.w1` an env that is not a cons cell. The
+harness writes stage-1 to /tmp/fpp-fixpoint/stage1.wat, so the text is already
+there after a run.

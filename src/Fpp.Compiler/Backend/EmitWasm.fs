@@ -3441,17 +3441,31 @@ TUPLE_CMP
     (local $n i32)
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
-      (br_if $done (i32.eqz (ref.test (ref $arr) (local.get $e))))
-      (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
-      (local.set $i (i32.const 0))
-      (block $out
-        (loop $go
-          (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
-          (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+      ;; TWO environment shapes coexist: a flat array (captures) and a cons
+      ;; chain (curried partial application). Patch whichever this is —
+      ;; scanning only the array left a recursive function reached through a
+      ;; partial application holding its own marker, which traps when called.
+      (if (ref.test (ref $arr) (local.get $e))
+        (then
+          (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
+          (local.set $i (i32.const 0))
+          (block $out
+            (loop $go
+              (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
+              (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+                          (ref.cast (ref null eq) (global.get $selfmark)))
+                (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $c))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $go)))
+          (br $done)))
+      (block $cout
+        (loop $cgo
+          (br_if $cout (i32.eqz (ref.test (ref $cons) (local.get $e))))
+          (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
                       (ref.cast (ref null eq) (global.get $selfmark)))
-            (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $c))))
-          (local.set $i (i32.add (local.get $i) (i32.const 1)))
-          (br $go)))))
+            (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $c))))
+          (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
+          (br $cgo)))))
   (func $patchmark (param $c anyref) (param $mark anyref) (param $v anyref)
     ;; tie one strand of a rec GROUP's knot: in closure $c's FLAT environment,
     ;; whatever slot still holds the marker $mark becomes $v
@@ -3460,17 +3474,31 @@ TUPLE_CMP
     (local $n i32)
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
-      (br_if $done (i32.eqz (ref.test (ref $arr) (local.get $e))))
-      (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
-      (local.set $i (i32.const 0))
-      (block $out
-        (loop $go
-          (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
-          (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+      ;; TWO environment shapes coexist: a flat array (captures) and a cons
+      ;; chain (curried partial application). Patch whichever this is —
+      ;; scanning only the array left a recursive function reached through a
+      ;; partial application holding its own marker, which traps when called.
+      (if (ref.test (ref $arr) (local.get $e))
+        (then
+          (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
+          (local.set $i (i32.const 0))
+          (block $out
+            (loop $go
+              (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
+              (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+                          (ref.cast (ref null eq) (local.get $mark)))
+                (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $v))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $go)))
+          (br $done)))
+      (block $cout
+        (loop $cgo
+          (br_if $cout (i32.eqz (ref.test (ref $cons) (local.get $e))))
+          (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
                       (ref.cast (ref null eq) (local.get $mark)))
-            (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $v))))
-          (local.set $i (i32.add (local.get $i) (i32.const 1)))
-          (br $go)))))
+            (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $v))))
+          (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
+          (br $cgo)))))
   (func $applyc (param $f anyref) (param $a anyref) (result anyref)
     (call_ref $u1 (local.get $a)
       (struct.get $clo 1 (ref.cast (ref $clo) (local.get $f)))
