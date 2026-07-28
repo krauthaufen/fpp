@@ -274,6 +274,30 @@ let noBoxGate =
             Expect.equal out "a,b,c\nxy\nsolo\n\nababab\n0123\n20000\n"
                 "separators land between pieces, in order, at every arity"
         }
+        test "tupled arguments are a calling convention, in all three shapes" {
+            // `let f (a, b)` compiles to a two-argument function. A literal
+            // call passes elements; a call with a tuple VALUE destructures
+            // at the call site; a first-class use goes through a shared
+            // tupled shim. Over-application (`h (a, b) extra` lowers
+            // FLATTENED) must disqualify a function — binding tuple->a,
+            // extra->b is how two attempts at this trapped the self-compile.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let f (a, b) = a * b + 1"
+                    "let g (a, b, c) = a + b + c"
+                    "let h (a, b) = fun c -> a + b + c"
+                    "let go ="
+                    "    let t = (3, 4)"
+                    "    print (string (f (3, 4)))"
+                    "    print (string (f t))"
+                    "    print (string (g (1, 2, 3)))"
+                    "    print (string (List.sum (List.map f [(1, 2); (3, 4)])))"
+                    "    print (string (h (1, 2) 3))"
+                    "" ])
+            Expect.equal out "13\n13\n6\n16\n6\n"
+                "literal, value, first-class and over-applied calls all agree"
+        }
     ]
 
 [<Tests>]

@@ -16,9 +16,11 @@ open Fpp.Core.Ir
 // remains a check that the compiler agrees with itself. The behavioural
 // gate is the test suite.
 
-let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
-    let r = mapExpr f
-    let e2 =
+/// Rebuild a node with `r` applied to its immediate children. Separate from
+/// `mapExpr` so a TOP-DOWN rewrite can drive its own recursion:
+/// `uncurryTupleArgs` must recognise `EApp (EVar f, ...)` before the
+/// `EVar f` inside it is rewritten into something else.
+let rec private mapChildrenWith (r : Expr -> Expr) (e : Expr) : Expr =
         match e with
         | ELam (ps, b) -> ELam (ps, r b)
         | EApp (g, args) -> EApp (r g, List.map r args)
@@ -48,7 +50,9 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | EArrayUnpin (n, a) -> EArrayUnpin (n, r a)
         | ETry (b, cs) -> ETry (r b, cs |> List.map (fun (p, g, x) -> p, Option.map r g, r x))
         | other -> other
-    f e2
+
+and private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
+    f (mapChildrenWith (mapExpr f) e)
 
 let rec private sizeOf (e : Expr) : int =
     let sum xs = List.fold (fun a x -> a + sizeOf x) 0 xs
@@ -182,107 +186,152 @@ let fuseTuples (decls : Decl list) : Decl list =
         | DLet (rc, v, sch, body) -> DLet (rc, v, sch, mapExpr rewrite body)
         | other -> other)
 
-/// `f (a, b)` must compile to a TWO-ARGUMENT CALL.
+/// `f (a, b)` compiles to a TWO-ARGUMENT CALL. The convention:
 ///
-/// `let f (a, b) = ...` types as taking one tuple, and it still does — the
-/// signature is not a lie and the tuple is still a reference value. But the
-/// call site allocated a `$tup2`, wrote two fields, and the body immediately
-/// matched it apart to read them back: allocate, write, read, discard, per
-/// call. F# compiles these to multi-parameter functions and materializes the
-/// tuple only where the function is used as a VALUE.
+///   f (a, b)    a two-argument call, no tuple
+///   f t         `match t with (x, y) -> f x y` at the call site — the
+///               caller's tuple still exists, it just is not REBUILT to be
+///               pulled apart again
+///   f as value  one shared tupled SHIM per function (an ordinary top-level
+///               decl the backend already knows how to emit), not a fresh
+///               lambda per use site; dead-code elimination drops the ones
+///               nobody reaches. The shim keeps the SOURCE (tupled) scheme,
+///               which is what a first-class consumer applies it at.
 ///
-/// A function is rewritten only when EVERY occurrence of it in the program
-/// is a direct call with a tuple literal of the right width. That keeps the
-/// change local and total: there is no use left that expects the old shape,
-/// so no wrapper has to reconstruct the tuple. A function used first-class
-/// keeps the tupled signature untouched.
+/// The traversal is BOTTOM-UP through plain `mapExpr`, on purpose. Children
+/// rebuild before parents, so by the time a call node is visited its head
+/// `EVar` has already been rewritten to the shim — and the call case UNDOES
+/// that (shim identities are invertible) into a direct multi-argument call.
+/// A top-down formulation with a local recursive `go` passed first-class
+/// into the traversal was tried twice and MISCOMPILES under self-hosting
+/// (the pass runs correctly under dotnet and builds a cyclic expression when
+/// the compiler runs as wasm); until that is hunted down, nothing in this
+/// pass hands a local recursive closure to another function.
+///
+/// Excluded candidates, each for a reason found by compiling the compiler:
+/// - **over-applied functions**: `f (a, b) extra` lowers FLATTENED to
+///   `EApp (f, [tuple; extra])`, so rewriting the definition would bind
+///   tuple->a, extra->b — garbage;
+/// - **a body that still mentions the tuple parameter** after destructuring;
+/// - anything in DClass/DMembers/DExtern lists (fixed-signature machinery).
+///
+/// The EXPORTED signature is untouched: `BuildLibrary` serializes the
+/// pre-optimization decls, so `a -> b -> r` and `(a * b) -> r` stay
+/// distinguishable to consumers, who re-derive this convention themselves.
+let private shimBase = 33000000
+
 let uncurryTupleArgs (decls : Decl list) : Decl list =
-    // candidates: fun (t) -> match t with (x, y, ...) -> body
-    let cands = dictNew<string * int, (VarId * Scheme) list> ()
+    let pinned = dictNew<string * int, bool> ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam ([ (pv, _) ], EMatch (EVar (sv, _), [ (PTuple ps, None, _) ]))) when
+        | DClass (_, _, own, impls) ->
+            for _, v in own do dictSet pinned (v.Path, v.Offset) true
+            for _, ms in impls do
+                for _, v in ms do dictSet pinned (v.Path, v.Offset) true
+        | DMembers (_, own) -> for _, v in own do dictSet pinned (v.Path, v.Offset) true
+        | DExtern (v, _) -> dictSet pinned (v.Path, v.Offset) true
+        | _ -> ()
+    let candInfo = dictNew<string * int, string * (VarId * Scheme) list * Scheme> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, sch, ELam ([ (pv, _) ], EMatch (EVar (sv, _), [ (PTuple ps, None, mbody) ]))) when
               (sv.Path, sv.Offset) = (pv.Path, pv.Offset)
+              && not (dictTryFind pinned (v.Path, v.Offset)).IsSome
               && ps.Length >= 2
               && ps |> List.forall (fun p -> match p with PVar _ -> true | _ -> false) ->
-            let binders = ps |> List.map (fun p -> match p with PVar (bv, bs) -> bv, bs | _ -> pv, mono (TCon ("?", [])))
-            dictSet cands (v.Path, v.Offset) binders
+            let selfK = dictNew<string * int, bool> ()
+            dictSet selfK (pv.Path, pv.Offset) true
+            if not (mentions selfK mbody) then
+                dictSet candInfo (v.Path, v.Offset)
+                    (v.Name,
+                     ps |> List.map (fun p -> match p with PVar (bv, bs) -> bv, bs | _ -> pv, mono (TCon ("?", []))),
+                     sch)
         | _ -> ()
-    if dictPairs cands |> List.isEmpty then decls
-    else
-    // a candidate survives only if every mention of it is a direct call
-    // carrying a tuple literal of exactly its width
-    let seen = dictNew<string * int, int> ()
-    let good = dictNew<string * int, int> ()
-    let bump (t : Dict<string * int, int>) (k : string * int) =
-        dictSet t k (match dictTryFind t k with Some n -> n + 1 | None -> 1)
+    // disqualify over-applied candidates
+    let overApplied = vecNew<string * int> ()
     for d in decls do
         match d with
         | DLet (_, _, _, body) ->
             mapExpr
                 (fun x ->
                     (match x with
-                     | EVar (v, _) | EVarI (v, _, _) ->
-                         if (dictTryFind cands (v.Path, v.Offset)).IsSome then bump seen (v.Path, v.Offset)
-                     | _ -> ())
-                    (match x with
-                     // a direct call counts however the argument is spelled: a tuple
-                     // LITERAL passes its elements, a tuple VALUE is destructured at
-                     // the call site. What disqualifies a function is a use that is
-                     // not a call at all.
-                     | EApp (EVar (v, _), [ _ ]) ->
-                         if (dictTryFind cands (v.Path, v.Offset)).IsSome then bump good (v.Path, v.Offset)
+                     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
+                           List.length args > 1 && (dictTryFind candInfo (v.Path, v.Offset)).IsSome ->
+                         vecAdd overApplied (v.Path, v.Offset)
                      | _ -> ())
                     x)
                 body |> ignore
         | _ -> ()
+    for k in vecToList overApplied do dictRemove candInfo k
+    if dictPairs candInfo |> List.isEmpty then decls
+    else
+    let isCand (v : VarId) = (dictTryFind candInfo (v.Path, v.Offset)).IsSome
+    let shimOf (pth : string) (off : int) (name : string) : VarId =
+        { Path = pth; Offset = off + shimBase; Name = name + "$tupled" }
+    let isShim (v : VarId) =
+        v.Offset >= shimBase && (dictTryFind candInfo (v.Path, v.Offset - shimBase)).IsSome
     let ucount = vecNew<int> ()
     vecAdd ucount 0
-    let eligible (k : string * int) =
-        match dictTryFind cands k, dictTryFind seen k, dictTryFind good k with
-        | Some _, Some n, Some g -> n = g
-        | _ -> false
-    // the SIGNATURE uncurries with the parameters: (a * b) -> r becomes
-    // a -> b -> r, which is what the backend reads arity and kinds from
+    // the BACKEND-FACING signature uncurries with the parameters; the
+    // exported one was serialized before this pass ran
     let uncurryScheme (n : int) (sch : Scheme) : Scheme =
         match prune sch.Body with
         | TFun (TTuple ts, r) when ts.Length = n ->
             { sch with Body = List.foldBack (fun t acc -> TFun (t, acc)) ts r }
         | _ -> sch
-    decls
-    |> List.map (fun d ->
-        let d2 =
+    /// `match arg with (x0, x1, ...) -> f x0 x1 ... rest`, with FRESH
+    /// binders — the definition's own binder VarIds must not be rebound in
+    /// another function (backend local state is keyed per VarId).
+    let destructuredCall (fv : VarId) (fsch : Scheme) (bs : (VarId * Scheme) list) (arg : Expr) (rest : Expr list) : Expr =
+        let fresh =
+            bs |> List.map (fun (bv, bsch) ->
+                let n = vecGet ucount 0
+                vecSet ucount 0 (n + 1)
+                ({ Path = "$untuple"; Offset = n; Name = bv.Name } : VarId), bsch)
+        EMatch (arg,
+                [ (PTuple (fresh |> List.map (fun (nv, ns) -> PVar (nv, ns))),
+                   None,
+                   EApp (EVar (fv, fsch), (fresh |> List.map (fun (nv, ns) -> EVar (nv, ns))) @ rest)) ])
+    let rewriteNode (x : Expr) : Expr =
+        match x with
+        // every bare candidate reference becomes the shim — including call
+        // heads, which the EApp case below converts back
+        | EVar (f, fsch) when isCand f ->
+            let nm, _, _ = (dictTryFind candInfo (f.Path, f.Offset)).Value
+            EVar (shimOf f.Path f.Offset nm, fsch)
+        | EVarI (f, fsch, _) when isCand f ->
+            let nm, _, _ = (dictTryFind candInfo (f.Path, f.Offset)).Value
+            EVar (shimOf f.Path f.Offset nm, fsch)
+        // a DIRECT call: the head arrived here already shimmed (children
+        // rebuild first); undo that into the multi-argument call
+        | EApp (EVar (s, ssch), arg :: rest) when isShim s ->
+            let orig = (s.Path, s.Offset - shimBase)
+            let nm, bs, sch = (dictTryFind candInfo orig).Value
+            let fv : VarId = { Path = s.Path; Offset = s.Offset - shimBase; Name = nm }
+            let usch = uncurryScheme bs.Length sch
+            (match arg with
+             | ETuple xs when xs.Length = bs.Length -> EApp (EVar (fv, usch), xs @ rest)
+             | other -> destructuredCall fv usch bs other rest)
+        | other -> other
+    let rewritten =
+        decls
+        |> List.map (fun d ->
             match d with
-            | DLet (rc, v, sch, ELam ([ _ ], EMatch (_, [ (_, None, body) ]))) when eligible (v.Path, v.Offset) ->
-                let bs = (dictTryFind cands (v.Path, v.Offset)).Value
-                DLet (rc, v, uncurryScheme bs.Length sch, ELam (bs, body))
-            | other -> other
-        match d2 with
-        | DLet (rc, v, sch, body) ->
-            DLet (rc, v, sch,
-                  mapExpr
-                      (fun x ->
-                          match x with
-                          | EApp (EVar (f, fs), [ arg ]) when eligible (f.Path, f.Offset) ->
-                              let bs = (dictTryFind cands (f.Path, f.Offset)).Value
-                              (match arg with
-                               | ETuple xs when xs.Length = bs.Length -> EApp (EVar (f, fs), xs)
-                               | other ->
-                                   // a real tuple VALUE: take it apart here, then make the
-                                   // multi-argument call. The tuple still exists — it is the
-                                   // caller's value — it just is not rebuilt to be pulled apart.
-                                   let fresh =
-                                       bs |> List.map (fun (bv, bsch) ->
-                                           let n = vecGet ucount 0
-                                           vecSet ucount 0 (n + 1)
-                                           ({ Path = "$untuple"; Offset = n; Name = bv.Name } : VarId), bsch)
-                                   EMatch (other,
-                                           [ (PTuple (fresh |> List.map (fun (nv, ns) -> PVar (nv, ns))),
-                                              None,
-                                              EApp (EVar (f, fs), fresh |> List.map (fun (nv, ns) -> EVar (nv, ns)))) ]))
-                          | other -> other)
-                      body)
-        | other -> other)
+            | DLet (rc, v, sch, ELam ([ _ ], EMatch (_, [ (_, None, mbody) ]))) when isCand v ->
+                let _, bs, _ = (dictTryFind candInfo (v.Path, v.Offset)).Value
+                DLet (rc, v, uncurryScheme bs.Length sch, ELam (bs, mapExpr rewriteNode mbody))
+            | DLet (rc, v, sch, body) -> DLet (rc, v, sch, mapExpr rewriteNode body)
+            | other -> other)
+    let shims =
+        dictPairs candInfo
+        |> List.map (fun ((pth, off), (nm, bs, sch)) ->
+            let tupTy = match prune sch.Body with TFun (a, _) -> a | _ -> TCon ("?", [])
+            let tv : VarId = { Path = "$untuple$t"; Offset = off; Name = "t" }
+            let fv : VarId = { Path = pth; Offset = off; Name = nm }
+            DLet (false, shimOf pth off nm, sch,
+                  ELam ([ tv, mono tupTy ],
+                        destructuredCall fv (uncurryScheme bs.Length sch) bs (EVar (tv, mono tupTy)) [])))
+    rewritten @ shims
 
 /// A body small enough that the call costs more than the code. Measured in
 /// IR nodes; a call is an allocation-free direct call in the best case and a
