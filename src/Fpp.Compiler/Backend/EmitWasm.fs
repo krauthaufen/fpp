@@ -491,7 +491,31 @@ let emit (decls : Decl list) : EmitResult =
         vecLen strings - 1
 
     let unescape (raw : string) : string =
-        // raw includes the surrounding quotes
+        // raw includes the surrounding quotes, and there are three spellings.
+        // Treating them all as `"..."` took two characters off each end of a
+        // triple-quoted literal and left the rest — which is how the emitted
+        // runtime source grew a stray `""`.
+        let raw = if strLen raw > 1 && charAt raw (strLen raw - 1) = 'B' then substr raw 0 (strLen raw - 1) else raw
+        let isTriple =
+            strLen raw >= 6 && charAt raw 0 = '"' && charAt raw 1 = '"' && charAt raw 2 = '"'
+        let isVerbatim = strLen raw >= 3 && charAt raw 0 = '@'
+        if isTriple then
+            // no escape processing at all: the text IS the value
+            substr raw 3 (strLen raw - 6)
+        elif isVerbatim then
+            // `""` is the only escape a verbatim string has
+            let inner = substr raw 2 (strLen raw - 3)
+            let out = sbNew ()
+            let mutable i = 0
+            while i < strLen inner do
+                if charAt inner i = '"' && i + 1 < strLen inner && charAt inner (i + 1) = '"' then
+                    sbAdd out (string '"')
+                    i <- i + 2
+                else
+                    sbAdd out (string (charAt inner i))
+                    i <- i + 1
+            sbText out
+        else
         let inner = substr raw 1 (strLen raw - 2)
         let out = sbNew ()
         let mutable i = 0

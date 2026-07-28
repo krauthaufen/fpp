@@ -214,6 +214,24 @@ let noBoxGate =
                     "" ])
             Expect.equal out "1\n-1\n0\n200\n-1\n" "byte is unsigned, sbyte is signed, neither loops"
         }
+        test "the three string literal spellings each carry their own value" {
+            // every literal was unescaped as if it were `"..."`: a triple
+            // quoted one kept two quotes at each end and still processed
+            // backslashes, and a verbatim one kept its doubled quotes.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let a = \"\"\"x\\ny\"\"\""
+                    "let b = @\"c:\\p\"\"q\""
+                    "let c = \"m\\tn\""
+                    "let go ="
+                    "    print a"
+                    "    print b"
+                    "    print c"
+                    "" ])
+            Expect.equal out "x\\ny\nc:\\p\"q\nm\tn\n"
+                "triple quoted is literal, verbatim folds \"\", ordinary escapes"
+        }
     ]
 
 [<Tests>]
