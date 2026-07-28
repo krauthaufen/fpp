@@ -1756,3 +1756,42 @@ function names, which is why a wasmtime backtrace reads
 - **DWARF in `.debug_*` sections** — line AND variable info, consumed by
   lldb and Chrome's C/C++ DevTools extension. Much heavier, and only worth it
   once someone actually needs to step through F++ in a debugger.
+
+### Self-hosting speed: 97s -> 43s, and where the rest goes
+Profiled with `perf` + wasmtime's `--profile=perfmap` (the in-process guest
+profiler walks the whole stack per sample and made a 70s run take over ten
+minutes — unusable on a deeply recursive compiler).
+
+The first profile said the job was 42% GARBAGE COLLECTION —
+`CopyingHeap::forward`, `scan_field`, `collect_increment`. Two fixes:
+
+1. **The emitter's memo hashed on the constructor tag alone.** `RefMap` only
+   requires a hash that is stable and reads immutable fields, and a tag
+   satisfies that — but twenty-eight values across the tens of thousands of
+   subexpressions in one function turned open addressing into a linear scan
+   of a single cluster that grows with the function. `exprTag` now mixes in
+   offsets, names (bounded — a string literal can be the whole runtime blob)
+   and child arity. This helped the DOTNET build too: `RefMap` there is a
+   HashSet with the same comparer, so both stages were paying it.
+   `localsTag` stays constant on purpose — that dictionary IS mutated while
+   it is a key, so a content hash would strand its entries.
+2. **The bootstrap sizes the GC heap.** A compiler is a batch job: it
+   allocates hard and keeps almost nothing, so the default heap collects
+   constantly. One gigabyte up front took the wasm side 63s -> 36s and
+   changes nothing about the answer.
+
+    97s  ->  73s   (memo hash; stage-0's own emit got faster too)
+    73s  ->  43s   (GC heap sizing)
+
+After both, GC is 12% and nothing dominates. What is left, in order:
+
+- **`strcat` 9.3%** — `compileExpr` returns STRINGS, so every parent
+  reconcatenates its children's whole text. The fix is a rope or builder
+  through the emitter rather than `string`, which touches every `recur a +
+  "..."` site in EmitWasm.fs. Biggest single win available, biggest refactor.
+- **`toi`/`ofi` 10.3%** — every integer is `anyref` in the emitted code, so
+  it is tagged and untagged constantly. Neither allocates (i31 covers the
+  range); this is pure call frequency. The emitter already carries unboxed
+  `f64`/`f32`/`i64` through `sigKinds`/`kindOf` — extending that to `i32` is
+  the natural next step and is a real project, not a peephole.
+- `addv` 3.3%, `equal` 3.0%, `compareOrdinalAt` 2.8%, then a long tail.
