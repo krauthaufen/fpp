@@ -395,9 +395,22 @@ let emit (decls : Decl list) : EmitResult =
                 let ps, r = splitArrow (n - 1) b
                 scalarKindOfTy a :: ps, r
             | other -> [], scalarKindOfTy other
+    // Two definitions that mangle to ONE wasm identifier produce a module
+    // the assembler rejects, thousands of lines from either cause. Name the
+    // pair instead: stamping composes names, and a composed name can collide.
+    let symOwner = dictNew<string, string * int> ()
+    let claimSym (v : VarId) =
+        let s = mangle v
+        match dictTryFind symOwner s with
+        | Some (p, o) when (p, o) <> (v.Path, v.Offset) ->
+            vecAdd errors
+              ("two definitions emit the same wasm symbol " + s + ": "
+               + p + "@" + string o + " and " + v.Path + "@" + string v.Offset)
+        | _ -> dictSet symOwner s (v.Path, v.Offset)
     for d in decls do
         match d with
         | DLet (_, v, sch, ELam (ps, _)) ->
+            claimSym v
             dictSet topArity (v.Path, v.Offset) ps.Length
             dictSet topName (v.Path, v.Offset) (mangle v)
             let pk, rk = splitArrow ps.Length sch.Body
@@ -411,6 +424,7 @@ let emit (decls : Decl list) : EmitResult =
                 if List.exists Option.isSome pss || rs.IsSome then
                     dictSet sigStructs (v.Path, v.Offset) (pss, rs)
         | DLet (_, v, _, _) ->
+            claimSym v
             dictSet topName (v.Path, v.Offset) (mangle v)
         | DExtern (v, sch) ->
             let ar = arrowArity sch.Body

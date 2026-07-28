@@ -133,6 +133,49 @@ let noBoxGate =
             for alloc in [ "struct.new $box"; "call $off"; "call $oss"; "call $ofl"; "struct.new $r_V2d" ] do
                 Expect.isFalse (loopBody.Contains alloc) (sprintf "allocation '%s' in hot loop" alloc)
         }
+        test "a store into an int[] field builds a FLAT array" {
+            // `r.Slots <- Array.zeroCreate n` used to build a UNIFORM array:
+            // assignment did not unify through a dot target, so nothing
+            // pinned the element type, and every later read cast it to
+            // $parr_i and trapped. Found in the self-compile (RefMap.Clear).
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type R = { mutable Slots : int[]; mutable Count : int }"
+                    "let clear (r : R) : unit ="
+                    "    r.Slots <- Array.zeroCreate r.Slots.Length"
+                    "    r.Count <- 0"
+                    "let r : R = { Slots = Array.zeroCreate 16; Count = 3 }"
+                    "let go ="
+                    "    clear r"
+                    "    r.Slots.[2] <- 7"
+                    "    print (string (r.Slots.Length + r.Slots.[2] + r.Count))"
+                    "" ])
+            Expect.equal out "23\n" "the field holds a flat int array through the store"
+        }
+        test "`.Length` behind a parked dot is array length, not a like-named field" {
+            // `(s.Substring 1).Split ':'` leaves the receiver unknown until
+            // the dot fixpoint runs, so `.Length` on it resolved LATE — and
+            // the late path had no array case, so it bound to whatever
+            // record in scope declares a `Length`. Silently: a field WAS
+            // found. This is what trapped the stage-1 compiler.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Definition = { Name : string; Offset : int; Length : int }"
+                    "let f (n : string) ="
+                    "    let parts = (n.Substring 1).Split ':'"
+                    "    match parts.Length with"
+                    "    | 3 -> 30"
+                    "    | 2 -> 20"
+                    "    | _ -> 0"
+                    "let d = { Name = \"x\"; Offset = 0; Length = 42 }"
+                    "let go ="
+                    "    print (string (f \"@a:b:c\"))"
+                    "    print (string d.Length)"
+                    "" ])
+            Expect.equal out "30\n42\n" "array length, and the record field still reads"
+        }
     ]
 
 [<Tests>]

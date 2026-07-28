@@ -266,6 +266,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable pendingStructAttr = false
     let memberSitesRaw = vecNew<int * string> ()
     let fieldOwnersRaw = vecNew<int * string> ()
+    /// dot accesses that bound to a plain DATA field (a record or DU field,
+    /// never a member with a body). Assigning to one is as safe to unify
+    /// through as assigning to a variable — see the `assign` case.
+    let recordFieldTargets = dictNew<int, bool> ()
     let ctorSitesRaw = vecNew<int * int> ()
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
@@ -441,6 +445,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> false)
                  | None -> false)
             | _ -> false
+        match prune recvTy, name with
+        // `.Length` on an array or a string is a BUILTIN: there is no
+        // "array.Length" in the fields table, so without this the parked
+        // path fell through to a by-name field lookup and bound the access
+        // to some unrelated record that happens to declare a `Length` —
+        // silently, since a field WAS found. The eager path (where the
+        // receiver type is already known) has always answered here; a
+        // receiver that only takes shape through another parked dot
+        // (`(s.Substring 1).Split ':'`) reaches this one and must agree.
+        | TCon ("array", [ e ]), "Length" ->
+            unifyAt offset result tInt
+            vecAdd arrKindsRaw (offset, TCon ("array", [ e ]))
+            true
+        | TCon ("string", []), "Length" ->
+            // sentinel: string RECEIVER, not string elements
+            unifyAt offset result tInt
+            vecAdd arrKindsRaw (offset, TCon ("$str", []))
+            true
+        | _ ->
         match prune recvTy with
         | TCon (tn, args) ->
             (match declaringOwner tn args with
@@ -487,7 +510,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
                      unifyAt offset result (substVars subst fi.FieldType)
                      vecAdd memberSitesRaw (offset, ownerTag)
-                     if fi.DefKey.IsNone then vecAdd fieldOwnersRaw (offset, instName recvTy)
+                     if fi.DefKey.IsNone then
+                         vecAdd fieldOwnersRaw (offset, instName recvTy)
+                         dictSet recordFieldTargets offset true
                      // a SAME-FILE member is a generic function once lifted:
                      // this use is a specialization demand like any other,
                      // recorded in the definition scheme's own variable
@@ -1485,7 +1510,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               && (match Green.tokens (GNode l) |> List.tryHead with
                                   | Some t -> (dictTryFind arrIndexTargets t.Offset).IsSome
                                   | None -> false)
-                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex) then
+                          // a RECORD FIELD target is safe for the same reason
+                          // again: its type is the declared field type, and
+                          // the store has to fit it. Leaving it out is how
+                          // `r.Slots <- Array.zeroCreate n` (Slots : int[])
+                          // built a UNIFORM array — nothing pinned the
+                          // element type, so the write and every later read
+                          // disagreed about the representation
+                          let isRecordField =
+                              l.NodeKind = DotExpr
+                              && not isArrayIndex
+                              && (match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                                  | Some t -> (dictTryFind recordFieldTargets t.Offset).IsSome
+                                  | None -> false)
+                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex || isRecordField) then
                               unifyArg op.Offset lt rt
                           tUnit
                       | _ -> st.Fresh ())
