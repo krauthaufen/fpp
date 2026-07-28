@@ -556,3 +556,40 @@ let stringForInTests =
             Expect.equal out "3\nsay \\\"hi\\\"\n0\n" "characters in order, empty string safe"
         }
     ]
+
+[<Tests>]
+let comprehensionTests =
+    // `[ for x in src -> e ]`: the loop lowers by the ordinary rules and its
+    // body conses onto an accumulator, which is reversed once at the end.
+    testList "list comprehensions (arrow form)" [
+        test "over a range, a list, an array, and a destructuring binder" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let squares = [ for i in 1 .. 5 -> i * i ]"
+                    "let r1 = print (String.concat \",\" (List.map (fun n -> string n) squares))"
+                    "let xs = [ \"a\"; \"bb\"; \"ccc\" ]"
+                    "let lens = [ for s in xs -> s.Length ]"
+                    "let r2 = print (String.concat \",\" (List.map (fun n -> string n) lens))"
+                    "let arr = [| 10; 20; 30 |]"
+                    "let doubled = [ for v in arr -> v * 2 ]"
+                    "let r3 = print (String.concat \",\" (List.map (fun n -> string n) doubled))"
+                    "let ps = [ (1, \"x\"); (2, \"y\") ]"
+                    "let names = [ for k, v in ps -> v + string k ]"
+                    "let r4 = print (String.concat \",\" names)"
+                    "let none = [ for i in 1 .. 0 -> i ]"
+                    "let r5 = print (string (List.length none))"
+                    "" ])
+            Expect.equal out "1,4,9,16,25\n1,2,3\n20,40,60\nx1,y2\n0\n"
+                "elements in source order"
+        }
+        test "a loop INSIDE the yielded expression stays an ordinary loop" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let sums = [ for i in 1 .. 3 -> (let mutable t = 0 in (for j in 1 .. i do t <- t + j); t) ]"
+                    "let r = print (String.concat \",\" (List.map (fun n -> string n) sums))"
+                    "" ])
+            Expect.equal out "1,3,6\n" "the inner loop accumulates nothing"
+        }
+    ]

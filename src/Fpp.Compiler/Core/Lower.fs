@@ -33,6 +33,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
     let mutable pendingStruct = false
+    // Set while lowering the loop of a list comprehension: the loop's BODY
+    // is the yielded element, so it accumulates instead of being evaluated
+    // for effect. Consumed on entry to the body, so a nested loop inside it
+    // is an ordinary loop again.
+    let mutable yieldInto : VarId option = None
     // offsets of top-level `let` bindings in this file — the only symbols
     // Link can clone, hence the only uses that carry instantiations
     let topLevelDefs = dictNew<int, bool> ()
@@ -205,6 +210,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ".") then
             List.tryLast idents
         else List.tryHead idents
+
+    let anonScheme = mono (TCon ("?", []))
 
     let rec lowerPat (n : GreenNode) : Pat =
         match n.NodeKind with
@@ -784,8 +791,45 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     elif m.NodeKind = ForExpr || m.NodeKind = WhileExpr || m.NodeKind = LetDecl then comprehension <- true
                     elif isExprish m.NodeKind then vecAdd items (lowerExpr (GNode m))
                 nodesOf n |> List.iter add
-                if comprehension then note (offsetOf n) "list comprehension"
-                else EListLit (vecToList items)
+                // `[ for x in src -> e ]`: the loop's body is the element.
+                // The loop itself lowers by the ordinary rules — range, cons
+                // walk, indexed array or enumerator — with the body consing
+                // onto an accumulator, which is then reversed.
+                let arrowFor =
+                    match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                    | [ f ] when f.NodeKind = ForExpr
+                                 && (tokensOf f |> List.exists (fun t -> t.Kind = Operator && t.Text = "->")) -> Some f
+                    | _ -> None
+                match arrowFor with
+                | Some f ->
+                    let off = offsetOf n
+                    let acc = { Path = path; Offset = off + 11000000; Name = "_acc" }
+                    let restV = { Path = path; Offset = off + 12000000; Name = "_crest" }
+                    let outV = { Path = path; Offset = off + 13000000; Name = "_cout" }
+                    let hV = { Path = path; Offset = off + 14000000; Name = "_ch" }
+                    let tV = { Path = path; Offset = off + 15000000; Name = "_ct" }
+                    let anon = anonScheme
+                    let saved = yieldInto
+                    yieldInto <- Some acc
+                    let loop = lowerExpr (GNode f)
+                    yieldInto <- saved
+                    let notNull (e : Expr) =
+                        EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+                    // built by prepending, so the result is reversed once
+                    let reverse =
+                        ELet (false, restV, anon, EVar (acc, anon),
+                          ELet (false, outV, anon, EListLit [],
+                            ESeq [ EWhile (notNull (EVar (restV, anon)),
+                                     EMatch (EVar (restV, anon),
+                                       [ PCons (PVar (hV, anon), PVar (tV, anon)), None,
+                                           ESeq [ EAssign (outV, EPrim ("::", [ EVar (hV, anon); EVar (outV, anon) ]))
+                                                  EAssign (restV, EVar (tV, anon)) ]
+                                         PWild, None, ELit LUnit ]))
+                                   EVar (outV, anon) ]))
+                    ELet (false, acc, anon, EListLit [], ESeq [ loop; reverse ])
+                | None ->
+                    if comprehension then note (offsetOf n) "list comprehension"
+                    else EListLit (vecToList items)
             | LambdaExpr ->
                 let pats = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
                 let body =
@@ -1119,7 +1163,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           ELet (false, iv, isch, lo,
                             ELet (false, hiV, isch, hi,
                               EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
-                                ESeq [ lowerExpr (GNode body)
+                                ESeq [ loopBody body
                                        EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
                       | pat, coll when (dictTryFind arrKinds (offsetOf range)) = Some "list" ->
                           // for x in xs (a LIST): a cons walk. The binder may
@@ -1134,7 +1178,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             EWhile (notNull (EVar (restV, anon)),
                               EMatch (EVar (restV, anon),
                                 [ PCons (pat, PVar (tailV, anon)), None,
-                                    ESeq [ lowerExpr (GNode body)
+                                    ESeq [ loopBody body
                                            EAssign (restV, EVar (tailV, anon)) ]
                                   PWild, None, ELit LUnit ])))
                       | pat, coll when
@@ -1153,8 +1197,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let elem = EIndex (nm, EVar (av, anon), EVar (ix, ish))
                           let inner =
                               match pat with
-                              | PVar (iv, isch) -> ELet (false, iv, isch, elem, lowerExpr (GNode body))
-                              | p -> EMatch (elem, [ p, None, lowerExpr (GNode body) ])
+                              | PVar (iv, isch) -> ELet (false, iv, isch, elem, loopBody body)
+                              | p -> EMatch (elem, [ p, None, loopBody body ])
                           ELet (false, av, anon, coll,
                             ELet (false, ix, ish, ELit (LInt "0"),
                               EWhile (EPrim ("<", [ EVar (ix, ish); EArrayLen (nm, EVar (av, anon)) ]),
@@ -1187,11 +1231,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                let inner =
                                    match pat with
                                    | PVar (iv, isch) ->
-                                       ELet (false, iv, isch, c, lowerExpr (GNode body))
+                                       ELet (false, iv, isch, c, loopBody body)
                                    | p ->
                                        // tuple and struct-tuple binders
                                        // destructure the current element
-                                       EMatch (c, [ p, None, lowerExpr (GNode body) ])
+                                       EMatch (c, [ p, None, loopBody body ])
                                ELet (false, enV, anon, g, EWhile (m, inner))
                            | _ -> note (offsetOf n) "for-in (no GetEnumerator on the source)"))
                  | _ -> note (offsetOf n) "for loop shape")
@@ -1393,6 +1437,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Expand `let struct(a, b) = rhs in body` into a struct binding plus
     /// one field read per binder — the struct itself is an ordinary value.
+    /// A loop body. Inside a list comprehension the body IS the yielded
+    /// element, so it is consed onto the accumulator instead of being run
+    /// for its effect; the sink is consumed here, so a loop NESTED in the
+    /// body is an ordinary loop again.
+    and loopBody (body : GreenNode) : Expr =
+        match yieldInto with
+        | None -> lowerExpr (GNode body)
+        | Some acc ->
+            yieldInto <- None
+            let e = lowerExpr (GNode body)
+            yieldInto <- Some acc
+            EAssign (acc, EPrim ("::", [ e; EVar (acc, anonScheme) ]))
+
     and structLetExpr (slots : (VarId * Scheme) option list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
         match slots |> List.choose id with
         | [] -> body

@@ -959,13 +959,53 @@ Then two more, and the frontier reached 14:
 - **`System.Text.StringBuilder` in `Serialize.fs` and `Link.fs`** joined the
   other builders behind the seam as a `Vec<string>` concatenated once.
 
-The frontier is 14 of 20 files: through `Parser`, `Resolve`, `Types`,
-`Format`, `Classes`, `Infer`, `Core`, `Lower`, `Lint` and `Serialize`. The
-next wall is `Core/Link.fs`, and it is the LIST COMPREHENSION gap — the one
-deliberately deferred at stage 0. Six sites remain, in `Link.fs` and
-`EmitWasm.fs`; lowering `for`/`if`/`yield` into a Vec accumulation is the
-fix, and it is now the single largest thing between here and a compiler that
-emits all of itself.
+### List comprehensions, arrow form
+`[ for x in src -> e ]` lowers now. The loop itself takes the ORDINARY path
+— range, cons walk, indexed array or enumerator protocol, whichever applies
+— and the only change is that its body conses onto an accumulator instead of
+running for effect; the list is built by prepending and reversed once at the
+end. The sink is consumed on entry to the body, so a loop NESTED inside the
+yielded expression is an ordinary loop again (pinned by a test: the inner
+loop must accumulate nothing).
+
+That covers four of the five remaining sites. What is still refused is the
+STATEMENT form — `[ for x in xs do ... yield e ]` with `if`/`match`/`let`
+between, and `yield!` flattening a sublist. One site needs it,
+`Link.builtinInstanceWrappers`, and it needs the full treatment: a
+transformation over the body's syntax where every construct passes the sink
+down and `yield!` appends instead of conses. Worth doing properly rather
+than pattern-matching that one shape.
+
+### Where the frontier stands, and the next decision
+14 of 20 files: `bootstrap`, `Tokens`, `Lexer`, `Tree`, `Parser`, `Resolve`,
+`Types`, `Format`, `Classes`, `Infer`, `Core`, `Lower`, `Lint`, `Serialize`.
+
+`Core/Link.fs` is the wall, and past the comprehension it is not a bug but a
+DECISION. The remaining files call the .NET string API directly — 88 sites:
+26 in `Link.fs`, 55 in `EmitWasm.fs`, 6 in `Project.fs`, 1 in `Workspace.fs`
+— `Substring`, `StartsWith`, `EndsWith`, `IndexOf`, `Contains`, `Replace`,
+`Split`, `Trim`. F++ models a string as a primitive `$str` with `.Length`
+and indexing through the `"$str"` sentinel and no members beyond that, so
+every one of those calls parks unresolved. (That is also why `Link.fs` still
+reports a for-in: `for c in inner` where `inner = name.Substring ...` — the
+source type never becomes known, so the loop cannot be walked.)
+
+Two ways, and they should not be mixed:
+
+1. **Give F++ string members.** `name.StartsWith p` keeps working verbatim,
+   at the cost of teaching the type system and the emitter a member surface
+   on a primitive.
+2. **Route the 88 sites through the seam** as ordinary functions
+   (`startsWith s p`, `indexOfFrom s p i`, …) added to `Prelude.fs` and
+   `stdlib/bootstrap.fpp` together. Mechanical, in house style, and it makes
+   the seam explicit — but it is 88 edits, and each one can slip a semantic
+   (`IndexOf` returning -1, `Split` on empty, `Replace` overlapping).
+
+Recommendation: (2), because it keeps the primitive primitive and every
+other seam member already reads this way — but it is a deliberate choice
+about the language surface, not a cleanup, so it belongs in a plan entry
+before the first edit. `Workspace`/`Project` still need the host-import
+surface decided separately; file IO is not a string function.
 
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they
