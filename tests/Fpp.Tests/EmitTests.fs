@@ -251,6 +251,29 @@ let noBoxGate =
                     "" ])
             Expect.equal out "0\n0\n65\n65\n10\naAb\n" "decimal, hex and named escapes all decode"
         }
+        test "joining many pieces is not quadratic" {
+            // `String.concat` folded left, so joining n chunks of total
+            // length L copied O(n*L) characters. The compiler's own emitter
+            // joins a six-megabyte module out of hundreds of thousands of
+            // chunks: self-hosting went from not finishing in fifty minutes
+            // to ninety-seven seconds when this became a pairwise merge.
+            // The GATE here is the answer, not the clock — a left fold gets
+            // these right too, and only the bootstrap measures the speed.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    print (String.concat \",\" [\"a\"; \"b\"; \"c\"])"
+                    "    print (String.concat \"\" [\"x\"; \"y\"])"
+                    "    print (String.concat \"-\" [\"solo\"])"
+                    "    print (String.concat \"-\" [])"
+                    "    print (String.replicate 3 \"ab\")"
+                    "    print (String.init 4 (fun i -> string i))"
+                    "    print (string (String.length (String.concat \"\" (List.replicate 2000 \"0123456789\"))))"
+                    "" ])
+            Expect.equal out "a,b,c\nxy\nsolo\n\nababab\n0123\n20000\n"
+                "separators land between pieces, in order, at every arity"
+        }
     ]
 
 [<Tests>]

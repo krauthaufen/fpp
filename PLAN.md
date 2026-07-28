@@ -1699,6 +1699,36 @@ of producing a module the assembler rejects thousands of lines later.
   scanned only the flat array, so a recursive function reached through a
   partial application kept its own marker. It was not this trap.
 
+### SELF-HOSTING: the compiler compiles itself, byte for byte
+
+    corpus: bootstrap.fpp, Tokens.fs, ... Workspace.fs, compiledrive.fpp
+    stage-0 answer: 6238872 bytes
+    stage-1:        6238872 bytes of wat
+    FIXPOINT: stage-1 reproduces stage-0 byte for byte (6238872 bytes)
+
+97 seconds, against ~2 seconds for the same job natively. Two bugs stood
+between the single-file fixpoint and this one:
+
+1. **Only the NAMED character escapes were decoded.** `'\000'` came out as
+   the digit zero, so the compiler compiled its own lexer's end-of-input
+   guard (`peek (pos + 1) <> '\000'`) into a test against '0' — and stage-1
+   then rejected every char literal in its own sources, 473 errors deep. The
+   emitter now decodes `\DDD`, `\xHH`, `\uXXXX`, `\UXXXXXXXX` and
+   `\a \b \f \v`, with code points above ASCII encoded as UTF-8 bytes.
+2. **`String.concat` folded left.** `acc <- acc + sep + x` copies the whole
+   accumulator every step, so joining n chunks of total length L costs
+   O(n*L). `sbText` is exactly that fold over the emitter's chunks, and the
+   emitted module is six megabytes: the first full self-host ran 50 minutes
+   without finishing. As a pairwise merge it is O(L log n) — the four-file
+   probe went 248s -> 25s, and the whole compiler finished in 97s.
+   `String.replicate`, `String.init` and `stringOfChars` had the same shape
+   and were fixed with it.
+
+The lesson worth keeping: the .NET half of the seam gets `StringBuilder` and
+`Dictionary` from the host, so an O(n^2) stdlib routine in the F++ half is
+invisible until the compiler runs on ITSELF. Native speed proves nothing
+about the hosted build.
+
 ### Stage 3: the compiler as its own corpus
 `dotnet fsi tests/bootstrap/fixpoint.fsx self` makes the corpus the COMPILER —
 its twenty sources plus the driver, under the same served names stage-1 was

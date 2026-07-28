@@ -20,11 +20,35 @@ let isAsciiLetter (c : char) : bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <
 /// the only question the lexer asks of this predicate.
 let isLetter (c : char) : bool = isAsciiLetter c || int c >= 128
 
+/// Pairwise merge, not a left fold — `acc + string c` copies the whole
+/// accumulator per character, which is quadratic in the result.
 let stringOfChars (cs : char list) : string =
-    let mutable acc = ""
+    let mutable cur : string list = []
+    let mutable n = 0
     for c in cs do
-        acc <- acc + string c
-    acc
+        cur <- string c :: cur
+        n <- n + 1
+    let mutable reversed = true
+    while n > 1 do
+        let mutable out : string list = []
+        let mutable rest = cur
+        let mutable more = true
+        while more do
+            match rest with
+            | x :: y :: tail ->
+                out <- (if reversed then y + x else x + y) :: out
+                rest <- tail
+            | [ x ] ->
+                out <- x :: out
+                rest <- []
+                more <- false
+            | [] -> more <- false
+        cur <- out
+        reversed <- not reversed
+        n <- (n + 1) / 2
+    match cur with
+    | [ one ] -> one
+    | _ -> ""
 
 // ---- Vec: a growable vector ------------------------------------------
 

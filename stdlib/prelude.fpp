@@ -746,20 +746,22 @@ module String =
         | [ one ] -> one
         | _ -> ""
 
+    // both build through `concat`, for the reason spelled out there: a left
+    // fold over `+` copies the accumulator every step
     let replicate (n : int) (s : string) =
-        let mutable acc = ""
+        let mutable parts : string list = []
         let mutable i = 0
         while i < n do
-            acc <- acc + s
+            parts <- s :: parts
             i <- i + 1
-        acc
+        concat "" parts
     let init (n : int) (f : int -> string) =
-        let mutable acc = ""
-        let mutable i = 0
-        while i < n do
-            acc <- acc + f i
-            i <- i + 1
-        acc
+        let mutable parts : string list = []
+        let mutable i = n - 1
+        while i >= 0 do
+            parts <- f i :: parts
+            i <- i - 1
+        concat "" parts
     let exists (p : char -> bool) (s : string) =
         let mutable found = false
         let mutable i = 0
