@@ -323,6 +323,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "string.TrimEnd" (m (TFun (charArr, tString)))
     registerStringMembers ()
 
+    // ---- builtin members on `option` --------------------------------------
+    // F# code says `d.IsSome`, so F++ has to mean it. These COULD be written
+    // as ordinary members on the prelude's `Option` DU — that compiles — but
+    // a member on a generic DU is stamped per instantiation, and `option` is
+    // instantiated at nearly every type in the compiler: doing it that way
+    // took the 20-file self-emit from 115s/0.6GB to over 30min/30GB. They are
+    // properties of the TAG, identical at every element type, so they belong
+    // here and lower to a match instead (see DIVERGENCES.md).
+    let registerOptionMembers () =
+        if (dictTryFind fields "Option.IsSome").IsNone then
+            // `Value` reads the payload, so its type IS the receiver's type
+            // argument: one parameter, substituted per use site
+            let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
+            let m (ty : Type) =
+                { TypeName = "Option"; Params = [ elem ]; Quantified = []
+                  FieldType = ty; DefKey = None; IsStatic = false }
+            registerField "Option.IsSome" (m tBool)
+            registerField "Option.IsNone" (m tBool)
+            registerField "Option.Value" (m (TVar elem))
+    registerOptionMembers ()
+
     /// A member's overload set, with the ordinal that reaches each entry
     /// (0 = the plain key).
     let fieldCandidates (key : string) : (int * FieldInfo) list =

@@ -605,9 +605,6 @@ type ISet<'a> =
 type Option<'a> =
     | None
     | Some of 'a
-    member x.IsSome = match x with Some _ -> true | None -> false
-    member x.IsNone = match x with Some _ -> false | None -> true
-    member x.Value = match x with Some v -> v | None -> failwith "Option.Value: None"
 type option<'a> = Option<'a>
 type Result<'t, 'e> =
     | Ok of 't

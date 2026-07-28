@@ -127,3 +127,22 @@ pieces (`"a,b,"` gives three), and `Replace` scans left to right without
 letting replacements overlap (`"aaa".Replace("aa", "b")` is `"ba"`, not
 `"b"`). `Trim` trims ASCII whitespace; the full Unicode set is not
 implemented.
+
+## `IsSome`, `IsNone` and `Value` on `option` are builtin members
+
+`o.IsSome`, `o.IsNone` and `o.Value` resolve, and mean exactly what F# means
+by them. They are not declared on the prelude's `Option` type, though:
+they are registered as builtin members the way the `string` surface is, and
+lower to the `match` they stand for.
+
+**Reason: cost, not semantics.** A member on a generic DU is stamped per
+instantiation, and `option` is instantiated at very nearly every type in the
+compiler. All three are properties of the TAG — identical code at every
+element type — so a copy per element type is pure waste. Declaring them on
+`Option` compiles and behaves the same; it just pays for something nobody
+uses.
+
+**The divergence.** As with `string`, the set is CLOSED: `o.IsValueNone` or
+a user-defined extension member on `option` do not resolve. `Option` itself
+carries no other members, and general extension members on builtins remain an
+open language feature.

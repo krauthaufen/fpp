@@ -1211,11 +1211,15 @@ out to be:
   `empty = MapEmpty`. The cost argument agrees: the resolver rebuilds the
   environment by `add` on the way down every scope, and a copying insert is
   quadratic over a file where a tree insert shares all but the spine.
-- **`option.IsSome`/`IsNone` are ordinary DU members**, declared on `Option`
-  in the prelude — no compiler change, no divergence, exact F# semantics.
-  `Value` came with them, and it was not cosmetic: `(dictTryFind d k).Value`
-  had been resolving to *`KeyValuePair`'s* `Value` slot, reading the wrong
-  field of the wrong type. Silent, and now correct.
+- **`option.IsSome`/`IsNone`/`Value` are BUILTIN members**, registered in
+  Infer's `fields` table beside the string ones and lowered to the match they
+  mean. Declaring them on the prelude's `Option` DU also works and reads
+  better — but a member on a generic DU is stamped per instantiation, and
+  `option` is instantiated at nearly every type in the compiler. These three
+  are properties of the TAG, identical at every element type, so a stamp per
+  type is pure waste. `Value` was not cosmetic either way:
+  `(dictTryFind d k).Value` had been resolving to *`KeyValuePair`'s* `Value`
+  slot, reading the wrong field of the wrong type. Silent, and now correct.
 - **The small gaps**: `char` (one entry in each of the three conversion
   lists — Infer's kind capture, Infer's typing, Lower's dispatch — since a
   char IS its code point and the emitter's generic conversion case already
@@ -1260,7 +1264,46 @@ Two things fell out that are worth writing down:
   elimination drops unused prelude FUNCTIONS but not this. Small, but it
   moves the emitted bytes of every program, which matters to the fixpoint.
 
-**What is left: `Builtin.source`.** `Workspace.fs` reads `stdlib/prelude.fpp`
+### The next wall: the compiler has never actually emitted itself
+Fixing the census tail revealed that every previous measurement of "the
+20-file emit" was measuring an INCOMPLETE program. Both the 109-error and the
+49-error censuses contain `unbound variable emit`, `unbound variable infer`,
+`unbound variable builtinInstanceWrappers` and `unbound variable
+instanceFunctions` — the whole backend and the whole inference engine were
+ABSENT from the module. The output was ~8.2k lines of wat for an 18k-line
+compiler, which is the same tell.
+
+So the numbers to carry forward are not what they looked like:
+
+| state | errors | time | peak RSS | wat |
+|---|---|---|---|---|
+| before this milestone | 109 | 115s | 0.62 GB | 8245 |
+| tail fixed, `IsSome` still failing | 49 | 115s | 0.62 GB | 8342 |
+| `IsSome` resolving | ? | >30 min, killed | ~29.9 GB, twice | — |
+
+The moment `IsSome` resolves, `infer` and `emit` become reachable for the
+first time, and monomorphizing them does not fit. It plateaus at ~29.9 GB and
+makes no further progress; two independent runs stopped at the same figure.
+
+**This is not about how the option members are implemented.** DU members and
+builtin members blow up identically, because the cause is REACHABILITY, not
+the members: they were simply the last thing holding the backend out of the
+module. Nor is it the aggregate of twenty files. The cheapest repro found is
+all 20 sources minus `Workspace.fs`, plus a three-line root:
+
+    module Root
+    open Fpp.Prelude
+    let r = Fpp.Analysis.Infer.infer
+
+That alone does not finish in ten minutes. `Infer.infer` is where to look —
+and the stamper is the thing to look at, since it is the pass whose cost is
+per instantiation. Whether this is exponential stamping (a bug) or merely a
+very large but finite closure (a budget problem) is the question that decides
+the shape of the rest of the bootstrap, and it should be answered before any
+more emission gaps are chased: the remaining errors are a short list, and
+closing them changes nothing if the result cannot be built.
+
+**What is also left: `Builtin.source`.** `Workspace.fs` reads `stdlib/prelude.fpp`
 out of the assembly with `GetManifestResourceStream`, and a wasm module has
 no such thing. This is the one remaining item that touches the APPROVED
 four-function host-import surface, so it is a decision and not a patch: a

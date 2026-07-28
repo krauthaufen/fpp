@@ -1335,7 +1335,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               match dictTryFind fieldOwners name.Offset with
                               | Some o -> o
                               | None -> (match dictTryFind memberSites name.Offset with Some o -> o | None -> "")
-                          EField (lowerExpr (GNode lhs), name.Text, owner))
+                          // a BUILTIN member on `option`: a property of the
+                          // tag, so it lowers to the match it means rather
+                          // than to a stamped member (see Infer)
+                          let anon = anonScheme
+                          let optTag (whenSome : Expr) (whenNone : Expr) =
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCtor ("Some", anon, [ PWild ]), None, whenSome
+                                        PWild, None, whenNone ])
+                          if owner = "Option" && name.Text = "IsSome" then
+                              optTag (ELit (LBool true)) (ELit (LBool false))
+                          elif owner = "Option" && name.Text = "IsNone" then
+                              optTag (ELit (LBool false)) (ELit (LBool true))
+                          elif owner = "Option" && name.Text = "Value" then
+                              let tmp = { Path = path; Offset = offsetOf n + 21000000; Name = "_optv" }
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCtor ("Some", anon, [ PVar (tmp, anon) ]), None, EVar (tmp, anon)
+                                        PWild, None,
+                                          EApp (EUnknown "failwith",
+                                                [ ELit (LString "\"the option value was None\"") ]) ])
+                          else EField (lowerExpr (GNode lhs), name.Text, owner))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->
                 // range-for: `for i in a .. b do body` — desugars to a while
