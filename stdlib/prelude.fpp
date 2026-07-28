@@ -635,6 +635,43 @@ type DefaultEqualityComparer<'a> =
 type KeyValuePair<'K, 'V>(key : 'K, value : 'V) =
     member x.Key = key
     member x.Value = value
+// ---- the identity function ----
+let id (x : 'a) : 'a = x
+
+// ---- Option: the F# Option module ----
+module Option =
+    let isSome (o : 'a option) : bool = match o with Some _ -> true | None -> false
+    let isNone (o : 'a option) : bool = match o with Some _ -> false | None -> true
+    let map (f : 'a -> 'b) (o : 'a option) : 'b option =
+        match o with
+        | Some x -> Some (f x)
+        | None -> None
+    let bind (f : 'a -> 'b option) (o : 'a option) : 'b option =
+        match o with
+        | Some x -> f x
+        | None -> None
+    let filter (p : 'a -> bool) (o : 'a option) : 'a option =
+        match o with
+        | Some x -> if p x then Some x else None
+        | None -> None
+    let forall (p : 'a -> bool) (o : 'a option) : bool =
+        match o with
+        | Some x -> p x
+        | None -> true
+    let exists (p : 'a -> bool) (o : 'a option) : bool =
+        match o with
+        | Some x -> p x
+        | None -> false
+    let iter (f : 'a -> unit) (o : 'a option) : unit =
+        match o with
+        | Some x -> f x
+        | None -> ()
+    let defaultValue (fallback : 'a) (o : 'a option) : 'a =
+        match o with
+        | Some x -> x
+        | None -> fallback
+    let toList (o : 'a option) : 'a list = match o with Some x -> [ x ] | None -> []
+
 // ---- tuple projections ----
 let fst (t : 'a * 'b) : 'a = match t with (a, _) -> a
 let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b

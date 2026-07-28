@@ -968,13 +968,32 @@ end. The sink is consumed on entry to the body, so a loop NESTED inside the
 yielded expression is an ordinary loop again (pinned by a test: the inner
 loop must accumulate nothing).
 
-That covers four of the five remaining sites. What is still refused is the
-STATEMENT form — `[ for x in xs do ... yield e ]` with `if`/`match`/`let`
-between, and `yield!` flattening a sublist. One site needs it,
-`Link.builtinInstanceWrappers`, and it needs the full treatment: a
-transformation over the body's syntax where every construct passes the sink
-down and `yield!` appends instead of conses. Worth doing properly rather
-than pattern-matching that one shape.
+### The statement form, and a `yield` that escaped its `if`
+`[ for x in xs do ... yield e ... ]` lowers now too, including `yield!`.
+The sink turned out not to need a syntax-directed transformation at all: it
+is DYNAMIC. `compAcc` is set while the comprehension's loop is lowered by
+the ordinary rules, and the interception happens at `yield` itself, wherever
+the lowering reaches it — inside an `if`, a `match` arm, a nested loop, a
+`let` continuation. Those constructs already lower their sub-expressions the
+normal way, so they carry the sink without knowing about it. `yield!` walks
+the spliced list and pushes each element, which keeps the single reversal at
+the end correct.
+
+Refused deliberately: a comprehension whose body contains NO explicit yield.
+F# would read a bare non-unit expression as an implicit yield; lowering one
+as a statement would silently produce `[]`, so it stays a note.
+
+Finding it needed a PARSER fix first. `yield` was a block item but not an
+expression start, so `if cond then yield y` parsed with an EMPTY then-branch
+and the yield became a SIBLING of the loop — which would have yielded
+unconditionally. `then`, `else` and match-arm bodies accept `yield`/`return`
+as a body start now. That is a silent-wrongness bug that existed
+independently of comprehensions.
+
+`Option` (map, bind, filter, forall, exists, iter, isSome, isNone,
+defaultValue, toList) and `id` joined the prelude on the same push — 45
+`Option.map` and 27 `Option.bind` sites across the compiler were waiting on
+them.
 
 ### Where the frontier stands, and the next decision
 14 of 20 files: `bootstrap`, `Tokens`, `Lexer`, `Tree`, `Parser`, `Resolve`,

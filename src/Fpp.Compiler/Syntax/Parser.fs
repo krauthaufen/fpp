@@ -780,7 +780,11 @@ let parse (src : string) : ParseResult =
         vecAdd acc (s.Bump ())   // if / elif
         vecAdd acc (parseExpr ifCol)
         if s.IsKw "then" then vecAdd acc (s.Bump ()) else s.Diag "expected 'then'"
-        if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock ifCol)
+        // `yield`/`return` start a body too: inside a comprehension the
+        // branch IS a yield, and without this it escaped the `if` and became
+        // a sibling — which would yield unconditionally
+        if canStartExpr () || s.IsKw "let" || s.IsKw "yield" || s.IsKw "return" then
+            vecAdd acc (parseBlock ifCol)
         let mutable go = true
         while go do
             if s.IsKw "elif" && s.CurCol >= ifCol then
@@ -788,7 +792,8 @@ let parse (src : string) : ParseResult =
                 go <- false   // nested elif consumed the rest of the chain
             elif s.IsKw "else" && s.CurCol >= ifCol then
                 vecAdd acc (s.Bump ())
-                if canStartExpr () || s.IsKw "let" || s.IsKw "if" then vecAdd acc (parseBlock ifCol)
+                if canStartExpr () || s.IsKw "let" || s.IsKw "if" || s.IsKw "yield" || s.IsKw "return" then
+                    vecAdd acc (parseBlock ifCol)
                 go <- false
             else go <- false
         Green.node IfExpr (vecToList acc)
@@ -813,7 +818,8 @@ let parse (src : string) : ParseResult =
                 vecAdd c (s.Bump ())
                 vecAdd c (parseExpr barCol)
             if s.IsOp "->" then vecAdd c (s.Bump ()) else s.Diag "expected '->' in match clause"
-            if canStartExpr () || s.IsKw "let" then vecAdd c (parseBlock barCol)
+            if canStartExpr () || s.IsKw "let" || s.IsKw "yield" || s.IsKw "return" then
+                vecAdd c (parseBlock barCol)
             vecAdd acc (Green.node MatchClause (vecToList c))
         // first clause may omit the bar: `match x with null -> ...`
         if not (s.IsOp "|") && canStartAtomPat () && s.SameLine then

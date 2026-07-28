@@ -38,6 +38,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // for effect. Consumed on entry to the body, so a nested loop inside it
     // is an ordinary loop again.
     let mutable yieldInto : VarId option = None
+    // Set while lowering the STATEMENT form of a comprehension. Unlike the
+    // arrow form the yields are explicit and can sit anywhere — inside an
+    // `if`, a `match` arm, a nested loop — so the sink is dynamic and the
+    // interception happens at `yield` itself, wherever the ordinary lowering
+    // reaches it.
+    let mutable compAcc : VarId option = None
     // offsets of top-level `let` bindings in this file — the only symbols
     // Link can clone, hence the only uses that carry instantiations
     let topLevelDefs = dictNew<int, bool> ()
@@ -740,6 +746,34 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | None ->
                               EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
                  | _ -> note (offsetOf n) "operator shape")
+            | PrefixExpr when (match tokensOf n |> List.tryHead with
+                               | Some t -> t.Kind = Keyword && t.Text = "yield"
+                               | None -> false) && compAcc.IsSome ->
+                let acc = compAcc.Value
+                let bang = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = "!")
+                let value =
+                    match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                    | [ e ] -> lowerExpr (GNode e)
+                    | _ -> ELit LUnit
+                if not bang then
+                    // the accumulator is built REVERSED and turned around once
+                    EAssign (acc, EPrim ("::", [ value; EVar (acc, anonScheme) ]))
+                else
+                    // `yield!` splices a list: walk it and push each element,
+                    // which keeps the single reversal at the end correct
+                    let off = offsetOf n
+                    let rv = { Path = path; Offset = off + 16000000; Name = "_yrest" }
+                    let hv = { Path = path; Offset = off + 17000000; Name = "_yh" }
+                    let tv = { Path = path; Offset = off + 18000000; Name = "_yt" }
+                    let notNull (e : Expr) =
+                        EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+                    ELet (false, rv, anonScheme, value,
+                      EWhile (notNull (EVar (rv, anonScheme)),
+                        EMatch (EVar (rv, anonScheme),
+                          [ PCons (PVar (hv, anonScheme), PVar (tv, anonScheme)), None,
+                              ESeq [ EAssign (acc, EPrim ("::", [ EVar (hv, anonScheme); EVar (acc, anonScheme) ]))
+                                     EAssign (rv, EVar (tv, anonScheme)) ]
+                            PWild, None, ELit LUnit ])))
             | PrefixExpr ->
                 (match tokensOf n |> List.tryHead, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
@@ -826,6 +860,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | [ f ] when f.NodeKind = ForExpr
                                  && (tokensOf f |> List.exists (fun t -> t.Kind = Operator && t.Text = "->")) -> Some f
                     | _ -> None
+                // the STATEMENT form: `[ for ... do ... yield e ... ]`, with
+                // the yields explicit and anywhere inside. Refused when the
+                // body has no yield at all, because an IMPLICIT yield would
+                // otherwise lower to a statement and silently produce []
+                let hasYield =
+                    let rec go (m : GreenNode) =
+                        (m.NodeKind = PrefixExpr
+                         && (match tokensOf m |> List.tryHead with
+                             | Some t -> t.Kind = Keyword && t.Text = "yield"
+                             | None -> false))
+                        // a nested comprehension owns its own yields
+                        || (m.NodeKind <> ListExpr && (nodesOf m |> List.exists go))
+                    nodesOf n |> List.exists go
+                let stmtFor =
+                    match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                    | [ f ] when (f.NodeKind = ForExpr || f.NodeKind = WhileExpr) && hasYield -> Some f
+                    | _ -> None
                 match arrowFor with
                 | Some f ->
                     let off = offsetOf n
@@ -842,6 +893,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let notNull (e : Expr) =
                         EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
                     // built by prepending, so the result is reversed once
+                    let reverse =
+                        ELet (false, restV, anon, EVar (acc, anon),
+                          ELet (false, outV, anon, EListLit [],
+                            ESeq [ EWhile (notNull (EVar (restV, anon)),
+                                     EMatch (EVar (restV, anon),
+                                       [ PCons (PVar (hV, anon), PVar (tV, anon)), None,
+                                           ESeq [ EAssign (outV, EPrim ("::", [ EVar (hV, anon); EVar (outV, anon) ]))
+                                                  EAssign (restV, EVar (tV, anon)) ]
+                                         PWild, None, ELit LUnit ]))
+                                   EVar (outV, anon) ]))
+                    ELet (false, acc, anon, EListLit [], ESeq [ loop; reverse ])
+                | None ->
+                match stmtFor with
+                | Some f ->
+                    let off = offsetOf n
+                    let acc = { Path = path; Offset = off + 11000000; Name = "_acc" }
+                    let restV = { Path = path; Offset = off + 12000000; Name = "_crest" }
+                    let outV = { Path = path; Offset = off + 13000000; Name = "_cout" }
+                    let hV = { Path = path; Offset = off + 14000000; Name = "_ch" }
+                    let tV = { Path = path; Offset = off + 15000000; Name = "_ct" }
+                    let anon = anonScheme
+                    let savedAcc = compAcc
+                    let savedYield = yieldInto
+                    compAcc <- Some acc
+                    // the loop body is a STATEMENT sequence here, not the
+                    // element: the arrow-form sink must not also fire
+                    yieldInto <- None
+                    let loop = lowerExpr (GNode f)
+                    compAcc <- savedAcc
+                    yieldInto <- savedYield
+                    let notNull (e : Expr) =
+                        EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
                     let reverse =
                         ELet (false, restV, anon, EVar (acc, anon),
                           ELet (false, outV, anon, EListLit [],

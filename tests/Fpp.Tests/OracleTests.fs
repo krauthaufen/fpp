@@ -67,6 +67,34 @@ let private oracle (name : string) (srcLines : string list) =
 [<Tests>]
 let oracleTests =
     testList "oracle: F# vs F++" [
+        // The STATEMENT form of a list comprehension: yields are explicit
+        // and can sit inside an `if`, a `match` arm or a nested loop, and
+        // `yield!` splices a sublist.
+        oracle "comprehension: yield inside if, let, nested for, match" [
+            "let evens (ys : int list) = [ for y in ys do if y % 2 = 0 then yield y ]"
+            "let doubled (ys : int list) ="
+            "    [ for y in ys do"
+            "        let d = y * 2"
+            "        yield d"
+            "        yield d + 1 ]"
+            "let spliced (ys : int list) = [ for y in ys do yield! [ y; y * 10 ] ]"
+            "let nested (ys : int list) ="
+            "    [ for y in ys do"
+            "        for k in 1 .. 2 do"
+            "            yield y * k ]"
+            "let viaMatch (ys : int option list) ="
+            "    [ for y in ys do"
+            "        match y with"
+            "        | Some v -> yield v"
+            "        | None -> () ]"
+            "let show (xs : int list) = String.concat \",\" (List.map (fun n -> string n) xs)"
+            "let r1 = print (show (evens [ 1; 2; 3; 4 ]))"
+            "let r2 = print (show (doubled [ 1; 2 ]))"
+            "let r3 = print (show (spliced [ 1; 2 ]))"
+            "let r4 = print (show (nested [ 1; 2 ]))"
+            "let r5 = print (show (viaMatch [ Some 1; None; Some 3 ]))"
+            "let r6 = print (show (spliced []))"
+        ]
         // Builtin members on `string`. The cases are chosen where a
         // hand-rolled implementation and .NET part ways: an empty needle,
         // a missing one, a split that ends on the separator, and a Replace
