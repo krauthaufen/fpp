@@ -3577,34 +3577,58 @@ TUPLE_HASH
               "(call $tos ", "(struct.new $boxs "
               "(call $tol ", "(struct.new $boxl " ]
         let mutable t = text
+        // ONE scan per pass, marking what to drop, then a single compaction.
+        // The previous form rebuilt the whole module string per replacement
+        // and restarted its search from zero — on a multi-megabyte module
+        // that is hundreds of gigabytes of copying, and it was 97% of a
+        // whole-compiler compile.
+        let onePass (src : string) : string * bool =
+            let drop = Array.zeroCreate<bool> src.Length
+            let mutable found = false
+            let mutable i = 0
+            while i < src.Length do
+                if src.[i] = '(' then
+                    // which cancelling pair (if any) starts here
+                    let hit =
+                        pairs |> List.tryFind (fun (outer, inner) ->
+                            i + outer.Length + inner.Length <= src.Length
+                            && System.String.CompareOrdinal (src, i, outer, 0, outer.Length) = 0
+                            && System.String.CompareOrdinal (src, i + outer.Length, inner, 0, inner.Length) = 0)
+                    match hit with
+                    | Some (outer, inner) ->
+                        let innerStart = i + outer.Length
+                        let mutable depth = 0
+                        let mutable j = innerStart
+                        let mutable innerEnd = -1
+                        while innerEnd < 0 && j < src.Length do
+                            if src.[j] = '(' then depth <- depth + 1
+                            elif src.[j] = ')' then
+                                depth <- depth - 1
+                                if depth = 0 then innerEnd <- j
+                            j <- j + 1
+                        // the outer call must close immediately after the inner
+                        if innerEnd > 0 && innerEnd + 1 < src.Length && src.[innerEnd + 1] = ')' then
+                            // drop both heads and both closing parens; the
+                            // argument between them survives and is rescanned
+                            for k in i .. innerStart + inner.Length - 1 do drop.[k] <- true
+                            drop.[innerEnd] <- true
+                            drop.[innerEnd + 1] <- true
+                            found <- true
+                            i <- innerStart + inner.Length
+                        else i <- i + 1
+                    | None -> i <- i + 1
+                else i <- i + 1
+            if not found then src, false
+            else
+                let out = System.Text.StringBuilder (src.Length)
+                for k in 0 .. src.Length - 1 do
+                    if not drop.[k] then out.Append src.[k] |> ignore
+                out.ToString (), true
         let mutable changed = true
         while changed do
-            changed <- false
-            for outer, inner in pairs do
-                let pat = outer + inner
-                let mutable idx = t.IndexOf pat
-                while idx >= 0 do
-                    // inner sexp starts right after `outer`
-                    let innerStart = idx + outer.Length
-                    let mutable depth = 0
-                    let mutable j = innerStart
-                    let mutable innerEnd = -1
-                    while innerEnd < 0 && j < t.Length do
-                        if t.[j] = '(' then depth <- depth + 1
-                        elif t.[j] = ')' then
-                            depth <- depth - 1
-                            if depth = 0 then innerEnd <- j
-                        j <- j + 1
-                    // outer must close immediately after inner
-                    if innerEnd > 0 && innerEnd + 1 < t.Length && t.[innerEnd + 1] = ')' then
-                        let arg : string = t.Substring (innerStart + inner.Length, innerEnd - (innerStart + inner.Length))
-                        let before : string = t.Substring (0, idx)
-                        let after : string = t.Substring (innerEnd + 2)
-                        t <- before + arg + after
-                        changed <- true
-                        idx <- t.IndexOf pat
-                    else
-                        idx <- t.IndexOf (pat, idx + 1)
+            let next, didChange = onePass t
+            t <- next
+            changed <- didChange
         t
 
     { Wat = peephole (sb.ToString ()); Errors = vecToList errors }

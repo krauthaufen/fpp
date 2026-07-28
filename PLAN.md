@@ -1483,3 +1483,15 @@ multiply through nesting:
 Result: the whole compiler emits in ~2 min inside a 10 GB cap, 4.96 MB of
 wat, 104 remaining emission errors (a real list, no longer a wall). Suite
 402/402 with the lowering-lint gate green again.
+
+### Compile speed: the peephole was 97% of the time
+Whole-compiler compile was 110s; the phase split said parse 0.5s,
+resolve+infer 1.8s, lower 0.4s, link+emit 108s. The cost was one line in
+the peephole: every box/unbox cancellation rebuilt the ENTIRE module string
+(`before + arg + after`) and then restarted its search from position zero,
+so a multi-megabyte module with ~100k cancellations copied hundreds of
+gigabytes. It now marks deletions during one left-to-right scan and compacts
+once, looping only while a pass still finds something. 108s -> 1.2s, and the
+whole compiler compiles in 3.8s. (The output differs from the old pass by
+0.03%: both are fixpoints, reached in a different order — the pass is an
+optimization, and the oracle tests agree on behaviour.)
