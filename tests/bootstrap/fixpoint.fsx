@@ -160,6 +160,11 @@ let run (exe : string) (args : string) =
     let psi = System.Diagnostics.ProcessStartInfo(exe, args)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
+    // stage-1 writes BYTES. Decoding them as UTF-8 while stage-0's answer is
+    // a Latin-1 (byte-per-char) string compares two different domains, and a
+    // single em dash inside an emitted string literal read as a difference.
+    psi.StandardOutputEncoding <- System.Text.Encoding.Latin1
+    psi.StandardErrorEncoding <- System.Text.Encoding.Latin1
     use p = System.Diagnostics.Process.Start psi
     // BOTH pipes drained concurrently. Reading stdout to the end FIRST
     // deadlocks the moment the child fills the stderr buffer: the child
