@@ -149,6 +149,122 @@ let private freshenBinders (counter : Vec<int>) (e : Expr) : Expr =
             | other -> other)
         e
 
+/// A tuple that is BUILT and immediately TAKEN APART never has to exist.
+///
+/// The tuple stays a reference value — this changes no representation and no
+/// semantics, and `(a, b)` is still a heap object wherever anything can
+/// observe it. It simply is not allocated when the very next thing to happen
+/// is destructuring it. `match (a, b) with (x, y) -> body` becomes
+/// `let x = a in let y = b in body`, which evaluates a then b then the body,
+/// exactly as before.
+///
+/// Only irrefutable, unguarded, single-case matches on a tuple LITERAL
+/// qualify. That looks narrow, and on its own it is: the shape that matters
+/// appears when a tupled function is inlined, because `f (a, b)` becomes
+/// `let t = (a, b) in match t with (x, y) -> ...` and the chain shows up.
+/// This is the pass that makes inlining worth anything.
+let fuseTuples (decls : Decl list) : Decl list =
+    let rewrite (e : Expr) : Expr =
+        match e with
+        | EMatch (ETuple xs, [ (PTuple ps, None, body) ]) when
+              ps.Length = xs.Length
+              && ps |> List.forall (fun p -> match p with PVar _ -> true | _ -> false) ->
+            List.fold2
+                (fun acc p x ->
+                    match p with
+                    | PVar (v, sch) -> ELet (false, v, sch, x, acc)
+                    | _ -> acc)
+                body (List.rev ps) (List.rev xs)
+        | other -> other
+    decls
+    |> List.map (fun d ->
+        match d with
+        | DLet (rc, v, sch, body) -> DLet (rc, v, sch, mapExpr rewrite body)
+        | other -> other)
+
+/// `f (a, b)` must compile to a TWO-ARGUMENT CALL.
+///
+/// `let f (a, b) = ...` types as taking one tuple, and it still does — the
+/// signature is not a lie and the tuple is still a reference value. But the
+/// call site allocated a `$tup2`, wrote two fields, and the body immediately
+/// matched it apart to read them back: allocate, write, read, discard, per
+/// call. F# compiles these to multi-parameter functions and materializes the
+/// tuple only where the function is used as a VALUE.
+///
+/// A function is rewritten only when EVERY occurrence of it in the program
+/// is a direct call with a tuple literal of the right width. That keeps the
+/// change local and total: there is no use left that expects the old shape,
+/// so no wrapper has to reconstruct the tuple. A function used first-class
+/// keeps the tupled signature untouched.
+let uncurryTupleArgs (decls : Decl list) : Decl list =
+    // candidates: fun (t) -> match t with (x, y, ...) -> body
+    let cands = dictNew<string * int, (VarId * Scheme) list> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam ([ (pv, _) ], EMatch (EVar (sv, _), [ (PTuple ps, None, _) ]))) when
+              (sv.Path, sv.Offset) = (pv.Path, pv.Offset)
+              && ps.Length >= 2
+              && ps |> List.forall (fun p -> match p with PVar _ -> true | _ -> false) ->
+            let binders = ps |> List.map (fun p -> match p with PVar (bv, bs) -> bv, bs | _ -> pv, mono (TCon ("?", [])))
+            dictSet cands (v.Path, v.Offset) binders
+        | _ -> ()
+    if dictPairs cands |> List.isEmpty then decls
+    else
+    // a candidate survives only if every mention of it is a direct call
+    // carrying a tuple literal of exactly its width
+    let seen = dictNew<string * int, int> ()
+    let good = dictNew<string * int, int> ()
+    let bump (t : Dict<string * int, int>) (k : string * int) =
+        dictSet t k (match dictTryFind t k with Some n -> n + 1 | None -> 1)
+    for d in decls do
+        match d with
+        | DLet (_, _, _, body) ->
+            mapExpr
+                (fun x ->
+                    (match x with
+                     | EVar (v, _) | EVarI (v, _, _) ->
+                         if (dictTryFind cands (v.Path, v.Offset)).IsSome then bump seen (v.Path, v.Offset)
+                     | _ -> ())
+                    (match x with
+                     | EApp (EVar (v, _), [ ETuple xs ]) ->
+                         (match dictTryFind cands (v.Path, v.Offset) with
+                          | Some bs when bs.Length = xs.Length -> bump good (v.Path, v.Offset)
+                          | _ -> ())
+                     | _ -> ())
+                    x)
+                body |> ignore
+        | _ -> ()
+    let eligible (k : string * int) =
+        match dictTryFind cands k, dictTryFind seen k, dictTryFind good k with
+        | Some _, Some n, Some g -> n = g
+        | _ -> false
+    // the SIGNATURE uncurries with the parameters: (a * b) -> r becomes
+    // a -> b -> r, which is what the backend reads arity and kinds from
+    let uncurryScheme (n : int) (sch : Scheme) : Scheme =
+        match prune sch.Body with
+        | TFun (TTuple ts, r) when ts.Length = n ->
+            { sch with Body = List.foldBack (fun t acc -> TFun (t, acc)) ts r }
+        | _ -> sch
+    decls
+    |> List.map (fun d ->
+        let d2 =
+            match d with
+            | DLet (rc, v, sch, ELam ([ _ ], EMatch (_, [ (_, None, body) ]))) when eligible (v.Path, v.Offset) ->
+                let bs = (dictTryFind cands (v.Path, v.Offset)).Value
+                DLet (rc, v, uncurryScheme bs.Length sch, ELam (bs, body))
+            | other -> other
+        match d2 with
+        | DLet (rc, v, sch, body) ->
+            DLet (rc, v, sch,
+                  mapExpr
+                      (fun x ->
+                          match x with
+                          | EApp (EVar (f, fs), [ ETuple xs ]) when eligible (f.Path, f.Offset) ->
+                              EApp (EVar (f, fs), xs)
+                          | other -> other)
+                      body)
+        | other -> other)
+
 /// A body small enough that the call costs more than the code. Measured in
 /// IR nodes; a call is an allocation-free direct call in the best case and a
 /// closure application in the worst, so the threshold is not tiny.
@@ -230,4 +346,4 @@ let inlineCalls (decls : Decl list) : Decl list =
 /// call, a constant reaching a branch, a closure that stops being built —
 /// and none of those passes exist yet. It is kept, correct and gated, to be
 /// turned on with the unboxing work, which is when it starts to.
-let optimize (decls : Decl list) : Decl list = decls
+let optimize (decls : Decl list) : Decl list = decls |> uncurryTupleArgs |> fuseTuples

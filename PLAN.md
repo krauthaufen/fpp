@@ -2015,3 +2015,43 @@ Order of work, all measured rather than assumed:
 2. struct tuples in key position, for the 1083 remaining `$tup2` sites;
 3. inlining, which is worth switching on once 1 and 2 have removed the
    allocation it currently just duplicates.
+
+### Tupled arguments: pass written, and the convention question it raises
+`Core/Optimize.fs` gained `uncurryTupleArgs` and `fuseTuples`. Together:
+
+    let f (a, b) = a * b + 1
+    ;; before  func $f (param $a0 anyref) ... + 1 x struct.new $tup2 per call
+    ;; after   func $f (param $a0 i32) (param $a1 i32) (result i32), 0 allocations
+
+415 tests green, fixpoint byte-identical. It does what it says.
+
+**It does not help THIS compiler**: 43s -> 46s, and the `$tup2` count went
+1083 -> 1115. The compiler's own code is CURRIED, so it has almost no tupled
+functions to uncurry; its tuples are dictionary KEYS and `Vec` elements —
+tuple VALUES, which a calling convention cannot touch. Every measurement in
+this thread keeps landing on the same fact.
+
+**A soundness hole to close before this ships on.** The pass is a WHOLE
+PROGRAM analysis: it uncurries only when every occurrence of `f` in the unit
+is a direct call with a tuple literal. For a LIBRARY that is unsound — a
+consumer in another unit is an occurrence it never saw, and would call the
+tupled form of a two-parameter function.
+
+Two ways out:
+1. record the compiled arity per exported function, and have consumers read
+   it — metadata that can drift from the code, and makes the convention a
+   property of the build rather than of the type;
+2. make it a FIXED CONVENTION derived from the type: `(a * b) -> r` always
+   compiles to two parameters. Nothing to record, because any consumer
+   derives the same answer from the signature it already has.
+
+(2) is right, and it is justified by the representation argument: tuples
+compare and hash STRUCTURALLY, so tuple identity is not observable and
+ref-vs-struct is the compiler's free choice. It also removes the "all uses"
+restriction — a call carrying a real tuple VALUE deconstructs at the call
+site, and a first-class use goes through the curry wrapper, which already
+exists and already converts at that boundary. `[<Struct>]` types keep being
+structs; a bare `(a, b, c)` is representation-indifferent.
+
+Next: make it unconditional per (2), then measure again on a workload that
+actually uses tupled functions rather than on this compiler.
