@@ -87,6 +87,8 @@ let halfBits (v : float) : int =
 let byteLength (s : string) : int = s.Length
 /// the same text as BYTES (data segments carry bytes, not chars)
 let stringBytes (s : string) : byte[] = latin1.GetBytes s
+/// the reverse: bytes as the string they already are (Latin-1 both ways)
+let bytesString (bs : byte[]) : string = latin1.GetString bs
 
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count

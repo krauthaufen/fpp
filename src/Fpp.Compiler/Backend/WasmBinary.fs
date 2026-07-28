@@ -62,6 +62,19 @@ let emitSlice (b : Bytes) (start : int) (len : int) : unit =
         i <- i + 1
     b.Count <- b.Count + len
 
+/// Append TEXT bytes. The partial conversion runs the emitter in text-bytes
+/// mode first: converted cases append directly, unconverted ones build their
+/// string as before and append it here ONCE — so each converted ancestor
+/// level removes one whole-subtree copy, and the same case structure then
+/// carries the switch to opcode bytes.
+let emitStr (b : Bytes) (s : string) : unit =
+    grow b (b.Count + s.Length)
+    let mutable i = 0
+    while i < s.Length do
+        b.Buf.[b.Count + i] <- byte s.[i]
+        i <- i + 1
+    b.Count <- b.Count + s.Length
+
 let bytesToArray (b : Bytes) : byte[] =
     let a : byte[] = Array.zeroCreate b.Count
     let mutable i = 0

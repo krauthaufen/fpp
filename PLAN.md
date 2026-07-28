@@ -2367,3 +2367,32 @@ becomes (start, len) slices, the ~20 compute-before-branch cases restructure
 to decide-then-emit, indices assigned by the existing topName prepass, name
 section for backtraces. The text emitter stays as the debug path until the
 binary one is byte-stable under the fixpoint.
+
+### Binary emission, brick 2 begun: `compileInto` — partial conversion, contained
+The emitter now has the PARTIAL path the full conversion rides on:
+
+    compileInto  : Bytes -> ... -> Expr -> unit     converted cases APPEND
+    fallback     : any unconverted case builds its string as before and
+                   appends it ONCE
+    compileToText: a function body through the buffer — one string
+                   materialization per body instead of one per concat level
+
+Converted so far: the ESeq spine and the constant literals (bool/null/unit).
+Function bodies route through `compileToText`. Text is byte-identical to the
+string path (the representation gates grep the output, and the fixpoint
+closed with the scaffold in the corpus: 420 tests, byte-exact self-host).
+
+The remaining work is a CHECKLIST, not a design: move cases from
+`compileExprInner` into `compileInto` one at a time, deepest spines first,
+each move gated by suite + fixpoint —
+
+  1. ELet chains (the iterative let-spine)      — deepest, biggest win
+  2. EMatch (already builds via a local Builder — redirect into bb)
+  3. EIf / EWhile / EApp known-call / EPrim operators
+  4. leaves: EVar, ELit ints/floats/strings, EField
+  5. then lambda bodies and global inits route through compileToText too
+  6. once the traversal is fully append-shaped: switch emitStr per case to
+     opcode bytes (WasmBinary has LEB/patch/labels ready), assemble sections
+     binary, keep the text emitter as the debug path
+
+Seam gained `bytesString` (bytes -> string, Latin-1 identity both halves).

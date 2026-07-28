@@ -593,6 +593,17 @@ let halfBits (v : float) : int = float16Bits (float16 v)
 /// source is read as bytes, so there is nothing left to encode.
 let byteLength (s : string) : int = s.Length
 
+/// Bytes as the string they already are: a string IS a byte array here, so
+/// this is a copy with a type change (the Builder merges pairwise, so the
+/// concat is not quadratic).
+let bytesString (bs : byte[]) : string =
+    let b = sbNew ()
+    let mutable i = 0
+    while i < bs.Length do
+        sbAdd b (string (char (int bs.[i])))
+        i <- i + 1
+    sbText b
+
 /// The same text as BYTES.
 let stringBytes (s : string) : byte[] =
     let out = Array.zeroCreate s.Length

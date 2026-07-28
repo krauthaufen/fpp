@@ -916,6 +916,45 @@ let emit (decls : Decl list) : EmitResult =
             refMapSet memo e r0
             r0
 
+    /// The PARTIAL conversion to buffer emission (PLAN.md: binary, brick 2).
+    /// Converted cases append into the buffer and recurse through
+    /// `compileInto`; every other case falls back to the STRING path and
+    /// appends its result once — so each converted spine level removes one
+    /// whole-subtree copy, and the case structure is already the one the
+    /// opcode-byte switch needs. Text produced here is byte-identical to the
+    /// string path (the representation gates grep the output).
+    and compileInto (bb : WasmBinary.Bytes) (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                    (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : unit =
+        match e with
+        | ESeq xs ->
+            (match List.rev xs with
+             | [] -> WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
+             | last :: initRev ->
+                 WasmBinary.emitStr bb "(block (result anyref) "
+                 let mutable first = true
+                 for x in List.rev initRev do
+                     if not first then WasmBinary.emitStr bb " "
+                     first <- false
+                     WasmBinary.emitStr bb "(drop "
+                     compileInto bb locals extraLocals freeEnv false x
+                     WasmBinary.emitStr bb ")"
+                 WasmBinary.emitStr bb " "
+                 compileInto bb locals extraLocals freeEnv tail last
+                 WasmBinary.emitStr bb ")")
+        | ELit (LBool b) ->
+            WasmBinary.emitStr bb (if b then "(ref.i31 (i32.const 1))" else "(ref.i31 (i32.const 0))")
+        | ELit LNull -> WasmBinary.emitStr bb "(ref.null any)"
+        | ELit LUnit -> WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
+        | other -> WasmBinary.emitStr bb (compileExpr locals extraLocals freeEnv tail other)
+
+    /// A function body through the buffer: ONE string materialization at the
+    /// end instead of one per concatenation level.
+    and compileToText (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                      (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
+        let bb = WasmBinary.bytesNew ()
+        compileInto bb locals extraLocals freeEnv tail e
+        bytesString (WasmBinary.bytesToArray bb)
+
     and compileExprInner (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                         (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
         let recur = compileExpr locals extraLocals freeEnv false
@@ -3945,7 +3984,7 @@ TUPLE_CMP
                 // the call site, by whether the kinds agree. Gating it here
                 // on uniformity cost every int-returning function its tail
                 // calls the moment `int` became a scalar kind.
-                let bodyRaw = compileExpr locals extra (dictNew ()) true body
+                let bodyRaw = compileToText locals extra (dictNew ()) true body
                 let bodyW = if rk = "u" then bodyRaw else unboxK rk bodyRaw
                 let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
                 line ("  (func " + fname + " " + String.concat " " (vecToList paramDecls) + " (result " + wasmTyOf rk + ") " + localDecls + " " + bodyW + ")")
