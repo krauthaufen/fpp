@@ -55,7 +55,12 @@ let lint (decls : Decl list) : string list =
 
     let litType (l : Lit) : Type =
         match l with
-        | LInt _ -> tInt
+        // the suffix decides: `0L` typed as int against an int64 operand
+        // was a false mismatch on every `v = 0L` in the compiler
+        | LInt t ->
+            if t.EndsWith "L" then TCon ("int64", [])
+            elif t.EndsWith "u" || t.EndsWith "U" then TCon ("uint32", [])
+            else tInt
         | LFloat _ -> tFloat
         | LString _ -> tString
         | LChar _ -> tChar

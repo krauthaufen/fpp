@@ -2341,3 +2341,29 @@ under the fixpoint, which compares bytes either way.
 
 Order stands: this first, then allocation-free dict keys, then remeasure,
 then inlining.
+
+### Binary emission, brick 1: the byte writer is in and proven
+`Backend/WasmBinary.fs` — the MemoryStream-shaped buffer (`Bytes`), LEB128
+encoders pinned to the reference vectors, `beginPatch`/`endPatch` (the
+seek-back size write, made a fixed-width overwrite by padded LEBs), the
+label stack, and `emitSlice` (how a memoized subtree re-mentions without
+re-walking). Proven the way that counts: `BinaryTests.fs` hand-assembles a
+module through it — patched section+body sizes, a block and a `br` resolved
+through the label stack — and RUNS it under wasmtime (prints 42). The file
+is in the fsproj, so it is part of the self-compile corpus from day one:
+420 tests, fixpoint byte-identical with it in.
+
+Adding it flushed out two compiler bugs, both fixed:
+- **Lint typed every int literal as `int`**, so `v = 0L` against an int64
+  flagged a false mismatch (`-1L` escaped only because unary minus lowers to
+  a prim the check treats differently). Lint now reads the suffix.
+- An inference note (unfixed, minor): int and int64 comparisons mixed in one
+  boolean chain bleed operand types into each other under the self-lowering
+  gate. emitS64 sidesteps it with separate bindings; worth a look when next
+  in Infer.
+
+Next brick: the emitter conversion — compileExpr appends to `Bytes`, memo
+becomes (start, len) slices, the ~20 compute-before-branch cases restructure
+to decide-then-emit, indices assigned by the existing topName prepass, name
+section for backtraces. The text emitter stays as the debug path until the
+binary one is byte-stable under the fixpoint.
