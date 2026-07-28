@@ -1634,41 +1634,67 @@ The bootstrap now gets deep. In order, each wall cleared:
 4. wasmtime's default 1 MB wasm stack is not enough for a recursive-descent
    compiler; stage-1 runs with 64 MB.
 
-**Where it stops now — the first REAL bug of the bootstrap.** Stage-1 parses,
-resolves and infers the corpus successfully, then traps inside its own
-`EmitProgram -> monomorphizeWith -> mapExpr` with a cast failure. Everything
-before emission works when the compiler runs as wasm; something in the
-monomorphizer's expression walk does not. That is the next thing to chase,
-and it is a miscompilation of the compiler by itself rather than a harness
-problem.
+**THE FIXPOINT CLOSES.** Stage-1 — the compiler compiled to wasm by stage-0 —
+compiles the corpus and reproduces stage-0's answer BYTE FOR BYTE (156255
+bytes). Everything below is the record of what stood in the way, because each
+was a real compiler bug that the ordinary test suite could not see.
 
-### The self-miscompilation: where it is, and what is ruled out
-Stage-1 parses, resolves and infers correctly, then traps with a CAST FAILURE
-inside its own `EmitProgram -> monomorphizeWith -> mapExpr`. The frames are
+### Seven bugs between "stage-1 traps" and "stage-1 agrees"
 
-    mapExpr -> applyc -> mapExpr.w1 -> (trap)
+Six were miscompilations, one was a divergence between the two halves of the
+seam. Every one is now covered by a test in `EmitTests.fs`.
 
-repeating, so the failure is in the CURRIED-WRAPPER path: `let r = mapExpr f`
-is a partial application, and `.w1` casts its `$env` to `$cons`.
+1. **A late-resolved `.Length` bound to a like-named record field.** The
+   eager dot path answers `.Length` on an array itself; the PARKED path (used
+   when the receiver only takes shape through another parked dot, as in
+   `(s.Substring 1).Split ':'`) had no array case, so it fell through to a
+   by-name field lookup and found whatever record in scope declares a
+   `Length` — silently, since a field WAS found. `parts.Length` in the
+   monomorphizer read field 5 of `Definition`. This was the cast failure.
+2. **A store into a record field did not constrain its value.** Assignment
+   only unified through variable and array-index targets; a dot target was
+   excluded because it might be a setter. So `m.MapSlots <- Array.zeroCreate n`
+   (`MapSlots : int[]`) built a UNIFORM array — nothing pinned the element
+   type — and every later read cast it to `$parr_i` and trapped. Record
+   fields are as safe as variables: their type IS the declared field type.
+3. **`int s` was the identity.** The conversion table's catch-all is right
+   for the int-shaped sources and wrong for a string, so the string itself
+   reached an integer context. All of `int`/`int64`/`uint32`/`byte`/`sbyte`/
+   `float`/`float32`/`float16`/`char` now parse, over new `$atoi`/`$atol`/
+   `$atof` runtime helpers, and any remaining string source is REPORTED.
+4. **A conversion's kind was unknown to `kindOf`**, so a nested one
+   (`int64 s |> int`) took the identity path one level up and left an i64 box
+   where an i32 was expected.
+5. **`byte` and `sbyte` were missing from the operator suffix table**, so
+   `<@byte` went looking for an instance member and found the GENERATED
+   `compare` — whose body is that very comparison. Infinite recursion. Both
+   are int-shaped and now spell the integer operator. A wrapper can also no
+   longer resolve into itself, whatever the type.
+6. **Every string literal was unescaped as if it were `"..."`.** A triple-
+   quoted one kept two quotes at each end (and still processed backslashes);
+   a verbatim one kept its doubled quotes. The emitted runtime blob grew a
+   stray `""`.
+7. **Source is BYTES, and .NET was reading it as UTF-8 text.** Char offsets
+   and byte offsets diverge after the first non-ASCII character: fifteen em
+   dashes in the prelude's own COMMENTS moved an object expression's
+   generated name by twelve, and the two stages then disagreed about a type
+   name. The .NET seam now reads source Latin-1 (the identity byte->char
+   map), `utf8Length`/`utf8Bytes` became `byteLength`/`stringBytes` with no
+   re-encoding at all, and the emitted runtime blob is ASCII — a literal in
+   the compiler's own F# source is compiled by dotnet as UTF-16 and by F++ as
+   bytes, so it must not contain anything where those differ.
 
-Ruled out (do not re-chase):
-- **Wrapper arity conflicts.** `requestWrappers` keyed on the name alone, so a
-  second request at a different arity was silently dropped — a plausible way
-  to hand `.w(k)` an environment shaped for another chain length. It now
-  REPORTS the conflict, and no conflict fires in the self-compile, so this is
-  not the cause. The guard stays: a silent one would trap far from its cause.
-- **Wrapper self-consistency.** w0 builds `cons(a, env)` and w1 reads it back;
-  the only producer of a `.w1` closure is w0, so the shape should match.
-- **Capture-env slot numbering.** `innerFree` assigns index i to freeList[i],
-  and the flat array is built in the same order — no off-by-one between the
-  build and the read.
-- **Knot-tying** was a real bug and IS fixed (committed): `$patchself` and
-  `$patchmark` scanned only the flat array, so a recursive function reached
-  through a partial application kept its own marker. Fixing it did not change
-  this trap, so it was a separate latent bug.
+Two guards were added along the way and stay, because both failure modes are
+silent: `requestWrappers` reports an arity conflict instead of dropping it,
+and emission reports two definitions that mangle to one wasm symbol instead
+of producing a module the assembler rejects thousands of lines later.
 
-Next step, with the wat in hand rather than by reasoning: dump stage-1's
-emitted `mapExpr`, `mapExpr.w0/.w1` and every construction site of a `.w1`
-closure, and find which one hands `.w1` an env that is not a cons cell. The
-harness writes stage-1 to /tmp/fpp-fixpoint/stage1.wat, so the text is already
-there after a run.
+### Ruled out during the hunt (do not re-chase)
+- **Wrapper arity conflicts.** Now reported; none fires in the self-compile.
+- **Wrapper self-consistency.** w0 builds `cons(a, env)` and w1 reads it
+  back; the only producer of a `.w1` closure is w0.
+- **Capture-env slot numbering.** `innerFree` assigns index i to freeList[i]
+  and the flat array is built in the same order.
+- **Knot-tying** was a real bug and IS fixed: `$patchself`/`$patchmark`
+  scanned only the flat array, so a recursive function reached through a
+  partial application kept its own marker. It was not this trap.
