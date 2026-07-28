@@ -1141,7 +1141,16 @@ let emit (decls : Decl list) : EmitResult =
                  WasmBinary.emitStr bb ("(" + opv + " " + fname + " ")
                  emitArgs []
                  WasmBinary.emitStr bb ")")
-        | EApp (f, args) when (match f with EUnknown _ | EField _ -> false | _ -> true) ->
+        | EApp (f, args) when
+              (match f with
+               | EUnknown _ | EField _ -> false
+               // a FULL-ARITY named call that the converted case above
+               // rejected (externs, scalarized signatures) belongs to the
+               // string path's known-call case, not the applyc chain —
+               // chaining it would hand uniform anyrefs to a function whose
+               // parameters are scalar leaves
+               | EVar (v, _) -> (dictTryFind topArity (v.Path, v.Offset)) <> Some (List.length args)
+               | _ -> true) ->
             // generic application: the curried applyc chain, innermost first
             for _ in args do WasmBinary.emitStr bb "(call $applyc "
             compileInto bb locals extraLocals freeEnv false f
@@ -2921,7 +2930,7 @@ let emit (decls : Decl list) : EmitResult =
         // enclosing function's kind must not leak in here.
         let savedRet = currentRetKind
         currentRetKind <- "u"
-        let bodyW = compileExpr innerLocals innerExtra innerFree true body
+        let bodyW = compileToText innerLocals innerExtra innerFree true body
         currentRetKind <- savedRet
         let localDecls = vecToList innerExtra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
         vecAdd lifted
@@ -4339,7 +4348,7 @@ TUPLE_CMP
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string * string> ()
-            let w = compileExpr locals extra (dictNew ()) false rhs
+            let w = compileToText locals extra (dictNew ()) false rhs
             let localDecls = vecToList extra |> List.map (fun (l, ty) -> "(local " + l + " " + ty + ")") |> String.concat " "
             let initName = "$init" + string (vecLen initFuncs)
             line ("  (func " + initName + " " + localDecls + " (global.set " + gname + " " + w + "))")
