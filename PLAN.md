@@ -2311,3 +2311,33 @@ In leverage order, each gated byte-exactly by the fixpoint:
 3. Remeasure. Expected order-of-magnitude: wasm side 36s -> ~10-15s, and the
    6.6x native gap collapsing toward 2-3x. THEN revisit inlining, which
    becomes worth switching on once call bodies stop allocating.
+
+### REVISION: skip the rope — emit binary DIRECTLY
+The rope was an intermediate to keep text primary. Binary-as-product removes
+the intermediate: `compileExpr` APPENDS BYTES to one growing buffer
+(`{ mutable Buf : byte[]; mutable Count }` — plain seam-free compiler code,
+byte[] is packed i8 now). The three real problems and their answers:
+
+1. **Size prefixes** (function bodies, sections): reserve a PADDED 5-byte
+   LEB128 and patch in place when the scope closes — the spec allows
+   non-minimal LEBs. No scratch buffers, no copies.
+2. **Labels**: binary `br` takes a RELATIVE DEPTH. The writer keeps a label
+   stack pushed/popped with blocks; `br $x` = stack.len - 1 - index. The one
+   genuinely new piece of bookkeeping.
+3. **Indices**: assign function/type/global indices in a prepass over decls
+   (deterministic declaration order — `topName` is already this). Emit the
+   `name` section so backtraces stay readable.
+
+The memo caches (start, len) SLICES of the buffer instead of strings; a
+re-mentioned subtree is one memcpy from earlier in the same buffer. The ~20
+compute-before-branch cases restructure to decide-then-emit. The peephole
+becomes a last-opcode check in the writer instead of a megabyte text scan.
+
+Kills in one stroke: O(depth) string copying, the pinned intermediate live
+set (the buffer IS the output), the 3s wat parse — and produces the format
+browsers require. The TEXT emitter stays untouched as the debug path
+(`fpp build -o x.wat`) until the binary path has earned trust byte-for-byte
+under the fixpoint, which compares bytes either way.
+
+Order stands: this first, then allocation-free dict keys, then remeasure,
+then inlining.
