@@ -2451,3 +2451,39 @@ the sweep, same box) — and byte-identical throughout.
 
 Next: convert the remaining specialist cases if profiling justifies it, then
 the emitStr -> opcode flip on the (now append-shaped) case structure.
+
+### ONE EMITTER. The string path and the memo are deleted.
+The half-and-half structure is gone, and not by porting sixty cases by hand.
+`compileExprInner` — the single case list — gained SKELETON MODE: with a
+child-sink set, `recur` returns a placeholder token (\001 idx \002) and
+records the child instead of compiling it. `compileInto` runs every node
+through that mode and REPLAYS the skeleton: literal runs append to the
+buffer, children compile at their token positions. Every case therefore
+serves both worlds from one body, and the hand-converted duplicate cases
+(20KB of them) were deleted outright.
+
+What fell out of that:
+- **`compileExpr` is deleted.** Nothing needs the classic string recursion:
+  bodies, lambdas and inits go through `compileToText` (one buffer, one
+  string per body), and the three residual string consumers
+  (`compileCall`/`compileLeaves` internals, one pattern literal) get REAL
+  text from `compileToText` — the append path's own string view — so tokens
+  can never leak into out-of-band output like the lifted-lambda vector.
+- **The memo is deleted** (ceMemos, exprTag, kindTag, shortHash, the
+  per-function clears). Skeleton replay makes every walk produce its output
+  bytes, so re-walks are bounded by output size — the exponential the memo
+  guarded against cannot occur, and measurement agrees.
+- A shared node re-mentioned is recompiled per mention, exactly what the
+  text semantics always meant (its instructions appear per mention).
+
+Numbers, same box, consecutive runs: 42-44s self-host (46-47 with the
+duplicated cases, 57-72 before the sweep), output 6.34MB (the deleted
+duplicates no longer compile into the corpus), 420 tests, byte-identical
+fixpoint at every step.
+
+Emission is now append-shaped END TO END with one case list. The remaining
+string surface is by construction shallow: skeleton literal runs (the future
+opcode bytes), `compilePat`'s test builder, `compileLambda`'s closure
+construction, and the module assembly `line`s — each a direct append, none a
+concatenation tree. The `emitStr -> opcode` flip per case plus binary
+section assembly on the proven writer is what remains for .wasm output.
