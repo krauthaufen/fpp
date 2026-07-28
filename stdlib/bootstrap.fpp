@@ -333,3 +333,60 @@ let refMapSet (m : RefMap<'k, 'v>) (k : 'k) (v : 'v) : unit =
 let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
     let e = m.MapSlots.[refMapSlot m k]
     if e > 0 then Some m.MapVals.[e - 1] else None
+
+// ---- host services ---------------------------------------------------
+
+// The RAW imports, over strings only, so that any host can satisfy them:
+// a wasm preload module, a browser's preloaded in-memory map. `readTextRaw`
+// answers null for a missing file and `listDirRaw` a newline-separated
+// list; the wrapping into option and array happens HERE, not in the host.
+//
+// Synchronous and process-global, deliberately. A host that cannot do
+// synchronous IO preloads instead — making the compiler async would infect
+// every call path to accommodate it.
+
+extern let readTextRaw : string -> string
+extern let existsRaw : string -> int
+extern let listDirRaw : string -> string
+extern let canonicalizeRaw : string -> string
+
+/// The text of a file, or None when it is not there. NO exception crosses
+/// the boundary: the caller reports the miss, with the diagnostics it
+/// already owns.
+let hostReadText (path : string) : string option =
+    let s = readTextRaw path
+    if isNull s then None else Some s
+
+let hostExists (path : string) : bool = existsRaw path <> 0
+
+let hostListDir (path : string) : string[] =
+    let s = listDirRaw path
+    if isNull s || s = "" then Array.zeroCreate 0
+    else Array.filter (fun (e : string) -> e <> "") (s.Split '\n')
+
+let hostCanonicalize (path : string) : string =
+    let s = canonicalizeRaw path
+    if isNull s then path else s
+
+// ---- path arithmetic: PURE, so no host is involved -------------------
+
+let pathIsRooted (p : string) : bool = strLen p > 0 && charAt p 0 = '/'
+
+let pathDirectory (p : string) : string =
+    let i = p.LastIndexOf '/'
+    if i < 0 then "" elif i = 0 then "/" else substr p 0 i
+
+let pathFileName (p : string) : string =
+    let i = p.LastIndexOf '/'
+    if i < 0 then p else substr p (i + 1) (strLen p - i - 1)
+
+let pathFileNameWithoutExtension (p : string) : string =
+    let f = pathFileName p
+    let i = f.LastIndexOf '.'
+    if i <= 0 then f else substr f 0 i
+
+let pathCombine (dir : string) (rel : string) : string =
+    if dir = "" then rel
+    elif pathIsRooted rel then rel
+    elif charAt dir (strLen dir - 1) = '/' then dir + rel
+    else dir + "/" + rel

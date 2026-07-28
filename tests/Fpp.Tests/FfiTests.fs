@@ -96,3 +96,65 @@ let ffiTests =
             Expect.isNonEmpty (ws.Diagnostics "f.fpp") "string into int extern caught"
         }
     ]
+
+[<Tests>]
+let hostImportTests =
+    // The host surface: readText, exists, listDir, canonicalize, satisfied
+    // by a wasm module the way a real host satisfies them. The point of the
+    // test is the CONTRACT — strings only, null for "not there", newline
+    // separated for a list — so any host can implement it.
+    testList "host imports" [
+        test "the four host services are satisfied by a preloaded module" {
+            let ws = Workspace()
+            ws.SetFileText "seam.fpp" (System.IO.File.ReadAllText (
+                System.IO.Path.GetFullPath (__SOURCE_DIRECTORY__ + "/../../stdlib/bootstrap.fpp")))
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module P"
+                "open Fpp.Prelude"
+                "let r1 ="
+                "    match hostReadText \"/there\" with"
+                "    | Some t -> print (\"read \" + t)"
+                "    | None -> print \"MISSING\""
+                "let r2 ="
+                "    match hostReadText \"/gone\" with"
+                "    | Some t -> print (\"BAD \" + t)"
+                "    | None -> print \"absent\""
+                "let r3 = print (string (hostExists \"/there\") + \" \" + string (hostExists \"/gone\"))"
+                "let r4 = print (String.concat \"|\" (Array.toList (hostListDir \"/d\")))"
+                "let r5 = print (string (Array.length (hostListDir \"/empty\")))"
+                "let r6 = print (hostCanonicalize \"/a/./b\")"
+                "" ])
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "the host surface emits"
+            // every import is declared against module "env"
+            Expect.stringContains wat "(import \"env\" \"readTextRaw\"" "readText is an import"
+            Expect.stringContains wat "(import \"env\" \"existsRaw\"" "exists is an import"
+            Expect.stringContains wat "(import \"env\" \"listDirRaw\"" "listDir is an import"
+            Expect.stringContains wat "(import \"env\" \"canonicalizeRaw\"" "canonicalize is an import"
+        }
+        test "a missing file is None, not an exception" {
+            // Runnable half of the contract: the .NET side of the seam, which
+            // the dotnet-hosted compiler uses today and which the F++ side
+            // must match. The wasm side declares the same shape (above) and
+            // wraps null into None in the seam, not in the host.
+            let tmp = System.IO.Path.GetTempFileName()
+            System.IO.File.WriteAllText(tmp, "contents")
+            Expect.equal (Prelude.hostReadText tmp) (Some "contents") "an existing file reads"
+            Expect.equal (Prelude.hostReadText (tmp + ".nope")) None "a missing file is None"
+            Expect.isTrue (Prelude.hostExists tmp) "exists sees the file"
+            Expect.isFalse (Prelude.hostExists (tmp + ".nope")) "and not a missing one"
+            let dir = System.IO.Path.GetDirectoryName tmp
+            Expect.isTrue (Prelude.hostExists dir) "exists covers directories too"
+            Expect.contains (Prelude.hostListDir dir) tmp "listDir finds the file"
+            Expect.equal (Prelude.hostListDir (tmp + "-no-such-dir")) [||] "a missing directory lists empty"
+            System.IO.File.Delete tmp
+        }
+        test "path arithmetic needs no host" {
+            Expect.equal (Prelude.pathDirectory "/a/b/c.fpp") "/a/b" "directory"
+            Expect.equal (Prelude.pathFileName "/a/b/c.fpp") "c.fpp" "file name"
+            Expect.equal (Prelude.pathFileNameWithoutExtension "/a/b/c.fpp") "c" "stem"
+            Expect.equal (Prelude.pathCombine "/a/b" "c.fpp") "/a/b/c.fpp" "combine"
+            Expect.equal (Prelude.pathCombine "/a/b" "/x.fpp") "/x.fpp" "an absolute rel wins"
+            Expect.equal (Prelude.pathCombine "" "c.fpp") "c.fpp" "empty dir"
+        }
+    ]

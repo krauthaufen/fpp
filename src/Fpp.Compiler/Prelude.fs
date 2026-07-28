@@ -104,3 +104,53 @@ let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
     match m.TryGetValue k with
     | true, v -> Some v
     | _ -> None
+
+// ---- host services ----------------------------------------------------
+//
+// The four things the compiler needs from a host: read a file, test a path,
+// list a directory, canonicalize a path. Nothing else — no writing, no
+// process, no network.
+//
+// NO EXCEPTION crosses this boundary. A missing file is `None` and the
+// CALLER reports it, which keeps the error surface in the compiler where
+// diagnostics already live. The F++ half declares the raw imports over
+// STRINGS only (null for "no result", newline-separated for a list) so any
+// host can satisfy them — a wasm preload module, a browser's in-memory map —
+// and wraps them into these signatures.
+
+let hostReadText (path : string) : string option =
+    if System.IO.File.Exists path then Some (System.IO.File.ReadAllText path) else None
+
+let hostExists (path : string) : bool =
+    System.IO.File.Exists path || System.IO.Directory.Exists path
+
+let hostListDir (path : string) : string[] =
+    if System.IO.Directory.Exists path then System.IO.Directory.GetFiles path |> Array.sort
+    else [||]
+
+let hostCanonicalize (path : string) : string =
+    if path = "" then "" else System.IO.Path.GetFullPath path
+
+// Path arithmetic is PURE — no host required, so it does not belong in the
+// import surface.
+
+let pathIsRooted (p : string) : bool = strLen p > 0 && charAt p 0 = '/'
+
+let pathDirectory (p : string) : string =
+    let i = p.LastIndexOf '/'
+    if i < 0 then "" elif i = 0 then "/" else substr p 0 i
+
+let pathFileName (p : string) : string =
+    let i = p.LastIndexOf '/'
+    if i < 0 then p else substr p (i + 1) (strLen p - i - 1)
+
+let pathFileNameWithoutExtension (p : string) : string =
+    let f = pathFileName p
+    let i = f.LastIndexOf '.'
+    if i <= 0 then f else substr f 0 i
+
+let pathCombine (dir : string) (rel : string) : string =
+    if dir = "" then rel
+    elif pathIsRooted rel then rel
+    elif charAt dir (strLen dir - 1) = '/' then dir + rel
+    else dir + "/" + rel

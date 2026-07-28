@@ -1133,7 +1133,51 @@ memoized queries, dependency tracking, invalidation and early cutoff through
 the emitted engine. It is not wired into the suite yet because the file does
 not emit.
 
-### Next: the host-import surface for `Workspace` and `Project` (DESIGN ONLY)
+### The host-import surface (APPROVED, then implemented)
+Decided: **synchronous, process-global, result-style.**
+
+- Four externs, module-level wasm imports: `readText`, `exists`, `listDir`,
+  `canonicalize`. That is everything `Workspace` and `Project` actually
+  need — no writing, no process, no network — and it should stay that small.
+- `readText` returns `option<string>`. **No exceptions cross the FFI
+  boundary**: a missing file is `None` and the CALLER reports it, which
+  keeps the error surface in the compiler where diagnostics already live.
+- Process-global. wasm imports are module-scoped anyway, and `Workspace`
+  state stays inside the module regardless.
+- **Not async.** A browser host satisfies the imports from a preloaded
+  in-memory map; making the compiler async would infect every call path to
+  accommodate a host that can preload.
+
+The mechanism is the existing one: `extern` lowers to an import from module
+`env`, which `FfiTests` already covers end to end with wasmtime supplying
+the implementation as a preload module.
+
+**Implemented.** The raw imports are over STRINGS ONLY — `readTextRaw`
+answers null for a missing file, `listDirRaw` a newline-separated list — so
+that any host can satisfy them without building F++ data structures. The
+wrapping into `option` and `string[]` happens in the SEAM, on both sides, so
+the compiler-facing API is `hostReadText : string -> string option`,
+`hostExists`, `hostListDir : string -> string[]`, `hostCanonicalize`.
+
+Path arithmetic — combine, directory, file name, stem — is PURE and lives in
+the seam as ordinary functions. It needs no host and does not belong in the
+import surface, which is how the surface stays at four.
+
+`Project.fs` and `Workspace.fs` are rewritten onto it and both emit;
+`Project.read` on a missing file now returns a LoadResult carrying
+"cannot read project file", which is the error surface staying in the
+compiler exactly as decided. Pinned by `FfiTests`: the wasm side declares
+all four imports against module `env`, and the .NET side — the runnable
+half — is asserted against real files, including that a missing one is
+`None` and a missing directory lists empty.
+
+Two more things fell out on the way: `List.truncate` (the prelude only had
+the `Seq` one, and `errs |> List.truncate 3` is a for-in source), and
+`lazy`/`.Force ()` in `BuiltinCache`, replaced by an explicit memo cell —
+F#'s `lazy` adds thread safety a single-threaded cache does not need, and it
+is not in the subset.
+
+### Superseded design notes (the questions, and how they were answered)
 The last two files need services no wasm module has: reading a file, listing
 a directory, resolving a project path. This is deliberately NOT implemented
 yet — the surface is a contract between the compiler and every host that

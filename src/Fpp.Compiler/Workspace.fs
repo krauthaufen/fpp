@@ -198,7 +198,17 @@ module private BuiltinCache =
               Ifaces = ifaces; Bases = bases; Impls = impls
               StructTypes = structTypes; Ctors = ctors; Classes = classes
               Members = members }
-    let value = lazy (compute ())
+    // Memoized by hand rather than with `lazy`: one cell, computed on first
+    // use. F#'s `lazy` adds thread safety this single-threaded cache does
+    // not need, and it is not part of the subset the compiler compiles.
+    let mutable cell : Cached option = None
+    let force () : Cached =
+        match cell with
+        | Some c -> c
+        | None ->
+            let c = compute ()
+            cell <- Some c
+            c
 
 type Workspace() =
     let db = Db()
@@ -259,11 +269,13 @@ type Workspace() =
         let r = Project.read projectPath
         let open_ = this.ProjectFiles |> Set.ofList
         for l in r.Loaded.Libs do
-            if System.IO.File.Exists l then this.AddLibrary l (System.IO.File.ReadAllText l)
+            match hostReadText l with
+            | Some text -> this.AddLibrary l text
+            | None -> ()
         db.SetInput "project" "" (box r.Loaded.Sources)
         for s in r.Loaded.Sources do
             if not (Set.contains s open_) then
-                let text = if System.IO.File.Exists s then System.IO.File.ReadAllText s else ""
+                let text = match hostReadText s with Some t -> t | None -> ""
                 db.SetInput "text" s (box text)
         r.Loaded, r.Errors
 
@@ -285,7 +297,7 @@ type Workspace() =
     member this.ProjectCheck () : ProjectResults =
         db.MemoT "projectCheck" "" (fun () ->
             // seed from the prelude cache: COPIES, since the project mutates
-            let cached = BuiltinCache.value.Force ()
+            let cached = BuiltinCache.force ()
             let imports = BuiltinCache.copyDict cached.Imports
             let schemes = BuiltinCache.copyDict cached.Schemes
             let aliases = BuiltinCache.copyDict cached.Aliases
@@ -398,7 +410,7 @@ type Workspace() =
             for d in this.Diagnostics path do
                 vecAdd errs (path + ":" + string (d.Line + 1) + ":" + string (d.Col + 1) + ": " + d.Message)
         // builtin decls (Option etc.) come first — from the process cache
-        let cached = BuiltinCache.value.Force ()
+        let cached = BuiltinCache.force ()
         let bp = cached.Parse
         let bb = cached.Bind
         // the prelude is source like any other file: its own bodies call the
@@ -563,7 +575,7 @@ type Workspace() =
                 vecAdd out (label, Analysis.Resolve.kindLabel d.Kind, typeOf d, full)
         // the prelude first, so the numeric classes and their members are
         // offered in a project that has not opened anything
-        let bb = (BuiltinCache.value.Force ()).Bind
+        let bb = (BuiltinCache.force ()).Bind
         for full, d in bb.Exports do offer d.Name full d
         for _, (b : Analysis.Resolve.BindResult, _) in dictPairs r.Files do
             for full, d in b.Exports do offer d.Name full d

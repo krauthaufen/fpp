@@ -38,18 +38,18 @@ let extension = ".fppproj"
 
 let private combine (dir : string) (rel : string) : string =
     if rel = "" then dir
-    else System.IO.Path.GetFullPath (System.IO.Path.Combine (dir, rel))
+    else hostCanonicalize (pathCombine dir rel)
 
 /// Parse a project file's TEXT. Kept separate from reading it so the LSP can
 /// parse an unsaved buffer.
 let parse (projectPath : string) (text : string) : LoadResult =
     let dir =
-        let d = System.IO.Path.GetDirectoryName projectPath
-        if System.String.IsNullOrEmpty d then "." else d
+        let d = pathDirectory projectPath
+        if d = "" then "." else d
     let errors = vecNew<int * string> ()
     let libs = vecNew<string> ()
     let sources = vecNew<string> ()
-    let mutable name = System.IO.Path.GetFileNameWithoutExtension projectPath
+    let mutable name = pathFileNameWithoutExtension projectPath
     let mutable out = ""
     let lines = text.Replace("\r\n", "\n").Split '\n'
     for i in 0 .. lines.Length - 1 do
@@ -68,25 +68,34 @@ let parse (projectPath : string) (text : string) : LoadResult =
                 vecAdd errors (i + 1, directive + " needs an argument")
     if vecLen sources = 0 then vecAdd errors (1, "project names no sources")
     { Loaded =
-        { Path = System.IO.Path.GetFullPath projectPath
+        { Path = hostCanonicalize projectPath
           Name = name
           Out = (if out = "" then name + ".wat" else out)
           Libs = vecToList libs
           Sources = vecToList sources }
       Errors = vecToList errors }
 
+/// A project that is not there is not an exception: the caller reports the
+/// miss with the diagnostics it already owns.
 let read (projectPath : string) : LoadResult =
-    parse projectPath (System.IO.File.ReadAllText projectPath)
+    match hostReadText projectPath with
+    | Some text -> parse projectPath text
+    | None ->
+        { Loaded = { Path = projectPath; Name = ""; Out = ""; Libs = []; Sources = [] }
+          Errors = [ 0, "cannot read project file " + projectPath ] }
 
 /// The project a source file belongs to: the nearest `*.fppproj` at or above
 /// its directory. An editor opens a FILE, not a project, so this is how a
 /// buffer finds its compile order.
 let rec findFor (startDir : string) : string option =
-    if System.String.IsNullOrEmpty startDir || not (System.IO.Directory.Exists startDir) then None
+    if startDir = "" || not (hostExists startDir) then None
     else
-        match System.IO.Directory.GetFiles (startDir, "*" + extension) |> Array.sort |> Array.tryHead with
+        match hostListDir startDir
+              |> Array.filter (fun f -> f.EndsWith extension)
+              |> Array.sort
+              |> Array.tryHead with
         | Some p -> Some p
         | None ->
-            let parent = System.IO.Path.GetDirectoryName startDir
-            if System.String.IsNullOrEmpty parent || parent = startDir then None
+            let parent = pathDirectory startDir
+            if parent = "" || parent = startDir then None
             else findFor parent

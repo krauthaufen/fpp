@@ -1281,6 +1281,16 @@ module List =
                 acc <- x :: acc
         List.rev acc
     let distinct (xs : 'a list) : 'a list = distinctBy (fun x -> x) xs
+    /// At most `n` elements — fewer is not an error, as in F#.
+    let truncate (n : int) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable k = 0
+        let mutable rest = xs
+        while k < n && not (List.isEmpty rest) do
+            acc <- List.head rest :: acc
+            rest <- List.tail rest
+            k <- k + 1
+        List.rev acc
     let zip (a : 'a list) (b : 'b list) = map2 (fun x y -> (x, y)) a b
     let unzip (xs : list<'a * 'b>) =
         let mutable la = []
