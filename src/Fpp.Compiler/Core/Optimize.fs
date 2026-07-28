@@ -226,14 +226,18 @@ let uncurryTupleArgs (decls : Decl list) : Decl list =
                          if (dictTryFind cands (v.Path, v.Offset)).IsSome then bump seen (v.Path, v.Offset)
                      | _ -> ())
                     (match x with
-                     | EApp (EVar (v, _), [ ETuple xs ]) ->
-                         (match dictTryFind cands (v.Path, v.Offset) with
-                          | Some bs when bs.Length = xs.Length -> bump good (v.Path, v.Offset)
-                          | _ -> ())
+                     // a direct call counts however the argument is spelled: a tuple
+                     // LITERAL passes its elements, a tuple VALUE is destructured at
+                     // the call site. What disqualifies a function is a use that is
+                     // not a call at all.
+                     | EApp (EVar (v, _), [ _ ]) ->
+                         if (dictTryFind cands (v.Path, v.Offset)).IsSome then bump good (v.Path, v.Offset)
                      | _ -> ())
                     x)
                 body |> ignore
         | _ -> ()
+    let ucount = vecNew<int> ()
+    vecAdd ucount 0
     let eligible (k : string * int) =
         match dictTryFind cands k, dictTryFind seen k, dictTryFind good k with
         | Some _, Some n, Some g -> n = g
@@ -259,8 +263,23 @@ let uncurryTupleArgs (decls : Decl list) : Decl list =
                   mapExpr
                       (fun x ->
                           match x with
-                          | EApp (EVar (f, fs), [ ETuple xs ]) when eligible (f.Path, f.Offset) ->
-                              EApp (EVar (f, fs), xs)
+                          | EApp (EVar (f, fs), [ arg ]) when eligible (f.Path, f.Offset) ->
+                              let bs = (dictTryFind cands (f.Path, f.Offset)).Value
+                              (match arg with
+                               | ETuple xs when xs.Length = bs.Length -> EApp (EVar (f, fs), xs)
+                               | other ->
+                                   // a real tuple VALUE: take it apart here, then make the
+                                   // multi-argument call. The tuple still exists — it is the
+                                   // caller's value — it just is not rebuilt to be pulled apart.
+                                   let fresh =
+                                       bs |> List.map (fun (bv, bsch) ->
+                                           let n = vecGet ucount 0
+                                           vecSet ucount 0 (n + 1)
+                                           ({ Path = "$untuple"; Offset = n; Name = bv.Name } : VarId), bsch)
+                                   EMatch (other,
+                                           [ (PTuple (fresh |> List.map (fun (nv, ns) -> PVar (nv, ns))),
+                                              None,
+                                              EApp (EVar (f, fs), fresh |> List.map (fun (nv, ns) -> EVar (nv, ns)))) ]))
                           | other -> other)
                       body)
         | other -> other)
