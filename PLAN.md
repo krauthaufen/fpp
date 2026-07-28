@@ -1795,3 +1795,37 @@ After both, GC is 12% and nothing dominates. What is left, in order:
   `f64`/`f32`/`i64` through `sigKinds`/`kindOf` — extending that to `i32` is
   the natural next step and is a real project, not a peephole.
 - `addv` 3.3%, `equal` 3.0%, `compareOrdinalAt` 2.8%, then a long tail.
+
+### Where the speed work stopped, and why
+After the memo hash and the GC heap the profile went FLAT — no single
+algorithmic fault remains. Measured at 43s total (34s of it the actual
+self-compile in wasm, ~5s stage-0 emitting natively, ~3s wasmtime parsing
+6.2MB of wat, ~2s dotnet fsi):
+
+    strcat                      10.0%
+    wasmtime GC (three frames)  12.6%
+    toi + ofi                    9.7%
+    addv, equal, compareOrdinalAt 10.1%
+    ... then a long tail, nothing above 1.8%
+
+Two more things were tried and measured rather than assumed:
+
+- **A 4GB GC heap instead of 1GB**: 36s -> 34s. Collection frequency was
+  already handled; what is left is scanning live data.
+- **`$addv` fast-paths two i31 integers.** Untyped `+` was testing both
+  operands for STRINGS before adding, at ~700 emitted sites, when `+t`
+  already carries the statically-known string case. Strictly better and
+  kept — but worth under a second, which is the point: at this stage
+  individual fixes are worth ~1%, not ~30%.
+
+**43s is close to the floor for this backend.** The remaining costs are
+properties of the emitted code, not bugs in it: text built by concatenation,
+and every integer boxed through i31. Getting materially below this means
+- **an instruction rope** (compileExpr returns structure, not `string`):
+  ~200 emit sites, worth maybe 15% of the wasm run;
+- **binary emission** on top of that rope: removes text entirely and the 3s
+  wat parse — and is the thing browsers need, so it pays twice;
+- **unboxed i32** through the existing `sigKinds`/`kindOf` machinery.
+
+All three together plausibly land near 20-25s. Six seconds would mean beating
+the native .NET build while running inside wasm, and is not reachable.

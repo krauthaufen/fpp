@@ -3371,6 +3371,13 @@ TUPLE_CMP
     (if (i32.gt_u (local.get $la) (local.get $lb)) (then (return (i32.const 1))))
     (i32.const 0))
   (func $addv (param $a anyref) (param $b anyref) (result anyref)
+    ;; Untyped `+`: `+t` carries the statically-known string case, so what
+    ;; reaches here is overwhelmingly INTEGER addition. Testing for strings
+    ;; first made every one of those pay two GC header loads before adding,
+    ;; and this is emitted at ~700 sites in the compiler itself.
+    (if (i32.and (ref.test (ref i31) (local.get $a)) (ref.test (ref i31) (local.get $b)))
+      (then (return (ref.i31 (i32.add (i31.get_s (ref.cast (ref i31) (local.get $a)))
+                                      (i31.get_s (ref.cast (ref i31) (local.get $b))))))))
     (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
       (then (return (call $strcat (ref.cast (ref $str) (local.get $a)) (ref.cast (ref $str) (local.get $b))))))
     (call $ofi (i32.add (call $toi (local.get $a)) (call $toi (local.get $b)))))
