@@ -664,7 +664,47 @@ let emit (decls : Decl list) : EmitResult =
 
     /// Compile one function body. `locals` maps (path,offset) to wasm local
     /// names; `extraLocals` collects locals to declare.
+    // Emission MEMO, per node identity and tail flag. Twenty cases in the
+    // emitter mention `recur x` more than once (an operand read in several
+    // branches of one instruction sequence), and each mention re-walked the
+    // whole subtree — the cost multiplied through nesting, so emitting the
+    // compiler's own emitter took ~110M walks and tens of GB. The
+    // environment objects are the same for the whole function, so the same
+    // node at the same tail position has the same text by construction.
+    // keyed by REFERENCE identity (the duplicate mentions pass the very same
+    // node object) — structural hashing would re-walk the tree per lookup
+    // and reintroduce the cost it exists to remove. Cleared per function,
+    // because `locals` is per-function state.
+    // keyed by the LOCALS dictionary as well as the node: a lambda body is
+    // emitted against a fresh locals map, and text produced in one
+    // environment must never be reused in another
+    let ceMemos =
+        System.Collections.Generic.Dictionary<Dict<string * int, string>,
+                                              System.Collections.Generic.Dictionary<Expr, string>
+                                              * System.Collections.Generic.Dictionary<Expr, string>>
+            (HashIdentity.Reference)
     let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                        (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
+        let plain, tailed =
+            match ceMemos.TryGetValue locals with
+            | true, pair -> pair
+            | _ ->
+                let pair =
+                    System.Collections.Generic.Dictionary<Expr, string> (HashIdentity.Reference),
+                    System.Collections.Generic.Dictionary<Expr, string> (HashIdentity.Reference)
+                ceMemos.[locals] <- pair
+                pair
+        let memo = if tail then tailed else plain
+        match memo.TryGetValue e with
+        | true, cached -> cached
+        | _ ->
+            let r0 = compileExprInner locals extraLocals freeEnv tail e
+            // `memo.[e] <- r0` lowers as an ARRAY index-set (F++ models no
+            // dict-index form), so the seam call is what self-compiles
+            memo.Add (e, r0)
+            r0
+
+    and compileExprInner (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                         (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
         let recur = compileExpr locals extraLocals freeEnv false
         let recurT = compileExpr locals extraLocals freeEnv tail
@@ -737,11 +777,8 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  match dictTryFind freeEnv key with
                  | Some idx ->
-                     // walk the env cons-chain
-                     let mutable w = "(local.get $env)"
-                     for _ in 1 .. idx do
-                         w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
-                     let slot = "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                     // FLAT env: one indexed read (see the build site)
+                     let slot = "(array.get $arr (ref.cast (ref $arr) (local.get $env)) (i32.const " + string idx + "))"
                      // the env slot holds the CELL, shared with the frame
                      // that owns it — that sharing is the whole point
                      if (dictTryFind cellVars key).IsSome then cellRead slot else slot
@@ -1041,21 +1078,42 @@ let emit (decls : Decl list) : EmitResult =
             "(block (result anyref) (local.set " + l + " (global.get $selfmark)) "
             + "(local.set " + l + " " + cloW + ") "
             + "(call $patchself (local.get " + l + ")) " + recurT body + ")"
-        | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
-            // captured mutable: the frame holds the cell, not the value
-            let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
-            let r = recur rhs
-            dictSet locals (v.Path, v.Offset) l
-            "(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) "
-            + recurT body + ")"
-        | ELet (_, v, _, rhs, body) ->
-            let k = kindOf rhs
-            let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
-            let r = recur rhs
-            dictSet locals (v.Path, v.Offset) l
-            dictSet localKinds (v.Path, v.Offset) k
-            let stored = if k = "u" then r else unboxK k r
-            "(block (result anyref) (local.set " + l + " " + stored + ") " + recurT body + ")"
+        | ELet (_, _, _, _, _) ->
+            // ITERATIVE over the let-SPINE. Recursing per link concatenated
+            // the whole remaining body at every level — O(depth * size) in
+            // emitted text, which is tens of GB on a several-thousand-let
+            // body like the emitter's own. Same bytes out, built once.
+            let spine = System.Text.StringBuilder ()
+            let mutable closes = 0
+            let mutable cur = e
+            let mutable walking = true
+            while walking do
+                match cur with
+                // rec-lambda and letrec-group forms have their own cases
+                // above; the spine stops and recurT re-dispatches to them
+                | ELet (true, _, _, ELam _, _) -> walking <- false
+                | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
+                    // captured mutable: the frame holds the cell, not the value
+                    let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+                    let r = recur rhs
+                    dictSet locals (v.Path, v.Offset) l
+                    spine.Append("(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) ") |> ignore
+                    closes <- closes + 1
+                    cur <- body
+                | ELet (_, v, _, rhs, body) ->
+                    let k = kindOf rhs
+                    let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
+                    let r = recur rhs
+                    dictSet locals (v.Path, v.Offset) l
+                    dictSet localKinds (v.Path, v.Offset) k
+                    let stored = if k = "u" then r else unboxK k r
+                    spine.Append("(block (result anyref) (local.set " + l + " " + stored + ") ") |> ignore
+                    closes <- closes + 1
+                    cur <- body
+                | _ -> walking <- false
+            spine.Append (recurT cur) |> ignore
+            spine.Append (String.replicate closes ")") |> ignore
+            spine.ToString ()
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
@@ -1075,8 +1133,14 @@ let emit (decls : Decl list) : EmitResult =
              | "<<<" -> "(call $ofl (i64.shl " + ia + " " + shift + "))"
              | _ -> "(call $ofl (i64.shr_s " + ia + " " + shift + "))")
         | EPrim (op, [ a; b ]) when op.EndsWith "w" && op.Length > 1 ->
-            let ia = fun () -> unwrapI32 (recur a)
-            let ib = fun () -> unwrapI32 (recur b)
+            // computed ONCE: these are used up to 14 times per case, and a
+            // thunk re-ran the whole recursive walk on each use — the cost
+            // multiplied through nesting (13^depth), which is what made
+            // emitting the compiler's own emitter take 110M walks
+            let iaW = unwrapI32 (recur a)
+            let ibW = unwrapI32 (recur b)
+            let ia = fun () -> iaW
+            let ib = fun () -> ibW
             (match op.Substring (0, op.Length - 1) with
              | "+" -> intWat ("(i32.add " + ia () + " " + ib () + ")")
              | "-" -> intWat ("(i32.sub " + ia () + " " + ib () + ")")
@@ -1197,8 +1261,14 @@ let emit (decls : Decl list) : EmitResult =
         | EPrim ("u-l", [ a ]) -> "(call $ofl (i64.sub (i64.const 0) (call $tol " + recur a + ")))"
         | EPrim ("u~~~", [ a ]) -> intWat ("(i32.xor " + unwrapI32 (recur a) + " (i32.const -1))")
         | EPrim (op, [ a; b ]) ->
-            let ia = fun () -> unwrapI32 (recur a)
-            let ib = fun () -> unwrapI32 (recur b)
+            // computed ONCE: these are used up to 14 times per case, and a
+            // thunk re-ran the whole recursive walk on each use — the cost
+            // multiplied through nesting (13^depth), which is what made
+            // emitting the compiler's own emitter take 110M walks
+            let iaW = unwrapI32 (recur a)
+            let ibW = unwrapI32 (recur b)
+            let ia = fun () -> iaW
+            let ib = fun () -> ibW
             (match op with
              | "+" -> "(call $addv " + recur a + " " + recur b + ")"
              | "-" -> intWat ("(i32.sub " + ia () + " " + ib () + ")")
@@ -1575,10 +1645,7 @@ let emit (decls : Decl list) : EmitResult =
                 | None ->
                     match dictTryFind freeEnv (v.Path, v.Offset) with
                     | Some idx ->
-                        let mutable w = "(local.get $env)"
-                        for _ in 1 .. idx do
-                            w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
-                        "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                        "(array.get $arr (ref.cast (ref $arr) (local.get $env)) (i32.const " + string idx + "))"
                     | None ->
                         emitError ("assignment to unknown " + v.Name)
                         "(ref.i31 (i32.const 0))"
@@ -1800,8 +1867,6 @@ let emit (decls : Decl list) : EmitResult =
                 vecAdd errors "Array.create needs a statically known element type"
                 "(ref.i31 (i32.const 0))"
         | ETry (body, cases) ->
-            let cases =
-                cases |> List.collect (fun (p, g, b) -> expandOr p |> List.map (fun q -> q, g, b))
             let res = newLocal "tres"
             let exn = newLocal "texn"
             let w = System.Text.StringBuilder()
@@ -1809,11 +1874,33 @@ let emit (decls : Decl list) : EmitResult =
             w.Append("(try_table (catch $fppexn $tcatch" + res + ") (local.set " + res + " " + recur body + ")) ") |> ignore
             w.Append("(br $tdone" + res + "))) ") |> ignore
             cases |> List.iteri (fun i (pat, guard, cbody) ->
+                // same shared-body scheme as EMatch (see there)
                 let lbl = "$tcase" + res + "_" + string i
+                let alts = expandOr pat
                 w.Append("(block " + lbl + " ") |> ignore
-                let tests = System.Text.StringBuilder()
-                compilePat locals extraLocals freeEnv tests lbl ("(local.get " + exn + ")") pat
-                w.Append(tests.ToString()) |> ignore
+                (match alts with
+                 | [ single ] ->
+                     let tests = System.Text.StringBuilder()
+                     compilePat locals extraLocals freeEnv tests lbl ("(local.get " + exn + ")") single
+                     w.Append(tests.ToString()) |> ignore
+                 | many ->
+                     let hm = "$thave" + res + "_" + string i
+                     // one slot map shared by all alternatives: they bind the
+                     // same identities, and the shared body reads one slot
+                     let orSlots = dictNew<string * int, string> ()
+                     w.Append("(block " + hm + " ") |> ignore
+                     many |> List.iteri (fun j alt ->
+                         let al = "$talt" + res + "_" + string i + "_" + string j
+                         w.Append("(block " + al + " ") |> ignore
+                         let tests = System.Text.StringBuilder()
+                         compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + exn + ")") alt
+                         // after the first alternative, every binder it
+                         // introduced is the slot the others must reuse
+                         for k, sl in dictPairs locals do
+                             if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
+                         w.Append(tests.ToString()) |> ignore
+                         w.Append("(br " + hm + ")) ") |> ignore)
+                     w.Append("(br " + lbl + ")) ") |> ignore)
                 (match guard with
                  | Some g -> w.Append("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ") |> ignore
                  | None -> ())
@@ -1822,19 +1909,41 @@ let emit (decls : Decl list) : EmitResult =
             w.Append(" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))") |> ignore
             w.ToString()
         | EMatch (scrut, cases) ->
-            // expand or-patterns into separate cases, at every depth
-            let cases =
-                cases |> List.collect (fun (p, g, b) -> expandOr p |> List.map (fun q -> q, g, b))
             let sl = newLocal "scrut"
             let res = newLocal "res"
             let w = System.Text.StringBuilder()
             w.Append("(block (result anyref) (local.set " + sl + " " + recur scrut + ") (block $done" + res + " ") |> ignore
             cases |> List.iteri (fun i (pat, guard, body) ->
+                // or-alternatives each get a TEST block; the BODY is emitted
+                // ONCE and shared — duplicating it per alternative made the
+                // emitted text multiplicative under nesting, and emitting the
+                // compiler's own emitter ran out of memory on exactly that
                 let lbl = "$case" + res + "_" + string i
+                let alts = expandOr pat
                 w.Append("(block " + lbl + " ") |> ignore
-                let tests = System.Text.StringBuilder()
-                compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") pat
-                w.Append(tests.ToString()) |> ignore
+                (match alts with
+                 | [ single ] ->
+                     let tests = System.Text.StringBuilder()
+                     compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") single
+                     w.Append(tests.ToString()) |> ignore
+                 | many ->
+                     let hm = "$have" + res + "_" + string i
+                     // one slot map shared by all alternatives: they bind the
+                     // same identities, and the shared body reads one slot
+                     let orSlots = dictNew<string * int, string> ()
+                     w.Append("(block " + hm + " ") |> ignore
+                     many |> List.iteri (fun j alt ->
+                         let al = "$alt" + res + "_" + string i + "_" + string j
+                         w.Append("(block " + al + " ") |> ignore
+                         let tests = System.Text.StringBuilder()
+                         compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + sl + ")") alt
+                         // after the first alternative, every binder it
+                         // introduced is the slot the others must reuse
+                         for k, sl in dictPairs locals do
+                             if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
+                         w.Append(tests.ToString()) |> ignore
+                         w.Append("(br " + hm + ")) ") |> ignore)
+                     w.Append("(br " + lbl + ")) ") |> ignore)
                 (match guard with
                  | Some g ->
                      w.Append("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ") |> ignore
@@ -1934,6 +2043,9 @@ let emit (decls : Decl list) : EmitResult =
         "(call " + fname + " " + String.concat " " wrapped + ")"
 
     and compilePat locals extraLocals freeEnv (out : System.Text.StringBuilder) (failLbl : string) (v : string) (p : Pat) : unit =
+        compilePatWith (dictNew ()) locals extraLocals freeEnv out failLbl v p
+
+    and compilePatWith (orSlots : Dict<string * int, string>) locals extraLocals freeEnv (out : System.Text.StringBuilder) (failLbl : string) (v : string) (p : Pat) : unit =
         let app (s : string) = out.Append(s + " ") |> ignore
         let newLocal (base_ : string) =
             let n = "$p" + string (vecLen extraLocals) + "_" + base_
@@ -1946,14 +2058,23 @@ let emit (decls : Decl list) : EmitResult =
             // survivor would bind nothing and test nothing, silently
             emitError "an or-pattern reached pattern compilation"
         | PVar (var, _) ->
-            let l = newLocal "v"
-            dictSet locals (var.Path, var.Offset) l
+            // REUSE the slot if this variable is already bound in this
+            // pattern position: or-alternatives bind the SAME identity
+            // (lowering aligned them), so every alternative must write the
+            // one slot the shared body reads
+            let l =
+                match dictTryFind orSlots (var.Path, var.Offset) with
+                | Some existing -> existing
+                | None ->
+                    let fresh = newLocal "v"
+                    dictSet locals (var.Path, var.Offset) fresh
+                    fresh
             app ("(local.set " + l + " " + v + ")")
         | PAs (inner, var, _) ->
             let l = newLocal "as"
             dictSet locals (var.Path, var.Offset) l
             app ("(local.set " + l + " " + v + ")")
-            compilePat locals extraLocals freeEnv out failLbl ("(local.get " + l + ")") inner
+            compilePatWith orSlots locals extraLocals freeEnv out failLbl ("(local.get " + l + ")") inner
         | PLit LUnit -> ()
         | PLit (LInt s) ->
             let digits =
@@ -2015,22 +2136,22 @@ let emit (decls : Decl list) : EmitResult =
                  app ("(br_if " + failLbl + " (i32.ne (i32.const " + tag + ") (struct.get " + ty + " 0 (ref.cast (ref " + ty + ") " + v + "))))")
                  args |> List.iteri (fun i a2 ->
                      let field = "(struct.get $du1 1 (ref.cast (ref $du1) " + v + "))"
-                     compilePat locals extraLocals freeEnv out failLbl field a2)
+                     compilePatWith orSlots locals extraLocals freeEnv out failLbl field a2)
              | None -> vecAdd errors ("unknown constructor pattern " + name))
         | PTuple ps ->
             let tn = "$tup" + string ps.Length
             ps |> List.iteri (fun i a ->
                 let field = "(struct.get " + tn + " " + string i + " (ref.cast (ref " + tn + ") " + v + "))"
-                compilePat locals extraLocals freeEnv out failLbl field a)
+                compilePatWith orSlots locals extraLocals freeEnv out failLbl field a)
         | PCons (h, t) ->
             app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref $cons) " + v + ")))")
-            compilePat locals extraLocals freeEnv out failLbl ("(struct.get $cons 0 (ref.cast (ref $cons) " + v + "))") h
-            compilePat locals extraLocals freeEnv out failLbl ("(struct.get $cons 1 (ref.cast (ref $cons) " + v + "))") t
+            compilePatWith orSlots locals extraLocals freeEnv out failLbl ("(struct.get $cons 0 (ref.cast (ref $cons) " + v + "))") h
+            compilePatWith orSlots locals extraLocals freeEnv out failLbl ("(struct.get $cons 1 (ref.cast (ref $cons) " + v + "))") t
         | PListLit ps ->
             let mutable cur = v
             for a in ps do
                 app ("(br_if " + failLbl + " (i32.eqz (ref.test (ref $cons) " + cur + ")))")
-                compilePat locals extraLocals freeEnv out failLbl ("(struct.get $cons 0 (ref.cast (ref $cons) " + cur + "))") a
+                compilePatWith orSlots locals extraLocals freeEnv out failLbl ("(struct.get $cons 0 (ref.cast (ref $cons) " + cur + "))") a
                 cur <- "(struct.get $cons 1 (ref.cast (ref $cons) " + cur + "))"
             app ("(br_if " + failLbl + " (i32.eqz (ref.is_null " + cur + ")))")
 
@@ -2125,17 +2246,19 @@ let emit (decls : Decl list) : EmitResult =
                 | None ->
                     match dictTryFind outerFree k with
                     | Some idx ->
-                        let mutable w = "(local.get $env)"
-                        for _ in 1 .. idx do
-                            w <- "(struct.get $cons 1 (ref.cast (ref $cons) " + w + "))"
-                        "(struct.get $cons 0 (ref.cast (ref $cons) " + w + "))"
+                        "(array.get $arr (ref.cast (ref $arr) (local.get $env)) (i32.const " + string idx + "))"
                     | None -> "(ref.null any)"
             else
                 recurOuter (EVar ({ Path = fst k; Offset = snd k; Name = "_free" }, Fpp.Analysis.Types.mono (Fpp.Analysis.Types.TCon ("?", []))))
+        // FLAT environment: one array, one indexed read per access. The
+        // cons-chain form emitted k nested struct.gets for capture k, which
+        // made the TEXT of closure-heavy functions quadratic — emitting the
+        // compiler's own emitter ran out of memory on exactly that
         let envW =
-            List.foldBack
-                (fun k acc -> "(struct.new $cons " + captureW k + " " + acc + ")")
-                freeList "(ref.null any)"
+            if List.isEmpty freeList then "(ref.null any)"
+            else
+                "(array.new_fixed $arr " + string (List.length freeList) + " "
+                + String.concat " " (List.map captureW freeList) + ")"
         "(struct.new $clo (ref.func " + fname + ") " + envW + ")"
 
     // ---- module assembly --------------------------------------------------
@@ -3246,30 +3369,42 @@ TUPLE_HASH
       (else (struct.get $boxi 0 (ref.cast (ref $boxi) (local.get $v))))))
   (func $patchself (param $c anyref)
     ;; tie the recursive knot: replace the marker captured in the closure's
-    ;; environment with the closure itself
+    ;; environment (a FLAT array) with the closure itself
     (local $e anyref)
+    (local $i i32)
+    (local $n i32)
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
-      (loop $go
-        (br_if $done (i32.eqz (ref.test (ref $cons) (local.get $e))))
-        (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
-                    (ref.cast (ref null eq) (global.get $selfmark)))
-          (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $c))))
-        (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
-        (br $go))))
+      (br_if $done (i32.eqz (ref.test (ref $arr) (local.get $e))))
+      (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
+      (local.set $i (i32.const 0))
+      (block $out
+        (loop $go
+          (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
+          (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+                      (ref.cast (ref null eq) (global.get $selfmark)))
+            (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $c))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $go)))))
   (func $patchmark (param $c anyref) (param $mark anyref) (param $v anyref)
-    ;; tie one strand of a rec GROUP's knot: in closure $c's environment,
+    ;; tie one strand of a rec GROUP's knot: in closure $c's FLAT environment,
     ;; whatever slot still holds the marker $mark becomes $v
     (local $e anyref)
+    (local $i i32)
+    (local $n i32)
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
-      (loop $go
-        (br_if $done (i32.eqz (ref.test (ref $cons) (local.get $e))))
-        (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
-                    (ref.cast (ref null eq) (local.get $mark)))
-          (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $v))))
-        (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
-        (br $go))))
+      (br_if $done (i32.eqz (ref.test (ref $arr) (local.get $e))))
+      (local.set $n (array.len (ref.cast (ref $arr) (local.get $e))))
+      (local.set $i (i32.const 0))
+      (block $out
+        (loop $go
+          (br_if $out (i32.ge_u (local.get $i) (local.get $n)))
+          (if (ref.eq (ref.cast (ref null eq) (array.get $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i)))
+                      (ref.cast (ref null eq) (local.get $mark)))
+            (then (array.set $arr (ref.cast (ref $arr) (local.get $e)) (local.get $i) (local.get $v))))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $go)))))
   (func $applyc (param $f anyref) (param $a anyref) (result anyref)
     (call_ref $u1 (local.get $a)
       (struct.get $clo 1 (ref.cast (ref $clo) (local.get $f)))
@@ -3312,6 +3447,7 @@ TUPLE_HASH
         | DLet (_, v, _, ELam (ps, body)) ->
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
+            ceMemos.Clear ()
             let pks, rk =
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
@@ -3352,6 +3488,7 @@ TUPLE_HASH
         | DLet (_, v, _, rhs) ->
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
+            ceMemos.Clear ()
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string * string> ()

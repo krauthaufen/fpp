@@ -1451,3 +1451,35 @@ The backend emits .wat text — debuggable, and wasmtime takes it directly.
 Browsers only take binary .wasm, so before F++ output meets the web either
 a binary section-writer (LEB128 + type/func/code sections) or a wat2wasm
 assembly step must land.
+
+### The emission wall: four duplication bugs, not the stamper
+Emitting all 20 compiler files used to take >15 min and ~30 GB and never
+finish; the largest single function (`EmitWasm.emit`, 15k core nodes) was
+where it died. Three separate investigations blamed monomorphization; the
+stamper was innocent (184 queue entries, 0.1s, longest instantiation name 17
+chars). The cost was in the emitter, as four independent duplications that
+multiply through nesting:
+
+- **Closure environments were cons chains.** Reading capture k emitted k
+  nested `struct.get`s, so a function's text grew with captures squared.
+  Environments are now ONE flat array with an indexed read. The two
+  knot-tying runtime routines (`$patchself`, `$patchmark`) walked the same
+  chain and were rewritten to scan the array — missing that broke every
+  mutual-recursion test until the drivers caught it.
+- **Or-pattern bodies were duplicated per alternative.** `| A n | B n -> e`
+  emitted `e` once per alternative, compounding through nesting. Now each
+  alternative gets a TEST block branching to one shared body. The binders
+  must then write ONE slot: `compilePat` reuses a per-position slot map, or
+  the matching alternative writes a local the body never reads (it printed
+  garbage for the first alternative — exactly the silent-wrong-answer class).
+- **Operator operands were thunks** (`fun () -> unwrapI32 (recur a)`) used up
+  to 14 times per case, re-walking the subtree on each use: 13^depth.
+- The general form: **twenty emitter cases mention `recur x` more than
+  once**. Fixed at the root by memoizing emission per (locals-map, node,
+  tail) on REFERENCE identity — structural hashing would re-walk the tree
+  per lookup, and the locals map must be part of the key because a lambda
+  body compiles against a fresh one.
+
+Result: the whole compiler emits in ~2 min inside a 10 GB cap, 4.96 MB of
+wat, 104 remaining emission errors (a real list, no longer a wall). Suite
+402/402 with the lowering-lint gate green again.
