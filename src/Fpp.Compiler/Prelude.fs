@@ -18,6 +18,17 @@ let stringOfChars (cs : char list) : string = System.String(List.toArray cs)
 /// Growable vector — the only mutable collection the compiler uses.
 type Vec<'a> = System.Collections.Generic.List<'a>
 
+/// Incremental text. Repeated `+` on a growing string is quadratic, and the
+/// emitter builds megabytes; both halves of the seam provide the same four
+/// operations so compiler code never names a host type.
+type Builder = System.Text.StringBuilder
+let sbNew () : Builder = System.Text.StringBuilder ()
+let sbAdd (b : Builder) (s : string) : unit = b.Append s |> ignore
+let sbAddLine (b : Builder) (s : string) : unit = b.AppendLine s |> ignore
+let sbLen (b : Builder) : int = b.Length
+let sbClear (b : Builder) : unit = b.Clear () |> ignore
+let sbText (b : Builder) : string = b.ToString ()
+
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count
 let inline vecGet (v : Vec<'a>) (i : int) : 'a = v.[i]

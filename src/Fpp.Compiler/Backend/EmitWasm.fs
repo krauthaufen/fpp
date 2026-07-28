@@ -21,8 +21,8 @@ let emit (decls : Decl list) : EmitResult =
     let mutable currentFn = ""
     let emitError (msg : string) =
         vecAdd errors (if currentFn = "" then msg else msg + " [in " + currentFn + "]")
-    let sb = System.Text.StringBuilder()
-    let line (s : string) = sb.AppendLine s |> ignore
+    let sb = sbNew ()
+    let line (s : string) = sbAddLine sb s
 
     // ---- program shape ----------------------------------------------------
 
@@ -479,22 +479,22 @@ let emit (decls : Decl list) : EmitResult =
     let unescape (raw : string) : string =
         // raw includes the surrounding quotes
         let inner = substr raw 1 (strLen raw - 2)
-        let out = System.Text.StringBuilder()
+        let out = sbNew ()
         let mutable i = 0
         while i < strLen inner do
             let c = charAt inner i
             if c = '\\' && i + 1 < strLen inner then
                 (match charAt inner (i + 1) with
-                 | 'n' -> out.Append '\n' |> ignore
-                 | 't' -> out.Append '\t' |> ignore
-                 | 'r' -> out.Append '\r' |> ignore
-                 | '\\' -> out.Append '\\' |> ignore
-                 | '"' -> out.Append '"' |> ignore
-                 | '\'' -> out.Append '\'' |> ignore
-                 | o -> out.Append o |> ignore)
+                 | 'n' -> sbAdd out (string '\n')
+                 | 't' -> sbAdd out (string '\t')
+                 | 'r' -> sbAdd out (string '\r')
+                 | '\\' -> sbAdd out (string '\\')
+                 | '"' -> sbAdd out (string '"')
+                 | '\'' -> sbAdd out (string '\'')
+                 | o -> sbAdd out (string o))
                 i <- i + 2
             else
-                out.Append c |> ignore
+                sbAdd out (string c)
                 i <- i + 1
         out.ToString()
 
@@ -1083,7 +1083,7 @@ let emit (decls : Decl list) : EmitResult =
             // the whole remaining body at every level — O(depth * size) in
             // emitted text, which is tens of GB on a several-thousand-let
             // body like the emitter's own. Same bytes out, built once.
-            let spine = System.Text.StringBuilder ()
+            let spine = sbNew ()
             let mutable closes = 0
             let mutable cur = e
             let mutable walking = true
@@ -1097,7 +1097,7 @@ let emit (decls : Decl list) : EmitResult =
                     let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
                     let r = recur rhs
                     dictSet locals (v.Path, v.Offset) l
-                    spine.Append("(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) ") |> ignore
+                    sbAdd spine ("(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) ")
                     closes <- closes + 1
                     cur <- body
                 | ELet (_, v, _, rhs, body) ->
@@ -1107,12 +1107,12 @@ let emit (decls : Decl list) : EmitResult =
                     dictSet locals (v.Path, v.Offset) l
                     dictSet localKinds (v.Path, v.Offset) k
                     let stored = if k = "u" then r else unboxK k r
-                    spine.Append("(block (result anyref) (local.set " + l + " " + stored + ") ") |> ignore
+                    sbAdd spine ("(block (result anyref) (local.set " + l + " " + stored + ") ")
                     closes <- closes + 1
                     cur <- body
                 | _ -> walking <- false
-            spine.Append (recurT cur) |> ignore
-            spine.Append (String.replicate closes ")") |> ignore
+            sbAdd spine (recurT cur)
+            sbAdd spine (String.replicate closes ")")
             spine.ToString ()
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
@@ -1892,50 +1892,50 @@ let emit (decls : Decl list) : EmitResult =
         | ETry (body, cases) ->
             let res = newLocal "tres"
             let exn = newLocal "texn"
-            let w = System.Text.StringBuilder()
-            w.Append("(block (result anyref) (block $tdone" + res + " (local.set " + exn + " (block $tcatch" + res + " (result anyref) ") |> ignore
-            w.Append("(try_table (catch $fppexn $tcatch" + res + ") (local.set " + res + " " + recur body + ")) ") |> ignore
-            w.Append("(br $tdone" + res + "))) ") |> ignore
+            let w = sbNew ()
+            sbAdd w ("(block (result anyref) (block $tdone" + res + " (local.set " + exn + " (block $tcatch" + res + " (result anyref) ")
+            sbAdd w ("(try_table (catch $fppexn $tcatch" + res + ") (local.set " + res + " " + recur body + ")) ")
+            sbAdd w ("(br $tdone" + res + "))) ")
             cases |> List.iteri (fun i (pat, guard, cbody) ->
                 // same shared-body scheme as EMatch (see there)
                 let lbl = "$tcase" + res + "_" + string i
                 let alts = expandOr pat
-                w.Append("(block " + lbl + " ") |> ignore
+                sbAdd w ("(block " + lbl + " ")
                 (match alts with
                  | [ single ] ->
-                     let tests = System.Text.StringBuilder()
+                     let tests = sbNew ()
                      compilePat locals extraLocals freeEnv tests lbl ("(local.get " + exn + ")") single
-                     w.Append(tests.ToString()) |> ignore
+                     sbAdd w (tests.ToString())
                  | many ->
                      let hm = "$thave" + res + "_" + string i
                      // one slot map shared by all alternatives: they bind the
                      // same identities, and the shared body reads one slot
                      let orSlots = dictNew<string * int, string> ()
-                     w.Append("(block " + hm + " ") |> ignore
+                     sbAdd w ("(block " + hm + " ")
                      many |> List.iteri (fun j alt ->
                          let al = "$talt" + res + "_" + string i + "_" + string j
-                         w.Append("(block " + al + " ") |> ignore
-                         let tests = System.Text.StringBuilder()
+                         sbAdd w ("(block " + al + " ")
+                         let tests = sbNew ()
                          compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + exn + ")") alt
                          // after the first alternative, every binder it
                          // introduced is the slot the others must reuse
                          for k, sl in dictPairs locals do
                              if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
-                         w.Append(tests.ToString()) |> ignore
-                         w.Append("(br " + hm + ")) ") |> ignore)
-                     w.Append("(br " + lbl + ")) ") |> ignore)
+                         sbAdd w (tests.ToString())
+                         sbAdd w ("(br " + hm + ")) "))
+                     sbAdd w ("(br " + lbl + ")) "))
                 (match guard with
-                 | Some g -> w.Append("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ") |> ignore
+                 | Some g -> sbAdd w ("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ")
                  | None -> ())
-                w.Append("(local.set " + res + " " + recur cbody + ") (br $tdone" + res + ") ") |> ignore
-                w.Append(")") |> ignore)
-            w.Append(" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))") |> ignore
+                sbAdd w ("(local.set " + res + " " + recur cbody + ") (br $tdone" + res + ") ")
+                sbAdd w (")"))
+            sbAdd w (" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))")
             w.ToString()
         | EMatch (scrut, cases) ->
             let sl = newLocal "scrut"
             let res = newLocal "res"
-            let w = System.Text.StringBuilder()
-            w.Append("(block (result anyref) (local.set " + sl + " " + recur scrut + ") (block $done" + res + " ") |> ignore
+            let w = sbNew ()
+            sbAdd w ("(block (result anyref) (local.set " + sl + " " + recur scrut + ") (block $done" + res + " ")
             cases |> List.iteri (fun i (pat, guard, body) ->
                 // or-alternatives each get a TEST block; the BODY is emitted
                 // ONCE and shared — duplicating it per alternative made the
@@ -1943,37 +1943,37 @@ let emit (decls : Decl list) : EmitResult =
                 // compiler's own emitter ran out of memory on exactly that
                 let lbl = "$case" + res + "_" + string i
                 let alts = expandOr pat
-                w.Append("(block " + lbl + " ") |> ignore
+                sbAdd w ("(block " + lbl + " ")
                 (match alts with
                  | [ single ] ->
-                     let tests = System.Text.StringBuilder()
+                     let tests = sbNew ()
                      compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") single
-                     w.Append(tests.ToString()) |> ignore
+                     sbAdd w (tests.ToString())
                  | many ->
                      let hm = "$have" + res + "_" + string i
                      // one slot map shared by all alternatives: they bind the
                      // same identities, and the shared body reads one slot
                      let orSlots = dictNew<string * int, string> ()
-                     w.Append("(block " + hm + " ") |> ignore
+                     sbAdd w ("(block " + hm + " ")
                      many |> List.iteri (fun j alt ->
                          let al = "$alt" + res + "_" + string i + "_" + string j
-                         w.Append("(block " + al + " ") |> ignore
-                         let tests = System.Text.StringBuilder()
+                         sbAdd w ("(block " + al + " ")
+                         let tests = sbNew ()
                          compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + sl + ")") alt
                          // after the first alternative, every binder it
                          // introduced is the slot the others must reuse
                          for k, sl in dictPairs locals do
                              if (dictTryFind orSlots k).IsNone then dictSet orSlots k sl
-                         w.Append(tests.ToString()) |> ignore
-                         w.Append("(br " + hm + ")) ") |> ignore)
-                     w.Append("(br " + lbl + ")) ") |> ignore)
+                         sbAdd w (tests.ToString())
+                         sbAdd w ("(br " + hm + ")) "))
+                     sbAdd w ("(br " + lbl + ")) "))
                 (match guard with
                  | Some g ->
-                     w.Append("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ") |> ignore
+                     sbAdd w ("(br_if " + lbl + " (i32.eqz " + unwrapI32 (recur g) + ")) ")
                  | None -> ())
-                w.Append("(local.set " + res + " " + recur body + ") (br $done" + res + ") ") |> ignore
-                w.Append(")") |> ignore)
-            w.Append(" (unreachable)) (local.get " + res + "))") |> ignore
+                sbAdd w ("(local.set " + res + " " + recur body + ") (br $done" + res + ") ")
+                sbAdd w (")"))
+            sbAdd w (" (unreachable)) (local.get " + res + "))")
             w.ToString()
 
     /// Emit tests (branching to failLbl on mismatch) and binds for a pattern
@@ -2065,11 +2065,11 @@ let emit (decls : Decl list) : EmitResult =
                     if k = "u" then recur a else unboxK k (recur a))
         "(call " + fname + " " + String.concat " " wrapped + ")"
 
-    and compilePat locals extraLocals freeEnv (out : System.Text.StringBuilder) (failLbl : string) (v : string) (p : Pat) : unit =
+    and compilePat locals extraLocals freeEnv (out : Builder) (failLbl : string) (v : string) (p : Pat) : unit =
         compilePatWith (dictNew ()) locals extraLocals freeEnv out failLbl v p
 
-    and compilePatWith (orSlots : Dict<string * int, string>) locals extraLocals freeEnv (out : System.Text.StringBuilder) (failLbl : string) (v : string) (p : Pat) : unit =
-        let app (s : string) = out.Append(s + " ") |> ignore
+    and compilePatWith (orSlots : Dict<string * int, string>) locals extraLocals freeEnv (out : Builder) (failLbl : string) (v : string) (p : Pat) : unit =
+        let app (s : string) = sbAdd out (s + " ")
         let newLocal (base_ : string) =
             let n = "$p" + string (vecLen extraLocals) + "_" + base_
             vecAdd extraLocals (n, "anyref")
@@ -3555,11 +3555,11 @@ TUPLE_HASH
 
     // string data segments (escape as \xx hex where needed)
     let hexEscape (bytes : byte[]) : string =
-        let out = System.Text.StringBuilder()
+        let out = sbNew ()
         for b in bytes do
             let c = char b
-            if b >= 32uy && b < 127uy && c <> '"' && c <> '\\' then out.Append c |> ignore
-            else out.Append("\\" + (sprintf "%02x" b)) |> ignore
+            if b >= 32uy && b < 127uy && c <> '"' && c <> '\\' then sbAdd out (string c)
+            else sbAdd out ("\\" + (sprintf "%02x" b))
         out.ToString()
     vecToList strings
     |> List.iteri (fun i sdata ->
@@ -3648,9 +3648,9 @@ TUPLE_HASH
                 else i <- i + 1
             if not found then src, false
             else
-                let out = System.Text.StringBuilder (src.Length)
+                let out = sbNew ()
                 for k in 0 .. src.Length - 1 do
-                    if not drop.[k] then out.Append src.[k] |> ignore
+                    if not drop.[k] then sbAdd out (string src.[k])
                 out.ToString (), true
         let mutable changed = true
         while changed do

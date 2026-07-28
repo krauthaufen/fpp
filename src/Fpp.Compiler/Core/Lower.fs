@@ -752,6 +752,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | _ -> note (offsetOf n) "assignment target")
                       | "|>" -> EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
+                      // f >> g  ==  fun x -> g (f x)   (and << the other way)
+                      | ">>" | "<<" ->
+                          let first, second =
+                              if op.Text = ">>" then lowerExpr (GNode l), lowerExpr (GNode r)
+                              else lowerExpr (GNode r), lowerExpr (GNode l)
+                          let arg = { Path = path; Offset = offsetOf n + 660000; Name = "_cx" }
+                          let sch = mono (TCon ("?", []))
+                          ELam ([ arg, sch ], EApp (second, [ EApp (first, [ EVar (arg, sch) ]) ]))
                       | _ ->
                           // typed prims: inference resolved the operand kind
                           // (equality stays unsuffixed — structural $equal)

@@ -428,3 +428,21 @@ let pathCombine (dir : string) (rel : string) : string =
     elif pathIsRooted rel then rel
     elif charAt dir (strLen dir - 1) = '/' then dir + rel
     else dir + "/" + rel
+
+// ---- incremental text ----
+// The same four operations the .NET half exposes over StringBuilder. Here it
+// is a vector of chunks joined once: appending is amortized O(1) and the join
+// is linear, where repeated `+` on a growing string would be quadratic.
+type Builder = { mutable Chunks : Vec<string> }
+
+let sbNew () : Builder = { Chunks = vecNew () }
+let sbAdd (b : Builder) (s : string) : unit = vecAdd b.Chunks s
+let sbAddLine (b : Builder) (s : string) : unit =
+    vecAdd b.Chunks s
+    vecAdd b.Chunks "\n"
+let sbLen (b : Builder) : int =
+    let mutable n = 0
+    for c in vecToList b.Chunks do n <- n + c.Length
+    n
+let sbClear (b : Builder) : unit = b.Chunks <- vecNew ()
+let sbText (b : Builder) : string = String.concat "" (vecToList b.Chunks)

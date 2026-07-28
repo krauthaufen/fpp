@@ -1036,6 +1036,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         elif text = "::" then "cons"
         elif text = "|>" then "pipe"
         elif text = "<|" then "pipeBack"
+        elif text = ">>" then "compose"
+        elif text = "<<" then "composeBack"
         elif text = "=" || text = "<>" || text = "<" || text = ">" || text = "<=" || text = ">=" then "cmp"
         elif text = "+" || text = "-" || text = "*" || text = "/" || text = "%" || text = "**" then "arith"
         elif text = "&&&" || text = "|||" || text = "^^^" || text = "<<<" || text = ">>>" then "bits"
@@ -1417,6 +1419,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                unifyAt op.Offset res lt2
                            | _ -> unifyAt op.Offset lt (TFun (rt, res)))
                           res
+                      | "compose" | "composeBack" ->
+                          // f >> g : the output of one feeds the other. Same
+                          // decomposition as a pipe, so an argument may widen
+                          let a = st.Fresh ()
+                          let b = st.Fresh ()
+                          let c = st.Fresh ()
+                          let first, second = (if opClass op.Text = "compose" then lt, rt else rt, lt)
+                          unifyAt op.Offset first (TFun (a, b))
+                          unifyAt op.Offset second (TFun (b, c))
+                          TFun (a, c)
                       | "assign" ->
                           // the RHS must fit the target — like an argument,
                           // so a list may still widen into a seq-typed cell.
