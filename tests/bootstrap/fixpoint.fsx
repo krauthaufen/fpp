@@ -75,6 +75,11 @@ let escape (bytes : byte[]) =
         else sb.Append("\\").Append(b.ToString "x2") |> ignore
     sb.ToString ()
 
+/// The prelude source the host hands to stage-1 — the SAME text stage-0
+/// compiled against, read from the file the build embeds.
+let preludeText : string =
+    System.IO.File.ReadAllText (root + "/stdlib/prelude.fpp")
+
 let generateHost (files : (string * string) list) : string =
     let sb = System.Text.StringBuilder()
     let app (s : string) = sb.Append(s).Append('\n') |> ignore
@@ -83,6 +88,7 @@ let generateHost (files : (string * string) list) : string =
     files |> List.iteri (fun i (p, c) ->
         app (sprintf "  (data $p%d \"%s\")" i (escape (System.Text.Encoding.UTF8.GetBytes p)))
         app (sprintf "  (data $c%d \"%s\")" i (escape (System.Text.Encoding.UTF8.GetBytes c))))
+    app (sprintf "  (data $prelude \"%s\")" (escape (System.Text.Encoding.UTF8.GetBytes preludeText)))
     app "  (func $eq (param $a (ref $str)) (param $b (ref $str)) (result i32)"
     app "    (local $i i32)"
     app "    (if (i32.ne (array.len (local.get $a)) (array.len (local.get $b))) (then (return (i32.const 0))))"
@@ -115,6 +121,12 @@ let generateHost (files : (string * string) list) : string =
     app "    (i32.ne (call $which (local.get $p)) (i32.const -1)))"
     app "  (func (export \"listDirRaw\") (param $p anyref) (result anyref) (ref.null any))"
     app "  (func (export \"canonicalizeRaw\") (param $p anyref) (result anyref) (local.get $p))"
+    // the prelude's own text is a host service too: stage-1 gets EXACTLY the
+    // string stage-0 compiled against, which is what makes the two stages
+    // comparable rather than merely similar
+    app "  (func (export \"preludeSourceRaw\") (param $p anyref) (result anyref)"
+    app (sprintf "    (array.new_data $str $prelude (i32.const 0) (i32.const %d)))"
+                 (System.Text.Encoding.UTF8.GetByteCount preludeText))
     app ")"
     sb.ToString ()
 
@@ -142,10 +154,14 @@ let run (exe : string) (args : string) =
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi
-    let o = p.StandardOutput.ReadToEnd()
-    let e = p.StandardError.ReadToEnd()
+    // BOTH pipes drained concurrently. Reading stdout to the end FIRST
+    // deadlocks the moment the child fills the stderr buffer: the child
+    // waits for stderr to drain, the parent waits for stdout to end, and
+    // stage-1 sits there burning no CPU at all.
+    let ot = p.StandardOutput.ReadToEndAsync ()
+    let et = p.StandardError.ReadToEndAsync ()
     p.WaitForExit()
-    o, e, p.ExitCode
+    ot.Result, et.Result, p.ExitCode
 
 // ---- the bisector --------------------------------------------------------
 // A difference is only useful if it names the emission site, so report the
@@ -215,7 +231,11 @@ let hostPath = scratch + "/env.wat"
 System.IO.File.WriteAllText (hostPath,
     generateHost (corpusFiles @ [ "prelude.fpp", System.IO.File.ReadAllText (root + "/stdlib/prelude.fpp") ]))
 
-let out, err, code = run wasmtime ("run -W exceptions=y,gc=y --preload env=" + hostPath + " " + stage1Path)
+// 64 MB of wasm stack: the compiler is recursive-descent throughout (parser,
+// type walks, emission), and wasmtime's 1 MB default is not a statement about
+// the program — a native build gets far more.
+let out, err, code =
+    run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864 --preload env=" + hostPath + " " + stage1Path)
 if code <> 0 then
     printfn "stage-1 failed to run (exit %d)" code
     printfn "%s" (err.Substring (0, min 2000 err.Length))

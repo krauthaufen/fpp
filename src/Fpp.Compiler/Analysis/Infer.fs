@@ -2382,6 +2382,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      recordDef t ctorTy
                  | _ -> ())
             | LetDecl -> inferLet m |> ignore
+            // a `do` block in a class body is CONSTRUCTOR code and has to be
+            // typed like any other: without this its dot-accesses never
+            // resolved, so `do db.SetInput ...` reached emission as an
+            // unknown field — and only when something made it reachable
+            | BlockExpr -> exprType (GNode m) |> ignore
             | MemberDecl when tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val") ->
                 // `val mutable X : T` is a field declaration
                 (match tokensOf m |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast,

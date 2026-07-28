@@ -1615,3 +1615,29 @@ Also this stretch: utf8Bytes in both halves, `list.IsEmpty/Length/Head/Tail`
 as builtin members (lowered to the match they mean, like Option's), and
 `byte`/`sbyte` conversions — which the seam's own UTF-8 encoder needed and
 which the language did not have (byte 300 = 44, sbyte 200 = -56, as F#).
+
+### Stage-1 RUNS: the compiler as wasm, and where it stops
+The bootstrap now gets deep. In order, each wall cleared:
+
+1. **Class `do` blocks were never type-checked.** `inferTypeDecl`'s member
+   loop handled let/member/interface but had no case for a `do` block, so
+   constructor code was never typed and its dot-accesses never resolved —
+   `do db.SetInput ...` reached emission as an unknown field, and only once
+   something made it reachable. Ten-line repro, one-line fix.
+2. The harness predated the fifth host import: it now serves `preludeSourceRaw`
+   — deliberately the SAME prelude text stage-0 compiled against, which is
+   what makes the two stages comparable rather than merely similar.
+3. **A pipe deadlock in the harness**, not the compiler: it drained stdout to
+   the end before reading stderr, so stage-1 blocked once the stderr buffer
+   filled (153s elapsed, 9s of CPU — the signature of a block, not slowness).
+   Both pipes are read concurrently now.
+4. wasmtime's default 1 MB wasm stack is not enough for a recursive-descent
+   compiler; stage-1 runs with 64 MB.
+
+**Where it stops now — the first REAL bug of the bootstrap.** Stage-1 parses,
+resolves and infers the corpus successfully, then traps inside its own
+`EmitProgram -> monomorphizeWith -> mapExpr` with a cast failure. Everything
+before emission works when the compiler runs as wasm; something in the
+monomorphizer's expression walk does not. That is the next thing to chase,
+and it is a miscompilation of the compiler by itself rather than a harness
+problem.
