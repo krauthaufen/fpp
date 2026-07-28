@@ -406,7 +406,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                           if not (dictTryFind seen mangled).IsSome then
                               dictSet seen mangled true
                               vecAdd queue (key, i)
-                          EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (hash mangled) % 1000000)
+                          EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000)
                                   Name = mangled }, substScheme i sch)
                       | None ->
                           // a struct instantiation whose body we cannot see
@@ -568,7 +568,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         (match dictTryFind bodies key with
          | Some (rc, v, sch, e) ->
              let mangled = mangleFor v inst
-             let nv = { Path = v.Path; Offset = v.Offset + 7000000 + (abs (hash mangled) % 1000000); Name = mangled }
+             let nv = { Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000); Name = mangled }
              // map the callee's quantified vars to this instantiation so
              // demands nested in the body specialize too
              let subst = dictNew<string, string> ()
@@ -589,7 +589,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                      x
              let clone =
                  DLet (rc, nv, substScheme inst sch,
-                       alphaRename (10000000 + (abs (hash mangled) % 1000000) * 10)
+                       alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10)
                            (selfFix (rewrite mangled selfKey subst false e)))
              dictSet stamped mangled clone
          | None -> ())

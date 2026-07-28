@@ -458,6 +458,18 @@ let isLetterOrDigit (c : char) : bool =
     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 let isDigitCh (c : char) : bool = c >= '0' && c <= '9'
 
+/// A string hash the compiler can BUILD NAMES from — spelled out so both
+/// halves of the seam agree. The host's own `hash` does not: the same
+/// mangled name hashed differently in the dotnet-built compiler and in the
+/// compiler compiled to wasm, and the two emitted different symbols.
+let strHash (s : string) : int =
+    let mutable h = 17
+    let mutable i = 0
+    while i < s.Length do
+        h <- h * 31 + int s.[i]
+        i <- i + 1
+    h
+
 /// Ordinal comparison of a SLICE of `s` (at `i`, `len` long) against the
 /// slice of `t` at `j`. Negative, zero or positive, like the .NET half.
 let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) : int =

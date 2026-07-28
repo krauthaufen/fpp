@@ -33,6 +33,20 @@ let sbText (b : Builder) : string = b.ToString ()
 /// implements them over code points rather than naming a .NET type.
 let isLetterOrDigit (c : char) : bool = System.Char.IsLetterOrDigit c
 let isDigitCh (c : char) : bool = c >= '0' && c <= '9'
+/// A string hash the compiler can BUILD NAMES from. `hash` is whatever the
+/// host provides, and the two halves of the seam do not provide the same
+/// one — so a mangled name derived from it came out differently in the
+/// dotnet-built compiler and in the compiler compiled to wasm. This is
+/// spelled out here, identically in both halves, and is the only hash that
+/// may reach emitted output.
+let strHash (s : string) : int =
+    let mutable h = 17
+    let mutable i = 0
+    while i < s.Length do
+        h <- h * 31 + int s.[i]
+        i <- i + 1
+    h
+
 /// Ordinal comparison of a SLICE of `s` (at `i`, `len` long) against `t`.
 let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) : int =
     System.String.CompareOrdinal (s, i, t, j, len)

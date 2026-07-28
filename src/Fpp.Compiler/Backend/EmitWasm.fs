@@ -341,7 +341,7 @@ let emit (decls : Decl list) : EmitResult =
 
     let topArity = dictNew<string * int, int> ()   // (path,offset) -> arity of top-level fn
     let topName = dictNew<string * int, string> ()
-    let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_'))
+    let mangle (v : VarId) = "$g" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_'))
     // extern signatures: param/result kinds derived from the scheme.
     // "i" = int (i32 ABI, wrapped), "r" = reference/other (opaque anyref)
     // scalar-typed signatures: (paramKinds, resultKind) for top-level fns
