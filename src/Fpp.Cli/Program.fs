@@ -2,6 +2,12 @@ module Fpp.Cli.Program
 
 open Fpp
 
+/// Source is BYTES: every offset the compiler records is a byte offset, and
+/// decoding UTF-8 into .NET chars renumbers everything after the first
+/// non-ASCII character. Same reader the compiler's own host services use.
+let private readSource (path : string) : string =
+    System.Text.Encoding.Latin1.GetString (System.IO.File.ReadAllBytes path)
+
 // `fpp check <files>` — batch diagnostics. Deliberately a second thin client
 // of the same Workspace the LSP server uses.
 
@@ -9,7 +15,7 @@ let private check (files : string list) : int =
     let ws = Workspace()
     // argument order is the compile order — exports flow forward
     for f in files do
-        ws.SetFileText f (System.IO.File.ReadAllText f)
+        ws.SetFileText f (readSource f)
     let mutable errors = 0
     for f in files do
         for d in ws.Diagnostics f do
@@ -20,7 +26,7 @@ let private check (files : string list) : int =
 let private buildLib (out : string) (files : string list) : int =
     let ws = Workspace()
     for f in files do
-        ws.SetFileText f (System.IO.File.ReadAllText f)
+        ws.SetFileText f (readSource f)
     let lib, errors = ws.BuildLibrary ()
     if not (List.isEmpty errors) then
         for e in errors do eprintfn "error: %s" e
@@ -34,9 +40,9 @@ let private build (out : string) (files : string list) : int =
     let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
     for l in libs do
-        ws.AddLibrary l (System.IO.File.ReadAllText l)
+        ws.AddLibrary l (readSource l)
     for f in srcs do
-        ws.SetFileText f (System.IO.File.ReadAllText f)
+        ws.SetFileText f (readSource f)
     let wat, errors = ws.EmitProgram ()
     if not (List.isEmpty errors) then
         for e in errors do eprintfn "error: %s" e

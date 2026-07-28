@@ -232,6 +232,25 @@ let noBoxGate =
             Expect.equal out "x\\ny\nc:\\p\"q\nm\tn\n"
                 "triple quoted is literal, verbatim folds \"\", ordinary escapes"
         }
+        test "numeric character escapes name the character they spell" {
+            // only the NAMED escapes were decoded, so `'\\000'` came out as
+            // '0'. The compiler's own lexer guards end-of-input with exactly
+            // that literal, so the compiler compiled its lexer into a test
+            // against the digit zero — and then rejected every char literal
+            // in its own sources.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    print (string (int '\\000'))"
+                    "    print (string (int '\\0'))"
+                    "    print (string (int '\\065'))"
+                    "    print (string (int '\\x41'))"
+                    "    print (string (int '\\n'))"
+                    "    print \"a\\065b\""
+                    "" ])
+            Expect.equal out "0\n0\n65\n65\n10\naAb\n" "decimal, hex and named escapes all decode"
+        }
     ]
 
 [<Tests>]

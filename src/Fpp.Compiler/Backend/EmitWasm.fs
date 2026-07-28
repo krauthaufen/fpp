@@ -490,6 +490,51 @@ let emit (decls : Decl list) : EmitResult =
         vecAdd strings bytes
         vecLen strings - 1
 
+    /// The escape starting at `i` (which is a backslash) as a code point and
+    /// the number of characters it spans. F# spells a byte three ways —
+    /// `\DDD` decimal, `\xHH` hex, and the named ones — and two more for a
+    /// code point, `\uXXXX` and `\UXXXXXXXX`. Only the named ones were
+    /// handled: `'\000'` came out as '0', which is how the compiler compiled
+    /// its OWN lexer's end-of-input guard into a test against the digit zero
+    /// and then rejected every char literal in its own sources.
+    let escapeAt (s : string) (i : int) : int * int =
+        let at k = if i + k < strLen s then charAt s (i + k) else '\000'
+        let hexVal (c : char) =
+            if c >= '0' && c <= '9' then int c - 48
+            elif c >= 'a' && c <= 'f' then int c - 87
+            elif c >= 'A' && c <= 'F' then int c - 55
+            else -1
+        let hexRun (start : int) (count : int) =
+            let mutable v = 0
+            let mutable k = 0
+            let mutable ok = true
+            while ok && k < count do
+                let d = hexVal (at (start + k))
+                if d < 0 then ok <- false else v <- v * 16 + d
+                k <- k + 1
+            if ok then Some v else None
+        match at 1 with
+        | 'n' -> 10, 2
+        | 't' -> 9, 2
+        | 'r' -> 13, 2
+        | 'a' -> 7, 2
+        | 'b' -> 8, 2
+        | 'f' -> 12, 2
+        | 'v' -> 11, 2
+        | '\\' -> 92, 2
+        | '"' -> 34, 2
+        | '\'' -> 39, 2
+        | 'x' -> (match hexRun 2 2 with Some v -> v, 4 | None -> int (at 1), 2)
+        | 'u' -> (match hexRun 2 4 with Some v -> v, 6 | None -> int (at 1), 2)
+        | 'U' -> (match hexRun 2 8 with Some v -> v, 10 | None -> int (at 1), 2)
+        | c when c >= '0' && c <= '9' ->
+            // the decimal trigraph, and `\0` on its own is NUL
+            if isDigit (at 2) && isDigit (at 3) then
+                ((int (at 1) - 48) * 100 + (int (at 2) - 48) * 10 + (int (at 3) - 48)) % 256, 4
+            elif c = '0' then 0, 2
+            else int c, 2
+        | c -> int c, 2
+
     let unescape (raw : string) : string =
         // raw includes the surrounding quotes, and there are three spellings.
         // Treating them all as `"..."` took two characters off each end of a
@@ -522,21 +567,32 @@ let emit (decls : Decl list) : EmitResult =
         while i < strLen inner do
             let c = charAt inner i
             if c = '\\' && i + 1 < strLen inner then
-                (match charAt inner (i + 1) with
-                 | 'n' -> sbAdd out (string '\n')
-                 | 't' -> sbAdd out (string '\t')
-                 | 'r' -> sbAdd out (string '\r')
-                 | '\\' -> sbAdd out (string '\\')
-                 | '"' -> sbAdd out (string '"')
-                 | '\'' -> sbAdd out (string '\'')
-                 | o -> sbAdd out (string o))
-                i <- i + 2
+                let code, width = escapeAt inner i
+                // a code point above ASCII is UTF-8, because a string IS a
+                // byte sequence here; a `\DDD` or `\xHH` escape names ONE
+                // byte and `escapeAt` already keeps it under 256
+                if code < 128 then sbAdd out (string (char code))
+                elif width > 2 && (charAt inner (i + 1) = 'u' || charAt inner (i + 1) = 'U') then
+                    if code < 2048 then
+                        sbAdd out (string (char (192 ||| (code / 64))))
+                        sbAdd out (string (char (128 ||| (code % 64))))
+                    else
+                        sbAdd out (string (char (224 ||| (code / 4096))))
+                        sbAdd out (string (char (128 ||| ((code / 64) % 64))))
+                        sbAdd out (string (char (128 ||| (code % 64))))
+                else sbAdd out (string (char code))
+                i <- i + width
             else
                 sbAdd out (string c)
                 i <- i + 1
         sbText out
 
     let charCode (raw : string) : int =
+        // a char literal is ONE code point, and reading it out of the
+        // unescaped text would take only the first byte of a multi-byte one
+        let inner = substr raw 1 (strLen raw - 2)
+        if strLen inner > 1 && charAt inner 0 = '\\' then fst (escapeAt inner 0)
+        else
         let s = unescape raw
         if strLen s > 0 then int (charAt s 0) else 0
 

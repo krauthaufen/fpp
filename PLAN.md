@@ -1698,3 +1698,17 @@ of producing a module the assembler rejects thousands of lines later.
 - **Knot-tying** was a real bug and IS fixed: `$patchself`/`$patchmark`
   scanned only the flat array, so a recursive function reached through a
   partial application kept its own marker. It was not this trap.
+
+### Stage 3: the compiler as its own corpus
+`dotnet fsi tests/bootstrap/fixpoint.fsx self` makes the corpus the COMPILER —
+its twenty sources plus the driver, under the same served names stage-1 was
+built from. Stage-0's answer for that corpus therefore IS stage-1's own text,
+so the run asks one question: does the compiler, running as wasm, reproduce
+itself byte for byte? That is self-hosting; the single-file corpus only ever
+showed that the two stages agree on a program neither of them is.
+
+Source names are SERVED names (basenames) on both sides now. A file's name
+reaches the .wat through diagnostics and symbol prefixes, so naming a source
+by absolute path in stage-1 and by basename in the host made the two stages
+differ for no reason — and it made the emitted compiler depend on where the
+checkout lives.
