@@ -27,8 +27,13 @@ let emit (decls : Decl list) : EmitResult =
     let mutable currentRetKind = "u"
     let emitError (msg : string) =
         vecAdd errors (if currentFn = "" then msg else msg + " [in " + currentFn + "]")
-    let sb = sbNew ()
-    let line (s : string) = sbAddLine sb s
+    // the MODULE buffer: every line of output appends here. One buffer,
+    // one final string — the Builder's chunk list and its closing concat
+    // are gone along with the per-node string world.
+    let modOut = WasmBinary.bytesNew ()
+    let line (s : string) =
+        WasmBinary.emitStr modOut s
+        WasmBinary.emitByte modOut 10
 
     // ---- program shape ----------------------------------------------------
 
@@ -845,15 +850,14 @@ let emit (decls : Decl list) : EmitResult =
     // so the hash only has to be stable and cheap (see the seam's RefMap)
     let rec compileInto (bb : WasmBinary.Bytes) (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                     (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : unit =
-        // THE append path — and there is exactly ONE case list, in
-        // `compileExprInner`. It runs here in SKELETON MODE: children come
-        // back as placeholder tokens, the literal runs append directly, and
-        // each child compiles at its token position through this same
-        // function. Early versions duplicated the hot cases here as native
-        // append code; that halved the copying but meant every case existed
-        // twice, and the two drifted. One list, one behavior, both worlds.
+        // THE emitter — and there is exactly ONE case list, in
+        // `nodeSkeleton`. A node's case renders its own literal text with
+        // children as placeholder tokens; this replay appends the literal
+        // runs and compiles each child at its token position. Early versions
+        // duplicated hot cases here as native append code — half the copying,
+        // but every case existed twice and the two drifted. One list.
         let kids = vecNew<Expr * bool> ()
-        let skel = compileExprInner locals extraLocals freeEnv tail (Some kids) e
+        let skel = nodeSkeleton locals extraLocals freeEnv tail kids e
         let n = strLen skel
         let mutable i = 0
         let mutable lit = 0
@@ -880,8 +884,8 @@ let emit (decls : Decl list) : EmitResult =
         compileInto bb locals extraLocals freeEnv tail e
         bytesString (WasmBinary.bytesToArray bb)
 
-    and compileExprInner (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
-                        (freeEnv : Dict<string * int, int>) (tail : bool) (sink : Vec<Expr * bool> option)
+    and nodeSkeleton (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+                        (freeEnv : Dict<string * int, int>) (tail : bool) (sink : Vec<Expr * bool>)
                         (e : Expr) : string =
         // SKELETON MODE (`sink` set): `recur` returns a placeholder token
         // (\001 idx \002) and records the child instead of compiling it,
@@ -890,11 +894,8 @@ let emit (decls : Decl list) : EmitResult =
         // into the buffer and compiles children at token positions. One
         // structure; no case exists twice.
         let child (t : bool) (x : Expr) : string =
-            match sink with
-            | Some v ->
-                vecAdd v (x, t)
-                string (char 1) + string (vecLen v - 1) + string (char 2)
-            | None -> compileToText locals extraLocals freeEnv t x
+            vecAdd sink (x, t)
+            string (char 1) + string (vecLen sink - 1) + string (char 2)
         let recur = child false
         let recurT = child tail
         let newTypedLocal (base_ : string) (ty : string) : string =
@@ -4096,4 +4097,4 @@ TUPLE_CMP
             changed <- didChange
         t
 
-    { Wat = peephole (sbText sb); Errors = vecToList errors }
+    { Wat = peephole (bytesString (WasmBinary.bytesToArray modOut)); Errors = vecToList errors }
