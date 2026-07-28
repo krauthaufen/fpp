@@ -1829,3 +1829,27 @@ and every integer boxed through i31. Getting materially below this means
 
 All three together plausibly land near 20-25s. Six seconds would mean beating
 the native .NET build while running inside wasm, and is not reachable.
+
+### Why the hosted build is ~6.6x the native one
+Not the format. wasm itself lands within ~2x of native for C; the gap here is
+what WE emit, measured against what .NET brings:
+
+- **Uniform boxing.** Every integer is `anyref`, tagged into i31 and untagged
+  on use — `toi`/`ofi` are ~10% of the run and simply do not exist in the
+  .NET build, where F# emits `int32` locals and RyuJIT keeps them in
+  registers. Every field read is a `ref.cast` for the same reason.
+- **No inlining, anywhere.** Every `dictTryFind`, accessor and `recur` is a
+  real call. RyuJIT inlines, devirtualises, and eliminates bounds checks.
+- **Hand-rolled collections and strings** against a tuned BCL: `equal` +
+  `compareOrdinalAt` + `hashv` ~7%, `strcat` 10%, GC 12.6%.
+
+A thing that was tried and did NOT work, recorded so it is not retried:
+caching each entry's hash in `Dict` measured FLAT. The reasoning was wrong —
+at a load factor under a half a probe almost always hits the right entry
+first, and the key comparison that follows CONFIRMS the hit, so it cannot be
+skipped. A stored hash only saves work on collisions, which are rare. It was
+kept anyway because rehashing no longer recomputes hashes, but it buys
+nothing on lookups.
+
+The gap is therefore uniform boxing first, inlining second. Neither is a
+tweak.
