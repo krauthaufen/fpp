@@ -1403,7 +1403,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Classify and lower a LetDecl node.
     and lowerLetParts (n : GreenNode) : LetShape option =
-        let isRec = tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "rec")
+        // `and g ...` continues a `let rec` group: the `rec` sits on the
+        // group's FIRST member, but every member of it is recursive
+        let isRec =
+            tokensOf n
+            |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "rec" || t.Text = "and"))
         let hasIn = tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "in")
         let mutable seenEq = false
         let before = vecNew<Green> ()

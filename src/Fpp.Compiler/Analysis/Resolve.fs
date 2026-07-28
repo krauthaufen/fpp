@@ -196,28 +196,57 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     /// so every sibling's name is bound before any body in the group is
     /// walked. Keyed by the index of the group's first declaration; the
     /// bindings are value-equal to what walkTypeDecl registers later.
+    /// The name a SIMPLE `let` binding introduces — the first `IdentPat`
+    /// child, which is the binding's own name (its parameters follow it).
+    /// None for a destructuring binding, which never forms an `and` group.
+    let letNameToken (children : Green list) : Token option =
+        children
+        |> List.tryPick (fun c ->
+            match c with
+            | GNode p when p.NodeKind = IdentPat ->
+                (match p.Children with
+                 | [ GToken t ] when t.Kind = Ident -> Some t
+                 | _ -> None)
+            | _ -> None)
+
+    /// Names an `and` group must have in scope BEFORE any of its members is
+    /// walked, keyed by the index of the member that opens the group. Both
+    /// `type A ... and B ...` and `let rec f ... and g ...`: a member's body
+    /// is walked when that member is reached, so a forward reference to a
+    /// sibling has nothing to resolve against otherwise — and an unresolved
+    /// name is not a diagnostic, so it fails silently and only surfaces as an
+    /// `EUnknown` at emission.
     let andGroupBindings (children : Green list) : Dict<int, (string * Definition) list> =
         let m = dictNew<int, (string * Definition) list> ()
         let arr = Array.ofList children
-        let isTypeDecl (g : Green) = match g with GNode n -> n.NodeKind = TypeDecl | _ -> false
+        let groupKind (g : Green) =
+            match g with
+            | GNode n when n.NodeKind = TypeDecl -> "type"
+            | GNode n when n.NodeKind = LetDecl -> "let"
+            | _ -> ""
         let startsWithAnd (g : Green) =
             match Green.tokens g |> List.tryHead with
             | Some t -> t.Kind = Keyword && t.Text = "and"
             | None -> false
         let mutable i = 0
         while i < arr.Length do
-            if isTypeDecl arr.[i] && not (startsWithAnd arr.[i]) then
+            let kind = groupKind arr.[i]
+            if kind <> "" && not (startsWithAnd arr.[i]) then
                 let mutable j = i + 1
-                while j < arr.Length && isTypeDecl arr.[j] && startsWithAnd arr.[j] do j <- j + 1
+                while j < arr.Length && groupKind arr.[j] = kind && startsWithAnd arr.[j] do j <- j + 1
                 if j - i > 1 then
+                    let defKind = if kind = "type" then DefType else DefLet
                     let binds =
                         [ i .. j - 1 ]
                         |> List.choose (fun k ->
                             match arr.[k] with
                             | GNode n ->
-                                (match firstIdentToken n.Children with
+                                let tok =
+                                    if kind = "type" then firstIdentToken n.Children
+                                    else letNameToken n.Children
+                                (match tok with
                                  | Some t ->
-                                     Some (t.Text, { Name = t.Text; Kind = DefType; Path = path
+                                     Some (t.Text, { Name = t.Text; Kind = defKind; Path = path
                                                      Offset = t.Offset; Length = strLen t.Text })
                                  | None -> None)
                             | GToken _ -> None)
@@ -225,6 +254,38 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 i <- j
             else i <- i + 1
         m
+
+    /// LetDecl offset -> the names of the `and` group it belongs to. A local
+    /// group is registered by the block that contains it and applied by
+    /// `walkLet` when it reaches each member, which is what puts a sibling in
+    /// scope for a body walked BEFORE that sibling is bound.
+    let groupBinds = dictNew<int, Definition list> ()
+
+    /// The env a sibling at `idx` is walked in: if an `and` group opens here,
+    /// every member's name goes in scope first. Only the env is touched —
+    /// each definition is still recorded when its own member is walked, and
+    /// the entry made here is the value `define` builds there, so they agree.
+    let openAndGroup (groups : Dict<int, (string * Definition) list>) (idx : int) (env : Env) : Env =
+        let mutable e = env
+        (match dictTryFind groups idx with
+         | Some binds ->
+             for nm, d in binds do
+                 // a type also answers to its type-namespace key; a value never does
+                 let withValue = Map.add nm d e
+                 if d.Kind = DefType then e <- Map.add (typeKey nm) d withValue
+                 else e <- withValue
+         | None -> ())
+        e
+
+    /// Record every `and` group among `children` against each of its members
+    /// (a group's bindings carry their own name-token offsets, which is the
+    /// key `walkLet` looks itself up by). Returns nothing: a block only
+    /// reports what it saw, and `walkLet` does the scoping.
+    let noteAndGroups (children : Green list) : unit =
+        for _, binds in dictPairs (andGroupBindings children) do
+            let ds = List.map snd binds
+            for d in ds do
+                dictSet groupBinds d.Offset ds
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
@@ -463,6 +524,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 env
             | BraceExpr -> env
             | BlockExpr ->
+                // a local `let rec f ... and g ...`: register the group's
+                // names against each member, so `walkLet` has them in scope
+                // for every body. Recording is all that happens here — see
+                // `groupBinds`
+                noteAndGroups n.Children
                 let mutable e = env
                 for c in n.Children do e <- walkExpr e c
                 env
@@ -477,7 +543,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     // ---- declarations -----------------------------------------------------
 
     and walkLet (env : Env) (n : GreenNode) : Env =
-        let isRec = hasKwChild "rec" n.Children
+        // `and g ...` continues a `let rec` group: the `rec` keyword sits on
+        // the group's FIRST member, but every member of it is recursive — and
+        // sees the whole group, not just itself
+        let isRec = hasKwChild "rec" n.Children || hasKwChild "and" n.Children
         let exportHere = atExportLevel
         let mutable seenEq = false
         let before = vecNew<Green> ()
@@ -523,8 +592,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 let envAll = List.fold (bindPat DefLet) env pats
                 defsBound <- vecLen defs
                 local (fun () ->
+                    let mutable here = env
                     for c in vecToList after do
-                        walkExpr env c |> ignore)
+                        match c with
+                        | GToken t when t.Kind = Keyword && t.Text = "in" -> here <- envAll
+                        | c -> walkExpr here c |> ignore)
                 envAll
             else
                 match pats with
@@ -532,11 +604,29 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 | namePat :: paramPats ->
                     let envWithName = bindPat DefLet env namePat
                     defsBound <- vecLen defs
-                    let bodyBase = if isRec then envWithName else env
+                    // a member of a local `let rec f ... and g ...`: the whole
+                    // group is in scope for this body, siblings included, and
+                    // a sibling defined LATER is exactly what `and` is for
+                    // a member of a local `let rec f ... and g ...`: the whole
+                    // group is in scope for this body, and a sibling defined
+                    // LATER is exactly what `and` is for
+                    let groupNames =
+                        match letNameToken (vecToList before) with
+                        | Some nt ->
+                            (match dictTryFind groupBinds nt.Offset with
+                             | Some binds -> binds
+                             | None -> [])
+                        | None -> []
+                    let envGroup =
+                        List.fold (fun (acc : Env) (d : Definition) -> Map.add d.Name d acc)
+                            envWithName groupNames
+                    let bodyBase = if isRec then envGroup else env
                     local (fun () ->
-                        let bodyEnv = List.fold (bindPat DefParam) bodyBase paramPats
+                        let mutable here = List.fold (bindPat DefParam) bodyBase paramPats
                         for c in vecToList after do
-                            walkExpr bodyEnv c |> ignore)
+                            match c with
+                            | GToken t when t.Kind = Keyword && t.Text = "in" -> here <- envWithName
+                            | c -> walkExpr here c |> ignore)
                     envWithName
         if exportHere then
             for i in defsBefore .. defsBound - 1 do
@@ -808,11 +898,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 let groups = andGroupBindings n.Children
                 let mutable idx = 0
                 for c in n.Children do
-                    (match dictTryFind groups idx with
-                     | Some binds ->
-                         for nm, d in binds do
-                             inner <- Map.add nm d (Map.add (typeKey nm) d inner)
-                     | None -> ())
+                    inner <- openAndGroup groups idx inner
                     (match c with
                      | GNode _ -> inner <- walkDecl inner c
                      | GToken _ -> ())
@@ -856,11 +942,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let rootGroups = andGroupBindings root.Children
     let mutable rootIdx = 0
     for c in root.Children do
-        (match dictTryFind rootGroups rootIdx with
-         | Some binds ->
-             for nm, d in binds do
-                 env <- Map.add nm d (Map.add (typeKey nm) d env)
-         | None -> ())
+        env <- openAndGroup rootGroups rootIdx env
         env <- walkDecl env c
         rootIdx <- rootIdx + 1
 

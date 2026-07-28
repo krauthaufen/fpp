@@ -342,3 +342,129 @@ let capturedMutableTests =
             Expect.equal withLoop baseline "no cell where nothing captures"
         }
     ]
+
+[<Tests>]
+let mutualRecursionTests =
+    // `and` binds a GROUP: every member's body sees every member's name, and
+    // an unresolved name is not a diagnostic, so a miss here is silent until
+    // emission. Local groups additionally need their knot tied at runtime —
+    // each member is built over a marker standing for its siblings.
+    testList "mutually recursive bindings" [
+        test "a top-level let rec ... and group" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let rec even (k : int) : bool ="
+                    "    if k = 0 then true else odd (k - 1)"
+                    "and odd (k : int) : bool ="
+                    "    if k = 0 then false else even (k - 1)"
+                    "let p = print (string (even 10) + \" \" + string (odd 10))"
+                    "" ])
+            Expect.equal out "True False\n" "the forward reference resolves"
+        }
+        test "a LOCAL let rec ... and group" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let outer (n : int) : int ="
+                    "    let rec even (k : int) : bool ="
+                    "        if k = 0 then true else odd (k - 1)"
+                    "    and odd (k : int) : bool ="
+                    "        if k = 0 then false else even (k - 1)"
+                    "    if even n then 1 else 0"
+                    "let p = print (string (outer 10) + string (outer 7))"
+                    "" ])
+            Expect.equal out "10\n" "closures see each other once the knot is tied"
+        }
+        test "a three-member group closing over the enclosing frame" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let classify (limit : int) (start : int) : string ="
+                    "    let tag = \"<\" + string limit + \">\""
+                    "    let rec down (k : int) : string ="
+                    "        if k <= 0 then \"done\" + tag"
+                    "        elif k > limit then down (k - 1)"
+                    "        else across k"
+                    "    and across (k : int) : string ="
+                    "        if k % 2 = 0 then up (k - 1) else down (k - 1)"
+                    "    and up (k : int) : string ="
+                    "        if k <= 0 then \"up\" + tag else across k"
+                    "    down start"
+                    "let a = print (classify 3 9)"
+                    "" ])
+            Expect.equal out "done<3>\n" "every member sees the others and the capture"
+        }
+        test "a group member used as a value, and nested groups" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let pick (n : int) : int ="
+                    "    let rec f (k : int) : int = if k = 0 then 0 else g (k - 1)"
+                    "    and g (k : int) : int = if k = 0 then 1 else f (k - 1)"
+                    "    let apply (h : int -> int) (x : int) : int = h x"
+                    "    apply f n + apply g n"
+                    "let nested (n : int) : int ="
+                    "    let rec outerA (k : int) : int ="
+                    "        let rec innerA (j : int) : int = if j = 0 then 0 else innerB (j - 1) + 1"
+                    "        and innerB (j : int) : int = if j = 0 then 100 else innerA (j - 1)"
+                    "        if k = 0 then innerA 3 else outerB (k - 1)"
+                    "    and outerB (k : int) : int = outerA k"
+                    "    outerA n"
+                    "let c = print (string (pick 4) + \" \" + string (nested 2))"
+                    "" ])
+            Expect.equal out "1 102\n" "a member passed as a value is the patched closure"
+        }
+        test "a group whose members write a captured mutable" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let counts (xs : int list) : string ="
+                    "    let mutable evens = 0"
+                    "    let mutable odds = 0"
+                    "    let rec goE (ys : int list) : unit ="
+                    "        match ys with"
+                    "        | [] -> ()"
+                    "        | _ :: rest ->"
+                    "            evens <- evens + 1"
+                    "            goO rest"
+                    "    and goO (ys : int list) : unit ="
+                    "        match ys with"
+                    "        | [] -> ()"
+                    "        | _ :: rest ->"
+                    "            odds <- odds + 1"
+                    "            goE rest"
+                    "    goE xs"
+                    "    string evens + \"/\" + string odds"
+                    "let e = print (counts [ 1; 2; 3; 4; 5 ])"
+                    "" ])
+            Expect.equal out "3/2\n" "cells and the rec-group knot coexist"
+        }
+    ]
+
+[<Tests>]
+let letInScopeTests =
+    testList "let ... in scoping" [
+        test "the in-body sees the binding" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let f (xs : int list) : bool ="
+                    "    match xs with"
+                    "    | [] -> false"
+                    "    | x :: _ -> (let n = x + 1 in n > 3 && n < 10)"
+                    "let a = print (string (f [ 5 ]) + \" \" + string (f [ 1 ]))"
+                    "" ])
+            Expect.equal out "True False\n" "n is in scope after `in`"
+        }
+        test "an in-bound function is callable in the body" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let g (y : int) : int ="
+                    "    (let h (z : int) : int = z * 2 in h y + h 1)"
+                    "let b = print (string (g 5))"
+                    "" ])
+            Expect.equal out "12\n" "the binding, not its parameters, is what the body sees"
+        }
+    ]

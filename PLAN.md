@@ -818,19 +818,41 @@ Four gaps closed on the way:
 parsedrive.fpp` (parses a source string with the emitted parser, prints a
 paren/dot shape fingerprint of the tree, the round-trip witness and the
 diagnostics, and does it again for deliberately broken input) does not emit
-yet. It was 102 errors from exactly two causes; the second is fixed, so 93
-remain, all of them the first.
+yet — it does now. It was 102 errors from exactly two causes, and both are
+fixed.
 
-- **Mutually recursive LOCAL functions.** `let rec even ... and odd ...`
-  inside a function: `odd` is unresolved at its use inside `even`, so
-  lowering emits `EUnknown` and the emitter reports "unknown name reaches
-  emission: odd". Top level works only because globals are resolved by name
-  regardless of order. Locals lower to NESTED `ELet`s, which gives the
-  second binding sight of the first and never the reverse. Needs sibling
-  scope in `Resolve` for an `and` group, a group form through `Lower`, and
-  the knot tied at emission — the self-marker patch (`$selfmark`, "tie the
-  recursive knot") already does this for ONE closure and generalizes to a
-  group with one marker each.
+- ~~**Mutually recursive functions.**~~ FIXED, and it was never only about
+  locals: `let rec even ... and odd ...` was broken at the TOP level too, so
+  the theory that globals resolve by name regardless of order was wrong.
+  `and` binds a GROUP and nothing put the group in scope, so a forward
+  reference resolved to nothing — silently, because an unresolved name is not
+  a diagnostic; it only surfaced as an `EUnknown` at emission. Three parts:
+  `andGroupBindings` in `Resolve` now covers `let` groups as well as the
+  `type ... and ...` groups it already handled, and `walkLet` counts `and` as
+  recursive, so every member's body sees every member's name; `Lower` counts
+  `and` as recursive too, so each member reaches the emitter as a recursive
+  binding; and the emitter ties the knot for a GROUP, giving each member a
+  freshly allocated marker (distinct identity under `ref.eq`), building every
+  closure over those markers, then replacing each marker with the closure it
+  stood for via `$patchmark` — the generalization of the single-binding
+  `$selfmark`/`$patchself` trick.
+- ~~**`let x = e in body` scoping.**~~ FIXED, found while closing the group
+  work. Everything after `=` is a child of the same node, but the two halves
+  are not in the same scope: the `in` body sees the binding (and not its
+  parameters), the right-hand side does not. `walkLet` walked them alike, so
+  five uses in `Parser.fs` — every `(let n = s.Peek 1 in n.Kind = ...)` —
+  resolved to nothing.
+- ~~**Local let-polymorphism was monomorphized in the lint.**~~ FIXED. The
+  same bug that was fixed for TOP-LEVEL bindings, one scope down: `ELet`
+  stored the binding's monotype and discarded its scheme, so a local generic
+  helper used at two types was pinned by its first use. It stayed invisible
+  while the group fix was missing — `local (fun () -> walkLet env n)` in
+  `Resolve` had an unresolved `walkLet`, so that use demanded nothing of
+  `local`'s `'a`; the moment forward references resolved, `local` was used at
+  both `Env` and `unit` and the lowered core stopped type-checking. A
+  ten-line repro (`let apply (g : unit -> 'a) : 'a = g ()` applied at `int`
+  and `string`) reproduces it away from the compiler entirely. Inference was
+  never wrong here — only the core the lint checks.
 - ~~**A captured mutable local.**~~ FIXED. Mutable locals are wasm locals and
   closure conversion copies free variables BY VALUE, so a closure used to
   write to a copy ("assignment to unknown acc"). A local that is let-bound,
@@ -847,6 +869,13 @@ remain, all of them the first.
 Minimal repros for both, ready to grow into tests, are 12 lines each:
 `let rec even k = if k = 0 then true else odd (k - 1) and odd k = ...` and
 `let counter n = let mutable acc = 0 in let bump k = acc <- acc + k in ...`.
+
+The parser is now gated the way the lexer is: `tests/bootstrap/parsedrive.fpp`
+parses a source string with the EMITTED parser and prints the diagnostics, a
+paren/dot shape fingerprint of the tree, the round-trip witness and node
+counts, then does it all again for deliberately broken input; the Expecto test
+compares that against the same program run by the hosted parser. They agree,
+byte for byte, on both inputs. `Parser.fs` has joined the gated prefix.
 
 **Where the frontier stops without a driver: `Analysis/Types.fs`.** It reaches past the seam
 straight into `System.Collections.Generic` — `HashSet`, `Dictionary`, `List`

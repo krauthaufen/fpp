@@ -587,6 +587,17 @@ let emit (decls : Decl list) : EmitResult =
                 dictSet cellVars k true
     cellScan ()
 
+    /// The maximal run of adjacent recursive lambda bindings at the head of
+    /// `e` — what Lower emits for a `let rec f ... and g ...` group — with
+    /// the body that follows them. Grouping bindings that are NOT mutually
+    /// recursive is harmless: their markers are simply never captured.
+    let rec recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
+        match e with
+        | ELet (true, v, _, (ELam (_, _) as lam), rest) ->
+            let ms, body = recGroupOf rest
+            (v, lam) :: ms, body
+        | _ -> [], e
+
     let boolWat (w : string) = "(ref.i31 " + w + ")"
     let unwrapI32 (w : string) = "(call $toi " + w + ")"
     let intWat (w : string) = "(call $ofi " + w + ")"
@@ -949,6 +960,39 @@ let emit (decls : Decl list) : EmitResult =
             (match curry ps body with
              | ELam ([ (pv, _) ], b) -> compileLambda locals freeEnv pv b recur
              | other -> recur other)
+        | ELet (true, _, _, ELam _, _) when List.length (fst (recGroupOf e)) > 1 ->
+            // a `let rec f ... and g ...` group of local functions. Each
+            // member captures the OTHERS, so no member can be built until
+            // every name has a slot: give each one a freshly allocated marker
+            // (distinct identity, so ref.eq tells them apart), build every
+            // closure over those markers, then replace each marker with the
+            // closure it stood for. Same trick as the single-binding case,
+            // one marker per binding instead of the shared global.
+            let members, groupBody = recGroupOf e
+            let clean (nm : string) = nm |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')
+            let slots =
+                members
+                |> List.map (fun (v, lam) ->
+                    v, lam, newLocal (clean v.Name), newLocal ("mk_" + clean v.Name), newLocal ("cl_" + clean v.Name))
+            // every name is in scope for every body, so bind the slots first
+            for v, _, l, _, _ in slots do dictSet locals (v.Path, v.Offset) l
+            let markers =
+                slots
+                |> List.map (fun (_, _, l, m, _) ->
+                    "(local.set " + m + " (struct.new $du0 (i32.const -999))) (local.set " + l + " (local.get " + m + "))")
+            let builds =
+                slots |> List.map (fun (_, lam, _, _, c) -> "(local.set " + c + " " + recur lam + ")")
+            let installs =
+                slots |> List.map (fun (_, _, l, _, c) -> "(local.set " + l + " (local.get " + c + "))")
+            let patches =
+                slots
+                |> List.collect (fun (_, _, _, _, c) ->
+                    slots
+                    |> List.map (fun (_, _, _, m2, c2) ->
+                        "(call $patchmark (local.get " + c + ") (local.get " + m2 + ") (local.get " + c2 + "))"))
+            "(block (result anyref) "
+            + String.concat " " (markers @ builds @ installs @ patches)
+            + " " + recurT groupBody + ")"
         | ELet (true, v, _, ELam (ps, lbody), body) ->
             // recursive local function: lambda-lift via a self-slot that is
             // patched after construction (env cells are mutable)
@@ -3039,6 +3083,19 @@ TUPLE_HASH
         (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
                     (ref.cast (ref null eq) (global.get $selfmark)))
           (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $c))))
+        (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
+        (br $go))))
+  (func $patchmark (param $c anyref) (param $mark anyref) (param $v anyref)
+    ;; tie one strand of a rec GROUP's knot: in closure $c's environment,
+    ;; whatever slot still holds the marker $mark becomes $v
+    (local $e anyref)
+    (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
+    (block $done
+      (loop $go
+        (br_if $done (i32.eqz (ref.test (ref $cons) (local.get $e))))
+        (if (ref.eq (ref.cast (ref null eq) (struct.get $cons 0 (ref.cast (ref $cons) (local.get $e))))
+                    (ref.cast (ref null eq) (local.get $mark)))
+          (then (struct.set $cons 0 (ref.cast (ref $cons) (local.get $e)) (local.get $v))))
         (local.set $e (struct.get $cons 1 (ref.cast (ref $cons) (local.get $e))))
         (br $go))))
   (func $applyc (param $f anyref) (param $a anyref) (result anyref)

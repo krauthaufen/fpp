@@ -27,7 +27,7 @@ let p4 = print ("width " + string r.Root.Width + " of " + string (strLen src))
 let p5 = print ("tokens " + string (List.length (Green.tokens (GNode r.Root))))
 let p6 = print ("lets " + string (List.length (Green.collectNodes LetDecl (GNode r.Root))))
 let p7 = print ("types " + string (List.length (Green.collectNodes TypeDecl (GNode r.Root))))
-let p8 = print ("cases " + string (List.length (Green.collectNodes MatchCase (GNode r.Root))))
+let p8 = print ("cases " + string (List.length (Green.collectNodes MatchClause (GNode r.Root))))
 let p9 = print ("errors " + string (List.length (Green.collectNodes ErrorNode (GNode r.Root))))
 let p10 = print (shape (GNode r.Root))
 

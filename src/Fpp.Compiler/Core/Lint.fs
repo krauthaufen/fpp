@@ -168,12 +168,19 @@ let lint (decls : Decl list) : string list =
                  | _ -> unifyC "application" ft (TFun (at, res)))
                 ft <- res
             ft
-        | ELet (isRec, v, _, rhs, body) ->
+        | ELet (isRec, v, sch, rhs, body) ->
             let t = st.Fresh ()
             if isRec then dictSet env (keyOf v) t
             let rt = exprType rhs
             unifyC ("let " + v.Name) t rt
             dictSet env (keyOf v) rt
+            // A POLYMORPHIC local is used at several types, and sharing one
+            // monotype across its uses is the same monomorphization that was
+            // fixed for top-level bindings: the first use would pin `'a` and
+            // every other one would disagree. Its own scheme is the general
+            // one, so uses re-instantiate it — recursive uses inside the RHS
+            // stay monomorphic, exactly as above.
+            if not (List.isEmpty sch.Quantified) then dictSet generalized (keyOf v) true
             exprType body
         | EIf (c, t, f) ->
             unifyC "if condition" (exprType c) tBool

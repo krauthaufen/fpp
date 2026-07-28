@@ -19,7 +19,8 @@ let private prefix =
     [ root + "/stdlib/bootstrap.fpp"
       root + "/src/Fpp.Compiler/Syntax/Tokens.fs"
       root + "/src/Fpp.Compiler/Syntax/Tree.fs"
-      root + "/src/Fpp.Compiler/Syntax/Lexer.fs" ]
+      root + "/src/Fpp.Compiler/Syntax/Lexer.fs"
+      root + "/src/Fpp.Compiler/Syntax/Parser.fs" ]
 
 let private runWasm (files : string list) : string =
     let ws = Workspace()
@@ -77,14 +78,44 @@ let private lexOracle (src : string) =
             + string (Syntax.Keywords.isKeyword "matches")
           "" ]
 
-/// The `src` the driver lexes, read out of the driver itself so the two
-/// cannot drift apart.
-let private driverSource () =
-    let text = System.IO.File.ReadAllText (root + "/tests/bootstrap/lexdrive.fpp")
-    let line = text.Split '\n' |> Array.find (fun l -> l.StartsWith "let src = ")
+/// A string literal the driver works on, read out of the driver itself so the
+/// oracle and the wasm program cannot drift apart.
+let private driverLiteral (driver : string) (binding : string) =
+    let text = System.IO.File.ReadAllText (root + "/tests/bootstrap/" + driver)
+    let line = text.Split '\n' |> Array.find (fun l -> l.StartsWith ("let " + binding + " = "))
     let lit = line.Substring (line.IndexOf '"' + 1, line.LastIndexOf '"' - line.IndexOf '"' - 1)
     // the driver's literal is F++ source: undo the escapes it needs
     lit.Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\\\", "\\")
+
+let private driverSource () = driverLiteral "lexdrive.fpp" "src"
+
+// ---- the oracle for the parser driver --------------------------------
+
+let rec private shape (g : Syntax.Green) =
+    match g with
+    | Syntax.GToken _ -> "."
+    | Syntax.GNode n -> "(" + String.concat "" (n.Children |> List.map shape) + ")"
+
+let private parseOracle (src : string) (bad : string) =
+    let r = Syntax.Parser.parse src
+    let rb = Syntax.Parser.parse bad
+    let count k (root : Syntax.GreenNode) =
+        List.length (Syntax.Green.collectNodes k (Syntax.GNode root))
+    String.concat "\n"
+        [ "diagnostics " + string (List.length r.Diagnostics)
+          String.concat "; " (r.Diagnostics |> List.map (fun d -> string d.Offset + ":" + d.Message))
+          (if Syntax.Green.toText (Syntax.GNode r.Root) = src then "roundtrip ok" else "ROUNDTRIP BROKEN")
+          "width " + string r.Root.Width + " of " + string src.Length
+          "tokens " + string (List.length (Syntax.Green.tokens (Syntax.GNode r.Root)))
+          "lets " + string (count Syntax.LetDecl r.Root)
+          "types " + string (count Syntax.TypeDecl r.Root)
+          "cases " + string (count Syntax.MatchClause r.Root)
+          "errors " + string (count Syntax.ErrorNode r.Root)
+          shape (Syntax.GNode r.Root)
+          (if Syntax.Green.toText (Syntax.GNode rb.Root) = bad then "bad roundtrip ok" else "BAD ROUNDTRIP BROKEN")
+          "bad diagnostics " + string (List.length rb.Diagnostics)
+          shape (Syntax.GNode rb.Root)
+          "" ]
 
 [<Tests>]
 let bootstrapTests =
@@ -95,6 +126,12 @@ let bootstrapTests =
         test "the emitted lexer lexes what the hosted one lexes" {
             let out = runWasm (prefix @ [ root + "/tests/bootstrap/lexdrive.fpp" ])
             Expect.equal out (lexOracle (driverSource ())) "emitted lexer disagrees with the hosted one"
+        }
+        test "the emitted parser parses what the hosted one parses" {
+            let out = runWasm (prefix @ [ root + "/tests/bootstrap/parsedrive.fpp" ])
+            let expected =
+                parseOracle (driverLiteral "parsedrive.fpp" "src") (driverLiteral "parsedrive.fpp" "bad")
+            Expect.equal out expected "emitted parser disagrees with the hosted one"
         }
         test "the emitted bootstrap prelude behaves like the .NET seam" {
             let out = runWasm [ root + "/stdlib/bootstrap.fpp"
