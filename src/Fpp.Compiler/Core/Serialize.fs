@@ -17,27 +17,29 @@ type Sx =
     | S of string          // string literal
     | L of Sx list
 
-let rec private wr (sb : System.Text.StringBuilder) (x : Sx) =
+// chunks, joined once: appending to a string would be quadratic, and a
+// builder is not part of the seam
+let rec private wr (sb : Vec<string>) (x : Sx) =
     match x with
-    | A a -> sb.Append a |> ignore
+    | A a -> vecAdd sb a
     | S s ->
-        sb.Append '"' |> ignore
+        vecAdd sb "\""
         for c in s do
-            if c = '"' || c = '\\' then sb.Append('\\').Append(c) |> ignore
-            elif c = '\n' then sb.Append "\\n" |> ignore
-            else sb.Append c |> ignore
-        sb.Append '"' |> ignore
+            if c = '"' || c = '\\' then vecAdd sb ("\\" + string c)
+            elif c = '\n' then vecAdd sb "\\n"
+            else vecAdd sb (string c)
+        vecAdd sb "\""
     | L xs ->
-        sb.Append '(' |> ignore
+        vecAdd sb "("
         xs |> List.iteri (fun i x ->
-            if i > 0 then sb.Append ' ' |> ignore
+            if i > 0 then vecAdd sb " "
             wr sb x)
-        sb.Append ')' |> ignore
+        vecAdd sb ")"
 
 let toText (x : Sx) : string =
-    let sb = System.Text.StringBuilder()
+    let sb = vecNew<string> ()
     wr sb x
-    sb.ToString()
+    String.concat "" (vecToList sb)
 
 let parse (text : string) : Sx =
     let n = strLen text
@@ -58,18 +60,18 @@ let parse (text : string) : Sx =
             L (vecToList items)
         elif charAt text i = '"' then
             i <- i + 1
-            let sb = System.Text.StringBuilder()
+            let sb = vecNew<string> ()
             while i < n && charAt text i <> '"' do
                 if charAt text i = '\\' && i + 1 < n then
                     (match charAt text (i + 1) with
-                     | 'n' -> sb.Append '\n' |> ignore
-                     | c -> sb.Append c |> ignore)
+                     | 'n' -> vecAdd sb "\n"
+                     | c -> vecAdd sb (string c))
                     i <- i + 2
                 else
-                    sb.Append (charAt text i) |> ignore
+                    vecAdd sb (string (charAt text i))
                     i <- i + 1
             i <- i + 1
-            S (sb.ToString())
+            S (String.concat "" (vecToList sb))
         else
             let start = i
             while i < n && charAt text i <> ' ' && charAt text i <> ')' && charAt text i <> '(' && charAt text i <> '\n' && charAt text i <> '\r' && charAt text i <> '\t' do i <- i + 1

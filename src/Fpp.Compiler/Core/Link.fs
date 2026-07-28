@@ -164,16 +164,18 @@ let stampRecords (decls : Decl list) : Decl list =
                 let baseName = name.Substring (0, i)
                 let inner = name.Substring (i + 2, name.Length - i - 3)
                 let args = vecNew<string> ()
-                let cur = System.Text.StringBuilder()
+                // chunks joined per argument: a builder is not part of the
+                // seam, and string append would be quadratic
+                let cur = vecNew<string> ()
                 let mutable depth = 0
                 for c in inner do
-                    if c = '<' then depth <- depth + 1; cur.Append c |> ignore
-                    elif c = '>' then depth <- depth - 1; cur.Append c |> ignore
+                    if c = '<' then depth <- depth + 1; vecAdd cur (string c)
+                    elif c = '>' then depth <- depth - 1; vecAdd cur (string c)
                     elif c = '.' && depth = 0 then
-                        vecAdd args (cur.ToString ())
-                        cur.Clear () |> ignore
-                    else cur.Append c |> ignore
-                if cur.Length > 0 then vecAdd args (cur.ToString ())
+                        vecAdd args (String.concat "" (vecToList cur))
+                        vecClear cur
+                    else vecAdd cur (string c)
+                if vecLen cur > 0 then vecAdd args (String.concat "" (vecToList cur))
                 Some (baseName, vecToList args)
         let stamped = vecNew<Decl> ()
         for name, _ in dictPairs used do

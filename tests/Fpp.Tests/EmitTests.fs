@@ -528,3 +528,31 @@ let qualifiedCasePatternTests =
             Expect.equal out "on\noff\n" "qualified nullary cases select correctly"
         }
     ]
+
+[<Tests>]
+let stringForInTests =
+    // `for c in s` walks a string by index, like an array — the emitter's
+    // "$str" sentinel is the marker, so no new backend machinery.
+    testList "for-in over a string" [
+        test "iterating a string yields its characters" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let count (s : string) : int ="
+                    "    let mutable n = 0"
+                    "    for c in s do"
+                    "        if c = 'a' then n <- n + 1"
+                    "    n"
+                    "let esc (s : string) : string ="
+                    "    let mutable acc = \"\""
+                    "    for c in s do"
+                    "        if c = '\"' then acc <- acc + \"\\\\\" + string c"
+                    "        else acc <- acc + string c"
+                    "    acc"
+                    "let r1 = print (string (count \"banana\"))"
+                    "let r2 = print (esc \"say \\\"hi\\\"\")"
+                    "let r3 = print (string (count \"\"))"
+                    "" ])
+            Expect.equal out "3\nsay \\\"hi\\\"\n0\n" "characters in order, empty string safe"
+        }
+    ]

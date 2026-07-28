@@ -950,9 +950,22 @@ Three gaps fell out on the way:
   on the prefix, and lowering read the name from the prefix too. All three
   layers now take the LAST segment, which is where the case actually is.
 
-The frontier is 13 of 20 files: through `Parser`, `Resolve`, `Types`,
-`Format`, `Classes`, `Infer`, `Core`, `Lower` and `Lint`. Next wall is one
-for-in note in `Core/Serialize.fs`.
+Then two more, and the frontier reached 14:
+
+- **`for c in s` over a string** now walks by index like an array. Inference
+  records the `"$str"` sentinel the emitter already reads for a string
+  receiver, so the existing array lowering does the rest — no backend
+  change.
+- **`System.Text.StringBuilder` in `Serialize.fs` and `Link.fs`** joined the
+  other builders behind the seam as a `Vec<string>` concatenated once.
+
+The frontier is 14 of 20 files: through `Parser`, `Resolve`, `Types`,
+`Format`, `Classes`, `Infer`, `Core`, `Lower`, `Lint` and `Serialize`. The
+next wall is `Core/Link.fs`, and it is the LIST COMPREHENSION gap — the one
+deliberately deferred at stage 0. Six sites remain, in `Link.fs` and
+`EmitWasm.fs`; lowering `for`/`if`/`yield` into a Vec accumulation is the
+fix, and it is now the single largest thing between here and a compiler that
+emits all of itself.
 
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they

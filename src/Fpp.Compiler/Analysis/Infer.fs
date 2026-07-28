@@ -1869,6 +1869,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
                            | Some ip -> unify (patType fvars ip) e |> ignore
                            | None -> ())
+                      | TCon ("string", []) ->
+                          // `for c in s`: a string is walked by index, like
+                          // an array. The "$str" sentinel is the marker the
+                          // emitter already reads for a string receiver, so
+                          // the array lowering does the rest
+                          (match Green.tokens (GNode coll) |> List.tryHead with
+                           | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
+                           | None -> ())
+                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                           | Some ip -> unify (patType fvars ip) tChar |> ignore
+                           | None -> ())
                       | TCon (tn, _) when tn <> "string" ->
                           // the enumerator protocol: three member accesses
                           // that have no tokens of their own, parked at
