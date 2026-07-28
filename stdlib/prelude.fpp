@@ -638,6 +638,12 @@ type KeyValuePair<'K, 'V>(key : 'K, value : 'V) =
 // ---- the identity function ----
 let id (x : 'a) : 'a = x
 
+// Boxing is a TYPE-level operation here: every value is already a reference
+// at runtime, so both of these lower to their argument. `obj` is the top
+// type the subtyping check already knows.
+extern let box : 'a -> obj
+extern let unbox : obj -> 'a
+
 // ---- Option: the F# Option module ----
 module Option =
     let isSome (o : 'a option) : bool = match o with Some _ -> true | None -> false

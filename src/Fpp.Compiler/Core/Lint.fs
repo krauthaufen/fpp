@@ -24,9 +24,15 @@ let lint (decls : Decl list) : string list =
         vecAdd errors (ctx + ": " + msg)
 
     let unifyC (ctx : string) (a : Type) (b : Type) : unit =
-        match unify a b with
-        | Some msg -> fail ctx msg
-        | None -> ()
+        // `obj` is the top type: anything widens to it, and `unbox` narrows
+        // back out of it. The unifier has no notion of subtyping, so the one
+        // place it matters is allowed here rather than weakening unification
+        let isObj (t : Type) = match prune t with TCon ("obj", []) -> true | _ -> false
+        if isObj a || isObj b then ()
+        else
+            match unify a b with
+            | Some msg -> fail ctx msg
+            | None -> ()
 
     /// Instantiate with ALL variables freshened — schemes come from another
     /// inference run and must not leak links into the lint world.

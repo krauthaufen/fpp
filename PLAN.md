@@ -1053,8 +1053,80 @@ Two smaller things fell out of the same push:
   value, so the honest fix is a new `Pat` case — worth doing when a second
   site wants it.
 
-`Workspace`/`Project` still need the host-import surface decided
-separately; file IO is not a string function.
+### The frontier reaches 17 of 20, and stops on the stamper
+`Link`, `Plugins` and `EmitWasm` — the whole backend — emit now. Four more
+gaps closed on the way:
+
+- **`for _ in 1 .. n`** — a wildcard binder in a range loop. The loop still
+  needs a counter, so the binder gets a synthetic variable; before, the
+  range branch only matched a named binder and the loop fell through to "no
+  GetEnumerator". Four sites in `EmitWasm` alone.
+- **`box`/`unbox`** are type-level here: every value is already a reference,
+  so both lower to their argument. `obj` was already the top type in the
+  subtyping check; it is a real type in the prelude now.
+- **The core lint had to learn `obj`.** Once `box` typed properly, the lint
+  read `string` against `obj` as a mismatch — the unifier has no subtyping.
+  Allowed at that one place rather than weakening unification.
+- **`Option`** (map, bind, filter, forall, exists, iter, isSome, isNone,
+  defaultValue, toList) and **`id`** joined the prelude.
+
+**Where it stops: `Query.fs`, and the cause is the stamper.** A generic
+function cannot be specialized at a TUPLE type argument. Eight lines:
+
+    let table : Dict<string * string, obj> = dictNew ()
+    let a = dictSet table ("s", "a") (box 1)
+
+gives "cannot specialize 'dictNew': element layout is not statically known
+here". `Db` holds exactly that — `Dict<QueryKey, Entry>` with
+`QueryKey = string * string` — so the query engine cannot be stamped.
+
+Two things to fix, and the second is the worse one:
+
+1. A tuple has no static layout name, so it cannot drive specialization.
+   Arrays already solved this: a tuple element is a UNIFORM reference and
+   the array is `$ref` whatever it holds. The same answer should work for a
+   type argument — stamp one shared copy for all tuple instantiations —
+   but it is a stamper design decision, not a patch.
+2. **Inside a CLASS the same failure is silent.** At top level it reports
+   the three errors above; as a class field it emits nothing at all and the
+   class's members simply vanish ("unbound variable Db", "unbound variable
+   SetInput"). A specialization that cannot be done must say so wherever it
+   occurs — a missing function that nobody warned about is how a
+   self-hosted compiler miscompiles quietly.
+
+`tests/bootstrap/querydrive.fpp` is written and waiting: it drives inputs,
+memoized queries, dependency tracking, invalidation and early cutoff through
+the emitted engine. It is not wired into the suite yet because the file does
+not emit.
+
+### Next: the host-import surface for `Workspace` and `Project` (DESIGN ONLY)
+The last two files need services no wasm module has: reading a file, listing
+a directory, resolving a project path. This is deliberately NOT implemented
+yet — the surface is a contract between the compiler and every host that
+will ever run it (wasmtime, a browser, a build server), and it outlives any
+one of them.
+
+What the two files actually need, from reading them: read a file's text,
+test existence, list a directory, and canonicalize a path. Nothing else —
+no writing, no process, no network. That is a small surface, and it should
+stay small.
+
+The mechanism already exists and should be reused rather than invented:
+`extern` lowers to a wasm import from module `env` (`FfiTests` covers it
+end to end, with wasmtime supplying the implementation as a preload module).
+So the design is a prelude module of externs — `hostReadFile : string ->
+string`, `hostFileExists : string -> bool`, `hostListDir : string ->
+string[]`, `hostFullPath : string -> string` — plus the .NET half of the
+seam implementing them over `System.IO` so the dotnet-hosted compiler keeps
+working unchanged.
+
+Open questions that need answering BEFORE the first line is written, since
+each changes the signatures: how a missing file is reported (an option, an
+exception, or a sentinel — `Project.fs` currently leans on .NET exceptions);
+whether the host surface is per-Workspace state or process-global; and
+whether a browser host, which cannot do synchronous IO, forces the whole
+surface to be async, which would reshape `Workspace` far beyond these four
+functions. That last one is the reason to decide it deliberately.
 
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they

@@ -639,6 +639,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayUnpin (nm, pa)
+                      // box/unbox are type-level: every value is already a
+                      // reference, so both are the identity at runtime
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
+                            (bv.Name = "box" || bv.Name = "unbox") && bv.Path = "(builtin)" -> bx
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])
@@ -1267,7 +1271,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match pats, exprs with
                  | [ ip ], [ range; body ] ->
                      (match lowerPat ip, lowerExpr (GNode range) with
-                      | PVar (iv, isch), EPrim ("..", [ lo; hi ]) ->
+                      // `for _ in 1 .. n do` counts without naming the
+                      // counter; the loop still needs one, so a wildcard
+                      // binder gets a synthetic variable
+                      | (PVar _ | PWild), EPrim ("..", [ lo; hi ]) ->
+                          let iv, isch =
+                              match lowerPat ip with
+                              | PVar (v, sch) -> v, sch
+                              | _ ->
+                                  { Path = path; Offset = offsetOf n + 19000000; Name = "_i" },
+                                  mono (TCon ("int", []))
                           let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
                           ELet (false, iv, isch, lo,
                             ELet (false, hiV, isch, hi,

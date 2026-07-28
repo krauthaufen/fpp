@@ -593,3 +593,48 @@ let comprehensionTests =
             Expect.equal out "1,3,6\n" "the inner loop accumulates nothing"
         }
     ]
+
+[<Tests>]
+let wildcardRangeTests =
+    testList "range loops and boxing" [
+        test "for _ in 1 .. n counts without naming the counter" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let repeat (n : int) (s : string) ="
+                    "    let mutable acc = \"\""
+                    "    for _ in 1 .. n do"
+                    "        acc <- acc + s"
+                    "    acc"
+                    "let r1 = print (repeat 3 \"ab\")"
+                    "let r2 = print (repeat 0 \"ab\" + \"|\")"
+                    "" ])
+            Expect.equal out "ababab\n|\n" "the wildcard binder still drives the loop"
+        }
+        test "box and unbox are the identity at runtime" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let store : obj = box 41"
+                    "let back = unbox<int> store"
+                    "let r1 = print (string (back + 1))"
+                    "let s : obj = box \"hi\""
+                    "let r2 = print (unbox<string> s)"
+                    "" ])
+            Expect.equal out "42\nhi\n" "a value survives a round trip through obj"
+        }
+        test "the Option module" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let a = Option.map (fun x -> x + 1) (Some 1)"
+                    "let b = Option.bind (fun x -> if x > 0 then Some (x * 2) else None) (Some 3)"
+                    "let c = Option.filter (fun x -> x > 10) (Some 3)"
+                    "let show (o : int option) = match o with Some v -> string v | None -> \"none\""
+                    "let r = print (show a + \",\" + show b + \",\" + show c)"
+                    "let d = print (string (Option.isSome (Some 1)) + \",\" + string (Option.isNone (Some 1)))"
+                    "let e = print (string (Option.defaultValue 9 None) + \",\" + string (Option.defaultValue 9 (Some 4)))"
+                    "" ])
+            Expect.equal out "2,6,none\nTrue,False\n9,4\n" "map, bind, filter, isSome, defaultValue"
+        }
+    ]
