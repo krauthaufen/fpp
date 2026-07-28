@@ -24,6 +24,7 @@
     <Compile Include="LinkTests.fs" />
     <Compile Include="FfiTests.fs" />
     <Compile Include="BootstrapTests.fs" />
+    <Compile Include="FixpointTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

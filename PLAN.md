@@ -1276,6 +1276,54 @@ instantiates". Files that need host services (file IO in `Workspace`,
 `Project`) come last and need an import surface decided first. Full
 bootstrap (stage-1 compiling stage-2) is NOT in scope until every file emits.
 
+### Phase 2 harness: the fixpoint is wired, and what it is waiting on
+The stage-0/stage-1 comparison is built and its plumbing is PROVEN; only
+stage-1 itself is missing, and it is missing for one reason (below).
+
+- `tests/bootstrap/fixpoint.fsx` — stage-0 emits both the expected answer
+  (its own .wat for a corpus) and stage-1 (the 20 sources plus the driver).
+  Stage-1 runs under wasmtime, compiles the same corpus, and its stdout must
+  match byte for byte. A difference is bisected to the first differing byte,
+  with its line, column, and the emitted function it falls inside.
+  `... fixpoint.fsx stage0` stops after the expected answer, which costs
+  seconds instead of the minutes and gigabytes stage-1 emission costs.
+- `tests/bootstrap/compiledrive.fpp` — the driver. It carries the corpus
+  PATHS, never the text: a driver holding the source could let the two
+  stages compile different bytes and still agree, which is the weak gate
+  this phase exists to close.
+- `tests/bootstrap/fixcorpus.fpp` — a self-contained corpus (generics and
+  stamping, a class with inheritance, a DU, a record, a struct tuple, a
+  downcast, a comprehension). The drivers cannot serve as the default
+  corpus: each is a FRAGMENT that only compiles beside the compiler's own
+  sources, so using one would drag `Parser.fs` into every fixpoint run.
+  Stage-0's answer for it is 151300 bytes.
+- `tests/Fpp.Tests/FixpointTests.fs` — gated off by default and says so;
+  `FPP_FIXPOINT=1` runs it. Gated because one run is a wasmtime execution of
+  a module the size of the compiler, and that is measured before trusted.
+
+**How the corpus reaches stage-1, measured rather than assumed.** A preload
+module CAN satisfy the string-typed host imports: the imports are
+`anyref -> anyref`, and the emitted `$str` is `(array (mut i8))` outside any
+rec group, so a host declaring the same array type is structurally identical
+and its arrays survive the `ref.cast`. Verified end to end — a generated host
+serving a file map answers `hostReadText` for two files, `None` for a miss,
+and a module reading a 1576-byte corpus through it echoes it back byte for
+byte. `generateHost` in the harness is that generator, and it is what a
+browser host looks like from the module's side.
+
+**Blocked on `Builtin.source`.** Stage-1 is `Workspace` running in wasm, and
+`Workspace` reads the prelude through `System.Reflection` — which is not in
+the subset. The measurement above answers the open question: make it a SEAM
+function. .NET keeps the embedded resource (the single self-contained binary
+stays), the F++ half reads `prelude.fpp` through `hostReadText`, and the
+harness already serves that file to stage-1 alongside the corpus. No new
+import, no second copy of the prelude to drift.
+
+**Also measured:** all 20 files LOWER with zero notes in 3.3s, so nothing is
+parked at the front end. Whole-program emission of all 20 is the expensive
+part — it had not finished after 8 minutes and ~6GB, which is the number
+that decides whether the fixpoint test can ever come off its gate.
+
 ### The prelude is a real source file now
 `stdlib/prelude.fpp` (1492 lines of actual F++, editor support and all),
 embedded into Fpp.Compiler as a resource at build time; `Builtin.source`
