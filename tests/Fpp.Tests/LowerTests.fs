@@ -48,6 +48,14 @@ let lowerTests =
             let hasRecord = r.Decls |> List.exists (fun d -> match d with DRecord ("P", _, [ ("X", _); ("Y", _) ], _) -> true | _ -> false)
             Expect.isTrue hasRecord "record declaration lowered"
         }
+        test "a qualified record label names the field, not the qualifier" {
+            let src = "type P =\n    { MPath : string\n      MName : string }\nlet p = { P.MPath = \"a\"; MName = \"b\" }\n"
+            let r, errs = lintSrc src
+            Expect.isEmpty r.Notes "everything lowerable"
+            Expect.isEmpty errs "lint clean"
+            let printed = r.Decls |> List.map printDecl |> String.concat "\n"
+            Expect.stringContains printed "{P| MPath = " "label is MPath and the owner resolved"
+        }
         test "blocks become nested lets" {
             let src = "let f x =\n    let y = x + 1\n    let z = y * 2\n    z - x\n"
             let r, errs = lintSrc src

@@ -1579,3 +1579,13 @@ scratchpad/dbg/phases.fsx (parse/infer/lower/emit split plus the error list):
 - **`$class:Ordered:compare:$ref`** — sorting at a tuple key. Still the open
   design question: giving `$ref` an Ordered instance would make every
   reference type comparable.
+
+### The 13 were one bug, and not in Workspace.fs at all
+`{ Classes.MPath = path; ... }` in `Infer.infer` — a record label QUALIFIED by
+its owning module, which F# allows. Both Infer and Lower read the label as the
+first `Ident` token of the field node, so they saw `Classes`, not `MPath`. The
+literal then matched no record, lowered with owner `?`, and emission's
+fallback ("pick the record owning the first known label") landed on `Cached`,
+whose only shared field is `Classes` — hence thirteen "missing field X in
+Cached" for a record literal in a different file entirely. The label is now the
+last identifier BEFORE the `=` in both halves. 18 -> 5 errors.

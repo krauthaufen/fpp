@@ -509,6 +509,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let tokensOf (n : GreenNode) : Token list =
         n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
 
+    /// The label of a record-literal field. It may be qualified with the
+    /// owning type or module (`{ Classes.MPath = p; ... }`), in which case
+    /// the label is the LAST identifier before the '=', not the first.
+    let recordFieldLabel (f : GreenNode) : Token option =
+        let mutable found = None
+        let mutable stop = false
+        for t in tokensOf f do
+            if not stop then
+                if t.Kind = Operator && t.Text = "=" then stop <- true
+                elif t.Kind = Ident then found <- Some t
+        found
+
     let hasOpToken (text : string) (n : GreenNode) : bool =
         tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = text)
 
@@ -2033,7 +2045,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let baseExpr = nodesOf n |> List.tryFind (fun m -> m.NodeKind <> RecordExprField && isExprish m.NodeKind)
                 let fieldNames =
                     fieldNodes
-                    |> List.choose (fun f -> tokensOf f |> List.tryFind (fun t -> t.Kind = Ident))
+                    |> List.choose recordFieldLabel
                     |> List.map (fun t -> t.Text)
                 // determine the record type from ALL labels (F# semantics):
                 // among candidate owners, the first whose field set covers
@@ -2061,7 +2073,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt off (exprType (GNode b)) recTy
                       | None -> ())
                      for f in fieldNodes do
-                         let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
+                         let nameTok = recordFieldLabel f
                          let valTy =
                              nodesOf f |> List.filter (fun m -> isExprish m.NodeKind)
                              |> List.map (fun m -> exprType (GNode m))

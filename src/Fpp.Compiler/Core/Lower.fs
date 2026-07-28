@@ -180,6 +180,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let nodesOf (n : GreenNode) = n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
     let tokensOf (n : GreenNode) = n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+    /// The label of a record-literal field. It may be qualified with the
+    /// owning type or module (`{ Classes.MPath = p; ... }`), in which case
+    /// the label is the LAST identifier before the '=', not the first.
+    let recordFieldLabel (f : GreenNode) =
+        let mutable found = None
+        let mutable stop = false
+        for t in tokensOf f do
+            if not stop then
+                if t.Kind = Operator && t.Text = "=" then stop <- true
+                elif t.Kind = Ident then found <- Some t
+        found
     let offsetOf (n : GreenNode) =
         match Green.tokens (GNode n) |> List.tryHead with
         | Some t -> t.Offset
@@ -1124,7 +1135,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf n
                     |> List.filter (fun m -> m.NodeKind = RecordExprField)
                     |> List.choose (fun f ->
-                        let name = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
+                        let name = recordFieldLabel f
                         let value = nodesOf f |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast
                         match name, value with
                         | Some t, Some v -> Some (t.Text, lowerExpr (GNode v))
