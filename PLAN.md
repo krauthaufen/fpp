@@ -1288,20 +1288,43 @@ makes no further progress; two independent runs stopped at the same figure.
 **This is not about how the option members are implemented.** DU members and
 builtin members blow up identically, because the cause is REACHABILITY, not
 the members: they were simply the last thing holding the backend out of the
-module. Nor is it the aggregate of twenty files. The cheapest repro found is
-all 20 sources minus `Workspace.fs`, plus a three-line root:
+module.
 
-    module Root
-    open Fpp.Prelude
-    let r = Fpp.Analysis.Infer.infer
+**It is ONE function, and it is `EmitWasm.emit` — the emitter emitting
+itself.** Instrumenting the pipeline localizes it exactly:
 
-That alone does not finish in ten minutes. `Infer.infer` is where to look —
-and the stamper is the thing to look at, since it is the pass whose cost is
-per instantiation. Whether this is exponential stamping (a bug) or merely a
-very large but finite closure (a budget problem) is the question that decides
-the shape of the rest of the bootstrap, and it should be answered before any
-more emission gaps are chased: the remaining errors are a short list, and
-closing them changes nothing if the result cannot be built.
+| phase | cost |
+|---|---|
+| lowering all 20 files | 2.4s, 0.36 GB |
+| `monomorphizeWith` + `stampRecords` + `deadCodeEliminate` | 0.1s, no growth |
+| emitting functions 1..216 (~51k core nodes) | 0.4s, 0.42 GB |
+| emitting function 217, `emit` (15,099 nodes) | >15 min, ~30 GB, no result |
+
+So the cost is superlinear in a SINGLE function's size by a factor no
+quadratic term explains: 216 functions totalling 51k nodes cost 0.4s, and one
+function of 15k nodes costs more than fifteen minutes. `emit` is the largest
+binding in the compiler (23% of its 66,282 core nodes); `infer` at 12,302 and
+`lower` at 10,157 are next, and they emit fine, so the cliff sits between
+10k and 15k nodes.
+
+Three suspects have been TESTED AND ELIMINATED, which is worth recording so
+nobody pays for them twice:
+
+- **The stamper is not involved.** Its work queue holds 184 entries and the
+  longest instantiation name is 17 characters; the whole of monomorphization
+  runs in 0.1s. This was the first theory and it was wrong.
+- **`expandOr` is not involved.** Instrumented to report any match whose case
+  count grows by more than 8 under or-expansion: it never fires, anywhere in
+  the compiler.
+- **Memoizing `kindOf` does not fix it.** `kindOf` recurses into both arms of
+  an `EIf`, which looked like the exponential; caching it on reference
+  identity changes nothing.
+
+What remains is the cost model of `compileExpr` itself — something in it
+walks or emits a subexpression more than once per node. That is a backend
+question, and it should be answered before any more emission gaps are
+chased: the remaining errors are a short list, and closing them changes
+nothing if the result cannot be built.
 
 **What is also left: `Builtin.source`.** `Workspace.fs` reads `stdlib/prelude.fpp`
 out of the assembly with `GetManifestResourceStream`, and a wasm module has
