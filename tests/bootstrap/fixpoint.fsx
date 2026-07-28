@@ -51,8 +51,13 @@ let defaultCorpus =
 
 let corpus =
     match System.Environment.GetCommandLineArgs () |> Array.tryLast with
-    | Some a when a.EndsWith ".fpp" || a.EndsWith ".txt" ->
-        [ if System.IO.Path.IsPathRooted a then a else root + "/" + a ]
+    | Some a when a.EndsWith ".fpp" || a.EndsWith ".txt" || a.EndsWith ".fs" ->
+        // a COMMA-SEPARATED list, so a run can be narrowed to a prefix of
+        // the compiler's own sources — which is how a stage-1 that never
+        // finishes gets bisected down to the input that stalls it
+        a.Split ','
+        |> Array.toList
+        |> List.map (fun x -> if System.IO.Path.IsPathRooted x then x else root + "/" + x)
     | _ -> defaultCorpus
 
 /// The corpus is served under STABLE names: the path a file is known by ends

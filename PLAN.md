@@ -1712,3 +1712,17 @@ reaches the .wat through diagnostics and symbol prefixes, so naming a source
 by absolute path in stage-1 and by basename in the host made the two stages
 differ for no reason — and it made the emitted compiler depend on where the
 checkout lives.
+
+### Debug information for the emitted module (not started)
+wasm carries debug info in CUSTOM SECTIONS, and there are three levels. The
+`name` section is already effectively present — wat identifiers become
+function names, which is why a wasmtime backtrace reads
+`g773_4262_mapExpr.w1` rather than `<wasm function 812>`. Above that:
+
+- **`sourceMappingURL`** — one string naming a JS-style `.map` file. Browsers
+  show F++ source instead of wat. Every node already carries a byte offset,
+  so the map is bookkeeping rather than new analysis; this is the cheap win,
+  and it wants binary emission first.
+- **DWARF in `.debug_*` sections** — line AND variable info, consumed by
+  lldb and Chrome's C/C++ DevTools extension. Much heavier, and only worth it
+  once someone actually needs to step through F++ in a debugger.

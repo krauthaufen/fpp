@@ -703,15 +703,49 @@ module String =
     /// it out of concatenation is quadratic, and the lexer lives on it.
     let sub (s : string) (start : int) (count : int) : string = strsub s start count
     let length (s : string) = s.Length
+    /// Pairwise MERGE, not a left fold. `acc <- acc + sep + x` copies the
+    /// whole accumulator at every step, so joining n chunks of total length
+    /// L costs O(n*L) — and the compiler's own emitter joins a six-megabyte
+    /// module out of hundreds of thousands of chunks, which is why the
+    /// compiler compiled to wasm spent hours on a job it does natively in
+    /// seconds. Merging adjacent pairs copies each character O(log n) times.
+    ///
+    /// Cons and `+` are the only tools used: `Array` and `List` are declared
+    /// further down this file, and the merge is written as loops rather than
+    /// recursion because the first pass is half as long as the input.
     let concat (sep : string) (strings : seq<string>) =
-        let mutable acc = ""
+        let mutable cur : string list = []
+        let mutable n = 0
         let mutable first = true
         for x in strings do
-            if first then
-                acc <- x
-                first <- false
-            else acc <- acc + sep + x
-        acc
+            // the separator is folded in once, on the way into the merge
+            cur <- (if first then x else sep + x) :: cur
+            first <- false
+            n <- n + 1
+        // `cur` is REVERSED, and every pass flips the order again, so which
+        // side of a pair comes first alternates with it
+        let mutable reversed = true
+        while n > 1 do
+            let mutable out : string list = []
+            let mutable rest = cur
+            let mutable more = true
+            while more do
+                match rest with
+                | x :: y :: tail ->
+                    out <- (if reversed then y + x else x + y) :: out
+                    rest <- tail
+                | [ x ] ->
+                    out <- x :: out
+                    rest <- []
+                    more <- false
+                | [] -> more <- false
+            cur <- out
+            reversed <- not reversed
+            n <- (n + 1) / 2
+        match cur with
+        | [ one ] -> one
+        | _ -> ""
+
     let replicate (n : int) (s : string) =
         let mutable acc = ""
         let mutable i = 0
