@@ -2357,8 +2357,20 @@ let emit (decls : Decl list) : EmitResult =
                     fresh
             app ("(local.set " + l + " " + v + ")")
         | PAs (inner, var, _) ->
-            let l = newLocal "as"
-            dictSet locals (var.Path, var.Offset) l
+            // the slot is SHARED across or-alternatives exactly as PVar's
+            // is: each alternative must write the one local the shared body
+            // reads. Allocating a fresh local here bound the body to
+            // whichever alternative compiled LAST, so an `(A _ | B _) as x`
+            // match returned garbage whenever an EARLIER alternative was the
+            // one that matched — found as a cyclic expression tree when the
+            // self-hosted compiler ran its own optimizer.
+            let l =
+                match dictTryFind orSlots (var.Path, var.Offset) with
+                | Some existing -> existing
+                | None ->
+                    let fresh = newLocal "as"
+                    dictSet locals (var.Path, var.Offset) fresh
+                    fresh
             app ("(local.set " + l + " " + v + ")")
             compilePatWith orSlots locals extraLocals freeEnv out failLbl ("(local.get " + l + ")") inner
         | PLit LUnit -> ()

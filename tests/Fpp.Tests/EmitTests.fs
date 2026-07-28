@@ -298,6 +298,36 @@ let noBoxGate =
             Expect.equal out "13\n13\n6\n16\n6\n"
                 "literal, value, first-class and over-applied calls all agree"
         }
+        test "an as-binding over an or-pattern is written by every alternative" {
+            // PAs allocated a FRESH local per or-alternative and the shared
+            // body read whichever compiled last, so `(A _ | B _) as x -> x`
+            // returned garbage whenever an EARLIER alternative matched. In
+            // the self-compile that surfaced as a cyclic expression tree
+            // that sent the emitter into infinite recursion — three attempts
+            // at the untupling pass were blamed for it before this repro.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type E ="
+                    "    | A of int * string"
+                    "    | B of int * string * bool"
+                    "    | C"
+                    "let keep (e : E) : E ="
+                    "    match e with"
+                    "    | (A (n, _) | B (n, _, _)) as it when n > 2 -> it"
+                    "    | _ -> C"
+                    "let show (e : E) : string ="
+                    "    match e with"
+                    "    | A (n, s) -> \"A\" + string n + s"
+                    "    | B (n, s, b) -> \"B\" + string n + s + (if b then \"T\" else \"F\")"
+                    "    | C -> \"C\""
+                    "let go ="
+                    "    print (show (keep (A (9, \"z\"))))"
+                    "    print (show (keep (B (7, \"q\", true))))"
+                    "    print (show (keep (A (1, \"x\"))))"
+                    "" ])
+            Expect.equal out "A9z\nB7qT\nC\n" "the first alternative binds the same slot the body reads"
+        }
     ]
 
 [<Tests>]
