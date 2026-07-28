@@ -2085,3 +2085,37 @@ tupled function. So: THE EXPORTED SIGNATURE IS THE SOURCE-LEVEL TYPE.
 Untupling is a backend calling convention and must never rewrite an exported
 scheme. Worth a test that asserts a library round-trips a tupled signature as
 tupled.
+
+### Unconditional untupling: written, and it breaks self-compilation
+The convention version was implemented — always untuple, with all three use
+shapes handled in the pass rather than the backend:
+
+    f (a, b)    -> two-argument call, no tuple
+    f t         -> `match t with (x, y) -> f x y` at the call site
+    f as value  -> eta-expanded to a tuple-taking lambda that destructures
+
+It works on a direct test: `f (3, 4)`, `f t`, a 3-tuple, and `List.map f`
+all give the right answers, and `f` emits as `(param $a0 i32) (param $a1 i32)`.
+**415 tests pass.** And stage-1 then traps: `compileExpr` and
+`compileExprInner` — the emitter's own memoized mutual recursion — loop until
+the stack is gone.
+
+So the pass miscompiles something the whole test suite does not cover and the
+BOOTSTRAP does. That is the gate earning its keep: a compiler can pass every
+test it has and still be unable to compile itself.
+
+Reverted to the conditional version (green, 42-46s, fixpoint byte-identical).
+The unconditional one is the right design and should be finished — the bug is
+in the pass, not the idea. Where to look, given the symptom is the memo
+recursion in `compileExpr`:
+- `EVarI` heads lose their instantiation in the first-class case, which after
+  monomorphization may matter more than it looks;
+- the definition rewrite matches `EMatch (_, [ (_, None, body) ])` guarded
+  only by `isCand`, so it trusts that the guard and the pattern agree about
+  WHICH node the body came from;
+- `destructured` builds a fresh `EMatch` that `fuseTuples` then sees, and the
+  two passes have not been checked against each other on a tree where the
+  argument is itself a tuple of the wrong width.
+
+Reproduce with `dotnet fsi tests/bootstrap/fixpoint.fsx self` — it fails in
+about 20s, which is a fast enough loop to bisect against.
