@@ -1977,3 +1977,41 @@ Two ways in, and the first is cheap enough to try immediately:
 **This is the next piece of optimization work, ahead of everything else in
 this file.** It is the only remaining item measured to be where the time
 actually goes.
+
+### Tupled arguments should be a CALLING CONVENTION, not an allocation
+`let f (a, b) = a * b + 1` emits:
+
+    func $g561_4_f (param $a0 anyref) (result i32) (local $l0_scrut anyref) ...
+    ;; and the call site: 1 x struct.new $tup2
+
+So every call allocates a tuple, writes two fields, and the body immediately
+matches it apart to read them back. Allocate, write, read, discard — on the
+GC heap, per call. F# does not do this: a tupled function compiles to a
+multi-parameter method and the tuple materializes only where the function is
+used as a VALUE.
+
+The type signature must stay honest — `(int * int) -> int` really is callable
+with a tuple — and it can, because both halves already exist:
+
+- **`sigStructs` already splits POD-struct parameters into leaves** and
+  materializes only at uniform boundaries. A tuple parameter is that problem
+  under another name.
+- **The curry wrappers are the first-class path.** `.w0` takes the tuple as
+  anyref, deconstructs it and calls the N-parameter function. They already
+  convert scalar kinds at that boundary, so it is the right place.
+
+The rule: a function whose parameter is a tuple gets N parameters; a
+syntactic call with a tuple literal passes the elements directly; every other
+use goes through the wrapper and materializes there.
+
+This is better than making tuples into struct tuples for this case, because
+it REMOVES the tuple rather than making it cheaper — and the two compose:
+struct tuples then fix the remaining genuine tuple VALUES (dictionary keys,
+`Vec` elements, `dictPairs` results), which no calling convention can reach.
+
+Order of work, all measured rather than assumed:
+1. tupled-argument calling convention (this) — contained, and the fixpoint
+   gates it byte-exactly;
+2. struct tuples in key position, for the 1083 remaining `$tup2` sites;
+3. inlining, which is worth switching on once 1 and 2 have removed the
+   allocation it currently just duplicates.
