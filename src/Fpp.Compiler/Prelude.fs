@@ -26,6 +26,7 @@ let inline vecAdd (v : Vec<'a>) (x : 'a) : unit = v.Add x
 let inline vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit = v.Insert(i, x)
 let inline vecClear (v : Vec<'a>) : unit = v.Clear ()
 let inline vecToList (v : Vec<'a>) : 'a list = List.ofSeq v
+let inline vecToArray (v : Vec<'a>) : 'a[] = v.ToArray()
 let vecOfList (xs : 'a list) : Vec<'a> = Vec<'a>(xs)
 
 /// Mutable hash map — used only by the query engine.
@@ -38,6 +39,8 @@ let dictTryFind (d : Dict<'k, 'v>) (k : 'k) : 'v option =
     match d.TryGetValue k with
     | true, v -> Some v
     | _ -> None
+
+let inline dictRemove (d : Dict<'k, 'v>) (k : 'k) : unit = d.Remove k |> ignore
 
 let dictPairs (d : Dict<'k, 'v>) : ('k * 'v) list =
     [ for kv in d -> kv.Key, kv.Value ]

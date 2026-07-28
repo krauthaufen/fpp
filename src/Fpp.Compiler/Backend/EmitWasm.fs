@@ -1801,11 +1801,7 @@ let emit (decls : Decl list) : EmitResult =
                 "(ref.i31 (i32.const 0))"
         | ETry (body, cases) ->
             let cases =
-                cases
-                |> List.collect (fun (p, g, b) ->
-                    match p with
-                    | POr ps -> ps |> List.map (fun q -> q, g, b)
-                    | _ -> [ p, g, b ])
+                cases |> List.collect (fun (p, g, b) -> expandOr p |> List.map (fun q -> q, g, b))
             let res = newLocal "tres"
             let exn = newLocal "texn"
             let w = System.Text.StringBuilder()
@@ -1826,13 +1822,9 @@ let emit (decls : Decl list) : EmitResult =
             w.Append(" (throw $fppexn (local.get " + exn + "))) (local.get " + res + "))") |> ignore
             w.ToString()
         | EMatch (scrut, cases) ->
-            // expand or-patterns into separate cases
+            // expand or-patterns into separate cases, at every depth
             let cases =
-                cases
-                |> List.collect (fun (p, g, b) ->
-                    match p with
-                    | POr ps -> ps |> List.map (fun q -> q, g, b)
-                    | _ -> [ p, g, b ])
+                cases |> List.collect (fun (p, g, b) -> expandOr p |> List.map (fun q -> q, g, b))
             let sl = newLocal "scrut"
             let res = newLocal "res"
             let w = System.Text.StringBuilder()
@@ -1949,7 +1941,10 @@ let emit (decls : Decl list) : EmitResult =
             n
         match p with
         | PWild -> ()
-        | POr _ -> ()   // expanded at EMatch level
+        | POr _ ->
+            // `expandOr` removes these before compilePat ever sees one; a
+            // survivor would bind nothing and test nothing, silently
+            emitError "an or-pattern reached pattern compilation"
         | PVar (var, _) ->
             let l = newLocal "v"
             dictSet locals (var.Path, var.Offset) l

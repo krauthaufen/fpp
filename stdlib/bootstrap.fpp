@@ -63,6 +63,14 @@ let vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit =
 
 let vecClear (v : Vec<'a>) : unit = v.Count <- 0
 
+let vecToArray (v : Vec<'a>) : 'a[] =
+    let a : 'a[] = Array.zeroCreate v.Count
+    let mutable i = 0
+    while i < v.Count do
+        a.[i] <- v.Items.[i]
+        i <- i + 1
+    a
+
 let vecToList (v : Vec<'a>) : 'a list =
     let mutable acc = []
     let mutable i = v.Count - 1
@@ -143,6 +151,30 @@ let dictSet (d : Dict<'k, 'v>) (k : 'k) (v : 'v) : unit =
 let dictTryFind (d : Dict<'k, 'v>) (k : 'k) : 'v option =
     let e = d.Slots.[dictSlot d k]
     if e > 0 then Some d.Vals.[e - 1] else None
+
+/// Removing keeps the entries INSERTION-ORDERED — the survivors shift down
+/// and the whole index is rebuilt. A tombstone would be cheaper, but
+/// `dictSlot` probes until it finds an empty slot, and `dictPairs` order is
+/// what makes the emitter's output reproducible.
+let dictRemove (d : Dict<'k, 'v>) (k : 'k) : unit =
+    let e = d.Slots.[dictSlot d k]
+    if e > 0 then
+        let mutable i = e - 1
+        while i < d.Count - 1 do
+            d.Keys.[i] <- d.Keys.[i + 1]
+            d.Vals.[i] <- d.Vals.[i + 1]
+            i <- i + 1
+        d.Count <- d.Count - 1
+        let slots : int[] = Array.zeroCreate d.Slots.Length
+        let mask = slots.Length - 1
+        let mutable j = 0
+        while j < d.Count do
+            let mutable p = (hash d.Keys.[j] &&& 1073741823) &&& mask
+            while slots.[p] <> 0 do
+                p <- (p + 1) &&& mask
+            slots.[p] <- j + 1
+            j <- j + 1
+        d.Slots <- slots
 
 let dictPairs (d : Dict<'k, 'v>) : ('k * 'v) list =
     let mutable acc = []

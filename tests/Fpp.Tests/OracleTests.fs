@@ -1014,4 +1014,106 @@ let oracleTests =
             "let w = print ((0 - 7) * (0 - 6))"
             "let v = print (100000 * 30000)"   // int32 wraparound semantics
         ]
+        // An or-pattern may sit at ANY depth. Emission only expanded one at
+        // the top of a case pattern; nested in a tuple it bound nothing and
+        // tested nothing, so the body read a local that was never written.
+        oracle "an or-pattern nested inside a tuple pattern binds" [
+            "type E = EVar of string * int | EVarI of string * int * int | EOther"
+            "let classify (e : E) (args : int list) : string ="
+            "    match e, args with"
+            "    | (EVar (n, _) | EVarI (n, _, _)), [ a ] when n = \"pin\" -> \"pin/\" + string a"
+            "    | (EVar (n, _) | EVarI (n, _, _)), [ a ] -> n + \"/\" + string a"
+            "    | _, _ -> \"none\""
+            "let r1 = print (classify (EVar (\"pin\", 1)) [ 7 ])"
+            "let r2 = print (classify (EVarI (\"q\", 1, 2)) [ 8 ])"
+            "let r3 = print (classify (EVar (\"pin\", 1)) [])"
+            "let r4 = print (classify EOther [ 1 ])"
+        ]
+        oracle "or-patterns nested in a list and a constructor pattern" [
+            "type T = A of int | B of int | C of int"
+            "let f (xs : T list) : int ="
+            "    match xs with"
+            "    | [ (A n | B n); C m ] -> n * 10 + m"
+            "    | _ -> 0"
+            "let r1 = print (f [ A 1; C 2 ])"
+            "let r2 = print (f [ B 3; C 4 ])"
+            "let r3 = print (f [ C 5; C 6 ])"
+        ]
+        // Indexing the result of a PARKED dot access. `(s.Split ':').[0]`
+        // typed its receiver only after the dot fixpoint ran, so the index
+        // site was left nameless and reached emission as "array read needs a
+        // statically known element type".
+        oracle "indexing the result of a builtin string member" [
+            "let parse (n : string) : string ="
+            "    let parts = n.Split ':'"
+            "    parts.[0] + \"/\" + parts.[2] + \"/\" + string parts.Length"
+            "let a = print (parse \"Ordered:compare:int\")"
+            "let b = print ((\"a,b,c\".Split ',').[1])"
+        ]
+        // A range used as a VALUE, not as a loop source.
+        oracle "a range list is a value" [
+            "let i = 2"
+            "let j = 6"
+            "let show (xs : int list) = String.concat \",\" (List.map (fun (x : int) -> string x) xs)"
+            "let a = print (show [ i .. j - 1 ])"
+            "let b = print (List.length [ 1 .. 0 ])"
+            "let c = print (show [ 0 .. 3 ])"
+            "let d = print (List.sum [ 1 .. 100 ])"
+        ]
+        // `IsSome`/`IsNone`/`Value` are members on the prelude's own Option
+        // DU, not a builtin-member surface.
+        oracle "option carries IsSome, IsNone and Value" [
+            "let a : int option = Some 3"
+            "let b : int option = None"
+            "let r1 = print (if a.IsSome then 1 else 0)"
+            "let r2 = print (if a.IsNone then 1 else 0)"
+            "let r3 = print (if b.IsSome then 1 else 0)"
+            "let r4 = print (if b.IsNone then 1 else 0)"
+            "let r5 = print a.Value"
+        ]
+        oracle "the small prelude surface: char, defaultArg, List.take" [
+            "let a = print (string (char (int 'a' + 2)))"
+            "let b = print (int 'A')"
+            "let c = print (defaultArg (Some \"x\") \"y\")"
+            "let d = print (defaultArg None \"y\")"
+            "let e = print (String.concat \",\" (List.take 2 [ \"p\"; \"q\"; \"r\" ]))"
+            "let f = print (match List.tryFindIndex (fun x -> x > 2) [ 1; 2; 3; 4 ] with Some i -> i | None -> 0 - 1)"
+            "let g = print (match List.tryFindIndex (fun x -> x > 9) [ 1; 2 ] with Some i -> i | None -> 0 - 1)"
+        ]
+        // The resolver's environment is an F# Map, so the prelude has one:
+        // an AVL tree, ordered by `compare`, with `empty` a nullary case so
+        // that it generalizes under the value restriction.
+        oracle "Map agrees with F#'s" [
+            "let mutable m : Map<string, int> = Map.empty"
+            "let show (o : int option) = match o with Some v -> string v | None -> \"-\""
+            "let build ="
+            "    m <- Map.add \"b\" 2 m"
+            "    m <- Map.add \"a\" 1 m"
+            "    m <- Map.add \"c\" 3 m"
+            "    m <- Map.add \"a\" 9 m"
+            "let r1 = print (Map.count m)"
+            "let r2 = print (show (Map.tryFind \"a\" m))"
+            "let r3 = print (show (Map.tryFind \"zz\" m))"
+            "let r4 = print (Map.find \"c\" m)"
+            "let r5 = print (Map.count (Map.filter (fun k v -> v > 2) m))"
+            "let r6 = print (String.concat \",\" (List.map fst (Map.toList m)))"
+            "let r7 = print (String.concat \",\" (List.map (fun (kv : string * int) -> string (snd kv)) (Map.toList m)))"
+            "let r8 = print (show (Map.tryFind \"b\" (Map.remove \"b\" m)))"
+            "let r9 = print (Map.count (Map.remove \"nope\" m))"
+            "let r10 = print (if Map.containsKey \"c\" m then 1 else 0)"
+            "let r11 = print (Map.fold (fun s k v -> s + v) 0 m)"
+            "let r12 = print (Map.count (Map.ofList [ (\"x\", 1); (\"y\", 2); (\"x\", 3) ]))"
+            "let r13 = print (if Map.isEmpty (Map.empty : Map<int, int>) then 1 else 0)"
+        ]
+        oracle "Map stays balanced and ordered over many keys" [
+            "let mutable m : Map<int, int> = Map.empty"
+            "let build ="
+            "    for i in 1 .. 200 do"
+            "        m <- Map.add i (i * i) m"
+            "    for i in 1 .. 200 do"
+            "        if i % 3 = 0 then m <- Map.remove i m"
+            "let r1 = print (Map.count m)"
+            "let r2 = print (Map.fold (fun s k v -> s + k) 0 m)"
+            "let r3 = print (String.concat \",\" (List.map (fun (kv : int * int) -> string (fst kv)) (List.truncate 5 (Map.toList m))))"
+        ]
     ]

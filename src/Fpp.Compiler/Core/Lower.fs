@@ -430,7 +430,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
@@ -930,6 +930,30 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                     | [ f ] when (f.NodeKind = ForExpr || f.NodeKind = WhileExpr) && hasYield -> Some f
                     | _ -> None
+                // `[ a .. b ]` — a range as a VALUE, not a loop source. Built
+                // DOWNWARDS so the conses come out in order and nothing has to
+                // be reversed; both ends are bound first, so each is evaluated
+                // once.
+                let rangeItems =
+                    match vecToList items with
+                    | [ EPrim ("..", [ lo; hi ]) ] -> Some (lo, hi)
+                    | _ -> None
+                match rangeItems with
+                | Some (lo, hi) ->
+                    let off = offsetOf n
+                    let ish = mono (TCon ("int", []))
+                    let anon = anonScheme
+                    let loV = { Path = path; Offset = off + 16000000; Name = "_rlo" }
+                    let iV = { Path = path; Offset = off + 17000000; Name = "_ri" }
+                    let outV = { Path = path; Offset = off + 18000000; Name = "_rout" }
+                    ELet (false, loV, ish, lo,
+                      ELet (false, iV, ish, hi,
+                        ELet (false, outV, anon, EListLit [],
+                          ESeq [ EWhile (EPrim (">=", [ EVar (iV, ish); EVar (loV, ish) ]),
+                                   ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anon) ]))
+                                          EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ])) ])
+                                 EVar (outV, anon) ])))
+                | None ->
                 match arrowFor with
                 | Some f ->
                     let off = offsetOf n
@@ -1172,7 +1196,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for k, prior in savedMaps do
                     match prior with
                     | Some p -> dictSet fieldOfVar k p
-                    | None -> (fieldOfVar : Dict<string * int, string * string>).Remove k |> ignore
+                    | None -> dictRemove fieldOfVar k
                 vecAdd decls
                     (DClass (synth, None, [],
                              match iface with Some i -> [ i, bound ] | None -> []))

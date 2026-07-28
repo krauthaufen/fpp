@@ -12,7 +12,7 @@ module Lines =
         vecAdd v 0
         for i in 0 .. strLen text - 1 do
             if charAt text i = '\n' then vecAdd v (i + 1)
-        v.ToArray()
+        vecToArray v
 
     let toLineCol (starts : int[]) (offset : int) : int * int =
         let mutable lo = 0
@@ -361,7 +361,10 @@ type Workspace() =
                   EndLine = line; EndCol = col + 1; Message = msg }
             (r.Diagnostics |> List.map (fun d -> at d.Offset d.Message))
             @ (t.Diagnostics |> List.map (fun (off, msg) -> at off msg))
-            |> List.sortBy (fun d -> d.Line, d.Col))
+            // by (Line, Col), spelled out: `Ordered` has no instance at a
+            // TUPLE type, so a tuple key cannot drive `sortBy` (see PLAN.md)
+            |> List.sortWith (fun a b ->
+                if a.Line <> b.Line then compare a.Line b.Line else compare a.Col b.Col))
 
     member this.Outline (path : string) : OutlineItem list =
         db.MemoT "outline" path (fun () ->

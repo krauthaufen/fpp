@@ -43,11 +43,14 @@ let pluginTests =
 
             // same behaviour, fewer runtime operations
             Expect.equal (runWat folded) (runWat baseWat) "semantics preserved"
-            // compare only the program's own code, not the runtime prelude
+            // Compare only the initializers, not the runtime prelude's
+            // functions. Every `$initN` together, rather than `$init0` alone:
+            // one file's top-level bindings become several inits, and `$init0`
+            // is not even this file's — the prelude's `Map.empty` claims it.
             let userCode (w : string) =
-                let i = w.IndexOf "(func $init0"
-                let j = w.IndexOf("(func ", i + 8)
-                w.Substring(i, (if j > i then j else w.Length) - i)
+                w.Split '\n'
+                |> Array.filter (fun l -> l.TrimStart().StartsWith "(func $init")
+                |> String.concat "\n"
             Expect.stringContains (userCode baseWat) "i32.mul" "baseline multiplies at runtime"
             Expect.isFalse ((userCode folded).Contains "i32.mul") "multiply folded away"
             Expect.isFalse ((userCode folded).Contains "call $addv") "addition folded away"

@@ -273,6 +273,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `downcast`/`upcast` sites: the target type is only known once the
     /// surrounding expression has been solved
     let pendingCasts = vecNew<int * Type> ()
+    /// `a.[i]` whose receiver was still a variable when the walk reached it —
+    /// which is every index into the result of a PARKED dot access, e.g.
+    /// `(s.Split ':').[0]`. Retried once the dot fixpoint has run.
+    let pendingIndex = vecNew<int * Type * Type> ()
 
     /// Register a member's FieldInfo. A second declaration under the same
     /// name is an OVERLOAD: it keeps its own entry under an ordinal suffix
@@ -1069,7 +1073,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -1160,6 +1164,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "string" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tString
+                              // a char IS its code point, so this only
+                              // changes how the value reads
+                              | Some t when t.Text = "char" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some tChar
 
                               | Some t when t.Text = "isNull" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
@@ -1717,7 +1726,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
                       | None -> ())
                      tChar
-                 | _ -> st.Fresh ())
+                 | _ ->
+                     // the receiver is still a variable: park the site rather
+                     // than leaving it nameless, which reaches emission as
+                     // "array read needs a statically known element type"
+                     let result = st.Fresh ()
+                     (match lhsTy, Green.tokens (GNode n) |> List.tryHead with
+                      | Some recv, Some t -> vecAdd pendingIndex (t.Offset, recv, result)
+                      | _ -> ())
+                     result)
             | DotExpr ->
                 let lastIdent =
                     Green.tokens (GNode n)
@@ -2823,6 +2840,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // wait no longer: force the tie, which binds in declaration order
     for offset, recvTy, result, name in parked do
         tryResolveDot true offset recvTy result name |> ignore
+    // index sites whose receiver only took shape through a parked dot: the
+    // element type is known now, so name the read and tie the result to it
+    for offset, recvTy, result in vecToList pendingIndex do
+        match prune recvTy with
+        | TCon ("array", [ e ]) ->
+            unifyAt offset result e
+            vecAdd arrKindsRaw (offset, e)
+            dictSet arrIndexTargets offset true
+        | TCon ("string", []) ->
+            unifyAt offset result tChar
+            vecAdd arrKindsRaw (offset, TCon ("$str", []))
+        | _ -> ()
+
     // record literals: name the instantiation once everything is solved
     for offset, ty in vecToList pendingRecords do
         vecAdd fieldOwnersRaw (offset, instName ty)

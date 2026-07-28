@@ -169,6 +169,28 @@ and printPat (p : Pat) : string =
     | PAs (p, v, _) -> "(" + printPat p + " as " + v.Name + ")"
     | POr ps -> "(" + String.concat " | " (List.map printPat ps) + ")"
 
+/// Every or-free pattern a pattern stands for. An alternative may sit at any
+/// depth — `(A n | B n), [x]` is one tuple case, not two top-level ones — so
+/// the expansion is the product over the positions, not a peel of the head.
+/// Lowering has already aligned the alternatives' binders onto one identity
+/// per name, which is what makes the copies interchangeable.
+let rec expandOr (p : Pat) : Pat list =
+    match p with
+    | POr ps -> List.collect expandOr ps
+    | PCtor (n, sch, ps) -> orProduct ps |> List.map (fun qs -> PCtor (n, sch, qs))
+    | PTuple ps -> orProduct ps |> List.map PTuple
+    | PListLit ps -> orProduct ps |> List.map PListLit
+    | PCons (h, t) -> orProduct [ h; t ] |> List.map (fun qs -> PCons (List.head qs, List.item 1 qs))
+    | PAs (inner, v, sch) -> expandOr inner |> List.map (fun q -> PAs (q, v, sch))
+    | PWild | PLit _ | PVar _ | PTypeTest _ -> [ p ]
+
+and private orProduct (ps : Pat list) : Pat list list =
+    match ps with
+    | [] -> [ [] ]
+    | h :: t ->
+        let rest = orProduct t
+        expandOr h |> List.collect (fun a -> rest |> List.map (fun r -> a :: r))
+
 let printDecl (d : Decl) : string =
     match d with
     | DExtern (v, _) -> "extern " + v.Name

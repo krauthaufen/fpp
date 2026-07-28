@@ -605,6 +605,9 @@ type ISet<'a> =
 type Option<'a> =
     | None
     | Some of 'a
+    member x.IsSome = match x with Some _ -> true | None -> false
+    member x.IsNone = match x with Some _ -> false | None -> true
+    member x.Value = match x with Some v -> v | None -> failwith "Option.Value: None"
 type option<'a> = Option<'a>
 type Result<'t, 'e> =
     | Ok of 't
@@ -679,6 +682,10 @@ module Option =
     let toList (o : 'a option) : 'a list = match o with Some x -> [ x ] | None -> []
 
 // ---- tuple projections ----
+let defaultArg (o : 'a option) (dflt : 'a) : 'a =
+    match o with
+    | Some v -> v
+    | None -> dflt
 let fst (t : 'a * 'b) : 'a = match t with (a, _) -> a
 let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b
 
@@ -1291,6 +1298,28 @@ module List =
             rest <- List.tail rest
             k <- k + 1
         List.rev acc
+    /// Exactly `n` elements — unlike `truncate`, a short list is an error.
+    let take (n : int) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable k = 0
+        let mutable rest = xs
+        while k < n do
+            if List.isEmpty rest then failwith "the list is too short"
+            acc <- List.head rest :: acc
+            rest <- List.tail rest
+            k <- k + 1
+        List.rev acc
+    let tryFindIndex (p : 'a -> bool) (xs : 'a list) : int option =
+        let mutable i = 0
+        let mutable found = -1
+        for x in xs do
+            if found < 0 && p x then found <- i
+            i <- i + 1
+        if found < 0 then None else Some found
+    let findIndex (p : 'a -> bool) (xs : 'a list) : int =
+        match tryFindIndex p xs with
+        | Some i -> i
+        | None -> raise (KeyNotFoundException "no element matches the predicate")
     let zip (a : 'a list) (b : 'b list) = map2 (fun x y -> (x, y)) a b
     let unzip (xs : list<'a * 'b>) =
         let mutable la = []
@@ -1656,3 +1685,173 @@ module Set =
     let isSubset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
         Array.forall (fun x -> search b x >= 0) a.SetItems
     let isSuperset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> = isSubset b a
+
+// A height-balanced (AVL) tree map, ordered by structural `compare` — the
+// same shape F#'s Map has, and the same one `stdlib/mapext.fpp` already
+// exercises. A tree rather than the sorted array `Set` uses, because the
+// resolver threads an environment through every scope and rebuilds it by
+// `add` on the way down: a copying insert is quadratic over a file, a tree
+// insert shares all but the spine.
+//
+// `empty` is a nullary case, which makes it a syntactic value and therefore
+// generalizable — `let mutable env : Env = Map.empty` needs that.
+type Map<'k, 'v> =
+    | MapEmpty
+    | MapNode of 'k * 'v * Map<'k, 'v> * Map<'k, 'v> * int * int
+
+module Map =
+    let empty = MapEmpty
+
+    let height (t : Map<'k, 'v>) : int =
+        match t with
+        | MapEmpty -> 0
+        | MapNode (k, v, l, r, h, c) -> h
+
+    let count (t : Map<'k, 'v>) : int =
+        match t with
+        | MapEmpty -> 0
+        | MapNode (k, v, l, r, h, c) -> c
+
+    let isEmpty (t : Map<'k, 'v>) : bool =
+        match t with
+        | MapEmpty -> true
+        | MapNode (k, v, l, r, h, c) -> false
+
+    let private mk (k : 'k) (v : 'v) (l : Map<'k, 'v>) (r : Map<'k, 'v>) : Map<'k, 'v> =
+        let hl = height l
+        let hr = height r
+        let h = (if hl > hr then hl else hr) + 1
+        MapNode (k, v, l, r, h, count l + count r + 1)
+
+    let private rebalance (k : 'k) (v : 'v) (l : Map<'k, 'v>) (r : Map<'k, 'v>) : Map<'k, 'v> =
+        let hl = height l
+        let hr = height r
+        if hr > hl + 2 then
+            match r with
+            | MapNode (rk, rv, rl, rr, rh, rc) ->
+                if height rl > height rr then
+                    match rl with
+                    | MapNode (rlk, rlv, rll, rlr, rlh, rlc) ->
+                        mk rlk rlv (mk k v l rll) (mk rk rv rlr rr)
+                    | MapEmpty -> mk k v l r
+                else mk rk rv (mk k v l rl) rr
+            | MapEmpty -> mk k v l r
+        elif hl > hr + 2 then
+            match l with
+            | MapNode (lk, lv, ll, lr, lh, lc) ->
+                if height lr > height ll then
+                    match lr with
+                    | MapNode (lrk, lrv, lrl, lrr, lrh, lrc) ->
+                        mk lrk lrv (mk lk lv ll lrl) (mk k v lrr r)
+                    | MapEmpty -> mk k v l r
+                else mk lk lv ll (mk k v lr r)
+            | MapEmpty -> mk k v l r
+        else mk k v l r
+
+    let rec add (key : 'k) (value : 'v) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match t with
+        | MapEmpty -> MapNode (key, value, MapEmpty, MapEmpty, 1, 1)
+        | MapNode (k, v, l, r, h, c) ->
+            let d = compare key k
+            if d < 0 then rebalance k v (add key value l) r
+            elif d > 0 then rebalance k v l (add key value r)
+            else MapNode (key, value, l, r, h, c)
+
+    let rec tryFind (key : 'k) (t : Map<'k, 'v>) : 'v option when Ordered<'k> =
+        match t with
+        | MapEmpty -> None
+        | MapNode (k, v, l, r, h, c) ->
+            let d = compare key k
+            if d < 0 then tryFind key l
+            elif d > 0 then tryFind key r
+            else Some v
+
+    let containsKey (key : 'k) (t : Map<'k, 'v>) : bool when Ordered<'k> =
+        match tryFind key t with
+        | Some v -> true
+        | None -> false
+
+    let find (key : 'k) (t : Map<'k, 'v>) : 'v when Ordered<'k> =
+        match tryFind key t with
+        | Some v -> v
+        | None -> raise (KeyNotFoundException "the key was not present in the map")
+
+    let findOr (dflt : 'v) (key : 'k) (t : Map<'k, 'v>) : 'v when Ordered<'k> =
+        match tryFind key t with
+        | Some v -> v
+        | None -> dflt
+
+    let rec private tryMin (t : Map<'k, 'v>) : ('k * 'v) option =
+        match t with
+        | MapEmpty -> None
+        | MapNode (k, v, l, r, h, c) ->
+            match l with
+            | MapEmpty -> Some (k, v)
+            | MapNode (a, b, cc, d, e, f) -> tryMin l
+
+    let rec private removeMin (t : Map<'k, 'v>) : Map<'k, 'v> =
+        match t with
+        | MapEmpty -> MapEmpty
+        | MapNode (k, v, l, r, h, c) ->
+            match l with
+            | MapEmpty -> r
+            | MapNode (a, b, cc, d, e, f) -> rebalance k v (removeMin l) r
+
+    let rec remove (key : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match t with
+        | MapEmpty -> MapEmpty
+        | MapNode (k, v, l, r, h, c) ->
+            let d = compare key k
+            if d < 0 then rebalance k v (remove key l) r
+            elif d > 0 then rebalance k v l (remove key r)
+            else
+                match l, r with
+                | MapEmpty, _ -> r
+                | _, MapEmpty -> l
+                | _, _ ->
+                    match tryMin r with
+                    | Some (sk, sv) -> rebalance sk sv l (removeMin r)
+                    | None -> l
+
+    let rec fold (f : 's -> 'k -> 'v -> 's) (s : 's) (t : Map<'k, 'v>) : 's =
+        match t with
+        | MapEmpty -> s
+        | MapNode (k, v, l, r, h, c) -> fold f (f (fold f s l) k v) r
+
+    let rec foldBack (f : 'k -> 'v -> 's -> 's) (t : Map<'k, 'v>) (s : 's) : 's =
+        match t with
+        | MapEmpty -> s
+        | MapNode (k, v, l, r, h, c) -> foldBack f l (f k v (foldBack f r s))
+
+    let iter (f : 'k -> 'v -> unit) (t : Map<'k, 'v>) : unit =
+        fold (fun s k v -> f k v) () t
+
+    let toList (t : Map<'k, 'v>) : ('k * 'v) list = foldBack (fun k v acc -> (k, v) :: acc) t []
+    let toSeq (t : Map<'k, 'v>) : ('k * 'v) seq = List.toSeq (toList t)
+    let keys (t : Map<'k, 'v>) : 'k list = foldBack (fun k v acc -> k :: acc) t []
+    let values (t : Map<'k, 'v>) : 'v list = foldBack (fun k v acc -> v :: acc) t []
+
+    let rec private ofListInto (acc : Map<'k, 'v>) (xs : ('k * 'v) list) : Map<'k, 'v> when Ordered<'k> =
+        match xs with
+        | (k, v) :: rest -> ofListInto (add k v acc) rest
+        | [] -> acc
+    let ofList (xs : ('k * 'v) list) : Map<'k, 'v> when Ordered<'k> = ofListInto MapEmpty xs
+    let ofSeq (xs : ('k * 'v) seq) : Map<'k, 'v> when Ordered<'k> = ofListInto MapEmpty (List.ofSeq xs)
+    let ofArray (xs : ('k * 'v)[]) : Map<'k, 'v> when Ordered<'k> = ofListInto MapEmpty (Array.toList xs)
+
+    let change (key : 'k) (f : 'v option -> 'v option) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match f (tryFind key t) with
+        | Some nv -> add key nv t
+        | None -> remove key t
+
+    let map (f : 'k -> 'v -> 'w) (t : Map<'k, 'v>) : Map<'k, 'w> when Ordered<'k> =
+        fold (fun acc k v -> add k (f k v) acc) MapEmpty t
+
+    let filter (p : 'k -> 'v -> bool) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        fold (fun acc k v -> if p k v then add k v acc else acc) MapEmpty t
+
+    let exists (p : 'k -> 'v -> bool) (t : Map<'k, 'v>) : bool =
+        fold (fun acc k v -> if acc then true else p k v) false t
+
+    let forall (p : 'k -> 'v -> bool) (t : Map<'k, 'v>) : bool =
+        fold (fun acc k v -> if acc then p k v else false) true t

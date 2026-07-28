@@ -55,7 +55,13 @@ let parse (projectPath : string) (text : string) : LoadResult =
     for i in 0 .. lines.Length - 1 do
         let line = lines.[i].Trim()
         if line <> "" && not (line.StartsWith "#") then
-            let sp = line.IndexOfAny [| ' '; '\t' |]
+            let spSpace = line.IndexOf ' '
+            let spTab = line.IndexOf '\t'
+            let sp =
+                if spSpace < 0 then spTab
+                elif spTab < 0 then spSpace
+                elif spSpace < spTab then spSpace
+                else spTab
             let directive = if sp < 0 then line else line.Substring (0, sp)
             let arg = if sp < 0 then "" else line.Substring(sp + 1).Trim()
             match directive with

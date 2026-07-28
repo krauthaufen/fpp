@@ -1198,27 +1198,76 @@ gaps becoming reachable at once, and looking for them inside `Workspace.fs`
 will find nothing. Expect the same effect at every later stage: the moment a
 driver exercises a path, its gaps appear.
 
-What is still needed, from the census — a long tail, no longer a wall:
+### The long tail closes, and one decision is left
+Everything in the census above is done except the last item. What each turned
+out to be:
 
-- **`Map`** (26 sites: `add`, `tryFind`, `find`, `empty`, `filter`). The
-  resolver's `Env` is an F# `Map`. The prelude has `Set` already, and a
-  sorted-array `Map` is the same shape of work.
-- **`option.IsSome`/`IsNone` as PROPERTIES** (37 sites). NOT the
-  builtin-members question: a DU can carry members in F++ today (verified
-  with a probe — `type Opt<'a> = ... member x.IsJust = ...` compiles and
-  runs), so declaring them on `Option` in the prelude is enough. If they
-  still do not resolve at those sites after that, the cause is the RECEIVER,
-  not the member: a `.IsSome` on a value whose type is only known after a
-  parked dot resolves is the same late-typing shape that hid the for-in
-  sources — diagnose it there rather than adding machinery.
-- **Small prelude gaps**: `char` (6), `defaultArg` (2), `List.take`,
-  `List.tryFindIndex`, `System.Char.IsDigit`, a dictionary `Remove`, and one
-  more `StringBuilder` that should become a `Vec<string>`.
-- **Three real emission bugs**: `array read needs a statically known element
-  type (got '')` — the nameless case, now reported rather than silent;
-  `unbound variable bv` in an or-pattern nested inside a tuple pattern (the
-  alignment above does not reach that shape yet); and `unsupported operator
-  ..` where a range is used as a value rather than as a loop source.
+- **`Map` is a TREE, and that is what made `Map.empty` work.** The census
+  called for a sorted array like `Set`'s, but `Resolve.fs` writes
+  `let mutable env : Env = Map.empty` — a generic VALUE, which the full value
+  restriction only generalizes for a SYNTACTIC value. A record literal over
+  two empty arrays is not one; a nullary DU case is. So the prelude's Map is
+  the AVL tree `stdlib/mapext.fpp` already exercises, ported over, with
+  `empty = MapEmpty`. The cost argument agrees: the resolver rebuilds the
+  environment by `add` on the way down every scope, and a copying insert is
+  quadratic over a file where a tree insert shares all but the spine.
+- **`option.IsSome`/`IsNone` are ordinary DU members**, declared on `Option`
+  in the prelude — no compiler change, no divergence, exact F# semantics.
+  `Value` came with them, and it was not cosmetic: `(dictTryFind d k).Value`
+  had been resolving to *`KeyValuePair`'s* `Value` slot, reading the wrong
+  field of the wrong type. Silent, and now correct.
+- **The small gaps**: `char` (one entry in each of the three conversion
+  lists — Infer's kind capture, Infer's typing, Lower's dispatch — since a
+  char IS its code point and the emitter's generic conversion case already
+  handles the rest), `defaultArg`, `List.take`, `List.tryFindIndex` and
+  `findIndex`. `dictRemove` and `vecToArray` joined BOTH halves of the seam;
+  the F++ `dictRemove` shifts the survivors down and rebuilds the index
+  rather than leaving a tombstone, because `dictSlot` probes until it finds
+  an empty slot and `dictPairs` order is what makes emission reproducible.
+  `System.Char.IsDigit` became the seam's own `isDigit`, `Link.substName`'s
+  StringBuilder became a `Vec<string>` and a join, and `Project.fs`'s
+  `IndexOfAny` became two `IndexOf` calls.
+- **The or-pattern bug was in EMISSION, not in the alignment.** Lowering was
+  already correct — the alternatives shared one identity per name. But the
+  emitter expanded a `POr` only when it sat at the TOP of a case pattern, so
+  `(EVar (bv, _) | EVarI (bv, _, _)), [ pa ]` — an alternative nested inside
+  a TUPLE — reached `compilePat`'s `| POr _ -> ()`, which bound nothing and
+  tested nothing. Hence "unbound variable bv" and a cast trap at runtime.
+  `Core.expandOr` now takes the product over positions at any depth, and the
+  `compilePat` no-op is an error, so the next missed shape is loud instead of
+  silent.
+- **The nameless array read was a late-typing shape**, exactly as suspected
+  of `.IsSome`: `(s.Split ':').[0]` indexes the result of a PARKED dot, so
+  the receiver was still a variable when the walk reached the index site and
+  nothing was recorded. Index sites park too now, and are retried after the
+  dot fixpoint — which also ties the read's result to the element type
+  instead of leaving it free.
+- **`[ a .. b ]` as a value** lowers to a downward cons walk, so nothing has
+  to be reversed, with both ends bound first so each is evaluated once.
+
+Two things fell out that are worth writing down:
+
+- **`Ordered` has no instance at a TUPLE type.** `List.sortBy (fun d ->
+  d.Line, d.Col)` in `Workspace.fs` reaches emission as
+  `$class:Ordered:compare:$ref` and finds nothing, because tuples canon-name
+  to `$ref` and no instance names that. Inference ACCEPTS the constraint, so
+  the gap only shows at emission. The site is spelled out with `sortWith`
+  instead; giving `$ref` an `Ordered` instance would make every reference
+  type comparable, which is a language decision and not a patch.
+- **An unused prelude global is still emitted.** `Map.empty` is the first
+  top-level VALUE the prelude has ever had, and it costs every program one
+  global plus `$init0` even when nothing mentions `Map`. Dead-code
+  elimination drops unused prelude FUNCTIONS but not this. Small, but it
+  moves the emitted bytes of every program, which matters to the fixpoint.
+
+**What is left: `Builtin.source`.** `Workspace.fs` reads `stdlib/prelude.fpp`
+out of the assembly with `GetManifestResourceStream`, and a wasm module has
+no such thing. This is the one remaining item that touches the APPROVED
+four-function host-import surface, so it is a decision and not a patch: a
+fifth extern, a seam function layered over `hostReadText` (which needs the
+compiler to learn where stdlib lives), or a generated string constant in
+`stdlib/bootstrap.fpp` — the direct analogue of what the .NET half already
+does, and the only one that keeps a browser host from needing a filesystem.
 
 ### A note on the weak gate, since it has now bitten three times
 "File N emits" has meant three different things at three different moments,

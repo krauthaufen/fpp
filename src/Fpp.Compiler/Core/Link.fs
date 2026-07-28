@@ -60,19 +60,19 @@ let instanceKey (cls : string) (memberName : string) (heads : string list) : str
 let private substName (subst : Dict<string, string>) (n : string) =
     if not (n.Contains "#") then n
     else
-        let out = System.Text.StringBuilder ()
+        let out = vecNew<string> ()
         let mutable i = 0
         while i < n.Length do
             if n.[i] = '#' then
                 let start = i
                 i <- i + 1
-                while i < n.Length && System.Char.IsDigit n.[i] do i <- i + 1
+                while i < n.Length && isDigit n.[i] do i <- i + 1
                 let var = n.Substring (start, i - start)
-                out.Append (match dictTryFind subst var with Some c -> c | None -> var) |> ignore
+                vecAdd out (match dictTryFind subst var with Some c -> c | None -> var)
             else
-                out.Append n.[i] |> ignore
+                vecAdd out (substr n i 1)
                 i <- i + 1
-        out.ToString ()
+        String.concat "" (vecToList out)
 
 let private mangleInst (name : string) (inst : string list) =
     name + "$" + String.concat "$" inst
