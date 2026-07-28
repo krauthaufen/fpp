@@ -67,6 +67,36 @@ let private oracle (name : string) (srcLines : string list) =
 [<Tests>]
 let oracleTests =
     testList "oracle: F# vs F++" [
+        // Or-patterns that BIND. Each alternative writes its own binder, so
+        // each had its own identity, and the body — which resolves to the
+        // last — read a local the matching alternative never wrote. The
+        // second case is the one the compiler's own sources use: the binders
+        // swap sides between alternatives, so aligning them by POSITION
+        // would be wrong.
+        oracle "or-patterns bind one variable across alternatives" [
+            "type T = A of int | B of int | C"
+            "let value (t : T) : int ="
+            "    match t with"
+            "    | A n | B n -> n"
+            "    | C -> 0"
+            "let r1 = print (value (A 7))"
+            "let r2 = print (value (B 9))"
+            "let r3 = print (value C)"
+        ]
+        oracle "or-pattern binders may swap sides" [
+            "type T = V of int | K of string"
+            "let pick (a : T) (b : T) : string ="
+            "    match a, b with"
+            "    | V n, other | other, V n ->"
+            "        (match other with"
+            "         | V m -> \"both \" + string (n + m)"
+            "         | K s -> \"one \" + string n + \" \" + s)"
+            "    | K s1, K s2 -> \"none \" + s1 + s2"
+            "let r1 = print (pick (V 1) (K \"x\"))"
+            "let r2 = print (pick (K \"y\") (V 2))"
+            "let r3 = print (pick (V 3) (V 4))"
+            "let r4 = print (pick (K \"p\") (K \"q\"))"
+        ]
         // The STATEMENT form of a list comprehension: yields are explicit
         // and can sit inside an `if`, a `match` arm or a nested loop, and
         // `yield!` splices a sublist.

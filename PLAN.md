@@ -1177,6 +1177,36 @@ the `Seq` one, and `errs |> List.truncate 3` is a for-in source), and
 F#'s `lazy` adds thread safety a single-threaded cache does not need, and it
 is not in the subset.
 
+### Or-patterns that bind, and what `Workspace.fs` still needs
+Removing the last lowering note let emission run over all 20 files for the
+first time, and it reported 153 errors that the note had been MASKING. The
+largest single cause was one bug: **an or-pattern's alternatives each bound
+their own variable.** `| A n | B n -> n` wrote two different `n` identities,
+and the body — which resolves to the LAST alternative, since each shadows
+the previous — read a local the matching alternative never wrote. The
+alternatives are aligned by NAME now, onto the last one's identity. By name
+and not by position, because the compiler's own use swaps sides:
+`| TVar v, other | other, TVar v ->`. Both shapes are oracle-tested against
+F#. That alone took 153 errors to 109.
+
+What the last file still needs, from the census — a long tail, no longer a
+wall:
+
+- **`Map`** (26 sites: `add`, `tryFind`, `find`, `empty`, `filter`). The
+  resolver's `Env` is an F# `Map`. The prelude has `Set` already, and a
+  sorted-array `Map` is the same shape of work.
+- **`option.IsSome`/`IsNone` as PROPERTIES** (37 sites). The functions exist
+  in the `Option` module; these are member accesses on a DU, which is the
+  builtin-members question again, now for `Option` rather than `string`.
+- **Small prelude gaps**: `char` (6), `defaultArg` (2), `List.take`,
+  `List.tryFindIndex`, `System.Char.IsDigit`, a dictionary `Remove`, and one
+  more `StringBuilder` that should become a `Vec<string>`.
+- **Three real emission bugs**: `array read needs a statically known element
+  type (got '')` — the nameless case, now reported rather than silent;
+  `unbound variable bv` in an or-pattern nested inside a tuple pattern (the
+  alignment above does not reach that shape yet); and `unsupported operator
+  ..` where a range is used as a value rather than as a loop source.
+
 ### Superseded design notes (the questions, and how they were answered)
 The last two files need services no wasm module has: reading a file, listing
 a directory, resolving a project path. This is deliberately NOT implemented

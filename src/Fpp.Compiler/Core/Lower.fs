@@ -219,6 +219,48 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let anonScheme = mono (TCon ("?", []))
 
+    /// Every alternative of an or-pattern binds the SAME variables (F#
+    /// requires the same names in each), but each writes its own binder, so
+    /// each got its own VarId — and the body, which resolves to the FIRST,
+    /// then read a local that the matching alternative never wrote. Aliasing
+    /// the later alternatives onto the first's identities by NAME is what
+    /// makes `| A n | B n -> n` bind one `n`. By name, not position: in
+    /// `| TVar v, other | other, TVar v ->` the binders swap sides.
+    let alignOrBinders (alts : Pat list) : Pat list =
+        let rec binders (p : Pat) : (string * (VarId * Scheme)) list =
+            match p with
+            | PVar (v, sch) -> [ v.Name, (v, sch) ]
+            | PAs (inner, v, sch) -> (v.Name, (v, sch)) :: binders inner
+            | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.collect binders ps
+            | PCons (h, t) -> binders h @ binders t
+            | PWild | PLit _ | PTypeTest _ -> []
+        match alts with
+        | [] | [ _ ] -> alts
+        | _ ->
+            // canonical identity comes from the LAST alternative: the
+            // resolver walks the alternatives in order and each shadows the
+            // previous, so that is the one the body's uses resolve to
+            let canon = dictNew<string, VarId * Scheme> ()
+            for name, b in binders (List.last alts) do
+                if (dictTryFind canon name).IsNone then dictSet canon name b
+            let rec rename (p : Pat) : Pat =
+                match p with
+                | PVar (v, sch) ->
+                    (match dictTryFind canon v.Name with
+                     | Some (cv, csch) -> PVar (cv, csch)
+                     | None -> PVar (v, sch))
+                | PAs (inner, v, sch) ->
+                    (match dictTryFind canon v.Name with
+                     | Some (cv, csch) -> PAs (rename inner, cv, csch)
+                     | None -> PAs (rename inner, v, sch))
+                | PCtor (n, sch, ps) -> PCtor (n, sch, List.map rename ps)
+                | PTuple ps -> PTuple (List.map rename ps)
+                | PListLit ps -> PListLit (List.map rename ps)
+                | POr ps -> POr (List.map rename ps)
+                | PCons (h, t) -> PCons (rename h, rename t)
+                | other -> other
+            List.map rename alts
+
     let rec lowerPat (n : GreenNode) : Pat =
         match n.NodeKind with
         | WildcardPat -> PWild
@@ -261,7 +303,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
              | [] -> PLit LUnit
              | [ one ] -> lowerPat one
-             | many when hasBar -> POr (List.map lowerPat many)
+             | many when hasBar -> POr (alignOrBinders (List.map lowerPat many))
              | many -> PTuple (List.map lowerPat many))
         | AsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
@@ -1028,7 +1070,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 PVar (tmp, sch), structLetExpr binders tn (EVar (tmp, sch)) body
                             | [ p ] -> lowerPat p, body
                             | [] -> PWild, body
-                            | ps -> POr (List.map lowerPat ps), body   // bar-separated alternatives
+                            | ps -> POr (alignOrBinders (List.map lowerPat ps)), body   // bar-separated alternatives
                         pat, guard, body)
                 (match scrut with
                  | Some s -> EMatch (lowerExpr (GNode s), cases)
@@ -1395,7 +1437,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             match pats with
                             | [ p ] -> lowerPat p
                             | [] -> PWild
-                            | ps -> POr (List.map lowerPat ps)
+                            | ps -> POr (alignOrBinders (List.map lowerPat ps))
                         pat, guard, cbody)
                 (match List.tryLast body with
                  | Some b -> ETry (b, cases)
