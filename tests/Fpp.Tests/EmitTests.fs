@@ -176,6 +176,25 @@ let noBoxGate =
                     "" ])
             Expect.equal out "30\n42\n" "array length, and the record field still reads"
         }
+        test "conversions FROM a string parse, and nest" {
+            // `int s` fell through the conversion table's catch-all identity
+            // and handed the STRING to an integer context. The nesting case
+            // is the same hazard one level up: a conversion's kind is its
+            // TARGET's, and reporting "u" made the outer one an identity too.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    print (string (int \"42\"))"
+                    "    print (string (int \"-17\"))"
+                    "    print (string (int64 \"1234567890123\" |> int))"
+                    "    print (string (float \"-2.5e2\"))"
+                    "    print (string (float \"1.25E-2\"))"
+                    "    print (string (int (char \"A\")))"
+                    "" ])
+            Expect.equal out "42\n-17\n1912276171\n-250\n0.0125\n65\n"
+                "each conversion parses, and the i64 wraps on the way to int"
+        }
     ]
 
 [<Tests>]

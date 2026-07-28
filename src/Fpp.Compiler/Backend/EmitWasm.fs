@@ -663,6 +663,18 @@ let emit (decls : Decl list) : EmitResult =
         | EIf (_, t, f) ->
             let a, b = kindOf t, kindOf f
             if a = b then a else "u"
+        // a CONVERSION has the kind of its target. Without this a nested one
+        // (`int64 s |> int`) reported "u", and the outer conversion took the
+        // identity path — leaving an i64 box where an i32 was expected.
+        | EApp (EUnknown n, [ _ ]) when n.Contains "#" ->
+            (match n.Substring (0, n.IndexOf "#") with
+             | "float" -> "f"
+             | "float32" -> "s"
+             | "int64" -> "l"
+             | _ -> "u")
+        | EApp (EUnknown "int64", [ _ ]) -> "l"
+        | EApp (EUnknown "float", [ _ ]) -> "f"
+        | EApp (EUnknown "float32", [ _ ]) -> "s"
         | _ -> "u"
     let newTypedLocalOuter (v : Vec<string * string>) (base_ : string) (ty : string) : string =
         let n = "$x" + string (vecLen v) + "_" + base_
@@ -905,8 +917,24 @@ let emit (decls : Decl list) : EmitResult =
                 | "f" -> "(call $tof " + recur a + ")"
                 | "s" -> "(call $tos " + recur a + ")"
                 | _ -> unwrapI32 (recur a)
+            // parsing conversions. Without these the catch-all identity
+            // below handed the STRING itself to an integer context, which
+            // trapped inside $toi — silently, and far from the conversion.
+            let strArg = "(ref.cast (ref $str) " + recur a + ")"
             (match target, src with
              | "string", "t" -> recur a
+             | "int", "t" | "uint32", "t" -> "(call $ofi (call $atoi " + strArg + "))"
+             | "int64", "t" -> "(call $ofl (call $atol " + strArg + "))"
+             | "byte", "t" ->
+                 intWat ("(i32.and (call $atoi " + strArg + ") (i32.const 255))")
+             | "sbyte", "t" ->
+                 intWat ("(i32.shr_s (i32.shl (call $atoi " + strArg + ") (i32.const 24)) (i32.const 24))")
+             | "float", "t" -> "(call $off (call $atof " + strArg + "))"
+             | "float32", "t" -> "(call $oss (f32.demote_f64 (call $atof " + strArg + ")))"
+             | "float16", "t" -> intWat ("(call $f2h (f32.demote_f64 (call $atof " + strArg + ")))")
+             // `char s` is .NET's Char.Parse: the single character of a
+             // one-character string. Longer input takes the first.
+             | "char", "t" -> intWat ("(array.get_u $str " + strArg + " (i32.const 0))")
              | "string", "f" -> "(call $ftoa " + raw + ")"
              | "string", "s" -> "(call $ftoa (f64.promote_f32 " + raw + "))"
              | "string", "l" -> "(call $ltoa " + raw + ")"
@@ -952,6 +980,13 @@ let emit (decls : Decl list) : EmitResult =
              | _, "l" -> "(call $ofi (i32.wrap_i64 " + raw + "))"
              | _, "f" -> "(call $ofi (i32.trunc_f64_s " + raw + "))"
              | _, "s" -> "(call $ofi (i32.trunc_f32_s " + raw + "))"
+             // the identity below is right for the int-shaped sources (int,
+             // char, bool, uint32) and WRONG for anything else. A string is
+             // the one other source that reaches here, so say so instead of
+             // emitting a value of the wrong representation.
+             | _, "t" ->
+                 emitError ("cannot convert a string to " + target)
+                 recur a
              | _, _ -> recur a)
         | EApp (EUnknown "int64", [ a ]) ->
             (match kindOf a with
@@ -3220,6 +3255,86 @@ TUPLE_CMP
     (local.set $r (array.new_default $str (local.get $p)))
     (array.copy $str $str (local.get $r) (i32.const 0) (local.get $s) (i32.const 0) (local.get $p))
     (local.get $r))
+  ;; string -> number. `int "42"` is a CONVERSION in F#, so it belongs with
+  ;; the rest of the family rather than in the prelude; parsing stops at the
+  ;; first character that cannot continue the number (see DIVERGENCES.md —
+  ;; .NET would raise, and F++ has no exception to raise here).
+  (func $atol (param $s (ref $str)) (result i64)
+    (local $i i32) (local $n i32) (local $neg i32) (local $acc i64) (local $c i32)
+    (local.set $n (array.len (local.get $s)))
+    (if (i32.gt_u (local.get $n) (i32.const 0))
+      (then
+        (if (i32.eq (array.get_u $str (local.get $s) (i32.const 0)) (i32.const 45))
+          (then (local.set $neg (i32.const 1)) (local.set $i (i32.const 1))))
+        (if (i32.eq (array.get_u $str (local.get $s) (i32.const 0)) (i32.const 43))
+          (then (local.set $i (i32.const 1))))))
+    (block $done
+      (loop $go
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (local.set $c (array.get_u $str (local.get $s) (local.get $i)))
+        (br_if $done (i32.lt_u (local.get $c) (i32.const 48)))
+        (br_if $done (i32.gt_u (local.get $c) (i32.const 57)))
+        (local.set $acc
+          (i64.add (i64.mul (local.get $acc) (i64.const 10))
+                   (i64.extend_i32_u (i32.sub (local.get $c) (i32.const 48)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $go)))
+    (if (result i64) (local.get $neg)
+      (then (i64.sub (i64.const 0) (local.get $acc)))
+      (else (local.get $acc))))
+  (func $atoi (param $s (ref $str)) (result i32)
+    (i32.wrap_i64 (call $atol (local.get $s))))
+  (func $atof (param $s (ref $str)) (result f64)
+    (local $i i32) (local $n i32) (local $neg i32) (local $v f64) (local $scale f64)
+    (local $stage i32) (local $exp i32) (local $esign i32) (local $c i32) (local $k i32)
+    (local.set $n (array.len (local.get $s)))
+    (local.set $scale (f64.const 0.1))
+    (local.set $esign (i32.const 1))
+    (block $done
+      (loop $go
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (local.set $c (array.get_u $str (local.get $s) (local.get $i)))
+        (if (i32.and (i32.eq (local.get $c) (i32.const 45)) (i32.eqz (local.get $i)))
+          (then (local.set $neg (i32.const 1))))
+        (if (i32.eq (local.get $c) (i32.const 46))
+          (then (local.set $stage (i32.const 1))))
+        (if (i32.or (i32.eq (local.get $c) (i32.const 101))
+                    (i32.eq (local.get $c) (i32.const 69)))
+          (then (local.set $stage (i32.const 2))))
+        (if (i32.and (i32.eq (local.get $c) (i32.const 45))
+                     (i32.eq (local.get $stage) (i32.const 2)))
+          (then (local.set $esign (i32.const -1))))
+        (if (i32.and (i32.ge_u (local.get $c) (i32.const 48))
+                     (i32.le_u (local.get $c) (i32.const 57)))
+          (then
+            (if (i32.eqz (local.get $stage))
+              (then (local.set $v
+                      (f64.add (f64.mul (local.get $v) (f64.const 10))
+                               (f64.convert_i32_u (i32.sub (local.get $c) (i32.const 48)))))))
+            (if (i32.eq (local.get $stage) (i32.const 1))
+              (then
+                (local.set $v
+                  (f64.add (local.get $v)
+                           (f64.mul (f64.convert_i32_u (i32.sub (local.get $c) (i32.const 48)))
+                                    (local.get $scale))))
+                (local.set $scale (f64.mul (local.get $scale) (f64.const 0.1)))))
+            (if (i32.eq (local.get $stage) (i32.const 2))
+              (then (local.set $exp
+                      (i32.add (i32.mul (local.get $exp) (i32.const 10))
+                               (i32.sub (local.get $c) (i32.const 48))))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $go)))
+    (block $edone
+      (loop $ego
+        (br_if $edone (i32.ge_s (local.get $k) (local.get $exp)))
+        (if (i32.gt_s (local.get $esign) (i32.const 0))
+          (then (local.set $v (f64.mul (local.get $v) (f64.const 10))))
+          (else (local.set $v (f64.div (local.get $v) (f64.const 10)))))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $ego)))
+    (if (result f64) (local.get $neg)
+      (then (f64.neg (local.get $v)))
+      (else (local.get $v))))
   (func $ltoa (param $n i64) (result anyref)
     (local $s (ref $str)) (local $p i32)
     (local.set $s (array.new_default $str (i32.const 24)))
