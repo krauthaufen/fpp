@@ -163,6 +163,13 @@ let emit (decls : Decl list) : EmitResult =
         // FIELD still stores as i32 — packing it would touch every
         // struct.get site for a per-field saving that does not matter.)
         | "float16" -> "h"
+        // byte and sbyte pack into i8 storage. They share ONE wasm array
+        // type: wasm-GC canonicalises structurally identical types, so
+        // declaring two would collapse them anyway and `ref.test` could not
+        // tell them apart. The KIND letter keeps the signedness, which is a
+        // static property of the element type, and only the read differs.
+        | "byte" -> "b"
+        | "sbyte" -> "y"
         | "float" -> "f"
         | "float32" -> "s"
         | "int64" -> "l"
@@ -175,7 +182,20 @@ let emit (decls : Decl list) : EmitResult =
         structRecordsDecl
         |> List.map (fun (n, fs) -> n, fs |> List.map (fun (f, t) -> f, kindOfType structNameList t))
     let isStructName (n : string) = structRecords |> List.exists (fun (rn, _) -> rn = n)
-    let parrOf (k : string) = "$parr_" + k
+    /// A packed byte array IS the string type. wasm-GC canonicalises
+    /// structurally identical types, and the string type is already
+    /// `(array (mut i8))` — declaring a separate packed byte array produced
+    /// a type `ref.test` could not tell from a string, so strings started
+    /// answering `:? array`. One type, and `byte[]` therefore shares a
+    /// representation with `string` (see DIVERGENCES.md).
+    let parrOf (k : string) = match k with "b" | "y" -> "$str" | _ -> "$parr_" + k
+    /// packed storage reads need an explicit sign; plain `array.get` is not
+    /// even valid on a packed array
+    let getOpOf (k : string) =
+        match k with
+        | "b" | "h" -> "array.get_u "
+        | "y" -> "array.get_s "
+        | _ -> "array.get "
     // ---- C ABI layout for POD structs (clang natural alignment) ----------
     // fields: (name, kind, byteOffset); sizeof rounded to max align;
     // storage = shared GC (array (mut i64)), strideWords per element
@@ -1691,7 +1711,8 @@ let emit (decls : Decl list) : EmitResult =
             let src = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") " + recur a + "))"
             let raw =
                 match k with
-                | "f" | "s" | "l" | "i" -> "(array.get " + parrOf k + " " + src + " " + unwrapI32 (recur i) + ")"
+                | "f" | "s" | "l" | "i" | "h" | "b" | "y" ->
+                    "(" + getOpOf k + parrOf k + " " + src + " " + unwrapI32 (recur i) + ")"
                 | _ -> "(array.get $arr " + src + " " + unwrapI32 (recur i) + ")"
             (match k with
              | "f" | "s" | "l" -> boxK k raw
@@ -1919,7 +1940,7 @@ let emit (decls : Decl list) : EmitResult =
                 let fs = structRecords |> List.pick (fun (rn, fs) -> if rn = elemName then Some fs else None)
                 let elemLocals = xs |> List.map (fun _ -> newLocal "sa")
                 let fieldArr (fi : int) (k : string) =
-                    let elemT = match k with "f" | "s" | "l" | "i" -> parrOf k | _ -> "$arr"
+                    let elemT = match k with "f" | "s" | "l" | "i" | "h" | "b" | "y" -> parrOf k | _ -> "$arr"
                     let ops =
                         List.zip elemLocals xs
                         |> List.map (fun (l, x) ->
@@ -1941,7 +1962,7 @@ let emit (decls : Decl list) : EmitResult =
                 // char access on a STRING receiver (the "$str" sentinel)
                 "(ref.i31 (array.get_u $str (ref.cast (ref $str) " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif pk <> "" then
-                let getOp = if pk = "h" then "array.get_u " else "array.get "
+                let getOp = getOpOf pk
                 "(call " + boxOfKind pk + " (" + getOp + parrOf pk + " (ref.cast (ref " + parrOf pk + ") " + recur a + ") " + unwrapI32 (recur i) + "))"
             elif isPod nm then
                 let placed, _, wd = (dictTryFind podLayout nm).Value
@@ -1961,7 +1982,7 @@ let emit (decls : Decl list) : EmitResult =
                 let getF fi (k : string) =
                     let src = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") (local.get " + al + ")))"
                     match k with
-                    | "f" | "s" | "l" | "i" -> "(array.get " + parrOf k + " " + src + " " + idx + ")"
+                    | "f" | "s" | "l" | "i" | "h" | "b" | "y" -> "(" + getOpOf k + parrOf k + " " + src + " " + idx + ")"
                     | _ -> "(array.get $arr " + src + " " + idx + ")"
                 "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) "
                 + "(struct.new $r_" + nm + " " + (fs |> List.mapi (fun fi (_, k) -> getF fi k) |> String.concat " ") + "))"
@@ -2002,7 +2023,7 @@ let emit (decls : Decl list) : EmitResult =
                     let dst = "(struct.get $sarr_" + nm + " " + string fi + " (ref.cast (ref $sarr_" + nm + ") (local.get " + al + ")))"
                     let fv = "(struct.get $r_" + nm + " " + string fi + " (ref.cast (ref $r_" + nm + ") (local.get " + vl + ")))"
                     match k with
-                    | "f" | "s" | "l" | "i" -> "(array.set " + parrOf k + " " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
+                    | "f" | "s" | "l" | "i" | "h" | "b" | "y" -> "(array.set " + parrOf k + " " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
                     | _ -> "(array.set $arr " + dst + " (call $toi (local.get " + il + ")) " + fv + ")"
                 "(block (result anyref) (local.set " + al + " " + recur a + ") (local.set " + il + " (call $ofi " + unwrapI32 (recur i) + ")) (local.set " + vl + " " + recur v + ") "
                 + (fs |> List.mapi (fun fi (_, k) -> setF fi k) |> String.concat " ") + " (ref.i31 (i32.const 0)))"
@@ -2058,7 +2079,7 @@ let emit (decls : Decl list) : EmitResult =
                 let nl = newTypedLocal "zn" "i32"
                 let mk (k : string) =
                     match k with
-                    | "f" | "s" | "l" | "i" | "h" -> "(array.new_default " + parrOf k + " (local.get " + nl + "))"
+                    | "f" | "s" | "l" | "i" | "h" | "b" | "y" -> "(array.new_default " + parrOf k + " (local.get " + nl + "))"
                     | _ -> "(array.new_default $arr (local.get " + nl + "))"
                 "(block (result anyref) (local.set " + nl + " " + unwrapI32 (recur n) + ") "
                 + "(struct.new $sarr_" + nm + " " + (fs |> List.map (fun (_, k) -> mk k) |> String.concat " ") + "))"
@@ -2092,7 +2113,7 @@ let emit (decls : Decl list) : EmitResult =
                 let mk fi (k : string) =
                     let fv = "(struct.get $r_" + nm + " " + string fi + " (ref.cast (ref $r_" + nm + ") (local.get " + vl + ")))"
                     match k with
-                    | "f" | "s" | "l" | "i" -> "(array.new " + parrOf k + " " + fv + " (call $toi (local.get " + nl + ")))"
+                    | "f" | "s" | "l" | "i" | "h" | "b" | "y" -> "(array.new " + parrOf k + " " + fv + " (call $toi (local.get " + nl + ")))"
                     | _ -> "(array.new $arr " + fv + " (call $toi (local.get " + nl + ")))"
                 "(block (result anyref) (local.set " + nl + " (call $ofi " + unwrapI32 (recur n) + ")) (local.set " + vl + " " + recur v + ") "
                 + "(struct.new $sarr_" + nm + " " + (fs |> List.mapi (fun fi (_, k) -> mk fi k) |> String.concat " ") + "))"
@@ -2582,7 +2603,7 @@ let emit (decls : Decl list) : EmitResult =
       if not (isPod rn) then
         let fa (k : string) =
             match k with
-            | "f" | "s" | "l" | "i" -> "(field (ref " + parrOf k + "))"
+            | "f" | "s" | "l" | "i" | "h" | "b" | "y" -> "(field (ref " + parrOf k + "))"
             | _ -> "(field (ref $arr))"
         line ("  (type $sarr_" + rn + " (struct " + (fs |> List.map (fun (_, k) -> fa k) |> String.concat " ") + "))")
     // DU cases share two tagged layouts — wasm-GC canonicalizes
