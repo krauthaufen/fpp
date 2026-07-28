@@ -2487,3 +2487,48 @@ opcode bytes), `compilePat`'s test builder, `compileLambda`'s closure
 construction, and the module assembly `line`s — each a direct append, none a
 concatenation tree. The `emitStr -> opcode` flip per case plus binary
 section assembly on the proven writer is what remains for .wasm output.
+
+### BRANCH binary-emitter: the direct-binary rewrite is underway
+Decision (user): no assembler anywhere, no text form at all — every case and
+the runtime emit BYTES directly. Text was the wrong intermediate; binary is
+the product; `wasm-tools print` is the debug view.
+
+DONE and execution-validated (421 tests, the SDK test RUNS a GC module built
+entirely through the API):
+- `WasmBinary.fs`: opcode tables (core + 0xFB GC sub-ops + memory ops),
+  heap/val type bytes, ref-type and blocktype writers, composite type heads
+  (func/struct/array/sub), LEB128, patched sizes, label depths.
+- `EmitBin.fs`: the module builder — explicit index spaces (types, funcs
+  with imports first, globals, data), function contexts with NAMED locals
+  and labels, struct field helpers, section assembly incl. DataCount and the
+  DECLARATIVE ELEM segment (`ref.func` targets — the wat parser had been
+  adding this silently; in raw binary it is mandatory and `rf` records it).
+
+THE GRIND that remains, in dependency order — mechanical, not hard:
+1. Fixed module frame as EmitBin calls: the ~25 prelude types in their exact
+   order ($u1 $clo $cell $cons $str $boxf $boxi $arr $parr_* $iter $pk $hnd
+   $boxl $boxs $vt $desc $obj(open sub) $du0 $du1 $v1..$vN $r_StructTuple*),
+   fd_write import, memory 17 pages + export, the exception tag (needs
+   try_table/throw encodings — opTryTable is defined, catch clause encoding
+   still to add), tuple types by observed arity.
+2. Transliterate the runtime blob (~90 functions) from hand-wat to Fn-API
+   calls. Pure typing; each is 5-40 instructions. Start with the print/itoa/
+   strcat/equal/hashv/applyc core so small programs run early.
+3. Rewrite `nodeSkeleton`'s cases to Fn-API emission (postorder: children
+   first, opcode+immediates at close; blocks open early). The skeleton/token
+   machinery then DIES; `compileToText`/`bytesString` die; EmitResult
+   carries bytes.
+4. eq/hash generators, compilePat (tests as bytes), compileLambda,
+   compileCall/compileLeaves, data segments (via dataSeg), globals, exports,
+   name section (add: readable backtraces).
+5. Peephole becomes a writer-level last-opcode check or is dropped.
+6. Gates: fixpoint compares BYTES; representation-gate greps move to
+   wasm-tools print output or to structural checks on the byte stream.
+7. Floats: carried as BITS from the literal (parse once at emission);
+   bootstrap parseFloat needs the exact fast path (mantissa<=15 digits,
+   |exp|<=22 -> exact double arithmetic) so stage-0 and stage-1 agree.
+
+Notes for whoever continues: local declaration must happen BEFORE
+instructions (localsDone writes the grouped local vector); body order must
+match declFn order; abs-heap ref.cast uses NEGATIVE s33 (gcAbs); wasmtime
+needs `-W gc=y` (and exceptions once the tag lands).
