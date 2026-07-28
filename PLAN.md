@@ -1540,3 +1540,18 @@ is still a type variable. Lowering prefers whichever name is not symbolic.
 The bootstrap drivers caught the first attempt at this (bracket-only keying
 lost the resolution and broke every generic container in the seam), which is
 what those drivers are for.
+
+### Host services as FAMILIES, and the count that follows
+The .NET surface still reachable from compiler source was closed as coherent
+seam families rather than call-by-call: **Builder** (four operations; .NET
+aliases StringBuilder, F++ joins a chunk vector once — repeated `+` on a
+growing string is the quadratic the peephole already taught us), **character
+classes and ordinal comparison**, and **literal parsing** (integers in any
+base, culture-independent floats, UTF-8 byte length, IEEE half bits). The
+emitter's memo tables moved onto the seam's own RefMap with a shallow
+constructor-tag hash. Function composition `>>` / `<<` became real operators
+(typed like a pipe, lowered to `fun x -> g (f x)`), and `float16Bits` a
+language primitive so source can name a half's BIT PATTERN — the runtime
+representation already is those bits, so it is the identity.
+Whole-compiler emission errors this session: 124 -> 66 -> 42 -> 33, with the
+suite at 407/407 and the acceptance file 0/0/0 at every step.

@@ -642,6 +642,10 @@ let id (x : 'a) : 'a = x
 // at runtime, so both of these lower to their argument. `obj` is the top
 // type the subtyping check already knows.
 extern let box : 'a -> obj
+/// A half's 16 BITS, as an int. The runtime representation of float16 IS
+/// that bit pattern, so this is the identity — it exists to give source a
+/// way to name the pattern rather than the number.
+extern let float16Bits : float16 -> int
 extern let unbox : obj -> 'a
 
 // ---- Option: the F# Option module ----

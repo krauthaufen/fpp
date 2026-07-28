@@ -37,6 +37,27 @@ let isDigitCh (c : char) : bool = c >= '0' && c <= '9'
 let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) : int =
     System.String.CompareOrdinal (s, i, t, j, len)
 
+// ---- literal parsing -------------------------------------------------
+// One family, because a compiler reads numbers in exactly these forms and
+// the F++ half must answer identically — bit patterns, not approximations.
+
+/// digits in the given base (2..16) as a signed 64-bit value
+let parseInt64In (baseN : int) (digits : string) : int64 =
+    System.Convert.ToInt64 (digits, baseN)
+/// digits in the given base as an unsigned 32-bit value, kept in an int
+let parseUInt32In (baseN : int) (digits : string) : int =
+    int (System.Convert.ToUInt32 (digits, baseN))
+let parseUInt32 (digits : string) : int = int (System.UInt32.Parse digits)
+/// decimal (never locale-dependent: a compiler's output must not move
+/// because of a machine's culture settings)
+let parseFloat (s : string) : float =
+    System.Double.Parse (s, System.Globalization.CultureInfo.InvariantCulture)
+/// the IEEE half nearest `v`, as its 16 bits
+let halfBits (v : float) : int =
+    int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
+/// how many BYTES this text occupies as UTF-8
+let utf8Length (s : string) : int = System.Text.Encoding.UTF8.GetByteCount s
+
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count
 let inline vecGet (v : Vec<'a>) (i : int) : 'a = v.[i]

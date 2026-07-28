@@ -684,7 +684,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // box/unbox are type-level: every value is already a
                       // reference, so both are the identity at runtime
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
-                            (bv.Name = "box" || bv.Name = "unbox") && bv.Path = "(builtin)" -> bx
+                            (bv.Name = "box" || bv.Name = "unbox" || bv.Name = "float16Bits")
+                            && bv.Path = "(builtin)" -> bx
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])

@@ -467,3 +467,76 @@ let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) :
             elif a > b then r <- 1
         k <- k + 1
     r
+
+// ---- literal parsing ----
+// The same family the .NET half exposes. A compiler reads numbers in these
+// forms only, and both halves must answer identically.
+
+let private digitVal (c : char) : int =
+    if c >= '0' && c <= '9' then int c - int '0'
+    elif c >= 'a' && c <= 'f' then 10 + int c - int 'a'
+    elif c >= 'A' && c <= 'F' then 10 + int c - int 'A'
+    else -1
+
+let parseInt64In (baseN : int) (digits : string) : int64 =
+    let mutable acc = 0L
+    let mutable i = 0
+    while i < digits.Length do
+        let d = digitVal digits.[i]
+        if d >= 0 && d < baseN then acc <- acc * int64 baseN + int64 d
+        i <- i + 1
+    acc
+
+let parseUInt32In (baseN : int) (digits : string) : int =
+    int (parseInt64In baseN digits)
+
+let parseUInt32 (digits : string) : int = int (parseInt64In 10 digits)
+
+/// decimal, including an exponent: mantissa digits scaled by the exponent
+let parseFloat (s : string) : float =
+    let mutable intPart = 0.0
+    let mutable frac = 0.0
+    let mutable scale = 0.1
+    let mutable exp = 0
+    let mutable expSign = 1
+    let mutable neg = false
+    let mutable stage = 0
+    let mutable i = 0
+    while i < s.Length do
+        let c = s.[i]
+        if c = '-' && i = 0 then neg <- true
+        elif c = '.' then stage <- 1
+        elif c = 'e' || c = 'E' then stage <- 2
+        elif c = '-' && stage = 2 then expSign <- -1
+        elif c = '+' && stage = 2 then expSign <- 1
+        elif isDigitCh c then
+            let d = digitVal c
+            if stage = 0 then intPart <- intPart * 10.0 + float d
+            elif stage = 1 then
+                frac <- frac + float d * scale
+                scale <- scale * 0.1
+            else exp <- exp * 10 + d
+        i <- i + 1
+    let mutable v = intPart + frac
+    let mutable k = 0
+    while k < exp do
+        if expSign > 0 then v <- v * 10.0 else v <- v / 10.0
+        k <- k + 1
+    if neg then -v else v
+
+/// The IEEE half nearest `v`, as its 16 bits. F++ HAS float16, and the
+/// conversion is exact by the 2p+2 double-rounding rule the backend already
+/// relies on, so the bits come from the language rather than a host call.
+let halfBits (v : float) : int = float16Bits (float16 v)
+
+/// how many BYTES this text occupies as UTF-8
+let utf8Length (s : string) : int =
+    let mutable n = 0
+    let mutable i = 0
+    while i < s.Length do
+        let c = int s.[i]
+        if c < 0x80 then n <- n + 1
+        elif c < 0x800 then n <- n + 2
+        else n <- n + 3
+        i <- i + 1
+    n

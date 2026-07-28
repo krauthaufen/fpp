@@ -725,18 +725,18 @@ let emit (decls : Decl list) : EmitResult =
             let isUnsigned = s.EndsWith "u" || s.EndsWith "U"
             if s.EndsWith "L" then
                 let digits =
-                    if isHex then string (System.Convert.ToInt64 (s.Substring(2).TrimEnd ([| 'L' |]), 16))
+                    if isHex then string (parseInt64In 16 (s.Substring(2).TrimEnd ([| 'L' |])))
                     else s |> String.filter (fun c -> isDigit c || c = '-')
                 "(call $ofl (i64.const " + (if digits = "" then "0" else digits) + "))"
             else
                 // both int and uint32 are one i32; an unsigned literal is the
                 // i32 with that bit pattern
                 let v =
-                    if isHex then int (System.Convert.ToUInt32 (s.Substring(2).TrimEnd ([| 'u'; 'U' |]), 16))
+                    if isHex then parseUInt32In 16 (s.Substring(2).TrimEnd ([| 'u'; 'U' |]))
                     else
                         let digits = s |> String.filter (fun c -> isDigit c || c = '-')
                         if digits = "" then 0
-                        elif isUnsigned then int (System.UInt32.Parse digits)
+                        elif isUnsigned then parseUInt32 digits
                         else int digits
                 "(call $ofi (i32.const " + string v + "))"
         | ELit (LBool b) -> "(ref.i31 (i32.const " + (if b then "1" else "0") + "))"
@@ -751,9 +751,9 @@ let emit (decls : Decl list) : EmitResult =
             if s.EndsWith "h" || s.EndsWith "H" then
                 // a half literal is rounded ONCE, here, and emitted as the
                 // bit pattern it becomes — no runtime conversion
-                let v = System.Double.Parse (num, System.Globalization.CultureInfo.InvariantCulture)
+                let v = parseFloat num
                 let bits =
-                    int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
+                    halfBits v
                 "(ref.i31 (i32.const " + string bits + "))"
             elif s.EndsWith "f" || s.EndsWith "F" then
                 "(struct.new $boxs (f32.const " + num + "))"
@@ -762,7 +762,7 @@ let emit (decls : Decl list) : EmitResult =
         | ELit (LString raw) ->
             let bytes = unescape raw
             let id = internString bytes
-            "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (System.Text.Encoding.UTF8.GetByteCount bytes) + "))"
+            "(array.new_data $str $d" + string id + " (i32.const 0) (i32.const " + string (utf8Length bytes) + "))"
         | EVarI (v, sch, _) -> recur (EVar (v, sch))
         | EVar (v, _) when (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome ->
             let rn, m = (dictTryFind paramLeaves (v.Path, v.Offset)).Value
@@ -2106,7 +2106,7 @@ let emit (decls : Decl list) : EmitResult =
         | PLit (LInt s) ->
             let digits =
                 if s.StartsWith "0x" || s.StartsWith "0X" then
-                    string (System.Convert.ToInt32 (s.TrimEnd ([| 'L'; 'u' |]), 16))
+                    string (parseInt64In 16 (s.TrimEnd ([| 'L'; 'u' |])))
                 else s |> String.filter (fun c -> isDigit c || c = '-')
             let n = if digits = "" then 0 else int digits
             app ("(br_if " + failLbl + " (i32.eqz (i32.or (ref.test (ref i31) " + v + ") (ref.test (ref $boxi) " + v + "))))")
