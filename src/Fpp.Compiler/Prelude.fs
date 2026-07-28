@@ -164,8 +164,20 @@ let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
 // host can satisfy them — a wasm preload module, a browser's in-memory map —
 // and wraps them into these signatures.
 
+/// Source is a sequence of BYTES, and every offset the compiler records —
+/// diagnostics, synthetic names built from a node's position — is a byte
+/// offset, because that is what the F++ half sees. Decoding UTF-8 into .NET
+/// chars silently renumbers everything after the first non-ASCII character:
+/// fifteen em dashes in the prelude's own comments moved an object
+/// expression's generated name by twelve, and stage-0 and stage-1 then
+/// disagreed about a type's name. Latin-1 is the identity byte->char map, so
+/// the two halves index the same way; the emitter escapes bytes on the way
+/// out, so text survives unchanged.
+let private latin1 = System.Text.Encoding.Latin1
+
 let hostReadText (path : string) : string option =
-    if System.IO.File.Exists path then Some (System.IO.File.ReadAllText path) else None
+    if System.IO.File.Exists path then Some (latin1.GetString (System.IO.File.ReadAllBytes path))
+    else None
 
 /// The prelude's own source. A host SUPPLIES it — the .NET build embeds
 /// stdlib/prelude.fpp as a resource so the binary stays self-contained; a
@@ -174,8 +186,9 @@ let hostReadText (path : string) : string option =
 let preludeSource () : string =
     use s =
         System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream "prelude.fpp"
-    use r = new System.IO.StreamReader (s)
-    r.ReadToEnd ()
+    use m = new System.IO.MemoryStream ()
+    s.CopyTo m
+    latin1.GetString (m.ToArray ())
 
 let hostExists (path : string) : bool =
     System.IO.File.Exists path || System.IO.Directory.Exists path
