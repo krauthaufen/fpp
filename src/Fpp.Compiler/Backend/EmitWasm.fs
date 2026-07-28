@@ -843,461 +843,34 @@ let emit (decls : Decl list) : EmitResult =
     // environment must never be reused in another
     // hashed SHALLOWLY on the node's constructor — identity decides equality,
     // so the hash only has to be stable and cheap (see the seam's RefMap)
-    /// The RefMap contract asks only for a hash that is STABLE and reads
-    /// immutable fields — and a constructor tag satisfies it. But stable is
-    /// not DISTRIBUTING: twenty-eight values over the tens of thousands of
-    /// subexpressions in one function turned the memo's open addressing into
-    /// a linear scan of one enormous cluster, and the scan grows with the
-    /// function. These read the same immutable fields and spread.
-    ///
-    /// Bounded on purpose: a string literal can be the whole runtime blob,
-    /// and hashing all of it on every lookup would cost more than the probing
-    /// it saves. Length plus the first few characters separates names.
-    let shortHash (s : string) : int =
-        let n = strLen s
-        let mutable h = n * 131
-        let mutable i = 0
-        while i < n && i < 8 do
-            h <- h * 31 + int (charAt s i)
-            i <- i + 1
-        h
-    /// the cheap constructor tag, used to mix a CHILD in without recursing
-    let kindTag (x : Expr) : int =
-        match x with
-        | EVar _ -> 1 | EVarI _ -> 2 | ELit _ -> 3 | ELam _ -> 4 | EApp _ -> 5
-        | ELet _ -> 6 | EIf _ -> 7 | EMatch _ -> 8 | ETuple _ -> 9 | EListLit _ -> 10
-        | ESeq _ -> 11 | EPrim _ -> 12 | ECtor _ -> 13 | ERecord _ -> 14 | EField _ -> 15
-        | EIfaceCall _ -> 16 | ECast _ -> 17 | ETypeTest _ -> 18 | EFieldSet _ -> 19
-        | EWhile _ -> 20 | EAssign _ -> 21 | EArray _ -> 22 | EIndex _ -> 23
-        | EIndexSet _ -> 24 | EArrayLen _ -> 25 | EArrayCreate _ -> 26 | ETry _ -> 27
-        | _ -> 28
-    let exprTag (x : Expr) : int =
-        match x with
-        | EVar (v, _) -> 1 + v.Offset * 29
-        | EVarI (v, _, _) -> 2 + v.Offset * 29
-        | ELit (LInt t) -> 3 + shortHash t * 29
-        | ELit (LFloat t) -> 4 + shortHash t * 29
-        | ELit (LString t) -> 5 + shortHash t * 29
-        | ELit (LChar t) -> 6 + shortHash t * 29
-        | ELit _ -> 7
-        | ELam (ps, b) -> 8 + List.length ps * 29 + kindTag b * 641
-        | EApp (f, args) -> 9 + List.length args * 29 + kindTag f * 641
-        | ELet (_, v, _, _, _) -> 10 + v.Offset * 29
-        | EIf (c, _, _) -> 11 + kindTag c * 29
-        | EMatch (sc, cs) -> 12 + List.length cs * 29 + kindTag sc * 641
-        | ETuple xs -> 13 + List.length xs * 29
-        | EListLit xs -> 14 + List.length xs * 29
-        | ESeq xs -> 15 + List.length xs * 29
-        | EPrim (op, xs) -> 16 + shortHash op * 29 + List.length xs * 641
-        | ECtor (n, _, xs) -> 17 + shortHash n * 29 + List.length xs * 641
-        | ERecord (n, fs) -> 18 + shortHash n * 29 + List.length fs * 641
-        | EField (r, fn, _) -> 19 + shortHash fn * 29 + kindTag r * 641
-        | EIfaceCall (_, m, _, args) -> 20 + shortHash m * 29 + List.length args * 641
-        | ECast (t, _, _) -> 21 + shortHash t * 29
-        | ETypeTest (t, _) -> 22 + shortHash t * 29
-        | EFieldSet (_, fn, _, _) -> 23 + shortHash fn * 29
-        | EWhile (c, _) -> 24 + kindTag c * 29
-        | EAssign (v, _) -> 25 + v.Offset * 29
-        | EArray (n, xs) -> 26 + shortHash n * 29 + List.length xs * 641
-        | EIndex (n, _, _) -> 27 + shortHash n * 29
-        | EIndexSet (n, _, _, _) -> 28 + shortHash n * 29
-        | EArrayLen (n, _) -> 29 + shortHash n * 29
-        | EArrayCreate (n, _, _) -> 30 + shortHash n * 29
-        | ETry (b, cs) -> 31 + List.length cs * 29 + kindTag b * 641
-        | _ -> 32
-    let localsTag (_ : Dict<string * int, string>) : int = 0
-    let ceMemos = refMapNew localsTag
-    let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
-                        (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
-        let plain, tailed =
-            match refMapTryFind ceMemos locals with
-            | Some pair -> pair
-            | None ->
-                let pair = refMapNew exprTag, refMapNew exprTag
-                refMapSet ceMemos locals pair
-                pair
-        let memo = if tail then tailed else plain
-        match refMapTryFind memo e with
-        | Some cached -> cached
-        | None ->
-            let r0 = compileExprInner locals extraLocals freeEnv tail e
-            refMapSet memo e r0
-            r0
-
-    /// The PARTIAL conversion to buffer emission (PLAN.md: binary, brick 2).
-    /// Converted cases append into the buffer and recurse through
-    /// `compileInto`; every other case falls back to the STRING path and
-    /// appends its result once — so each converted spine level removes one
-    /// whole-subtree copy, and the case structure is already the one the
-    /// opcode-byte switch needs. Text produced here is byte-identical to the
-    /// string path (the representation gates grep the output).
-    and compileInto (bb : WasmBinary.Bytes) (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
+    let rec compileInto (bb : WasmBinary.Bytes) (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                     (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : unit =
-        match e with
-        | ESeq xs ->
-            (match List.rev xs with
-             | [] -> WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
-             | last :: initRev ->
-                 WasmBinary.emitStr bb "(block (result anyref) "
-                 let mutable first = true
-                 for x in List.rev initRev do
-                     if not first then WasmBinary.emitStr bb " "
-                     first <- false
-                     WasmBinary.emitStr bb "(drop "
-                     compileInto bb locals extraLocals freeEnv false x
-                     WasmBinary.emitStr bb ")"
-                 WasmBinary.emitStr bb " "
-                 compileInto bb locals extraLocals freeEnv tail last
-                 WasmBinary.emitStr bb ")")
-        | ELit (LBool b) ->
-            WasmBinary.emitStr bb (if b then "(ref.i31 (i32.const 1))" else "(ref.i31 (i32.const 0))")
-        | ELit LNull -> WasmBinary.emitStr bb "(ref.null any)"
-        | ELit LUnit -> WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
-        | EIf (c, t, f) ->
-            WasmBinary.emitStr bb "(if (result anyref) (i32.ne (i32.const 0) (call $toi "
-            compileInto bb locals extraLocals freeEnv false c
-            WasmBinary.emitStr bb ")) (then "
-            compileInto bb locals extraLocals freeEnv tail t
-            WasmBinary.emitStr bb ") (else "
-            compileInto bb locals extraLocals freeEnv tail f
-            WasmBinary.emitStr bb "))"
-        // the let-SPINE, appended link by link. The rec-lambda and letrec
-        // group forms keep their string cases; the fallback re-dispatches to
-        // them. Side-effect ORDER matches the string path: rhs compiles
-        // BEFORE its binder registers (shadowing), the binder before body.
-        | ELet (_, _, _, _, _) when (match e with ELet (true, _, _, ELam _, _) -> false | _ -> true) ->
-            let newTypedLocal (base_ : string) (ty : string) : string =
-                let n = "$l" + string (vecLen extraLocals) + "_" + base_
-                vecAdd extraLocals (n, ty)
-                n
-            let mutable closes = 0
-            let mutable cur = e
-            let mutable walking = true
-            while walking do
-                match cur with
-                | ELet (true, _, _, ELam _, _) -> walking <- false
-                | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
-                    let l = newTypedLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_')) "anyref"
-                    WasmBinary.emitStr bb "(block (result anyref) (local.set "
-                    WasmBinary.emitStr bb l
-                    WasmBinary.emitStr bb " (struct.new $cell "
-                    compileInto bb locals extraLocals freeEnv false rhs
-                    dictSet locals (v.Path, v.Offset) l
-                    WasmBinary.emitStr bb ")) "
-                    closes <- closes + 1
-                    cur <- body
-                | ELet (_, v, _, rhs, body) ->
-                    let k = kindOf rhs
-                    let l = newTypedLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_')) (wasmTyOf k)
-                    WasmBinary.emitStr bb "(block (result anyref) (local.set "
-                    WasmBinary.emitStr bb l
-                    WasmBinary.emitStr bb " "
-                    if k = "u" then compileInto bb locals extraLocals freeEnv false rhs
-                    else
-                        WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
-                        compileInto bb locals extraLocals freeEnv false rhs
-                        WasmBinary.emitStr bb ")"
-                    dictSet locals (v.Path, v.Offset) l
-                    dictSet localKinds (v.Path, v.Offset) k
-                    WasmBinary.emitStr bb ") "
-                    closes <- closes + 1
-                    cur <- body
-                | _ -> walking <- false
-            compileInto bb locals extraLocals freeEnv tail cur
-            let mutable ci = 0
-            while ci < closes do
-                WasmBinary.emitStr bb ")"
-                ci <- ci + 1
-        | ETuple xs ->
-            WasmBinary.emitStr bb ("(struct.new $tup" + string xs.Length + " ")
-            let mutable first = true
-            for x in xs do
-                if not first then WasmBinary.emitStr bb " "
-                first <- false
-                compileInto bb locals extraLocals freeEnv false x
-            WasmBinary.emitStr bb ")"
-        | EListLit xs ->
-            for x in xs do
-                WasmBinary.emitStr bb "(struct.new $cons "
-                compileInto bb locals extraLocals freeEnv false x
-                WasmBinary.emitStr bb " "
-            WasmBinary.emitStr bb "(ref.null any)"
-            for _ in xs do WasmBinary.emitStr bb ")"
-        | ECtor (name, _, args) when
-              not (dictTryFind enumConst name).IsSome
-              && (match dictTryFind caseArity name with
-                  | Some n -> n > 0 && not (List.isEmpty args)
-                  | None -> false) ->
-            WasmBinary.emitStr bb ("(struct.new $du1 (i32.const " + string (dictTryFind caseTag name).Value + ") ")
-            let mutable first = true
-            for a in args do
-                if not first then WasmBinary.emitStr bb " "
-                first <- false
-                compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb ")"
-        | EWhile (c, b2) ->
-            let lbl =
-                let n = "$l" + string (vecLen extraLocals) + "_w"
-                vecAdd extraLocals (n, "anyref")
-                n
-            WasmBinary.emitStr bb ("(block (result anyref) (block $brk" + lbl + " (loop $cont" + lbl + " (br_if $brk" + lbl + " (i32.eqz (call $toi ")
-            compileInto bb locals extraLocals freeEnv false c
-            WasmBinary.emitStr bb "))) (drop "
-            compileInto bb locals extraLocals freeEnv false b2
-            WasmBinary.emitStr bb (") (br $cont" + lbl + "))) (ref.i31 (i32.const 0)))")
-        | EAssign (v, rhs) when
-              not (dictTryFind cellVars (v.Path, v.Offset)).IsSome
-              && (dictTryFind locals (v.Path, v.Offset)).IsSome ->
-            let l = (dictTryFind locals (v.Path, v.Offset)).Value
-            let k = match dictTryFind localKinds (v.Path, v.Offset) with Some k -> k | None -> "u"
-            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + l + " ")
-            if k = "u" then compileInto bb locals extraLocals freeEnv false rhs
-            else
-                WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
-                compileInto bb locals extraLocals freeEnv false rhs
-                WasmBinary.emitStr bb ")"
-            WasmBinary.emitStr bb ") (ref.i31 (i32.const 0)))"
-        | EMatch (scrut, cases) ->
-            let newLocal2 (base_ : string) : string =
-                let n = "$l" + string (vecLen extraLocals) + "_" + base_
-                vecAdd extraLocals (n, "anyref")
-                n
-            let sl = newLocal2 "scrut"
-            let res = newLocal2 "res"
-            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + sl + " ")
-            compileInto bb locals extraLocals freeEnv false scrut
-            WasmBinary.emitStr bb (") (block $done" + res + " ")
-            cases |> List.iteri (fun i (pat, guard, body) ->
-                let lbl = "$case" + res + "_" + string i
-                let alts = expandOr pat
-                WasmBinary.emitStr bb ("(block " + lbl + " ")
-                (match alts with
-                 | [ single ] ->
-                     let tests = sbNew ()
-                     compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") single
-                     WasmBinary.emitStr bb (sbText tests)
-                 | many ->
-                     let hm = "$have" + res + "_" + string i
-                     let orSlots = dictNew<string * int, string> ()
-                     WasmBinary.emitStr bb ("(block " + hm + " ")
-                     many |> List.iteri (fun j alt ->
-                         let al = "$alt" + res + "_" + string i + "_" + string j
-                         WasmBinary.emitStr bb ("(block " + al + " ")
-                         let tests = sbNew ()
-                         compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + sl + ")") alt
-                         for bk, bsl in dictPairs locals do
-                             if (dictTryFind orSlots bk).IsNone then dictSet orSlots bk bsl
-                         WasmBinary.emitStr bb (sbText tests)
-                         WasmBinary.emitStr bb ("(br " + hm + ")) "))
-                     WasmBinary.emitStr bb ("(br " + lbl + ")) "))
-                (match guard with
-                 | Some g ->
-                     WasmBinary.emitStr bb ("(br_if " + lbl + " (i32.eqz (call $toi ")
-                     compileInto bb locals extraLocals freeEnv false g
-                     WasmBinary.emitStr bb "))) "
-                 | None -> ())
-                WasmBinary.emitStr bb ("(local.set " + res + " ")
-                compileInto bb locals extraLocals freeEnv false body
-                WasmBinary.emitStr bb (") (br $done" + res + ") ")
-                WasmBinary.emitStr bb ")")
-            WasmBinary.emitStr bb (" (unreachable)) (local.get " + res + "))")
-        // known full-arity call, the two COMMON branches (externs and
-        // scalarized-struct signatures stay on the string path)
-        | EApp (EVar (v, _), args) when
-              (dictTryFind topArity (v.Path, v.Offset)) = Some (List.length args)
-              && not (dictTryFind externs (v.Path, v.Offset)).IsSome
-              && not (dictTryFind sigStructs (v.Path, v.Offset)).IsSome ->
-            let fname = (dictTryFind topName (v.Path, v.Offset)).Value
-            let op = if tail then "return_call" else "call"
-            let emitArgs (pks : string list) =
-                let mutable first = true
-                let mutable ks = pks
-                for a in args do
-                    if not first then WasmBinary.emitStr bb " "
-                    first <- false
-                    (match ks with
-                     | k :: rest ->
-                         ks <- rest
-                         if k = "u" then compileInto bb locals extraLocals freeEnv false a
-                         else
-                             WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
-                             compileInto bb locals extraLocals freeEnv false a
-                             WasmBinary.emitStr bb ")"
-                     | [] -> compileInto bb locals extraLocals freeEnv false a)
-            (match dictTryFind sigKinds (v.Path, v.Offset) with
-             | Some (pks, rk) when List.length pks = List.length args ->
-                 if tail && rk = currentRetKind then
-                     WasmBinary.emitStr bb ("(" + op + " " + fname + " ")
-                     emitArgs pks
-                     WasmBinary.emitStr bb ")"
-                 else
-                     if rk <> "u" then WasmBinary.emitStr bb ("(call " + boxFn rk + " ")
-                     WasmBinary.emitStr bb ("(call " + fname + " ")
-                     emitArgs pks
-                     WasmBinary.emitStr bb ")"
-                     if rk <> "u" then WasmBinary.emitStr bb ")"
-             | _ ->
-                 let opv = if tail && currentRetKind = "u" then op else "call"
-                 WasmBinary.emitStr bb ("(" + opv + " " + fname + " ")
-                 emitArgs []
-                 WasmBinary.emitStr bb ")")
-        | EApp (f, args) when
-              (match f with
-               | EUnknown _ | EField _ -> false
-               // a FULL-ARITY named call that the converted case above
-               // rejected (externs, scalarized signatures) belongs to the
-               // string path's known-call case, not the applyc chain —
-               // chaining it would hand uniform anyrefs to a function whose
-               // parameters are scalar leaves
-               | EVar (v, _) -> (dictTryFind topArity (v.Path, v.Offset)) <> Some (List.length args)
-               | _ -> true) ->
-            // generic application: the curried applyc chain, innermost first
-            for _ in args do WasmBinary.emitStr bb "(call $applyc "
-            compileInto bb locals extraLocals freeEnv false f
-            for a in args do
-                WasmBinary.emitStr bb " "
-                compileInto bb locals extraLocals freeEnv false a
-                WasmBinary.emitStr bb ")"
-        | EPrim (op, [ a; b ]) when
-              List.contains op [ "-"; "*"; "/"; "%"; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
-            let insn =
-                match op with
-                | "-" -> "i32.sub" | "*" -> "i32.mul" | "/" -> "i32.div_s" | "%" -> "i32.rem_s"
-                | "&&&" -> "i32.and" | "|||" -> "i32.or" | "^^^" -> "i32.xor"
-                | "<<<" -> "i32.shl" | _ -> "i32.shr_s"
-            WasmBinary.emitStr bb ("(call $ofi (" + insn + " (call $toi ")
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb ") (call $toi "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")))"
-        | EPrim (op, [ a; b ]) when List.contains op [ "<"; ">"; "<="; ">=" ] ->
-            let insn =
-                match op with
-                | "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | _ -> "i32.ge_s"
-            WasmBinary.emitStr bb ("(ref.i31 (" + insn + " (call $toi ")
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb ") (call $toi "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")))"
-        | EPrim ("+", [ a; b ]) ->
-            WasmBinary.emitStr bb "(call $addv "
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb " "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")"
-        | EPrim ("=", [ a; b ]) ->
-            WasmBinary.emitStr bb "(call $equal "
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb " "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")"
-        | EPrim ("<>", [ a; b ]) ->
-            WasmBinary.emitStr bb "(ref.i31 (i32.eqz (call $toi (call $equal "
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb " "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb "))))"
-        | EPrim ("&&", [ a; b ]) ->
-            compileInto bb locals extraLocals freeEnv false (EIf (a, b, ELit (LBool false)))
-        | EPrim ("||", [ a; b ]) ->
-            compileInto bb locals extraLocals freeEnv false (EIf (a, ELit (LBool true), b))
-        | EPrim ("::", [ a; b ]) ->
-            WasmBinary.emitStr bb "(struct.new $cons "
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb " "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")"
-        | EPrim ("@", [ a; b ]) ->
-            WasmBinary.emitStr bb "(call $append "
-            compileInto bb locals extraLocals freeEnv false a
-            WasmBinary.emitStr bb " "
-            compileInto bb locals extraLocals freeEnv false b
-            WasmBinary.emitStr bb ")"
-        | ECast (_, inner, false) ->
-            // widening: representation unchanged, nothing at runtime
-            compileInto bb locals extraLocals freeEnv false inner
-        | ERecord (tyName, fields) when
-              (let rn0 =
-                  if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome then tyName
-                  else (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
-                        | Some (rn2, _, _) -> rn2
-                        | None -> "")
-               rn0 <> "" && (dictTryFind recordOrder rn0).IsSome
-               && not (isPod rn0) && not (isStructName rn0)) ->
-            let rn =
-                if tyName <> "" && tyName <> "?" && (dictTryFind recordOrder tyName).IsSome then tyName
-                else (match fields |> List.tryPick (fun (f, _) -> dictTryFind fieldIndex f) with
-                      | Some (rn2, _, _) -> rn2
-                      | None -> tyName)
-            let order = (dictTryFind recordOrder rn).Value
-            WasmBinary.emitStr bb ("(struct.new $r_" + rn + " ")
-            let mutable first = true
-            for fname, k in order do
-                if not first then WasmBinary.emitStr bb " "
-                first <- false
-                if fname = "__idhash" then WasmBinary.emitStr bb "(i32.const 0)"
-                elif fname = "__desc" && isObjRecord rn then WasmBinary.emitStr bb ("(global.get $desc_" + rn + ")")
-                else
-                    match fields |> List.tryFind (fun (f, _) -> f = fname) with
-                    | Some (_, v) ->
-                        if k = "f" || k = "s" || k = "l" || k = "i" then
-                            WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
-                            compileInto bb locals extraLocals freeEnv false v
-                            WasmBinary.emitStr bb ")"
-                        else compileInto bb locals extraLocals freeEnv false v
-                    | None ->
-                        emitError ("missing field " + fname + " in "
-                                   + (if tyName = rn then rn else rn + " (asked for " + tyName + ")"))
-                        WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
-            WasmBinary.emitStr bb ")"
-        | EField (r, fname, owner) when
-              (match e with
-               | EField (_, "Length", _) -> (dictTryFind fieldIndex "Length").IsSome
-               | _ -> true)
-              && (match r with EIndex _ | EField _ | EUnknown _ -> false | _ -> true)
-              && (match fieldSlot owner fname with Some (rn0, _, _) -> not (isPod rn0) && not (isStructName rn0) | None -> false)
-              && not (match r with EVar (v, _) -> (dictTryFind paramLeaves (v.Path, v.Offset)).IsSome | _ -> false) ->
-            // the PLAIN field read; the POD/SoA/fusion shapes keep their
-            // string cases (guarded on receiver shape above)
-            let rn, idx, k = (fieldSlot owner fname).Value
-            if k = "f" || k = "s" || k = "l" || k = "i" then
-                WasmBinary.emitStr bb ("(call " + boxFn k + " ")
-            WasmBinary.emitStr bb ("(struct.get $r_" + rn + " " + string idx + " (ref.cast (ref $r_" + rn + ") ")
-            compileInto bb locals extraLocals freeEnv false r
-            WasmBinary.emitStr bb "))"
-            if k = "f" || k = "s" || k = "l" || k = "i" then WasmBinary.emitStr bb ")"
-        | EFieldSet (r, fname, owner, v) when
-              (match fieldSlot owner fname with Some (rn0, _, _) -> not (isPod rn0) && not (isStructName rn0) | None -> false) ->
-            let rn, idx, k = (fieldSlot owner fname).Value
-            WasmBinary.emitStr bb ("(block (result anyref) (struct.set $r_" + rn + " " + string idx
-                                   + " (ref.cast (ref $r_" + rn + ") ")
-            compileInto bb locals extraLocals freeEnv false r
-            WasmBinary.emitStr bb ") "
-            if k = "f" || k = "s" || k = "l" || k = "i" then
-                WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
-                compileInto bb locals extraLocals freeEnv false v
-                WasmBinary.emitStr bb ")"
-            else compileInto bb locals extraLocals freeEnv false v
-            WasmBinary.emitStr bb ") (ref.i31 (i32.const 0)))"
-        | EIfaceCall (iface, mname, recv, args) when
-              (slotOf iface mname).IsSome
-              && not (iface = "IEnumerable" && mname = "GetEnumerator")
-              && not (iface = "IEnumerator" && (mname = "MoveNext" || mname = "Current")) ->
-            let slot = (slotOf iface mname).Value
-            let t =
-                let n = "$l" + string (vecLen extraLocals) + "_d"
-                vecAdd extraLocals (n, "anyref")
-                n
-            let arity = 1 + List.length args
-            let ft = "$v" + string arity
-            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + t + " ")
-            compileInto bb locals extraLocals freeEnv false recv
-            WasmBinary.emitStr bb (") (call_ref " + ft + " (local.get " + t + ") ")
-            for a in args do
-                compileInto bb locals extraLocals freeEnv false a
-                WasmBinary.emitStr bb " "
-            WasmBinary.emitStr bb ("(ref.cast (ref " + ft + ") (array.get $vt (struct.get $desc 1 (ref.cast (ref $desc) (struct.get $obj 0 (ref.cast (ref $obj) (local.get " + t + "))))) (i32.const " + string slot + ")))))")
-        | other -> WasmBinary.emitStr bb (compileExpr locals extraLocals freeEnv tail other)
+        // THE append path — and there is exactly ONE case list, in
+        // `compileExprInner`. It runs here in SKELETON MODE: children come
+        // back as placeholder tokens, the literal runs append directly, and
+        // each child compiles at its token position through this same
+        // function. Early versions duplicated the hot cases here as native
+        // append code; that halved the copying but meant every case existed
+        // twice, and the two drifted. One list, one behavior, both worlds.
+        let kids = vecNew<Expr * bool> ()
+        let skel = compileExprInner locals extraLocals freeEnv tail (Some kids) e
+        let n = strLen skel
+        let mutable i = 0
+        let mutable lit = 0
+        while i < n do
+            if charAt skel i = char 1 then
+                if i > lit then WasmBinary.emitStr bb (substr skel lit (i - lit))
+                let mutable j = i + 1
+                let mutable idx = 0
+                while charAt skel j <> char 2 do
+                    idx <- idx * 10 + (int (charAt skel j) - 48)
+                    j <- j + 1
+                let kid, ktail = vecGet kids idx
+                compileInto bb locals extraLocals freeEnv ktail kid
+                i <- j + 1
+                lit <- i
+            else i <- i + 1
+        if n > lit then WasmBinary.emitStr bb (substr skel lit (n - lit))
 
     /// A function body through the buffer: ONE string materialization at the
     /// end instead of one per concatenation level.
@@ -1308,9 +881,22 @@ let emit (decls : Decl list) : EmitResult =
         bytesString (WasmBinary.bytesToArray bb)
 
     and compileExprInner (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
-                        (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
-        let recur = compileExpr locals extraLocals freeEnv false
-        let recurT = compileExpr locals extraLocals freeEnv tail
+                        (freeEnv : Dict<string * int, int>) (tail : bool) (sink : Vec<Expr * bool> option)
+                        (e : Expr) : string =
+        // SKELETON MODE (`sink` set): `recur` returns a placeholder token
+        // (\001 idx \002) and records the child instead of compiling it,
+        // so THIS case list serves both worlds — the classic string result,
+        // and the append path, which replays the skeleton's literal runs
+        // into the buffer and compiles children at token positions. One
+        // structure; no case exists twice.
+        let child (t : bool) (x : Expr) : string =
+            match sink with
+            | Some v ->
+                vecAdd v (x, t)
+                string (char 1) + string (vecLen v - 1) + string (char 2)
+            | None -> compileToText locals extraLocals freeEnv t x
+        let recur = child false
+        let recurT = child tail
         let newTypedLocal (base_ : string) (ty : string) : string =
             let n = "$l" + string (vecLen extraLocals) + "_" + base_
             vecAdd extraLocals (n, ty)
@@ -2637,7 +2223,10 @@ let emit (decls : Decl list) : EmitResult =
     /// scalarized param, packed-array read, scalarized call).
     and compileLeaves (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                       (freeEnv : Dict<string * int, int>) (rn : string) (e : Expr) : string =
-        let recur = compileExpr locals extraLocals freeEnv false
+        // REAL text, built by the append path: compileCall/compileLeaves
+        // outputs are embedded at top level and inside skeletons alike, so
+        // tokens must never leak out of them
+        let recur (x : Expr) : string = compileToText locals extraLocals freeEnv false x
         let leaves = leavesOf rn
         let unboxLeaf (k : string) (w : string) =
             match k with
@@ -2700,7 +2289,10 @@ let emit (decls : Decl list) : EmitResult =
     /// A direct call, expanding struct args into leaves where scalarized.
     and compileCall (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                     (freeEnv : Dict<string * int, int>) (v : VarId) (args : Expr list) : string =
-        let recur = compileExpr locals extraLocals freeEnv false
+        // REAL text, built by the append path: compileCall/compileLeaves
+        // outputs are embedded at top level and inside skeletons alike, so
+        // tokens must never leak out of them
+        let recur (x : Expr) : string = compileToText locals extraLocals freeEnv false x
         let fname = (dictTryFind topName (v.Path, v.Offset)).Value
         let pss, _ =
             match dictTryFind sigStructs (v.Path, v.Offset) with
@@ -2812,7 +2404,7 @@ let emit (decls : Decl list) : EmitResult =
             else
                 vecAdd errors ("cannot type-test against " + tn + ": not a class")
         | PLit (LString raw) ->
-            let lit = compileExpr locals extraLocals freeEnv false (ELit (LString raw))
+            let lit = compileToText locals extraLocals freeEnv false (ELit (LString raw))
             app ("(br_if " + failLbl + " (i32.eqz " + unwrapI32 ("(call $equal " + v + " " + lit + ")") + "))")
         | PLit (LFloat _) ->
             vecAdd errors "float patterns unsupported"
@@ -4296,7 +3888,6 @@ TUPLE_CMP
         | DLet (_, v, _, ELam (ps, body)) ->
             let fname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
-            refMapClear ceMemos
             let pks, rk =
                 match dictTryFind sigKinds (v.Path, v.Offset) with
                 | Some (pk, r) -> pk, r
@@ -4344,7 +3935,6 @@ TUPLE_CMP
             let gname = (dictTryFind topName (v.Path, v.Offset)).Value
             currentFn <- v.Name
             currentRetKind <- "u"
-            refMapClear ceMemos
             line ("  (global " + gname + " (mut anyref) (ref.null any))")
             let locals = dictNew<string * int, string> ()
             let extra = vecNew<string * string> ()
