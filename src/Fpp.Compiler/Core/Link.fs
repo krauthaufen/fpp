@@ -425,9 +425,15 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
             | EUnknown n when n.StartsWith "$class:" ->
-                (match n.Substring(7).Split ':' with
-                 | [| cls; memberName; tn0 |] ->
-                     let tn = substName subst tn0
+                // an ARRAY pattern would read better here, but F++ has no
+                // array patterns yet (see PLAN.md) — an array literal in
+                // pattern position parses as a list pattern
+                (let parts = n.Substring(7).Split ':'
+                 match parts.Length with
+                 | 3 ->
+                     let cls = parts.[0]
+                     let memberName = parts.[1]
+                     let tn = substName subst parts.[2]
                      // a one-parameter class keys on one head, a homogeneous
                      // two-parameter one on the pair
                      let byOne = dictTryFind instanceFns (instanceKey cls memberName [ tn ])

@@ -764,6 +764,43 @@ let emit (decls : Decl list) : EmitResult =
             "(ref.i31 (i32.const 0))"
         | EApp (EField (EUnknown "Array", "length", _), [ a ]) ->
             "(call $lenv " + recur a + ")"
+        // builtin members on `string`, registered in inference under
+        // "string.X" and reaching here as $str.X (with the overload ordinal)
+        | EApp (EUnknown "$str.Substring", [ s; start ]) ->
+            let sw = "(ref.cast (ref $str) " + recur s + ")"
+            let sl = newTypedLocal "sbs" "i32"
+            "(block (result anyref) (local.set " + sl + " " + unwrapI32 (recur start) + ") "
+            + "(call $strsub " + sw + " (local.get " + sl + ") "
+            + "(i32.sub (array.len " + sw + ") (local.get " + sl + "))))"
+        | EApp (EUnknown "$str.Substring#2", [ s; start; len ]) ->
+            "(call $strsub (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur start)
+            + " " + unwrapI32 (recur len) + ")"
+        | EApp (EUnknown "$str.StartsWith", [ s; p ]) ->
+            boolWat ("(call $strStarts (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) " + recur p + "))")
+        | EApp (EUnknown "$str.EndsWith", [ s; p ]) ->
+            boolWat ("(call $strEnds (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) " + recur p + "))")
+        | EApp (EUnknown "$str.Contains", [ s; p ]) ->
+            boolWat ("(i32.ge_s (call $strFind (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) "
+                     + recur p + ") (i32.const 0)) (i32.const 0))")
+        | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
+            intWat ("(call $strFind (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) "
+                    + recur p + ") (i32.const 0))")
+        | EApp (EUnknown "$str.IndexOf#2", [ s; c ]) ->
+            intWat ("(call $strFindChar (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur c) + ")")
+        | EApp (EUnknown "$str.IndexOf#3", [ s; p; from ]) ->
+            intWat ("(call $strFind (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) "
+                    + recur p + ") " + unwrapI32 (recur from) + ")")
+        | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
+            intWat ("(call $strLastFindChar (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur c) + ")")
+        | EApp (EUnknown "$str.Split", [ s; c ]) ->
+            "(call $strSplitChar (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur c) + ")"
+        | EApp (EUnknown "$str.Replace", [ s; a; b ]) ->
+            "(call $strReplace (ref.cast (ref $str) " + recur s + ") (ref.cast (ref $str) " + recur a
+            + ") (ref.cast (ref $str) " + recur b + "))"
+        | EApp (EUnknown "$str.Trim", [ s ]) ->
+            "(call $strTrim (ref.cast (ref $str) " + recur s + "))"
+        | EApp (EUnknown "$str.TrimEnd", [ s; cs ]) ->
+            "(call $strTrimEndChars (ref.cast (ref $str) " + recur s + ") " + recur cs + ")"
         | EApp (EUnknown "strsub", [ s; start; len ]) ->
             "(call $strsub (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur start)
             + " " + unwrapI32 (recur len) + ")"
@@ -2672,6 +2709,146 @@ TUPLE_HASH
         (array.get_u $str (local.get $s) (i32.add (local.get $start) (local.get $i))))
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l)))
     (local.get $r))
+  ;; ---- builtin string members ------------------------------------------
+  ;; .NET semantics, deliberately: an empty needle is found at `from`, a
+  ;; missing one is -1, Replace scans left to right without overlapping.
+  (func $strFind (param $s (ref $str)) (param $p (ref $str)) (param $from i32) (result i32)
+    (local $i i32) (local $j i32) (local $ls i32) (local $lp i32)
+    (local.set $ls (array.len (local.get $s)))
+    (local.set $lp (array.len (local.get $p)))
+    (local.set $i (local.get $from))
+    (if (i32.lt_s (local.get $i) (i32.const 0)) (then (local.set $i (i32.const 0))))
+    (if (i32.eqz (local.get $lp)) (then (return (select (local.get $i) (local.get $ls)
+                                                        (i32.le_s (local.get $i) (local.get $ls))))))
+    (block $done
+      (loop $outer
+        (br_if $done (i32.gt_s (i32.add (local.get $i) (local.get $lp)) (local.get $ls)))
+        (local.set $j (i32.const 0))
+        (block $mismatch
+          (loop $inner
+            (if (i32.ge_u (local.get $j) (local.get $lp)) (then (return (local.get $i))))
+            (br_if $mismatch (i32.ne (array.get_u $str (local.get $s) (i32.add (local.get $i) (local.get $j)))
+                                     (array.get_u $str (local.get $p) (local.get $j))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $inner)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $outer)))
+    (i32.const -1))
+  (func $strFindChar (param $s (ref $str)) (param $c i32) (result i32)
+    (local $i i32)
+    (block $done (loop $go
+      (br_if $done (i32.ge_u (local.get $i) (array.len (local.get $s))))
+      (if (i32.eq (array.get_u $str (local.get $s) (local.get $i)) (local.get $c))
+        (then (return (local.get $i))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $go)))
+    (i32.const -1))
+  (func $strLastFindChar (param $s (ref $str)) (param $c i32) (result i32)
+    (local $i i32)
+    (local.set $i (array.len (local.get $s)))
+    (block $done (loop $go
+      (br_if $done (i32.eqz (local.get $i)))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (if (i32.eq (array.get_u $str (local.get $s) (local.get $i)) (local.get $c))
+        (then (return (local.get $i))))
+      (br $go)))
+    (i32.const -1))
+  (func $strStarts (param $s (ref $str)) (param $p (ref $str)) (result i32)
+    (local $i i32)
+    (if (i32.gt_u (array.len (local.get $p)) (array.len (local.get $s))) (then (return (i32.const 0))))
+    (block $done (loop $go
+      (br_if $done (i32.ge_u (local.get $i) (array.len (local.get $p))))
+      (if (i32.ne (array.get_u $str (local.get $s) (local.get $i))
+                  (array.get_u $str (local.get $p) (local.get $i)))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $go)))
+    (i32.const 1))
+  (func $strEnds (param $s (ref $str)) (param $p (ref $str)) (result i32)
+    (local $i i32) (local $off i32)
+    (if (i32.gt_u (array.len (local.get $p)) (array.len (local.get $s))) (then (return (i32.const 0))))
+    (local.set $off (i32.sub (array.len (local.get $s)) (array.len (local.get $p))))
+    (block $done (loop $go
+      (br_if $done (i32.ge_u (local.get $i) (array.len (local.get $p))))
+      (if (i32.ne (array.get_u $str (local.get $s) (i32.add (local.get $off) (local.get $i)))
+                  (array.get_u $str (local.get $p) (local.get $i)))
+        (then (return (i32.const 0))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $go)))
+    (i32.const 1))
+  ;; n+1 pieces for n separators — "a,b," splits to "a", "b", ""
+  (func $strSplitChar (param $s (ref $str)) (param $c i32) (result anyref)
+    (local $n i32) (local $i i32) (local $start i32) (local $k i32) (local $r (ref $arr))
+    (local.set $n (i32.const 1))
+    (block $cd (loop $cg
+      (br_if $cd (i32.ge_u (local.get $i) (array.len (local.get $s))))
+      (if (i32.eq (array.get_u $str (local.get $s) (local.get $i)) (local.get $c))
+        (then (local.set $n (i32.add (local.get $n) (i32.const 1)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $cg)))
+    (local.set $r (array.new_default $arr (local.get $n)))
+    (local.set $i (i32.const 0))
+    (block $sd (loop $sg
+      (br_if $sd (i32.ge_u (local.get $i) (array.len (local.get $s))))
+      (if (i32.eq (array.get_u $str (local.get $s) (local.get $i)) (local.get $c))
+        (then
+          (array.set $arr (local.get $r) (local.get $k)
+            (call $strsub (local.get $s) (local.get $start) (i32.sub (local.get $i) (local.get $start))))
+          (local.set $k (i32.add (local.get $k) (i32.const 1)))
+          (local.set $start (i32.add (local.get $i) (i32.const 1)))))
+      (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $sg)))
+    (array.set $arr (local.get $r) (local.get $k)
+      (call $strsub (local.get $s) (local.get $start) (i32.sub (array.len (local.get $s)) (local.get $start))))
+    (local.get $r))
+  (func $strReplace (param $s (ref $str)) (param $a (ref $str)) (param $b (ref $str)) (result anyref)
+    (local $i i32) (local $at i32) (local $acc anyref)
+    (local.set $acc (array.new_default $str (i32.const 0)))
+    (if (i32.eqz (array.len (local.get $a))) (then (return (local.get $s))))
+    (block $done (loop $go
+      (local.set $at (call $strFind (local.get $s) (local.get $a) (local.get $i)))
+      (br_if $done (i32.lt_s (local.get $at) (i32.const 0)))
+      (local.set $acc (call $strcat (ref.cast (ref $str) (local.get $acc))
+        (ref.cast (ref $str) (call $strsub (local.get $s) (local.get $i) (i32.sub (local.get $at) (local.get $i))))))
+      (local.set $acc (call $strcat (ref.cast (ref $str) (local.get $acc)) (local.get $b)))
+      ;; past the match, never into it: replacements do not overlap
+      (local.set $i (i32.add (local.get $at) (array.len (local.get $a))))
+      (br $go)))
+    (call $strcat (ref.cast (ref $str) (local.get $acc))
+      (ref.cast (ref $str) (call $strsub (local.get $s) (local.get $i)
+        (i32.sub (array.len (local.get $s)) (local.get $i))))))
+  (func $strIsWs (param $c i32) (result i32)
+    (i32.or (i32.eq (local.get $c) (i32.const 32))
+      (i32.or (i32.eq (local.get $c) (i32.const 9))
+        (i32.or (i32.eq (local.get $c) (i32.const 10))
+          (i32.or (i32.eq (local.get $c) (i32.const 13))
+            (i32.or (i32.eq (local.get $c) (i32.const 11)) (i32.eq (local.get $c) (i32.const 12))))))))
+  (func $strTrim (param $s (ref $str)) (result anyref)
+    (local $a i32) (local $b i32)
+    (local.set $b (array.len (local.get $s)))
+    (block $ld (loop $lg
+      (br_if $ld (i32.ge_u (local.get $a) (local.get $b)))
+      (br_if $ld (i32.eqz (call $strIsWs (array.get_u $str (local.get $s) (local.get $a)))))
+      (local.set $a (i32.add (local.get $a) (i32.const 1))) (br $lg)))
+    (block $rd (loop $rg
+      (br_if $rd (i32.ge_u (local.get $a) (local.get $b)))
+      (br_if $rd (i32.eqz (call $strIsWs (array.get_u $str (local.get $s) (i32.sub (local.get $b) (i32.const 1))))))
+      (local.set $b (i32.sub (local.get $b) (i32.const 1))) (br $rg)))
+    (call $strsub (local.get $s) (local.get $a) (i32.sub (local.get $b) (local.get $a))))
+  ;; TrimEnd over a char ARRAY: chars are POD, so the array is packed i32
+  (func $strTrimEndChars (param $s (ref $str)) (param $cs anyref) (result anyref)
+    (local $b i32) (local $j i32) (local $hit i32) (local $ca (ref $parr_i)) (local $c i32)
+    (local.set $ca (ref.cast (ref $parr_i) (local.get $cs)))
+    (local.set $b (array.len (local.get $s)))
+    (block $done (loop $go
+      (br_if $done (i32.eqz (local.get $b)))
+      (local.set $c (array.get_u $str (local.get $s) (i32.sub (local.get $b) (i32.const 1))))
+      (local.set $hit (i32.const 0))
+      (local.set $j (i32.const 0))
+      (block $sd (loop $sg
+        (br_if $sd (i32.ge_u (local.get $j) (array.len (local.get $ca))))
+        (if (i32.eq (array.get $parr_i (local.get $ca) (local.get $j)) (local.get $c))
+          (then (local.set $hit (i32.const 1)) (br $sd)))
+        (local.set $j (i32.add (local.get $j) (i32.const 1))) (br $sg)))
+      (br_if $done (i32.eqz (local.get $hit)))
+      (local.set $b (i32.sub (local.get $b) (i32.const 1)))
+      (br $go)))
+    (call $strsub (local.get $s) (i32.const 0) (local.get $b)))
   (func $strcat (param $a (ref $str)) (param $b (ref $str)) (result anyref)
     (local $r (ref $str)) (local $i i32) (local $la i32)
     (local.set $la (array.len (local.get $a)))

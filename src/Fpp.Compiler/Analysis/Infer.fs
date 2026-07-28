@@ -285,6 +285,40 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             while (dictTryFind fields (key + "#" + string k)).IsSome do k <- k + 1
             dictSet fields (key + "#" + string k) fi
 
+    // ---- builtin members on `string` --------------------------------------
+    // F# code says `name.StartsWith "$<"`, so F++ has to mean it. A string is
+    // a primitive with no class to hang members on, so the surface is
+    // registered here and emitted through the $str primitives. It is a
+    // BOUNDED set, derived from what the compiler's own sources actually
+    // call — not the beginning of general extension members on builtins
+    // (see DIVERGENCES.md).
+    //
+    // Overloads use the ordinal mechanism: the second Substring is
+    // "string.Substring#2", chosen by the shape the use site was
+    // constrained to, exactly like a user-declared overload set.
+    let registerStringMembers () =
+        if (dictTryFind fields "string.Substring").IsNone then
+            let m (ty : Type) =
+                { TypeName = "string"; Params = []; Quantified = []
+                  FieldType = ty; DefKey = None; IsStatic = false }
+            let strArr = TCon ("array", [ tString ])
+            let charArr = TCon ("array", [ tChar ])
+            // the 1-arg form first: ordinal order IS declaration order
+            registerField "string.Substring" (m (TFun (tInt, tString)))
+            registerField "string.Substring" (m (TFun (TTuple [ tInt; tInt ], tString)))
+            registerField "string.StartsWith" (m (TFun (tString, tBool)))
+            registerField "string.EndsWith" (m (TFun (tString, tBool)))
+            registerField "string.Contains" (m (TFun (tString, tBool)))
+            registerField "string.IndexOf" (m (TFun (tString, tInt)))
+            registerField "string.IndexOf" (m (TFun (tChar, tInt)))
+            registerField "string.IndexOf" (m (TFun (TTuple [ tString; tInt ], tInt)))
+            registerField "string.LastIndexOf" (m (TFun (tChar, tInt)))
+            registerField "string.Split" (m (TFun (tChar, strArr)))
+            registerField "string.Replace" (m (TFun (TTuple [ tString; tString ], tString)))
+            registerField "string.Trim" (m (TFun (tUnit, tString)))
+            registerField "string.TrimEnd" (m (TFun (charArr, tString)))
+    registerStringMembers ()
+
     /// A member's overload set, with the ordinal that reaches each entry
     /// (0 = the plain key).
     let fieldCandidates (key : string) : (int * FieldInfo) list =
@@ -2858,10 +2892,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // can walk without anything having been parked for it
         (vecToList arrKindsRaw
          @ (vecToList lateLoopSources
-            |> List.filter (fun (_, ty) ->
+            |> List.choose (fun (off, ty) ->
                 match prune ty with
-                | TCon ("list", [ _ ]) | TCon ("array", [ _ ]) -> true
-                | _ -> false)))
+                | TCon ("list", [ _ ]) | TCon ("array", [ _ ]) -> Some (off, ty)
+                // a string walks by index under the sentinel, and can never
+                // have been the enumerator protocol
+                | TCon ("string", []) -> Some (off, TCon ("$str", []))
+                | _ -> None)))
         |> List.choose (fun (off, ty) ->
             let nameOf (t : Type) =
                 match prune t with

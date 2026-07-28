@@ -67,6 +67,44 @@ let private oracle (name : string) (srcLines : string list) =
 [<Tests>]
 let oracleTests =
     testList "oracle: F# vs F++" [
+        // Builtin members on `string`. The cases are chosen where a
+        // hand-rolled implementation and .NET part ways: an empty needle,
+        // a missing one, a split that ends on the separator, and a Replace
+        // whose replacements could overlap if the scan stepped by one.
+        oracle "string members: substring, prefix and suffix tests" [
+            "let s = \"hello world\""
+            "let a1 = print (s.Substring 6)"
+            "let a2 = print (s.Substring (0, 5))"
+            "let a3 = print (s.Substring (5, 0) + \"|\")"
+            "let b1 = print (string (s.StartsWith \"hell\") + \" \" + string (s.StartsWith \"world\") + \" \" + string (s.StartsWith \"\"))"
+            "let b2 = print (string (s.EndsWith \"rld\") + \" \" + string (s.EndsWith \"hello\") + \" \" + string (s.EndsWith \"\"))"
+            "let b3 = print (string (s.Contains \"lo w\") + \" \" + string (s.Contains \"xyz\") + \" \" + string (s.Contains \"\"))"
+        ]
+        oracle "string members: IndexOf returns -1, and 0 for an empty needle" [
+            "let s = \"hello world\""
+            "let c1 = print (string (s.IndexOf \"o\") + \" \" + string (s.IndexOf \"zz\") + \" \" + string (s.IndexOf \"\"))"
+            "let c2 = print (string (s.IndexOf 'o') + \" \" + string (s.IndexOf 'z'))"
+            "let c3 = print (string (s.IndexOf (\"o\", 5)) + \" \" + string (s.IndexOf (\"o\", 9)))"
+            "let c4 = print (string (s.LastIndexOf 'o') + \" \" + string (s.LastIndexOf 'z'))"
+        ]
+        oracle "string members: Split keeps empty pieces" [
+            "let d1 = print (String.concat \"|\" (Array.toList (\"a,b,\".Split ',')))"
+            "let d2 = print (String.concat \"|\" (Array.toList (\"\".Split ',')))"
+            "let d3 = print (String.concat \"|\" (Array.toList (\"abc\".Split ',')))"
+        ]
+        oracle "string members: Replace does not overlap itself" [
+            "let e1 = print (\"aaa\".Replace (\"aa\", \"b\"))"
+            "let e2 = print (\"banana\".Replace (\"a\", \"oo\"))"
+            "let e3 = print (\"xyz\".Replace (\"q\", \"Q\"))"
+        ]
+        oracle "string members: Trim and TrimEnd" [
+            "let f1 = print (\"  pad  \".Trim() + \"|\")"
+            "let f2 = print (\"\\t\\n x \\r\\n\".Trim() + \"|\")"
+            "let f3 = print (\"\".Trim() + \"|\")"
+            "let g1 = print (\"0x2AL\".TrimEnd ([| 'L' |]))"
+            "let g2 = print (\"100uU\".TrimEnd ([| 'u'; 'U' |]))"
+            "let g3 = print (\"abc\".TrimEnd ([| 'z' |]))"
+        ]
         oracle "factorial including beyond-i31 range" [
             "let rec fact n ="
             "    if n <= 1 then 1"

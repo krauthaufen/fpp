@@ -1001,11 +1001,41 @@ Two ways, and they should not be mixed:
    the seam explicit — but it is 88 edits, and each one can slip a semantic
    (`IndexOf` returning -1, `Split` on empty, `Replace` overlapping).
 
-Recommendation: (2), because it keeps the primitive primitive and every
-other seam member already reads this way — but it is a deliberate choice
-about the language surface, not a cleanup, so it belongs in a plan entry
-before the first edit. `Workspace`/`Project` still need the host-import
-surface decided separately; file IO is not a string function.
+**Decided: (1), builtin string members.** The self-hosting goal is F#
+compatibility, and `s.Substring` IS the F# surface; rewriting 88 idiomatic
+sites away from it moves the sources in the wrong direction, so the fix
+belongs in the compiler. The surface was derived from the survey, not
+guessed: `Substring` (1 and 2 argument), `StartsWith`, `EndsWith`,
+`Contains`, `IndexOf` (char, string, string-from-index), `LastIndexOf`,
+`Split` (char), `Replace`, `Trim`, `TrimEnd`. They register in Infer's
+`fields` table under `"string.X"` — the ordinal mechanism carries the
+overloads, so `Substring#2` is chosen by the shape the use site was
+constrained to, exactly like a user-declared overload set — and emit through
+`$str` primitives (`$strFind`, `$strStarts`, `$strEnds`, `$strSplitChar`,
+`$strReplace`, `$strTrim`, `$strTrimEndChars`, alongside the existing
+`$strsub`/`$strcat`/`$strcmp`).
+
+Pinned by oracle tests against dotnet fsi on exactly the cases where a
+hand-rolled implementation drifts: empty needles (found at 0), missing ones
+(-1), `Split` keeping trailing empty pieces, and `Replace` not overlapping
+itself. The set is CLOSED and that is a divergence — recorded in
+DIVERGENCES.md, along with the fact that general extension members on
+builtins remain an open language feature.
+
+Two smaller things fell out of the same push:
+
+- A late loop source that resolves to a STRING is promoted like a list or an
+  array now (`for c in name.Substring ...`); a string can never have been
+  the enumerator protocol, so the sentinel is safe to add after the walk.
+- **Array PATTERNS do not exist.** `[| a; b; c |]` in pattern position
+  parses as a list pattern and types as a list, so `Link.fs`'s one use was
+  rewritten into a length test plus indexing. Typing it as an array without
+  a matching IR node would silently lower a list match against an array
+  value, so the honest fix is a new `Pat` case — worth doing when a second
+  site wants it.
+
+`Workspace`/`Project` still need the host-import surface decided
+separately; file IO is not a string function.
 
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they

@@ -97,3 +97,33 @@ exact, stay eligible for the oracle.
 remainder and so do we (`a - b * truncate (a / b)`), even though wasm has no
 instruction for it. `min`/`max` likewise use F#'s own definition,
 `if a < b then a else b`.
+
+## Members on `string` are a fixed builtin set, not extension members
+
+A string is a primitive — an array of bytes with no class to hang members
+on — so `s.Substring 2` cannot resolve the way a member on a declared type
+does. The set F# code actually uses is registered as builtin members instead
+and emitted through the `$str` primitives: `Substring` (1 and 2 argument),
+`StartsWith`, `EndsWith`, `Contains`, `IndexOf` (char, string, and string
+from an index), `LastIndexOf`, `Split` (char), `Replace`, `Trim` and
+`TrimEnd`.
+
+**Reason.** The alternative was to rewrite every call site onto seam
+functions (`startsWith s p`), and that moves the codebase AWAY from F#
+compatibility for the compiler's convenience. The member surface is the F#
+surface; the fix belongs in the compiler.
+
+**The divergence.** The set is CLOSED. `s.ToUpper()` or `s.PadLeft 3` do not
+resolve, and neither does a user-defined extension member on `string` or on
+any other builtin — general extension members remain an open language
+feature. The bounded set was derived from what the compiler's own sources
+call; growing it is a one-line registration plus a primitive, deliberately
+so.
+
+**Where they agree exactly.** Semantics are .NET's, pinned by oracle tests
+on the cases where a hand-rolled implementation would drift: an empty needle
+is found at index 0, a missing one gives -1, `Split` keeps trailing empty
+pieces (`"a,b,"` gives three), and `Replace` scans left to right without
+letting replacements overlap (`"aaa".Replace("aa", "b")` is `"ba"`, not
+`"b"`). `Trim` trims ASCII whitespace; the full Unicode set is not
+implemented.

@@ -580,6 +580,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | Some coff -> dictTryFind defsAt coff
                                   | None -> None)
                              | None -> None
+                     // a BUILTIN member on `string`: no definition to call,
+                     // it emits as a $str primitive. The member site names
+                     // the owner ("string", or "string#2" for the second
+                     // overload), and the ordinal picks the primitive.
+                     let stringBuiltin =
+                         if head.NodeKind <> DotExpr then None
+                         else
+                             match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t ->
+                                 (match dictTryFind memberSites t.Offset with
+                                  | Some owner when owner = "string" || owner.StartsWith "string#" ->
+                                      let ord = if owner = "string" then "" else owner.Substring (owner.IndexOf "#")
+                                      (match nodesOf head |> List.tryHead with
+                                       | Some recv -> Some ("$str." + t.Text + ord, lowerExpr (GNode recv))
+                                       | None -> None)
+                                  | _ -> None)
+                             | None -> None
+                     match stringBuiltin with
+                     | Some (prim, recv) ->
+                         // a 2-argument .NET call passes a TUPLE; flatten it
+                         // so the primitive sees plain operands
+                         let flat =
+                             loweredArgs
+                             |> List.collect (fun a -> match a with ETuple xs -> xs | ELit LUnit -> [] | x -> [ x ])
+                         EApp (EUnknown prim, recv :: flat)
+                     | None ->
                      match overloaded with
                      | Some cd -> EApp (EVar (varIdOf cd, schemeOf cd), loweredArgs)
                      | None ->
