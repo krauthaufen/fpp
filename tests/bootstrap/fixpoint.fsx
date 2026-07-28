@@ -75,10 +75,17 @@ let escape (bytes : byte[]) =
         else sb.Append("\\").Append(b.ToString "x2") |> ignore
     sb.ToString ()
 
+/// Source is BYTES. Reading it as UTF-8 text gives .NET char offsets, and
+/// stage-1 — which sees the same file as bytes — then numbers every node
+/// after the first non-ASCII character differently. Latin-1 is the identity
+/// byte->char map, so both stages index the same way.
+let readSource (path : string) : string =
+    System.Text.Encoding.Latin1.GetString (System.IO.File.ReadAllBytes path)
+
 /// The prelude source the host hands to stage-1 — the SAME text stage-0
 /// compiled against, read from the file the build embeds.
 let preludeText : string =
-    System.IO.File.ReadAllText (root + "/stdlib/prelude.fpp")
+    readSource (root + "/stdlib/prelude.fpp")
 
 let generateHost (files : (string * string) list) : string =
     let sb = System.Text.StringBuilder()
@@ -87,8 +94,8 @@ let generateHost (files : (string * string) list) : string =
     app "  (type $str (array (mut i8)))"
     files |> List.iteri (fun i (p, c) ->
         app (sprintf "  (data $p%d \"%s\")" i (escape (System.Text.Encoding.UTF8.GetBytes p)))
-        app (sprintf "  (data $c%d \"%s\")" i (escape (System.Text.Encoding.UTF8.GetBytes c))))
-    app (sprintf "  (data $prelude \"%s\")" (escape (System.Text.Encoding.UTF8.GetBytes preludeText)))
+        app (sprintf "  (data $c%d \"%s\")" i (escape (System.Text.Encoding.Latin1.GetBytes c))))
+    app (sprintf "  (data $prelude \"%s\")" (escape (System.Text.Encoding.Latin1.GetBytes preludeText)))
     app "  (func $eq (param $a (ref $str)) (param $b (ref $str)) (result i32)"
     app "    (local $i i32)"
     app "    (if (i32.ne (array.len (local.get $a)) (array.len (local.get $b))) (then (return (i32.const 0))))"
@@ -126,7 +133,7 @@ let generateHost (files : (string * string) list) : string =
     // comparable rather than merely similar
     app "  (func (export \"preludeSourceRaw\") (param $p anyref) (result anyref)"
     app (sprintf "    (array.new_data $str $prelude (i32.const 0) (i32.const %d)))"
-                 (System.Text.Encoding.UTF8.GetByteCount preludeText))
+                 (System.Text.Encoding.Latin1.GetByteCount preludeText))
     app ")"
     sb.ToString ()
 
@@ -200,7 +207,7 @@ let report (expected : string) (actual : string) =
 
 // ---- go ------------------------------------------------------------------
 
-let corpusFiles = corpus |> List.map (fun p -> servedName p, System.IO.File.ReadAllText p)
+let corpusFiles = corpus |> List.map (fun p -> servedName p, readSource p)
 
 printfn "corpus: %s" (String.concat ", " (corpusFiles |> List.map fst))
 
@@ -213,10 +220,10 @@ printfn "stage-0 answer: %d bytes" expected.Length
 if System.Environment.GetCommandLineArgs () |> Array.contains "stage0" then exit 0
 
 let stage1Source =
-    (compilerFiles |> List.map (fun f -> f, System.IO.File.ReadAllText f))
+    (compilerFiles |> List.map (fun f -> f, readSource f))
     @ [ let d = root + "/tests/bootstrap/compiledrive.fpp"
         // the driver names the corpus; keep it and the host in step
-        let text = System.IO.File.ReadAllText d
+        let text = readSource d
         let names = corpusFiles |> List.map (fun (n, _) -> "\"" + n + "\"")
         d, text.Replace ("let corpus = [ \"corpus.fpp\" ]",
                          "let corpus = [ " + String.concat "; " names + " ]") ]
@@ -229,7 +236,7 @@ printfn "stage-1: %d bytes of wat" stage1.Length
 // the host serves the corpus AND the prelude the compiler reads at startup
 let hostPath = scratch + "/env.wat"
 System.IO.File.WriteAllText (hostPath,
-    generateHost (corpusFiles @ [ "prelude.fpp", System.IO.File.ReadAllText (root + "/stdlib/prelude.fpp") ]))
+    generateHost (corpusFiles @ [ "prelude.fpp", readSource (root + "/stdlib/prelude.fpp") ]))
 
 // 64 MB of wasm stack: the compiler is recursive-descent throughout (parser,
 // type walks, emission), and wasmtime's 1 MB default is not a statement about
