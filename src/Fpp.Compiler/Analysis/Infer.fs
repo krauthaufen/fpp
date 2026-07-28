@@ -344,6 +344,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "Option.Value" (m (TVar elem))
     registerOptionMembers ()
 
+    // ---- builtin members on `list` ----------------------------------------
+    // Same argument as `option`: F# code says `xs.IsEmpty`, and these are
+    // properties of the cons CELL, identical at every element type. A member
+    // on the generic list would be stamped per element type for nothing.
+    let registerListMembers () =
+        if (dictTryFind fields "list.IsEmpty").IsNone then
+            let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
+            let m (ty : Type) =
+                { TypeName = "list"; Params = [ elem ]; Quantified = []
+                  FieldType = ty; DefKey = None; IsStatic = false }
+            registerField "list.IsEmpty" (m tBool)
+            registerField "list.Length" (m tInt)
+            registerField "list.Head" (m (TVar elem))
+            registerField "list.Tail" (m (tList (TVar elem)))
+    registerListMembers ()
+
     /// A member's overload set, with the ordinal that reaches each entry
     /// (0 = the plain key).
     let fieldCandidates (key : string) : (int * FieldInfo) list =
@@ -1108,7 +1124,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -1204,6 +1220,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "char" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tChar
+                              // byte and sbyte are int-shaped like char: the
+                              // conversion changes how the value READS, and
+                              // the emitter masks to the width
+                              | Some t when (t.Text = "byte" || t.Text = "sbyte")
+                                            && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon (t.Text, []))
 
                               | Some t when t.Text = "isNull" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore

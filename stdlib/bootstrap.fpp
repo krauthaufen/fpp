@@ -546,3 +546,26 @@ let utf8Length (s : string) : int =
         else n <- n + 3
         i <- i + 1
     n
+
+/// The same text as UTF-8 BYTES. Encodes the three ranges a source file can
+/// contain; a lone surrogate cannot appear in a well-formed string here.
+let utf8Bytes (s : string) : byte[] =
+    let out = Array.zeroCreate (utf8Length s)
+    let mutable j = 0
+    let mutable i = 0
+    while i < s.Length do
+        let c = int s.[i]
+        if c < 0x80 then
+            out.[j] <- byte c
+            j <- j + 1
+        elif c < 0x800 then
+            out.[j] <- byte (0xC0 ||| (c >>> 6))
+            out.[j + 1] <- byte (0x80 ||| (c &&& 0x3F))
+            j <- j + 2
+        else
+            out.[j] <- byte (0xE0 ||| (c >>> 12))
+            out.[j + 1] <- byte (0x80 ||| ((c >>> 6) &&& 0x3F))
+            out.[j + 2] <- byte (0x80 ||| (c &&& 0x3F))
+            j <- j + 3
+        i <- i + 1
+    out

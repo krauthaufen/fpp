@@ -57,6 +57,8 @@ let halfBits (v : float) : int =
     int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
 /// how many BYTES this text occupies as UTF-8
 let utf8Length (s : string) : int = System.Text.Encoding.UTF8.GetByteCount s
+/// the same text as UTF-8 BYTES (data segments carry bytes, not chars)
+let utf8Bytes (s : string) : byte[] = System.Text.Encoding.UTF8.GetBytes s
 
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count

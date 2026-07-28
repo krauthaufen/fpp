@@ -441,7 +441,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
@@ -1403,6 +1403,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         PWild, None,
                                           EApp (EUnknown "failwith",
                                                 [ ELit (LString "\"the option value was None\"") ]) ])
+                          // list: cons-cell properties, lowered to the shape
+                          // they mean rather than to a stamped member
+                          elif owner = "list" && name.Text = "IsEmpty" then
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCons (PWild, PWild), None, ELit (LBool false)
+                                        PWild, None, ELit (LBool true) ])
+                          elif owner = "list" && name.Text = "Head" then
+                              let h = { Path = path; Offset = offsetOf n + 22000000; Name = "_lh" }
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCons (PVar (h, anon), PWild), None, EVar (h, anon)
+                                        PWild, None,
+                                          EApp (EUnknown "failwith",
+                                                [ ELit (LString "\"the list is empty\"") ]) ])
+                          elif owner = "list" && name.Text = "Tail" then
+                              let t = { Path = path; Offset = offsetOf n + 23000000; Name = "_lt" }
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCons (PWild, PVar (t, anon)), None, EVar (t, anon)
+                                        PWild, None,
+                                          EApp (EUnknown "failwith",
+                                                [ ELit (LString "\"the list is empty\"") ]) ])
+                          elif owner = "list" && name.Text = "Length" then
+                              EApp (EUnknown "$listLength", [ lowerExpr (GNode lhs) ])
                           else EField (lowerExpr (GNode lhs), name.Text, owner))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->

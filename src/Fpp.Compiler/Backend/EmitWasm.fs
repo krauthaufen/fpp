@@ -842,6 +842,7 @@ let emit (decls : Decl list) : EmitResult =
             "(call $strTrim (ref.cast (ref $str) " + recur s + "))"
         | EApp (EUnknown "$str.TrimEnd", [ s; cs ]) ->
             "(call $strTrimEndChars (ref.cast (ref $str) " + recur s + ") " + recur cs + ")"
+        | EApp (EUnknown "$listLength", [ xs ]) -> "(call $listLength " + recur xs + ")"
         | EApp (EUnknown "strsub", [ s; start; len ]) ->
             "(call $strsub (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur start)
             + " " + unwrapI32 (recur len) + ")"
@@ -887,6 +888,14 @@ let emit (decls : Decl list) : EmitResult =
                  "(if (result anyref) (i32.eqz " + raw + ")"
                  + " (then (array.new_fixed $str 5 (i32.const 70) (i32.const 97) (i32.const 108) (i32.const 115) (i32.const 101)))"
                  + " (else (array.new_fixed $str 4 (i32.const 84) (i32.const 114) (i32.const 117) (i32.const 101))))"
+             // byte / sbyte: int-shaped, MASKED to eight bits (sbyte then
+             // sign-extended) — what F# means by `byte (c >>> 6)`
+             | "byte", "f" -> intWat ("(i32.and (i32.trunc_f64_s " + raw + ") (i32.const 255))")
+             | "byte", "s" -> intWat ("(i32.and (i32.trunc_f32_s " + raw + ") (i32.const 255))")
+             | "byte", "l" -> intWat ("(i32.and (i32.wrap_i64 " + raw + ") (i32.const 255))")
+             | "byte", _ -> intWat ("(i32.and " + raw + " (i32.const 255))")
+             | "sbyte", "l" -> intWat ("(i32.shr_s (i32.shl (i32.wrap_i64 " + raw + ") (i32.const 24)) (i32.const 24))")
+             | "sbyte", _ -> intWat ("(i32.shr_s (i32.shl " + raw + " (i32.const 24)) (i32.const 24))")
              | "string", "c" -> "(array.new $str " + raw + " (i32.const 1))"
              | "string", _ -> "(call $itoa " + raw + ")"
              // a half is its bit pattern, so every conversion goes through
@@ -2692,6 +2701,19 @@ TUPLE_EQ
   ;; .Length where the element representation is not statically known: the
   ;; two generic call sites referenced this WITHOUT it existing, so any
   ;; module reaching them failed validation
+  (func $listLength (param $v anyref) (result anyref)
+    ;; length of a cons chain — `xs.Length` on a list
+    (local $n i32)
+    (local $c anyref)
+    (local.set $n (i32.const 0))
+    (local.set $c (local.get $v))
+    (block $done
+      (loop $go
+        (br_if $done (i32.eqz (ref.test (ref $cons) (local.get $c))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (local.set $c (struct.get $cons 1 (ref.cast (ref $cons) (local.get $c))))
+        (br $go)))
+    (call $ofi (local.get $n)))
   (func $lenv (param $v anyref) (result anyref)
     (if (ref.test (ref $arr) (local.get $v))
       (then (return (call $ofi (array.len (ref.cast (ref $arr) (local.get $v)))))))
@@ -3567,7 +3589,7 @@ TUPLE_HASH
         sbText out
     vecToList strings
     |> List.iteri (fun i sdata ->
-        line ("  (data $d" + string i + " \"" + hexEscape (System.Text.Encoding.UTF8.GetBytes sdata) + "\")"))
+        line ("  (data $d" + string i + " \"" + hexEscape (utf8Bytes sdata) + "\")"))
 
     // string accessors for host glue (JS reads/builds $str through these)
     line """  (func (export "str_len") (param $s anyref) (result i32)
