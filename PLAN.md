@@ -2252,3 +2252,34 @@ in `compileExpr` — a `refEq`-visited-set walk of the optimize output would
 locate the back-edge and the function that built it. This is the compiler
 miscompiling a pass of its own optimizer: exactly the class of bug nothing
 but self-hosting finds.
+
+### THE MISCOMPILATION, FOUND AND FIXED: `(A _ | B _) as x` bound garbage
+The cyclic-tree hunt ended in a four-line repro:
+
+    match e with
+    | (A (n, _) | B (n, _, _)) as it when n > 2 -> it
+    | _ -> C
+
+`PVar` shares one slot across or-alternatives through `orSlots`; **`PAs` did
+not** — it allocated a fresh local per alternative and rebound the variable,
+so the shared body read whichever alternative compiled LAST. Match on the
+FIRST alternative and the body returned whatever garbage sat in the last
+alternative's never-written local.
+
+That garbage is what became the "cyclic expression tree": the untupling
+pass's top-down `go` used exactly this pattern shape
+(`(EVar (f, _) | EVarI (f, _, _)) as hd`), so `hd` was junk whenever the
+EVar alternative matched — and a rebuild around a junk node can point
+anywhere, including at an ancestor. Three pass formulations were blamed and
+reverted for what was a twelve-year-old-style backend bug. The A/B that
+cracked it: the same pass logic routed through `mapExpr` (no or-as pattern)
+was green; only the formulation using or-as trapped.
+
+Fix: `PAs` now consults `orSlots` exactly as `PVar` does (EmitWasm). Repro
+is a regression test; 417 tests green; self-host byte-identical.
+
+Worth knowing for future hunts: the failing self-compile was reproduced with
+stage-0 rewriting NOTHING (control build), which proved the corruption came
+from the pass merely EXECUTING in stage-1 — i.e. from how stage-0 compiled
+the pass's own code. That control-experiment shape is the fastest way to
+separate "my new pass is wrong" from "the compiler miscompiles my new pass".
