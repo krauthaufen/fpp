@@ -341,7 +341,7 @@ let emit (decls : Decl list) : EmitResult =
 
     let topArity = dictNew<string * int, int> ()   // (path,offset) -> arity of top-level fn
     let topName = dictNew<string * int, string> ()
-    let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+    let mangle (v : VarId) = "$g" + string (abs (hash v.Path % 1000)) + "_" + string v.Offset + "_" + (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_'))
     // extern signatures: param/result kinds derived from the scheme.
     // "i" = int (i32 ABI, wrapped), "r" = reference/other (opaque anyref)
     // scalar-typed signatures: (paramKinds, resultKind) for top-level fns
@@ -678,30 +678,34 @@ let emit (decls : Decl list) : EmitResult =
     // keyed by the LOCALS dictionary as well as the node: a lambda body is
     // emitted against a fresh locals map, and text produced in one
     // environment must never be reused in another
-    let ceMemos =
-        System.Collections.Generic.Dictionary<Dict<string * int, string>,
-                                              System.Collections.Generic.Dictionary<Expr, string>
-                                              * System.Collections.Generic.Dictionary<Expr, string>>
-            (HashIdentity.Reference)
+    // hashed SHALLOWLY on the node's constructor — identity decides equality,
+    // so the hash only has to be stable and cheap (see the seam's RefMap)
+    let exprTag (x : Expr) : int =
+        match x with
+        | EVar _ -> 1 | EVarI _ -> 2 | ELit _ -> 3 | ELam _ -> 4 | EApp _ -> 5
+        | ELet _ -> 6 | EIf _ -> 7 | EMatch _ -> 8 | ETuple _ -> 9 | EListLit _ -> 10
+        | ESeq _ -> 11 | EPrim _ -> 12 | ECtor _ -> 13 | ERecord _ -> 14 | EField _ -> 15
+        | EIfaceCall _ -> 16 | ECast _ -> 17 | ETypeTest _ -> 18 | EFieldSet _ -> 19
+        | EWhile _ -> 20 | EAssign _ -> 21 | EArray _ -> 22 | EIndex _ -> 23
+        | EIndexSet _ -> 24 | EArrayLen _ -> 25 | EArrayCreate _ -> 26 | ETry _ -> 27
+        | _ -> 28
+    let localsTag (_ : Dict<string * int, string>) : int = 0
+    let ceMemos = refMapNew localsTag
     let rec compileExpr (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
                         (freeEnv : Dict<string * int, int>) (tail : bool) (e : Expr) : string =
         let plain, tailed =
-            match ceMemos.TryGetValue locals with
-            | true, pair -> pair
-            | _ ->
-                let pair =
-                    System.Collections.Generic.Dictionary<Expr, string> (HashIdentity.Reference),
-                    System.Collections.Generic.Dictionary<Expr, string> (HashIdentity.Reference)
-                ceMemos.[locals] <- pair
+            match refMapTryFind ceMemos locals with
+            | Some pair -> pair
+            | None ->
+                let pair = refMapNew exprTag, refMapNew exprTag
+                refMapSet ceMemos locals pair
                 pair
         let memo = if tail then tailed else plain
-        match memo.TryGetValue e with
-        | true, cached -> cached
-        | _ ->
+        match refMapTryFind memo e with
+        | Some cached -> cached
+        | None ->
             let r0 = compileExprInner locals extraLocals freeEnv tail e
-            // `memo.[e] <- r0` lowers as an ARRAY index-set (F++ models no
-            // dict-index form), so the seam call is what self-compiles
-            memo.Add (e, r0)
+            refMapSet memo e r0
             r0
 
     and compileExprInner (locals : Dict<string * int, string>) (extraLocals : Vec<string * string>)
@@ -1043,7 +1047,7 @@ let emit (decls : Decl list) : EmitResult =
             // closure it stood for. Same trick as the single-binding case,
             // one marker per binding instead of the shared global.
             let members, groupBody = recGroupOf e
-            let clean (nm : string) = nm |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')
+            let clean (nm : string) = nm |> String.map (fun c -> if isLetterOrDigit c then c else '_')
             let slots =
                 members
                 |> List.map (fun (v, lam) ->
@@ -1070,7 +1074,7 @@ let emit (decls : Decl list) : EmitResult =
         | ELet (true, v, _, ELam (ps, lbody), body) ->
             // recursive local function: lambda-lift via a self-slot that is
             // patched after construction (env cells are mutable)
-            let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+            let l = newLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_'))
             dictSet locals (v.Path, v.Offset) l
             // the closure captures a unique marker for itself; after the
             // closure exists, every env slot holding the marker is patched
@@ -1094,7 +1098,7 @@ let emit (decls : Decl list) : EmitResult =
                 | ELet (true, _, _, ELam _, _) -> walking <- false
                 | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
                     // captured mutable: the frame holds the cell, not the value
-                    let l = newLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_'))
+                    let l = newLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_'))
                     let r = recur rhs
                     dictSet locals (v.Path, v.Offset) l
                     sbAdd spine ("(block (result anyref) (local.set " + l + " (struct.new $cell " + r + ")) ")
@@ -1102,7 +1106,7 @@ let emit (decls : Decl list) : EmitResult =
                     cur <- body
                 | ELet (_, v, _, rhs, body) ->
                     let k = kindOf rhs
-                    let l = newTypedLocal (v.Name |> String.map (fun c -> if System.Char.IsLetterOrDigit c then c else '_')) (wasmTyOf k)
+                    let l = newTypedLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_')) (wasmTyOf k)
                     let r = recur rhs
                     dictSet locals (v.Path, v.Offset) l
                     dictSet localKinds (v.Path, v.Offset) k
@@ -1113,7 +1117,7 @@ let emit (decls : Decl list) : EmitResult =
                 | _ -> walking <- false
             sbAdd spine (recurT cur)
             sbAdd spine (String.replicate closes ")")
-            spine.ToString ()
+            sbText spine
         | EIf (c, t, f) ->
             "(if (result anyref) (i32.ne (i32.const 0) " + unwrapI32 (recur c) + ") (then "
             + recurT t + ") (else " + recurT f + "))"
@@ -3620,8 +3624,8 @@ TUPLE_HASH
                     let hit =
                         pairs |> List.tryFind (fun (outer, inner) ->
                             i + outer.Length + inner.Length <= src.Length
-                            && System.String.CompareOrdinal (src, i, outer, 0, outer.Length) = 0
-                            && System.String.CompareOrdinal (src, i + outer.Length, inner, 0, inner.Length) = 0)
+                            && compareOrdinalAt src i outer 0 outer.Length = 0
+                            && compareOrdinalAt src (i + outer.Length) inner 0 inner.Length = 0)
                     match hit with
                     | Some (outer, inner) ->
                         let innerStart = i + outer.Length
@@ -3651,7 +3655,7 @@ TUPLE_HASH
                 let out = sbNew ()
                 for k in 0 .. src.Length - 1 do
                     if not drop.[k] then sbAdd out (string src.[k])
-                out.ToString (), true
+                sbText out, true
         let mutable changed = true
         while changed do
             let next, didChange = onePass t
@@ -3659,4 +3663,4 @@ TUPLE_HASH
             changed <- didChange
         t
 
-    { Wat = peephole (sb.ToString ()); Errors = vecToList errors }
+    { Wat = peephole (sbText sb); Errors = vecToList errors }

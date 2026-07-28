@@ -29,6 +29,14 @@ let sbLen (b : Builder) : int = b.Length
 let sbClear (b : Builder) : unit = b.Clear () |> ignore
 let sbText (b : Builder) : string = b.ToString ()
 
+/// Character classes and ordinal comparison, as host services: the F++ half
+/// implements them over code points rather than naming a .NET type.
+let isLetterOrDigit (c : char) : bool = System.Char.IsLetterOrDigit c
+let isDigitCh (c : char) : bool = c >= '0' && c <= '9'
+/// Ordinal comparison of a SLICE of `s` (at `i`, `len` long) against `t`.
+let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) : int =
+    System.String.CompareOrdinal (s, i, t, j, len)
+
 let inline vecNew<'a> () : Vec<'a> = Vec<'a>()
 let inline vecLen (v : Vec<'a>) : int = v.Count
 let inline vecGet (v : Vec<'a>) (i : int) : 'a = v.[i]

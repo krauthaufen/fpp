@@ -446,3 +446,24 @@ let sbLen (b : Builder) : int =
     n
 let sbClear (b : Builder) : unit = b.Chunks <- vecNew ()
 let sbText (b : Builder) : string = String.concat "" (vecToList b.Chunks)
+
+// ---- character classes and ordinal comparison ----
+let isLetterOrDigit (c : char) : bool =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+let isDigitCh (c : char) : bool = c >= '0' && c <= '9'
+
+/// Ordinal comparison of a SLICE of `s` (at `i`, `len` long) against the
+/// slice of `t` at `j`. Negative, zero or positive, like the .NET half.
+let compareOrdinalAt (s : string) (i : int) (t : string) (j : int) (len : int) : int =
+    let mutable k = 0
+    let mutable r = 0
+    while r = 0 && k < len do
+        if i + k >= s.Length then r <- -1
+        elif j + k >= t.Length then r <- 1
+        else
+            let a = int s.[i + k]
+            let b = int t.[j + k]
+            if a < b then r <- -1
+            elif a > b then r <- 1
+        k <- k + 1
+    r
