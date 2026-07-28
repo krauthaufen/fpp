@@ -2420,3 +2420,34 @@ For whoever continues (the conversion itself is proven mechanical):
    it pays a tuple + map insert per node for hits that may be rare. The
    string-path memo already caps fallback subtrees.
 4. The endgame stays: all cases appended, then flip emitStr to opcode bytes.
+
+### Brick 2, the real sweep: the emitter now appends
+`compileInto` covers the interior of the language — ESeq, ELet spines, EIf,
+EMatch (shared or-alternative bodies included), EWhile, both EAssigns,
+ETuple, EListLit, ECtor payloads, EApp direct calls and applyc chains, the
+EPrim operator families, ERecord, EField, EFieldSet, widening ECast, and
+EIfaceCall dispatch. All three entry points (function bodies, lifted lambda
+bodies, global initializers) route through `compileToText`: one buffer per
+body, one string materialization at the end.
+
+Still on the string fallback, by DESIGN for now: leaves (their memoized
+string is appended once — no depth cost), and the guarded specialist paths
+(POD/SoA scalarization, externs, string builtins, ETry, closures/recgroups,
+array cases). Every one is a shallow subtree, so the O(depth) copying is
+gone in practice even though `emitStr` still exists as the fallback bridge.
+
+Two traps found while converting, both by the suite rather than the
+fixpoint, which is the containment working as intended:
+- POD/struct types must be EXCLUDED from the converted ERecord/EField/
+  EFieldSet cases — they have scalarized string paths the new cases would
+  have shadowed;
+- the generic applyc-chain case must not catch FULL-ARITY named calls that
+  the converted known-call case rejected (externs, scalarized signatures):
+  chaining hands uniform anyrefs to a function whose parameters are scalar
+  leaves, and the module fails to validate.
+
+Measured: self-host 46-47s across three consecutive runs (was 57-72s before
+the sweep, same box) — and byte-identical throughout.
+
+Next: convert the remaining specialist cases if profiling justifies it, then
+the emitStr -> opcode flip on the (now append-shaped) case structure.
