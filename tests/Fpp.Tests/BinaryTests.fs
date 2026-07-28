@@ -2,6 +2,7 @@ module Fpp.Tests.BinaryTests
 
 open Expecto
 open Fpp.Backend.WasmBinary
+open Fpp.Backend.EmitBin
 
 // The byte writer for direct binary emission, proven the only way that
 // counts: a module assembled by hand through it RUNS. Encodings are also
@@ -99,5 +100,103 @@ let binaryWriter =
             System.IO.File.Delete path
             Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
             Expect.stringContains out "42" "the module computes through the patched sizes and the br"
+        }
+        test "the EmitBin API builds a GC module that runs" {
+            // every encoding in the SDK exercised at once: func/struct/array
+            // /sub types, struct.new/get, ref.cast, ref.i31/i31.get_s, a
+            // passive data segment through array.new_data (with DataCount),
+            // ref.func + call_ref via the declarative elem segment, a
+            // mutable global, nested labels, and a direct call. If this
+            // runs, transliteration can trust the layer underneath.
+            let m = modNew ()
+            tyFunc m "$v1" [ "anyref" ] [ "anyref" ]
+            tyStruct m "$box" [ fld true "i32" ]
+            tyArray m "$bytes" "i8"
+            tyStructSub m "$base" "" true [ fld true "anyref" ]
+            tyStructSub m "$derived" "$base" false [ fld true "anyref"; fld true "i32" ]
+            tyFunc m "$main_t" [] [ "i32" ]
+            globalAnyref m "$g"
+            dataSeg m "$d0" [| byte 65; byte 66; byte 67 |]
+            declFn m "$twice" "$v1"
+            declFn m "$main" "$main_t"
+            exportFn m "f" "$main"
+            // $twice: unbox i31, double, rebox
+            let f1 = beginFn m [ "$x" ]
+            localsDone f1
+            lg f1 "$x"
+            gcAbs f1 "ref.cast" "i31"
+            i31get f1
+            ic f1 2
+            ins f1 "i32.mul"
+            refI31 f1
+            endFn f1
+            // $main: 21*2 via call_ref of $twice + struct roundtrip + data
+            let f = beginFn m []
+            local f "$acc" "i32"
+            local f "$s" "anyref"
+            localsDone f
+            // call_ref through a first-class $twice
+            ic f 21
+            refI31 f
+            rf f "$twice"
+            callRef f "$v1"
+            gcAbs f "ref.cast" "i31"
+            i31get f
+            ls f "$acc"
+            // struct roundtrip: box 5, read back, add
+            ic f 5
+            gcT f "struct.new" "$box"
+            ls f "$s"
+            lg f "$s"
+            gcT f "ref.cast" "$box"
+            gcTF f "struct.get" "$box" 0
+            lg f "$acc"
+            ins f "i32.add"
+            ls f "$acc"
+            // data segment: len "ABC" = 3, via array.new_data
+            ic f 0
+            ic f 3
+            arrNewData f "$bytes" "$d0"
+            gci f "array.len"
+            lg f "$acc"
+            ins f "i32.add"
+            ls f "$acc"
+            // subtype: derived through base-typed global, cast down, read field
+            refNull f "any"
+            ic f 9
+            gcT f "struct.new" "$derived"
+            gs f "$g"
+            gg f "$g"
+            gcT f "ref.cast" "$derived"
+            gcTF f "struct.get" "$derived" 1
+            lg f "$acc"
+            ins f "i32.add"
+            ls f "$acc"
+            // labels: skip an addition through a nested br
+            blockE f "$outer"
+            blockE f "$inner"
+            br f "$outer"
+            endB f
+            ic f 100
+            lg f "$acc"
+            ins f "i32.add"
+            ls f "$acc"
+            endB f
+            lg f "$acc"
+            endFn f
+            let bytes = assemble m 1 false
+            let path = System.IO.Path.GetTempFileName () + ".wasm"
+            System.IO.File.WriteAllBytes (path, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y --invoke f " + path)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd ()
+            let err = p.StandardError.ReadToEnd ()
+            p.WaitForExit ()
+            System.IO.File.Delete path
+            Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+            // 42 + 5 + 3 + 9 = 59, and the br skipped the +100
+            Expect.stringContains out "59" "GC types, casts, data, call_ref and labels all encode"
         }
     ]

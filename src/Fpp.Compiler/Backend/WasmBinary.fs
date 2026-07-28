@@ -205,3 +205,148 @@ let labelDepth (ls : Labels) (name : string) : int =
         if ls.Names.[i] = name then found <- ls.Depth - 1 - i
         i <- i - 1
     found
+
+// ---- opcodes --------------------------------------------------------------
+// The closed instruction set the emitter uses (inventoried from the emitted
+// compiler itself). Plain ops encode as one byte; GC ops as 0xFB + sub-op.
+// Cases call these by NAME through `opByte`/`gcByte`, so a typo is an error
+// at emission, not a corrupt module.
+
+let opByte (name : string) : int =
+    match name with
+    | "unreachable" -> 0x00
+    | "nop" -> 0x01
+    | "throw" -> 0x08
+    | "drop" -> 0x1A
+    | "select" -> 0x1B
+    | "i32.eqz" -> 0x45 | "i32.eq" -> 0x46 | "i32.ne" -> 0x47
+    | "i32.lt_s" -> 0x48 | "i32.lt_u" -> 0x49 | "i32.gt_s" -> 0x4A | "i32.gt_u" -> 0x4B
+    | "i32.le_s" -> 0x4C | "i32.le_u" -> 0x4D | "i32.ge_s" -> 0x4E | "i32.ge_u" -> 0x4F
+    | "i64.eqz" -> 0x50 | "i64.eq" -> 0x51 | "i64.ne" -> 0x52
+    | "i64.lt_s" -> 0x53 | "i64.lt_u" -> 0x54 | "i64.gt_s" -> 0x55 | "i64.gt_u" -> 0x56
+    | "i64.le_s" -> 0x57 | "i64.le_u" -> 0x58 | "i64.ge_s" -> 0x59 | "i64.ge_u" -> 0x5A
+    | "f32.eq" -> 0x5B | "f32.ne" -> 0x5C | "f32.lt" -> 0x5D | "f32.gt" -> 0x5E
+    | "f32.le" -> 0x5F | "f32.ge" -> 0x60
+    | "f64.eq" -> 0x61 | "f64.ne" -> 0x62 | "f64.lt" -> 0x63 | "f64.gt" -> 0x64
+    | "f64.le" -> 0x65 | "f64.ge" -> 0x66
+    | "i32.add" -> 0x6A | "i32.sub" -> 0x6B | "i32.mul" -> 0x6C
+    | "i32.div_s" -> 0x6D | "i32.div_u" -> 0x6E | "i32.rem_s" -> 0x6F | "i32.rem_u" -> 0x70
+    | "i32.and" -> 0x71 | "i32.or" -> 0x72 | "i32.xor" -> 0x73
+    | "i32.shl" -> 0x74 | "i32.shr_s" -> 0x75 | "i32.shr_u" -> 0x76
+    | "i64.add" -> 0x7C | "i64.sub" -> 0x7D | "i64.mul" -> 0x7E
+    | "i64.div_s" -> 0x7F | "i64.div_u" -> 0x80 | "i64.rem_s" -> 0x81 | "i64.rem_u" -> 0x82
+    | "i64.and" -> 0x83 | "i64.or" -> 0x84 | "i64.xor" -> 0x85
+    | "i64.shl" -> 0x86 | "i64.shr_s" -> 0x87 | "i64.shr_u" -> 0x88
+    | "f32.neg" -> 0x8C | "f32.add" -> 0x92 | "f32.sub" -> 0x93 | "f32.mul" -> 0x94 | "f32.div" -> 0x95
+    | "f64.floor" -> 0x9C | "f64.neg" -> 0x9A
+    | "f64.add" -> 0xA0 | "f64.sub" -> 0xA1 | "f64.mul" -> 0xA2 | "f64.div" -> 0xA3
+    | "i32.wrap_i64" -> 0xA7
+    | "i32.trunc_f32_s" -> 0xA8 | "i32.trunc_f64_s" -> 0xAA
+    | "i64.extend_i32_s" -> 0xAC | "i64.extend_i32_u" -> 0xAD
+    | "i64.trunc_f32_s" -> 0xAE | "i64.trunc_f64_s" -> 0xB0
+    | "f32.convert_i32_s" -> 0xB2 | "f32.convert_i32_u" -> 0xB3 | "f32.convert_i64_s" -> 0xB4
+    | "f32.demote_f64" -> 0xB6
+    | "f64.convert_i32_s" -> 0xB7 | "f64.convert_i32_u" -> 0xB8 | "f64.convert_i64_s" -> 0xB9
+    | "f64.promote_f32" -> 0xBB
+    | "i32.reinterpret_f32" -> 0xBC | "i64.reinterpret_f64" -> 0xBD
+    | "f32.reinterpret_i32" -> 0xBE | "f64.reinterpret_i64" -> 0xBF
+    | "ref.null" -> 0xD0 | "ref.is_null" -> 0xD1 | "ref.func" -> 0xD2
+    | "ref.eq" -> 0xD3 | "ref.as_non_null" -> 0xD4
+    | _ -> -1
+
+/// GC sub-opcodes (encoded as 0xFB + this as u32 LEB)
+let gcByte (name : string) : int =
+    match name with
+    | "struct.new" -> 0 | "struct.new_default" -> 1
+    | "struct.get" -> 2 | "struct.get_s" -> 3 | "struct.get_u" -> 4 | "struct.set" -> 5
+    | "array.new" -> 6 | "array.new_default" -> 7 | "array.new_fixed" -> 8
+    | "array.new_data" -> 9 | "array.new_elem" -> 10
+    | "array.get" -> 11 | "array.get_s" -> 12 | "array.get_u" -> 13 | "array.set" -> 14
+    | "array.len" -> 15 | "array.fill" -> 16 | "array.copy" -> 17
+    | "ref.test" -> 20 | "ref.test_null" -> 21 | "ref.cast" -> 22 | "ref.cast_null" -> 23
+    | "ref.i31" -> 28 | "i31.get_s" -> 29 | "i31.get_u" -> 30
+    | _ -> -1
+
+// memory ops carry align+offset immediates
+let memByte (name : string) : int =
+    match name with
+    | "i32.load" -> 0x28 | "i64.load" -> 0x29 | "f32.load" -> 0x2A | "f64.load" -> 0x2B
+    | "i32.store" -> 0x36 | "i64.store" -> 0x37 | "f32.store" -> 0x38 | "f64.store" -> 0x39
+    | "i32.store8" -> 0x3A
+    | _ -> -1
+
+// ---- types ----------------------------------------------------------------
+// abstract heap types, as the SIGNED s33 the binary format wants
+let heapByte (name : string) : int =
+    match name with
+    | "nofunc" -> 0x73 | "noextern" -> 0x72 | "none" -> 0x71
+    | "func" -> 0x70 | "extern" -> 0x6F | "any" -> 0x6E
+    | "eq" -> 0x6D | "i31" -> 0x6C | "struct" -> 0x6B | "array" -> 0x6A
+    | _ -> -1
+
+let valByte (name : string) : int =
+    match name with
+    | "i32" -> 0x7F | "i64" -> 0x7E | "f32" -> 0x7D | "f64" -> 0x7C
+    | "i8" -> 0x78 | "i16" -> 0x77
+    | "anyref" -> 0x6E | "funcref" -> 0x70 | "eqref" -> 0x6D
+    | _ -> -1
+
+/// (ref $t) / (ref null $t) with a CONCRETE type index
+let emitRefType (b : Bytes) (nullable : bool) (tyIdx : int) : unit =
+    emitByte b (if nullable then 0x63 else 0x64)
+    emitS32 b tyIdx
+
+/// (ref null any) etc — abstract heap type
+let emitRefAbs (b : Bytes) (nullable : bool) (heap : string) : unit =
+    emitByte b (if nullable then 0x63 else 0x64)
+    emitByte b (heapByte heap)
+
+// composite type headers for the type section
+let emitFuncTypeHead (b : Bytes) : unit = emitByte b 0x60
+let emitStructHead (b : Bytes) : unit = emitByte b 0x5F
+let emitArrayHead (b : Bytes) : unit = emitByte b 0x5E
+/// (sub $base ...) — non-final subtype with one supertype
+let emitSubHead (b : Bytes) (baseIdx : int) : unit =
+    emitByte b 0x50
+    emitU32 b 1
+    emitU32 b baseIdx
+/// field: storage type + mutability
+let emitField (b : Bytes) (mut : bool) (emitStorage : Bytes -> unit) : unit =
+    emitStorage b
+    emitByte b (if mut then 1 else 0)
+
+// blocktype: empty, one valtype, or a type index (multi-result)
+let emitBlockTypeEmpty (b : Bytes) : unit = emitByte b 0x40
+let emitBlockTypeVal (b : Bytes) (v : int) : unit = emitByte b v
+let emitBlockTypeIdx (b : Bytes) (tyIdx : int) : unit = emitS32 b tyIdx
+
+// control opcodes (block/loop/if emit at OPEN, end at CLOSE)
+let opBlock = 0x02
+let opLoop = 0x03
+let opIf = 0x04
+let opElse = 0x05
+let opEnd = 0x0B
+let opBr = 0x0C
+let opBrIf = 0x0D
+let opReturn = 0x0F
+let opCall = 0x10
+let opReturnCall = 0x12
+let opCallRef = 0x14
+let opTryTable = 0x1F
+let opLocalGet = 0x20
+let opLocalSet = 0x21
+let opLocalTee = 0x22
+let opGlobalGet = 0x23
+let opGlobalSet = 0x24
+let opI32Const = 0x41
+let opI64Const = 0x42
+let opF32Const = 0x43
+let opF64Const = 0x44
+let opGcPrefix = 0xFB
+
+/// one section: id byte, patched size, payload written by `fill`
+let emitSection (b : Bytes) (id : int) (fill : Bytes -> unit) : unit =
+    emitByte b id
+    let at = beginPatch b
+    fill b
+    endPatch b at
