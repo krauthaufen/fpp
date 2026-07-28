@@ -1189,15 +1189,28 @@ and not by position, because the compiler's own use swaps sides:
 `| TVar v, other | other, TVar v ->`. Both shapes are oracle-tested against
 F#. That alone took 153 errors to 109.
 
-What the last file still needs, from the census — a long tail, no longer a
-wall:
+**Read the census correctly: these are not `Workspace.fs`'s gaps.** The
+errors are attributed to functions in `Resolve`, `Lower`, `Infer` and
+`Link` — files that pass on their own. They pass because dead-code
+elimination drops what nothing calls, and `Workspace` is the file that
+finally CALLS everything. So the 109 are the whole compiler's remaining
+gaps becoming reachable at once, and looking for them inside `Workspace.fs`
+will find nothing. Expect the same effect at every later stage: the moment a
+driver exercises a path, its gaps appear.
+
+What is still needed, from the census — a long tail, no longer a wall:
 
 - **`Map`** (26 sites: `add`, `tryFind`, `find`, `empty`, `filter`). The
   resolver's `Env` is an F# `Map`. The prelude has `Set` already, and a
   sorted-array `Map` is the same shape of work.
-- **`option.IsSome`/`IsNone` as PROPERTIES** (37 sites). The functions exist
-  in the `Option` module; these are member accesses on a DU, which is the
-  builtin-members question again, now for `Option` rather than `string`.
+- **`option.IsSome`/`IsNone` as PROPERTIES** (37 sites). NOT the
+  builtin-members question: a DU can carry members in F++ today (verified
+  with a probe — `type Opt<'a> = ... member x.IsJust = ...` compiles and
+  runs), so declaring them on `Option` in the prelude is enough. If they
+  still do not resolve at those sites after that, the cause is the RECEIVER,
+  not the member: a `.IsSome` on a value whose type is only known after a
+  parked dot resolves is the same late-typing shape that hid the for-in
+  sources — diagnose it there rather than adding machinery.
 - **Small prelude gaps**: `char` (6), `defaultArg` (2), `List.take`,
   `List.tryFindIndex`, `System.Char.IsDigit`, a dictionary `Remove`, and one
   more `StringBuilder` that should become a `Vec<string>`.
@@ -1206,6 +1219,23 @@ wall:
   `unbound variable bv` in an or-pattern nested inside a tuple pattern (the
   alignment above does not reach that shape yet); and `unsupported operator
   ..` where a range is used as a value rather than as a loop source.
+
+### A note on the weak gate, since it has now bitten three times
+"File N emits" has meant three different things at three different moments,
+and the difference matters more each time:
+
+1. It LOWERS without notes — but emission never ran, because a lower note
+   returns early. `Workspace.fs` sat here for a long time, and clearing its
+   last note revealed 153 emission errors that had been masked.
+2. It EMITS without errors — but dead-code elimination dropped most of it,
+   because nothing calls it. `Parser.fs` and `Resolve.fs` both passed this
+   way at stage 0 while emitting almost nothing.
+3. A DRIVER runs it and its output matches the hosted compiler. Only this
+   one is evidence.
+
+The frontier script reports (1) and (2) and says so in its header; the
+drivers in `tests/bootstrap` are the only (3). When the count of emitting
+files goes up, check which kind of "emits" moved.
 
 ### Superseded design notes (the questions, and how they were answered)
 The last two files need services no wasm module has: reading a file, listing
