@@ -1555,3 +1555,27 @@ language primitive so source can name a half's BIT PATTERN — the runtime
 representation already is those bits, so it is the identity.
 Whole-compiler emission errors this session: 124 -> 66 -> 42 -> 33, with the
 suite at 407/407 and the acceptance file 0/0/0 at every step.
+
+### The remaining 18 (whole-compiler emission), individually
+No longer families — each is its own puzzle. Measure with
+scratchpad/dbg/phases.fsx (parse/infer/lower/emit split plus the error list):
+
+- **13x `missing field X in Cached (asked for ?)`** — the record literal in
+  Workspace's BuiltinCache.compute lowers with owner "?" , i.e. inference
+  recorded no type for that literal, so every field is "missing". NOT
+  reproducible with a small record in a nested/private module, with many
+  fields, or multiline (all probed clean) — the real one has 14 fields whose
+  types come from four different modules. Suspect the pendingRecords
+  resolution not firing when the literal is the last expression of a function
+  whose return type is only known through it.
+- **2x `unbound variable dictNew`** (in infer, in emit) — a generic seam
+  function losing its instantiation at a call site that passes it directly as
+  an argument (`compilePatWith (dictNew ()) ...`).
+- **`unknown field IsEmpty`** — `.IsEmpty` on a list. Wants the builtin-member
+  treatment `string` already has (register under "list.X"), together with
+  `.Head`/`.Tail`/`.Length` for the same reason.
+- **`unknown field GetBytes`** — the last Encoding call; the seam has
+  utf8Length, this needs the bytes themselves (utf8Bytes).
+- **`$class:Ordered:compare:$ref`** — sorting at a tuple key. Still the open
+  design question: giving `$ref` an Ordered instance would make every
+  reference type comparable.
