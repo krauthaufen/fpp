@@ -2199,3 +2199,56 @@ Worth checking next, in this order:
 Both attempts are reverted; the committed state has call-site destructuring
 only (green, fixpoint byte-identical). The remaining gap is exactly this one
 case, and it is what stands between here and "tuples gone unless stored".
+
+### UNTUPLING SHIPS — and the hunt found a real, still-open compiler bug
+The convention is in (`c9aa932`), all three shapes, 416 tests, self-host
+byte-identical:
+
+    f (a, b)    two-argument call                (param $a0 i32) (param $a1 i32)
+    f t         match t with (x, y) -> f x y     at the call site
+    f as value  one shared tupled shim per fn    DCE drops unused ones
+
+The working formulation is BOTTOM-UP `mapExpr` with INVERTIBLE SHIMS: the
+bare-EVar case rewrites every candidate reference to its shim (offset +
+33000000), and the EApp case, which sees its head AFTER children rebuilt,
+recognises a shimmed head and undoes it into the direct multi-argument call.
+No local recursive traversal function exists in the pass at all.
+
+That last sentence is the point. **Three prior attempts failed the
+self-compile while passing all 415 tests, and the bisection proved the
+rewriting was innocent every time:**
+
+- a CONTROL build (pass detects candidates but rewrites NOTHING in stage-0)
+  still trapped — stage-1 runs the full pass on its own IR, and ITS run
+  built a CYCLIC expression tree that sent `compileExpr`/`compileExprInner`
+  (identified by their locals in the wat, not guessed) into infinite mutual
+  recursion;
+- detection-only (scans compiled AND executed, rewrite disconnected) is
+  GREEN;
+- the `mapChildrenWith`/`mapExpr` mutual refactor alone on the green base is
+  GREEN;
+- the same pass logic under dotnet terminates and emits correctly.
+
+So: **some construct in the top-down rewrite — a local `let rec go` with
+many captures handed FIRST-CLASS into the traversal (`mapChildrenWith go`) —
+is miscompiled by the current compiler.** Compiled by dotnet it runs right;
+compiled to wasm it builds a cycle out of a pure rebuild. The constructors
+(`State`, `KeyValuePair`) that an earlier note blamed are exonerated: v4
+rewrites them and the fixpoint closes.
+
+Micro-repros that do NOT trigger it (all correct, kept in /tmp that session):
+local rec closure passed first-class into a top-level mapper over a DU;
+the mutual mapKids/mapAll pair with self partial application; nested-tuple
+lambda parameters over an assoc list; guards capturing enclosing locals;
+triple destructuring-let through `.Value`. Whatever the trigger is, it needs
+more than these — plausibly the capture-count, the closure-in-closure
+environment shape, or an interaction with the memoized traversal.
+
+**Open item, high value:** distill stage-1's cyclic-tree construction into a
+small repro. The failing configuration is one `git revert` away (any of the
+three prior attempts), fails in ~19s under
+`dotnet fsi tests/bootstrap/fixpoint.fsx self`, and the cycle is observable
+in `compileExpr` — a `refEq`-visited-set walk of the optimize output would
+locate the back-edge and the function that built it. This is the compiler
+miscompiling a pass of its own optimizer: exactly the class of bug nothing
+but self-hosting finds.
