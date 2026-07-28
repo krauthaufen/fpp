@@ -206,7 +206,7 @@ let monoTests =
                     "let d = id2 \"t\""
                     "let r = print (id2 5)"
                     "" ])
-            let wat, errs = ws.EmitProgram ()
+            let wat, errs = ws.EmitProgramRaw ()
             Expect.isEmpty errs "compiles"
             // wasm identifiers sanitize '$' to '_'
             Expect.stringContains wat "id2_V2d" "V2d instantiation stamped"
@@ -242,7 +242,7 @@ let monoPropagationTests =
                     "let a = outer { X = 1.0; Y = 2.0 }"
                     "let b = print (outer 5)"
                     "" ])
-            let wat, errs = ws.EmitProgram ()
+            let wat, errs = ws.EmitProgramRaw ()
             Expect.isEmpty errs "compiles"
             let defsOf (needle : string) =
                 wat.Split([| needle + " (param" |], System.StringSplitOptions.None).Length - 1
@@ -277,7 +277,7 @@ let monoLayoutTests =
                     "let a = print (accum pts (fun p -> p.X + p.Y))"
                     "let b = print (accum ints (fun n -> 0.5))"
                     "" ])
-            let wat, errs = ws.EmitProgram ()
+            let wat, errs = ws.EmitProgramRaw ()
             Expect.isEmpty errs "generic array code compiles once specialized"
             let defsOf (needle : string) =
                 wat.Split([| needle + " (param" |], System.StringSplitOptions.None).Length - 1

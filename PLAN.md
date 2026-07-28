@@ -1853,3 +1853,31 @@ nothing on lookups.
 
 The gap is therefore uniform boxing first, inlining second. Neither is a
 tweak.
+
+### An optimizer pass pipeline exists, and inlining is measured
+`src/Fpp.Compiler/Core/Optimize.fs` runs on the MONOMORPHIC ir, after
+stamping and before dead-code elimination, so every call it sees is
+concrete and DCE collects whatever inlining orphans. `Workspace.EmitProgramRaw`
+emits with it off — the stamping and scalarization gates assert that their
+symbols appear in the output, and a later pass legitimately removes the very
+functions they look for, so each pass is checked on its OWN output.
+
+`inlineCalls` inlines non-recursive functions at full-arity call sites. It
+binds arguments to `let`s rather than substituting them: F++ has mutable
+locals and assignment, so substituting an argument used twice would evaluate
+it twice and one used under a branch would move its effects. Binders in the
+inlined body are freshened into a synthetic `$inline` path, because capture
+is only prevented by identity here and (path, offset) is that identity.
+
+**It is switched off, on the measurement.** On a fixed corpus the compiler
+built with inlining ran 1492-1506ms against 1481-1636ms without — the same —
+for 3.6% more code. Inlining the whole self-compile at threshold 24 was
+worse: 43s -> 55s, 6.26MB -> 8.51MB of wat. The fixpoint closed in every
+configuration, so the pass is correct; it simply is not worth anything yet.
+
+The reason is the same one behind the 6.6x: a wasm direct call is cheap, and
+the body copied into the call site still boxes and unboxes exactly as before.
+Inlining pays when it ENABLES something else — arithmetic that stays unboxed
+across the call, a constant that reaches a branch, a closure that stops being
+allocated. **Unboxing is the pass to write next**, and inlining turns on with
+it. Doing it in the other order is what this measurement rules out.

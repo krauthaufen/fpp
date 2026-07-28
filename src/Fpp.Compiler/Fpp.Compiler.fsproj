@@ -23,6 +23,7 @@
     <Compile Include="Core/Lint.fs" />
     <Compile Include="Core/Serialize.fs" />
     <Compile Include="Core/Link.fs" />
+    <Compile Include="Core/Optimize.fs" />
     <Compile Include="Core/Plugins.fs" />
     <Compile Include="Backend/EmitWasm.fs" />
     <Compile Include="Query.fs" />

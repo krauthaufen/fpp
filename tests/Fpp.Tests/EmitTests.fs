@@ -299,7 +299,7 @@ let scalarizationGate =
                     "    acc"
                     "let a = print total"
                     "" ])
-            let wat, errs = ws.EmitProgram ()
+            let wat, errs = ws.EmitProgramRaw ()
             Expect.isEmpty errs "compiles"
             Expect.stringContains wat "(result f64 f64)" "struct return scalarized to leaves"
             Expect.stringContains wat "(param $a0_0 f64) (param $a0_1 f64)" "struct params scalarized"

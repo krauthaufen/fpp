@@ -377,7 +377,16 @@ type Workspace() =
 
     /// Lower the whole project (builtin first, then files in compile order)
     /// and emit a wasm module. Returns (wat, all errors incl. diagnostics).
-    member this.EmitProgram () : string * string list =
+    /// Emit with the optimizer OFF. The passes that run before it — stamping,
+    /// scalarization — are gated by asserting their symbols appear in the
+    /// output, and inlining legitimately removes the very functions those
+    /// gates look for. Each pass is checked on its own output rather than
+    /// through whatever survives the ones after it.
+    member this.EmitProgramRaw () : string * string list = this.EmitWith false
+
+    member this.EmitProgram () : string * string list = this.EmitWith true
+
+    member private this.EmitWith (optimize : bool) : string * string list =
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
@@ -469,7 +478,11 @@ type Workspace() =
             // stamped clones have concrete instantiations, so record layouts
             // can only be settled once monomorphization has run
             let mono = Fpp.Core.Link.stampRecords mono0
-            let linked = Fpp.Core.Link.deadCodeEliminate mono
+            // optimization runs on the MONOMORPHIC ir: every call is
+            // concrete here, and dead-code elimination afterwards collects
+            // the definitions inlining made unreachable
+            let opt = if optimize then Fpp.Core.Optimize.optimize mono else mono
+            let linked = Fpp.Core.Link.deadCodeEliminate opt
             if not (List.isEmpty monoErrs) then "", monoErrs
             else
                 let res = Fpp.Backend.EmitWasm.emit linked
