@@ -2119,3 +2119,45 @@ recursion in `compileExpr`:
 
 Reproduce with `dotnet fsi tests/bootstrap/fixpoint.fsx self` — it fails in
 about 20s, which is a fast enough loop to bisect against.
+
+### Untupling, bisected — and a correction about libraries
+The unconditional pass was split in two and re-applied one half at a time,
+which located the fault immediately:
+
+- **Call-site destructuring: WORKS.** A call carrying a real tuple VALUE now
+  takes it apart at the call site instead of the function rebuilding it, and
+  a function qualifies whether its callers spell the argument as a literal or
+  a value. Suite green, self-host green, fixpoint byte-identical.
+
+      let f (a, b) = a * b + 1
+      f (3, 4)   ;; two-argument call, no tuple
+      f t        ;; match t with (x, y) -> f x y
+      func $f (param $a0 i32) (param $a1 i32) (result i32)
+
+  The only `$tup2` left in that program is `let t = (3, 4)` — the user's own
+  value, which is exactly right.
+
+- **Eta-expanding first-class uses: BREAKS the self-compile.** That half is
+  what makes `compileExpr`/`compileExprInner` loop. It is not yet applied; a
+  function used first-class still keeps its tupled signature.
+
+**A CORRECTION to what is written above.** The earlier note that a
+whole-program "all uses" analysis is unsound for libraries is WRONG.
+`Workspace.EmitWith` decodes each library's decls and joins them to the
+program before monomorphization:
+
+    // linked library declarations join the program before emission
+    for _, text in this.Libraries do
+        let _, _, ds = Fpp.Core.Serialize.decodeLib text
+
+F++ libraries ship FAT IR, not compiled binaries, so every use really is in
+the program being analysed and the analysis is sound. It also answers the
+metadata question more simply: a consumer receives the source-level scheme
+AND the body and re-derives the convention itself, so nothing has to travel
+alongside. (That changes if F++ ever links compiled modules rather than IR —
+at which point untupling must become the unconditional rule, and the reason
+to finish the eta-expansion.)
+
+Cost on this compiler: 42s -> 46s, because the compiler is written in curried
+style and has almost no tupled functions to improve, while every program that
+does use them stops allocating per call. Kept on that basis.
