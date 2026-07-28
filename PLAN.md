@@ -1834,10 +1834,21 @@ the native .NET build while running inside wasm, and is not reachable.
 Not the format. wasm itself lands within ~2x of native for C; the gap here is
 what WE emit, measured against what .NET brings:
 
-- **Uniform boxing.** Every integer is `anyref`, tagged into i31 and untagged
-  on use — `toi`/`ofi` are ~10% of the run and simply do not exist in the
-  .NET build, where F# emits `int32` locals and RyuJIT keeps them in
-  registers. Every field read is a `ref.cast` for the same reason.
+- **Integer TAGGING — not boxing.** Nothing is heap-allocated for an int:
+  i31 is an immediate, so `$ofi` allocates nothing and the representation
+  gate holds. What costs is that `int` has no SCALAR KIND, so its locals,
+  parameters and returns are `anyref` and every touch is a `$toi`/`$ofi`
+  call (~10% of the run), while `+` goes through `$addv`. Float, float32 and
+  int64 already get raw locals — `wasmTyOf` maps `f`/`s`/`l` to f64/f32/i64
+  and everything else to `anyref`, and `int` falls in the `_`. So the fix is
+  not new machinery, it is EXTENDING the machinery that already works:
+
+      ;; float loop      (local $l0_s f64)     (f64.const 0.0)
+      ;; int loop        (local $l0_s anyref)  (call $ofi (i32.const 0))
+
+  Even in the float loop the loop COUNTER is `anyref`, because it is an int.
+  Every field read is a `ref.cast` for the separate reason that values are
+  `anyref` at rest.
 - **No inlining, anywhere.** Every `dictTryFind`, accessor and `recur` is a
   real call. RyuJIT inlines, devirtualises, and eliminates bounds checks.
 - **Hand-rolled collections and strings** against a tuned BCL: `equal` +
@@ -1851,8 +1862,9 @@ skipped. A stored hash only saves work on collisions, which are rare. It was
 kept anyway because rehashing no longer recomputes hashes, but it buys
 nothing on lookups.
 
-The gap is therefore uniform boxing first, inlining second. Neither is a
-tweak.
+The gap is therefore the missing i32 scalar kind first, inlining second —
+and in that order, because the measurement below shows inlining is worth
+nothing until arithmetic can stay raw across a call.
 
 ### An optimizer pass pipeline exists, and inlining is measured
 `src/Fpp.Compiler/Core/Optimize.fs` runs on the MONOMORPHIC ir, after
@@ -1879,5 +1891,5 @@ The reason is the same one behind the 6.6x: a wasm direct call is cheap, and
 the body copied into the call site still boxes and unboxes exactly as before.
 Inlining pays when it ENABLES something else — arithmetic that stays unboxed
 across the call, a constant that reaches a branch, a closure that stops being
-allocated. **Unboxing is the pass to write next**, and inlining turns on with
-it. Doing it in the other order is what this measurement rules out.
+allocated. **An i32 scalar kind is the pass to write next**, and inlining turns on
+with it. Doing it in the other order is what this measurement rules out.
