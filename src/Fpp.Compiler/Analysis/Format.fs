@@ -1,5 +1,7 @@
 module Fpp.Analysis.Format
 
+open Fpp.Prelude
+
 // The printf family is COMPILE-TIME: the format string is a literal, so its
 // holes are parsed once, typed during inference, and expanded to string
 // concatenation during lowering. Nothing survives to runtime but the pieces.
@@ -21,12 +23,14 @@ type Seg =
 /// Split a raw format (without the surrounding quotes) into segments.
 /// Returns an error message for anything unsupported.
 let parse (raw : string) : Result<Seg list, string> =
-    let segs = System.Collections.Generic.List<Seg>()
-    let text = System.Text.StringBuilder()
+    let segs = vecNew<Seg> ()
+    // chunks joined once at the end: appending to a string would be
+    // quadratic, and a builder is not part of the seam
+    let text = vecNew<string> ()
     let flush () =
-        if text.Length > 0 then
-            segs.Add (Text (text.ToString ()))
-            text.Clear () |> ignore
+        if vecLen text > 0 then
+            vecAdd segs (Text (String.concat "" (vecToList text)))
+            vecClear text
     let mutable i = 0
     let mutable error = None
     while error.IsNone && i < raw.Length do
@@ -34,7 +38,7 @@ let parse (raw : string) : Result<Seg list, string> =
         if c = '%' then
             if i + 1 >= raw.Length then error <- Some "the format ends inside a specifier"
             elif raw.[i + 1] = '%' then
-                text.Append '%' |> ignore
+                vecAdd text "%"
                 i <- i + 2
             else
                 // flags, then width, then the specifier
@@ -51,19 +55,19 @@ let parse (raw : string) : Result<Seg list, string> =
                 if j >= raw.Length then error <- Some "the format ends inside a specifier"
                 else
                     let sp = raw.[j]
-                    if "diuscbxXofA".IndexOf sp >= 0 then
+                    if String.exists (fun k -> k = sp) "diuscbxXofA" then
                         flush ()
-                        segs.Add (Hole (sp, width, zero, left))
+                        vecAdd segs (Hole (sp, width, zero, left))
                     else
                         error <- Some ("unsupported format specifier %" + string sp)
                     i <- j + 1
         else
-            text.Append c |> ignore
+            vecAdd text (string c)
             i <- i + 1
     flush ()
     match error with
     | Some e -> Error e
-    | None -> Ok (List.ofSeq segs)
+    | None -> Ok (vecToList segs)
 
 let holes (segs : Seg list) : (char * int * bool * bool) list =
     segs |> List.choose (fun s -> match s with Hole (c, w, z, l) -> Some (c, w, z, l) | Text _ -> None)

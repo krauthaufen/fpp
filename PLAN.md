@@ -895,13 +895,64 @@ v0 offside rule and parse as top-level junk. Flat helper bindings work. The
 driver is written in that flat style; whether the offside rule should accept
 the nested form is a separate question.
 
-**Where the frontier stops without a driver: `Analysis/Types.fs`.** It reaches past the seam
-straight into `System.Collections.Generic` — `HashSet`, `Dictionary`, `List`
-and an `IEqualityComparer` object expression over `HashIdentity.Reference`
-for cycle detection. Those must route through `Prelude` like everything
-else, which means the seam grows a reference-identity set and map (`refEq`
-already exists as a primitive on the F++ side, `HashIdentity.Reference` on
-the .NET side). `Infer.fs` and `Format.fs` have the same violation.
+### The reference-identity seam, and the frontier at 13 files
+`Analysis` used to reach past the seam straight into
+`System.Collections.Generic`: `Types.fs` alone had a reference comparer
+feeding three `HashSet<Type>` visited sets, a pair comparer for `unifySeen`
+and a `Dictionary<Type, Type>` memo; `Infer.fs` spelled the same memo
+`HashIdentity.Reference`; `Format.fs` used `List<Seg>` and a
+`StringBuilder`. Eleven sites, now all behind `RefSet` / `RefPairSet` /
+`RefMap`, name-for-name in both halves.
+
+These are not an optimization. A pruned type is a GRAPH — a variable solved
+once and read many times is one node on many paths — so a walker without a
+visited set is exponential, and IDENTITY is what it must key on: two
+structurally equal types that are different objects are different nodes, and
+hashing a cyclic one structurally would not terminate.
+
+**Hash shallowly, compare by identity.** The .NET half builds on
+`Object.ReferenceEquals`, the F++ half on the `refEq` primitive over an
+open-addressed table; the hash is the CALLER's, and reads only immutable
+fields — a variable's id, a constructor's name and arity. Stability is the
+constraint that forces this: `unifySeen` rewrites `Link` while its visited
+set is live, and a hash that looked at a link would strand its entry in the
+wrong bucket. Any hash consistent with identity is otherwise legal, since
+identity-equal values are the same object. That is what lets this work
+without an identity-hash primitive at all — wasm-GC exposes no address, and
+the emitter's identity numbers live in a hidden field on CLASS instances
+that a DU value does not have.
+
+`Format.fs` needed no new machinery: `Vec<Seg>`, and a `Vec<string>` joined
+once with `String.concat ""` where a builder would have been (repeated `+`
+is quadratic).
+
+Gated by `tests/bootstrap/refdrive.fpp`: the same program — distinct but
+structurally equal keys, a mutation of a non-hashed field, 40 entries in one
+bucket to force rehashing, update semantics, pair order — run by BOTH halves
+and diffed.
+
+Three gaps fell out on the way:
+
+- **`fst`/`snd` and `List.distinctBy`/`distinct` were missing** from the F++
+  prelude. Added; `distinctBy` keeps F#'s first-occurrence-wins order.
+- **A for-in whose source type was still unknown when the loop was typed**
+  recorded no marker at all, so lowering had nothing to walk. Late sources
+  are now remembered and promoted at finalization — but ONLY if they turn
+  out to be a list or an array, because the enumerator protocol needs member
+  accesses parked DURING the walk, and promoting one of those would emit an
+  array walk over a class.
+- **A QUALIFIED case pattern was named by its FIRST segment.**
+  `Classes.Improve inst` typed off the MODULE name `Classes`, so the
+  constructor was never instantiated, the payload binder `inst` had no type,
+  and everything read out of it stayed unknown — which is why
+  `for ctx in inst.Context` could not tell it was walking a list. The parser
+  was innocent (it builds the right `AppPat`); resolution recorded the use
+  on the prefix, and lowering read the name from the prefix too. All three
+  layers now take the LAST segment, which is where the case actually is.
+
+The frontier is 13 of 20 files: through `Parser`, `Resolve`, `Types`,
+`Format`, `Classes`, `Infer`, `Core`, `Lower` and `Lint`. Next wall is one
+for-in note in `Core/Serialize.fs`.
 
 ### Next: stage-0/stage-1 bootstrap harness
 The self-application gates prove the front end ACCEPTS its own sources; they

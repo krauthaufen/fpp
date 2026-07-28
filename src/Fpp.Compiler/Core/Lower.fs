@@ -197,6 +197,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     // ---- patterns ---------------------------------------------------------
 
+    /// The identifier a pattern is NAMED by. A qualified case
+    /// (`Classes.Improve inst`) is named by its LAST segment — the leading
+    /// spine is a module, and that is also where resolution recorded it.
+    let patHeadToken (n : GreenNode) : Token option =
+        let idents = tokensOf n |> List.filter (fun t -> t.Kind = Ident)
+        if tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ".") then
+            List.tryLast idents
+        else List.tryHead idents
+
     let rec lowerPat (n : GreenNode) : Pat =
         match n.NodeKind with
         | WildcardPat -> PWild
@@ -205,7 +214,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some l -> PLit l
              | None -> PWild)
         | IdentPat ->
-            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+            (match patHeadToken n with
              | Some t ->
                  (match dictTryFind defsAt t.Offset with
                   | Some d -> PVar (varIdOf d, schemeOf d)
@@ -219,7 +228,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match nodesOf n with
              | head :: args ->
                  let ctorName, ctorSch =
-                     match tokensOf head |> List.tryHead |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                     match patHeadToken head |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                      | Some d -> d.Name, schemeOf d
                      | None -> "?", mono (TCon ("?", []))
                  PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)

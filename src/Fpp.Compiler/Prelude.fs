@@ -24,6 +24,7 @@ let inline vecGet (v : Vec<'a>) (i : int) : 'a = v.[i]
 let inline vecSet (v : Vec<'a>) (i : int) (x : 'a) : unit = v.[i] <- x
 let inline vecAdd (v : Vec<'a>) (x : 'a) : unit = v.Add x
 let inline vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit = v.Insert(i, x)
+let inline vecClear (v : Vec<'a>) : unit = v.Clear ()
 let inline vecToList (v : Vec<'a>) : 'a list = List.ofSeq v
 let vecOfList (xs : 'a list) : Vec<'a> = Vec<'a>(xs)
 
@@ -40,3 +41,66 @@ let dictTryFind (d : Dict<'k, 'v>) (k : 'k) : 'v option =
 
 let dictPairs (d : Dict<'k, 'v>) : ('k * 'v) list =
     [ for kv in d -> kv.Key, kv.Value ]
+
+// ---- reference-identity collections -----------------------------------
+//
+// A pruned type is a GRAPH, so every structural walker over one needs a
+// visited set, and IDENTITY is what it has to key on: two structurally
+// equal types that are different objects are different nodes, and hashing
+// a cyclic one structurally would not terminate.
+//
+// The hash comes from the caller and must read only IMMUTABLE fields.
+// Unification rewrites `Link` while a visited set is live; a hash that
+// looked at a link would move an entry's bucket out from under it. Any hash
+// is otherwise legal, since identity-equal values are the same object and
+// hash equally by construction.
+//
+// The F++ half (stdlib/bootstrap.fpp) builds these over `refEq`, which is
+// why the hash is a parameter at all: wasm-GC exposes no address, and the
+// emitter's identity numbers live in a hidden field on CLASS instances that
+// a DU value does not have.
+
+let private identityComparer<'a when 'a : not struct> (h : 'a -> int) =
+    { new System.Collections.Generic.IEqualityComparer<'a> with
+        member _.Equals (a, b) = System.Object.ReferenceEquals (a, b)
+        member _.GetHashCode a = h a }
+
+type RefSet<'a> = System.Collections.Generic.HashSet<'a>
+
+let refSetNew<'a when 'a : not struct> (h : 'a -> int) : RefSet<'a> =
+    RefSet<'a> (identityComparer h)
+
+/// Add, reporting whether the value was NEW — every visited-set walk asks
+/// exactly this question.
+let inline refSetAdd (s : RefSet<'a>) (x : 'a) : bool = s.Add x
+let inline refSetContains (s : RefSet<'a>) (x : 'a) : bool = s.Contains x
+
+/// A set of PAIRS compared componentwise by identity — the shape
+/// `unifySeen` needs to cut a shared sub-DAG down to one visit.
+type RefPair<'a> =
+    { PairFst : 'a; PairSnd : 'a }
+
+type RefPairSet<'a> = System.Collections.Generic.HashSet<RefPair<'a>>
+
+let refPairSetNew<'a when 'a : not struct> (h : 'a -> int) : RefPairSet<'a> =
+    RefPairSet<'a> (
+        { new System.Collections.Generic.IEqualityComparer<RefPair<'a>> with
+            member _.Equals (a, b) =
+                System.Object.ReferenceEquals (a.PairFst, b.PairFst)
+                && System.Object.ReferenceEquals (a.PairSnd, b.PairSnd)
+            member _.GetHashCode p = h p.PairFst * 397 ^^^ h p.PairSnd })
+
+let inline refPairSetAdd (s : RefPairSet<'a>) (a : 'a) (b : 'a) : bool =
+    s.Add { PairFst = a; PairSnd = b }
+
+type RefMap<'k, 'v> = System.Collections.Generic.Dictionary<'k, 'v>
+
+let refMapNew<'k, 'v when 'k : not struct> (h : 'k -> int) : RefMap<'k, 'v> =
+    RefMap<'k, 'v> (identityComparer h)
+
+let inline refMapSet (m : RefMap<'k, 'v>) (k : 'k) (v : 'v) : unit = m.[k] <- v
+
+let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
+    match m.TryGetValue k with
+    | true, v -> Some v
+    | _ -> None

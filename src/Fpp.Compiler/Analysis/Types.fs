@@ -81,30 +81,36 @@ let mapConstraint (f : Type -> Type) (c : Constraint) : Constraint =
 // times); every structural walker must be DAG-aware or a shared node
 // expands into an exponential tree walk. Each walker below carries a
 // reference-identity visited set.
-let private refComparer<'a when 'a : not struct> =
-    { new System.Collections.Generic.IEqualityComparer<'a> with
-        member _.Equals (a, b) = System.Object.ReferenceEquals (a, b)
-        member _.GetHashCode a = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode a }
+/// Bucket for a visited set: cheap, and STABLE while the walk runs. It
+/// reads only immutable fields — a variable's id, a constructor's name and
+/// arity — because unification rewrites `Link` under a live set, and an
+/// entry whose hash moved would be lost.
+let shallowHash (t : Type) : int =
+    match t with
+    | TVar v -> v.Id * 4 + 1
+    | TCon (n, args) -> (hash n * 31 + List.length args) * 4 + 2
+    | TFun (_, _) -> 3
+    | TTuple ts -> List.length ts * 4
 
 let freeVars (t : Type) : Var list =
-    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
-    let acc = System.Collections.Generic.List<Var> ()
+    let seen = refSetNew<Type> shallowHash
+    let acc = vecNew<Var> ()
     let rec go (t : Type) : unit =
         let p = prune t
-        if seen.Add p then
+        if refSetAdd seen p then
             match p with
-            | TVar v -> acc.Add v
+            | TVar v -> vecAdd acc v
             | TCon (_, args) -> List.iter go args
             | TFun (a, b) -> go a; go b
             | TTuple ts -> List.iter go ts
     go t
-    List.ofSeq acc
+    vecToList acc
 
 let private occurs (v : Var) (t : Type) : bool =
-    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
+    let seen = refSetNew<Type> shallowHash
     let rec go (t : Type) : bool =
         let p = prune t
-        if not (seen.Add p) then false
+        if not (refSetAdd seen p) then false
         else
             match p with
             | TVar w -> System.Object.ReferenceEquals (v, w)
@@ -116,10 +122,10 @@ let private occurs (v : Var) (t : Type) : bool =
 /// Clamp levels of all vars in t to at most `level` (link-time invariant
 /// that keeps generalization sound).
 let private adjustLevels (level : int) (t : Type) : unit =
-    let seen = System.Collections.Generic.HashSet<Type> (refComparer)
+    let seen = refSetNew<Type> shallowHash
     let rec go (t : Type) : unit =
         let p = prune t
-        if seen.Add p then
+        if refSetAdd seen p then
             match p with
             | TVar w -> if w.Level > level then w.Level <- level
             | TCon (_, args) -> List.iter go args
@@ -207,22 +213,14 @@ let prunedId (v : Var) : int =
     | TVar w -> w.Id
     | _ -> v.Id
 
-let private pairComparer =
-    { new System.Collections.Generic.IEqualityComparer<struct (Type * Type)> with
-        member _.Equals (struct (a1, b1), struct (a2, b2)) =
-            System.Object.ReferenceEquals (a1, a2) && System.Object.ReferenceEquals (b1, b2)
-        member _.GetHashCode (struct (a, b)) =
-            (System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode a * 397)
-            ^^^ System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode b }
-
-let rec private unifySeen (seen : System.Collections.Generic.HashSet<struct (Type * Type)>) (t1 : Type) (t2 : Type) : string option =
+let rec private unifySeen (seen : RefPairSet<Type>) (t1 : Type) (t2 : Type) : string option =
     let unify a b = unifySeen seen a b
     let a = prune t1
     let b = prune t2
     if System.Object.ReferenceEquals (a, b) then None
     // a revisited PAIR is already being unified higher up the walk: the
     // shared sub-DAG expands exponentially as a tree without this cut
-    elif not (seen.Add (struct (a, b))) then None
+    elif not (refPairSetAdd seen a b) then None
     else
     match a, b with
     | TVar v, TVar w when System.Object.ReferenceEquals (v, w) -> None
@@ -263,7 +261,7 @@ let rec private unifySeen (seen : System.Collections.Generic.HashSet<struct (Typ
         Some ("type mismatch: " + typeString a + " vs " + typeString b)
 
 let unify (t1 : Type) (t2 : Type) : string option =
-    unifySeen (System.Collections.Generic.HashSet<struct (Type * Type)> (pairComparer)) t1 t2
+    unifySeen (refPairSetNew<Type> shallowHash) t1 t2
 
 /// Variable supply and level tracking for one inference run.
 type TypeState() =
@@ -315,12 +313,12 @@ type TypeState() =
             // memoized on node identity: the copy PRESERVES the body's
             // sharing — a naive walk materializes a shared sub-DAG once per
             // path, and the copies grow exponentially
-            let memo = System.Collections.Generic.Dictionary<Type, Type> (refComparer)
+            let memo = refMapNew<Type, Type> shallowHash
             let rec go (t : Type) : Type =
                 let p = prune t
-                match memo.TryGetValue p with
-                | true, r -> r
-                | _ ->
+                match refMapTryFind memo p with
+                | Some r -> r
+                | None ->
                     let r =
                         match p with
                         | TVar v ->
@@ -330,7 +328,7 @@ type TypeState() =
                         | TCon (n, args) -> TCon (n, List.map go args)
                         | TFun (a, b) -> TFun (go a, go b)
                         | TTuple ts -> TTuple (List.map go ts)
-                    dictSet memo p r
+                    refMapSet memo p r
                     r
             go s.Body, List.map (mapConstraint go) s.Constraints
 

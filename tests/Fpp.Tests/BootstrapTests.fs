@@ -117,6 +117,45 @@ let private parseOracle (src : string) (bad : string) =
           shape (Syntax.GNode rb.Root)
           "" ]
 
+// ---- the oracle for the reference-identity driver ---------------------
+// tests/bootstrap/refdrive.fpp, transcribed onto the .NET half of the seam.
+// The two must agree line for line.
+
+type private RefNode = { Tag : int; mutable Kid : RefNode option }
+
+let private refOracle () =
+    let out = System.Text.StringBuilder()
+    let p (s : string) = out.Append(s).Append('\n') |> ignore
+    let shallow (n : RefNode) = n.Tag
+    let a = { Tag = 1; Kid = None }
+    let b = { Tag = 1; Kid = None }
+    let s = Prelude.refSetNew<RefNode> shallow
+    p (string (Prelude.refSetAdd s a))
+    p (string (Prelude.refSetAdd s a))
+    p (string (Prelude.refSetAdd s b))
+    p (string (Prelude.refSetContains s a) + " " + string (Prelude.refSetContains s b))
+    let c = { Tag = 1; Kid = None }
+    p (string (Prelude.refSetContains s c))
+    a.Kid <- Some b
+    p (string (Prelude.refSetContains s a))
+    let mutable kept = 0
+    for _ in 1 .. 40 do
+        if Prelude.refSetAdd s { Tag = 7; Kid = None } then kept <- kept + 1
+    p ("added " + string kept)
+    let m = Prelude.refMapNew<RefNode, string> shallow
+    Prelude.refMapSet m a "first"
+    Prelude.refMapSet m b "second"
+    Prelude.refMapSet m a "updated"
+    p (match Prelude.refMapTryFind m a with Some v -> v | None -> "MISSING")
+    p (match Prelude.refMapTryFind m b with Some v -> v | None -> "MISSING")
+    p (match Prelude.refMapTryFind m c with Some v -> "BAD " + v | None -> "absent")
+    let ps = Prelude.refPairSetNew<RefNode> shallow
+    p (string (Prelude.refPairSetAdd ps a b))
+    p (string (Prelude.refPairSetAdd ps a b))
+    p (string (Prelude.refPairSetAdd ps b a))
+    p (string (Prelude.refPairSetAdd ps a c))
+    out.ToString ()
+
 [<Tests>]
 let bootstrapTests =
     testList "stage-0 bootstrap" [
@@ -132,6 +171,13 @@ let bootstrapTests =
             let expected =
                 parseOracle (driverLiteral "parsedrive.fpp" "src") (driverLiteral "parsedrive.fpp" "bad")
             Expect.equal out expected "emitted parser disagrees with the hosted one"
+        }
+        test "the emitted reference-identity collections behave like the .NET seam" {
+            // the same program, run by both halves: HashSet over
+            // ReferenceEquals here, an open-addressed table over refEq there
+            let out = runWasm [ root + "/stdlib/bootstrap.fpp"
+                                root + "/tests/bootstrap/refdrive.fpp" ]
+            Expect.equal out (refOracle ()) "the two halves of the seam disagree"
         }
         test "the emitted bootstrap prelude behaves like the .NET seam" {
             let out = runWasm [ root + "/stdlib/bootstrap.fpp"

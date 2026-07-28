@@ -333,6 +333,29 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
 
     // ---- patterns ---------------------------------------------------------
 
+    /// A QUALIFIED case in pattern position (`Classes.Improve inst`). The
+    /// case is the LAST segment — the leading spine is its module — and the
+    /// use has to land on that segment, because that is where inference
+    /// looks for the constructor to instantiate. Without it the payload
+    /// binder never gets a type, and everything read out of it stays
+    /// unknown: the loop over `inst.Context` could not even tell it was
+    /// walking a list.
+    let recordQualifiedCase (env : Env) (children : Green list) : unit =
+        let idents =
+            children
+            |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+        match idents with
+        | [] -> ()
+        | first :: _ ->
+            // the prefix still records as before, so go-to-def on a module
+            // segment keeps working
+            tryRecord env first
+            if idents.Length > 1 then
+                let full = idents |> List.map (fun t -> t.Text) |> String.concat "."
+                match lookupValue env full with
+                | Some d -> record (List.last idents) d
+                | None -> ()
+
     let rec bindPat (kind : DefKind) (env : Env) (g : Green) : Env =
         match g with
         | GToken _ -> env
@@ -342,7 +365,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 (match n.Children with
                  | GToken t :: rest when t.Kind = Ident ->
                      if not (List.isEmpty rest) then
-                         tryRecord env t
+                         recordQualifiedCase env n.Children
                          env
                      else
                          match lookupValue env t.Text with
@@ -364,7 +387,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      (match head with
                       | GNode hn when hn.NodeKind = IdentPat ->
                           (match hn.Children with
-                           | GToken t :: _ when t.Kind = Ident -> tryRecord env t
+                           | GToken t :: _ when t.Kind = Ident -> recordQualifiedCase env hn.Children
                            | _ -> ())
                       | _ -> ())
                      List.fold (bindPat kind) env args

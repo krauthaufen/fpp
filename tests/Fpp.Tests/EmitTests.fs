@@ -468,3 +468,63 @@ let letInScopeTests =
             Expect.equal out "12\n" "the binding, not its parameters, is what the body sees"
         }
     ]
+
+[<Tests>]
+let qualifiedCasePatternTests =
+    // A qualified case in PATTERN position is named by its last segment.
+    // Getting that wrong typed the pattern off the MODULE name, so the
+    // payload binder had no type and everything read out of it was unknown.
+    testList "qualified union-case patterns" [
+        test "a qualified case pattern types its payload binder" {
+            let ws = Fpp.Workspace()
+            ws.SetFileText "other.fpp" (String.concat "\n" [
+                "module Other"
+                "type InstDef = { Head : string; Ctx : string list }"
+                "type Outcome ="
+                "    | Chose of InstDef"
+                "    | NoneFit"
+                "" ])
+            ws.SetFileText "m.fpp" (String.concat "\n" [
+                "module M"
+                "open Other"
+                "let run (o : Outcome) : int ="
+                "    let mutable n = 0"
+                "    match o with"
+                "    | Other.Chose inst ->"
+                // the loop is the witness: without the payload's type the
+                // source is not known to be a list and cannot be walked
+                "        for c in inst.Ctx do"
+                "            n <- n + c.Length"
+                "    | Other.NoneFit -> n <- -1"
+                "    n"
+                "let r = print (string (run (Chose { Head = \"h\"; Ctx = [ \"ab\"; \"cde\" ] })))"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "clean"
+            let wat, errs = ws.EmitProgram ()
+            Expect.isEmpty errs "emits"
+            let tmp = System.IO.Path.GetTempFileName() + ".wat"
+            System.IO.File.WriteAllText(tmp, wat)
+            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd()
+            p.WaitForExit()
+            System.IO.File.Delete tmp
+            Expect.equal out "5\n" "the payload's list field is walked"
+        }
+        test "a qualified nullary case still matches" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Flag = | On | Off"
+                    "let show (f : Flag) ="
+                    "    match f with"
+                    "    | M.On -> \"on\""
+                    "    | M.Off -> \"off\""
+                    "let a = print (show On)"
+                    "let b = print (show Off)"
+                    "" ])
+            Expect.equal out "on\noff\n" "qualified nullary cases select correctly"
+        }
+    ]

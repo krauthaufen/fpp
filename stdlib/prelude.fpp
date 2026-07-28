@@ -635,6 +635,10 @@ type DefaultEqualityComparer<'a> =
 type KeyValuePair<'K, 'V>(key : 'K, value : 'V) =
     member x.Key = key
     member x.Value = value
+// ---- tuple projections ----
+let fst (t : 'a * 'b) : 'a = match t with (a, _) -> a
+let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b
+
 // ---- String: the F# String module ----
 module String =
     extern let strsub : string -> int -> int -> string
@@ -1223,6 +1227,17 @@ module List =
     let sort (xs : 'a list) : 'a list when Ordered<'a> = sortWith compare xs
     let sortBy (f : 'a -> 'k) (xs : 'a list) : 'a list when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
+    /// First occurrence wins, order preserved — F#'s own rule.
+    let distinctBy (key : 'a -> 'k) (xs : 'a list) : 'a list =
+        let mutable seenKeys = []
+        let mutable acc = []
+        for x in xs do
+            let k = key x
+            if not (List.exists (fun s -> s = k) seenKeys) then
+                seenKeys <- k :: seenKeys
+                acc <- x :: acc
+        List.rev acc
+    let distinct (xs : 'a list) : 'a list = distinctBy (fun x -> x) xs
     let zip (a : 'a list) (b : 'b list) = map2 (fun x y -> (x, y)) a b
     let unzip (xs : list<'a * 'b>) =
         let mutable la = []

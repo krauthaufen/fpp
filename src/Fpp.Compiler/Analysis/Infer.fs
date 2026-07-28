@@ -84,6 +84,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let diags = vecNew<int * string> ()
     let opKindsRaw = vecNew<int * Type> ()
     let arrKindsRaw = vecNew<int * Type> ()
+    // `for x in e` whose source type was still UNKNOWN when the loop was
+    // typed — a parked dot resolves after the walk. Promoted to a real
+    // marker at the end, but only if it turned out to be a list or an
+    // array: the enumerator protocol needs member accesses parked DURING
+    // the walk, so promoting one here would emit an array walk over a class
+    let lateLoopSources = vecNew<int * Type> ()
     let instRaw = vecNew<int * Type list> ()
     // index expressions whose RECEIVER is an array: `a.[i] <- v` may tie the
     // value to the element type, which a member setter's shape may not
@@ -178,19 +184,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Substitute specific vars (by id) with given types, freshening nothing else.
     /// Memoized on node identity so a shared sub-DAG is copied ONCE.
     let substVars (subst : Dict<int, Type>) (t : Type) : Type =
-        let memo = System.Collections.Generic.Dictionary<Type, Type> (HashIdentity.Reference)
+        let memo = refMapNew<Type, Type> shallowHash
         let rec go (t : Type) : Type =
             let p = prune t
-            match memo.TryGetValue p with
-            | true, r -> r
-            | _ ->
+            match refMapTryFind memo p with
+            | Some r -> r
+            | None ->
                 let r =
                     match p with
                     | TVar v -> (match dictTryFind subst v.Id with Some a -> a | None -> TVar v)
                     | TCon (c, xs) -> TCon (c, List.map go xs)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
-                dictSet memo p r
+                refMapSet memo p r
                 r
         go t
 
@@ -839,7 +845,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some t -> literalType t
              | None -> st.Fresh ())
         | IdentPat ->
-            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+            // A QUALIFIED case pattern (`Classes.Improve inst`) names its
+            // case in the LAST identifier — the leading spine is a module.
+            // Taking the first typed the pattern off the MODULE name, so the
+            // constructor was never instantiated and the payload binder
+            // stayed unknown, along with everything read out of it.
+            let identToks = tokensOf n |> List.filter (fun t -> t.Kind = Ident)
+            let headTok =
+                if tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ".") then
+                    List.tryLast identToks
+                else List.tryHead identToks
+            (match headTok with
              | Some t ->
                  match dictTryFind defsAt t.Offset with
                  | Some _ ->
@@ -1880,6 +1896,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | Some ip -> unify (patType fvars ip) cTy |> ignore
                            | None -> ())
                       | _ ->
+                          // the type is not known YET — a parked dot may
+                          // still resolve it. Remember the source so the
+                          // finalization can look again
+                          (match Green.tokens (GNode coll) |> List.tryHead with
+                           | Some t -> vecAdd lateLoopSources (t.Offset, ct)
+                           | None -> ())
                           // neither array, list nor protocol: still bind the
                           // pattern so the body sees its names
                           (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
@@ -2820,7 +2842,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | TVar v -> "#" + string v.Id
             | _ -> "")
       ArrKinds =
-        vecToList arrKindsRaw
+        // a loop source that only became known after the walk joins the
+        // markers — but ONLY as a list or an array, the two shapes lowering
+        // can walk without anything having been parked for it
+        (vecToList arrKindsRaw
+         @ (vecToList lateLoopSources
+            |> List.filter (fun (_, ty) ->
+                match prune ty with
+                | TCon ("list", [ _ ]) | TCon ("array", [ _ ]) -> true
+                | _ -> false)))
         |> List.choose (fun (off, ty) ->
             let nameOf (t : Type) =
                 match prune t with

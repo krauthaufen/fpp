@@ -61,6 +61,8 @@ let vecInsert (v : Vec<'a>) (i : int) (x : 'a) : unit =
     v.Items.[i] <- x
     v.Count <- v.Count + 1
 
+let vecClear (v : Vec<'a>) : unit = v.Count <- 0
+
 let vecToList (v : Vec<'a>) : 'a list =
     let mutable acc = []
     let mutable i = v.Count - 1
@@ -149,3 +151,185 @@ let dictPairs (d : Dict<'k, 'v>) : ('k * 'v) list =
         acc <- (d.Keys.[i], d.Vals.[i]) :: acc
         i <- i - 1
     acc
+
+// ---- reference-identity collections ----------------------------------
+
+// The .NET half builds these over `Object.ReferenceEquals`; here the
+// identity test is the `refEq` primitive. The hash is the CALLER's, and it
+// must read only immutable fields: unification rewrites `Link` while a
+// visited set is live, and a hash that moved would strand its entry in the
+// wrong bucket. Any hash consistent with identity is legal, so a shallow
+// one — a constructor tag, a variable's id — is enough, which is what lets
+// this work without an identity-hash primitive at all.
+
+/// Open-addressed over insertion-ordered entries, exactly like `Dict`; only
+/// the equality differs.
+type RefSet<'a> =
+    { mutable RefKeys : 'a[]
+      mutable RefSlots : int[]
+      mutable RefCount : int
+      RefHash : 'a -> int }
+
+let refSetNew (h : 'a -> int) : RefSet<'a> =
+    { RefKeys = Array.zeroCreate 8; RefSlots = Array.zeroCreate 16; RefCount = 0; RefHash = h }
+
+let private refSetSlot (s : RefSet<'a>) (x : 'a) : int =
+    let mask = s.RefSlots.Length - 1
+    let mutable i = (s.RefHash x &&& 1073741823) &&& mask
+    let mutable found = -1
+    while found < 0 do
+        let e = s.RefSlots.[i]
+        if e = 0 then found <- i
+        elif refEq s.RefKeys.[e - 1] x then found <- i
+        else i <- (i + 1) &&& mask
+    found
+
+let private refSetRehash (s : RefSet<'a>) : unit =
+    let slots : int[] = Array.zeroCreate (s.RefSlots.Length * 2)
+    let mask = slots.Length - 1
+    let mutable e = 0
+    while e < s.RefCount do
+        let mutable i = (s.RefHash s.RefKeys.[e] &&& 1073741823) &&& mask
+        while slots.[i] <> 0 do
+            i <- (i + 1) &&& mask
+        slots.[i] <- e + 1
+        e <- e + 1
+    s.RefSlots <- slots
+
+let refSetContains (s : RefSet<'a>) (x : 'a) : bool = s.RefSlots.[refSetSlot s x] > 0
+
+/// Add, reporting whether the value was NEW.
+let refSetAdd (s : RefSet<'a>) (x : 'a) : bool =
+    let at = refSetSlot s x
+    if s.RefSlots.[at] > 0 then false
+    else
+        if s.RefCount >= s.RefKeys.Length then
+            let keys : 'a[] = Array.zeroCreate (s.RefKeys.Length * 2)
+            let mutable i = 0
+            while i < s.RefCount do
+                keys.[i] <- s.RefKeys.[i]
+                i <- i + 1
+            s.RefKeys <- keys
+        s.RefKeys.[s.RefCount] <- x
+        s.RefCount <- s.RefCount + 1
+        if s.RefCount * 2 >= s.RefSlots.Length then refSetRehash s
+        else s.RefSlots.[at] <- s.RefCount
+        true
+
+/// A set of PAIRS compared componentwise by identity.
+type RefPair<'a> = { PairFst : 'a; PairSnd : 'a }
+
+type RefPairSet<'a> =
+    { mutable PairFsts : 'a[]
+      mutable PairSnds : 'a[]
+      mutable PairSlots : int[]
+      mutable PairCount : int
+      PairHash : 'a -> int }
+
+let refPairSetNew (h : 'a -> int) : RefPairSet<'a> =
+    { PairFsts = Array.zeroCreate 8; PairSnds = Array.zeroCreate 8
+      PairSlots = Array.zeroCreate 16; PairCount = 0; PairHash = h }
+
+let private refPairSlot (s : RefPairSet<'a>) (a : 'a) (b : 'a) : int =
+    let mask = s.PairSlots.Length - 1
+    let mutable i = ((s.PairHash a * 397 ^^^ s.PairHash b) &&& 1073741823) &&& mask
+    let mutable found = -1
+    while found < 0 do
+        let e = s.PairSlots.[i]
+        if e = 0 then found <- i
+        elif refEq s.PairFsts.[e - 1] a && refEq s.PairSnds.[e - 1] b then found <- i
+        else i <- (i + 1) &&& mask
+    found
+
+let private refPairRehash (s : RefPairSet<'a>) : unit =
+    let slots : int[] = Array.zeroCreate (s.PairSlots.Length * 2)
+    let mask = slots.Length - 1
+    let mutable e = 0
+    while e < s.PairCount do
+        let h = s.PairHash s.PairFsts.[e] * 397 ^^^ s.PairHash s.PairSnds.[e]
+        let mutable i = (h &&& 1073741823) &&& mask
+        while slots.[i] <> 0 do
+            i <- (i + 1) &&& mask
+        slots.[i] <- e + 1
+        e <- e + 1
+    s.PairSlots <- slots
+
+let refPairSetAdd (s : RefPairSet<'a>) (a : 'a) (b : 'a) : bool =
+    let at = refPairSlot s a b
+    if s.PairSlots.[at] > 0 then false
+    else
+        if s.PairCount >= s.PairFsts.Length then
+            let fs : 'a[] = Array.zeroCreate (s.PairFsts.Length * 2)
+            let ss : 'a[] = Array.zeroCreate (s.PairSnds.Length * 2)
+            let mutable i = 0
+            while i < s.PairCount do
+                fs.[i] <- s.PairFsts.[i]
+                ss.[i] <- s.PairSnds.[i]
+                i <- i + 1
+            s.PairFsts <- fs
+            s.PairSnds <- ss
+        s.PairFsts.[s.PairCount] <- a
+        s.PairSnds.[s.PairCount] <- b
+        s.PairCount <- s.PairCount + 1
+        if s.PairCount * 2 >= s.PairSlots.Length then refPairRehash s
+        else s.PairSlots.[at] <- s.PairCount
+        true
+
+type RefMap<'k, 'v> =
+    { mutable MapKeys : 'k[]
+      mutable MapVals : 'v[]
+      mutable MapSlots : int[]
+      mutable MapCount : int
+      MapHash : 'k -> int }
+
+let refMapNew (h : 'k -> int) : RefMap<'k, 'v> =
+    { MapKeys = Array.zeroCreate 8; MapVals = Array.zeroCreate 8
+      MapSlots = Array.zeroCreate 16; MapCount = 0; MapHash = h }
+
+let private refMapSlot (m : RefMap<'k, 'v>) (k : 'k) : int =
+    let mask = m.MapSlots.Length - 1
+    let mutable i = (m.MapHash k &&& 1073741823) &&& mask
+    let mutable found = -1
+    while found < 0 do
+        let e = m.MapSlots.[i]
+        if e = 0 then found <- i
+        elif refEq m.MapKeys.[e - 1] k then found <- i
+        else i <- (i + 1) &&& mask
+    found
+
+let private refMapRehash (m : RefMap<'k, 'v>) : unit =
+    let slots : int[] = Array.zeroCreate (m.MapSlots.Length * 2)
+    let mask = slots.Length - 1
+    let mutable e = 0
+    while e < m.MapCount do
+        let mutable i = (m.MapHash m.MapKeys.[e] &&& 1073741823) &&& mask
+        while slots.[i] <> 0 do
+            i <- (i + 1) &&& mask
+        slots.[i] <- e + 1
+        e <- e + 1
+    m.MapSlots <- slots
+
+let refMapSet (m : RefMap<'k, 'v>) (k : 'k) (v : 'v) : unit =
+    let at = refMapSlot m k
+    let e = m.MapSlots.[at]
+    if e > 0 then m.MapVals.[e - 1] <- v
+    else
+        if m.MapCount >= m.MapKeys.Length then
+            let keys : 'k[] = Array.zeroCreate (m.MapKeys.Length * 2)
+            let vals : 'v[] = Array.zeroCreate (m.MapVals.Length * 2)
+            let mutable i = 0
+            while i < m.MapCount do
+                keys.[i] <- m.MapKeys.[i]
+                vals.[i] <- m.MapVals.[i]
+                i <- i + 1
+            m.MapKeys <- keys
+            m.MapVals <- vals
+        m.MapKeys.[m.MapCount] <- k
+        m.MapVals.[m.MapCount] <- v
+        m.MapCount <- m.MapCount + 1
+        if m.MapCount * 2 >= m.MapSlots.Length then refMapRehash m
+        else m.MapSlots.[at] <- m.MapCount
+
+let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
+    let e = m.MapSlots.[refMapSlot m k]
+    if e > 0 then Some m.MapVals.[e - 1] else None
