@@ -1938,3 +1938,42 @@ scalar-returning function, and it is the precondition for inlining to be
 worth switching on. But it is the THIRD optimization in a row to measure
 neutral, and the lesson is consistent — this compiler's time goes to
 allocation and data shuffling, not to arithmetic or call overhead.
+
+### THE boxing that matters: tuple dictionary keys
+Counted in the emitted compiler:
+
+    struct.new $tup2              1083     heap tuple allocations
+    struct.new $r_StructTuple2       0     struct tuples: never used
+
+    $g..._dictSlot_int_int                 specialization WORKS on primitives
+    $g..._dictSlot_string__ref
+    $g..._dictSlot__ref_Expr               a TUPLE key stamps as "_ref"
+
+The generic `Dict` already specializes per key and value type — `dictSlot_int_int`
+is a stamped clone with unboxed int keys. The gap is narrower and worse than
+"no specialization": TUPLES ARE HEAP OBJECTS, so a `string * int` key
+classifies uniform AND allocates a `$tup2` on every lookup. The compiler keys
+almost everything on `(v.Path, v.Offset)`, so those 1083 sites run millions
+of times.
+
+This is what the flat measurements in this thread were pointing at the whole
+time. Tagging (i31) is free and I kept removing it; the heap traffic is in
+tuple keys, which is why GC was 42% of the run before the heap was sized and
+is still the largest single block afterwards.
+
+The fix is half-built already: `$r_StructTuple2` EXISTS as a type and is
+allocated zero times. Struct tuples are supported and unused. Give the hot
+dictionary keys a struct tuple and the existing monomorphizer stamps `Dict`
+at a struct instantiation — keys inline, no allocation per lookup — through
+the same machinery that already produces `dictSlot_int_int`.
+
+Two ways in, and the first is cheap enough to try immediately:
+- make the compiler's own `Dict<string * int, _>` keys struct tuples, at the
+  ~hundreds of use sites in the compiler (mechanical, and the fixpoint gates
+  it);
+- or decide that a tuple in KEY POSITION lowers to a struct tuple generally,
+  which is a representation rule rather than a per-site change.
+
+**This is the next piece of optimization work, ahead of everything else in
+this file.** It is the only remaining item measured to be where the time
+actually goes.
