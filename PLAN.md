@@ -877,6 +877,24 @@ counts, then does it all again for deliberately broken input; the Expecto test
 compares that against the same program run by the hosted parser. They agree,
 byte for byte, on both inputs. `Parser.fs` has joined the gated prefix.
 
+**Next up, `Analysis/Resolve.fs`.** It emits (file 6 of 20), and
+`tests/bootstrap/resolvedrive.fpp` is written and parses — it runs the emitted
+resolver over a program containing the shapes this stage fixed (an `and` group
+referencing forwards and backwards, a shadowed name, a one-line `let ... in`)
+and prints the definitions and resolutions. It is NOT gated yet: emission
+reports `unbound variable resolve`, i.e. the use resolved to a definition the
+emitter has no top-level slot for. A qualified cross-file call through a
+namespace prefix is fine in isolation (`Thing.compute` from another file emits
+and runs), so the suspect is narrower: `Fpp.Analysis.Resolve.resolve` is a
+VALUE whose name matches its own MODULE, and module-versus-value spines are
+exactly where that has bitten before. One minimized probe should settle it.
+
+Layout note found while writing that driver: deeply nested multi-line
+arguments (`print (String.concat " "` with the list on following lines) hit the
+v0 offside rule and parse as top-level junk. Flat helper bindings work. The
+driver is written in that flat style; whether the offside rule should accept
+the nested form is a separate question.
+
 **Where the frontier stops without a driver: `Analysis/Types.fs`.** It reaches past the seam
 straight into `System.Collections.Generic` — `HashSet`, `Dictionary`, `List`
 and an `IEqualityComparer` object expression over `HashIdentity.Reference`
