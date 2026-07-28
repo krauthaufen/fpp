@@ -812,6 +812,10 @@ let emit (decls : Decl list) : EmitResult =
         match k with
         | "f" -> "(call $off " + w + ")" | "s" -> "(call $oss " + w + ")"
         | "l" -> "(call $ofl " + w + ")" | "i" -> "(call $ofi " + w + ")" | _ -> w
+    /// the bare box function for append-mode emission
+    let boxFn (k : string) =
+        match k with
+        | "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
     /// the bare unbox function for append-mode emission
     let unboxFn (k : string) =
         match k with
@@ -1097,6 +1101,109 @@ let emit (decls : Decl list) : EmitResult =
                 WasmBinary.emitStr bb (") (br $done" + res + ") ")
                 WasmBinary.emitStr bb ")")
             WasmBinary.emitStr bb (" (unreachable)) (local.get " + res + "))")
+        // known full-arity call, the two COMMON branches (externs and
+        // scalarized-struct signatures stay on the string path)
+        | EApp (EVar (v, _), args) when
+              (dictTryFind topArity (v.Path, v.Offset)) = Some (List.length args)
+              && not (dictTryFind externs (v.Path, v.Offset)).IsSome
+              && not (dictTryFind sigStructs (v.Path, v.Offset)).IsSome ->
+            let fname = (dictTryFind topName (v.Path, v.Offset)).Value
+            let op = if tail then "return_call" else "call"
+            let emitArgs (pks : string list) =
+                let mutable first = true
+                let mutable ks = pks
+                for a in args do
+                    if not first then WasmBinary.emitStr bb " "
+                    first <- false
+                    (match ks with
+                     | k :: rest ->
+                         ks <- rest
+                         if k = "u" then compileInto bb locals extraLocals freeEnv false a
+                         else
+                             WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
+                             compileInto bb locals extraLocals freeEnv false a
+                             WasmBinary.emitStr bb ")"
+                     | [] -> compileInto bb locals extraLocals freeEnv false a)
+            (match dictTryFind sigKinds (v.Path, v.Offset) with
+             | Some (pks, rk) when List.length pks = List.length args ->
+                 if tail && rk = currentRetKind then
+                     WasmBinary.emitStr bb ("(" + op + " " + fname + " ")
+                     emitArgs pks
+                     WasmBinary.emitStr bb ")"
+                 else
+                     if rk <> "u" then WasmBinary.emitStr bb ("(call " + boxFn rk + " ")
+                     WasmBinary.emitStr bb ("(call " + fname + " ")
+                     emitArgs pks
+                     WasmBinary.emitStr bb ")"
+                     if rk <> "u" then WasmBinary.emitStr bb ")"
+             | _ ->
+                 let opv = if tail && currentRetKind = "u" then op else "call"
+                 WasmBinary.emitStr bb ("(" + opv + " " + fname + " ")
+                 emitArgs []
+                 WasmBinary.emitStr bb ")")
+        | EApp (f, args) when (match f with EUnknown _ | EField _ -> false | _ -> true) ->
+            // generic application: the curried applyc chain, innermost first
+            for _ in args do WasmBinary.emitStr bb "(call $applyc "
+            compileInto bb locals extraLocals freeEnv false f
+            for a in args do
+                WasmBinary.emitStr bb " "
+                compileInto bb locals extraLocals freeEnv false a
+                WasmBinary.emitStr bb ")"
+        | EPrim (op, [ a; b ]) when
+              List.contains op [ "-"; "*"; "/"; "%"; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+            let insn =
+                match op with
+                | "-" -> "i32.sub" | "*" -> "i32.mul" | "/" -> "i32.div_s" | "%" -> "i32.rem_s"
+                | "&&&" -> "i32.and" | "|||" -> "i32.or" | "^^^" -> "i32.xor"
+                | "<<<" -> "i32.shl" | _ -> "i32.shr_s"
+            WasmBinary.emitStr bb ("(call $ofi (" + insn + " (call $toi ")
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb ") (call $toi "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")))"
+        | EPrim (op, [ a; b ]) when List.contains op [ "<"; ">"; "<="; ">=" ] ->
+            let insn =
+                match op with
+                | "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | _ -> "i32.ge_s"
+            WasmBinary.emitStr bb ("(ref.i31 (" + insn + " (call $toi ")
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb ") (call $toi "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")))"
+        | EPrim ("+", [ a; b ]) ->
+            WasmBinary.emitStr bb "(call $addv "
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb " "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")"
+        | EPrim ("=", [ a; b ]) ->
+            WasmBinary.emitStr bb "(call $equal "
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb " "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")"
+        | EPrim ("<>", [ a; b ]) ->
+            WasmBinary.emitStr bb "(ref.i31 (i32.eqz (call $toi (call $equal "
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb " "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb "))))"
+        | EPrim ("&&", [ a; b ]) ->
+            compileInto bb locals extraLocals freeEnv false (EIf (a, b, ELit (LBool false)))
+        | EPrim ("||", [ a; b ]) ->
+            compileInto bb locals extraLocals freeEnv false (EIf (a, ELit (LBool true), b))
+        | EPrim ("::", [ a; b ]) ->
+            WasmBinary.emitStr bb "(struct.new $cons "
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb " "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")"
+        | EPrim ("@", [ a; b ]) ->
+            WasmBinary.emitStr bb "(call $append "
+            compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb " "
+            compileInto bb locals extraLocals freeEnv false b
+            WasmBinary.emitStr bb ")"
         | other -> WasmBinary.emitStr bb (compileExpr locals extraLocals freeEnv tail other)
 
     /// A function body through the buffer: ONE string materialization at the
