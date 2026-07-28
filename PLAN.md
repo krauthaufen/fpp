@@ -2055,3 +2055,33 @@ structs; a bare `(a, b, c)` is representation-indifferent.
 
 Next: make it unconditional per (2), then measure again on a workload that
 actually uses tupled functions rather than on this compiler.
+
+### The convention is: ALWAYS UNTUPLE. And what must accompany a binary.
+Decided: `(a * b) -> r` always compiles to two parameters. Not an
+optimization gated on an analysis — a rule. A call carrying a real tuple
+VALUE deconstructs at the call site; a first-class use goes through the curry
+wrapper, which already exists and already converts at that boundary.
+
+That answers "what metadata does a binary need for the calling convention":
+none. Any consumer derives the same answer from the signature.
+
+But a consumer DOES need to know whether `f` was written `f a b` or
+`f (a, b)`, because those type-check differently even though they compile
+identically — and the answer is that we already carry it. The types are
+distinct VALUES:
+
+    a -> b -> r      TFun (a, TFun (b, r))
+    (a * b) -> r     TFun (TTuple [a; b], r)
+
+and `BuildLibrary` serializes the PRE-optimization decls and schemes, so
+`.fppir` keeps the source-level shape. A consumer type-checks `f (a, b)` and
+rejects `f a b` correctly, then emits a two-argument call by the same rule.
+
+**The invariant this depends on, which is easy to break:** `uncurryTupleArgs`
+rewrites the scheme (`uncurryScheme`) in the optimized IR. That is safe only
+because the library path never sees that IR. Serializing post-optimization
+decls would destroy the distinction and consumers would accept `f a b` for a
+tupled function. So: THE EXPORTED SIGNATURE IS THE SOURCE-LEVEL TYPE.
+Untupling is a backend calling convention and must never rewrite an exported
+scheme. Worth a test that asserts a library round-trips a tupled signature as
+tupled.
