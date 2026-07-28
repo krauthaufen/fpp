@@ -812,6 +812,10 @@ let emit (decls : Decl list) : EmitResult =
         match k with
         | "f" -> "(call $off " + w + ")" | "s" -> "(call $oss " + w + ")"
         | "l" -> "(call $ofl " + w + ")" | "i" -> "(call $ofi " + w + ")" | _ -> w
+    /// the bare unbox function for append-mode emission
+    let unboxFn (k : string) =
+        match k with
+        | "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
     let unboxK (k : string) (w : string) =
         match k with
         | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
@@ -945,6 +949,154 @@ let emit (decls : Decl list) : EmitResult =
             WasmBinary.emitStr bb (if b then "(ref.i31 (i32.const 1))" else "(ref.i31 (i32.const 0))")
         | ELit LNull -> WasmBinary.emitStr bb "(ref.null any)"
         | ELit LUnit -> WasmBinary.emitStr bb "(ref.i31 (i32.const 0))"
+        | EIf (c, t, f) ->
+            WasmBinary.emitStr bb "(if (result anyref) (i32.ne (i32.const 0) (call $toi "
+            compileInto bb locals extraLocals freeEnv false c
+            WasmBinary.emitStr bb ")) (then "
+            compileInto bb locals extraLocals freeEnv tail t
+            WasmBinary.emitStr bb ") (else "
+            compileInto bb locals extraLocals freeEnv tail f
+            WasmBinary.emitStr bb "))"
+        // the let-SPINE, appended link by link. The rec-lambda and letrec
+        // group forms keep their string cases; the fallback re-dispatches to
+        // them. Side-effect ORDER matches the string path: rhs compiles
+        // BEFORE its binder registers (shadowing), the binder before body.
+        | ELet (_, _, _, _, _) when (match e with ELet (true, _, _, ELam _, _) -> false | _ -> true) ->
+            let newTypedLocal (base_ : string) (ty : string) : string =
+                let n = "$l" + string (vecLen extraLocals) + "_" + base_
+                vecAdd extraLocals (n, ty)
+                n
+            let mutable closes = 0
+            let mutable cur = e
+            let mutable walking = true
+            while walking do
+                match cur with
+                | ELet (true, _, _, ELam _, _) -> walking <- false
+                | ELet (_, v, _, rhs, body) when (dictTryFind cellVars (v.Path, v.Offset)).IsSome ->
+                    let l = newTypedLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_')) "anyref"
+                    WasmBinary.emitStr bb "(block (result anyref) (local.set "
+                    WasmBinary.emitStr bb l
+                    WasmBinary.emitStr bb " (struct.new $cell "
+                    compileInto bb locals extraLocals freeEnv false rhs
+                    dictSet locals (v.Path, v.Offset) l
+                    WasmBinary.emitStr bb ")) "
+                    closes <- closes + 1
+                    cur <- body
+                | ELet (_, v, _, rhs, body) ->
+                    let k = kindOf rhs
+                    let l = newTypedLocal (v.Name |> String.map (fun c -> if isLetterOrDigit c then c else '_')) (wasmTyOf k)
+                    WasmBinary.emitStr bb "(block (result anyref) (local.set "
+                    WasmBinary.emitStr bb l
+                    WasmBinary.emitStr bb " "
+                    if k = "u" then compileInto bb locals extraLocals freeEnv false rhs
+                    else
+                        WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
+                        compileInto bb locals extraLocals freeEnv false rhs
+                        WasmBinary.emitStr bb ")"
+                    dictSet locals (v.Path, v.Offset) l
+                    dictSet localKinds (v.Path, v.Offset) k
+                    WasmBinary.emitStr bb ") "
+                    closes <- closes + 1
+                    cur <- body
+                | _ -> walking <- false
+            compileInto bb locals extraLocals freeEnv tail cur
+            let mutable ci = 0
+            while ci < closes do
+                WasmBinary.emitStr bb ")"
+                ci <- ci + 1
+        | ETuple xs ->
+            WasmBinary.emitStr bb ("(struct.new $tup" + string xs.Length + " ")
+            let mutable first = true
+            for x in xs do
+                if not first then WasmBinary.emitStr bb " "
+                first <- false
+                compileInto bb locals extraLocals freeEnv false x
+            WasmBinary.emitStr bb ")"
+        | EListLit xs ->
+            for x in xs do
+                WasmBinary.emitStr bb "(struct.new $cons "
+                compileInto bb locals extraLocals freeEnv false x
+                WasmBinary.emitStr bb " "
+            WasmBinary.emitStr bb "(ref.null any)"
+            for _ in xs do WasmBinary.emitStr bb ")"
+        | ECtor (name, _, args) when
+              not (dictTryFind enumConst name).IsSome
+              && (match dictTryFind caseArity name with
+                  | Some n -> n > 0 && not (List.isEmpty args)
+                  | None -> false) ->
+            WasmBinary.emitStr bb ("(struct.new $du1 (i32.const " + string (dictTryFind caseTag name).Value + ") ")
+            let mutable first = true
+            for a in args do
+                if not first then WasmBinary.emitStr bb " "
+                first <- false
+                compileInto bb locals extraLocals freeEnv false a
+            WasmBinary.emitStr bb ")"
+        | EWhile (c, b2) ->
+            let lbl =
+                let n = "$l" + string (vecLen extraLocals) + "_w"
+                vecAdd extraLocals (n, "anyref")
+                n
+            WasmBinary.emitStr bb ("(block (result anyref) (block $brk" + lbl + " (loop $cont" + lbl + " (br_if $brk" + lbl + " (i32.eqz (call $toi ")
+            compileInto bb locals extraLocals freeEnv false c
+            WasmBinary.emitStr bb "))) (drop "
+            compileInto bb locals extraLocals freeEnv false b2
+            WasmBinary.emitStr bb (") (br $cont" + lbl + "))) (ref.i31 (i32.const 0)))")
+        | EAssign (v, rhs) when
+              not (dictTryFind cellVars (v.Path, v.Offset)).IsSome
+              && (dictTryFind locals (v.Path, v.Offset)).IsSome ->
+            let l = (dictTryFind locals (v.Path, v.Offset)).Value
+            let k = match dictTryFind localKinds (v.Path, v.Offset) with Some k -> k | None -> "u"
+            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + l + " ")
+            if k = "u" then compileInto bb locals extraLocals freeEnv false rhs
+            else
+                WasmBinary.emitStr bb ("(call " + unboxFn k + " ")
+                compileInto bb locals extraLocals freeEnv false rhs
+                WasmBinary.emitStr bb ")"
+            WasmBinary.emitStr bb ") (ref.i31 (i32.const 0)))"
+        | EMatch (scrut, cases) ->
+            let newLocal2 (base_ : string) : string =
+                let n = "$l" + string (vecLen extraLocals) + "_" + base_
+                vecAdd extraLocals (n, "anyref")
+                n
+            let sl = newLocal2 "scrut"
+            let res = newLocal2 "res"
+            WasmBinary.emitStr bb ("(block (result anyref) (local.set " + sl + " ")
+            compileInto bb locals extraLocals freeEnv false scrut
+            WasmBinary.emitStr bb (") (block $done" + res + " ")
+            cases |> List.iteri (fun i (pat, guard, body) ->
+                let lbl = "$case" + res + "_" + string i
+                let alts = expandOr pat
+                WasmBinary.emitStr bb ("(block " + lbl + " ")
+                (match alts with
+                 | [ single ] ->
+                     let tests = sbNew ()
+                     compilePat locals extraLocals freeEnv tests lbl ("(local.get " + sl + ")") single
+                     WasmBinary.emitStr bb (sbText tests)
+                 | many ->
+                     let hm = "$have" + res + "_" + string i
+                     let orSlots = dictNew<string * int, string> ()
+                     WasmBinary.emitStr bb ("(block " + hm + " ")
+                     many |> List.iteri (fun j alt ->
+                         let al = "$alt" + res + "_" + string i + "_" + string j
+                         WasmBinary.emitStr bb ("(block " + al + " ")
+                         let tests = sbNew ()
+                         compilePatWith orSlots locals extraLocals freeEnv tests al ("(local.get " + sl + ")") alt
+                         for bk, bsl in dictPairs locals do
+                             if (dictTryFind orSlots bk).IsNone then dictSet orSlots bk bsl
+                         WasmBinary.emitStr bb (sbText tests)
+                         WasmBinary.emitStr bb ("(br " + hm + ")) "))
+                     WasmBinary.emitStr bb ("(br " + lbl + ")) "))
+                (match guard with
+                 | Some g ->
+                     WasmBinary.emitStr bb ("(br_if " + lbl + " (i32.eqz (call $toi ")
+                     compileInto bb locals extraLocals freeEnv false g
+                     WasmBinary.emitStr bb "))) "
+                 | None -> ())
+                WasmBinary.emitStr bb ("(local.set " + res + " ")
+                compileInto bb locals extraLocals freeEnv false body
+                WasmBinary.emitStr bb (") (br $done" + res + ") ")
+                WasmBinary.emitStr bb ")")
+            WasmBinary.emitStr bb (" (unreachable)) (local.get " + res + "))")
         | other -> WasmBinary.emitStr bb (compileExpr locals extraLocals freeEnv tail other)
 
     /// A function body through the buffer: ONE string materialization at the
