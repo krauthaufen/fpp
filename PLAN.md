@@ -1651,7 +1651,12 @@ inside its own `EmitProgram -> monomorphizeWith -> mapExpr`. The frames are
 repeating, so the failure is in the CURRIED-WRAPPER path: `let r = mapExpr f`
 is a partial application, and `.w1` casts its `$env` to `$cons`.
 
-Ruled out by inspection (do not re-chase):
+Ruled out (do not re-chase):
+- **Wrapper arity conflicts.** `requestWrappers` keyed on the name alone, so a
+  second request at a different arity was silently dropped — a plausible way
+  to hand `.w(k)` an environment shaped for another chain length. It now
+  REPORTS the conflict, and no conflict fires in the self-compile, so this is
+  not the cause. The guard stays: a silent one would trap far from its cause.
 - **Wrapper self-consistency.** w0 builds `cons(a, env)` and w1 reads it back;
   the only producer of a `.w1` closure is w0, so the shape should match.
 - **Capture-env slot numbering.** `innerFree` assigns index i to freeList[i],

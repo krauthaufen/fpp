@@ -510,8 +510,15 @@ let emit (decls : Decl list) : EmitResult =
     // curry wrappers requested for top-level functions: (name, arity)
     let wrappers = vecNew<string * int> ()
     let requestWrappers (fname : string) (arity : int) =
-        if not (vecToList wrappers |> List.exists (fun (n, _) -> n = fname)) then
-            vecAdd wrappers (fname, arity)
+        // keyed by NAME ONLY, so a second request at a DIFFERENT arity used to
+        // be dropped in silence — and wrappers generated for the wrong arity
+        // hand `.w(k)` an environment shaped for a different chain length,
+        // which traps at the cast rather than anywhere near the cause
+        match vecToList wrappers |> List.tryFind (fun (n, _) -> n = fname) with
+        | Some (_, existing) when existing <> arity ->
+            emitError ("wrapper arity conflict for " + fname + ": " + string existing + " vs " + string arity)
+        | Some _ -> ()
+        | None -> vecAdd wrappers (fname, arity)
 
     // single-payload constructors used as first-class functions
     let ctorAsFn = vecNew<string> ()
