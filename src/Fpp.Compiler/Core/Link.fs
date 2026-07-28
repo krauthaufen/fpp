@@ -566,9 +566,15 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         vecToList out
         |> List.filter (fun d ->
             match d with
-            // only FUNCTION templates are unreachable-by-construction;
-            // value initializers are program effects and must never be cut
-            | DLet (_, v, _, ELam _) -> (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true
+            // only GENERIC function templates are unreachable-by-construction:
+            // every use of one is stamped. A MONOMORPHIC function has no
+            // instantiation to stamp, so removing it (because its body
+            // happens to touch a layout-dependent helper) deletes a function
+            // its callers still name — which is how `infer`, `emit` and
+            // friends vanished out of a self-compiled compiler.
+            | DLet (_, v, sch, ELam _) ->
+                (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true
+                || List.isEmpty sch.Quantified
             | _ -> true)
     emitted @ (dictPairs stamped |> List.map snd), vecToList errors
 

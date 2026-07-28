@@ -1495,3 +1495,35 @@ once, looping only while a pass still finds something. 108s -> 1.2s, and the
 whole compiler compiles in 3.8s. (The output differs from the old pass by
 0.03%: both are fixpoints, reached in a different order — the pass is an
 optimization, and the oracle tests agree on behaviour.)
+
+### The prelude families completed, and four bugs behind them
+`List`, `Array` and `Seq` now carry the same standard surface rather than the
+slice the compiler happened to call: the two-collection family (iter2,
+forall2, exists2, fold2), the position-aware combinators (indexed, scan,
+pairwise), unfold, skip/take/truncate, windowed, chunkBySize,
+distinct/distinctBy, except, sortDescending/sortByDescending.
+
+Four compiler bugs surfaced while doing it:
+- **`{ v with f = v }` was unimplemented.** It lowered as a plain record and
+  silently dropped every field the literal did not mention. Now lowers to
+  ERecordExt with a plain-record emission (copy each unmentioned slot), and
+  the closure capture walk covers ERecordExt — its base and field values are
+  ordinary uses, and skipping them lost captures.
+- **Monomorphic functions were deleted as templates.** The rule removed any
+  layout-dependent function, but only a GENERIC one is unreachable by
+  construction (every use is stamped). A monomorphic one has no
+  instantiation, so removing it deleted a function its callers still name:
+  `infer`, `emit`, `builtinInstanceWrappers`, `instanceFunctions` all
+  vanished. This also explains a false measurement — with those four gone,
+  the errors INSIDE them were never counted, so "12 errors remaining" was
+  really 154.
+- **Nested arrays did not work at all.** Element naming unwrapped one level
+  too far (`int[][]` emitted as a packed int array, trapping on the cast).
+  Every arrKinds site now records the ARRAY type, so the reader unwraps
+  exactly once and a nested array names its element `$ref`.
+- **`a.[i].Length` collided with itself**: the index site and the length site
+  keyed their element kind by the same first-token offset, so one silently
+  overwrote the other. Length sites key by their member token.
+
+`Builtin.source` moved behind the host seam (Prelude.preludeSource /
+bootstrap's preludeSourceRaw), so Workspace.fs contains no .NET at all.

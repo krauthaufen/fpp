@@ -381,6 +381,12 @@ extern let readTextRaw : string -> string
 extern let existsRaw : string -> int
 extern let listDirRaw : string -> string
 extern let canonicalizeRaw : string -> string
+// the prelude's own text, supplied by the host (the .NET build reads it out
+// of its embedded resource; a wasm host hands over what it preloaded)
+extern let preludeSourceRaw : string -> string
+
+/// The prelude's own source, as the compiler's front end needs it.
+let preludeSource () : string = preludeSourceRaw ""
 
 /// The text of a file, or None when it is not there. NO exception crosses
 /// the boundary: the caller reports the miss, with the diagnostics it

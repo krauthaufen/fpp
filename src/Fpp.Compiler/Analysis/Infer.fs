@@ -1735,7 +1735,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some (TCon ("array", [ e ])) ->
                      (match Green.tokens (GNode n) |> List.tryHead with
                       | Some t ->
-                          vecAdd arrKindsRaw (t.Offset, e)
+                          vecAdd arrKindsRaw (t.Offset, TCon ("array", [ e ]))
                           dictSet arrIndexTargets t.Offset true
                       | None -> ())
                      e
@@ -1882,15 +1882,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | None -> None
                      (match lhsTy |> Option.map prune, lastIdent with
                       | Some (TCon ("array", [ e ])), Some nm when nm.Text = "Length" ->
-                          (match Green.tokens (GNode n) |> List.tryHead with
-                           | Some t -> vecAdd arrKindsRaw (t.Offset, e)
-                           | None -> ())
+                          // keyed by the MEMBER token: `a.[i].Length` has an
+                          // index site and a length site whose expressions
+                          // start at the SAME token, and one overwrote the
+                          // other's element kind
+                          vecAdd arrKindsRaw (nm.Offset, TCon ("array", [ e ]))
                           tInt
                       | Some (TCon ("string", [])), Some nm when nm.Text = "Length" ->
                           // sentinel: string RECEIVER, not string elements
-                          (match Green.tokens (GNode n) |> List.tryHead with
-                           | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
-                           | None -> ())
+                          vecAdd arrKindsRaw (nm.Offset, TCon ("$str", []))
                           tInt
                       | _ ->
                      match lhsTy, lastIdent with
@@ -2056,7 +2056,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
                         unifyAt off (exprType (GNode m)) elem
                 (match Green.tokens (GNode n) |> List.tryHead with
-                 | Some t -> vecAdd arrKindsRaw (t.Offset, elem)
+                 | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("array", [ elem ]))
                  | None -> ())
                 TCon ("array", [ elem ])
             | BraceExpr -> st.Fresh ()
@@ -2867,7 +2867,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match prune recvTy with
         | TCon ("array", [ e ]) ->
             unifyAt offset result e
-            vecAdd arrKindsRaw (offset, e)
+            vecAdd arrKindsRaw (offset, TCon ("array", [ e ]))
             dictSet arrIndexTargets offset true
         | TCon ("string", []) ->
             unifyAt offset result tChar
@@ -2957,6 +2957,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         |> List.choose (fun (off, ty) ->
             let nameOf (t : Type) =
                 match prune t with
+                // a NESTED array is a reference like any other object: the
+                // outer array holds pointers, so it is a uniform $ref array.
+                // Naming it "array" asked the emitter for a packed layout
+                // that does not exist and trapped on the cast.
+                | TCon ("array", _) -> Some "$ref"
                 // the name carries the instantiation, so an array of
                 // Pair<int,int> is packed rather than an array of boxes
                 | TCon (_, _) -> Some (instName t)
@@ -2967,6 +2972,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // a plain anyref array whatever they are
                 | _ -> Some "$ref"
             match prune ty with
+            // every site records the ARRAY type, so this unwraps exactly
+            // once: `int[][]` names its element `$ref` (a nested array is a
+            // reference), never the inner element's packed kind
             | TCon ("array", [ e ]) -> nameOf e |> Option.map (fun n -> off, n)
             | TCon (_, _) -> Some (off, instName ty)
             | TVar v -> Some (off, "#" + string v.Id)

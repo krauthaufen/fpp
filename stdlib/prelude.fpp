@@ -1035,6 +1035,76 @@ module Array =
             b.[i] <- y
             i <- i + 1
         a, b
+    // ---- the two-array family, matching List's ----
+    let iter2 (f : 'a -> 'b -> unit) (a : 'a[]) (b : 'b[]) : unit =
+        if a.Length <> b.Length then failwith "the arrays have different lengths"
+        let mutable i = 0
+        while i < a.Length do
+            f a.[i] b.[i]
+            i <- i + 1
+    let forall2 (p : 'a -> 'b -> bool) (a : 'a[]) (b : 'b[]) : bool =
+        if a.Length <> b.Length then failwith "the arrays have different lengths"
+        let mutable ok = true
+        let mutable i = 0
+        while i < a.Length && ok do
+            if not (p a.[i] b.[i]) then ok <- false
+            i <- i + 1
+        ok
+    let exists2 (p : 'a -> 'b -> bool) (a : 'a[]) (b : 'b[]) : bool =
+        if a.Length <> b.Length then failwith "the arrays have different lengths"
+        let mutable found = false
+        let mutable i = 0
+        while i < a.Length && not found do
+            if p a.[i] b.[i] then found <- true
+            i <- i + 1
+        found
+    let fold2 (f : 's -> 'a -> 'b -> 's) (state : 's) (a : 'a[]) (b : 'b[]) : 's =
+        if a.Length <> b.Length then failwith "the arrays have different lengths"
+        let mutable acc = state
+        let mutable i = 0
+        while i < a.Length do
+            acc <- f acc a.[i] b.[i]
+            i <- i + 1
+        acc
+    let indexed (xs : 'a[]) : (int * 'a)[] = mapi (fun i x -> (i, x)) xs
+    let scan (f : 's -> 'a -> 's) (state : 's) (xs : 'a[]) : 's[] =
+        let out = zeroCreate (xs.Length + 1)
+        let mutable acc = state
+        out.[0] <- state
+        let mutable i = 0
+        while i < xs.Length do
+            acc <- f acc xs.[i]
+            out.[i + 1] <- acc
+            i <- i + 1
+        out
+    let pairwise (xs : 'a[]) : ('a * 'a)[] =
+        if xs.Length < 2 then zeroCreate 0
+        else init (xs.Length - 1) (fun i -> (xs.[i], xs.[i + 1]))
+    let skip (n : int) (xs : 'a[]) : 'a[] =
+        if n > xs.Length then failwith "the array is shorter than the skip count"
+        sub xs n (xs.Length - n)
+    let take (n : int) (xs : 'a[]) : 'a[] =
+        if n > xs.Length then failwith "the array has fewer elements than take asked for"
+        sub xs 0 n
+    let truncate (n : int) (xs : 'a[]) : 'a[] =
+        sub xs 0 (if n < xs.Length then n else xs.Length)
+    let windowed (size : int) (xs : 'a[]) : 'a[][] =
+        if size > xs.Length then zeroCreate 0
+        else init (xs.Length - size + 1) (fun i -> sub xs i size)
+    let chunkBySize (size : int) (xs : 'a[]) : 'a[][] =
+        let n = (xs.Length + size - 1) / size
+        init n (fun i ->
+            let start = i * size
+            let len = if start + size <= xs.Length then size else xs.Length - start
+            sub xs start len)
+    let distinct (xs : 'a[]) : 'a[] = ofList (List.distinct (toList xs))
+    let distinctBy (key : 'a -> 'k) (xs : 'a[]) : 'a[] = ofList (List.distinctBy key (toList xs))
+    let except (excluded : 'a[]) (xs : 'a[]) : 'a[] = filter (fun x -> not (contains x excluded)) xs
+    let sortDescending (xs : 'a[]) : 'a[] when Ordered<'a> = sortWith (fun a b -> compare b a) xs
+    let sortByDescending (f : 'a -> 'k) (xs : 'a[]) : 'a[] when Ordered<'k> =
+        sortWith (fun a b -> compare (f b) (f a)) xs
+
+
 // ---- List: the F# List module ----
 module List =
     let length (xs : 'a list) =
@@ -1334,6 +1404,159 @@ module List =
         for x in xs do
             acc <- x :: acc
         rev acc
+
+    // ---- the two-list family: F# spells these *2, and they exist for the
+    // same reason zip does — walking a pair of lists in step is common and
+    // building an intermediate list of tuples to do it is waste
+    let iter2 (f : 'a -> 'b -> unit) (a : 'a list) (b : 'b list) : unit =
+        let mutable l = a
+        let mutable r = b
+        let mutable go = true
+        while go do
+            match l, r with
+            | x :: lt, y :: rt ->
+                f x y
+                l <- lt
+                r <- rt
+            | [], [] -> go <- false
+            | _ -> failwith "the lists have different lengths"
+    let forall2 (p : 'a -> 'b -> bool) (a : 'a list) (b : 'b list) : bool =
+        let mutable l = a
+        let mutable r = b
+        let mutable ok = true
+        let mutable go = true
+        while go do
+            match l, r with
+            | x :: lt, y :: rt ->
+                if not (p x y) then
+                    ok <- false
+                    go <- false
+                else
+                    l <- lt
+                    r <- rt
+            | [], [] -> go <- false
+            | _ -> failwith "the lists have different lengths"
+        ok
+    let exists2 (p : 'a -> 'b -> bool) (a : 'a list) (b : 'b list) : bool =
+        let mutable l = a
+        let mutable r = b
+        let mutable found = false
+        let mutable go = true
+        while go do
+            match l, r with
+            | x :: lt, y :: rt ->
+                if p x y then
+                    found <- true
+                    go <- false
+                else
+                    l <- lt
+                    r <- rt
+            | [], [] -> go <- false
+            | _ -> failwith "the lists have different lengths"
+        found
+    let fold2 (f : 's -> 'a -> 'b -> 's) (state : 's) (a : 'a list) (b : 'b list) : 's =
+        let mutable acc = state
+        let mutable l = a
+        let mutable r = b
+        let mutable go = true
+        while go do
+            match l, r with
+            | x :: lt, y :: rt ->
+                acc <- f acc x y
+                l <- lt
+                r <- rt
+            | [], [] -> go <- false
+            | _ -> failwith "the lists have different lengths"
+        acc
+    // ---- position-aware and shape-changing combinators ----
+    let indexed (xs : 'a list) : (int * 'a) list = mapi (fun i x -> (i, x)) xs
+    let scan (f : 's -> 'a -> 's) (state : 's) (xs : 'a list) : 's list =
+        let mutable acc = state
+        let mutable out = [ state ]
+        for x in xs do
+            acc <- f acc x
+            out <- acc :: out
+        rev out
+    let pairwise (xs : 'a list) : ('a * 'a) list =
+        match xs with
+        | [] -> []
+        | h :: t ->
+            let mutable prev = h
+            let mutable out = []
+            for x in t do
+                out <- (prev, x) :: out
+                prev <- x
+            rev out
+    let unfold (gen : 's -> ('a * 's) option) (state : 's) : 'a list =
+        let mutable acc = []
+        let mutable cur = state
+        let mutable go = true
+        while go do
+            match gen cur with
+            | Some (x, next) ->
+                acc <- x :: acc
+                cur <- next
+            | None -> go <- false
+        rev acc
+    let skip (n : int) (xs : 'a list) : 'a list =
+        let mutable rest = xs
+        let mutable i = 0
+        while i < n do
+            match rest with
+            | _ :: t -> rest <- t
+            | [] -> failwith "the list is shorter than the skip count"
+            i <- i + 1
+        rest
+    let truncate (n : int) (xs : 'a list) : 'a list =
+        let mutable out = []
+        let mutable rest = xs
+        let mutable i = 0
+        while i < n && not (isEmpty rest) do
+            out <- head rest :: out
+            rest <- tail rest
+            i <- i + 1
+        rev out
+    let windowed (size : int) (xs : 'a list) : 'a list list =
+        let arr = toArray xs
+        let mutable out = []
+        let mutable i = 0
+        while i + size <= arr.Length do
+            out <- ofArray (Array.sub arr i size) :: out
+            i <- i + 1
+        rev out
+    let chunkBySize (size : int) (xs : 'a list) : 'a list list =
+        let arr = toArray xs
+        let mutable out = []
+        let mutable i = 0
+        while i < arr.Length do
+            let take = if i + size <= arr.Length then size else arr.Length - i
+            out <- ofArray (Array.sub arr i take) :: out
+            i <- i + size
+        rev out
+    let except (excluded : 'a list) (xs : 'a list) : 'a list =
+        filter (fun x -> not (contains x excluded)) xs
+    let distinct (xs : 'a list) : 'a list =
+        let mutable seen = []
+        let mutable out = []
+        for x in xs do
+            if not (contains x seen) then
+                seen <- x :: seen
+                out <- x :: out
+        rev out
+    let distinctBy (key : 'a -> 'k) (xs : 'a list) : 'a list =
+        let mutable seen = []
+        let mutable out = []
+        for x in xs do
+            let k = key x
+            if not (contains k seen) then
+                seen <- k :: seen
+                out <- x :: out
+        rev out
+    let sortDescending (xs : 'a list) : 'a list when Ordered<'a> =
+        sortWith (fun a b -> compare b a) xs
+    let sortByDescending (f : 'a -> 'k) (xs : 'a list) : 'a list when Ordered<'k> =
+        sortWith (fun a b -> compare (f b) (f a)) xs
+
 // ---- Seq: lazy combinators over the enumerator protocol ----
 module Seq =
     let map (f : 'a -> 'b) (xs : seq<'a>) : seq<'b> =
@@ -1589,6 +1812,51 @@ module Seq =
     let sortBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
 
+    // ---- the two-sequence family and the position-aware combinators,
+    // completing the same surface List and Array carry ----
+    let iter2 (f : 'a -> 'b -> unit) (a : seq<'a>) (b : seq<'b>) : unit =
+        let ea = a.GetEnumerator()
+        let eb = b.GetEnumerator()
+        let mutable go = true
+        while go do
+            if ea.MoveNext() then
+                if eb.MoveNext() then f ea.Current eb.Current
+                else failwith "the sequences have different lengths"
+            else
+                if eb.MoveNext() then failwith "the sequences have different lengths"
+                go <- false
+    let forall2 (p : 'a -> 'b -> bool) (a : seq<'a>) (b : seq<'b>) : bool =
+        let mutable ok = true
+        iter2 (fun x y -> if not (p x y) then ok <- false) a b
+        ok
+    let exists2 (p : 'a -> 'b -> bool) (a : seq<'a>) (b : seq<'b>) : bool =
+        let mutable found = false
+        iter2 (fun x y -> if p x y then found <- true) a b
+        found
+    let fold2 (f : 's -> 'a -> 'b -> 's) (state : 's) (a : seq<'a>) (b : seq<'b>) : 's =
+        let mutable acc = state
+        iter2 (fun x y -> acc <- f acc x y) a b
+        acc
+    let indexed (xs : seq<'a>) : seq<int * 'a> = mapi (fun i x -> (i, x)) xs
+    let scan (f : 's -> 'a -> 's) (state : 's) (xs : seq<'a>) : seq<'s> =
+        List.toSeq (List.scan f state (toList xs))
+    let pairwise (xs : seq<'a>) : seq<'a * 'a> = List.toSeq (List.pairwise (toList xs))
+    let unfold (gen : 's -> ('a * 's) option) (state : 's) : seq<'a> =
+        List.toSeq (List.unfold gen state)
+    let distinct (xs : seq<'a>) : seq<'a> = List.toSeq (List.distinct (toList xs))
+    let distinctBy (key : 'a -> 'k) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.distinctBy key (toList xs))
+    let except (excluded : seq<'a>) (xs : seq<'a>) : seq<'a> =
+        let ex = List.ofSeq excluded
+        filter (fun x -> not (List.contains x ex)) xs
+    let windowed (size : int) (xs : seq<'a>) : seq<'a list> =
+        List.toSeq (List.windowed size (toList xs))
+    let chunkBySize (size : int) (xs : seq<'a>) : seq<'a list> =
+        List.toSeq (List.chunkBySize size (toList xs))
+    let sortDescending (xs : seq<'a>) : seq<'a> when Ordered<'a> =
+        sortWith (fun a b -> compare b a) xs
+    let sortByDescending (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
+        sortWith (fun a b -> compare (f b) (f a)) xs
 // ---- Set: the F# Set module ----
 // Comparison-ordered like F#'s, but backed by a sorted array rather than a
 // tree: membership is a binary search, and the structure-sharing a tree buys

@@ -1124,7 +1124,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match dictTryFind fieldOwners (offsetOf n) with
                     | Some o -> o
                     | None -> "?"
-                ERecord (owner, fields)
+                // `{ base with f = v }`: the BASE is the first expression
+                // child that is not a field. Lowering it as a plain record
+                // silently dropped every field the literal did not mention
+                let baseExpr =
+                    if not (tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "with")) then None
+                    else
+                        nodesOf n
+                        |> List.filter (fun m -> m.NodeKind <> RecordExprField && isExprish m.NodeKind)
+                        |> List.tryHead
+                (match baseExpr with
+                 | Some b -> ERecordExt (owner, lowerExpr (GNode b), fields)
+                 | None -> ERecord (owner, fields))
             | ArrayExpr ->
                 let elemName =
                     match dictTryFind arrKinds (offsetOf n) with
@@ -1147,11 +1158,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> note (offsetOf n) "index shape")
                  | _ -> note (offsetOf n) "index shape")
             | DotExpr when
-                (Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
-                 |> Option.map (fun t -> t.Text) = Some "Length")
-                && (dictTryFind arrKinds (offsetOf n)).IsSome ->
+                (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                 | Some t -> t.Text = "Length" && (dictTryFind arrKinds t.Offset).IsSome
+                 | None -> false) ->
+                let mt = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.last
                 (match nodesOf n |> List.tryHead with
-                 | Some lhs -> EArrayLen ((dictTryFind arrKinds (offsetOf n)).Value, lowerExpr (GNode lhs))
+                 | Some lhs -> EArrayLen ((dictTryFind arrKinds mt.Offset).Value, lowerExpr (GNode lhs))
                  | None -> note (offsetOf n) "length shape")
             | ObjExpr ->
                 // An object expression is an anonymous class. Whatever it

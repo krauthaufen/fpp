@@ -113,13 +113,11 @@ module private Outline =
 module Builtin =
 
     /// The prelude LIVES in stdlib/prelude.fpp — a real F++ source file with
-    /// editor support — embedded into this assembly at build time so the
-    /// compiler remains a single self-contained binary.
-    let source : string =
-        use s =
-            System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream "prelude.fpp"
-        use r = new System.IO.StreamReader (s)
-        r.ReadToEnd ()
+    /// editor support. WHERE the text comes from is a host service (see
+    /// Prelude.preludeSource): the .NET build reads an embedded resource so
+    /// the binary stays self-contained, a wasm host supplies what it
+    /// preloaded. Nothing here reaches past the seam.
+    let source : string = preludeSource ()
 
     let path = Analysis.Classes.builtinPath
 

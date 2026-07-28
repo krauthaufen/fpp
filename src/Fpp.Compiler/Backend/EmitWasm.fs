@@ -1322,6 +1322,29 @@ let emit (decls : Decl list) : EmitResult =
              | None ->
                  vecAdd errors ("unknown constructor " + name)
                  "(ref.i31 (i32.const 0))")
+        // `{ base with f = v }` on a PLAIN record: every slot the literal
+        // does not mention is copied from the base value
+        | ERecordExt (rn, baseExpr, fields) when (baseOf rn).IsNone && (dictTryFind recordOrder rn).IsSome ->
+            let order = (dictTryFind recordOrder rn).Value
+            let b = newLocal "u"
+            let unboxBy (k : string) (w : string) =
+                match k with
+                | "f" -> "(call $tof " + w + ")" | "s" -> "(call $tos " + w + ")"
+                | "l" -> "(call $tol " + w + ")" | "i" -> "(call $toi " + w + ")"
+                | _ -> w
+            let vals =
+                order
+                |> List.mapi (fun i (fname, k) ->
+                    if fname = "__idhash" then "(i32.const 0)"
+                    elif fname = "__desc" && isObjRecord rn then "(global.get $desc_" + rn + ")"
+                    else
+                        match fields |> List.tryFind (fun (f, _) -> f = fname) with
+                        | Some (_, v) -> unboxBy k (recur v)
+                        | None ->
+                            // unchanged: same slot, straight out of the base
+                            "(struct.get $r_" + rn + " " + string i + " (ref.cast (ref $r_" + rn + ") (local.get " + b + ")))")
+            "(block (result anyref) (local.set " + b + " " + recur baseExpr + ") "
+            + "(struct.new $r_" + rn + " " + String.concat " " vals + "))"
         | ERecordExt (rn, baseExpr, fields) ->
             // a derived instance IS its base's layout plus its own fields, so
             // the base part is copied slot-for-slot out of a base instance
@@ -2196,6 +2219,11 @@ let emit (decls : Decl list) : EmitResult =
             | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter walk xs
             | ECtor (_, _, xs) -> List.iter walk xs
             | ERecord (_, fs) -> for _, v in fs do walk v
+            // `{ base with f = v }`: the base and every written field are
+            // ordinary uses, and a capture walk that skips them loses them
+            | ERecordExt (_, bse, fs) ->
+                walk bse
+                for _, v in fs do walk v
             | EField (r, _, _) -> walk r
             | EFieldSet (r, _, _, v) -> walk r; walk v
             | EWhile (c, b) -> walk c; walk b

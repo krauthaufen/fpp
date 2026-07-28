@@ -124,6 +124,16 @@ let refMapTryFind (m : RefMap<'k, 'v>) (k : 'k) : 'v option =
 let hostReadText (path : string) : string option =
     if System.IO.File.Exists path then Some (System.IO.File.ReadAllText path) else None
 
+/// The prelude's own source. A host SUPPLIES it — the .NET build embeds
+/// stdlib/prelude.fpp as a resource so the binary stays self-contained; a
+/// wasm host hands over the text it already has. Reading it by path would
+/// make the compiler depend on finding a stdlib directory.
+let preludeSource () : string =
+    use s =
+        System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream "prelude.fpp"
+    use r = new System.IO.StreamReader (s)
+    r.ReadToEnd ()
+
 let hostExists (path : string) : bool =
     System.IO.File.Exists path || System.IO.Directory.Exists path
 
