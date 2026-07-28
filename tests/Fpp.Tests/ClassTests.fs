@@ -1056,3 +1056,60 @@ let halfEqualityTests =
             Expect.equal out "1\n0\n1\n1\n1\n" "IEEE semantics at half width"
         }
     ]
+
+[<Tests>]
+let preludeFamilyTests =
+    testList "prelude: the families are complete and consistent" [
+        test "the two-collection family agrees across List, Array and Seq" {
+            let out =
+                run [ "let a = print (if List.forall2 (fun x y -> x < y) [ 1; 2 ] [ 3; 4 ] then 1 else 0)"
+                      "let b = print (if Array.exists2 (fun x y -> x = y) [| 1; 2 |] [| 9; 2 |] then 1 else 0)"
+                      "let c = print (List.fold2 (fun s x y -> s + x * y) 0 [ 1; 2 ] [ 3; 4 ])"
+                      "let d = print (Seq.fold2 (fun s x y -> s + x + y) 0 [ 1; 2 ] [ 10; 20 ])"
+                      "let mutable n = 0"
+                      "let e = Array.iter2 (fun x y -> n <- n + x * y) [| 2; 3 |] [| 4; 5 |]"
+                      "let f = print n" ]
+            Expect.equal out "1\n1\n11\n33\n23\n" "two-collection family"
+        }
+        test "position-aware combinators: indexed, scan, pairwise" {
+            let out =
+                run [ "let a = print (List.length (List.indexed [ 1; 2; 3 ]))"
+                      "let b = print ((Array.scan (fun s x -> s + x) 0 [| 1; 2; 3 |]).[3])"
+                      "let c = print (List.length (List.pairwise [ 1; 2; 3 ]))"
+                      "let d = print (Seq.length (Seq.indexed [ 5; 6 ]))" ]
+            Expect.equal out "3\n6\n2\n2\n" "position-aware combinators"
+        }
+        test "unfold, windowed, chunkBySize, except, sortDescending" {
+            let out =
+                run [ "let a = print (List.length (List.unfold (fun s -> if s > 3 then None else Some (s, s + 1)) 1))"
+                      "let b = print (List.length (List.windowed 2 [ 1; 2; 3 ]))"
+                      "let c = print ((Array.chunkBySize 2 [| 1; 2; 3 |]).Length)"
+                      "let d = print (List.length (List.except [ 2 ] [ 1; 2; 3 ]))"
+                      "let e = print (List.head (List.sortDescending [ 1; 5; 3 ]))"
+                      "let f = print (List.head (List.sortByDescending (fun x -> -x) [ 1; 5; 3 ]))" ]
+            Expect.equal out "3\n2\n2\n2\n5\n1\n" "shape-changing combinators"
+        }
+        test "copy-and-update keeps every field the literal omits" {
+            let out =
+                run [ "type V = { Path : string; Offset : int; Name : string }"
+                      "let bump (v : V) = { v with Offset = v.Offset + 1 }"
+                      "let a = { Path = \"p\"; Offset = 5; Name = \"n\" }"
+                      "let b = bump a"
+                      "let p = print b.Offset"
+                      "let q = print b.Name"
+                      "let r = print b.Path"
+                      "let s = print a.Offset" ]
+            Expect.equal out "6\nn\np\n5\n" "only the named field changes, and the source is untouched"
+        }
+        test "arrays of arrays: build, index, and length at both levels" {
+            let out =
+                run [ "let a = [| [| 1 |]; [| 2; 3 |] |]"
+                      "let p = print a.Length"
+                      "let q = print a.[1].Length"
+                      "let r = print a.[1].[0]"
+                      "let b = Array.init 2 (fun i -> Array.create (i + 1) i)"
+                      "let s = print b.[1].Length"
+                      "let t = print (Array.length (Array.map (fun (row : int[]) -> row.Length) b))" ]
+            Expect.equal out "2\n2\n2\n2\n2\n" "nested arrays are reference elements"
+        }
+    ]

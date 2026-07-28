@@ -1150,9 +1150,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind)
                          |> List.map (fun m -> lowerExpr (GNode m))
                      let nm =
-                         match dictTryFind arrKinds (offsetOf n) with
-                         | Some x -> x
-                         | None -> ""
+                         // this index's own bracket group is the key, but a
+                         // LATE dot-resolution may have recorded the resolved
+                         // element type under the node itself. Prefer a name
+                         // that is not still a type variable.
+                         let br = Green.tokens (GNode ix) |> List.tryHead
+                         let atBracket = br |> Option.bind (fun t -> dictTryFind arrKinds t.Offset)
+                         let atNode = dictTryFind arrKinds (offsetOf n)
+                         let resolved (x : string option) =
+                             match x with
+                             | Some v when v <> "" && not (v.StartsWith "#") -> Some v
+                             | _ -> None
+                         match resolved atBracket with
+                         | Some v -> v
+                         | None ->
+                             match resolved atNode with
+                             | Some v -> v
+                             | None ->
+                                 match atBracket with
+                                 | Some v -> v
+                                 | None -> (match atNode with Some v -> v | None -> "")
                      (match idx with
                       | [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")

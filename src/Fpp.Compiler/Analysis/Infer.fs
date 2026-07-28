@@ -1733,6 +1733,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     if m.NodeKind = ListExpr then exprType (GNode m) |> ignore
                 (match lhsTy |> Option.map prune with
                  | Some (TCon ("array", [ e ])) ->
+                     // keyed by THIS index's bracket: `a.[i].[j]` has two
+                     // index sites whose expressions start at the same token,
+                     // and the inner one silently overwrote the outer's
+                     // element kind (the outer read used the inner's layout)
+                     // keyed by THIS index's own bracket — the first token of
+                     // the ListExpr child. Not "the last bracket in the node":
+                     // the index expression may contain brackets of its own
+                     // (`a.[i.[0]]`), and not the head token either — chained
+                     // indexes share it and overwrote each other's layout
+                     (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
+                            |> Option.bind (fun ix -> Green.tokens (GNode ix) |> List.tryHead) with
+                      | Some br ->
+                          vecAdd arrKindsRaw (br.Offset, TCon ("array", [ e ]))
+                          dictSet arrIndexTargets br.Offset true
+                      | None -> ())
+                     // ALSO under the head token, which is where a later
+                     // dot-resolution records the RESOLVED element type; the
+                     // bracket key disambiguates chained indexes, the head key
+                     // carries the resolution, and lowering prefers whichever
+                     // is not still a type variable
                      (match Green.tokens (GNode n) |> List.tryHead with
                       | Some t ->
                           vecAdd arrKindsRaw (t.Offset, TCon ("array", [ e ]))

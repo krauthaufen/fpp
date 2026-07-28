@@ -1527,3 +1527,16 @@ Four compiler bugs surfaced while doing it:
 
 `Builtin.source` moved behind the host seam (Prelude.preludeSource /
 bootstrap's preludeSourceRaw), so Workspace.fs contains no .NET at all.
+
+### Element kinds are keyed per SITE, not per expression head
+Three bugs, one cause: an array operation recorded its element kind under the
+first token of the expression, so operations sharing a head silently
+overwrote each other. `a.[i].Length` (index site vs length site) and
+`a.[i].[j]` (two index sites) both read the wrong layout and trapped. Length
+sites key by their member token; index sites key by the first token of their
+own bracket group — and ALSO under the head token, because a later
+dot-resolution records the RESOLVED element type there while the early record
+is still a type variable. Lowering prefers whichever name is not symbolic.
+The bootstrap drivers caught the first attempt at this (bracket-only keying
+lost the resolution and broke every generic container in the seam), which is
+what those drivers are for.
