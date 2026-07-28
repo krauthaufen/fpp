@@ -797,6 +797,14 @@ let emit (decls : Decl list) : EmitResult =
                      | _ ->
                          emitError ("unbound variable " + v.Name)
                          "(ref.i31 (i32.const 0))")
+        // `compare` at a UNIFORM reference (a tuple key, say): the runtime
+        // already compares structurally, so the class member resolves to
+        // that rather than needing a blanket Ordered instance on every
+        // reference type — which is what an `instance Ordered<$ref>` would
+        // mean, and is not what F# means by comparing tuples
+        | EUnknown "$class:Ordered:compare:$ref" ->
+            requestWrappers "$cmpvBoxed" 2
+            "(struct.new $clo (ref.func $cmpvBoxed.w0) (ref.null any))"
         | EUnknown n ->
             emitError ("unknown name reaches emission: " + n)
             "(ref.i31 (i32.const 0))"
@@ -2787,6 +2795,9 @@ TUPLE_HASH
         (i32.mul (call $hashv (struct.get $cons 0 (ref.cast (ref $cons) (local.get $v)))) (i32.const 31))
         (call $hashv (struct.get $cons 1 (ref.cast (ref $cons) (local.get $v))))))))
     (i32.const 1))
+  (func $cmpvBoxed (param $a anyref) (param $b anyref) (result anyref)
+    ;; `compare` as a VALUE: structural comparison, boxed result
+    (call $ofi (call $cmpv (local.get $a) (local.get $b))))
   (func $cmpv (param $a anyref) (param $b anyref) (result i32)
     (local $i i32) (local $la i32) (local $lb i32) (local $x i32) (local $y i32) (local $c i32)
     (if (i32.and (ref.test (ref $str) (local.get $a)) (ref.test (ref $str) (local.get $b)))
@@ -2818,6 +2829,7 @@ TUPLE_HASH
       (then (return (i32.const 0))))
     (if (ref.is_null (local.get $a)) (then (return (i32.const -1))))
     (if (ref.is_null (local.get $b)) (then (return (i32.const 1))))
+TUPLE_CMP
     (if (i32.and (ref.test (ref $cons) (local.get $a)) (ref.test (ref $cons) (local.get $b)))
       (then
         (local.set $c (call $cmpv (struct.get $cons 0 (ref.cast (ref $cons) (local.get $a)))
@@ -3491,7 +3503,23 @@ TUPLE_HASH
                 |> List.reduce (fun acc x -> "(i32.add (i32.mul " + acc + " (i32.const 31)) " + x + ")")
             "    (if (ref.test (ref " + t + ") (local.get $v))\n      (then (return " + combined + ")))")
         |> String.concat "\n"
-    line (runtimeSrc.Replace("TUPLE_EQ", tupleEqCases).Replace("TUPLE_HASH", tupleHashCases))
+    // tuples compare LEXICOGRAPHICALLY, component by component — what F#
+    // means by comparing tuples, and what a tuple sort key needs
+    let tupleCmpCases =
+        vecToList tupleArities
+        |> List.map (fun n ->
+            let t = "$tup" + string n
+            let cmp i =
+                "        (local.set $c (call $cmpv "
+                + "(struct.get " + t + " " + string i + " (ref.cast (ref " + t + ") (local.get $a))) "
+                + "(struct.get " + t + " " + string i + " (ref.cast (ref " + t + ") (local.get $b)))))\n"
+                + "        (if (i32.ne (local.get $c) (i32.const 0)) (then (return (local.get $c))))"
+            "    (if (i32.and (ref.test (ref " + t + ") (local.get $a)) (ref.test (ref " + t + ") (local.get $b)))\n"
+            + "      (then\n"
+            + String.concat "\n" (List.init n cmp) + "\n"
+            + "        (return (i32.const 0))))")
+        |> String.concat "\n"
+    line (runtimeSrc.Replace("TUPLE_EQ", tupleEqCases).Replace("TUPLE_HASH", tupleHashCases).Replace("TUPLE_CMP", tupleCmpCases))
 
 
     // top-level functions and value initializers

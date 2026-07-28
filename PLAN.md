@@ -1589,3 +1589,29 @@ fallback ("pick the record owning the first known label") landed on `Cached`,
 whose only shared field is `Classes` — hence thirteen "missing field X in
 Cached" for a record literal in a different file entirely. The label is now the
 last identifier BEFORE the `=` in both halves. 18 -> 5 errors.
+
+### MILESTONE: the whole compiler emits with ZERO errors
+All 20 files, 6.2 MB of wat, 4.5s, no emission errors — from 124 at the
+start of the session. The last three:
+
+- **Qualified record labels named the qualifier.** `{ Classes.MPath = p }`
+  read its label as `Classes`, so no candidate record covered the label set
+  and the literal's owner came out "?" — every field then read as missing.
+  Taking the LAST identifier before the `=` fixed 13 errors at once. (Small
+  reproductions all passed because they never wrote a qualified label.)
+- **Ordering on tuples is structural.** `compare` at a uniform reference
+  routes to the runtime's structural comparison, and $cmpv gained
+  lexicographic tuple cases beside the equality ones it already generated.
+  This is deliberately NOT `instance Ordered<$ref>`, which would make every
+  reference type comparable.
+- **"Template" now requires genericity.** A layout-dependent MONOMORPHIC
+  function was treated as a specialization template, so symbolic type slots
+  inside it were deferred to clones that never come, and the use kept naming
+  a function specialization had removed (`dictNew`, twice). Outside a generic
+  template an unobserved slot stamps uniformly: nothing will ever resolve it
+  and nothing observes its layout.
+
+Also this stretch: utf8Bytes in both halves, `list.IsEmpty/Length/Head/Tail`
+as builtin members (lowered to the match they mean, like Option's), and
+`byte`/`sbyte` conversions — which the seam's own UTF-8 encoder needed and
+which the language did not have (byte 300 = 44, sbyte 200 = -56, as F#).

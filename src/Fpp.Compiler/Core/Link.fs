@@ -369,7 +369,20 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                 let nameless = inst |> List.exists (fun t -> t = "")
                 let cls =
                     if needsLayout then
-                        if nameless then
+                        // a slot with NO name is one nothing observes at this
+                        // call (an empty dictionary passed straight in, say):
+                        // the uniform representation is correct for it, so
+                        // stamp at $ref rather than leaving the use naming a
+                        // template that specialization removes
+                        if not isTemplate then
+                            // OUTSIDE a template nothing will ever clone this
+                            // body, so a slot that is still symbolic (or has
+                            // no name at all) will never become concrete —
+                            // and nothing observes its layout here. Uniform
+                            // is the right answer, and it keeps the use from
+                            // naming a template that specialization removes.
+                            Stamp (inst |> List.map (fun t -> if t = "" || t.StartsWith "#" then "$ref" else t))
+                        elif nameless then
                             Unclassifiable "the type argument has no name to specialize on"
                         elif inst |> List.exists (fun t -> t.StartsWith "#") then
                             Unclassifiable "element layout is not statically known here"
@@ -521,7 +534,14 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         match d with
         | DLet (rc, v, sch, e) ->
             let isFunction = (match e with ELam _ -> true | _ -> false)
-            let isTemplate = isFunction && (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+            // a TEMPLATE is a GENERIC layout-dependent function: its uses are
+            // stamped, so symbolic demands inside it resolve per clone. A
+            // MONOMORPHIC one is never cloned, so its symbolic demands must
+            // be settled here rather than deferred forever.
+            let isTemplate =
+                isFunction
+                && (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
+                && not (List.isEmpty sch.Quantified)
             vecAdd out (DLet (rc, v, sch, rewrite v.Name (dictNew ()) isTemplate e))
         | other -> vecAdd out other
 
@@ -559,19 +579,34 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
          | None -> ())
         i <- i + 1
 
-    // layout-dependent templates are never callable: every use is stamped
-    // (or an error), so they are removed by construction rather than left
-    // for reachability to maybe drop
+    // A layout-dependent template is normally unreachable — every use of one
+    // is stamped — but "normally" is not "always": a use whose instantiation
+    // is all-reference classifies CANON and keeps naming the template. So the
+    // rule is reachability, measured AFTER rewriting: drop a template only if
+    // nothing still refers to it. (Removing them unconditionally is how
+    // `dictNew` became an unbound variable at two call sites, and an earlier
+    // form of the same rule deleted `infer` and `emit` outright.)
+    let stillNamed = dictNew<string * int, bool> ()
+    let rec noteRefs (e : Expr) : unit =
+        mapExpr
+            (fun x ->
+                (match x with
+                 | EVar (v, _) | EVarI (v, _, _) -> dictSet stillNamed (v.Path, v.Offset) true
+                 | _ -> ())
+                x)
+            e |> ignore
+    for d in vecToList out do
+        match d with
+        | DLet (_, _, _, e) -> noteRefs e
+        | _ -> ()
+    for _, d in dictPairs stamped do
+        match d with
+        | DLet (_, _, _, e) -> noteRefs e
+        | _ -> ()
     let emitted =
         vecToList out
         |> List.filter (fun d ->
             match d with
-            // only GENERIC function templates are unreachable-by-construction:
-            // every use of one is stamped. A MONOMORPHIC function has no
-            // instantiation to stamp, so removing it (because its body
-            // happens to touch a layout-dependent helper) deletes a function
-            // its callers still name — which is how `infer`, `emit` and
-            // friends vanished out of a self-compiled compiler.
             | DLet (_, v, sch, ELam _) ->
                 (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true
                 || List.isEmpty sch.Quantified
