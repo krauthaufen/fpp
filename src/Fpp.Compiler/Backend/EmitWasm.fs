@@ -2705,7 +2705,7 @@ let emit (decls : Decl list) : EmitResult =
       (then (return (ref.i31 (i32.const 1)))))
     ;; Any reference type: descriptors are per-type, so two values whose
     ;; descriptors differ are of different types and cannot be equal. That
-    ;; is what makes this sound where a shape test is not — wasm-GC
+    ;; is what makes this sound where a shape test is not -- wasm-GC
     ;; canonicalizes same-shaped structs into ONE heap type.
     (if (i32.and (ref.test (ref $obj) (local.get $a)) (ref.test (ref $obj) (local.get $b)))
       (then
@@ -2721,7 +2721,7 @@ let emit (decls : Decl list) : EmitResult =
     ;; two different shapes
 TUPLE_EQ
     ;; DU cases: the tag is globally unique, so equal tags are the same case,
-    ;; and a table indexed by tag is a DU's equivalent of a vtable — which is
+    ;; and a table indexed by tag is a DU's equivalent of a vtable -- which is
     ;; how an Equals override on a union is reached.
     (if (i32.and (ref.test (ref $du0) (local.get $a)) (ref.test (ref $du0) (local.get $b)))
       (then
@@ -2790,7 +2790,7 @@ TUPLE_EQ
   ;; two generic call sites referenced this WITHOUT it existing, so any
   ;; module reaching them failed validation
   (func $listLength (param $v anyref) (result anyref)
-    ;; length of a cons chain — `xs.Length` on a list
+    ;; length of a cons chain -- `xs.Length` on a list
     (local $n i32)
     (local $c anyref)
     (local.set $n (i32.const 0))
@@ -3037,7 +3037,7 @@ TUPLE_CMP
         (then (return (i32.const 0))))
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $go)))
     (i32.const 1))
-  ;; n+1 pieces for n separators — "a,b," splits to "a", "b", ""
+  ;; n+1 pieces for n separators -- "a,b," splits to "a", "b", ""
   (func $strSplitChar (param $s (ref $str)) (param $c i32) (result anyref)
     (local $n i32) (local $i i32) (local $start i32) (local $k i32) (local $r (ref $arr))
     (local.set $n (i32.const 1))
@@ -3128,8 +3128,8 @@ TUPLE_CMP
       (local.set $i (i32.add (local.get $i) (i32.const 1))) (br $l2)))
     (local.get $r))
   ;; ---- float16 ----------------------------------------------------------
-  ;; wasm has no f16, so a half is carried as its 16 BIT PATTERN in an i31 —
-  ;; allocation-free, like an int — and every operation widens to f32, works
+  ;; wasm has no f16, so a half is carried as its 16 BIT PATTERN in an i31 --
+  ;; allocation-free, like an int -- and every operation widens to f32, works
   ;; there, and rounds back. That single rounding is CORRECT: f32 carries 24
   ;; significand bits and f16 needs 11, and double rounding is innocuous once
   ;; the wider format has at least 2p+2, which 24 exactly is. So +, -, *, /
@@ -3265,7 +3265,7 @@ TUPLE_CMP
   (func $sput (param $s (ref $str)) (param $p i32) (param $c i32) (result i32)
     (array.set $str (local.get $s) (local.get $p) (local.get $c))
     (i32.add (local.get $p) (i32.const 1)))
-  ;; digits of an i64 MAGNITUDE, unsigned — `0 - min` wraps to min, whose
+  ;; digits of an i64 MAGNITUDE, unsigned -- `0 - min` wraps to min, whose
   ;; unsigned value is exactly the magnitude, so negation never overflows
   (func $lput (param $s (ref $str)) (param $p i32) (param $n i64) (result i32)
     (local $m i64)
@@ -3281,7 +3281,7 @@ TUPLE_CMP
     (local.get $r))
   ;; string -> number. `int "42"` is a CONVERSION in F#, so it belongs with
   ;; the rest of the family rather than in the prelude; parsing stops at the
-  ;; first character that cannot continue the number (see DIVERGENCES.md —
+  ;; first character that cannot continue the number (see DIVERGENCES.md --
   ;; .NET would raise, and F++ has no exception to raise here).
   (func $atol (param $s (ref $str)) (result i64)
     (local $i i32) (local $n i32) (local $neg i32) (local $acc i64) (local $c i32)
@@ -3388,7 +3388,7 @@ TUPLE_CMP
       (then
         (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 45)))
         (local.set $v (f64.neg (local.get $v)))))
-    ;; .NET prints U+221E, not the word — so this stays oracle-checkable
+    ;; .NET prints U+221E, not the word -- so this stays oracle-checkable
     (if (f64.eq (local.get $v) (f64.const inf))
       (then
         (local.set $p (call $sput (local.get $s) (local.get $p) (i32.const 226)))
@@ -3602,7 +3602,7 @@ TUPLE_CMP
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
       ;; TWO environment shapes coexist: a flat array (captures) and a cons
-      ;; chain (curried partial application). Patch whichever this is —
+      ;; chain (curried partial application). Patch whichever this is --
       ;; scanning only the array left a recursive function reached through a
       ;; partial application holding its own marker, which traps when called.
       (if (ref.test (ref $arr) (local.get $e))
@@ -3635,7 +3635,7 @@ TUPLE_CMP
     (local.set $e (struct.get $clo 1 (ref.cast (ref $clo) (local.get $c))))
     (block $done
       ;; TWO environment shapes coexist: a flat array (captures) and a cons
-      ;; chain (curried partial application). Patch whichever this is —
+      ;; chain (curried partial application). Patch whichever this is --
       ;; scanning only the array left a recursive function reached through a
       ;; partial application holding its own marker, which traps when called.
       (if (ref.test (ref $arr) (local.get $e))
