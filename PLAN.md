@@ -2161,3 +2161,41 @@ to finish the eta-expansion.)
 Cost on this compiler: 42s -> 46s, because the compiler is written in curried
 style and has almost no tupled functions to improve, while every program that
 does use them stops allocating per call. Kept on that basis.
+
+### Saturated curried calls already allocate no closures
+    let add3 (a : int) (b : int) (c : int) = a + b + c
+    add3 1 2 3
+    ;; (call $g817_4_add3 (i32.const 1) (i32.const 2) (i32.const 3))
+
+A direct three-argument call, raw i32 arguments, no closure and no `applyc`.
+Known functions called at full arity have always taken this path; the raw
+arguments are new, from the i32 scalar kind. A closure is built only for
+genuine PARTIAL application (`let p = add3 1 2`), where the value escapes and
+has to exist. Nothing to do here.
+
+### First-class uses of an untupled function: second attempt, also failed
+Eta-expanding each first-class use was replaced by ONE shared tupled shim per
+function — an ordinary top-level decl the backend already knows how to emit,
+with dead-code elimination dropping the unused ones. It is the better shape,
+and it works on a direct test: `f (3, 4)`, `f t`, a 3-tuple and `List.map f`
+all correct, with `f` emitted as `(param $a0 i32) (param $a1 i32)` even though
+it is used first-class. **415 tests pass.**
+
+Self-compilation still fails, with a DIFFERENT symptom: `unreachable` —
+a match with no matching case — again inside `compileExpr`/`compileExprInner`.
+That points at `destructured`, which assumes the argument of a candidate call
+is a tuple of exactly N elements at RUNTIME. Somewhere in the compiler that
+does not hold, and the inserted `match arg with (x, y) -> ...` falls through.
+
+Worth checking next, in this order:
+- is the candidate ever POLYMORPHIC in a way that makes the parameter a tuple
+  only at some instantiations? The detection reads the pattern, not the type;
+- does `PTuple` in the emitter ever compile to a TESTED case rather than an
+  irrefutable destructure — if so, a scrutinee that is a struct tuple, or a
+  DU payload holding a tuple, would fail the test rather than bind;
+- narrow it by disabling the pass per-file until the self-compile passes, and
+  read the one function that breaks.
+
+Both attempts are reverted; the committed state has call-site destructuring
+only (green, fixpoint byte-identical). The remaining gap is exactly this one
+case, and it is what stands between here and "tuples gone unless stored".
