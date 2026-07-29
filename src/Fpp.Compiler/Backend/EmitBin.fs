@@ -429,3 +429,211 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
             emitU32 b m.DataCount
             emitBytes b (bytesToArray m.DataBody))
     bytesToArray out
+
+// ---- the runtime, transliterated ------------------------------------------
+// The hand-written wat blob moves here function by function, as direct
+// Fn-API emission. Each is checked against the text original when ported;
+// the SDK test executes them.
+
+/// declare the runtime's function types once
+let rtTypes (m : Mod) : unit =
+    tyFunc m "$rt_i2v" [ "i32" ] []
+    tyFunc m "$rt_i2i" [ "i32" ] [ "i32" ]
+    tyFunc m "$rt_i2a" [ "i32" ] [ "anyref" ]
+    tyFunc m "$rt_s2v" [ "$str" ] []
+
+/// the print/itoa slice — enough to see a number on stdout
+let rtCore (m : Mod) : unit =
+    // bodies must come in declFn order
+    // $putc
+    let f = beginFn m [ "$c" ]
+    localsDone f
+    ic f 64
+    lg f "$c"
+    mem f "i32.store8"
+    ic f 0
+    ic f 64
+    mem f "i32.store"
+    ic f 4
+    ic f 1
+    mem f "i32.store"
+    ic f 1
+    ic f 0
+    ic f 1
+    ic f 8
+    callf f "$fd_write"
+    ins f "drop"
+    endFn f
+    // $printi
+    let f = beginFn m [ "$n" ]
+    local f "$m" "i32"
+    localsDone f
+    lg f "$n"
+    ic f 0
+    ins f "i32.lt_s"
+    ifE f
+    ic f 45
+    callf f "$putc"
+    ic f 0
+    lg f "$n"
+    ins f "i32.sub"
+    ls f "$n"
+    endB f
+    lg f "$n"
+    ic f 10
+    ins f "i32.div_s"
+    ls f "$m"
+    lg f "$m"
+    ic f 0
+    ins f "i32.gt_s"
+    ifE f
+    lg f "$m"
+    callf f "$printi"
+    endB f
+    ic f 48
+    lg f "$n"
+    ic f 10
+    ins f "i32.rem_s"
+    ins f "i32.add"
+    callf f "$putc"
+    endFn f
+    // $ndigits
+    let f = beginFn m [ "$n" ]
+    local f "$c" "i32"
+    local f "$m" "i32"
+    localsDone f
+    lg f "$n"
+    ls f "$m"
+    lg f "$m"
+    ic f 0
+    ins f "i32.lt_s"
+    ifE f
+    ic f 1
+    ls f "$c"
+    ic f 0
+    lg f "$m"
+    ins f "i32.sub"
+    ls f "$m"
+    elseB f
+    ic f 0
+    ls f "$c"
+    endB f
+    lg f "$c"
+    ic f 1
+    ins f "i32.add"
+    ls f "$c"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$m"
+    ic f 10
+    ins f "i32.div_u"
+    ls f "$m"
+    lg f "$m"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$c"
+    ic f 1
+    ins f "i32.add"
+    ls f "$c"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$c"
+    endFn f
+    // $itoa
+    let f = beginFn m [ "$n" ]
+    local f "$len" "i32"
+    local f "$s" "$str"
+    local f "$i" "i32"
+    local f "$m" "i32"
+    local f "$neg" "i32"
+    localsDone f
+    lg f "$n"
+    callf f "$ndigits"
+    ls f "$len"
+    ic f 48
+    lg f "$len"
+    gcT f "array.new" "$str"
+    ls f "$s"
+    lg f "$n"
+    ls f "$m"
+    lg f "$m"
+    ic f 0
+    ins f "i32.lt_s"
+    ifE f
+    ic f 1
+    ls f "$neg"
+    ic f 0
+    lg f "$m"
+    ins f "i32.sub"
+    ls f "$m"
+    lg f "$s"
+    ic f 0
+    ic f 45
+    gcT f "array.set" "$str"
+    endB f
+    lg f "$len"
+    ic f 1
+    ins f "i32.sub"
+    ls f "$i"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$s"
+    lg f "$i"
+    ic f 48
+    lg f "$m"
+    ic f 10
+    ins f "i32.rem_u"
+    ins f "i32.add"
+    gcT f "array.set" "$str"
+    lg f "$m"
+    ic f 10
+    ins f "i32.div_u"
+    ls f "$m"
+    lg f "$i"
+    ic f 1
+    ins f "i32.sub"
+    ls f "$i"
+    lg f "$m"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$i"
+    lg f "$neg"
+    ins f "i32.lt_s"
+    brIf f "$done"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$s"
+    endFn f
+    // $prints
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    localsDone f
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    callf f "$putc"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    endFn f
+
+/// declare the runtime slice's functions, in body order
+let rtDecls (m : Mod) : unit =
+    declFn m "$putc" "$rt_i2v"
+    declFn m "$printi" "$rt_i2v"
+    declFn m "$ndigits" "$rt_i2i"
+    declFn m "$itoa" "$rt_i2a"
+    declFn m "$prints" "$rt_s2v"

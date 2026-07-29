@@ -199,4 +199,46 @@ let binaryWriter =
             // 42 + 5 + 3 + 9 = 59, and the br skipped the +100
             Expect.stringContains out "59" "GC types, casts, data, call_ref and labels all encode"
         }
+        test "the transliterated runtime slice prints a number" {
+            // putc/printi/ndigits/itoa/prints ported from the wat blob to
+            // direct emission, proven by executing prints(itoa(-3041)) plus
+            // printi(42) through fd_write from a binary-built module.
+            let m = modNew ()
+            tyArray m "$str" "i8"
+            rtTypes m
+            tyFunc m "$main_t" [] []
+            importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write"
+                [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+            rtDecls m
+            declFn m "$main" "$main_t"
+            exportMem m "memory"
+            exportFn m "_start" "$main"
+            rtCore m
+            let f = beginFn m []
+            localsDone f
+            ic f -3041
+            callf f "$itoa"
+            gcT f "ref.cast" "$str"
+            callf f "$prints"
+            ic f 10
+            callf f "$putc"
+            ic f 42
+            callf f "$printi"
+            ic f 10
+            callf f "$putc"
+            endFn f
+            let bytes = assemble m 17 false
+            let path = System.IO.Path.GetTempFileName () + ".wasm"
+            System.IO.File.WriteAllBytes (path, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y " + path)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd ()
+            let err = p.StandardError.ReadToEnd ()
+            p.WaitForExit ()
+            System.IO.File.Delete path
+            Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+            Expect.equal out "-3041\n42\n" "itoa, prints, printi and putc agree with the text runtime"
+        }
     ]
