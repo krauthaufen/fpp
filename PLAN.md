@@ -2537,110 +2537,72 @@ needs `-W gc=y` (and exceptions once the tag lands).
 ## CONTINUE HERE — binary emitter (branch `binary-emitter`)
 ================================================================================
 
-### State
-- `main`: text emitter, single case list (`nodeSkeleton` + skeleton replay),
-  420+ tests, self-host fixpoint byte-identical at ~42-46s. Untouched by the
-  branch work; keep it green.
-- `binary-emitter` (7 commits, all pushed): direct .wasm emission, no text
-  anywhere in that pipeline. PROVEN BY EXECUTION so far:
-    fact 10 -> 3628800; DU match; recursive list sum; tuple swap; record
-    construct/read/mutate; closure over captured local; and
-    List.sum (List.map (fun x -> x*x) [1;2;3]) -> 14  (prelude higher-order,
-    lifted lambda, env array, applyc/call_ref).
+### State (updated after the oracle gate closed)
+- `main`: text emitter, single case list, self-host fixpoint byte-identical.
+- `binary-emitter` (pushed through cd5fcec): direct .wasm emission, no text
+  anywhere. THE ORACLE GATE IS GREEN: all 70 OracleTests programs produce
+  byte-identical stdout through the text and binary emitters
+  (tests/Fpp.Tests/BinOracleTests.fs replays the corpus; OracleTests.corpus
+  records it). BinBattery.fs holds 25 executable end-to-end programs.
+- Everything below the gates is DONE: closures, letrec knots ($patchmark),
+  curried wrapper chains, cells, arrays, numeric/string kernel (strcmp,
+  boxing, ftoa/atof/ltoa, lenv), hashv/cmpv (+$duEq/$duHash with user
+  Equals/GetHashCode overrides, tag-indexed), str builtins, conversions
+  (target#srckind table + kindOfLite), or/as/type-test/literal patterns,
+  enum constants, class machinery (descriptors, vtables, iface dispatch,
+  seq protocol, inheritance via prefix layout, downcast+InvalidCast, ETry,
+  ERecordExt), printf family (itobase/ltobase/ftoa6/showv), tail calls
+  (markTails -> return_call for known full-arity calls).
 
-### The files
-- `Backend/WasmBinary.fs` — writer + opcode/type tables. Execution-validated.
-- `Backend/EmitBin.fs` — module builder (index spaces, sections, declarative
-  elem for ref.func, DataCount), Fn contexts (named locals/labels, REPLAY
-  mode, freshLocal), the fixed `frame`, try_table/throw, and the ported
-  runtime (~15 fns: putc printi ndigits itoa prints applyc ofi toi addv
-  strcat eq_du_default equal printval + globalVt).
-- `Backend/BinDriver.fs` — Decl list -> bytes. St carries tags, fields,
-  globals, fns, lambdas. `emitNode`/`emitPat` are the case lists;
-  `emitWithLocals` is the two-pass (scratch then replay) body scheme;
-  unported bodies become UNREACHABLE STUBS with a warning naming the case.
-- Tests: `tests/Fpp.Tests/BinaryTests.fs` (SDK + runtime slices, executed).
-  Battery driver script shape: /tmp/binrun2.fsx pattern — inline as a real
-  test file early next session (BinBattery.fs: compile source, run wasmtime,
-  compare stdout).
+### Remaining to finish task #8 (the only open work)
+1. **Full-suite green**: the suite now contains BinOracleTests (70 slow
+   dual-compile tests). Run `--sequenced`; parallel wasmtime runs have been
+   flaky on this box.
+2. **Name section** for the binary module (function names from FuncIdx) —
+   adopted ordering: BEFORE the byte-fixpoint gate, so divergences are
+   diagnosed by name, not raw offset.
+3. **Byte fixpoint / self-host**: fixpoint.fsx `self` mode with stage-1 as
+   .wasm bytes; compare BYTES. Needs the compiler corpus to compile through
+   the binary path (expect a stub-warning grind on compiler-only shapes —
+   the loop below still applies).
+4. **Merge to main**: EmitResult -> bytes. Delete-vs-debug-flag for the
+   text emitter is the USER'S call at merge time (open decision).
 
-### The loop (this is the whole method)
-1. Write a small F++ program for the next feature.
-2. `EmitProgramWasm()` it; stub warnings on stderr NAME the missing case.
-3. Port that case into emitNode/emitPat (or the runtime fn into EmitBin).
-4. Run; wrong output or trap -> `wasm-tools print /tmp/x.wasm` and read.
-5. Suite (424) must stay green; commit per feature.
-
-### Next items, in order (each was already demanded by a stub warning)
-1. **BinBattery.fs**: promote the battery to the suite so regressions gate.
-2. **Class machinery**: DClass/DMembers -> $r_ types with __desc/__idhash
-   head fields (isObjRecord equivalent), $desc_ globals (globalVt exists),
-   member fns, EIfaceCall dispatch (the SHAPE is already ported inside
-   `equal`'s obj branch — reuse), ETypeTest, ECast true-branch, ctor calls.
-   This unlocks: seqs/for-loops (GetEnumerator/MoveNext/Current specials —
-   port `$iterNew/$iterNext/$iterCur/$isBuiltinSeq` from the blob), string
-   builtins on classes, and un-stubs most of the prelude residue.
-3. **EUnknown family**: hash (port $hashv — sibling of $equal, same dispatch
-   skeleton + $duHash vtable via globalVt), compare ($cmpv likewise),
-   $str.* builtins (flat call shapes; runtime fns strsub/strFind/... port
-   mechanically like strcat), conversions (n.Contains "#" table — mirror the
-   text case; floats need `parseFloat` at emission and `fc` with bits).
-4. **Captured mutable cells**: cellVars equivalent — a prepass marking
-   assigned-and-captured locals; their ELet allocates (struct.new $cell),
-   reads/writes go through struct.get/set 0; env slots share the cell.
-   (The text emitter's cellVars logic is the reference.)
-5. **Arrays**: EArray/EIndex/EIndexSet/EArrayLen/EArrayCreate — UNIFORM $arr
-   first (packed/POD parity is a later, separate pass; the binary path may
-   stay uniform until the oracle is green, then add representation parity).
-6. **Function values / partial application**: known fn used first-class or
-   under-applied -> wrapper chain (.w0..wk cons-env) like requestWrappers;
-   port the wrapper generator (text emitter ~line 3950) onto declFn/beginFn.
-6b. **Handoff notes from the arrays/cells work (188e70c, 72a6128 — gated
-   and kept: battery, targeted probes, full 424 suite, pushed):**
-   - `Array.zeroCreate` fills a PER-ELEMENT-KIND zero (ref.i31 0 for
-     numerics, boxed 0.0 for floats, null for refs) — array.new_default
-     would wrongly give null for a zero int under uniform boxing.
-   - cells: a cellScan prepass (ported from the text emitter) marks
-     let-bound mutables that a lambda mentions; frame holds a $cell, reads
-     dereference, the env slot shares the reference. Aliasing verified: a
-     closure's write is observed by the frame afterwards.
-   - NOT started, next in #7: local `let rec` lambdas — probe traps with
-     "capture not in scope at build site"; analysis says the binary path
-     needs only $patchmark, treating a single rec binding as a one-element
-     group. And partial application — probe fails "unbound variable add";
-     needs the requestWrappers-equivalent chain.
-7. **Runtime completion**: hashv cmpv cmpvBoxed lenv append printl printf64
-   ftoa (BIG — float formatting; port last), balloc/pinh/unpinh (linear
-   memory pins), patchself/patchmark (knot-tying — needed for local rec
-   closures; test with `let rec go = ... mapKids go ...` shapes).
-8. **letrec groups + rec lambdas** in the driver (ELet(true, ELam...) and
-   groups — text cases at EmitWasm ~1338/1371 are the reference).
-9. **Interfaces of records/classes done -> the GATES**:
-   a. ORACLE: run the whole OracleTests corpus through EmitProgramWasm,
-      compare stdout against the text path. When green, binary is
-      semantically complete.
-   b. Self-host: fixcorpus + `self` mode with stage-1 as .wasm bytes;
-      fixpoint compares BYTES.
-   c. Then merge to main, flip EmitResult to bytes, and retire the text
-      emitter. ORDERING (adopted from review): the NAME SECTION lands BEFORE
-      the byte-fixpoint gate (b) — without it, a fixpoint divergence or trap
-      is diagnosed from raw byte offsets, and the bisector's
-      enclosing-function lookup should become a name-section lookup.
-      Delete-vs-debug-flag for the text emitter is the USER'S call at merge
-      time; recorded as an open decision, not a default.
+### The loop (unchanged, still the whole method)
+1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
+2. Port it; run; `wasm-tools print` to debug; suite green; commit.
 
 ### Gotchas already paid for (do not rediscover)
+- emitU32 REJECTS negatives (was: infinite loop + runaway allocation when a
+  type/func/global name lookup missed — that is what "hanging on Map" was).
+- $vN function types and $tupN tuple types are DYNAMIC: vArities from every
+  DLet arity + iface arities; tupArities from scanTupleArities over exprs
+  AND patterns. rtCore3/rtCore7 take the same tupArities list.
+- binary failwith wraps the message: throw $du1(FailureTag, msg) — the
+  `with Failure msg` pattern matches the payload, a bare string never does.
 - catch-clause label depths are relative OUTSIDE the try_table (its own
   label does not count). Checked against wasm-tools' encoding.
 - ref.func targets MUST be in the declarative elem segment (`rf` records).
 - abstract-heap ref.cast/test immediates are NEGATIVE s33 (gcAbs).
 - vtable array.get needs its type immediate ($vt).
-- declFn order must equal body-emission order; bodies are two-phase
-  (functions then inits) — interleaving corrupts slots.
+- declFn order must equal body-emission order. Wrapper decls append after
+  $_start and their bodies are emitted last — order still matches. The
+  generated identity fns ($eq_/$hash_/adapters) declare after program fns
+  (desc globals ref.func them) and their bodies land between program and
+  lambda bodies.
 - REPLAY mode: locals must be named via freshLocal (counter advances in
   both passes); naming by vecLen freezes and collides bindings.
-- $duEq/$duHash are indexed BY TAG: length = total tag count.
+- PVar/PAs REUSE an existing lv slot (or-alternatives bind the same
+  identity; the shared body reads one slot) — that reuse is replay-safe
+  because emitWithLocals copies lv per pass.
+- markTails marks EApp NODES by reference; it does not descend into ETry
+  (a return_call would escape the handler frame).
+- $duEq/$duHash are indexed BY TAG: length = total tag count; duSlot fills
+  overrides from DMembers via identityImpl, +1-arity via $adaptduN_t.
 - data segment names keyed by M.DataCount so scratch/real passes agree.
 - lambda capture list is filtered ONCE at discovery (globals/known fns are
   not captures); build site and body must index the SAME list.
 - wasmtime needs `-W gc=y,exceptions=y` for these modules.
+- the oracle gate harness (scratchpad gate.fsx pattern) must #r the TEST
+  bin's Fpp.Compiler.dll — rebuild tests/Fpp.Tests first or it runs stale.
+
