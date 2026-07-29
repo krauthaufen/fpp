@@ -34,9 +34,7 @@ let ffiTests =
             p.WaitForExit()
             Expect.equal out "42\n70\n61\n" "foreign calls compute correctly"
         }
-        // PENDING under the binary backend: Array.pin and the POD C-image
-        // layout are representation work the binary emitter has not done yet
-        ptest "pinned struct arrays expose byte-exact C layout" {
+        test "pinned struct arrays expose byte-exact C layout" {
             // THE FFI PROOF: pin a V2d[], let a foreign reader sum raw
             // doubles at the pointer; correct sum == byte-exact C layout.
             // (wasmtime hosts the "C library" as a preload module.)

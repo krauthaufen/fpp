@@ -92,9 +92,59 @@ let divergenceGate =
         }
     ]
 
+/// the module DISASSEMBLED — the name section names functions and types, so
+/// representation assertions read `$parr_i`, not a bare index
+let private disassemble (src : string) : string =
+    let ws = Workspace()
+    ws.SetFileText "prog.fpp" src
+    let bytes, errors = ws.EmitProgramWasm ()
+    Expect.isEmpty errors "emission errors"
+    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+    System.IO.File.WriteAllBytes(tmp, bytes)
+    let psi = System.Diagnostics.ProcessStartInfo("wasm-tools", "print " + tmp)
+    psi.RedirectStandardOutput <- true
+    psi.RedirectStandardError <- true
+    use p = System.Diagnostics.Process.Start psi
+    let out = p.StandardOutput.ReadToEnd()
+    p.StandardError.ReadToEnd() |> ignore
+    p.WaitForExit()
+    System.IO.File.Delete tmp
+    Expect.equal p.ExitCode 0 "wasm-tools print failed"
+    out
+
 [<Tests>]
 let noBoxGate =
     testList "representation gate" [
+        test "vectors and primitive arrays are packed — no per-element boxing" {
+            // THE INVARIANT (user requirement): primitive and POD-struct
+            // arrays are never boxed into generic arrays. Asserted against
+            // the DISASSEMBLED binary module.
+            let src =
+                String.concat "\n" [
+                    "module G"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |]"
+                    "let more = Array.create 8 { X = 0.0; Y = 0.0 }"
+                    "let ints = [| 1; 2; 3 |]"
+                    "let floats = [| 1.5; 2.5 |]"
+                    "let go ="
+                    "    let mutable s = 0.0"
+                    "    for i in 0 .. pts.Length - 1 do"
+                    "        s <- s + pts.[i].X"
+                    "    print s"
+                    "" ]
+            let text = disassemble src
+            Expect.stringContains text "array.new_fixed $pk" "V2d arrays are C-image packed"
+            Expect.stringContains text "array.new_fixed $parr_i" "int arrays are flat i32"
+            Expect.stringContains text "array.new_fixed $parr_f" "float arrays are flat f64"
+            Expect.isFalse (text.Contains "$sarr_") "no SoA wrapper for POD structs"
+            Expect.isFalse (text.Contains "$indexv") "no dispatching reader"
+            Expect.isFalse (text.Contains "$setv") "no dispatching writer"
+            Expect.isFalse (text.Contains "$creatv") "no dispatching allocator"
+            // and the program still computes
+            Expect.equal (runProgram src) "4\n" "the packed loop sums X"
+        }
         test "a store into an int[] field builds a FLAT array" {
             // `r.Slots <- Array.zeroCreate n` used to build a UNIFORM array:
             // assignment did not unify through a dot target, so nothing

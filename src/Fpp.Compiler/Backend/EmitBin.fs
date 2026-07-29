@@ -458,7 +458,21 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
             emitVec sub (stringBytes n)
         emitByte b 1
         emitU32 b sub.Count
-        emitBytes b (bytesToArray sub))
+        emitBytes b (bytesToArray sub)
+        // type names (subsection 4): representation assertions and dumps
+        // read `$parr_i`, not a bare index
+        let tnames =
+            dictPairs m.TypeIdx
+            |> List.sortBy snd
+        let tsub = bytesNew ()
+        emitU32 tsub (List.length tnames)
+        for n, i in tnames do
+            emitU32 tsub i
+            let n = if n.StartsWith "$" then n.Substring 1 else n
+            emitVec tsub (stringBytes n)
+        emitByte b 4
+        emitU32 b tsub.Count
+        emitBytes b (bytesToArray tsub))
     bytesToArray out
 
 // ---- the runtime, transliterated ------------------------------------------
@@ -2935,8 +2949,8 @@ let rtCore8 (m : Mod) : unit =
     ins f "i32.sub"
     callf f "$strsub"
     endFn f
-    // $strTrimEndChars — the char array is UNIFORM here ($arr of i31), not
-    // the text emitter's packed i32 array; the read goes through $toi
+    // $strTrimEndChars — the char array is PACKED i32, like the text
+    // emitter's
     let f = beginFn m [ "$s"; "$cs" ]
     local f "$b" "i32"
     local f "$j" "i32"
@@ -2965,15 +2979,14 @@ let rtCore8 (m : Mod) : unit =
     loopE f "$sg"
     lg f "$j"
     lg f "$cs"
-    gcT f "ref.cast" "$arr"
+    gcT f "ref.cast" "$parr_i"
     gci f "array.len"
     ins f "i32.ge_u"
     brIf f "$sd"
     lg f "$cs"
-    gcT f "ref.cast" "$arr"
+    gcT f "ref.cast" "$parr_i"
     lg f "$j"
-    gcT f "array.get" "$arr"
-    callf f "$toi"
+    gcT f "array.get" "$parr_i"
     lg f "$c"
     ins f "i32.eq"
     ifE f
@@ -3545,6 +3558,240 @@ let rtCore12 (m : Mod) : unit =
     ins f "i32.shr_u"
     lg f "$o"
     ins f "i32.or"
+    endFn f
+
+// ---- runtime: POD word handles and the linear-memory pin heap ---------------
+// A POD struct array is a $hnd over i64 words ($pk) — C-image layout.
+// Pinning copies the words into linear memory (the GC side is dropped while
+// pinned); unpinning copies back. The word accessors dispatch on which side
+// currently holds the data.
+
+let rtTypes13 (m : Mod) : unit =
+    tyFunc m "$rt_ai2l" [ "anyref"; "i32" ] [ "i64" ]
+    tyFunc m "$rt_ail2v" [ "anyref"; "i32"; "i64" ] []
+
+let rtDecls13 (m : Mod) : unit =
+    declFn m "$balloc" "$rt_i2i"
+    declFn m "$pinh" "$rt_a2i"
+    declFn m "$unpinh" "$rt_a2i"
+    declFn m "$hwget" "$rt_ai2l"
+    declFn m "$hwset" "$rt_ail2v"
+    declFn m "$hlen" "$rt_a2i"
+
+let rtCore13 (m : Mod) : unit =
+    // $balloc: bump allocator over the pin pages, 8-aligned
+    let f = beginFn m [ "$bytes" ]
+    local f "$p" "i32"
+    localsDone f
+    gg f "$heap"
+    ls f "$p"
+    lg f "$p"
+    lg f "$bytes"
+    ins f "i32.add"
+    ic f 7
+    ins f "i32.add"
+    ic f -8
+    ins f "i32.and"
+    gs f "$heap"
+    lg f "$p"
+    endFn f
+    // $pinh: copy the words to linear memory, drop the GC side
+    let f = beginFn m [ "$h" ]
+    local f "$s" "anyref"
+    local f "$n" "i32"
+    local f "$i" "i32"
+    local f "$p" "i32"
+    localsDone f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ls f "$s"
+    lg f "$s"
+    ins f "ref.is_null"
+    ifE f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 1
+    ret f
+    endB f
+    lg f "$s"
+    gcT f "ref.cast" "$pk"
+    gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    ic f 8
+    ins f "i32.mul"
+    callf f "$balloc"
+    ls f "$p"
+    blockE f "$d"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$d"
+    lg f "$p"
+    lg f "$i"
+    ic f 8
+    ins f "i32.mul"
+    ins f "i32.add"
+    lg f "$s"
+    gcT f "ref.cast" "$pk"
+    lg f "$i"
+    gcT f "array.get" "$pk"
+    mem f "i64.store"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    lg f "$p"
+    gcTF f "struct.set" "$hnd" 1
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    lg f "$n"
+    gcTF f "struct.set" "$hnd" 2
+    // drop the GC storage: managed side is reclaimed while pinned
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    refNull f "none"
+    gcTF f "struct.set" "$hnd" 0
+    lg f "$p"
+    endFn f
+    // $unpinh: copy linear memory back into fresh GC words
+    let f = beginFn m [ "$h" ]
+    local f "$s" "anyref"
+    local f "$n" "i32"
+    local f "$i" "i32"
+    local f "$p" "i32"
+    localsDone f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ins f "ref.is_null"
+    ins f "i32.eqz"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 2
+    ls f "$n"
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 1
+    ls f "$p"
+    lg f "$n"
+    gcT f "array.new_default" "$pk"
+    ls f "$s"
+    blockE f "$d"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$d"
+    lg f "$s"
+    gcT f "ref.cast" "$pk"
+    lg f "$i"
+    lg f "$p"
+    lg f "$i"
+    ic f 8
+    ins f "i32.mul"
+    ins f "i32.add"
+    mem f "i64.load"
+    gcT f "array.set" "$pk"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    lg f "$s"
+    gcT f "ref.cast" "$pk"
+    gcTF f "struct.set" "$hnd" 0
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    ic f 0
+    gcTF f "struct.set" "$hnd" 1
+    ic f 0
+    endFn f
+    // $hwget: one i64 word through the handle, wherever the data lives
+    let f = beginFn m [ "$h"; "$i" ]
+    localsDone f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ins f "ref.is_null"
+    ifV f "i64"
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 1
+    lg f "$i"
+    ic f 8
+    ins f "i32.mul"
+    ins f "i32.add"
+    mem f "i64.load"
+    elseB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    gcT f "ref.cast" "$pk"
+    lg f "$i"
+    gcT f "array.get" "$pk"
+    endB f
+    endFn f
+    // $hwset
+    let f = beginFn m [ "$h"; "$i"; "$v" ]
+    localsDone f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ins f "ref.is_null"
+    ifE f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 1
+    lg f "$i"
+    ic f 8
+    ins f "i32.mul"
+    ins f "i32.add"
+    lg f "$v"
+    mem f "i64.store"
+    elseB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    gcT f "ref.cast" "$pk"
+    lg f "$i"
+    lg f "$v"
+    gcT f "array.set" "$pk"
+    endB f
+    endFn f
+    // $hlen: word count
+    let f = beginFn m [ "$h" ]
+    localsDone f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ins f "ref.is_null"
+    ifV f "i32"
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 2
+    elseB f
+    lg f "$h"
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    gcT f "ref.cast" "$pk"
+    gci f "array.len"
+    endB f
     endFn f
 
 // ---- runtime: enumeration protocol and object identity helpers -------------

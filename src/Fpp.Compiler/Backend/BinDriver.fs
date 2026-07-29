@@ -52,6 +52,13 @@ type St =
       /// EApp nodes in tail position (by node identity): a full-arity call
       /// to a known function there compiles to return_call
       TailApp : RefMap<Expr, bool>
+      /// POD struct layout: name -> (leaves as (dotted path, kind, byte
+      /// offset), sizeof, stride in i64 words) — the C image a pinned
+      /// array exposes
+      Pod : Dict<string, (string * string * int) list * int * int>
+      /// struct-record fields with their declared TYPE names (uniform
+      /// records erase types; POD navigation needs them back)
+      StructFields : Dict<string, (string * string) list>
       /// curry wrappers requested for top-level functions used first-class:
       /// name -> arity, plus request order (bodies are emitted LAST, and
       /// their decls land last too, so decl order still equals body order)
@@ -491,6 +498,22 @@ let rec private markTails (st : St) (e : Expr) : unit =
     | EMatch (_, cs) -> for _, _, b in cs do markTails st b
     | _ -> ()
 
+/// packed-array element classification: which $parr_* a primitive element
+/// type stores in. byte/sbyte are NOT here — they share $str (packed i8).
+let private parrK (nm : string) : string =
+    match nm with
+    | "int" | "bool" | "char" -> "i"
+    | "float16" -> "h"
+    | "float" -> "f"
+    | "float32" -> "s"
+    | "int64" -> "l"
+    | _ -> ""
+let private parrTy (k : string) = "$parr_" + k
+let private boxOfK (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
+let private unboxOfK (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
+/// packed reads need an explicit sign; a half reads unsigned
+let private getOpOfK (k : string) = if k = "h" then "array.get_u" else "array.get"
+
 /// collect the run of `let rec ... = fun` bindings heading a let spine.
 /// Grouping bindings that are NOT mutually recursive is harmless: their
 /// markers are simply never captured, so patching finds nothing to do.
@@ -501,7 +524,98 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
         (v, lam) :: ms, body
     | _ -> [], e
 
-let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
+/// unbox instruction name for a POD leaf kind
+let private podUnbox (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
+
+/// read one leaf (dotted path) out of a UNIFORM struct value held in local
+/// `vl`, leaving the UNBOXED scalar on the stack
+let rec private emitPodLeaf (st : St) (f : Fn) (rn : string) (vl : string) (path : string) (k : string) : unit =
+    lg f vl
+    let mutable cur = rn
+    let mutable rest = path
+    let mutable go = true
+    while go do
+        let i = rest.IndexOf '.'
+        let head = if i < 0 then rest else rest.Substring (0, i)
+        let idx = (dictTryFind st.FieldIdx (cur, head)).Value
+        gcT f "ref.cast" ("$r_" + cur)
+        gcTF f "struct.get" ("$r_" + cur) idx
+        if i < 0 then go <- false
+        else
+            let fs = (dictTryFind st.StructFields cur).Value
+            let _, ty = fs |> List.find (fun (fn, _) -> fn = head)
+            cur <- ty
+            rest <- rest.Substring (i + 1)
+    callf f (podUnbox k)
+
+/// push i64 word `w` of the POD value in local `vl` (C image, little-endian
+/// packing of 4-byte scalars into 8-byte words)
+and private emitPodWord (st : St) (f : Fn) (rn : string) (vl : string) (w : int) : unit =
+    let placed, _, _ = (dictTryFind st.Pod rn).Value
+    let parts = placed |> List.filter (fun (_, _, off) -> off / 8 = w)
+    let one (fn : string, k : string, off : int) =
+        emitPodLeaf st f rn vl fn k
+        let sh = (off % 8) * 8
+        match k with
+        | "f" -> ins f "i64.reinterpret_f64"
+        | "l" -> ()
+        | "s" ->
+            ins f "i32.reinterpret_f32"
+            ins f "i64.extend_i32_u"
+            if sh <> 0 then
+                lc f (int64 sh)
+                ins f "i64.shl"
+        | _ ->
+            ins f "i64.extend_i32_u"
+            if sh <> 0 then
+                lc f (int64 sh)
+                ins f "i64.shl"
+    match parts with
+    | [] -> lc f 0L
+    | first :: restP ->
+        one first
+        for p in restP do
+            one p
+            ins f "i64.or"
+
+/// materialize a UNIFORM $r_ struct of (possibly nested) `rn` from the POD
+/// words: handle in `hl`, word base in `bl`; `top`/`prefix` index the
+/// top-level layout, whose offsets carry the dotted paths
+and private emitPodBuild (st : St) (f : Fn) (top : string) (hl : string) (bl : string) (rn : string) (prefix : string) : unit =
+    let placed, _, _ = (dictTryFind st.Pod top).Value
+    for fn, ty in (dictTryFind st.StructFields rn).Value do
+        let full = if prefix = "" then fn else prefix + "." + fn
+        if (dictTryFind st.StructFields ty).IsSome then
+            emitPodBuild st f top hl bl ty full
+        else
+            let _, k, off = placed |> List.find (fun (p, _, _) -> p = full)
+            lg f hl
+            lg f bl
+            ic f (off / 8)
+            ins f "i32.add"
+            callf f "$hwget"
+            let sh = (off % 8) * 8
+            (match k with
+             | "f" ->
+                 ins f "f64.reinterpret_i64"
+                 callf f "$off"
+             | "l" -> callf f "$ofl"
+             | "s" ->
+                 (if sh <> 0 then
+                     lc f (int64 sh)
+                     ins f "i64.shr_u")
+                 ins f "i32.wrap_i64"
+                 ins f "f32.reinterpret_i32"
+                 callf f "$oss"
+             | _ ->
+                 (if sh <> 0 then
+                     lc f (int64 sh)
+                     ins f "i64.shr_u")
+                 ins f "i32.wrap_i64"
+                 callf f "$ofi")
+    gcT f "struct.new" ("$r_" + rn)
+
+and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
         // an unsigned literal keeps its bit pattern: 4000000000u is the i32
@@ -1728,6 +1842,167 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
     // uniform until the oracle is green, and packed/POD parity is its own
     // pass afterwards. Every element is therefore a boxed anyref, exactly
     // like a closure env slot.
+    | EArray (nm, xs) when (dictTryFind st.Pod nm).IsSome ->
+        // C-image packed: N elements x strideWords i64 words, in a handle
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        for x in xs do
+            let el = freshLocal f "$pke" "anyref"
+            emitNode st f lv x
+            ls f el
+            for w in 0 .. wd - 1 do emitPodWord st f nm el w
+        arrNewFixed f "$pk" (List.length xs * wd)
+        ic f 0
+        ic f 0
+        gcT f "struct.new" "$hnd"
+    | EIndex (nm, a, i) when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        let hl = freshLocal f "$pha" "anyref"
+        let bl = freshLocal f "$phb" "i32"
+        emitNode st f lv a
+        ls f hl
+        emitNode st f lv i
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        ls f bl
+        emitPodBuild st f nm hl bl nm ""
+    | EIndexSet (nm, a, i, v) when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        let hl = freshLocal f "$pha" "anyref"
+        let bl = freshLocal f "$phb" "i32"
+        let vl = freshLocal f "$phv" "anyref"
+        emitNode st f lv a
+        ls f hl
+        emitNode st f lv i
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        ls f bl
+        emitNode st f lv v
+        ls f vl
+        for w in 0 .. wd - 1 do
+            lg f hl
+            lg f bl
+            ic f w
+            ins f "i32.add"
+            emitPodWord st f nm vl w
+            callf f "$hwset"
+        ic f 0
+        refI31 f
+    | EArrayCreate (nm, n, EUnknown "$zero") when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        emitNode st f lv n
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        gcT f "array.new_default" "$pk"
+        ic f 0
+        ic f 0
+        gcT f "struct.new" "$hnd"
+    | EArrayCreate (nm, n, v) when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        let nl = freshLocal f "$pkn" "i32"
+        let vl = freshLocal f "$pkv" "anyref"
+        let al = freshLocal f "$pka" "anyref"
+        let jl = freshLocal f "$pkj" "i32"
+        emitNode st f lv n
+        callf f "$toi"
+        ls f nl
+        emitNode st f lv v
+        ls f vl
+        lg f nl
+        ic f wd
+        ins f "i32.mul"
+        gcT f "array.new_default" "$pk"
+        ic f 0
+        ic f 0
+        gcT f "struct.new" "$hnd"
+        ls f al
+        ic f 0
+        ls f jl
+        blockE f "$pkd"
+        loopE f "$pkl"
+        lg f jl
+        lg f nl
+        ins f "i32.ge_u"
+        brIf f "$pkd"
+        for w in 0 .. wd - 1 do
+            lg f al
+            lg f jl
+            ic f wd
+            ins f "i32.mul"
+            ic f w
+            ins f "i32.add"
+            emitPodWord st f nm vl w
+            callf f "$hwset"
+        lg f jl
+        ic f 1
+        ins f "i32.add"
+        ls f jl
+        br f "$pkl"
+        endB f
+        endB f
+        lg f al
+    | EArrayLen (nm, a) when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        emitNode st f lv a
+        callf f "$hlen"
+        ic f wd
+        ins f "i32.div_u"
+        callf f "$ofi"
+    | EArrayPin (nm, a) ->
+        (if (dictTryFind st.Pod nm).IsSome then
+            emitNode st f lv a
+            callf f "$pinh"
+            callf f "$ofi"
+         else
+            err st "binary: Array.pin requires a POD struct array"
+            refNull f "any")
+    | EArrayUnpin (nm, a) ->
+        (if (dictTryFind st.Pod nm).IsSome then
+            emitNode st f lv a
+            callf f "$unpinh"
+            callf f "$ofi"
+         else
+            err st "binary: Array.unpin requires a POD struct array"
+            refNull f "any")
+    | EArray (nm, xs) when parrK nm <> "" ->
+        // packed primitive array: unboxed elements, no per-element GC object
+        let k = parrK nm
+        for x in xs do
+            emitNode st f lv x
+            callf f (unboxOfK k)
+        arrNewFixed f (parrTy k) (List.length xs)
+    | EIndex (nm, a, i) when parrK nm <> "" ->
+        let k = parrK nm
+        emitNode st f lv a
+        gcT f "ref.cast" (parrTy k)
+        emitNode st f lv i
+        callf f "$toi"
+        gcT f (getOpOfK k) (parrTy k)
+        callf f (boxOfK k)
+    | EIndexSet (nm, a, i, v) when parrK nm <> "" ->
+        let k = parrK nm
+        emitNode st f lv a
+        gcT f "ref.cast" (parrTy k)
+        emitNode st f lv i
+        callf f "$toi"
+        emitNode st f lv v
+        callf f (unboxOfK k)
+        gcT f "array.set" (parrTy k)
+        ic f 0
+        refI31 f
+    | EArrayCreate (nm, n, EUnknown "$zero") when parrK nm <> "" ->
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new_default" (parrTy (parrK nm))
+    | EArrayCreate (nm, n, v) when parrK nm <> "" ->
+        let k = parrK nm
+        emitNode st f lv v
+        callf f (unboxOfK k)
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new" (parrTy k)
     | EArray (("byte" | "sbyte"), xs) ->
         for x in xs do
             emitNode st f lv x
@@ -2124,7 +2399,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
-          TailApp = refMapNew (fun (_ : Expr) -> 7) }
+          TailApp = refMapNew (fun (_ : Expr) -> 7)
+          Pod = dictNew (); StructFields = dictNew () }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -2186,6 +2462,59 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             | Some b when b <> n -> expandedFields b @ fs
             | _ -> fs
     let isObjRecord (n : string) = rawRecords |> List.exists (fun (rn, _, stf) -> rn = n && not stf)
+    // ---- POD layout (clang natural alignment), like the text backend ------
+    let structNames = rawRecords |> List.filter (fun (_, _, stf) -> stf) |> List.map (fun (n, _, _) -> n)
+    let fieldKind (ty : string) : string =
+        match ty with
+        | "float" -> "f"
+        | "float32" -> "s"
+        | "int64" -> "l"
+        | "int" | "bool" | "char" | "float16" -> "i"
+        | t when List.contains t structNames -> "S:" + t
+        | _ -> "r"
+    let scalarSize (k : string) = if k = "i" || k = "s" then 4 else 8
+    for rn, fs, stf in rawRecords do
+        if stf then dictSet st.StructFields rn fs
+    let rec computeLayout (rn : string) : bool =
+        if (dictTryFind st.Pod rn).IsSome then true
+        else
+            match dictTryFind st.StructFields rn with
+            | None -> false
+            | Some fs ->
+                let ok =
+                    fs |> List.forall (fun (_, ty) ->
+                        let k = fieldKind ty
+                        if k = "i" || k = "f" || k = "s" || k = "l" then true
+                        elif k.StartsWith "S:" then
+                            let sn = k.Substring 2
+                            sn <> rn && computeLayout sn
+                        else false)
+                if not ok then false
+                else
+                    let mutable off = 0
+                    let mutable maxA = 1
+                    let leaves = vecNew<string * string * int> ()
+                    for fn, ty in fs do
+                        let k = fieldKind ty
+                        if k = "i" || k = "f" || k = "s" || k = "l" then
+                            let sz = scalarSize k
+                            off <- ((off + sz - 1) / sz) * sz
+                            vecAdd leaves (fn, k, off)
+                            off <- off + sz
+                            if sz > maxA then maxA <- sz
+                        else
+                            let sn = k.Substring 2
+                            let nl, nsz, _ = (dictTryFind st.Pod sn).Value
+                            let na = nl |> List.map (fun (_, k2, _) -> scalarSize k2) |> List.max
+                            off <- ((off + na - 1) / na) * na
+                            for np, nk, noff in nl do
+                                vecAdd leaves (fn + "." + np, nk, off + noff)
+                            off <- off + nsz
+                            if na > maxA then maxA <- na
+                    let sizeof_ = ((off + maxA - 1) / maxA) * maxA
+                    dictSet st.Pod rn (vecToList leaves, sizeof_, (sizeof_ + 7) / 8)
+                    true
+    for rn in structNames do computeLayout rn |> ignore
     let objRecordNames = rawRecords |> List.filter (fun (_, _, stf) -> not stf) |> List.map (fun (n, _, _) -> n)
     let descId (n : string) = objRecordNames |> List.findIndex (fun rn -> rn = n)
     // populate the St-side lookup tables emitNode dispatches through
@@ -2306,6 +2635,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes10 m
     rtTypes11 m
     rtTypes12 m
+    rtTypes13 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -2319,6 +2649,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls10 m
     rtDecls11 m
     rtDecls12 m
+    rtDecls13 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -2351,6 +2682,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     // generated identity per obj record, then the descriptor globals — the
     // member fns those vtables reference are all declared by now
     globalI32Mut m "$nextid" 0
+    globalI32Mut m "$heap" 65536
     let identityAdapters = vecNew<string * int * string> ()
     for rn in objRecordNames do
         declFn m ("$eq_" + rn) "$u1"
@@ -2444,6 +2776,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore10 m
     rtCore11 m
     rtCore12 m
+    rtCore13 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
