@@ -2555,18 +2555,20 @@ needs `-W gc=y` (and exceptions once the tag lands).
   (markTails -> return_call for known full-arity calls).
 
 ### Remaining to finish task #8 (the only open work)
-1. **Full-suite green**: the suite now contains BinOracleTests (70 slow
-   dual-compile tests). Run `--sequenced`; parallel wasmtime runs have been
-   flaky on this box.
-2. **Name section** for the binary module (function names from FuncIdx) —
-   adopted ordering: BEFORE the byte-fixpoint gate, so divergences are
-   diagnosed by name, not raw offset.
-3. **Byte fixpoint / self-host**: fixpoint.fsx `self` mode with stage-1 as
-   .wasm bytes; compare BYTES. Needs the compiler corpus to compile through
-   the binary path (expect a stub-warning grind on compiler-only shapes —
-   the loop below still applies).
-4. **Merge to main**: EmitResult -> bytes. Delete-vs-debug-flag for the
-   text emitter is the USER'S call at merge time (open decision).
+ALL MEASUREMENT GATES ARE GREEN (2026-07-29):
+- Oracle corpus 70/70 (text vs binary stdout identical).
+- Binary fixpoint: `dotnet fsi tests/bootstrap/fixpoint.fsx bin` — stage-1
+  (the compiler emitted as .wasm BYTES) runs and reproduces stage-0's
+  corpus bytes exactly.
+- Binary SELF-host: `... fixpoint.fsx bin self` — the binary-emitted
+  compiler compiles its own 24 sources to the byte-identical 1,863,929-byte
+  module it is. compiledrive-bin.fpp is the drive; byte[] ≡ $str packed
+  representation makes the bytesString identity true in both backends.
+
+What remains is the MERGE, and it is the USER'S call:
+- merge `binary-emitter` to main; EmitResult -> bytes as the default
+  pipeline output;
+- text emitter: delete vs keep behind a debug flag (open decision, user's).
 
 ### The loop (unchanged, still the whole method)
 1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
