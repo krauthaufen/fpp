@@ -2562,16 +2562,29 @@ Gates on the merged tree: suite 443 (+1 pending, see below), fixpoint `bin`
 and `bin self` both byte-identical — the self-hosted module is 1,350,391
 bytes (down from 1.86 MB with the text emitter still aboard).
 
-### Open follow-ups (representation parity the text emitter had)
-- PACKED/POD arrays: float/int/half arrays are UNIFORM ($arr of boxed) in
-  the binary backend; the text emitter packed them ($parr_*, POD C-image,
-  SoA struct arrays, scalarized struct params/returns). This is the perf
-  work the user cared about ("no boxing anywhere") — port as its own pass.
-- Array.pin/unpin + linear-memory pin heap (balloc/pinh/unpinh): unported;
-  the FFI pin test is `ptest`-pending in FfiTests.fs.
-- Two EmitTests were deleted with the emitter (flat-array invariant,
-  scalarization invariant) — resurrect them as BINARY assertions when the
-  packed pass lands.
+### Representation parity — landed (main f958897)
+- PACKED primitive arrays: int/bool/char->$parr_i, float->$parr_f,
+  float32->$parr_s, int64->$parr_l, float16->$parr_h (byte/sbyte were
+  already $str). Construction, index get/set, zeroCreate, create, Length,
+  iteration — all unboxed per element.
+- POD struct arrays: C-image $pk (i64 words) behind a $hnd, clang natural
+  alignment (podLayout port), nested structs inline. Literals, index
+  read/write, zeroCreate, create-fill, Length.
+- Array.pin/unpin + pin heap ($balloc/$pinh/$unpinh, $heap at 65536): pinned
+  data lives in linear memory, GC side dropped while pinned; the FFI
+  byte-exact-layout test is live again (was ptest).
+- Representation gate resurrected against `wasm-tools print` of the BINARY
+  module (name section carries function AND type names).
+- Gates: suite 445/445, fixpoint bin + bin self byte-identical (self-hosted
+  module now 1,399,101 bytes, packed everywhere).
+
+### Still open (the last parity piece)
+- SCALARIZATION (typed rails): locals/params/returns of known scalar or
+  struct type on raw f64/i32 rails, struct params/returns as leaves, fused
+  `pts.[i].X` reads without boxing. Without it a hot loop still boxes each
+  intermediate ($off per read). This was the text emitter's sigKinds/
+  localKinds machinery — the deleted "struct params pass as scalars"
+  EmitTest is its gate; resurrect it when the rails land.
 
 ### The loop (unchanged, still the whole method)
 1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
