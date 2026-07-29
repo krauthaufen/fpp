@@ -229,6 +229,33 @@ let binBattery =
               "    if (o :? B) then print 1 else print 0" ]
             "1\n0\n"
 
+        expects "inheritance: base field, virtual override"
+            [ "type Animal(n : int) ="
+              "    member x.Legs = n"
+              "    abstract member Sound : unit -> int"
+              "    default x.Sound () = 0"
+              "type Dog() ="
+              "    inherit Animal(4)"
+              "    override x.Sound () = 7"
+              "let go ="
+              "    let d = Dog()"
+              "    print d.Legs"
+              "    print (d.Sound ())" ]
+            "4\n7\n"
+
+        expects "downcast succeeds or throws InvalidCast, try/with catches"
+            [ "type A() ="
+              "    member x.N = 1"
+              "type B() ="
+              "    member x.N = 2"
+              "let go ="
+              "    let o = box (A())"
+              "    print (o :?> A).N"
+              "    try"
+              "        print (o :?> B).N"
+              "    with _ -> print 99" ]
+            "1\n99\n"
+
         expects "arrays: zeroCreate, index get/set, Length"
             [ "let go ="
               "    let a = Array.zeroCreate 3"

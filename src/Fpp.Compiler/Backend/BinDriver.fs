@@ -48,6 +48,7 @@ type St =
       IfaceName : Dict<string, bool>
       ImplsOf : Dict<string, string list>
       SubsOf : Dict<string, string list>
+      BaseOf : Dict<string, string>
       /// curry wrappers requested for top-level functions used first-class:
       /// name -> arity, plus request order (bodies are emitted LAST, and
       /// their decls land last too, so decl order still equals body order)
@@ -514,6 +515,80 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         ins f "unreachable"
         endB f
         lg f res
+    | ETry (body, cases) ->
+        let res = freshLocal f "$tr" "anyref"
+        let exn = freshLocal f "$tx" "anyref"
+        blockE f "$tdone"
+        blockA f "$tcatch"
+        tryTableA f "$tcatch"
+        emitNode st f lv body
+        endB f
+        ls f res
+        br f "$tdone"
+        endB f
+        ls f exn
+        let mutable ci = 0
+        for pat, guard, cbody in cases do
+            let lbl = "$tc" + string ci
+            ci <- ci + 1
+            blockE f lbl
+            emitPat st f lv lbl exn pat
+            (match guard with
+             | Some g ->
+                 emitNode st f lv g
+                 callf f "$toi"
+                 ins f "i32.eqz"
+                 brIf f lbl
+             | None -> ())
+            emitNode st f lv cbody
+            ls f res
+            br f "$tdone"
+            endB f
+        // no case matched: the exception continues outward
+        lg f exn
+        throwExn f
+        endB f
+        lg f res
+    | ERecordExt (rn, baseExpr, fields) ->
+        // a derived instance IS its base's layout plus its own fields;
+        // unchanged slots copy straight out of the base (prefix layout makes
+        // the index valid in the plain `{ r with ... }` case too)
+        (match dictTryFind st.FieldsOf rn with
+         | Some order ->
+             let bl = freshLocal f "$bx" "anyref"
+             emitNode st f lv baseExpr
+             ls f bl
+             let baseRn = dictTryFind st.BaseOf rn
+             let baseLen =
+                 match baseRn with
+                 | Some bn -> (match dictTryFind st.FieldsOf bn with Some o -> o.Length | None -> 0)
+                 | None -> 0
+             order |> List.iteri (fun i fname ->
+                 if fname = "__idhash" then
+                     ic f 0
+                     refI31 f
+                 elif fname = "__desc" && (dictTryFind st.ObjRec rn).IsSome then
+                     gg f ("$desc_" + rn)
+                 else
+                     match fields |> List.tryFind (fun (fn, _) -> fn = fname) with
+                     | Some (_, v) -> emitNode st f lv v
+                     | None ->
+                         match baseRn with
+                         | Some bn when i < baseLen ->
+                             lg f bl
+                             gcT f "ref.cast" ("$r_" + bn)
+                             gcTF f "struct.get" ("$r_" + bn) i
+                         | Some _ ->
+                             err st ("binary: missing field " + fname + " in " + rn)
+                             refNull f "any"
+                         | None ->
+                             lg f bl
+                             gcT f "ref.cast" ("$r_" + rn)
+                             gcTF f "struct.get" ("$r_" + rn) i)
+             gcT f "struct.new" ("$r_" + rn)
+         | None ->
+             err st ("binary: record ext with unknown type " + rn)
+             refNull f "any")
     | ECtor (name, _, args) ->
         (match dictTryFind st.CaseArity name with
          | Some 0 -> gg f ("$c_" + name)
@@ -1575,7 +1650,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls
           ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
-          SubsOf = dictNew () }
+          SubsOf = dictNew (); BaseOf = dictNew () }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -1646,6 +1721,9 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     for cn, _, _, _ in classDecls do
         dictSet st.ClassName cn true
         dictSet st.SubsOf cn (subclassesOf cn)
+        (match baseOf cn with
+         | Some b when b <> cn -> dictSet st.BaseOf cn b
+         | _ -> ())
     vtableSlots |> List.iteri (fun i (ifn, mn) -> dictSet st.SlotOf (ifn, mn) (i + identitySlots))
     for ifn, _ in interfaceDecls do dictSet st.IfaceName ifn true
     let ifaceNames =
