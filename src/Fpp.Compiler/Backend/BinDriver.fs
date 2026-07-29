@@ -39,6 +39,15 @@ type St =
       /// BY VALUE, so these live in a one-field $cell and the copy that
       /// lands in the closure's env is a copy of the CELL REFERENCE
       CellVars : Dict<string * int, bool>
+      /// class machinery: obj records (carry __desc), class ids, dispatch
+      /// slots, interface implementors, subclass sets
+      ObjRec : Dict<string, bool>
+      ClassName : Dict<string, bool>
+      DescIdOf : Dict<string, int>
+      SlotOf : Dict<string * string, int>
+      IfaceName : Dict<string, bool>
+      ImplsOf : Dict<string, string list>
+      SubsOf : Dict<string, string list>
       /// curry wrappers requested for top-level functions used first-class:
       /// name -> arity, plus request order (bodies are emitted LAST, and
       /// their decls land last too, so decl order still equals body order)
@@ -630,6 +639,194 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         gcT f "ref.cast" "$str"
         emitNode st f lv cs
         callf f "$strTrimEndChars"
+    | EIfaceCall (iface, mname, recv, args) ->
+        (match dictTryFind st.SlotOf (iface, mname) with
+         | Some slot ->
+             let t = freshLocal f "$dv" "anyref"
+             let ft = "$v" + string (1 + List.length args)
+             let dispatch () =
+                 lg f t
+                 for a in args do emitNode st f lv a
+                 lg f t
+                 gcT f "ref.cast" "$obj"
+                 gcTF f "struct.get" "$obj" 0
+                 gcT f "ref.cast" "$desc"
+                 gcTF f "struct.get" "$desc" 1
+                 ic f slot
+                 gcT f "array.get" "$vt"
+                 gcT f "ref.cast" ft
+                 callRef f ft
+             emitNode st f lv recv
+             ls f t
+             // lists and arrays ARE seqs but carry no vtable: pre-test the
+             // representation and route to the built-in iterators
+             if iface = "IEnumerable" && mname = "GetEnumerator" then
+                 lg f t
+                 callf f "$isBuiltinSeq"
+                 ifA f
+                 lg f t
+                 callf f "$iterNew"
+                 elseB f
+                 dispatch ()
+                 endB f
+             elif iface = "IEnumerator" && (mname = "MoveNext" || mname = "Current") then
+                 lg f t
+                 gcT f "ref.test" "$iter"
+                 ifA f
+                 lg f t
+                 callf f (if mname = "MoveNext" then "$iterNext" else "$iterCur")
+                 elseB f
+                 dispatch ()
+                 endB f
+             else dispatch ()
+         | None ->
+             err st ("binary: no dispatch slot for " + iface + "." + mname)
+             refNull f "any")
+    | ETypeTest (tn, e2) ->
+        // list/array/string test their representation; a class tests its
+        // descriptor id against itself and its subclasses; an interface
+        // against its implementors. GUARDED: a non-object answers false.
+        let t = freshLocal f "$bq" "anyref"
+        emitNode st f lv e2
+        ls f t
+        let idOf () =
+            lg f t
+            gcT f "ref.cast" "$obj"
+            gcTF f "struct.get" "$obj" 0
+            gcT f "ref.cast" "$desc"
+            gcTF f "struct.get" "$desc" 0
+        let classIdTest (classes : string list) =
+            let hits = classes |> List.filter (fun c -> (dictTryFind st.ObjRec c).IsSome)
+            lg f t
+            gcT f "ref.test" "$obj"
+            ifV f "i32"
+            (match hits with
+             | [] -> ic f 0
+             | first :: rest ->
+                 idOf ()
+                 ic f (dictTryFind st.DescIdOf first).Value
+                 ins f "i32.eq"
+                 for c in rest do
+                     idOf ()
+                     ic f (dictTryFind st.DescIdOf c).Value
+                     ins f "i32.eq"
+                     ins f "i32.or")
+            elseB f
+            ic f 0
+            endB f
+            refI31 f
+        if tn = "list" then
+            lg f t
+            ins f "ref.is_null"
+            lg f t
+            gcT f "ref.test" "$cons"
+            ins f "i32.or"
+            refI31 f
+        elif tn = "array" then
+            lg f t
+            callf f "$isArrayRep"
+            refI31 f
+        elif tn = "string" then
+            lg f t
+            gcT f "ref.test" "$str"
+            refI31 f
+        elif (dictTryFind st.ObjRec tn).IsSome then
+            classIdTest (match dictTryFind st.SubsOf tn with Some s -> s | None -> [ tn ])
+        elif (dictTryFind st.IfaceName tn).IsSome then
+            classIdTest (match dictTryFind st.ImplsOf tn with Some s -> s | None -> [])
+        else
+            err st ("binary: cannot type-test against " + tn + ": not a class")
+            refNull f "any"
+    | ECast (_, e2, false) ->
+        // widening: representation unchanged, nothing to do at runtime
+        emitNode st f lv e2
+    | ECast (tn, e2, true) ->
+        // a downcast CHECKS (representation is uniform); null casts to null
+        let t = freshLocal f "$bq" "anyref"
+        emitNode st f lv e2
+        ls f t
+        let idOf () =
+            lg f t
+            gcT f "ref.cast" "$obj"
+            gcTF f "struct.get" "$obj" 0
+            gcT f "ref.cast" "$desc"
+            gcTF f "struct.get" "$desc" 0
+        let classIdTest (classes : string list) =
+            let hits = classes |> List.filter (fun c -> (dictTryFind st.ObjRec c).IsSome)
+            lg f t
+            gcT f "ref.test" "$obj"
+            ifV f "i32"
+            (match hits with
+             | [] -> ic f 0
+             | first :: rest ->
+                 idOf ()
+                 ic f (dictTryFind st.DescIdOf first).Value
+                 ins f "i32.eq"
+                 for c in rest do
+                     idOf ()
+                     ic f (dictTryFind st.DescIdOf c).Value
+                     ins f "i32.eq"
+                     ins f "i32.or")
+            elseB f
+            ic f 0
+            endB f
+        let emitOk () =
+            if tn = "list" then
+                lg f t
+                ins f "ref.is_null"
+                lg f t
+                gcT f "ref.test" "$cons"
+                ins f "i32.or"
+            elif tn = "array" then
+                lg f t
+                callf f "$isArrayRep"
+            elif tn = "string" then
+                lg f t
+                gcT f "ref.test" "$str"
+            elif tn = "seq" || tn = "IEnumerable" then
+                lg f t
+                callf f "$isBuiltinSeq"
+                lg f t
+                gcT f "ref.test" "$obj"
+                ins f "i32.or"
+            elif (dictTryFind st.IfaceName tn).IsSome then
+                classIdTest (match dictTryFind st.ImplsOf tn with Some s -> s | None -> [])
+            else
+                classIdTest (match dictTryFind st.SubsOf tn with Some s -> s | None -> [ tn ])
+        if not ((dictTryFind st.ObjRec tn).IsSome || (dictTryFind st.IfaceName tn).IsSome
+                || tn = "list" || tn = "array" || tn = "string" || tn = "seq" || tn = "IEnumerable") then
+            err st ("binary: cannot downcast to " + tn + ": not a class")
+            refNull f "any"
+        else
+            lg f t
+            ins f "ref.is_null"
+            emitOk ()
+            ins f "i32.or"
+            ifA f
+            lg f t
+            elseB f
+            (match dictTryFind st.CaseTag "InvalidCast" with
+             | Some tg ->
+                 ic f tg
+                 emitNode st f lv (ELit (LString ("\"invalid cast to " + tn + "\"")))
+                 gcT f "struct.new" "$du1"
+                 throwExn f
+             | None -> ins f "unreachable")
+            endB f
+    | EUnknown "hash" ->
+        requestWrapper st f "$hashvBoxed" 1
+        rf f "$hashvBoxed.w0"
+        refNull f "any"
+        gcT f "struct.new" "$clo"
+    | EApp (EUnknown pd, [ a ]) when
+        pd.StartsWith "pad0#" || pd.StartsWith "padl#" || pd.StartsWith "padr#" ->
+        let width = pd.Substring 5
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        ic f (int width)
+        ic f (if pd.StartsWith "pad0#" then 48 else 32)
+        ic f (if pd.StartsWith "padl#" then 1 else 0)
+        callf f "$strPad"
     | EApp (EUnknown "compare", [ a; b ]) ->
         emitNode st f lv a
         emitNode st f lv b
@@ -732,6 +929,24 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
          | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
+    | EApp (EUnknown "printb", [ a ]) ->
+        // Boolean.ToString spells it with a capital
+        emitNode st f lv a
+        callf f "$toi"
+        ins f "i32.eqz"
+        ifE f
+        for c in [ 70; 97; 108; 115; 101 ] do ic f c
+        arrNewFixed f "$str" 5
+        callf f "$prints"
+        elseB f
+        for c in [ 84; 114; 117; 101 ] do ic f c
+        arrNewFixed f "$str" 4
+        callf f "$prints"
+        endB f
+        ic f 10
+        callf f "$putc"
+        ic f 0
+        refI31 f
     | EApp (EUnknown "printc", [ a ]) ->
         // a char prints as the character, not its code
         emitNode st f lv a
@@ -964,6 +1179,11 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
              for fname in order do
                  (match fields |> List.tryFind (fun (fn, _) -> fn = fname) with
                   | Some (_, v) -> emitNode st f lv v
+                  | None when fname = "__desc" && (dictTryFind st.ObjRec rn).IsSome ->
+                      gg f ("$desc_" + rn)
+                  | None when fname = "__idhash" ->
+                      ic f 0
+                      refI31 f
                   | None ->
                       err st ("binary: missing field " + fname + " in " + rn)
                       refNull f "any")
@@ -1352,7 +1572,109 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           Wrappers = dictNew (); WrapperOrder = vecNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
           LamName = refMapNew (fun (_ : Expr) -> 7)
-          LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls }
+          LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls
+          ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
+          SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
+          SubsOf = dictNew () }
+    // ---- class machinery tables (pure, over the decls) ---------------------
+    let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
+    let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
+    let isClassName (n : string) = classDecls |> List.exists (fun (cn, _, _, _) -> cn = n)
+    let baseOf (n : string) = classDecls |> List.tryPick (fun (cn, b, _, _) -> if cn = n then b else None)
+    let ownMembersOf (n : string) = classDecls |> List.tryPick (fun (cn, _, own, _) -> if cn = n then Some own else None)
+    let rec chainOf (n : string) : string list =
+        match baseOf n with
+        | Some b when b <> n -> n :: chainOf b
+        | _ -> [ n ]
+    let subclassesOf (n : string) =
+        let derived =
+            classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
+        if List.isEmpty derived then [ n ] else derived
+    let interfaceDecls = decls |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
+    let vtableSlots =
+        ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> i, mn)))
+         @ (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> i, mn)))))
+        |> List.distinct
+        |> List.sort
+    let slotImpl (cn : string) (owner : string) (mn : string) : VarId option =
+        let fromIface =
+            chainOf cn
+            |> List.tryPick (fun c ->
+                classDecls
+                |> List.tryPick (fun (n2, _, _, impls) ->
+                    if n2 <> c then None
+                    else impls |> List.tryPick (fun (i, ms) -> if i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+        match fromIface with
+        | Some v -> Some v
+        | None ->
+            if List.contains owner (chainOf cn) then
+                chainOf cn
+                |> List.tryPick (fun c ->
+                    ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
+            else None
+    // slots 0 and 1 of every vtable are Equals and GetHashCode
+    let identitySlots = 2
+    let declaredMembers =
+        decls |> List.choose (fun d -> match d with DMembers (n, own) -> Some (n, own) | _ -> None)
+    let identityImpl (cn : string) (name : string) : VarId option =
+        chainOf cn
+        |> List.tryPick (fun c ->
+            let fromClass =
+                ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None))
+            match fromClass with
+            | Some v -> Some v
+            | None ->
+                declaredMembers
+                |> List.tryPick (fun (n, own) ->
+                    if n <> c then None
+                    else own |> List.tryPick (fun (mm, v) -> if mm = name then Some v else None)))
+    let rawRecords = decls |> List.choose (fun d -> match d with DRecord (n, _, fs, stf) -> Some (n, fs, stf) | _ -> None)
+    let rec expandedFields (n : string) : (string * string) list =
+        match rawRecords |> List.tryPick (fun (rn, fs, _) -> if rn = n then Some fs else None) with
+        | None -> []
+        | Some fs ->
+            match baseOf n with
+            | Some b when b <> n -> expandedFields b @ fs
+            | _ -> fs
+    let isObjRecord (n : string) = rawRecords |> List.exists (fun (rn, _, stf) -> rn = n && not stf)
+    let objRecordNames = rawRecords |> List.filter (fun (_, _, stf) -> not stf) |> List.map (fun (n, _, _) -> n)
+    let descId (n : string) = objRecordNames |> List.findIndex (fun rn -> rn = n)
+    // populate the St-side lookup tables emitNode dispatches through
+    for n in objRecordNames do
+        dictSet st.ObjRec n true
+        dictSet st.DescIdOf n (descId n)
+    for cn, _, _, _ in classDecls do
+        dictSet st.ClassName cn true
+        dictSet st.SubsOf cn (subclassesOf cn)
+    vtableSlots |> List.iteri (fun i (ifn, mn) -> dictSet st.SlotOf (ifn, mn) (i + identitySlots))
+    for ifn, _ in interfaceDecls do dictSet st.IfaceName ifn true
+    let ifaceNames =
+        (interfaceDecls |> List.map fst)
+        @ (classImpls |> List.collect (fun (_, impls) -> impls |> List.map fst))
+        |> List.distinct
+    for ifn in ifaceNames do
+        dictSet st.IfaceName ifn true
+        let impls =
+            classImpls
+            |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> i = ifn))
+            |> List.collect (fun (cn, _) -> subclassesOf cn)
+            |> List.distinct
+            |> List.filter isObjRecord
+        dictSet st.ImplsOf ifn impls
+    // arity of every top-level function, for iface dispatch types
+    let dletArity = dictNew<string * int, int> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam (ps, _)) -> dictSet dletArity (v.Path, v.Offset) (List.length ps)
+        | _ -> ()
+    let ifaceArities =
+        classDecls
+        |> List.collect (fun (cn, _, _, _) ->
+            vtableSlots
+            |> List.choose (fun (i, mn) ->
+                slotImpl cn i mn |> Option.bind (fun v -> dictTryFind dletArity (v.Path, v.Offset))))
+        |> List.distinct
+    let vArities = ([ 1; 2; 3 ] @ ifaceArities) |> List.distinct |> List.sort
     // tags in declaration order, like the text prepass
     let mutable tag = 0
     for d in decls do
@@ -1363,19 +1685,31 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                 dictSet st.CaseArity cn ar
                 tag <- tag + 1
         | _ -> ()
-    frame m [ 1; 2; 3 ] [ 2; 3 ]
+    frame m vArities [ 2; 3 ]
     // record types: UNIFORM anyref fields (scalarization is a parity task,
-    // not a bring-up task); names as declared, stamped clones included
-    for d in decls do
-        match d with
-        | DRecord (rn, _, fs, _) ->
-            let names = fs |> List.map fst
-            dictSet st.FieldsOf rn names
-            names |> List.iteri (fun i fn ->
-                dictSet st.FieldIdx (rn, fn) i
-                dictSet st.FieldOwner fn rn)
+    // not a bring-up task). Every OBJ record carries __desc; classes add
+    // __idhash and inherit their base's fields as a prefix — that layout is
+    // what makes an upcast free. Bases are declared before derived types
+    // (their type index must exist), so order by chain depth.
+    let orderedRecords =
+        rawRecords
+        |> List.sortBy (fun (rn, _, stf) ->
+            if stf || not (isClassName rn) then 0 else List.length (chainOf rn))
+    for rn, fs0, stf in orderedRecords do
+        let fields =
+            if stf then fs0
+            elif isClassName rn then ("__desc", "r") :: ("__idhash", "int") :: expandedFields rn
+            else ("__desc", "r") :: fs0
+        let names = fields |> List.map fst
+        dictSet st.FieldsOf rn names
+        names |> List.iteri (fun i fn ->
+            dictSet st.FieldIdx (rn, fn) i
+            if fn <> "__desc" && fn <> "__idhash" then dictSet st.FieldOwner fn rn)
+        if not stf && isObjRecord rn then
+            let super = match baseOf rn with Some b when b <> rn -> "$r_" + b | _ -> "$obj"
+            tyStructSub m ("$r_" + rn) super false (names |> List.map (fun _ -> fld true "anyref"))
+        else
             tyStruct m ("$r_" + rn) (names |> List.map (fun _ -> fld true "anyref"))
-        | _ -> ()
     rtTypes2 m
     rtTypes3 m
     rtTypes4 m
@@ -1383,6 +1717,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes6 m
     rtTypes7 m
     rtTypes8 m
+    rtTypes9 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -1392,6 +1727,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls6 m
     rtDecls7 m
     rtDecls8 m
+    rtDecls9 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -1421,6 +1757,45 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             dictSet st.GlobalOf (v.Path, v.Offset) g
             globalAnyref m g
         | _ -> ()
+    // generated identity per obj record, then the descriptor globals — the
+    // member fns those vtables reference are all declared by now
+    globalI32Mut m "$nextid" 0
+    let identityAdapters = vecNew<string * int * string> ()
+    for rn in objRecordNames do
+        declFn m ("$eq_" + rn) "$u1"
+        declFn m ("$hash_" + rn) "$v1"
+    let slotFnName (v : VarId) : string option =
+        match dictTryFind dletArity (v.Path, v.Offset) with
+        | Some _ -> Some (mangle v)
+        | None -> None
+    let descSlots =
+        objRecordNames
+        |> List.map (fun cn ->
+            let identity =
+                [ "Equals", "$eq_" + cn, 2; "GetHashCode", "$hash_" + cn, 1 ]
+                |> List.map (fun (mname, generated, wantArity) ->
+                    match identityImpl cn mname with
+                    | Some v ->
+                        (match slotFnName v, dictTryFind dletArity (v.Path, v.Offset) with
+                         | Some fn, Some actual when actual = wantArity -> fn
+                         | Some fn, Some actual when actual = wantArity + 1 ->
+                             // GetHashCode() carries a unit argument: adapt
+                             let ad = "$adapt" + string wantArity + "_" + cn + "_" + mname
+                             vecAdd identityAdapters (ad, wantArity, fn)
+                             ad
+                         | _ -> generated)
+                    | None -> generated)
+            let slots =
+                vtableSlots
+                |> List.map (fun (i, mn) ->
+                    match slotImpl cn i mn with
+                    | Some v -> (match slotFnName v with Some fn -> fn | None -> "")
+                    | None -> "")
+            cn, identity @ slots)
+    for ad, arity, _ in vecToList identityAdapters do
+        declFn m ad ("$v" + string arity)
+    for cn, slots in descSlots do
+        globalDesc m ("$desc_" + cn) (descId cn) slots
     // lambdas discovered only AFTER globals/functions are registered, so
     // the capture filter (below) can exclude them — a global or a known
     // function resolves directly and is never an env slot
@@ -1451,6 +1826,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore6 m
     rtCore7 m [ 2; 3 ]
     rtCore8 m
+    rtCore9 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
@@ -1473,6 +1849,104 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             emitWithLocals st f lv (mangle v) body true |> ignore
             endFn f
         | _ -> ()
+    // generated identity bodies — a record compares and hashes over its
+    // fields; a class is reference-equal with a lazily assigned id number
+    // (wasm-GC exposes no identity of its own: ref.eq compares, it does
+    // not number)
+    for rn in objRecordNames do
+        let fieldCount = (dictTryFind st.FieldsOf rn).Value.Length
+        let rt = "$r_" + rn
+        // $eq_rn
+        let f = beginFn m [ "$a"; "$b" ]
+        localsDone f
+        if isClassName rn then
+            lg f "$a"
+            castEq f
+            lg f "$b"
+            castEq f
+            ins f "ref.eq"
+            refI31 f
+        else
+            for i in 1 .. fieldCount - 1 do
+                lg f "$a"
+                gcT f "ref.cast" rt
+                gcTF f "struct.get" rt i
+                lg f "$b"
+                gcT f "ref.cast" rt
+                gcTF f "struct.get" rt i
+                callf f "$equal"
+                gcAbs f "ref.cast" "i31"
+                i31get f
+                ins f "i32.eqz"
+                ifE f
+                ic f 0
+                refI31 f
+                ret f
+                endB f
+            ic f 1
+            refI31 f
+        endFn f
+        // $hash_rn
+        let f = beginFn m [ "$v" ]
+        local f "$h" "i32"
+        localsDone f
+        if isClassName rn then
+            lg f "$v"
+            gcT f "ref.cast" rt
+            gcTF f "struct.get" rt 1
+            callf f "$toi"
+            ls f "$h"
+            lg f "$h"
+            ins f "i32.eqz"
+            ifE f
+            gg f "$nextid"
+            ic f 1
+            ins f "i32.add"
+            gs f "$nextid"
+            gg f "$nextid"
+            ls f "$h"
+            lg f "$v"
+            gcT f "ref.cast" rt
+            lg f "$h"
+            callf f "$ofi"
+            gcTF f "struct.set" rt 1
+            endB f
+            // spread the sequential ids so they do not cluster in a table
+            lg f "$h"
+            ic f -1640531527
+            ins f "i32.mul"
+            refI31 f
+        else
+            let firstField = 1
+            if fieldCount <= firstField then
+                ic f (descId rn)
+                refI31 f
+            else
+                lg f "$v"
+                gcT f "ref.cast" rt
+                gcTF f "struct.get" rt firstField
+                callf f "$hashv"
+                for i in firstField + 1 .. fieldCount - 1 do
+                    ic f 31
+                    ins f "i32.mul"
+                    lg f "$v"
+                    gcT f "ref.cast" rt
+                    gcTF f "struct.get" rt i
+                    callf f "$hashv"
+                    ins f "i32.add"
+                refI31 f
+        endFn f
+    // identity adapters: the override carries a unit argument the slot
+    // does not; pass one
+    for _, arity, target in vecToList identityAdapters do
+        let names = List.init arity (fun i -> "$p" + string i)
+        let f = beginFn m names
+        localsDone f
+        for n in names do lg f n
+        ic f 0
+        refI31 f
+        callf f target
+        endFn f
     // lambda bodies: param + env; captured keys read from the env array.
     // The capture FILTER at each build site is "is it a local there", so the
     // body maps every free key optimistically; unreached slots never read.

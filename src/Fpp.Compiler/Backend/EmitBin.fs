@@ -831,6 +831,44 @@ let globalVt (m : Mod) (name : string) (fns : string list) : unit =
     emitU32 m.GlobalBody (List.length fns)
     emitByte m.GlobalBody opEnd
 
+/// a per-class descriptor global: (ref $desc) = struct.new $desc (id, vtable)
+/// with "" slots as ref.null func
+let globalDesc (m : Mod) (name : string) (id : int) (slots : string list) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitRefType m.GlobalBody false (tyIdx m "$desc")
+    emitByte m.GlobalBody 0
+    emitByte m.GlobalBody opI32Const
+    emitS32 m.GlobalBody id
+    for fn in slots do
+        if fn = "" then
+            emitByte m.GlobalBody (opByte "ref.null")
+            emitS32 m.GlobalBody (heapByte "func" - 0x80)
+        else
+            emitByte m.GlobalBody (opByte "ref.func")
+            emitU32 m.GlobalBody (funcIdx m fn)
+            if not (dictTryFind m.Declared fn).IsSome then
+                dictSet m.Declared fn true
+                vecAdd m.DeclaredOrder fn
+    emitByte m.GlobalBody opGcPrefix
+    emitU32 m.GlobalBody (gcByte "array.new_fixed")
+    emitU32 m.GlobalBody (tyIdx m "$vt")
+    emitU32 m.GlobalBody (List.length slots)
+    emitByte m.GlobalBody opGcPrefix
+    emitU32 m.GlobalBody (gcByte "struct.new")
+    emitU32 m.GlobalBody (tyIdx m "$desc")
+    emitByte m.GlobalBody opEnd
+
+/// a mutable i32 global with a constant initializer
+let globalI32Mut (m : Mod) (name : string) (init : int) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitByte m.GlobalBody (valByte "i32")
+    emitByte m.GlobalBody 1
+    emitByte m.GlobalBody opI32Const
+    emitS32 m.GlobalBody init
+    emitByte m.GlobalBody opEnd
+
 let rtDecls3 (m : Mod) : unit =
     declFn m "$strcat" "$rt_ss2a"
     declFn m "$eq_du_default" "$u1"
@@ -1122,6 +1160,44 @@ let rtCore3 (m : Mod) (tupArities : int list) : unit =
     gcT f "ref.cast" "$cons"
     gcTF f "struct.get" "$cons" 1
     callf f "$equal"
+    ret f
+    endB f
+    // any reference type: descriptors are per-type, so two values whose
+    // descriptors differ are of different types and cannot be equal — the
+    // shape test alone is NOT sound, wasm-GC canonicalizes same-shaped
+    // structs into one heap type
+    lg f "$a"
+    gcT f "ref.test" "$obj"
+    lg f "$b"
+    gcT f "ref.test" "$obj"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    castEq f
+    lg f "$b"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    castEq f
+    ins f "ref.eq"
+    ins f "i32.eqz"
+    ifE f
+    ic f 0
+    refI31 f
+    ret f
+    endB f
+    lg f "$a"
+    lg f "$b"
+    lg f "$a"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    gcT f "ref.cast" "$desc"
+    gcTF f "struct.get" "$desc" 1
+    ic f 0
+    gcT f "array.get" "$vt"
+    gcT f "ref.cast" "$v2"
+    callRef f "$v2"
     ret f
     endB f
     // fallback: identity
@@ -2910,6 +2986,226 @@ let rtCore8 (m : Mod) : unit =
     ic f 0
     lg f "$b"
     callf f "$strsub"
+    endFn f
+
+// ---- runtime: enumeration protocol and object identity helpers -------------
+// Lists and arrays ARE seqs but carry no vtable: $iterNew wraps whichever
+// representation arrives, $iterNext/$iterCur drive it.
+
+let rtTypes9 (m : Mod) : unit =
+    tyFunc m "$rt_ai2a" [ "anyref"; "i32" ] [ "anyref" ]
+    tyFunc m "$rt_siii2a" [ "$str"; "i32"; "i32"; "i32" ] [ "anyref" ]
+
+let rtDecls9 (m : Mod) : unit =
+    declFn m "$isBuiltinSeq" "$rt_a2i"
+    declFn m "$isArrayRep" "$rt_a2i"
+    declFn m "$iterNew" "$rt_a2a"
+    declFn m "$arrGetAny" "$rt_ai2a"
+    declFn m "$iterNext" "$rt_a2a"
+    declFn m "$iterCur" "$rt_a2a"
+    declFn m "$hashvBoxed" "$v1"
+    declFn m "$strPad" "$rt_siii2a"
+
+let rtCore9 (m : Mod) : unit =
+    // $isBuiltinSeq
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    ins f "ref.is_null"
+    for ty in [ "$cons"; "$arr"; "$parr_i"; "$parr_f"; "$parr_s"; "$parr_l"; "$parr_h" ] do
+        lg f "$v"
+        gcT f "ref.test" ty
+        ins f "i32.or"
+    endFn f
+    // $isArrayRep
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.test" "$arr"
+    for ty in [ "$parr_i"; "$parr_f"; "$parr_s"; "$parr_l"; "$parr_h" ] do
+        lg f "$v"
+        gcT f "ref.test" ty
+        ins f "i32.or"
+    endFn f
+    // $iterNew: mode 0 = list (cons chain), mode 1 = array (indexing)
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    ins f "ref.is_null"
+    lg f "$v"
+    gcT f "ref.test" "$cons"
+    ins f "i32.or"
+    ifA f
+    ic f 0
+    refNull f "any"
+    lg f "$v"
+    ic f 0
+    gcT f "struct.new" "$iter"
+    elseB f
+    ic f 1
+    lg f "$v"
+    refNull f "any"
+    ic f 0
+    gcT f "struct.new" "$iter"
+    endB f
+    endFn f
+    // $arrGetAny: one element of ANY array representation, boxed uniformly
+    let f = beginFn m [ "$v"; "$i" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.test" "$arr"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$arr"
+    lg f "$i"
+    gcT f "array.get" "$arr"
+    ret f
+    endB f
+    for ty, box_, get in
+        [ "$parr_i", "$ofi", "array.get"
+          "$parr_f", "$off", "array.get"
+          "$parr_s", "$oss", "array.get"
+          "$parr_l", "$ofl", "array.get"
+          "$parr_h", "$ofi", "array.get_u" ] do
+        lg f "$v"
+        gcT f "ref.test" ty
+        ifE f
+        lg f "$v"
+        gcT f "ref.cast" ty
+        lg f "$i"
+        gcT f get ty
+        callf f box_
+        ret f
+        endB f
+    ic f 0
+    refI31 f
+    endFn f
+    // $iterNext
+    let f = beginFn m [ "$st" ]
+    local f "$it" "$iter"
+    local f "$rest" "anyref"
+    local f "$i" "i32"
+    localsDone f
+    lg f "$st"
+    gcT f "ref.cast" "$iter"
+    ls f "$it"
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 0
+    ins f "i32.eqz"
+    ifA f
+    // list: advance the cons chain
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 2
+    ls f "$rest"
+    lg f "$rest"
+    ins f "ref.is_null"
+    ifA f
+    ic f 0
+    refI31 f
+    elseB f
+    lg f "$it"
+    lg f "$rest"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    gcTF f "struct.set" "$iter" 1
+    lg f "$it"
+    lg f "$rest"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    gcTF f "struct.set" "$iter" 2
+    ic f 1
+    refI31 f
+    endB f
+    elseB f
+    // array: bump the index
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 3
+    ls f "$i"
+    lg f "$i"
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 1
+    callf f "$lenv"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i32.ge_s"
+    ifA f
+    ic f 0
+    refI31 f
+    elseB f
+    lg f "$it"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    gcTF f "struct.set" "$iter" 3
+    ic f 1
+    refI31 f
+    endB f
+    endB f
+    endFn f
+    // $iterCur
+    let f = beginFn m [ "$st" ]
+    local f "$it" "$iter"
+    localsDone f
+    lg f "$st"
+    gcT f "ref.cast" "$iter"
+    ls f "$it"
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 0
+    ins f "i32.eqz"
+    ifA f
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 1
+    elseB f
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 1
+    lg f "$it"
+    gcTF f "struct.get" "$iter" 3
+    ic f 1
+    ins f "i32.sub"
+    callf f "$arrGetAny"
+    endB f
+    endFn f
+    // $hashvBoxed: `hash` as a VALUE
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    callf f "$hashv"
+    callf f "$ofi"
+    endFn f
+    // $strPad
+    let f = beginFn m [ "$v"; "$w"; "$c"; "$left" ]
+    local f "$n" "i32"
+    local f "$r" "$str"
+    local f "$off" "i32"
+    localsDone f
+    lg f "$v"
+    gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    lg f "$w"
+    ins f "i32.ge_u"
+    ifE f
+    lg f "$v"
+    ret f
+    endB f
+    lg f "$c"
+    lg f "$w"
+    gcT f "array.new" "$str"
+    ls f "$r"
+    ic f 0
+    lg f "$w"
+    lg f "$n"
+    ins f "i32.sub"
+    lg f "$left"
+    ins f "select"
+    ls f "$off"
+    lg f "$r"
+    lg f "$off"
+    lg f "$v"
+    ic f 0
+    lg f "$n"
+    arrCopy f "$str" "$str"
+    lg f "$r"
     endFn f
 
 let rtCore4 (m : Mod) : unit =

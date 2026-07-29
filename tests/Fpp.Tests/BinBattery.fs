@@ -180,6 +180,55 @@ let binBattery =
               "    print (sprintf \"%d-%s\" 5 \"x\")" ]
             "5-x\n"
 
+        expects "for-loop over a list (seq protocol)"
+            [ "let go ="
+              "    let mutable s = 0"
+              "    for x in [1; 2; 3] do"
+              "        s <- s + x"
+              "    print s" ]
+            "6\n"
+
+        expects "class: constructor and member call"
+            [ "type Calc(bias : int) ="
+              "    member x.Add(a : int) = a + bias"
+              "let go ="
+              "    let c = Calc(100)"
+              "    print (c.Add 5)" ]
+            "105\n"
+
+        expects "records are structural, classes are reference-equal"
+            [ "type P = { X : int; Y : int }"
+              "type Box(v : int) ="
+              "    member x.V = v"
+              "let go ="
+              "    if { X = 1; Y = 2 } = { X = 1; Y = 2 } then print 1 else print 0"
+              "    let a = Box(7)"
+              "    if a = Box(7) then print 1 else print 0"
+              "    if a = a then print 1 else print 0" ]
+            "1\n0\n1\n"
+
+        expects "interface dispatch through the vtable"
+            [ "type IShape ="
+              "    abstract member Area : unit -> int"
+              "type Sq(s : int) ="
+              "    interface IShape with"
+              "        member x.Area () = s * s"
+              "let go ="
+              "    let sh = Sq(4) :> IShape"
+              "    print (sh.Area ())" ]
+            "16\n"
+
+        expects "type tests read the descriptor id"
+            [ "type A() ="
+              "    member x.N = 1"
+              "type B() ="
+              "    member x.N = 2"
+              "let go ="
+              "    let o = box (A())"
+              "    if (o :? A) then print 1 else print 0"
+              "    if (o :? B) then print 1 else print 0" ]
+            "1\n0\n"
+
         expects "arrays: zeroCreate, index get/set, Length"
             [ "let go ="
               "    let a = Array.zeroCreate 3"
