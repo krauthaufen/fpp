@@ -7,7 +7,7 @@ open Fpp
 //
 // Stage-0 is the dotnet-built compiler. Stage-1 is the compiler AS WASM —
 // stage-0's output for the compiler's own 20 sources plus the driver in
-// tests/bootstrap/compiledrive.fpp. Both then compile the same corpus, and
+// tests/bootstrap/compiledrive-bin.fpp. Both then compile the same corpus, and
 // their .wat must agree byte for byte. Anything else is the compiler
 // miscompiling itself.
 //

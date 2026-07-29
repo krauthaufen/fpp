@@ -12,7 +12,7 @@ let private oracleFile (relPath : string) (stripPrefix : string) =
     let src = System.IO.File.ReadAllText (root + "/" + relPath)
     let ws = Workspace()
     ws.SetFileText relPath src
-    let wat, errs = ws.EmitProgram ()
+    let bytes, errs = ws.EmitProgramWasm ()
     Expect.isEmpty errs "compiles"
     let run (exe : string) (args : string) =
         let psi = System.Diagnostics.ProcessStartInfo(exe, args)
@@ -23,10 +23,10 @@ let private oracleFile (relPath : string) (stripPrefix : string) =
         p.StandardError.ReadToEnd() |> ignore
         p.WaitForExit()
         o
-    let tmp = System.IO.Path.GetTempFileName() + ".wat"
-    System.IO.File.WriteAllText(tmp, wat)
+    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+    System.IO.File.WriteAllBytes(tmp, bytes)
     let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-    let actual = run (home + "/.wasmtime/bin/wasmtime") ("-W exceptions=y " + tmp)
+    let actual = run (home + "/.wasmtime/bin/wasmtime") ("run -W gc=y,exceptions=y " + tmp)
     System.IO.File.Delete tmp
     let body =
         src.Split '\n'
@@ -72,10 +72,10 @@ let libraryTests =
             let src = System.IO.File.ReadAllText (root + "/examples/hashmap.fpp")
             let ws = Workspace()
             ws.SetFileText "hashmap.fpp" src
-            let wat, errs = ws.EmitProgram ()
+            let bytes, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "compiles"
-            let tmp = System.IO.Path.GetTempFileName() + ".wat"
-            System.IO.File.WriteAllText(tmp, wat)
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
             let run (exe : string) (args : string) =
                 let psi = System.Diagnostics.ProcessStartInfo(exe, args)
                 psi.RedirectStandardOutput <- true
@@ -86,7 +86,7 @@ let libraryTests =
                 p.WaitForExit()
                 o
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let actual = run (home + "/.wasmtime/bin/wasmtime") ("-W exceptions=y " + tmp)
+            let actual = run (home + "/.wasmtime/bin/wasmtime") ("run -W gc=y,exceptions=y " + tmp)
             System.IO.File.Delete tmp
             let body =
                 src.Split '\n'
@@ -151,13 +151,13 @@ let acceptanceTests =
             let ws = Workspace()
             ws.SetFileText "HashCollections.fpp" (src + usage)
             Expect.isEmpty (ws.Diagnostics "HashCollections.fpp") "type-checks"
-            let wat, errs = ws.EmitProgram ()
+            let bytes, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "compiles"
-            let tmp = System.IO.Path.GetTempFileName() + ".wat"
-            System.IO.File.WriteAllText(tmp, wat)
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
             let psi =
                 let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-                System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "-W exceptions=y " + tmp)
+                System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W gc=y,exceptions=y " + tmp)
             psi.RedirectStandardOutput <- true
             psi.RedirectStandardError <- true
             let actual, err, code =

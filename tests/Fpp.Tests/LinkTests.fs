@@ -28,13 +28,13 @@ let linkTests =
                     "let a = print (double 21)"
                     "let c = print (sumTo 100)"
                     "" ])
-            let wat, errs = ws.EmitProgram ()
+            let bytes, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "app links"
-            Expect.isFalse (wat.Contains "unusedHelper") "dead code eliminated"
-            let tmp = System.IO.Path.GetTempFileName() + ".wat"
-            System.IO.File.WriteAllText(tmp, wat)
+            Expect.isFalse ((System.Text.Encoding.Latin1.GetString bytes).Contains "unusedHelper") "dead code eliminated"
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "-W exceptions=y " + tmp)
+            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W gc=y,exceptions=y " + tmp)
             psi.RedirectStandardOutput <- true
             use p = System.Diagnostics.Process.Start psi
             let out = p.StandardOutput.ReadToEnd()

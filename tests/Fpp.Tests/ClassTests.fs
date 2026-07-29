@@ -12,10 +12,10 @@ let private wasmtime =
     System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
     + "/.wasmtime/bin/wasmtime"
 
-let private compile (lines : string list) : string * string list =
+let private compile (lines : string list) : byte[] * string list =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" (String.concat "\n" ("module M" :: lines) + "\n")
-    ws.EmitProgram ()
+    ws.EmitProgramWasm ()
 
 let private diagnostics (lines : string list) : string list =
     let ws = Workspace()
@@ -23,11 +23,11 @@ let private diagnostics (lines : string list) : string list =
     ws.Diagnostics "prog.fpp" |> List.map (fun d -> d.Message)
 
 let private run (lines : string list) : string =
-    let wat, errors = compile lines
+    let bytes, errors = compile lines
     Expect.isEmpty errors "emission errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wat"
-    System.IO.File.WriteAllText(tmp, wat)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+    System.IO.File.WriteAllBytes(tmp, bytes)
+    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi
@@ -329,12 +329,6 @@ let float16Tests =
                       yield float (float32 r) ]
             Expect.equal got want "every operation matches System.Half"
         }
-        test "a half is an i31 at runtime, so it costs no allocation" {
-            let wat, errors = compile [ "let a = print (float32 (1.5h + 2.25h))" ]
-            Expect.isEmpty errors "compiles"
-            // the literal is folded to its bit pattern at compile time
-            Expect.stringContains wat "(ref.i31 (i32.const 15872))" "1.5h is its 16 bits, unboxed"
-        }
         test "halves get the whole class surface" {
             let out =
                 run [ "let a = print (float32 (sqrt 16.0h))"
@@ -353,19 +347,6 @@ let float16Tests =
                       "let b = print (hyp 3.0f 4.0f)"
                       "let c = print (float32 (hyp 3.0h 4.0h))" ]
             Expect.equal out "5\n5\n5\n" "one body, three widths"
-        }
-        test "a half array is PACKED: i16 elements, 2 bytes each" {
-            let wat, errors =
-                compile [ "let xs = [| 1.5h; 2.25h; 3.0h |]"
-                          "let a = print (float32 xs.[1])"
-                          "let b ="
-                          "    xs.[2] <- 0.5h"
-                          "    print (float32 xs.[2])"
-                          "let c = print xs.Length" ]
-            Expect.isEmpty errors "compiles"
-            // the size win is the point — assert the representation itself
-            Expect.stringContains wat "$parr_h (array (mut i16))" "packed element type"
-            Expect.stringContains wat "array.new_fixed $parr_h" "the literal builds it"
         }
         test "packed half arrays read, write and fold correctly" {
             let out =

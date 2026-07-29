@@ -382,15 +382,9 @@ type Workspace() =
     /// output, and inlining legitimately removes the very functions those
     /// gates look for. Each pass is checked on its own output rather than
     /// through whatever survives the ones after it.
-    member this.EmitProgramRaw () : string * string list = this.EmitWith false
+    member this.EmitProgramWasmRaw () : byte[] * string list = this.EmitCore false
 
-    member this.EmitProgram () : string * string list = this.EmitWith true
-
-    member private this.EmitWith (optimize : bool) : string * string list =
-        match this.EmitCore optimize false with
-        | (wat, _, errs) -> wat, errs
-
-    member private this.EmitCore (optimize : bool) (binary : bool) : string * byte[] * string list =
+    member private this.EmitCore (optimize : bool) : byte[] * string list =
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
@@ -463,7 +457,7 @@ type Workspace() =
             let _, _, ds = Fpp.Core.Serialize.decodeLib text
             for d in ds do vecAdd libDecls d
         for pe in this.PluginErrors do vecAdd errs pe
-        if vecLen errs > 0 then "", [||], vecToList errs
+        if vecLen errs > 0 then [||], vecToList errs
         else
             let program = this.RunWholeProgram (vecToList libDecls @ vecToList allDecls)
             // tier-1: stamp per struct instantiation, share one body for
@@ -487,19 +481,14 @@ type Workspace() =
             // the definitions inlining made unreachable
             let opt = if optimize then Fpp.Core.Optimize.optimize mono else mono
             let linked = Fpp.Core.Link.deadCodeEliminate opt
-            if not (List.isEmpty monoErrs) then "", [||], monoErrs
-            elif binary then
+            if not (List.isEmpty monoErrs) then [||], monoErrs
+            else
                 let bytes, berrs, warns = Fpp.Backend.BinDriver.emitBinary linked
                 for w in warns do ewarn ("warn: " + w)
-                "", bytes, berrs
-            else
-                let res = Fpp.Backend.EmitWasm.emit linked
-                res.Wat, [||], res.Errors
+                bytes, berrs
 
-    /// The BINARY program: same pipeline, bytes out, no text anywhere.
-    member this.EmitProgramWasm () : byte[] * string list =
-        match this.EmitCore true true with
-        | (_, bytes, errs) -> bytes, errs
+    /// The program as a direct .wasm module: bytes out, no text anywhere.
+    member this.EmitProgramWasm () : byte[] * string list = this.EmitCore true
 
     /// Produce a fat-IR library from the current project files.
     member this.BuildLibrary () : string * string list =

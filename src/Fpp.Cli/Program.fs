@@ -43,12 +43,12 @@ let private build (out : string) (files : string list) : int =
         ws.AddLibrary l (readSource l)
     for f in srcs do
         ws.SetFileText f (readSource f)
-    let wat, errors = ws.EmitProgram ()
+    let bytes, errors = ws.EmitProgramWasm ()
     if not (List.isEmpty errors) then
         for e in errors do eprintfn "error: %s" e
         1
     else
-        System.IO.File.WriteAllText(out, wat)
+        System.IO.File.WriteAllBytes(out, bytes)
         0
 
 /// A project names its sources in compile order and its output, so `check`
@@ -87,6 +87,6 @@ let main argv =
     | _ ->
         eprintfn "usage:"
         eprintfn "  fpp check <project.fppproj> | fpp check <file>..."
-        eprintfn "  fpp build <project.fppproj> [-o out.wat] | fpp build -o out.wat <file>..."
+        eprintfn "  fpp build <project.fppproj> [-o out.wasm] | fpp build -o out.wasm <file>..."
         eprintfn "  fpp lib -o out.fppir <file>..."
         2

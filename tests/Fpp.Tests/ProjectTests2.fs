@@ -21,7 +21,7 @@ let private manifest =
     String.concat "\n"
         [ "# order is the point"
           "name demo"
-          "out demo.wat"
+          "out demo.wasm"
           "src util.fpp"
           "src main.fpp"
           "" ]
@@ -37,7 +37,7 @@ let projectFileTests =
             let r = Project.parse "/p/demo.fppproj" manifest
             Expect.isEmpty r.Errors "clean manifest"
             Expect.equal r.Loaded.Name "demo" "name"
-            Expect.equal r.Loaded.Out "demo.wat" "output"
+            Expect.equal r.Loaded.Out "demo.wasm" "output"
             Expect.equal
                 (r.Loaded.Sources |> List.map System.IO.Path.GetFileName)
                 [ "util.fpp"; "main.fpp" ]
@@ -53,7 +53,7 @@ let projectFileTests =
         }
         test "output defaults to the project name" {
             let r = Project.parse "/p/thing.fppproj" "src a.fpp\n"
-            Expect.equal r.Loaded.Out "thing.wat" "defaulted"
+            Expect.equal r.Loaded.Out "thing.wasm" "defaulted"
         }
         test "loading a project compiles across its files in order" {
             let dir = scratch "load" (("demo.fppproj", manifest) :: sources)
@@ -72,7 +72,7 @@ let projectFileTests =
             let dir = scratch "xfile" (("demo.fppproj", manifest) :: sources)
             let ws = Workspace()
             ws.LoadProject (System.IO.Path.Combine (dir, "demo.fppproj")) |> ignore
-            let _, errors = ws.EmitProgram ()
+            let _, errors = ws.EmitProgramWasm ()
             Expect.isEmpty errors "cross-file generic arithmetic emits"
             System.IO.Directory.Delete (dir, true)
         }

@@ -3392,6 +3392,161 @@ let rtCore11 (m : Mod) : unit =
     ins f "i32.or"
     endFn f
 
+// ---- runtime: half-precision widen/narrow -----------------------------------
+
+let rtTypes12 (m : Mod) : unit =
+    tyFunc m "$rt_i2fs" [ "i32" ] [ "f32" ]
+    tyFunc m "$rt_fs2i" [ "f32" ] [ "i32" ]
+
+let rtDecls12 (m : Mod) : unit =
+    declFn m "$h2f" "$rt_i2fs"
+    declFn m "$f2h" "$rt_fs2i"
+
+let rtCore12 (m : Mod) : unit =
+    // $h2f: half bits -> f32, exact
+    let f = beginFn m [ "$h" ]
+    local f "$exp" "i32"
+    local f "$man" "i32"
+    local f "$sgn" "f32"
+    localsDone f
+    lg f "$h"
+    ic f 10
+    ins f "i32.shr_u"
+    ic f 0x1f
+    ins f "i32.and"
+    ls f "$exp"
+    lg f "$h"
+    ic f 0x3ff
+    ins f "i32.and"
+    ls f "$man"
+    sc f 0xBF800000
+    sc f 0x3F800000
+    lg f "$h"
+    ic f 15
+    ins f "i32.shr_u"
+    ic f 1
+    ins f "i32.and"
+    ins f "select"
+    ls f "$sgn"
+    lg f "$exp"
+    ins f "i32.eqz"
+    ifE f
+    // zero or subnormal: mantissa * 2^-24, exact in f32
+    lg f "$sgn"
+    lg f "$man"
+    ins f "f32.convert_i32_u"
+    sc f 0x33800000
+    ins f "f32.mul"
+    ins f "f32.mul"
+    ret f
+    endB f
+    lg f "$exp"
+    ic f 0x1f
+    ins f "i32.eq"
+    ifE f
+    // infinity or NaN: rebuild with f32's exponent and a shifted payload
+    lg f "$h"
+    ic f 15
+    ins f "i32.shr_u"
+    ic f 1
+    ins f "i32.and"
+    ic f 31
+    ins f "i32.shl"
+    ic f 0x7f800000
+    lg f "$man"
+    ic f 13
+    ins f "i32.shl"
+    ins f "i32.or"
+    ins f "i32.or"
+    ins f "f32.reinterpret_i32"
+    ret f
+    endB f
+    lg f "$h"
+    ic f 15
+    ins f "i32.shr_u"
+    ic f 1
+    ins f "i32.and"
+    ic f 31
+    ins f "i32.shl"
+    lg f "$exp"
+    ic f 112
+    ins f "i32.add"
+    ic f 23
+    ins f "i32.shl"
+    lg f "$man"
+    ic f 13
+    ins f "i32.shl"
+    ins f "i32.or"
+    ins f "i32.or"
+    ins f "f32.reinterpret_i32"
+    endFn f
+    // $f2h: f32 -> half bits, round-to-nearest-even incl. subnormals
+    let f = beginFn m [ "$f" ]
+    local f "$u" "i32"
+    local f "$sign" "i32"
+    local f "$o" "i32"
+    localsDone f
+    lg f "$f"
+    ins f "i32.reinterpret_f32"
+    ls f "$u"
+    lg f "$u"
+    ic f 0x80000000
+    ins f "i32.and"
+    ls f "$sign"
+    lg f "$u"
+    lg f "$sign"
+    ins f "i32.xor"
+    ls f "$u"
+    lg f "$u"
+    ic f 0x47800000
+    ins f "i32.ge_u"
+    ifE f
+    ic f 0x7e00
+    ic f 0x7c00
+    lg f "$u"
+    ic f 0x7f800000
+    ins f "i32.gt_u"
+    ins f "select"
+    ls f "$o"
+    elseB f
+    lg f "$u"
+    ic f 0x38800000
+    ins f "i32.lt_u"
+    ifE f
+    lg f "$u"
+    ins f "f32.reinterpret_i32"
+    sc f 0x3F000000
+    ins f "f32.add"
+    ins f "i32.reinterpret_f32"
+    ic f 0x3f000000
+    ins f "i32.sub"
+    ls f "$o"
+    elseB f
+    lg f "$u"
+    ic f 0xfff
+    lg f "$u"
+    ic f 13
+    ins f "i32.shr_u"
+    ic f 1
+    ins f "i32.and"
+    ins f "i32.add"
+    ins f "i32.add"
+    ls f "$u"
+    lg f "$u"
+    ic f 13
+    ins f "i32.shr_u"
+    ic f 0x1c000
+    ins f "i32.sub"
+    ls f "$o"
+    endB f
+    endB f
+    lg f "$sign"
+    ic f 16
+    ins f "i32.shr_u"
+    lg f "$o"
+    ins f "i32.or"
+    endFn f
+
 // ---- runtime: enumeration protocol and object identity helpers -------------
 // Lists and arrays ARE seqs but carry no vtable: $iterNew wraps whichever
 // representation arrives, $iterNext/$iterCur drive it.

@@ -9,7 +9,7 @@ open Fpp.Prelude
 //
 //   # comment
 //   name demo
-//   out  demo.wat
+//   out  demo.wasm
 //   lib  vendor/thing.fppir
 //   src  util.fpp
 //   src  main.fpp
@@ -76,7 +76,7 @@ let parse (projectPath : string) (text : string) : LoadResult =
     { Loaded =
         { Path = hostCanonicalize projectPath
           Name = name
-          Out = (if out = "" then name + ".wat" else out)
+          Out = (if out = "" then name + ".wasm" else out)
           Libs = vecToList libs
           Sources = vecToList sources }
       Errors = vecToList errors }

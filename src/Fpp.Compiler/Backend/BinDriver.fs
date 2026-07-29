@@ -85,35 +85,100 @@ let private internStr (st : St) (bytes : byte[]) : string * int =
     dataSeg st.M name bytes
     name, bytes.Length
 
-// unescape for string literals — decimal/hex/named escapes, same rules as
-// the text emitter's (shared logic would be better placed in Prelude later)
+// unescape for string literals — the full three-spelling logic, ported from
+// the retired text emitter: triple-quoted is literal, verbatim folds `""`,
+// ordinary processes named/decimal/hex/unicode escapes into BYTES
+let private escapeAt (s : string) (i : int) : int * int =
+    let at k = if i + k < strLen s then charAt s (i + k) else '\000'
+    let hexVal (c : char) =
+        if c >= '0' && c <= '9' then int c - 48
+        elif c >= 'a' && c <= 'f' then int c - 87
+        elif c >= 'A' && c <= 'F' then int c - 55
+        else -1
+    let hexRun (start : int) (count : int) =
+        let mutable v = 0
+        let mutable k = 0
+        let mutable ok = true
+        while ok && k < count do
+            let d = hexVal (at (start + k))
+            if d < 0 then ok <- false else v <- v * 16 + d
+            k <- k + 1
+        if ok then Some v else None
+    match at 1 with
+    | 'n' -> 10, 2
+    | 't' -> 9, 2
+    | 'r' -> 13, 2
+    | 'a' -> 7, 2
+    | 'b' -> 8, 2
+    | 'f' -> 12, 2
+    | 'v' -> 11, 2
+    | '\\' -> 92, 2
+    | '"' -> 34, 2
+    | '\'' -> 39, 2
+    | 'x' -> (match hexRun 2 2 with Some v -> v, 4 | None -> int (at 1), 2)
+    | 'u' -> (match hexRun 2 4 with Some v -> v, 6 | None -> int (at 1), 2)
+    | 'U' -> (match hexRun 2 8 with Some v -> v, 10 | None -> int (at 1), 2)
+    | c when c >= '0' && c <= '9' ->
+        if isDigit (at 2) && isDigit (at 3) then
+            ((int (at 1) - 48) * 100 + (int (at 2) - 48) * 10 + (int (at 3) - 48)) % 256, 4
+        elif c = '0' then 0, 2
+        else int c, 2
+    | c -> int c, 2
+
 let private unescape (raw : string) : byte[] =
-    let inner =
-        if strLen raw >= 6 && charAt raw 0 = '"' && charAt raw 1 = '"' then substr raw 3 (strLen raw - 6)
-        elif strLen raw >= 3 && charAt raw 0 = '@' then substr raw 2 (strLen raw - 3)
-        elif strLen raw >= 2 then substr raw 1 (strLen raw - 2)
-        else raw
+    let raw = if strLen raw > 1 && charAt raw (strLen raw - 1) = 'B' then substr raw 0 (strLen raw - 1) else raw
+    let isTriple =
+        strLen raw >= 6 && charAt raw 0 = '"' && charAt raw 1 = '"' && charAt raw 2 = '"'
+    let isVerbatim = strLen raw >= 3 && charAt raw 0 = '@'
     let out = vecNew<byte> ()
-    let mutable i = 0
-    while i < strLen inner do
-        let c = charAt inner i
-        if c = '\\' && i + 1 < strLen inner then
-            let n = charAt inner (i + 1)
-            let code, w =
-                match n with
-                | 'n' -> 10, 2 | 't' -> 9, 2 | 'r' -> 13, 2
-                | '\\' -> 92, 2 | '"' -> 34, 2 | '\'' -> 39, 2
-                | d when d >= '0' && d <= '9' && i + 3 < strLen inner
-                         && isDigit (charAt inner (i + 2)) && isDigit (charAt inner (i + 3)) ->
-                    ((int d - 48) * 100 + (int (charAt inner (i + 2)) - 48) * 10
-                     + (int (charAt inner (i + 3)) - 48)) % 256, 4
-                | o -> int o, 2
-            vecAdd out (byte code)
-            i <- i + w
-        else
-            vecAdd out (byte c)
-            i <- i + 1
+    if isTriple then
+        // no escape processing at all: the text IS the value
+        let inner = substr raw 3 (strLen raw - 6)
+        for k in 0 .. strLen inner - 1 do vecAdd out (byte (charAt inner k))
+    elif isVerbatim then
+        // `""` is the only escape a verbatim string has
+        let inner = substr raw 2 (strLen raw - 3)
+        let mutable i = 0
+        while i < strLen inner do
+            if charAt inner i = '"' && i + 1 < strLen inner && charAt inner (i + 1) = '"' then
+                vecAdd out (byte 34)
+                i <- i + 2
+            else
+                vecAdd out (byte (charAt inner i))
+                i <- i + 1
+    else
+        let inner = if strLen raw >= 2 then substr raw 1 (strLen raw - 2) else raw
+        let mutable i = 0
+        while i < strLen inner do
+            let c = charAt inner i
+            if c = '\\' && i + 1 < strLen inner then
+                let code, width = escapeAt inner i
+                // above ASCII a `\u` escape is UTF-8 (a string IS bytes);
+                // `\DDD`/`\xHH` name ONE byte, kept under 256 by escapeAt
+                if code < 128 then vecAdd out (byte code)
+                elif width > 2 && (charAt inner (i + 1) = 'u' || charAt inner (i + 1) = 'U') then
+                    if code < 2048 then
+                        vecAdd out (byte (192 ||| (code / 64)))
+                        vecAdd out (byte (128 ||| (code % 64)))
+                    else
+                        vecAdd out (byte (224 ||| (code / 4096)))
+                        vecAdd out (byte (128 ||| ((code / 64) % 64)))
+                        vecAdd out (byte (128 ||| (code % 64)))
+                else vecAdd out (byte (code % 256))
+                i <- i + width
+            else
+                vecAdd out (byte c)
+                i <- i + 1
     vecToArray out
+
+/// a char literal is ONE code point; reading it out of the unescaped BYTES
+/// would take only the first byte of a multi-byte escape
+let private charCode (raw : string) : int =
+    let inner = if strLen raw >= 2 then substr raw 1 (strLen raw - 2) else raw
+    if strLen inner > 1 && charAt inner 0 = '\\' then fst (escapeAt inner 0)
+    else
+        let bs = unescape raw
+        if bs.Length > 0 then int bs.[0] else 0
 
 /// A local becomes a cell when it is let-bound, assigned somewhere, and
 /// mentioned inside a lambda. The test is per BINDING, so every read and
@@ -198,11 +263,25 @@ let rec private freeWalk (bound : Dict<string * int, bool>) (acc : Vec<string * 
     | ELam (ps, b) ->
         for pv, _ in ps do dictSet bound (pv.Path, pv.Offset) true
         freeWalk bound acc seen b
-    | ELet (isRec, v, _, rhs, b) ->
-        // a REC binder is in scope inside its own rhs: walking the rhs
-        // first noted the self-reference as free of the ENCLOSING lambda —
-        // a phantom capture no frame can ever provide
-        if isRec then dictSet bound (v.Path, v.Offset) true
+    | ELet (true, _, _, _, _) ->
+        // a REC GROUP's binders are all in scope inside every member's rhs:
+        // bind the whole spine run FIRST, or a member's reference to a later
+        // sibling leaks into the enclosing lambda as a phantom capture no
+        // frame can provide. Merging adjacent independent rec-lets this way
+        // is harmless — their binders simply shadow nothing.
+        let members = vecNew<Expr> ()
+        let mutable cur = e
+        let mutable go = true
+        while go do
+            match cur with
+            | ELet (true, v, _, rhs, b) ->
+                dictSet bound (v.Path, v.Offset) true
+                vecAdd members rhs
+                cur <- b
+            | _ -> go <- false
+        for rhs in vecToList members do freeWalk bound acc seen rhs
+        freeWalk bound acc seen cur
+    | ELet (_, v, _, rhs, b) ->
         freeWalk bound acc seen rhs
         dictSet bound (v.Path, v.Offset) true
         freeWalk bound acc seen b
@@ -462,8 +541,7 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
             fc f (doubleBits (parseFloat num))
             gcT f "struct.new" "$boxf"
     | ELit (LChar raw) ->
-        let bytes = unescape raw
-        ic f (if bytes.Length > 0 then int bytes.[0] else 0)
+        ic f (charCode raw)
         refI31 f
     | ELit (LBool b) ->
         ic f (if b then 1 else 0)
@@ -1028,9 +1106,7 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         rf f "$cmpvBoxed.w0"
         refNull f "any"
         gcT f "struct.new" "$clo"
-    | EApp (EUnknown n, [ a ]) when
-        n.Contains "#" && not (n.EndsWith "#h")
-        && not (n.StartsWith "float16#") && not (n.StartsWith "pad") ->
+    | EApp (EUnknown n, [ a ]) when n.Contains "#" && not (n.StartsWith "pad") ->
         // conversions whose source kind inference resolved: target#srckind
         let target = n.Substring (0, n.IndexOf "#")
         let src = n.Substring (n.IndexOf "#" + 1)
@@ -1049,6 +1125,17 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | "char", "t" ->
              // Char.Parse: the single (first) character of the string
              strA (); ic f 0; gcT f "array.get_u" "$str"; callf f "$ofi"
+         | "float16", "t" -> strA (); callf f "$atof"; ins f "f32.demote_f64"; callf f "$f2h"; callf f "$ofi"
+         | "float16", "h" -> emitA ()
+         | "float16", "f" -> emitA (); callf f "$tof"; callf f "$f2h64"; callf f "$ofi"
+         | "float16", "s" -> emitA (); callf f "$tos"; callf f "$f2h"; callf f "$ofi"
+         | "float16", "l" -> emitA (); callf f "$tol"; ins f "f32.convert_i64_s"; callf f "$f2h"; callf f "$ofi"
+         | "float16", _ -> emitA (); callf f "$toi"; ins f "f32.convert_i32_s"; callf f "$f2h"; callf f "$ofi"
+         | "string", "h" -> emitA (); callf f "$toi"; callf f "$h2f"; ins f "f64.promote_f32"; callf f "$ftoa"
+         | "float", "h" -> emitA (); callf f "$toi"; callf f "$h2f"; ins f "f64.promote_f32"; callf f "$off"
+         | "float32", "h" -> emitA (); callf f "$toi"; callf f "$h2f"; callf f "$oss"
+         | "int64", "h" -> emitA (); callf f "$toi"; callf f "$h2f"; ins f "i64.trunc_f32_s"; callf f "$ofl"
+         | _, "h" -> emitA (); callf f "$toi"; callf f "$h2f"; ins f "i32.trunc_f32_s"; callf f "$ofi"
          | "string", "f" -> emitA (); callf f "$tof"; callf f "$ftoa"
          | "string", "s" -> emitA (); callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "string", "l" -> emitA (); callf f "$tol"; callf f "$ltoa"
@@ -1352,6 +1439,49 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
                // family carries the `w` suffix
                | "<<<" -> "i32.shl" | _ -> "i32.shr_s")
         callf f "$ofi"
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "h"
+        && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        // float16: widen, operate in f32, round back — ONE rounding, and
+        // therefore the correctly-rounded f16 answer. IEEE equality: -0.0h
+        // equals 0.0h, a NaN half equals nothing
+        let baseOp = op.Substring (0, op.Length - 1)
+        emitNode st f lv a
+        callf f "$toi"
+        callf f "$h2f"
+        emitNode st f lv b
+        callf f "$toi"
+        callf f "$h2f"
+        (match baseOp with
+         | "+" | "-" | "*" | "/" ->
+             ins f ("f32." + (match baseOp with "+" -> "add" | "-" -> "sub" | "*" -> "mul" | _ -> "div"))
+             callf f "$f2h"
+             callf f "$ofi"
+         | _ ->
+             ins f ("f32." + (match baseOp with
+                              | "<" -> "lt" | ">" -> "gt" | "<=" -> "le"
+                              | "=" -> "eq" | "<>" -> "ne" | _ -> "ge"))
+             refI31 f)
+    | EPrim (("sqrth" | "absh" | "truncateh" | "u-h") as op, [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        callf f "$h2f"
+        ins f (match op with
+               | "sqrth" -> "f32.sqrt" | "absh" -> "f32.abs"
+               | "truncateh" -> "f32.trunc" | _ -> "f32.neg")
+        callf f "$f2h"
+        callf f "$ofi"
+    | EApp (EUnknown "printh", [ a ]) ->
+        // a half is an i31 at runtime, so printing needs the STATIC type
+        emitNode st f lv a
+        callf f "$toi"
+        callf f "$h2f"
+        callf f "$oss"
+        callf f "$printval"
+        ic f 10
+        callf f "$putc"
+        ic f 0
+        refI31 f
     | EPrim ("u-f", [ a ]) ->
         emitNode st f lv a
         callf f "$tof"
@@ -1874,10 +2004,9 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
         ins f "i32.eqz"
         brIf f failLbl
     | PLit (LChar raw) ->
-        let bytes = unescape raw
         lg f slot
         callf f "$toi"
-        ic f (if bytes.Length > 0 then int bytes.[0] else 0)
+        ic f (charCode raw)
         ins f "i32.ne"
         brIf f failLbl
     | PLit (LFloat s) ->
@@ -2176,6 +2305,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes9 m
     rtTypes10 m
     rtTypes11 m
+    rtTypes12 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -2188,6 +2318,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls9 m
     rtDecls10 m
     rtDecls11 m
+    rtDecls12 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -2312,6 +2443,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore9 m
     rtCore10 m
     rtCore11 m
+    rtCore12 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do

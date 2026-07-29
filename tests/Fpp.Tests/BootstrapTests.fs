@@ -37,17 +37,19 @@ let private wholeFrontier =
         root + "/src/Fpp.Compiler/Core/Serialize.fs"
         root + "/src/Fpp.Compiler/Core/Link.fs"
         root + "/src/Fpp.Compiler/Core/Plugins.fs"
-        root + "/src/Fpp.Compiler/Backend/EmitWasm.fs"
+        root + "/src/Fpp.Compiler/Backend/WasmBinary.fs"
+        root + "/src/Fpp.Compiler/Backend/EmitBin.fs"
+        root + "/src/Fpp.Compiler/Backend/BinDriver.fs"
         root + "/src/Fpp.Compiler/Query.fs" ]
 
 let private runWasm (files : string list) : string =
     let ws = Workspace()
     for f in files do ws.SetFileText f (System.IO.File.ReadAllText f)
-    let wat, errors = ws.EmitProgram ()
+    let bytes, errors = ws.EmitProgramWasm ()
     Expect.isEmpty errors "the prefix must emit without errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wat"
-    System.IO.File.WriteAllText(tmp, wat)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+    System.IO.File.WriteAllBytes(tmp, bytes)
+    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi

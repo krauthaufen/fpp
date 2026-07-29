@@ -48,7 +48,7 @@ for k in 1 .. min limit compilerFiles.Length do
         let files = compilerFiles |> List.truncate k
         let ws = Workspace()
         for f in files do ws.SetFileText f (System.IO.File.ReadAllText f)
-        let wat, errors = ws.EmitProgram ()
+        let bytes, errors = ws.EmitProgramWasm ()
         if not (List.isEmpty errors) then
             stop <- true
             printfn "%2d %-42s %d ERRORS" k (short (List.last files)) errors.Length
@@ -62,9 +62,9 @@ for k in 1 .. min limit compilerFiles.Length do
             |> List.iter (fun (m, c) -> printfn "       %3d  %s" c m)
             for e in errors |> List.truncate 10 do printfn "       %s" e
         else
-            let tmp = System.IO.Path.GetTempFileName() + ".wat"
-            System.IO.File.WriteAllText(tmp, wat)
-            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
             psi.RedirectStandardOutput <- true
             psi.RedirectStandardError <- true
             let p = System.Diagnostics.Process.Start psi
@@ -78,7 +78,6 @@ for k in 1 .. min limit compilerFiles.Length do
                 printfn "%s" (err.Substring (0, min 1500 err.Length))
             else
                 frontier <- k
-                printfn "%2d %-42s ok (%d lines of wat)" k (short (List.last files))
-                    (wat.Split '\n').Length
+                printfn "%2d %-42s ok (%d bytes)" k (short (List.last files)) bytes.Length
 
 printfn "frontier: %d of %d files" frontier compilerFiles.Length

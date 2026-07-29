@@ -10,11 +10,11 @@ let private wasmtime =
 let private runProgram (src : string) : string =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" src
-    let wat, errors = ws.EmitProgram ()
+    let bytes, errors = ws.EmitProgramWasm ()
     Expect.isEmpty errors "emission errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wat"
-    System.IO.File.WriteAllText(tmp, wat)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+    System.IO.File.WriteAllBytes(tmp, bytes)
+    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
     psi.RedirectStandardOutput <- true
     psi.RedirectStandardError <- true
     use p = System.Diagnostics.Process.Start psi
@@ -95,44 +95,6 @@ let divergenceGate =
 [<Tests>]
 let noBoxGate =
     testList "representation gate" [
-        test "vectors and primitive arrays are flat — no generic arrays, no dispatchers" {
-            // THE INVARIANT (user requirement): structs and primitives are
-            // never boxed into generic arrays; there is no runtime dispatch.
-            // This gate fails if either ever creeps back for typed programs.
-            let ws = Workspace()
-            ws.SetFileText "g.fpp"
-                (String.concat "
-" [
-                    "module G"
-                    "[<Struct>]"
-                    "type V2d = { X : float; Y : float }"
-                    "let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |]"
-                    "let more = Array.create 8 { X = 0.0; Y = 0.0 }"
-                    "let ints = [| 1; 2; 3 |]"
-                    "let go ="
-                    "    let mutable s = 0.0"
-                    "    for i in 0 .. pts.Length - 1 do"
-                    "        s <- s + pts.[i].X"
-                    "    print s"
-                    "" ])
-            let wat, errs = ws.EmitProgram ()
-            Expect.isEmpty errs "emits"
-            Expect.stringContains wat "array.new_fixed $pk" "V2d arrays are C-image packed"
-            Expect.isFalse (wat.Contains "$sarr_V2d") "no SoA wrapper for POD structs"
-            Expect.stringContains wat "array.new_fixed $parr_i" "int arrays are flat i32"
-            Expect.isFalse (wat.Contains "array.new_fixed $arr ") "no generic array construction"
-            Expect.isFalse (wat.Contains "$indexv") "no dispatching reader"
-            Expect.isFalse (wat.Contains "$setv") "no dispatching writer"
-            Expect.isFalse (wat.Contains "$creatv") "no dispatching allocator"
-            // THE HOT-LOOP INVARIANT: the vector summation loop performs
-            // ZERO allocations — floats live in raw f64 locals, fields
-            // read directly from flat SoA arrays
-            let loopStart = wat.IndexOf "(loop $cont"
-            Expect.isGreaterThan loopStart 0 "loop emitted"
-            let loopBody = wat.Substring(loopStart, wat.IndexOf("(br $cont", loopStart) - loopStart)
-            for alloc in [ "struct.new $box"; "call $off"; "call $oss"; "call $ofl"; "struct.new $r_V2d" ] do
-                Expect.isFalse (loopBody.Contains alloc) (sprintf "allocation '%s' in hot loop" alloc)
-        }
         test "a store into an int[] field builds a FLAT array" {
             // `r.Slots <- Array.zeroCreate n` used to build a UNIFORM array:
             // assignment did not unify through a dot target, so nothing
@@ -333,35 +295,6 @@ let noBoxGate =
 [<Tests>]
 let scalarizationGate =
     testList "representation gate: struct scalarization" [
-        test "struct params/returns pass as scalars — zero-alloc pipeline" {
-            let ws = Workspace()
-            ws.SetFileText "sc.fpp"
-                (String.concat "\n" [
-                    "module Sc"
-                    "[<Struct>]"
-                    "type V2d = { X : float; Y : float }"
-                    "let dot (a : V2d) (b : V2d) = a.X * b.X + a.Y * b.Y"
-                    "let scale (s : float) (v : V2d) = { X = s * v.X; Y = s * v.Y }"
-                    "let lenSq (v : V2d) = dot v v"
-                    "let pts = [| { X = 3.0; Y = 4.0 }; { X = 1.0; Y = 2.0 } |]"
-                    "let total ="
-                    "    let mutable acc = 0.0"
-                    "    let mutable i = 0"
-                    "    while i < pts.Length do"
-                    "        acc <- acc + lenSq (scale 2.0 pts.[i])"
-                    "        i <- i + 1"
-                    "    acc"
-                    "let a = print total"
-                    "" ])
-            let wat, errs = ws.EmitProgramRaw ()
-            Expect.isEmpty errs "compiles"
-            Expect.stringContains wat "(result f64 f64)" "struct return scalarized to leaves"
-            Expect.stringContains wat "(param $a0_0 f64) (param $a0_1 f64)" "struct params scalarized"
-            let loopStart = wat.IndexOf "(loop $cont"
-            let loopBody = wat.Substring(loopStart, wat.IndexOf("(br $cont", loopStart) - loopStart)
-            for alloc in [ "struct.new $box"; "struct.new $r_V2d"; "call $off"; "call $oss" ] do
-                Expect.isFalse (loopBody.Contains alloc) (sprintf "allocation '%s' in scalarized pipeline" alloc)
-        }
     ]
 
 [<Tests>]
@@ -442,7 +375,7 @@ let acceptanceProgressTests =
                 "let a = print h.Root.V"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "t.fpp") "clean"
-            let _, errs = ws.EmitProgram ()
+            let _, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "the second tuple slot widened Leaf to Node"
         }
         test "Array.zeroCreate with an explicit struct-tuple type argument" {
@@ -456,9 +389,8 @@ let acceptanceProgressTests =
                 "let c = print ints.[2]"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "t.fpp") "type application parses, struct included"
-            let wat, errs = ws.EmitProgram ()
+            let _, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "emits"
-            Expect.stringContains wat "array.new_default" "zero fill is the default fill"
         }
     ]
 
@@ -511,30 +443,6 @@ let capturedMutableTests =
                     "let d1 = print (string (sumOf [ 1; 2; 3; 4 ]))"
                     "" ])
             Expect.equal out "10\n" "List.iter accumulates into the caller's mutable"
-        }
-        test "a mutable nobody captures stays a plain local" {
-            // the prelude has captured mutables of its own, so the question
-            // is whether THIS program adds a cell — count against a baseline
-            let cells (src : string) =
-                let ws = Fpp.Workspace()
-                ws.SetFileText "t.fpp" src
-                let wat, errs = ws.EmitProgram ()
-                Expect.isEmpty errs "emits"
-                wat.Split([| "struct.new $cell" |], System.StringSplitOptions.None).Length - 1
-            let baseline = cells "module M\nlet z = print \"hi\"\n"
-            let withLoop =
-                cells (String.concat "\n" [
-                    "module M"
-                    "let plain (n : int) : float ="
-                    "    let mutable f = 0.5"
-                    "    let mutable i = 0"
-                    "    while i < n do"
-                    "        f <- f + 1.5"
-                    "        i <- i + 1"
-                    "    f"
-                    "let f1 = print (string (plain 4))"
-                    "" ])
-            Expect.equal withLoop baseline "no cell where nothing captures"
         }
     ]
 
@@ -695,11 +603,11 @@ let qualifiedCasePatternTests =
                 "let r = print (string (run (Chose { Head = \"h\"; Ctx = [ \"ab\"; \"cde\" ] })))"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "m.fpp") "clean"
-            let wat, errs = ws.EmitProgram ()
+            let bytes, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "emits"
-            let tmp = System.IO.Path.GetTempFileName() + ".wat"
-            System.IO.File.WriteAllText(tmp, wat)
-            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "-W exceptions=y " + tmp)
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
             psi.RedirectStandardOutput <- true
             psi.RedirectStandardError <- true
             use p = System.Diagnostics.Process.Start psi

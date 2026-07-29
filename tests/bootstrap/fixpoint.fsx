@@ -147,16 +147,15 @@ let generateHost (files : (string * string) list) : string =
 /// `bin` gates the BINARY backend: both stages emit .wasm BYTES and those
 /// must be identical. The byte domain is Latin-1 strings throughout, like
 /// the corpus text — one byte, one char.
-let binMode = System.Environment.GetCommandLineArgs () |> Array.contains "bin"
+// the BINARY backend is the only backend: every fixpoint is a byte fixpoint
+let binMode = true
 
 let emit (label : string) (files : (string * string) list) : string =
     let ws = Workspace()
     for path, text in files do ws.SetFileText path text
     let wat, errs =
-        if binMode then
-            let bytes, errs = ws.EmitProgramWasm ()
-            System.Text.Encoding.Latin1.GetString bytes, errs
-        else ws.EmitProgram ()
+        let bytes, errs = ws.EmitProgramWasm ()
+        System.Text.Encoding.Latin1.GetString bytes, errs
     if not (List.isEmpty errs) then
         printfn "%s: %d emit errors" label errs.Length
         errs
@@ -231,8 +230,7 @@ let report (expected : string) (actual : string) =
 /// two stages on a program neither of them is.
 let selfHost = System.Environment.GetCommandLineArgs () |> Array.contains "self"
 
-let driverPath =
-    root + "/tests/bootstrap/" + (if binMode then "compiledrive-bin.fpp" else "compiledrive.fpp")
+let driverPath = root + "/tests/bootstrap/compiledrive-bin.fpp"
 
 /// The names the corpus is SERVED under. In self mode they are the
 /// compiler's own files, which is what the driver must name too.
