@@ -39,6 +39,11 @@ type St =
       /// BY VALUE, so these live in a one-field $cell and the copy that
       /// lands in the closure's env is a copy of the CELL REFERENCE
       CellVars : Dict<string * int, bool>
+      /// curry wrappers requested for top-level functions used first-class:
+      /// name -> arity, plus request order (bodies are emitted LAST, and
+      /// their decls land last too, so decl order still equals body order)
+      Wrappers : Dict<string, int>
+      WrapperOrder : Vec<string>
       mutable DataN : int }
 
 let private err (st : St) (msg : string) : unit = vecAdd st.Errors msg
@@ -265,6 +270,24 @@ let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : E
             discoverLams st outer x
     | _ -> ()
 
+/// a known top-level function used as a VALUE: declare its curried wrapper
+/// chain once; the closure built at the use site enters at .w0
+let private requestWrapper (st : St) (f : Fn) (fname : string) (arity : int) : unit =
+    if not (dictTryFind st.Wrappers fname).IsSome then
+        dictSet st.Wrappers fname arity
+        vecAdd st.WrapperOrder fname
+        for k in 0 .. arity - 1 do declFn f.M (fname + ".w" + string k) "$u1"
+
+/// collect the run of `let rec ... = fun` bindings heading a let spine.
+/// Grouping bindings that are NOT mutually recursive is harmless: their
+/// markers are simply never captured, so patching finds nothing to do.
+let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
+    match e with
+    | ELet (true, v, _, (ELam (_, _) as lam), rest) ->
+        let ms, body = recGroupOf rest
+        (v, lam) :: ms, body
+    | _ -> [], e
+
 let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
@@ -313,6 +336,14 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          match dictTryFind st.GlobalOf vk with
          | Some g -> gg f g
          | None ->
+         match dictTryFind st.FnOf vk, dictTryFind st.ArityOf vk with
+         | Some fn, Some ar ->
+             // function as a value: curried wrapper closure chain
+             requestWrapper st f fn ar
+             rf f (fn + ".w0")
+             refNull f "any"
+             gcT f "struct.new" "$clo"
+         | _ ->
              err st ("binary: unbound variable " + v.Name)
              refNull f "any")
     | ELet (_, _, _, _, _) ->
@@ -321,6 +352,41 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         let mutable walking = true
         while walking do
             match cur with
+            | ELet (true, _, _, ELam _, _) ->
+                // recursive local functions: every member captures the
+                // others, so no closure can be built until every name has a
+                // slot. Bind each name to a fresh MARKER (distinct identity),
+                // build every closure over the markers, install, then patch
+                // each closure's env slots marker → closure. A single rec
+                // binding is just a one-element group.
+                let members, groupBody = recGroupOf cur
+                let slots =
+                    members
+                    |> List.map (fun (v, lam) ->
+                        v, lam,
+                        freshLocal f "$bl" "anyref",
+                        freshLocal f "$bmk" "anyref",
+                        freshLocal f "$bcl" "anyref")
+                for v, _, l, _, _ in slots do dictSet lv (v.Path, v.Offset) l
+                for _, _, l, mk, _ in slots do
+                    ic f -999
+                    gcT f "struct.new" "$du0"
+                    ls f mk
+                    lg f mk
+                    ls f l
+                for _, lam, _, _, cl in slots do
+                    emitNode st f lv lam
+                    ls f cl
+                for _, _, l, _, cl in slots do
+                    lg f cl
+                    ls f l
+                for _, _, _, _, cl in slots do
+                    for _, _, _, mk2, cl2 in slots do
+                        lg f cl
+                        lg f mk2
+                        lg f cl2
+                        callf f "$patchmark"
+                cur <- groupBody
             | ELet (_, v, _, rhs, body) ->
                 emitNode st f lv rhs
                 // a captured mutable: the frame holds the CELL, not the value
@@ -826,6 +892,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
           EnumConst = dictNew (); GlobalOf = dictNew (); FnOf = dictNew ()
           ArityOf = dictNew (); Warnings = vecNew ()
+          Wrappers = dictNew (); WrapperOrder = vecNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
           LamName = refMapNew (fun (_ : Expr) -> 7)
           LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls }
@@ -855,11 +922,13 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes2 m
     rtTypes3 m
     rtTypes4 m
+    rtTypes5 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
     rtDecls3 m
     rtDecls4 m
+    rtDecls5 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -914,6 +983,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore2 m
     rtCore3 m [ 2; 3 ]
     rtCore4 m
+    rtCore5 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
@@ -980,4 +1050,31 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     localsDone f
     for i in vecToList inits do callf f i
     endFn f
+    // curried wrapper bodies: requested lazily during body emission, so their
+    // decls sit after $_start in the function section — bodies land here in
+    // request order. Each .wk before the last conses its arg onto the env;
+    // the last unspools the chain (latest arg first) and calls direct.
+    for fname in vecToList st.WrapperOrder do
+        let arity = (dictTryFind st.Wrappers fname).Value
+        for k in 0 .. arity - 1 do
+            let f = beginFn m [ "$a"; "$env" ]
+            localsDone f
+            if k = arity - 1 then
+                for j in 0 .. arity - 1 do
+                    if j = k then lg f "$a"
+                    else
+                        lg f "$env"
+                        for _ in 1 .. (k - 1 - j) do
+                            gcT f "ref.cast" "$cons"
+                            gcTF f "struct.get" "$cons" 1
+                        gcT f "ref.cast" "$cons"
+                        gcTF f "struct.get" "$cons" 0
+                callf f fname
+            else
+                rf f (fname + ".w" + string (k + 1))
+                lg f "$a"
+                lg f "$env"
+                gcT f "struct.new" "$cons"
+                gcT f "struct.new" "$clo"
+            endFn f
     assemble m 17 true, vecToList st.Errors, vecToList st.Warnings

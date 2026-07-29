@@ -101,6 +101,38 @@ let binBattery =
               "let go = print (counter ())" ]
             "3\n"
 
+        expects "local let rec ties its own knot"
+            [ "let go ="
+              "    let base_ = 100"
+              "    let rec walk (n : int) : int ="
+              "        if n <= 0 then base_ else 1 + walk (n - 1)"
+              "    print (walk 5)" ]
+            "105\n"
+
+        expects "mutually recursive local functions"
+            [ "let go ="
+              "    let rec even (n : int) : bool ="
+              "        if n = 0 then true else odd (n - 1)"
+              "    and odd (n : int) : bool ="
+              "        if n = 0 then false else even (n - 1)"
+              "    if even 10 then print 1 else print 0"
+              "    if odd 7 then print 1 else print 0" ]
+            "1\n1\n"
+
+        expects "partial application of a top-level function"
+            [ "let add3 (a : int) (b : int) (c : int) : int = a + b + c"
+              "let go ="
+              "    let f = add3 100"
+              "    let g = f 20"
+              "    print (g 3)"
+              "    print (g 4)" ]
+            "123\n124\n"
+
+        expects "top-level function passed first-class"
+            [ "let double (x : int) : int = x * 2"
+              "let go = print (List.sum (List.map double [1; 2; 3]))" ]
+            "12\n"
+
         expects "arrays: zeroCreate, index get/set, Length"
             [ "let go ="
               "    let a = Array.zeroCreate 3"

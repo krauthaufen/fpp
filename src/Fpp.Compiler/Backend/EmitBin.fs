@@ -1141,6 +1141,97 @@ let rtDecls4 (m : Mod) : unit =
 let rtTypes4 (m : Mod) : unit =
     tyFunc m "$rt_a2v" [ "anyref" ] []
 
+// ---- runtime: recursive-closure knot tying ---------------------------------
+
+let rtTypes5 (m : Mod) : unit =
+    tyFunc m "$rt_aaa2v" [ "anyref"; "anyref"; "anyref" ] []
+
+let rtDecls5 (m : Mod) : unit =
+    declFn m "$patchmark" "$rt_aaa2v"
+
+/// $patchmark c mark v — tie one strand of a rec group's knot: in closure
+/// c's environment, whatever slot still holds the marker becomes v. TWO
+/// environment shapes coexist: a flat $arr (captures) and a $cons chain
+/// (curried partial application); patch whichever this is.
+let rtCore5 (m : Mod) : unit =
+    let f = beginFn m [ "$c"; "$mark"; "$v" ]
+    local f "$e" "anyref"
+    local f "$i" "i32"
+    local f "$n" "i32"
+    localsDone f
+    lg f "$c"
+    gcT f "ref.cast" "$clo"
+    gcTF f "struct.get" "$clo" 1
+    ls f "$e"
+    blockE f "$done"
+    lg f "$e"
+    gcT f "ref.test" "$arr"
+    ifE f
+    lg f "$e"
+    gcT f "ref.cast" "$arr"
+    gci f "array.len"
+    ls f "$n"
+    ic f 0
+    ls f "$i"
+    blockE f "$out"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$out"
+    lg f "$e"
+    gcT f "ref.cast" "$arr"
+    lg f "$i"
+    gcT f "array.get" "$arr"
+    castEq f
+    lg f "$mark"
+    castEq f
+    ins f "ref.eq"
+    ifE f
+    lg f "$e"
+    gcT f "ref.cast" "$arr"
+    lg f "$i"
+    lg f "$v"
+    gcT f "array.set" "$arr"
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f // loop $go
+    endB f // block $out
+    br f "$done"
+    endB f // if $arr
+    blockE f "$cout"
+    loopE f "$cgo"
+    lg f "$e"
+    gcT f "ref.test" "$cons"
+    ins f "i32.eqz"
+    brIf f "$cout"
+    lg f "$e"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    castEq f
+    lg f "$mark"
+    castEq f
+    ins f "ref.eq"
+    ifE f
+    lg f "$e"
+    gcT f "ref.cast" "$cons"
+    lg f "$v"
+    gcTF f "struct.set" "$cons" 0
+    endB f
+    lg f "$e"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    ls f "$e"
+    br f "$cgo"
+    endB f // loop $cgo
+    endB f // block $cout
+    endB f // block $done
+    endFn f
+
 let rtCore4 (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     localsDone f
