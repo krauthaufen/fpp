@@ -68,6 +68,9 @@ type St =
       /// string-literal segments by CONTENT: duplicates share one segment
       /// and one hoisted global (so equal literals are the SAME reference)
       StrSegs : Dict<string, string * int>
+      /// unions whose every case is nullary: their values are the global
+      /// singletons, so equality IS identity (one ref.eq, no dispatch)
+      EnumLikeUnion : Dict<string, bool>
       /// (record, field) -> declared type name, for EVERY record — uniform
       /// storage erases types, but the VALUE kind is still statically known
       RecFieldTy : Dict<string * string, string>
@@ -1499,6 +1502,19 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         emitNode st f lv b
         callf f "$addv"
+    | EPrim (op, [ a; b ]) when
+        (op.StartsWith "=@" || op.StartsWith "<>@")
+        && (dictTryFind st.EnumLikeUnion (op.Substring (op.IndexOf "@" + 1))).IsSome ->
+        // every case is nullary, so the values ARE the module's singletons:
+        // one ref.eq replaces the whole structural walk (the parser compares
+        // token kinds constantly)
+        emitNode st f lv a
+        castEq f
+        emitNode st f lv b
+        castEq f
+        ins f "ref.eq"
+        (if op.StartsWith "<>@" then ins f "i32.eqz")
+        refI31 f
     | EPrim (op, [ a; b ]) when op.StartsWith "=@" || op.StartsWith "<>@" ->
         // an equality whose operand type the backend cannot spell is the
         // STRUCTURAL one — records, unions, options all compare via $equal
@@ -2305,7 +2321,10 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              err st "binary: undiscovered lambda"
              refNull f "any")
     | EApp (g, args) ->
-        // generic application: the applyc chain
+        // generic application: the applyc chain. NOT inlined: measured, the
+        // inline form (struct.gets + call_indirect at every site) grew the
+        // module 11% for ZERO time change — wasmtime's call to a tiny
+        // function is already cheap, and the bigger code hurts the I-cache.
         emitNode st f lv g
         for a in args do
             emitNode st f lv a
@@ -2453,13 +2472,15 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
                 emitPat st f lv failLbl slot alt)
         endB f
     | PLit (LString raw) ->
+        // a string pattern is a STRING compare: $streq (identity, length,
+        // bytes) instead of the structural dispatch. Every `match name with
+        // "i32.add" -> ...` in the emitter's own opcode tables lands here.
         lg f slot
+        gcT f "ref.cast" "$str"
         let bytes = unescape raw
         let dn, _ = internStr st bytes
         gg f ("$sl:" + dn)
-        callf f "$equal"
-        gcAbs f "ref.cast" "i31"
-        i31get f
+        callf f "$streq"
         ins f "i32.eqz"
         brIf f failLbl
     | PLit (LChar raw) ->
@@ -2602,7 +2623,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           Pod = dictNew (); StructFields = dictNew ()
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
           SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u"
-          StrSegs = dictNew (); RecFieldTy = dictNew () }
+          StrSegs = dictNew (); RecFieldTy = dictNew ()
+          EnumLikeUnion = dictNew () }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -2797,6 +2819,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     for d in decls do
         match d with
         | DUnion (un, _, cases) ->
+            if cases |> List.forall (fun (_, ar) -> ar = 0) then
+                dictSet st.EnumLikeUnion un true
             for cn, ar in cases do
                 dictSet st.CaseTag cn tag
                 dictSet st.CaseArity cn ar
