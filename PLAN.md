@@ -2597,11 +2597,23 @@ bytes (down from 1.86 MB with the text emitter still aboard).
   peek into a nested let-block whose binder only exists mid-pass), and
   never leaks across monomorphized clones that share binder keys.
 
+### Signature rails — landed too
+Known top-level fns with scalar param/return types (int/float/float32/int64
+via the scheme's arrow) declare SPECIALIZED wasm func types ($sig_..): calls
+unbox arguments and box results (both cancel on rails), bodies receive raw
+params (seeded into LocalKind per pass) and return raw (result unboxed at
+the body end, cancelling the body's box). return_call only when callee and
+caller return kinds AGREE. Excluded: vtable-reachable fns (iface impls,
+identity overrides — the dispatch contract is all-anyref), externs (own ABI),
+and fns whose scalar param a LAMBDA captures (env slots are anyref; the
+capture build site reads slots raw). Wrappers adapt first-class uses.
+Gates: 446/446, fixpoint bin + bin self byte-identical.
+
 ### Possible further increments (not required by any gate)
-- Function-signature rails (text's sigKinds): typed params/returns for
-  known fns, so cross-function calls stop boxing arguments and results.
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload
   ever wants them.
+- Box the capture-site read instead of excluding lambda-captured scalar
+  params, keeping those fns specialized.
 
 ### The loop (unchanged, still the whole method)
 1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
