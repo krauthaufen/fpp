@@ -412,7 +412,10 @@ let private requestWrapper (st : St) (f : Fn) (fname : string) (arity : int) : u
     if not (dictTryFind st.Wrappers fname).IsSome then
         dictSet st.Wrappers fname arity
         vecAdd st.LateFns ("w:" + fname)
-        for k in 0 .. arity - 1 do declFn f.M (fname + ".w" + string k) "$u1"
+        for k in 0 .. arity - 1 do
+            let wk = fname + ".w" + string k
+            declFn f.M wk "$u1"
+            globalFuncRef f.M ("$fr:" + wk) wk "$u1"
 
 /// cast to (ref null eq) — ref.eq's operand type
 let private castEq (f : Fn) : unit =
@@ -422,6 +425,17 @@ let private castEq (f : Fn) : unit =
 /// the STATIC kind of an expression, where one is knowable without type
 /// state: enough to pick the rail a kindless conversion reads from. Uniform
 /// storage makes "u" safe everywhere else — the value carries its box.
+/// a SHALLOW hash for Expr-keyed refmaps: no identity exists under
+/// wasm-GC, but the node's surface (binder offsets, arities) spreads the
+/// open-addressed clusters from all-in-one to a handful per shape. refEq
+/// verifies, so collisions only cost probes.
+let private shallowExprHash (e : Expr) : int =
+    match e with
+    | ELam ((pv, _) :: _, _) -> 31 * pv.Offset + 7
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) -> 31 * v.Offset + List.length args
+    | EApp (_, args) -> 17 + List.length args
+    | _ -> 7
+
 /// packed-array element classification: which $parr_* a primitive element
 /// type stores in. byte/sbyte are NOT here — they share $str (packed i8).
 let private parrK (nm : string) : string =
@@ -738,7 +752,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | Some fn, Some ar ->
              // function as a value: curried wrapper closure chain
              requestWrapper st f fn ar
-             rf f (fn + ".w0")
+             gg f ("$fr:" + fn + ".w0")
              refNull f "any"
              gcT f "struct.new" "$clo"
          | _ ->
@@ -941,7 +955,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  dictSet st.CtorFns name true
                  vecAdd st.LateFns ("c:" + name)
                  declFn f.M ("$ctorfn_" + name) "$u1"
-             rf f ("$ctorfn_" + name)
+                 globalFuncRef f.M ("$fr:$ctorfn_" + name) ("$ctorfn_" + name) "$u1"
+             gg f ("$fr:$ctorfn_" + name)
              refNull f "any"
              gcT f "struct.new" "$clo"
          | Some _ ->
@@ -1237,7 +1252,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             endB f
     | EUnknown "hash" ->
         requestWrapper st f "$hashvBoxed" 1
-        rf f "$hashvBoxed.w0"
+        gg f "$fr:$hashvBoxed.w0"
         refNull f "any"
         gcT f "struct.new" "$clo"
     | EApp (EUnknown pd, [ a ]) when
@@ -1268,7 +1283,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EUnknown "$class:Ordered:compare:$ref" ->
         // `compare` at a UNIFORM reference: the runtime compares structurally
         requestWrapper st f "$cmpvBoxed" 2
-        rf f "$cmpvBoxed.w0"
+        gg f "$fr:$cmpvBoxed.w0"
         refNull f "any"
         gcT f "struct.new" "$clo"
     | EApp (EUnknown n, [ a ]) when n.Contains "#" && not (n.StartsWith "pad") ->
@@ -2207,7 +2222,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              // (struct.new $clo (ref.func $lam) env) — env slots hold the
              // CURRENT values of the captured locals, read here at build
              let free = (dictTryFind st.LamFree name).Value
-             rf f name
+             gg f ("$fr:" + name)
              if List.isEmpty free then refNull f "any"
              else
                  for k in free do
@@ -2517,12 +2532,12 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           Wrappers = dictNew ()
           CtorFns = dictNew (); LateFns = vecNew (); Externs = dictNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
-          LamName = refMapNew (fun (_ : Expr) -> 7)
+          LamName = refMapNew shallowExprHash
           LamFree = dictNew (); LamBody = vecNew (); CellVars = fst (cellScan decls)
           ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
-          TailApp = refMapNew (fun (_ : Expr) -> 7)
+          TailApp = refMapNew shallowExprHash
           Pod = dictNew (); StructFields = dictNew ()
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
           SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u" }
@@ -2923,6 +2938,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         | _ -> ()
     for name, _, _ in vecToList st.LamBody do
         declFn m name "$u1"
+        globalFuncRef m ("$fr:" + name) name "$u1"
     let mutable initN = 0
     for d in decls do
         match d with
@@ -2938,11 +2954,13 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     // bodies, in declaration order
     rtCore m
     rtCore2 m
-    rtCore3 m tupArities
+    let duEqDirect = duEqSlots |> List.forall (fun x -> x = "$eq_du_default")
+    let duHashDirect = duHashSlots |> List.forall (fun x -> x = "$hash_du_default")
+    rtCore3 m tupArities duEqDirect
     rtCore4 m
     rtCore5 m
     rtCore6 m
-    rtCore7 m tupArities
+    rtCore7 m tupArities duHashDirect
     rtCore8 m
     rtCore9 m
     rtCore10 m
@@ -3165,7 +3183,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                 callf f fname
                 if rk <> "u" then callf f (boxOfK rk)
             else
-                rf f (fname + ".w" + string (k + 1))
+                gg f ("$fr:" + fname + ".w" + string (k + 1))
                 lg f "$a"
                 lg f "$env"
                 gcT f "struct.new" "$cons"

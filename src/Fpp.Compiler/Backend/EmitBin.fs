@@ -706,23 +706,73 @@ let rtCore (m : Mod) : unit =
     endB f
     lg f "$s"
     endFn f
-    // $prints
+    // $prints — CHUNKED through linear memory: one fd_write per 32KB, not
+    // one per byte (printing the 1.4MB self-compile answer was over a
+    // million host calls)
     let f = beginFn m [ "$s" ]
     local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$chunk" "i32"
+    local f "$j" "i32"
     localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$n"
     blockE f "$done"
     loopE f "$go"
     lg f "$i"
-    lg f "$s"
-    gci f "array.len"
+    lg f "$n"
     ins f "i32.ge_u"
     brIf f "$done"
+    lg f "$n"
+    lg f "$i"
+    ins f "i32.sub"
+    ls f "$chunk"
+    lg f "$chunk"
+    ic f 32768
+    ins f "i32.gt_u"
+    ifE f
+    ic f 32768
+    ls f "$chunk"
+    endB f
+    ic f 0
+    ls f "$j"
+    blockE f "$cd"
+    loopE f "$cg"
+    lg f "$j"
+    lg f "$chunk"
+    ins f "i32.ge_u"
+    brIf f "$cd"
+    ic f 1024
+    lg f "$j"
+    ins f "i32.add"
     lg f "$s"
     lg f "$i"
+    lg f "$j"
+    ins f "i32.add"
     gcT f "array.get_u" "$str"
-    callf f "$putc"
-    lg f "$i"
+    mem f "i32.store8"
+    lg f "$j"
     ic f 1
+    ins f "i32.add"
+    ls f "$j"
+    br f "$cg"
+    endB f
+    endB f
+    ic f 8
+    ic f 1024
+    mem f "i32.store"
+    ic f 12
+    lg f "$chunk"
+    mem f "i32.store"
+    ic f 1
+    ic f 8
+    ic f 1
+    ic f 16
+    callf f "$fd_write"
+    ins f "drop"
+    lg f "$i"
+    lg f "$chunk"
     ins f "i32.add"
     ls f "$i"
     br f "$go"
@@ -944,6 +994,22 @@ let globalDesc (m : Mod) (name : string) (id : int) (slots : string list) : unit
     emitU32 m.GlobalBody (tyIdx m "$desc")
     emitByte m.GlobalBody opEnd
 
+/// an immutable funcref global: closure builds read this instead of
+/// evaluating `ref.func` per construction — wasmtime interns funcrefs
+/// through a libcall on every ref.func EXECUTION, and that was ~6%% of a
+/// whole self-compile; a global evaluates it once at instantiation
+let globalFuncRef (m : Mod) (gname : string) (fname : string) (tyName : string) : unit =
+    dictSet m.GlobalIdx gname m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitRefType m.GlobalBody false (tyIdx m tyName)
+    emitByte m.GlobalBody 0
+    emitByte m.GlobalBody (opByte "ref.func")
+    emitU32 m.GlobalBody (funcIdx m fname)
+    if not (dictTryFind m.Declared fname).IsSome then
+        dictSet m.Declared fname true
+        vecAdd m.DeclaredOrder fname
+    emitByte m.GlobalBody opEnd
+
 /// a mutable i32 global with a constant initializer
 let globalI32Mut (m : Mod) (name : string) (init : int) : unit =
     dictSet m.GlobalIdx name m.GlobalCount
@@ -964,7 +1030,7 @@ let private castEq (f : Fn) : unit =
     gci f "ref.cast_null"
     emitS32 f.B (heapByte "eq" - 0x80)
 
-let rtCore3 (m : Mod) (tupArities : int list) : unit =
+let rtCore3 (m : Mod) (tupArities : int list) (duEqDirect : bool) : unit =
     // $strcat
     let f = beginFn m [ "$a"; "$b" ]
     local f "$r" "$str"
@@ -1052,6 +1118,19 @@ let rtCore3 (m : Mod) (tupArities : int list) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$i" "i32"
     localsDone f
+    // IDENTITY fast path: the same reference is structurally equal to
+    // itself (i31s compare by value here too) — this alone was ~9%% of a
+    // whole self-compile spent walking structures that were the same object
+    lg f "$a"
+    castEq f
+    lg f "$b"
+    castEq f
+    ins f "ref.eq"
+    ifE f
+    ic f 1
+    refI31 f
+    ret f
+    endB f
     // null equals only null
     lg f "$a"
     ins f "ref.is_null"
@@ -1207,13 +1286,18 @@ let rtCore3 (m : Mod) (tupArities : int list) : unit =
         endB f
         lg f "$a"
         lg f "$b"
-        gg f "$duEq"
-        lg f "$a"
-        gcT f "ref.cast" dt
-        gcTF f "struct.get" dt 0
-        gcT f "array.get" "$vt"
-        gcT f "ref.cast" "$u1"
-        callRef f "$u1"
+        // when NO union overrides Equals, the whole table is the default:
+        // call it directly — the funcref-array read + cast + call_ref per
+        // comparison was measurable in the self-compile profile
+        (if duEqDirect then callf f "$eq_du_default"
+         else
+            gg f "$duEq"
+            lg f "$a"
+            gcT f "ref.cast" dt
+            gcTF f "struct.get" dt 0
+            gcT f "array.get" "$vt"
+            gcT f "ref.cast" "$u1"
+            callRef f "$u1")
         ret f
         endB f
     // cons: heads then tails
@@ -2150,7 +2234,7 @@ let rtDecls7 (m : Mod) : unit =
     declFn m "$cmpvBoxed" "$u1"
     declFn m "$hash_du_default" "$v1"
 
-let rtCore7 (m : Mod) (tupArities : int list) : unit =
+let rtCore7 (m : Mod) (tupArities : int list) (duHashDirect : bool) : unit =
     // $hashv: structural hash, representation-dispatched like $equal
     let f = beginFn m [ "$v" ]
     local f "$i" "i32"
@@ -2261,13 +2345,15 @@ let rtCore7 (m : Mod) (tupArities : int list) : unit =
         gcT f "ref.test" dt
         ifE f
         lg f "$v"
-        gg f "$duHash"
-        lg f "$v"
-        gcT f "ref.cast" dt
-        gcTF f "struct.get" dt 0
-        gcT f "array.get" "$vt"
-        gcT f "ref.cast" "$v1"
-        callRef f "$v1"
+        (if duHashDirect then callf f "$hash_du_default"
+         else
+            gg f "$duHash"
+            lg f "$v"
+            gcT f "ref.cast" dt
+            gcTF f "struct.get" dt 0
+            gcT f "array.get" "$vt"
+            gcT f "ref.cast" "$v1"
+            callRef f "$v1")
         gcAbs f "ref.cast" "i31"
         i31get f
         ret f
@@ -2337,6 +2423,17 @@ let rtCore7 (m : Mod) (tupArities : int list) : unit =
     local f "$y" "i32"
     local f "$c" "i32"
     localsDone f
+    // identity compares as 0 (holds for NaN boxes too: both f64 orderings
+    // answer false there, which is also 0)
+    lg f "$a"
+    castEq f
+    lg f "$b"
+    castEq f
+    ins f "ref.eq"
+    ifE f
+    ic f 0
+    ret f
+    endB f
     lg f "$a"
     gcT f "ref.test" "$str"
     lg f "$b"
@@ -3903,7 +4000,16 @@ let rtCore9 (m : Mod) : unit =
     ic f 0
     gcT f "struct.new" "$iter"
     elseB f
+    // array mode: field 0 carries len*2+1 — the length is read ONCE here,
+    // not per element ($iterNext used to call $lenv every step)
+    lg f "$v"
+    callf f "$lenv"
+    gcAbs f "ref.cast" "i31"
+    i31get f
     ic f 1
+    ins f "i32.shl"
+    ic f 1
+    ins f "i32.or"
     lg f "$v"
     refNull f "any"
     ic f 0
@@ -3984,10 +4090,9 @@ let rtCore9 (m : Mod) : unit =
     ls f "$i"
     lg f "$i"
     lg f "$it"
-    gcTF f "struct.get" "$iter" 1
-    callf f "$lenv"
-    gcAbs f "ref.cast" "i31"
-    i31get f
+    gcTF f "struct.get" "$iter" 0
+    ic f 1
+    ins f "i32.shr_u"
     ins f "i32.ge_s"
     ifA f
     ic f 0
