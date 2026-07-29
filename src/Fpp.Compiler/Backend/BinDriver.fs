@@ -1348,7 +1348,9 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         callf f "$toi"
         ins f (match op with
                | "&&&" -> "i32.and" | "|||" -> "i32.or" | "^^^" -> "i32.xor"
-               | "<<<" -> "i32.shl" | _ -> "i32.shr_u")
+               // bare >>> on int is ARITHMETIC, as F#'s — the unsigned
+               // family carries the `w` suffix
+               | "<<<" -> "i32.shl" | _ -> "i32.shr_s")
         callf f "$ofi"
     | EPrim ("u-f", [ a ]) ->
         emitNode st f lv a
