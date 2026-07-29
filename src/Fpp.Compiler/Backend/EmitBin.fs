@@ -1117,3 +1117,45 @@ let rtCore3 (m : Mod) (tupArities : int list) : unit =
     ins f "ref.eq"
     refI31 f
     endFn f
+
+// ---- runtime: printval (floats route to '?' until printf64 is ported) -----
+
+let rtDecls4 (m : Mod) : unit =
+    declFn m "$printval" "$rt_a2v"
+
+let rtTypes4 (m : Mod) : unit =
+    tyFunc m "$rt_a2v" [ "anyref" ] []
+
+let rtCore4 (m : Mod) : unit =
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcAbs f "ref.test" "i31"
+    ifE f
+    lg f "$v"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    callf f "$printi"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$str"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$str"
+    callf f "$prints"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxi"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxi"
+    gcTF f "struct.get" "$boxi" 0
+    callf f "$printi"
+    ret f
+    endB f
+    // WIP: boxl/boxf/boxs need printl/printf64; '?' marks the gap loudly
+    ic f 63
+    callf f "$putc"
+    endFn f

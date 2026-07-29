@@ -387,6 +387,10 @@ type Workspace() =
     member this.EmitProgram () : string * string list = this.EmitWith true
 
     member private this.EmitWith (optimize : bool) : string * string list =
+        match this.EmitCore optimize false with
+        | (wat, _, errs) -> wat, errs
+
+    member private this.EmitCore (optimize : bool) (binary : bool) : string * byte[] * string list =
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
@@ -459,7 +463,7 @@ type Workspace() =
             let _, _, ds = Fpp.Core.Serialize.decodeLib text
             for d in ds do vecAdd libDecls d
         for pe in this.PluginErrors do vecAdd errs pe
-        if vecLen errs > 0 then "", vecToList errs
+        if vecLen errs > 0 then "", [||], vecToList errs
         else
             let program = this.RunWholeProgram (vecToList libDecls @ vecToList allDecls)
             // tier-1: stamp per struct instantiation, share one body for
@@ -483,10 +487,18 @@ type Workspace() =
             // the definitions inlining made unreachable
             let opt = if optimize then Fpp.Core.Optimize.optimize mono else mono
             let linked = Fpp.Core.Link.deadCodeEliminate opt
-            if not (List.isEmpty monoErrs) then "", monoErrs
+            if not (List.isEmpty monoErrs) then "", [||], monoErrs
+            elif binary then
+                let bytes, berrs = Fpp.Backend.BinDriver.emitBinary linked
+                "", bytes, berrs
             else
                 let res = Fpp.Backend.EmitWasm.emit linked
-                res.Wat, res.Errors
+                res.Wat, [||], res.Errors
+
+    /// The BINARY program: same pipeline, bytes out, no text anywhere.
+    member this.EmitProgramWasm () : byte[] * string list =
+        match this.EmitCore true true with
+        | (_, bytes, errs) -> bytes, errs
 
     /// Produce a fat-IR library from the current project files.
     member this.BuildLibrary () : string * string list =
