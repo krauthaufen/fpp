@@ -791,3 +791,329 @@ let rtCore2 (m : Mod) : unit =
     callf f "$ofi"
     endB f
     endFn f
+
+// ---- runtime: strings, equality --------------------------------------------
+
+let rtTypes3 (m : Mod) : unit =
+    tyFunc m "$rt_ss2a" [ "$str"; "$str" ] [ "anyref" ]
+
+/// a global holding a funcref VTABLE (the DU eq/hash tables); the init
+/// builds it from the given function names
+let globalVt (m : Mod) (name : string) (fns : string list) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitRefType m.GlobalBody false (tyIdx m "$vt")
+    emitByte m.GlobalBody 0
+    for fn in fns do
+        emitByte m.GlobalBody (opByte "ref.func")
+        emitU32 m.GlobalBody (funcIdx m fn)
+        if not (dictTryFind m.Declared fn).IsSome then
+            dictSet m.Declared fn true
+            vecAdd m.DeclaredOrder fn
+    emitByte m.GlobalBody opGcPrefix
+    emitU32 m.GlobalBody (gcByte "array.new_fixed")
+    emitU32 m.GlobalBody (tyIdx m "$vt")
+    emitU32 m.GlobalBody (List.length fns)
+    emitByte m.GlobalBody opEnd
+
+let rtDecls3 (m : Mod) : unit =
+    declFn m "$strcat" "$rt_ss2a"
+    declFn m "$eq_du_default" "$u1"
+    declFn m "$equal" "$u1"
+
+/// cast to (ref null eq) — ref.eq's operand type
+let private castEq (f : Fn) : unit =
+    gci f "ref.cast_null"
+    emitS32 f.B (heapByte "eq" - 0x80)
+
+let rtCore3 (m : Mod) (tupArities : int list) : unit =
+    // $strcat
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$r" "$str"
+    local f "$i" "i32"
+    local f "$la" "i32"
+    localsDone f
+    lg f "$a"
+    gci f "array.len"
+    ls f "$la"
+    lg f "$la"
+    lg f "$b"
+    gci f "array.len"
+    ins f "i32.add"
+    gcT f "array.new_default" "$str"
+    ls f "$r"
+    blockE f "$d1"
+    loopE f "$l1"
+    lg f "$i"
+    lg f "$la"
+    ins f "i32.ge_u"
+    brIf f "$d1"
+    lg f "$r"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    lg f "$a"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    gcT f "array.set" "$str"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$l1"
+    endB f
+    endB f
+    ic f 0
+    ls f "$i"
+    blockE f "$d2"
+    loopE f "$l2"
+    lg f "$i"
+    lg f "$b"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$d2"
+    lg f "$r"
+    gcT f "ref.cast" "$str"
+    lg f "$la"
+    lg f "$i"
+    ins f "i32.add"
+    lg f "$b"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    gcT f "array.set" "$str"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$l2"
+    endB f
+    endB f
+    lg f "$r"
+    endFn f
+    // $eq_du_default: same tag already checked; compare payloads
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"
+    gcT f "ref.test" "$du1"
+    lg f "$b"
+    gcT f "ref.test" "$du1"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$du1"
+    gcTF f "struct.get" "$du1" 1
+    lg f "$b"
+    gcT f "ref.cast" "$du1"
+    gcTF f "struct.get" "$du1" 1
+    callf f "$equal"
+    ret f
+    endB f
+    ic f 1
+    refI31 f
+    endFn f
+    // $equal — structural dispatch, ported branch for branch
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$i" "i32"
+    localsDone f
+    // null equals only null
+    lg f "$a"
+    ins f "ref.is_null"
+    lg f "$b"
+    ins f "ref.is_null"
+    ins f "i32.or"
+    ifE f
+    lg f "$a"
+    ins f "ref.is_null"
+    lg f "$b"
+    ins f "ref.is_null"
+    ins f "i32.and"
+    refI31 f
+    ret f
+    endB f
+    // both i31
+    lg f "$a"
+    gcAbs f "ref.test" "i31"
+    lg f "$b"
+    gcAbs f "ref.test" "i31"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    lg f "$b"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i32.eq"
+    refI31 f
+    ret f
+    endB f
+    // both strings: length then bytes
+    lg f "$a"
+    gcT f "ref.test" "$str"
+    lg f "$b"
+    gcT f "ref.test" "$str"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$str"
+    gci f "array.len"
+    lg f "$b"
+    gcT f "ref.cast" "$str"
+    gci f "array.len"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    refI31 f
+    ret f
+    endB f
+    blockE f "$ne"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$a"
+    gcT f "ref.cast" "$str"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$ne"
+    lg f "$a"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$b"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    refI31 f
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    ic f 1
+    refI31 f
+    ret f
+    endB f
+    // boxed scalars
+    for bt, eqop in [ "$boxl", "i64.eq"; "$boxf", "f64.eq"; "$boxs", "f32.eq"; "$boxi", "i32.eq" ] do
+        lg f "$a"
+        gcT f "ref.test" bt
+        lg f "$b"
+        gcT f "ref.test" bt
+        ins f "i32.and"
+        ifE f
+        lg f "$a"
+        gcT f "ref.cast" bt
+        gcTF f "struct.get" bt 0
+        lg f "$b"
+        gcT f "ref.cast" bt
+        gcTF f "struct.get" bt 0
+        ins f eqop
+        refI31 f
+        ret f
+        endB f
+    // tuples, per arity in the frame
+    for n in tupArities do
+        let t = "$tup" + string n
+        lg f "$a"
+        gcT f "ref.test" t
+        lg f "$b"
+        gcT f "ref.test" t
+        ins f "i32.and"
+        ifE f
+        let mutable i = 0
+        while i < n do
+            lg f "$a"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            lg f "$b"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            callf f "$equal"
+            gcAbs f "ref.cast" "i31"
+            i31get f
+            ins f "i32.eqz"
+            ifE f
+            ic f 0
+            refI31 f
+            ret f
+            endB f
+            i <- i + 1
+        ic f 1
+        refI31 f
+        ret f
+        endB f
+    // DU cases: same tag, then through the $duEq table
+    for dt in [ "$du0"; "$du1" ] do
+        lg f "$a"
+        gcT f "ref.test" dt
+        lg f "$b"
+        gcT f "ref.test" dt
+        ins f "i32.and"
+        ifE f
+        lg f "$a"
+        gcT f "ref.cast" dt
+        gcTF f "struct.get" dt 0
+        lg f "$b"
+        gcT f "ref.cast" dt
+        gcTF f "struct.get" dt 0
+        ins f "i32.ne"
+        ifE f
+        ic f 0
+        refI31 f
+        ret f
+        endB f
+        lg f "$a"
+        lg f "$b"
+        gg f "$duEq"
+        lg f "$a"
+        gcT f "ref.cast" dt
+        gcTF f "struct.get" dt 0
+        gcT f "array.get" "$vt"
+        gcT f "ref.cast" "$u1"
+        callRef f "$u1"
+        ret f
+        endB f
+    // cons: heads then tails
+    lg f "$a"
+    gcT f "ref.test" "$cons"
+    lg f "$b"
+    gcT f "ref.test" "$cons"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    lg f "$b"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    callf f "$equal"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i32.eqz"
+    ifE f
+    ic f 0
+    refI31 f
+    ret f
+    endB f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    lg f "$b"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    callf f "$equal"
+    ret f
+    endB f
+    // fallback: identity
+    lg f "$a"
+    castEq f
+    lg f "$b"
+    castEq f
+    ins f "ref.eq"
+    refI31 f
+    endFn f

@@ -315,4 +315,130 @@ let binaryWriter =
             Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
             Expect.equal out "40\n7\n" "closures apply and exceptions catch, all from bytes"
         }
+        test "equal and strcat: structural equality from binary" {
+            // the big dispatch ported branch for branch: i31s, strings by
+            // content, tuples through recursive equal, DU tags through the
+            // $duEq vtable, cons lists element-wise, and addv's string path
+            // through strcat. Each prints 1/0; the line is the truth table.
+            let m = modNew ()
+            frame m [ 1; 2 ] [ 2 ]
+            rtTypes2 m
+            rtTypes3 m
+            tyFunc m "$main_t" [] []
+            rtDecls m
+            rtCoreDecls2 m
+            rtDecls3 m
+            declFn m "$main" "$main_t"
+            exportFn m "_start" "$main"
+            globalVt m "$duEq" [ "$eq_du_default"; "$eq_du_default" ]
+            dataSeg m "$dA" [| byte 104; byte 105 |]  // "hi"
+            dataSeg m "$dB" [| byte 104; byte 105 |]  // "hi" again
+            rtCore m
+            rtCore2 m
+            rtCore3 m [ 2 ]
+            let f = beginFn m []
+            local f "$p" "anyref"
+            local f "$q" "anyref"
+            localsDone f
+            let pr () =
+                gcAbs f "ref.cast" "i31"
+                i31get f
+                callf f "$printi"
+            // same-content strings equal
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dA"
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dB"
+            callf f "$equal"
+            pr ()
+            // tuples (1, "hi") = (1, "hi")
+            ic f 1
+            refI31 f
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dA"
+            gcT f "struct.new" "$tup2"
+            ls f "$p"
+            ic f 1
+            refI31 f
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dB"
+            gcT f "struct.new" "$tup2"
+            ls f "$q"
+            lg f "$p"
+            lg f "$q"
+            callf f "$equal"
+            pr ()
+            // DU: tag 1 with payload 7 vs payload 7 -> 1; vs payload 8 -> 0
+            ic f 1
+            ic f 7
+            refI31 f
+            gcT f "struct.new" "$du1"
+            ls f "$p"
+            ic f 1
+            ic f 8
+            refI31 f
+            gcT f "struct.new" "$du1"
+            ls f "$q"
+            lg f "$p"
+            lg f "$p"
+            callf f "$equal"
+            pr ()
+            lg f "$p"
+            lg f "$q"
+            callf f "$equal"
+            pr ()
+            // cons [1;2] = [1;2]
+            ic f 1
+            refI31 f
+            ic f 2
+            refI31 f
+            refNull f "any"
+            gcT f "struct.new" "$cons"
+            gcT f "struct.new" "$cons"
+            ls f "$p"
+            ic f 1
+            refI31 f
+            ic f 2
+            refI31 f
+            refNull f "any"
+            gcT f "struct.new" "$cons"
+            gcT f "struct.new" "$cons"
+            ls f "$q"
+            lg f "$p"
+            lg f "$q"
+            callf f "$equal"
+            pr ()
+            // addv on strings -> "hihi", printed
+            ic f 10
+            callf f "$putc"
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dA"
+            ic f 0
+            ic f 2
+            arrNewData f "$str" "$dB"
+            callf f "$strcat"
+            gcT f "ref.cast" "$str"
+            callf f "$prints"
+            ic f 10
+            callf f "$putc"
+            endFn f
+            let bytes = assemble m 17 true
+            let path = System.IO.Path.GetTempFileName () + ".wasm"
+            System.IO.File.WriteAllBytes (path, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + path)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd ()
+            let err = p.StandardError.ReadToEnd ()
+            p.WaitForExit ()
+            System.IO.File.Delete path
+            Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+            Expect.equal out "11101\nhihi\n" "content equality across every representation ported so far"
+        }
     ]
