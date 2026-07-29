@@ -443,6 +443,22 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
         emitSection out 11 (fun b ->
             emitU32 b m.DataCount
             emitBytes b (bytesToArray m.DataBody))
+    // name section (custom, id 0): function names, so a trap backtrace or a
+    // fixpoint divergence is diagnosed by NAME rather than raw byte offset
+    emitSection out 0 (fun b ->
+        emitVec b (stringBytes "name")
+        let names =
+            dictPairs m.FuncIdx
+            |> List.sortBy snd
+        let sub = bytesNew ()
+        emitU32 sub (List.length names)
+        for n, i in names do
+            emitU32 sub i
+            let n = if n.StartsWith "$" then n.Substring 1 else n
+            emitVec sub (stringBytes n)
+        emitByte b 1
+        emitU32 b sub.Count
+        emitBytes b (bytesToArray sub))
     bytesToArray out
 
 // ---- the runtime, transliterated ------------------------------------------
