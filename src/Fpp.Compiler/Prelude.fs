@@ -80,6 +80,10 @@ let parseFloat (s : string) : float =
 /// the IEEE half nearest `v`, as its 16 bits
 let halfBits (v : float) : int =
     int (System.BitConverter.HalfToInt16Bits (System.Half.op_Explicit v)) &&& 0xffff
+/// IEEE bits of a double/single — what the BINARY writer emits for a float
+/// constant (self-hosted this is i64.reinterpret_f64 / i32.reinterpret_f32)
+let doubleBits (v : float) : int64 = System.BitConverter.DoubleToInt64Bits v
+let singleBits (v : float32) : int = System.BitConverter.SingleToInt32Bits v
 /// How many BYTES this text occupies. Source is read as bytes (see
 /// `hostReadText`), so a string IS its bytes and no re-encoding is wanted —
 /// encoding it as UTF-8 here turned one em dash already in the source into

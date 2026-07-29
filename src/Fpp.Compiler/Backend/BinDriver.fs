@@ -291,9 +291,46 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
 let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
-        let digits = s |> String.filter (fun c -> isDigit c || c = '-')
-        ic f (if digits = "" then 0 else int digits)
+        // an unsigned literal keeps its bit pattern: 4000000000u is the i32
+        // whose unsigned reading is that value
+        let isHex = s.StartsWith "0x" || s.StartsWith "0X"
+        let isUnsigned = s.EndsWith "u" || s.EndsWith "U"
+        let v =
+            if isHex then parseUInt32In 16 (s.Substring(2).TrimEnd ([| 'u'; 'U' |]))
+            else
+                let digits = s |> String.filter (fun c -> isDigit c || c = '-')
+                if digits = "" then 0
+                elif isUnsigned then parseUInt32 digits
+                else int digits
+        ic f v
         callf f "$ofi"
+    | ELit (LInt s) ->
+        let isHex = s.StartsWith "0x" || s.StartsWith "0X"
+        let v =
+            if isHex then parseInt64In 16 (s.Substring(2).TrimEnd ([| 'L' |]))
+            else
+                let digits = s |> String.filter (fun c -> isDigit c || c = '-')
+                if digits = "" then 0L else int64 digits
+        lc f v
+        callf f "$ofl"
+    | ELit (LFloat s) ->
+        // keep everything a float constant may contain, drop only the F++
+        // width suffix; the writer speaks BITS, so the conversion is here
+        let num = s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E')
+        if s.EndsWith "h" || s.EndsWith "H" then
+            // a half literal is rounded ONCE, here, into its i31 bit pattern
+            ic f (halfBits (parseFloat num))
+            refI31 f
+        elif s.EndsWith "f" || s.EndsWith "F" then
+            sc f (singleBits (float32 (parseFloat num)))
+            gcT f "struct.new" "$boxs"
+        else
+            fc f (doubleBits (parseFloat num))
+            gcT f "struct.new" "$boxf"
+    | ELit (LChar raw) ->
+        let bytes = unescape raw
+        ic f (if bytes.Length > 0 then int bytes.[0] else 0)
+        refI31 f
     | ELit (LBool b) ->
         ic f (if b then 1 else 0)
         refI31 f
@@ -453,6 +490,15 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         callf f "$putc"
         ic f 0
         refI31 f
+    | EApp (EUnknown "printc", [ a ]) ->
+        // a char prints as the character, not its code
+        emitNode st f lv a
+        callf f "$toi"
+        callf f "$putc"
+        ic f 10
+        callf f "$putc"
+        ic f 0
+        refI31 f
     | EApp (EUnknown "prints", [ a ]) ->
         emitNode st f lv a
         gcT f "ref.cast" "$str"
@@ -508,6 +554,162 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         callf f "$toi"
         ins f "i32.eqz"
         refI31 f
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "t"
+        && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "<"; ">"; "<="; ">=" ] ->
+        // `+` concatenates; ordering is byte-wise ordinal, like F#'s `<`
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv b
+        gcT f "ref.cast" "$str"
+        (match op.Substring (0, op.Length - 1) with
+         | "+" -> callf f "$strcat"
+         | baseOp ->
+             callf f "$strcmp"
+             ic f 0
+             ins f (match baseOp with
+                    | "<" -> "i32.lt_s" | ">" -> "i32.gt_s"
+                    | "<=" -> "i32.le_s" | _ -> "i32.ge_s")
+             refI31 f)
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1
+        && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l" || op.EndsWith "i")
+        && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ] ->
+        let baseOp = op.Substring (0, op.Length - 1)
+        let kind = op.Substring (op.Length - 1)
+        let un, box_, ty, flt =
+            match kind with
+            | "f" -> "$tof", "$off", "f64", true
+            | "s" -> "$tos", "$oss", "f32", true
+            | "l" -> "$tol", "$ofl", "i64", false
+            | _ -> "$toi", "$ofi", "i32", false
+        if baseOp = "%" && flt then
+            err st "binary: float remainder unsupported"
+            refNull f "any"
+        else
+            emitNode st f lv a
+            callf f un
+            emitNode st f lv b
+            callf f un
+            let cmp = List.contains baseOp [ "<"; ">"; "<="; ">=" ]
+            let insn =
+                match baseOp with
+                | "+" -> ty + ".add" | "-" -> ty + ".sub" | "*" -> ty + ".mul"
+                | "/" -> if flt then ty + ".div" else ty + ".div_s"
+                | "%" -> ty + ".rem_s"
+                | "<" -> if flt then ty + ".lt" else ty + ".lt_s"
+                | ">" -> if flt then ty + ".gt" else ty + ".gt_s"
+                | "<=" -> if flt then ty + ".le" else ty + ".le_s"
+                | _ -> if flt then ty + ".ge" else ty + ".ge_s"
+            ins f insn
+            if cmp then refI31 f else callf f box_
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "w"
+        && List.contains (op.Substring (0, op.Length - 1))
+            [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+        // the UNSIGNED int family: uint32 semantics on the i32 rail
+        let baseOp = op.Substring (0, op.Length - 1)
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        let cmp = List.contains baseOp [ "<"; ">"; "<="; ">=" ]
+        let insn =
+            match baseOp with
+            | "+" -> "i32.add" | "-" -> "i32.sub" | "*" -> "i32.mul"
+            | "/" -> "i32.div_u" | "%" -> "i32.rem_u"
+            | "<" -> "i32.lt_u" | ">" -> "i32.gt_u" | "<=" -> "i32.le_u" | ">=" -> "i32.ge_u"
+            | "&&&" -> "i32.and" | "|||" -> "i32.or" | "^^^" -> "i32.xor"
+            | "<<<" -> "i32.shl" | _ -> "i32.shr_u"
+        ins f insn
+        if cmp then refI31 f else callf f "$ofi"
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "l"
+        && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+        let baseOp = op.Substring (0, op.Length - 1)
+        emitNode st f lv a
+        callf f "$tol"
+        emitNode st f lv b
+        (match baseOp with
+         | "<<<" | ">>>" ->
+             // the shift count is an int
+             callf f "$toi"
+             ins f "i64.extend_i32_s"
+         | _ -> callf f "$tol")
+        ins f (match baseOp with
+               | "&&&" -> "i64.and" | "|||" -> "i64.or" | "^^^" -> "i64.xor"
+               | "<<<" -> "i64.shl" | _ -> "i64.shr_s")
+        callf f "$ofl"
+    | EPrim (op, [ a; b ]) when List.contains op [ "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        ins f (match op with
+               | "&&&" -> "i32.and" | "|||" -> "i32.or" | "^^^" -> "i32.xor"
+               | "<<<" -> "i32.shl" | _ -> "i32.shr_u")
+        callf f "$ofi"
+    | EPrim ("u-f", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tof"
+        ins f "f64.neg"
+        callf f "$off"
+    | EPrim ("u-s", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tos"
+        ins f "f32.neg"
+        callf f "$oss"
+    | EPrim ("u-l", [ a ]) ->
+        lc f 0L
+        emitNode st f lv a
+        callf f "$tol"
+        ins f "i64.sub"
+        callf f "$ofl"
+    | EPrim ("u~~~", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        ic f -1
+        ins f "i32.xor"
+        callf f "$ofi"
+    | EPrim (("sqrtf" | "sqrts" | "absf" | "abss" | "truncatef" | "truncates") as op, [ a ]) ->
+        // the INSTRUCTION rather than `if x < 0 then -x`: that form gets
+        // -0.0 and NaN wrong
+        let f32 = op.EndsWith "s"
+        let ty = if f32 then "f32" else "f64"
+        emitNode st f lv a
+        callf f (if f32 then "$tos" else "$tof")
+        ins f (if op.StartsWith "sqrt" then ty + ".sqrt"
+               elif op.StartsWith "abs" then ty + ".abs"
+               else ty + ".trunc")
+        callf f (if f32 then "$oss" else "$off")
+    | EPrim ("abs", [ a ]) ->
+        let l = freshLocal f "$bn" "i32"
+        emitNode st f lv a
+        callf f "$toi"
+        ls f l
+        ic f 0
+        lg f l
+        ins f "i32.sub"
+        lg f l
+        lg f l
+        ic f 0
+        ins f "i32.lt_s"
+        ins f "select"
+        callf f "$ofi"
+    | EPrim ("absl", [ a ]) ->
+        let l = freshLocal f "$bnl" "i64"
+        emitNode st f lv a
+        callf f "$tol"
+        ls f l
+        lc f 0L
+        lg f l
+        ins f "i64.sub"
+        lg f l
+        lg f l
+        lc f 0L
+        ins f "i64.lt_s"
+        ins f "select"
+        callf f "$ofl"
     | ERecord (tyName, fields) ->
         let rn =
             if tyName <> "" && tyName <> "?" && (dictTryFind st.FieldsOf tyName).IsSome then tyName
@@ -527,6 +729,11 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | None ->
              err st ("binary: record with unknown type " + tyName)
              refNull f "any")
+    | EField (r, "Length", _) when not (dictTryFind st.FieldOwner "Length").IsSome ->
+        // no record claims a Length field: this is the built-in one, across
+        // strings and every array representation
+        emitNode st f lv r
+        callf f "$lenv"
     | EField (r, fname, owner) ->
         let rn =
             if owner <> "" && (dictTryFind st.FieldIdx (owner, fname)).IsSome then owner
@@ -687,6 +894,14 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         emitNode st f lv n
         callf f "$toi"
         gcT f "array.new" "$arr"
+    | EIndex ("$str", a, i) ->
+        // char access on a STRING receiver (the "$str" sentinel)
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv i
+        callf f "$toi"
+        gcT f "array.get_u" "$str"
+        refI31 f
     | EIndex (_, a, i) ->
         emitNode st f lv a
         gcT f "ref.cast" "$arr"
@@ -703,10 +918,10 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         ic f 0
         refI31 f
     | EArrayLen (_, a) ->
+        // representation-dispatched: the receiver may be $arr OR $str (byte
+        // strings and arrays share the length surface)
         emitNode st f lv a
-        gcT f "ref.cast" "$arr"
-        gci f "array.len"
-        callf f "$ofi"
+        callf f "$lenv"
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name ->
@@ -923,12 +1138,14 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes3 m
     rtTypes4 m
     rtTypes5 m
+    rtTypes6 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
     rtDecls3 m
     rtDecls4 m
     rtDecls5 m
+    rtDecls6 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -984,6 +1201,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore3 m [ 2; 3 ]
     rtCore4 m
     rtCore5 m
+    rtCore6 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do

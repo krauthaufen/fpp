@@ -1232,6 +1232,752 @@ let rtCore5 (m : Mod) : unit =
     endB f // block $done
     endFn f
 
+// ---- runtime: the numeric/string kernel ------------------------------------
+// Transliterated from the text runtime function by function: strcmp, the
+// f64/f32/i64 boxing family, digit put/take, string->number, number->string.
+
+let rtTypes6 (m : Mod) : unit =
+    tyFunc m "$rt_ss2i" [ "$str"; "$str" ] [ "i32" ]
+    tyFunc m "$rt_a2f" [ "anyref" ] [ "f64" ]
+    tyFunc m "$rt_f2a" [ "f64" ] [ "anyref" ]
+    tyFunc m "$rt_a2fs" [ "anyref" ] [ "f32" ]
+    tyFunc m "$rt_fs2a" [ "f32" ] [ "anyref" ]
+    tyFunc m "$rt_a2l" [ "anyref" ] [ "i64" ]
+    tyFunc m "$rt_l2a" [ "i64" ] [ "anyref" ]
+    tyFunc m "$rt_sii2i" [ "$str"; "i32"; "i32" ] [ "i32" ]
+    tyFunc m "$rt_sil2i" [ "$str"; "i32"; "i64" ] [ "i32" ]
+    tyFunc m "$rt_si2a" [ "$str"; "i32" ] [ "anyref" ]
+    tyFunc m "$rt_s2l" [ "$str" ] [ "i64" ]
+    tyFunc m "$rt_s2i" [ "$str" ] [ "i32" ]
+    tyFunc m "$rt_s2f" [ "$str" ] [ "f64" ]
+    tyFunc m "$rt_l2v" [ "i64" ] []
+    tyFunc m "$rt_f2v" [ "f64" ] []
+    tyFunc m "$rt_a2a" [ "anyref" ] [ "anyref" ]
+
+let rtDecls6 (m : Mod) : unit =
+    declFn m "$strcmp" "$rt_ss2i"
+    declFn m "$tof" "$rt_a2f"
+    declFn m "$off" "$rt_f2a"
+    declFn m "$tos" "$rt_a2fs"
+    declFn m "$oss" "$rt_fs2a"
+    declFn m "$tol" "$rt_a2l"
+    declFn m "$ofl" "$rt_l2a"
+    declFn m "$sput" "$rt_sii2i"
+    declFn m "$lput" "$rt_sil2i"
+    declFn m "$strTake" "$rt_si2a"
+    declFn m "$atol" "$rt_s2l"
+    declFn m "$atoi" "$rt_s2i"
+    declFn m "$atof" "$rt_s2f"
+    declFn m "$ltoa" "$rt_l2a"
+    declFn m "$ultoa" "$rt_l2a"
+    declFn m "$ftoa" "$rt_f2a"
+    declFn m "$printl" "$rt_l2v"
+    declFn m "$printf64" "$rt_f2v"
+    declFn m "$lenv" "$rt_a2a"
+
+// f64 constants by their bit patterns — the writer speaks bits, and spelled
+// this way the self-hosted compiler needs no host float formatting
+let private F10 = 0x4024000000000000L
+let private FTENTH = 0x3FB999999999999AL
+let private F1E18 = 0x43ABC16D674EC800L
+let private FINF = 0x7FF0000000000000L
+
+let rtCore6 (m : Mod) : unit =
+    // $strcmp: byte-wise ordinal; shorter sorts first
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$i" "i32"
+    local f "$la" "i32"
+    local f "$lb" "i32"
+    local f "$ca" "i32"
+    local f "$cb" "i32"
+    localsDone f
+    lg f "$a"
+    gci f "array.len"
+    ls f "$la"
+    lg f "$b"
+    gci f "array.len"
+    ls f "$lb"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$la"
+    ins f "i32.ge_u"
+    lg f "$i"
+    lg f "$lb"
+    ins f "i32.ge_u"
+    ins f "i32.or"
+    brIf f "$done"
+    lg f "$a"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ls f "$ca"
+    lg f "$b"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ls f "$cb"
+    lg f "$ca"
+    lg f "$cb"
+    ins f "i32.ne"
+    ifE f
+    ic f -1
+    ic f 1
+    lg f "$ca"
+    lg f "$cb"
+    ins f "i32.lt_u"
+    ins f "select"
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f // loop
+    endB f // $done
+    lg f "$la"
+    lg f "$lb"
+    ins f "i32.lt_u"
+    ifE f
+    ic f -1
+    ret f
+    endB f
+    lg f "$la"
+    lg f "$lb"
+    ins f "i32.gt_u"
+    ifE f
+    ic f 1
+    ret f
+    endB f
+    ic f 0
+    endFn f
+    // $tof
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    endFn f
+    // $off
+    let f = beginFn m [ "$x" ]
+    localsDone f
+    lg f "$x"
+    gcT f "struct.new" "$boxf"
+    endFn f
+    // $tos
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.cast" "$boxs"
+    gcTF f "struct.get" "$boxs" 0
+    endFn f
+    // $oss
+    let f = beginFn m [ "$x" ]
+    localsDone f
+    lg f "$x"
+    gcT f "struct.new" "$boxs"
+    endFn f
+    // $tol: an i31 widens; otherwise unbox
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcAbs f "ref.test" "i31"
+    ifV f "i64"
+    lg f "$v"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i64.extend_i32_s"
+    elseB f
+    lg f "$v"
+    gcT f "ref.cast" "$boxl"
+    gcTF f "struct.get" "$boxl" 0
+    endB f
+    endFn f
+    // $ofl: i31 when it fits in 31 bits, $boxl when it does not
+    let f = beginFn m [ "$n" ]
+    localsDone f
+    lg f "$n"
+    lg f "$n"
+    lc f 33L
+    ins f "i64.shl"
+    lc f 33L
+    ins f "i64.shr_s"
+    ins f "i64.eq"
+    ifA f
+    lg f "$n"
+    ins f "i32.wrap_i64"
+    refI31 f
+    elseB f
+    lg f "$n"
+    gcT f "struct.new" "$boxl"
+    endB f
+    endFn f
+    // $sput: store one byte, return the advanced position
+    let f = beginFn m [ "$s"; "$p"; "$c" ]
+    localsDone f
+    lg f "$s"
+    lg f "$p"
+    lg f "$c"
+    gcT f "array.set" "$str"
+    lg f "$p"
+    ic f 1
+    ins f "i32.add"
+    endFn f
+    // $lput: digits of an i64 MAGNITUDE, unsigned — `0 - min` wraps to min,
+    // whose unsigned value is exactly the magnitude
+    let f = beginFn m [ "$s"; "$p"; "$n" ]
+    local f "$m" "i64"
+    localsDone f
+    lg f "$n"
+    lc f 10L
+    ins f "i64.div_u"
+    ls f "$m"
+    lg f "$m"
+    lc f 0L
+    ins f "i64.gt_u"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    lg f "$m"
+    callf f "$lput"
+    ls f "$p"
+    endB f
+    lg f "$s"
+    lg f "$p"
+    ic f 48
+    lg f "$n"
+    lc f 10L
+    ins f "i64.rem_u"
+    ins f "i32.wrap_i64"
+    ins f "i32.add"
+    callf f "$sput"
+    endFn f
+    // $strTake: the first p bytes as a fresh string
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$r" "$str"
+    localsDone f
+    lg f "$p"
+    gcT f "array.new_default" "$str"
+    ls f "$r"
+    lg f "$r"
+    ic f 0
+    lg f "$s"
+    ic f 0
+    lg f "$p"
+    arrCopy f "$str" "$str"
+    lg f "$r"
+    endFn f
+    // $atol: parse stops at the first character that cannot continue
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$neg" "i32"
+    local f "$acc" "i64"
+    local f "$c" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    ic f 0
+    ins f "i32.gt_u"
+    ifE f
+    lg f "$s"
+    ic f 0
+    gcT f "array.get_u" "$str"
+    ic f 45
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$neg"
+    ic f 1
+    ls f "$i"
+    endB f
+    lg f "$s"
+    ic f 0
+    gcT f "array.get_u" "$str"
+    ic f 43
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$i"
+    endB f
+    endB f
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ls f "$c"
+    lg f "$c"
+    ic f 48
+    ins f "i32.lt_u"
+    brIf f "$done"
+    lg f "$c"
+    ic f 57
+    ins f "i32.gt_u"
+    brIf f "$done"
+    lg f "$acc"
+    lc f 10L
+    ins f "i64.mul"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "i64.extend_i32_u"
+    ins f "i64.add"
+    ls f "$acc"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$neg"
+    ifV f "i64"
+    lc f 0L
+    lg f "$acc"
+    ins f "i64.sub"
+    elseB f
+    lg f "$acc"
+    endB f
+    endFn f
+    // $atoi
+    let f = beginFn m [ "$s" ]
+    localsDone f
+    lg f "$s"
+    callf f "$atol"
+    ins f "i32.wrap_i64"
+    endFn f
+    // $atof: mantissa/fraction/exponent stages
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$neg" "i32"
+    local f "$v" "f64"
+    local f "$scale" "f64"
+    local f "$stage" "i32"
+    local f "$exp" "i32"
+    local f "$esign" "i32"
+    local f "$c" "i32"
+    local f "$k" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$n"
+    fc f FTENTH
+    ls f "$scale"
+    ic f 1
+    ls f "$esign"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ls f "$c"
+    lg f "$c"
+    ic f 45
+    ins f "i32.eq"
+    lg f "$i"
+    ins f "i32.eqz"
+    ins f "i32.and"
+    ifE f
+    ic f 1
+    ls f "$neg"
+    endB f
+    lg f "$c"
+    ic f 46
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$stage"
+    endB f
+    lg f "$c"
+    ic f 101
+    ins f "i32.eq"
+    lg f "$c"
+    ic f 69
+    ins f "i32.eq"
+    ins f "i32.or"
+    ifE f
+    ic f 2
+    ls f "$stage"
+    endB f
+    lg f "$c"
+    ic f 45
+    ins f "i32.eq"
+    lg f "$stage"
+    ic f 2
+    ins f "i32.eq"
+    ins f "i32.and"
+    ifE f
+    ic f -1
+    ls f "$esign"
+    endB f
+    lg f "$c"
+    ic f 48
+    ins f "i32.ge_u"
+    lg f "$c"
+    ic f 57
+    ins f "i32.le_u"
+    ins f "i32.and"
+    ifE f
+    lg f "$stage"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$v"
+    fc f F10
+    ins f "f64.mul"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "f64.convert_i32_u"
+    ins f "f64.add"
+    ls f "$v"
+    endB f
+    lg f "$stage"
+    ic f 1
+    ins f "i32.eq"
+    ifE f
+    lg f "$v"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "f64.convert_i32_u"
+    lg f "$scale"
+    ins f "f64.mul"
+    ins f "f64.add"
+    ls f "$v"
+    lg f "$scale"
+    fc f FTENTH
+    ins f "f64.mul"
+    ls f "$scale"
+    endB f
+    lg f "$stage"
+    ic f 2
+    ins f "i32.eq"
+    ifE f
+    lg f "$exp"
+    ic f 10
+    ins f "i32.mul"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "i32.add"
+    ls f "$exp"
+    endB f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    blockE f "$edone"
+    loopE f "$ego"
+    lg f "$k"
+    lg f "$exp"
+    ins f "i32.ge_s"
+    brIf f "$edone"
+    lg f "$esign"
+    ic f 0
+    ins f "i32.gt_s"
+    ifE f
+    lg f "$v"
+    fc f F10
+    ins f "f64.mul"
+    ls f "$v"
+    elseB f
+    lg f "$v"
+    fc f F10
+    ins f "f64.div"
+    ls f "$v"
+    endB f
+    lg f "$k"
+    ic f 1
+    ins f "i32.add"
+    ls f "$k"
+    br f "$ego"
+    endB f
+    endB f
+    lg f "$neg"
+    ifV f "f64"
+    lg f "$v"
+    ins f "f64.neg"
+    elseB f
+    lg f "$v"
+    endB f
+    endFn f
+    // $ltoa
+    let f = beginFn m [ "$n" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    localsDone f
+    ic f 24
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$n"
+    lc f 0L
+    ins f "i64.lt_s"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 45
+    callf f "$sput"
+    ls f "$p"
+    lc f 0L
+    lg f "$n"
+    ins f "i64.sub"
+    ls f "$n"
+    endB f
+    lg f "$s"
+    lg f "$p"
+    lg f "$n"
+    callf f "$lput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $ultoa
+    let f = beginFn m [ "$n" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    localsDone f
+    ic f 24
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$s"
+    lg f "$p"
+    lg f "$n"
+    callf f "$lput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $ftoa: NaN, sign, ∞ (U+221E, matching .NET), 1e18 normalization,
+    // integer part through $lput, up to 15 fractional digits, exponent
+    let f = beginFn m [ "$v" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    local f "$ip" "f64"
+    local f "$frac" "f64"
+    local f "$k" "i32"
+    local f "$d" "i32"
+    local f "$e" "i32"
+    localsDone f
+    ic f 40
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$v"
+    lg f "$v"
+    ins f "f64.ne"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 78
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 97
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 78
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    ret f
+    endB f
+    lg f "$v"
+    fc f 0L
+    ins f "f64.lt"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 45
+    callf f "$sput"
+    ls f "$p"
+    lg f "$v"
+    ins f "f64.neg"
+    ls f "$v"
+    endB f
+    lg f "$v"
+    fc f FINF
+    ins f "f64.eq"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 226
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 136
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 158
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    ret f
+    endB f
+    lg f "$v"
+    fc f F1E18
+    ins f "f64.ge"
+    ifE f
+    blockE f "$scaled"
+    loopE f "$sgo"
+    lg f "$v"
+    fc f F10
+    ins f "f64.lt"
+    brIf f "$scaled"
+    lg f "$v"
+    fc f F10
+    ins f "f64.div"
+    ls f "$v"
+    lg f "$e"
+    ic f 1
+    ins f "i32.add"
+    ls f "$e"
+    br f "$sgo"
+    endB f
+    endB f
+    endB f
+    lg f "$v"
+    ins f "f64.floor"
+    ls f "$ip"
+    lg f "$s"
+    lg f "$p"
+    lg f "$ip"
+    ins f "i64.trunc_f64_s"
+    callf f "$lput"
+    ls f "$p"
+    lg f "$v"
+    lg f "$ip"
+    ins f "f64.sub"
+    ls f "$frac"
+    lg f "$frac"
+    fc f 0L
+    ins f "f64.gt"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 46
+    callf f "$sput"
+    ls f "$p"
+    blockE f "$fdone"
+    loopE f "$fgo"
+    lg f "$k"
+    ic f 15
+    ins f "i32.ge_s"
+    brIf f "$fdone"
+    lg f "$frac"
+    fc f F10
+    ins f "f64.mul"
+    ls f "$frac"
+    lg f "$frac"
+    ins f "f64.floor"
+    ins f "i32.trunc_f64_s"
+    ls f "$d"
+    lg f "$s"
+    lg f "$p"
+    ic f 48
+    lg f "$d"
+    ins f "i32.add"
+    callf f "$sput"
+    ls f "$p"
+    lg f "$frac"
+    lg f "$frac"
+    ins f "f64.floor"
+    ins f "f64.sub"
+    ls f "$frac"
+    lg f "$frac"
+    fc f 0L
+    ins f "f64.eq"
+    brIf f "$fdone"
+    lg f "$k"
+    ic f 1
+    ins f "i32.add"
+    ls f "$k"
+    br f "$fgo"
+    endB f
+    endB f
+    endB f
+    lg f "$e"
+    ic f 0
+    ins f "i32.ne"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 69
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 43
+    callf f "$sput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    lg f "$e"
+    ins f "i64.extend_i32_u"
+    callf f "$lput"
+    ls f "$p"
+    endB f
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $printl / $printf64: print the builder's result
+    let f = beginFn m [ "$n" ]
+    localsDone f
+    lg f "$n"
+    callf f "$ltoa"
+    gcT f "ref.cast" "$str"
+    callf f "$prints"
+    endFn f
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    callf f "$ftoa"
+    gcT f "ref.cast" "$str"
+    callf f "$prints"
+    endFn f
+    // $lenv: .Length across every array-like representation
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    for ty in [ "$arr"; "$parr_i"; "$parr_f"; "$parr_s"; "$parr_l"; "$parr_h"; "$str" ] do
+        lg f "$v"
+        gcT f "ref.test" ty
+        ifE f
+        lg f "$v"
+        gcT f "ref.cast" ty
+        gci f "array.len"
+        callf f "$ofi"
+        ret f
+        endB f
+    ic f 0
+    refI31 f
+    endFn f
+
 let rtCore4 (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     localsDone f
@@ -1261,7 +2007,34 @@ let rtCore4 (m : Mod) : unit =
     callf f "$printi"
     ret f
     endB f
-    // WIP: boxl/boxf/boxs need printl/printf64; '?' marks the gap loudly
+    lg f "$v"
+    gcT f "ref.test" "$boxl"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxl"
+    gcTF f "struct.get" "$boxl" 0
+    callf f "$printl"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxf"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    callf f "$printf64"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxs"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxs"
+    gcTF f "struct.get" "$boxs" 0
+    ins f "f64.promote_f32"
+    callf f "$printf64"
+    ret f
+    endB f
     ic f 63
     callf f "$putc"
     endFn f

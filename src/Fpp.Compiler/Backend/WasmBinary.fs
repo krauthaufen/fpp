@@ -237,13 +237,18 @@ let opByte (name : string) : int =
     | "i64.div_s" -> 0x7F | "i64.div_u" -> 0x80 | "i64.rem_s" -> 0x81 | "i64.rem_u" -> 0x82
     | "i64.and" -> 0x83 | "i64.or" -> 0x84 | "i64.xor" -> 0x85
     | "i64.shl" -> 0x86 | "i64.shr_s" -> 0x87 | "i64.shr_u" -> 0x88
-    | "f32.neg" -> 0x8C | "f32.add" -> 0x92 | "f32.sub" -> 0x93 | "f32.mul" -> 0x94 | "f32.div" -> 0x95
-    | "f64.floor" -> 0x9C | "f64.neg" -> 0x9A
+    | "f32.abs" -> 0x8B | "f32.neg" -> 0x8C | "f32.ceil" -> 0x8D | "f32.floor" -> 0x8E
+    | "f32.trunc" -> 0x8F | "f32.sqrt" -> 0x91
+    | "f32.add" -> 0x92 | "f32.sub" -> 0x93 | "f32.mul" -> 0x94 | "f32.div" -> 0x95
+    | "f64.abs" -> 0x99 | "f64.neg" -> 0x9A | "f64.ceil" -> 0x9B | "f64.floor" -> 0x9C
+    | "f64.trunc" -> 0x9D | "f64.sqrt" -> 0x9F
     | "f64.add" -> 0xA0 | "f64.sub" -> 0xA1 | "f64.mul" -> 0xA2 | "f64.div" -> 0xA3
     | "i32.wrap_i64" -> 0xA7
-    | "i32.trunc_f32_s" -> 0xA8 | "i32.trunc_f64_s" -> 0xAA
+    | "i32.trunc_f32_s" -> 0xA8 | "i32.trunc_f32_u" -> 0xA9
+    | "i32.trunc_f64_s" -> 0xAA | "i32.trunc_f64_u" -> 0xAB
     | "i64.extend_i32_s" -> 0xAC | "i64.extend_i32_u" -> 0xAD
-    | "i64.trunc_f32_s" -> 0xAE | "i64.trunc_f64_s" -> 0xB0
+    | "i64.trunc_f32_s" -> 0xAE | "i64.trunc_f32_u" -> 0xAF
+    | "i64.trunc_f64_s" -> 0xB0 | "i64.trunc_f64_u" -> 0xB1
     | "f32.convert_i32_s" -> 0xB2 | "f32.convert_i32_u" -> 0xB3 | "f32.convert_i64_s" -> 0xB4
     | "f32.demote_f64" -> 0xB6
     | "f64.convert_i32_s" -> 0xB7 | "f64.convert_i32_u" -> 0xB8 | "f64.convert_i64_s" -> 0xB9
