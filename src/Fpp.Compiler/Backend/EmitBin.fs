@@ -3291,6 +3291,107 @@ let rtCore10 (m : Mod) : unit =
     arrNewFixed f "$str" 1
     endFn f
 
+// ---- runtime: list append and the half-precision rounder --------------------
+
+let rtTypes11 (m : Mod) : unit =
+    tyFunc m "$rt_f2i" [ "f64" ] [ "i32" ]
+
+let rtDecls11 (m : Mod) : unit =
+    declFn m "$append" "$u1"
+    declFn m "$f2h64" "$rt_f2i"
+
+let rtCore11 (m : Mod) : unit =
+    // $append: rebuild the left spine onto the right
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"
+    gcT f "ref.test" "$cons"
+    ifA f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    lg f "$b"
+    callf f "$append"
+    gcT f "struct.new" "$cons"
+    elseB f
+    lg f "$b"
+    endB f
+    endFn f
+    // $f2h64: double -> IEEE half bits, correctly rounded (magic-constant
+    // trick in the subnormal range, ties-to-even at bit 42 elsewhere)
+    let f = beginFn m [ "$v" ]
+    local f "$u" "i64"
+    local f "$mag" "i64"
+    local f "$sign" "i32"
+    local f "$o" "i32"
+    localsDone f
+    lg f "$v"
+    ins f "i64.reinterpret_f64"
+    ls f "$u"
+    lg f "$u"
+    lc f 0x8000000000000000L
+    ins f "i64.and"
+    lc f 48L
+    ins f "i64.shr_u"
+    ins f "i32.wrap_i64"
+    ls f "$sign"
+    lg f "$u"
+    lc f 0x7fffffffffffffffL
+    ins f "i64.and"
+    ls f "$mag"
+    lg f "$mag"
+    lc f 0x40f0000000000000L
+    ins f "i64.ge_u"
+    ifE f
+    ic f 0x7e00
+    ic f 0x7c00
+    lg f "$mag"
+    lc f 0x7ff0000000000000L
+    ins f "i64.gt_u"
+    ins f "select"
+    ls f "$o"
+    elseB f
+    lg f "$mag"
+    lc f 0x3f10000000000000L
+    ins f "i64.lt_u"
+    ifE f
+    lg f "$mag"
+    ins f "f64.reinterpret_i64"
+    fc f 0x41B0000000000000L
+    ins f "f64.add"
+    ins f "i64.reinterpret_f64"
+    lc f 0x41b0000000000000L
+    ins f "i64.sub"
+    ins f "i32.wrap_i64"
+    ls f "$o"
+    elseB f
+    lg f "$mag"
+    lc f 0x1ffffffffffL
+    lg f "$mag"
+    lc f 42L
+    ins f "i64.shr_u"
+    lc f 1L
+    ins f "i64.and"
+    ins f "i64.add"
+    ins f "i64.add"
+    ls f "$mag"
+    lg f "$mag"
+    lc f 42L
+    ins f "i64.shr_u"
+    lc f 1032192L
+    ins f "i64.sub"
+    ins f "i32.wrap_i64"
+    ls f "$o"
+    endB f
+    endB f
+    lg f "$sign"
+    lg f "$o"
+    ins f "i32.or"
+    endFn f
+
 // ---- runtime: enumeration protocol and object identity helpers -------------
 // Lists and arrays ARE seqs but carry no vtable: $iterNew wraps whichever
 // representation arrives, $iterNext/$iterCur drive it.

@@ -144,10 +144,19 @@ let generateHost (files : (string * string) list) : string =
 
 // ---- the two stages ------------------------------------------------------
 
+/// `bin` gates the BINARY backend: both stages emit .wasm BYTES and those
+/// must be identical. The byte domain is Latin-1 strings throughout, like
+/// the corpus text — one byte, one char.
+let binMode = System.Environment.GetCommandLineArgs () |> Array.contains "bin"
+
 let emit (label : string) (files : (string * string) list) : string =
     let ws = Workspace()
     for path, text in files do ws.SetFileText path text
-    let wat, errs = ws.EmitProgram ()
+    let wat, errs =
+        if binMode then
+            let bytes, errs = ws.EmitProgramWasm ()
+            System.Text.Encoding.Latin1.GetString bytes, errs
+        else ws.EmitProgram ()
     if not (List.isEmpty errs) then
         printfn "%s: %d emit errors" label errs.Length
         errs
@@ -222,7 +231,8 @@ let report (expected : string) (actual : string) =
 /// two stages on a program neither of them is.
 let selfHost = System.Environment.GetCommandLineArgs () |> Array.contains "self"
 
-let driverPath = root + "/tests/bootstrap/compiledrive.fpp"
+let driverPath =
+    root + "/tests/bootstrap/" + (if binMode then "compiledrive-bin.fpp" else "compiledrive.fpp")
 
 /// The names the corpus is SERVED under. In self mode they are the
 /// compiler's own files, which is what the driver must name too.
@@ -262,9 +272,12 @@ if System.Environment.GetCommandLineArgs () |> Array.contains "stage0" then exit
 // in self mode stage-1 IS the expected answer: same sources, same names, so
 // emitting it twice would only prove that stage-0 is deterministic
 let stage1 = if selfHost then expected else emit "stage-1" stage1Source
-let stage1Path = scratch + "/stage1.wat"
-System.IO.File.WriteAllText (stage1Path, stage1)
-printfn "stage-1: %d bytes of wat" stage1.Length
+let stage1Path = scratch + (if binMode then "/stage1.wasm" else "/stage1.wat")
+// the binary module is BYTES: WriteAllText would re-encode as UTF-8 and
+// corrupt everything past 0x7F
+if binMode then System.IO.File.WriteAllBytes (stage1Path, System.Text.Encoding.Latin1.GetBytes stage1)
+else System.IO.File.WriteAllText (stage1Path, stage1)
+printfn "stage-1: %d bytes of %s" stage1.Length (if binMode then "wasm" else "wat")
 
 // the host serves the corpus AND the prelude the compiler reads at startup
 let hostPath = scratch + "/env.wat"

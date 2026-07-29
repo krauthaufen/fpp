@@ -1040,6 +1040,10 @@ let emit (decls : Decl list) : EmitResult =
         | EApp (EUnknown "strsub", [ s; start; len ]) ->
             "(call $strsub (ref.cast (ref $str) " + recur s + ") " + unwrapI32 (recur start)
             + " " + unwrapI32 (recur len) + ")"
+        | EApp (EUnknown "doubleBits", [ a ]) ->
+            "(call $ofl (i64.reinterpret_f64 (call $tof " + recur a + ")))"
+        | EApp (EUnknown "singleBits", [ a ]) ->
+            "(call $ofi (i32.reinterpret_f32 (call $tos " + recur a + ")))"
         | EApp (EUnknown "memLoadF64", [ a ]) ->
             "(call $off (f64.load (call $toi " + recur a + ")))"
         | EApp (EUnknown "memStoreF32", [ a; v ]) ->

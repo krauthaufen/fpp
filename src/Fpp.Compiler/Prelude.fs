@@ -84,6 +84,9 @@ let halfBits (v : float) : int =
 /// constant (self-hosted this is i64.reinterpret_f64 / i32.reinterpret_f32)
 let doubleBits (v : float) : int64 = System.BitConverter.DoubleToInt64Bits v
 let singleBits (v : float32) : int = System.BitConverter.SingleToInt32Bits v
+/// a warning to stderr — self-hosted this is a no-op (stdout carries the
+/// compiledrive protocol and must stay clean)
+let ewarn (s : string) : unit = System.Console.Error.WriteLine s
 /// How many BYTES this text occupies. Source is read as bytes (see
 /// `hostReadText`), so a string IS its bytes and no re-encoding is wanted —
 /// encoding it as UTF-8 here turned one em dash already in the source into

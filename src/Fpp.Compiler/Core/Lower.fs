@@ -697,6 +697,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
                             (bv.Name = "box" || bv.Name = "unbox" || bv.Name = "float16Bits")
                             && bv.Path = "(builtin)" -> bx
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
+                            (bv.Name = "doubleBits" || bv.Name = "singleBits")
+                            && bv.Path = "(builtin)" ->
+                          // NOT identity: the float is boxed, the bits are an
+                          // integer — the emitters reinterpret
+                          EApp (EUnknown bv.Name, [ bx ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])

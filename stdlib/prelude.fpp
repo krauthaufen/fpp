@@ -652,6 +652,10 @@ extern let box : 'a -> obj
 /// that bit pattern, so this is the identity — it exists to give source a
 /// way to name the pattern rather than the number.
 extern let float16Bits : float16 -> int
+/// A double's/single's IEEE bits — what a binary emitter writes for a float
+/// constant. Lowered to the wasm reinterpret instructions.
+extern let doubleBits : float -> int64
+extern let singleBits : float32 -> int
 extern let unbox : obj -> 'a
 
 // ---- Option: the F# Option module ----

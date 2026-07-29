@@ -600,6 +600,10 @@ let byteLength (s : string) : int = s.Length
 /// 94s the day this function appeared.
 let bytesString (bs : byte[]) : string = unbox (box bs)
 
+/// a warning to stderr — self-hosted this is a NO-OP: stdout carries the
+/// compiledrive protocol and must stay clean, and there is no stderr FFI
+let ewarn (s : string) : unit = ignore s
+
 /// The same text as BYTES.
 let stringBytes (s : string) : byte[] =
     let out = Array.zeroCreate s.Length

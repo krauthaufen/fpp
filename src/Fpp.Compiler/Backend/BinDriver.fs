@@ -56,7 +56,14 @@ type St =
       /// name -> arity, plus request order (bodies are emitted LAST, and
       /// their decls land last too, so decl order still equals body order)
       Wrappers : Dict<string, int>
-      WrapperOrder : Vec<string>
+      /// constructors used as first-class functions share the lazy-decl
+      /// scheme with wrappers; ONE ordered list keeps decl order = body
+      /// order across both kinds ("w:" wrapper chain, "c:" ctorfn)
+      CtorFns : Dict<string, bool>
+      LateFns : Vec<string>
+      /// extern (FFI) functions: (path,offset) -> param kinds * result kind
+      /// ("i" crosses as raw i32, anything else as opaque anyref)
+      Externs : Dict<string * int, string list * string>
       mutable DataN : int }
 
 let private err (st : St) (msg : string) : unit = vecAdd st.Errors msg
@@ -191,7 +198,11 @@ let rec private freeWalk (bound : Dict<string * int, bool>) (acc : Vec<string * 
     | ELam (ps, b) ->
         for pv, _ in ps do dictSet bound (pv.Path, pv.Offset) true
         freeWalk bound acc seen b
-    | ELet (_, v, _, rhs, b) ->
+    | ELet (isRec, v, _, rhs, b) ->
+        // a REC binder is in scope inside its own rhs: walking the rhs
+        // first noted the self-reference as free of the ENCLOSING lambda —
+        // a phantom capture no frame can ever provide
+        if isRec then dictSet bound (v.Path, v.Offset) true
         freeWalk bound acc seen rhs
         dictSet bound (v.Path, v.Offset) true
         freeWalk bound acc seen b
@@ -267,7 +278,7 @@ let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : E
             discoverLams st outer b
     | EApp (g, args) -> discoverLams st outer g; for a in args do discoverLams st outer a
     | EIf (a, b, c) -> discoverLams st outer a; discoverLams st outer b; discoverLams st outer c
-    | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) | ECtor (_, _, xs) ->
+    | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) ->
         for x in xs do discoverLams st outer x
     | ERecord (_, fs) -> for _, v in fs do discoverLams st outer v
     | EField (r, _, _) -> discoverLams st outer r
@@ -275,7 +286,17 @@ let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : E
     | EWhile (c, b) -> discoverLams st outer c; discoverLams st outer b
     | EAssign (_, x) -> discoverLams st outer x
     | EIfaceCall (_, _, r, args) -> discoverLams st outer r; for a in args do discoverLams st outer a
-    | ECast (_, x, _) | ETypeTest (_, x) -> discoverLams st outer x
+    | ECast (_, x, _) | ETypeTest (_, x) | EArrayLen (_, x) | EArrayPin (_, x) | EArrayUnpin (_, x) ->
+        discoverLams st outer x
+    | ERecordExt (_, b, fs) ->
+        discoverLams st outer b
+        for _, v in fs do discoverLams st outer v
+    | EIndex (_, a, i) -> discoverLams st outer a; discoverLams st outer i
+    | EIndexSet (_, a, i, v) ->
+        discoverLams st outer a
+        discoverLams st outer i
+        discoverLams st outer v
+    | EArrayCreate (_, n, v) -> discoverLams st outer n; discoverLams st outer v
     | ETry (b, cs) ->
         discoverLams st outer b
         for _, g, x in cs do
@@ -288,7 +309,7 @@ let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : E
 let private requestWrapper (st : St) (f : Fn) (fname : string) (arity : int) : unit =
     if not (dictTryFind st.Wrappers fname).IsSome then
         dictSet st.Wrappers fname arity
-        vecAdd st.WrapperOrder fname
+        vecAdd st.LateFns ("w:" + fname)
         for k in 0 .. arity - 1 do declFn f.M (fname + ".w" + string k) "$u1"
 
 /// cast to (ref null eq) — ref.eq's operand type
@@ -670,6 +691,19 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
                   err st "binary: multi-payload ctor not ported"
                   refNull f "any")
              gcT f "struct.new" "$du1"
+         | Some 1 ->
+             // the constructor as a VALUE (`|> Some`): a closure whose
+             // function builds the case; body emitted with the wrapper tail
+             if not (dictTryFind st.CtorFns name).IsSome then
+                 dictSet st.CtorFns name true
+                 vecAdd st.LateFns ("c:" + name)
+                 declFn f.M ("$ctorfn_" + name) "$u1"
+             rf f ("$ctorfn_" + name)
+             refNull f "any"
+             gcT f "struct.new" "$clo"
+         | Some _ ->
+             err st ("binary: unapplied multi-payload constructor " + name)
+             refNull f "any"
          | _ ->
              err st ("binary: ctor shape not ported: " + name)
              refNull f "any")
@@ -1074,6 +1108,22 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
          | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
+    | EApp (EUnknown "float16#f", [ a ]) ->
+        // a half is its bit pattern: round the double once, here
+        emitNode st f lv a
+        callf f "$tof"
+        callf f "$f2h64"
+        callf f "$ofi"
+    | EApp (EUnknown "doubleBits", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tof"
+        ins f "i64.reinterpret_f64"
+        callf f "$ofl"
+    | EApp (EUnknown "singleBits", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tos"
+        ins f "i32.reinterpret_f32"
+        callf f "$ofi"
     | EApp (EUnknown "hexlower", [ a ]) ->
         emitNode st f lv a
         callf f "$toi"
@@ -1188,6 +1238,10 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         emitNode st f lv a
         emitNode st f lv b
         gcT f "struct.new" "$cons"
+    | EPrim ("@", [ a; b ]) ->
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$append"
     | EPrim ("&&", [ a; b ]) -> emitNode st f lv (EIf (a, b, ELit (LBool false)))
     | EPrim ("||", [ a; b ]) -> emitNode st f lv (EIf (a, ELit (LBool true), b))
     | EPrim ("u-", [ a ]) ->
@@ -1422,11 +1476,20 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         for _ in xs do gcT f "struct.new" "$cons"
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
-        for a in args do emitNode st f lv a
         let fn = (dictTryFind st.FnOf (v.Path, v.Offset)).Value
-        // a marked tail call returns the callee's result as ours — no frame
-        // grows, which is what recursion at depth 1000000 needs
-        if (refMapTryFind st.TailApp e).IsSome then retCall f fn else callf f fn
+        (match dictTryFind st.Externs (v.Path, v.Offset) with
+         | Some (pks, rk) ->
+             // FFI boundary: ints cross as raw i32, references pass opaque
+             for k, a in List.zip pks args do
+                 emitNode st f lv a
+                 if k = "i" then callf f "$toi"
+             callf f fn
+             if rk = "i" then callf f "$ofi"
+         | None ->
+             for a in args do emitNode st f lv a
+             // a marked tail call returns the callee's result as ours — no
+             // frame grows, which is what recursion at depth 1000000 needs
+             if (refMapTryFind st.TailApp e).IsSome then retCall f fn else callf f fn)
     | EAssign (v, rhs) when (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome ->
         // the cell may live in this frame or in the closure's env; both reads
         // yield the SAME cell, and the write goes through it
@@ -1533,9 +1596,25 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
     // uniform until the oracle is green, and packed/POD parity is its own
     // pass afterwards. Every element is therefore a boxed anyref, exactly
     // like a closure env slot.
+    | EArray (("byte" | "sbyte"), xs) ->
+        for x in xs do
+            emitNode st f lv x
+            callf f "$toi"
+        arrNewFixed f "$str" (List.length xs)
     | EArray (_, xs) ->
         for x in xs do emitNode st f lv x
         arrNewFixed f "$arr" (List.length xs)
+    | EArrayCreate (("byte" | "sbyte"), n, EUnknown "$zero") ->
+        // packed i8 array, zeroed — same representation as a string
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new_default" "$str"
+    | EArrayCreate (("byte" | "sbyte"), n, v) ->
+        emitNode st f lv v
+        callf f "$toi"
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new" "$str"
     | EArrayCreate (nm, n, EUnknown "$zero") ->
         // Array.zeroCreate. `array.new_default` would give NULL in every
         // slot, which is right for a reference element and wrong for a
@@ -1567,6 +1646,25 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         emitNode st f lv i
         callf f "$toi"
         gcT f "array.get_u" "$str"
+        refI31 f
+    | EIndex (("byte" | "sbyte") as nm, a, i) ->
+        // byte[]/sbyte[] share the packed i8 representation with strings —
+        // that identity is what stringBytes/bytesString rely on
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv i
+        callf f "$toi"
+        gcT f (if nm = "byte" then "array.get_u" else "array.get_s") "$str"
+        callf f "$ofi"
+    | EIndexSet (("byte" | "sbyte"), a, i, v) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv i
+        callf f "$toi"
+        emitNode st f lv v
+        callf f "$toi"
+        gcT f "array.set" "$str"
+        ic f 0
         refI31 f
     | EIndex (_, a, i) ->
         emitNode st f lv a
@@ -1606,7 +1704,7 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
                           gcT f "array.get" "$arr"
                       | Some l -> lg f l
                       | None ->
-                          err st "binary: capture not in scope at build site"
+                          err st ("binary: capture not in scope at build site: " + fst k + "@" + string (snd k))
                           refNull f "any")
                  arrNewFixed f "$arr" (List.length free)
              gcT f "struct.new" "$clo"
@@ -1887,7 +1985,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
           EnumConst = dictNew (); GlobalOf = dictNew (); FnOf = dictNew ()
           ArityOf = dictNew (); Warnings = vecNew ()
-          Wrappers = dictNew (); WrapperOrder = vecNew ()
+          Wrappers = dictNew ()
+          CtorFns = dictNew (); LateFns = vecNew (); Externs = dictNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
           LamName = refMapNew (fun (_ : Expr) -> 7)
           LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls
@@ -2016,6 +2115,31 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         | _ -> ()
     let tupArities = ([ 2; 3 ] @ scanTupleArities decls) |> List.distinct |> List.sort
     frame m vArities tupArities
+    // FFI imports — these occupy function indices BEFORE every declared
+    // function, so they must all be registered here, right after the frame
+    let abiKind (t : Fpp.Analysis.Types.Type) : string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TCon ("int", []) | Fpp.Analysis.Types.TCon ("bool", [])
+        | Fpp.Analysis.Types.TCon ("char", []) -> "i"
+        | _ -> "r"
+    let rec abiSig (t : Fpp.Analysis.Types.Type) : string list * string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TFun (a, b) ->
+            let ps, r = abiSig b
+            abiKind a :: ps, r
+        | r -> [], abiKind r
+    for d in decls do
+        match d with
+        | DExtern (v, sch) ->
+            let pks, rk = abiSig sch.Body
+            let fn = mangle v
+            importFn m "env" v.Name fn
+                (pks |> List.map (fun k -> if k = "i" then "i32" else "anyref"))
+                [ (if rk = "i" then "i32" else "anyref") ]
+            dictSet st.FnOf (v.Path, v.Offset) fn
+            dictSet st.ArityOf (v.Path, v.Offset) (List.length pks)
+            dictSet st.Externs (v.Path, v.Offset) (pks, rk)
+        | _ -> ()
     // record types: UNIFORM anyref fields (scalarization is a parity task,
     // not a bring-up task). Every OBJ record carries __desc; classes add
     // __idhash and inherit their base's fields as a prefix — that layout is
@@ -2049,6 +2173,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes8 m
     rtTypes9 m
     rtTypes10 m
+    rtTypes11 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -2060,6 +2185,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls8 m
     rtDecls9 m
     rtDecls10 m
+    rtDecls11 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -2183,6 +2309,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore8 m
     rtCore9 m
     rtCore10 m
+    rtCore11 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
@@ -2353,7 +2480,18 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     // decls sit after $_start in the function section — bodies land here in
     // request order. Each .wk before the last conses its arg onto the env;
     // the last unspools the chain (latest arg first) and calls direct.
-    for fname in vecToList st.WrapperOrder do
+    for entry in vecToList st.LateFns do
+        if entry.StartsWith "c:" then
+            // a constructor as a function: build the case from the argument
+            let name = entry.Substring 2
+            let f = beginFn m [ "$a"; "$env" ]
+            localsDone f
+            ic f (dictTryFind st.CaseTag name).Value
+            lg f "$a"
+            gcT f "struct.new" "$du1"
+            endFn f
+        else
+        let fname = entry.Substring 2
         let arity = (dictTryFind st.Wrappers fname).Value
         for k in 0 .. arity - 1 do
             let f = beginFn m [ "$a"; "$env" ]

@@ -490,7 +490,7 @@ type Workspace() =
             if not (List.isEmpty monoErrs) then "", [||], monoErrs
             elif binary then
                 let bytes, berrs, warns = Fpp.Backend.BinDriver.emitBinary linked
-                for w in warns do System.Console.Error.WriteLine ("warn: " + w)
+                for w in warns do ewarn ("warn: " + w)
                 "", bytes, berrs
             else
                 let res = Fpp.Backend.EmitWasm.emit linked
