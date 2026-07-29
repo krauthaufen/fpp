@@ -38,6 +38,12 @@ type Mod =
       DataIdx : Dict<string, int>
       DataBody : Bytes
       mutable DataCount : int
+      /// the CLOSURE CODE TABLE: $u1 functions callable through a $clo's
+      /// i32 index via call_indirect — funcrefs never enter the GC heap
+      /// (wasmtime interns them per store, with SipHash, and that was ~10%%
+      /// of a self-compile)
+      TableIdx : Dict<string, int>
+      TableOrder : Vec<string>
       /// funcs referenced first-class; the declarative elem segment
       Declared : Dict<string, bool>
       DeclaredOrder : Vec<string> }
@@ -50,7 +56,8 @@ let modNew () : Mod =
       ExportBody = bytesNew (); ExportCount = 0
       CodeBody = bytesNew (); CodeCount = 0
       DataIdx = dictNew (); DataBody = bytesNew (); DataCount = 0
-      Declared = dictNew (); DeclaredOrder = vecNew () }
+      Declared = dictNew (); DeclaredOrder = vecNew ()
+      TableIdx = dictNew (); TableOrder = vecNew () }
 
 let tyIdx (m : Mod) (name : string) : int =
     match dictTryFind m.TypeIdx name with
@@ -153,6 +160,16 @@ let funcIdx (m : Mod) (fname : string) : int =
     match dictTryFind m.FuncIdx fname with
     | Some i -> i
     | None -> -1
+
+/// register a $u1 function in the closure code table, returning its index
+let tblIdx (m : Mod) (fname : string) : int =
+    match dictTryFind m.TableIdx fname with
+    | Some i -> i
+    | None ->
+        let i = vecLen m.TableOrder
+        dictSet m.TableIdx fname i
+        vecAdd m.TableOrder fname
+        i
 
 // ---- function bodies -------------------------------------------------------
 
@@ -347,6 +364,10 @@ let retCall (f : Fn) (name : string) : unit =
 let callRef (f : Fn) (tyName : string) : unit =
     emitByte f.B opCallRef
     emitU32 f.B (tyIdx f.M tyName)
+let callIndirect (f : Fn) (tyName : string) : unit =
+    emitByte f.B 0x11
+    emitU32 f.B (tyIdx f.M tyName)
+    emitU32 f.B 0
 /// ref.func — and record the target for the declarative elem segment
 let rf (f : Fn) (name : string) : unit =
     emitByte f.B (opByte "ref.func")
@@ -465,6 +486,14 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
     emitSection out 3 (fun b ->
         emitU32 b (m.FuncCount - m.ImportedFuncs)
         emitBytes b (bytesToArray m.FuncSigs))
+    // table 0 always exists: applyc's call_indirect names it even when no
+    // closure was ever built
+    emitSection out 4 (fun b ->
+        emitU32 b 1
+        emitByte b (valByte "funcref")
+        emitByte b 1
+        emitU32 b (vecLen m.TableOrder)
+        emitU32 b (vecLen m.TableOrder))
     emitSection out 5 (fun b ->
         emitU32 b 1
         emitByte b 0
@@ -480,15 +509,28 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
     emitSection out 7 (fun b ->
         emitU32 b m.ExportCount
         emitBytes b (bytesToArray m.ExportBody))
-    // declarative elem segment for every ref.func target
-    if vecLen m.DeclaredOrder > 0 then
+    // elem segments: the ACTIVE closure-code table, then the declarative
+    // segment for every remaining ref.func target
+    let segs =
+        (if vecLen m.TableOrder > 0 then 1 else 0)
+        + (if vecLen m.DeclaredOrder > 0 then 1 else 0)
+    if segs > 0 then
         emitSection out 9 (fun b ->
-            emitU32 b 1
-            emitByte b 3          // declarative, funcidx list
-            emitByte b 0x00       // elemkind: func
-            emitU32 b (vecLen m.DeclaredOrder)
-            for n in vecToList m.DeclaredOrder do
-                emitU32 b (funcIdx m n))
+            emitU32 b segs
+            if vecLen m.TableOrder > 0 then
+                emitByte b 0          // active, table 0, funcidx list
+                emitByte b 0x41       // i32.const
+                emitU32 b 0
+                emitByte b 0x0B       // end
+                emitU32 b (vecLen m.TableOrder)
+                for n in vecToList m.TableOrder do
+                    emitU32 b (funcIdx m n)
+            if vecLen m.DeclaredOrder > 0 then
+                emitByte b 3          // declarative, funcidx list
+                emitByte b 0x00       // elemkind: func
+                emitU32 b (vecLen m.DeclaredOrder)
+                for n in vecToList m.DeclaredOrder do
+                    emitU32 b (funcIdx m n))
     if m.DataCount > 0 then
         emitSection out 12 (fun b -> emitU32 b m.DataCount)
     emitSection out 10 (fun b ->
@@ -816,7 +858,7 @@ let throwExn (f : Fn) : unit =
 
 let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyFunc m "$u1" [ "anyref"; "anyref" ] [ "anyref" ]
-    tyStruct m "$clo" [ fldRef false "$u1"; fld false "anyref" ]
+    tyStruct m "$clo" [ fld false "i32"; fld false "anyref" ]
     tyStruct m "$cell" [ fld true "anyref" ]
     tyStruct m "$cons" [ fld true "anyref"; fld true "anyref" ]
     tyArray m "$str" "i8"
@@ -880,7 +922,7 @@ let rtCore2 (m : Mod) : unit =
     lg f "$f"
     gcT f "ref.cast" "$clo"
     gcTF f "struct.get" "$clo" 0
-    callRef f "$u1"
+    callIndirect f "$u1"
     endFn f
     // $ofi: i31 when it fits, $boxi when it does not
     let f = beginFn m [ "$n" ]
@@ -1008,6 +1050,20 @@ let globalFuncRef (m : Mod) (gname : string) (fname : string) (tyName : string) 
     if not (dictTryFind m.Declared fname).IsSome then
         dictSet m.Declared fname true
         vecAdd m.DeclaredOrder fname
+    emitByte m.GlobalBody opEnd
+
+/// a HOISTED string literal: (ref $str) global built once at instantiation
+/// via array.new_data — evaluating a literal is a global.get, not a fresh
+/// allocation, and duplicate literals share one reference
+let globalStrLit (m : Mod) (gname : string) : unit =
+    // array.new_data is NOT const-valid, so the global starts null and
+    // $strinit fills it before anything else runs
+    dictSet m.GlobalIdx gname m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitRefType m.GlobalBody true (tyIdx m "$str")
+    emitByte m.GlobalBody 1
+    emitByte m.GlobalBody (opByte "ref.null")
+    emitByte m.GlobalBody (heapByte "none")
     emitByte m.GlobalBody opEnd
 
 /// a mutable i32 global with a constant initializer
@@ -2239,6 +2295,7 @@ let rtCore7 (m : Mod) (tupArities : int list) (duHashDirect : bool) : unit =
     let f = beginFn m [ "$v" ]
     local f "$i" "i32"
     local f "$h" "i32"
+    local f "$n" "i32"
     localsDone f
     lg f "$v"
     gcAbs f "ref.test" "i31"
@@ -2361,20 +2418,45 @@ let rtCore7 (m : Mod) (tupArities : int list) (duHashDirect : bool) : unit =
     lg f "$v"
     gcT f "ref.test" "$str"
     ifE f
-    ic f -2128831035
-    ls f "$h"
-    blockE f "$hd"
-    loopE f "$hgo"
-    lg f "$i"
+    // SAMPLED string hash: length, then up to four bytes from each end —
+    // constant time where the FNV walk was O(n) on EVERY table probe. The
+    // dicts are insertion-ordered, so hash values never reach the output;
+    // collisions only cost an equality check that is length-gated anyway.
     lg f "$v"
     gcT f "ref.cast" "$str"
     gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    ic f -2128831035
+    ins f "i32.xor"
+    ls f "$h"
+    ic f 0
+    ls f "$i"
+    blockE f "$hd"
+    loopE f "$hgo"
+    lg f "$i"
+    ic f 4
+    ins f "i32.ge_u"
+    brIf f "$hd"
+    lg f "$i"
+    lg f "$n"
     ins f "i32.ge_u"
     brIf f "$hd"
     lg f "$h"
     lg f "$v"
     gcT f "ref.cast" "$str"
     lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.xor"
+    ic f 16777619
+    ins f "i32.mul"
+    lg f "$v"
+    gcT f "ref.cast" "$str"
+    lg f "$n"
+    ic f 1
+    ins f "i32.sub"
+    lg f "$i"
+    ins f "i32.sub"
     gcT f "array.get_u" "$str"
     ins f "i32.xor"
     ic f 16777619

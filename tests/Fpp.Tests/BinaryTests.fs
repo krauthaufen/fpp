@@ -268,8 +268,8 @@ let binaryWriter =
             local f "$c" "anyref"
             local f "$r" "anyref"
             localsDone f
-            // closure: (struct.new $clo (ref.func $double) null)
-            rf f "$double"
+            // closure: (struct.new $clo <table index of $double> null)
+            ic f (tblIdx m "$double")
             refNull f "any"
             gcT f "struct.new" "$clo"
             ls f "$c"
@@ -335,7 +335,7 @@ let binaryWriter =
             dataSeg m "$dB" [| byte 104; byte 105 |]  // "hi" again
             rtCore m
             rtCore2 m
-            rtCore3 m [ 2 ]
+            rtCore3 m [ 2 ] true
             let f = beginFn m []
             local f "$p" "anyref"
             local f "$q" "anyref"

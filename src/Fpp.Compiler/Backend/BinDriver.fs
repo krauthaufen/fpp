@@ -65,6 +65,12 @@ type St =
       /// bodies receive raw params and return raw
       SigKinds : Dict<string * int, string list * string>
       SigByName : Dict<string, string list * string>
+      /// string-literal segments by CONTENT: duplicates share one segment
+      /// and one hoisted global (so equal literals are the SAME reference)
+      StrSegs : Dict<string, string * int>
+      /// (record, field) -> declared type name, for EVERY record — uniform
+      /// storage erases types, but the VALUE kind is still statically known
+      RecFieldTy : Dict<string * string, string>
       /// the CURRENT body's return kind — return_call is legal only when
       /// callee and caller agree (the frame that would unbox is gone)
       mutable CurRet : string
@@ -100,11 +106,16 @@ let private mangle (v : VarId) : string =
 
 /// intern a string literal as a data segment, return its name and length
 let private internStr (st : St) (bytes : byte[]) : string * int =
-    // named by the MODULE's segment count: the scratch pass and the real
-    // pass then agree without shared mutable state of their own
-    let name = "$bd" + string st.M.DataCount
-    dataSeg st.M name bytes
-    name, bytes.Length
+    let key = bytesString bytes
+    match dictTryFind st.StrSegs key with
+    | Some (n, l) -> n, l
+    | None ->
+        let name = "$bd" + string st.M.DataCount
+        dataSeg st.M name bytes
+        // hoisted: one (ref $str) global per distinct literal
+        globalStrLit st.M ("$sl:" + name)
+        dictSet st.StrSegs key (name, bytes.Length)
+        name, bytes.Length
 
 // unescape for string literals — the full three-spelling logic, ported from
 // the retired text emitter: triple-quoted is literal, verbatim folds `""`,
@@ -415,7 +426,7 @@ let private requestWrapper (st : St) (f : Fn) (fname : string) (arity : int) : u
         for k in 0 .. arity - 1 do
             let wk = fname + ".w" + string k
             declFn f.M wk "$u1"
-            globalFuncRef f.M ("$fr:" + wk) wk "$u1"
+            tblIdx f.M wk |> ignore
 
 /// cast to (ref null eq) — ref.eq's operand type
 let private castEq (f : Fn) : unit =
@@ -466,6 +477,17 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
         (match (dictTryFind st.Pod nm).Value |> fun (placed, _, _) -> placed |> List.tryFind (fun (p, _, _) -> p = fname) with
          | Some (_, k, _) -> k
          | None -> "u")
+    | EField (_, fname, owner) when owner <> "" ->
+        // ONLY the lint-resolved owner: the last-wins FieldOwner fallback
+        // can name a different record that shares the field name, and a
+        // wrong KIND is a trap where a wrong index was merely the
+        // pre-existing ambiguity
+        (match dictTryFind st.RecFieldTy (owner, fname) with
+         | Some "int" -> "i"
+         | Some "float" -> "f"
+         | Some "float32" -> "s"
+         | Some "int64" -> "l"
+         | _ -> "u")
     | ELit (LFloat t) ->
         if t.EndsWith "h" || t.EndsWith "H" then "u"
         elif t.EndsWith "f" || t.EndsWith "F" then "s"
@@ -713,10 +735,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | ELit LNull -> refNull f "any"
     | ELit (LString raw) ->
         let bytes = unescape raw
-        let dn, len = internStr st bytes
-        ic f 0
-        ic f len
-        arrNewData f "$str" dn
+        let dn, _ = internStr st bytes
+        gg f ("$sl:" + dn)
     | ESeq xs ->
         (match List.rev xs with
          | [] ->
@@ -752,7 +772,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | Some fn, Some ar ->
              // function as a value: curried wrapper closure chain
              requestWrapper st f fn ar
-             gg f ("$fr:" + fn + ".w0")
+             ic f (tblIdx f.M (fn + ".w0"))
              refNull f "any"
              gcT f "struct.new" "$clo"
          | _ ->
@@ -955,8 +975,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  dictSet st.CtorFns name true
                  vecAdd st.LateFns ("c:" + name)
                  declFn f.M ("$ctorfn_" + name) "$u1"
-                 globalFuncRef f.M ("$fr:$ctorfn_" + name) ("$ctorfn_" + name) "$u1"
-             gg f ("$fr:$ctorfn_" + name)
+             ic f (tblIdx f.M ("$ctorfn_" + name))
              refNull f "any"
              gcT f "struct.new" "$clo"
          | Some _ ->
@@ -1252,7 +1271,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             endB f
     | EUnknown "hash" ->
         requestWrapper st f "$hashvBoxed" 1
-        gg f "$fr:$hashvBoxed.w0"
+        ic f (tblIdx f.M "$hashvBoxed.w0")
         refNull f "any"
         gcT f "struct.new" "$clo"
     | EApp (EUnknown pd, [ a ]) when
@@ -1283,7 +1302,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EUnknown "$class:Ordered:compare:$ref" ->
         // `compare` at a UNIFORM reference: the runtime compares structurally
         requestWrapper st f "$cmpvBoxed" 2
-        gg f "$fr:$cmpvBoxed.w0"
+        ic f (tblIdx f.M "$cmpvBoxed.w0")
         refNull f "any"
         gcT f "struct.new" "$clo"
     | EApp (EUnknown n, [ a ]) when n.Contains "#" && not (n.StartsWith "pad") ->
@@ -1480,6 +1499,20 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         emitNode st f lv b
         callf f "$addv"
+    | EPrim ("=", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        ins f "i32.eq"
+        refI31 f
+    | EPrim ("<>", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        ins f "i32.ne"
+        refI31 f
     | EPrim ("=", [ a; b ]) ->
         emitNode st f lv a
         emitNode st f lv b
@@ -2211,6 +2244,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "array.set" "$arr"
         ic f 0
         refI31 f
+    | EArrayLen (("$str" | "byte" | "sbyte"), a) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        callf f "$ofi"
+    | EArrayLen (nm, a) when parrK nm <> "" ->
+        emitNode st f lv a
+        gcT f "ref.cast" (parrTy (parrK nm))
+        gci f "array.len"
+        callf f "$ofi"
     | EArrayLen (_, a) ->
         // representation-dispatched: the receiver may be $arr OR $str (byte
         // strings and arrays share the length surface)
@@ -2222,7 +2265,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              // (struct.new $clo (ref.func $lam) env) — env slots hold the
              // CURRENT values of the captured locals, read here at build
              let free = (dictTryFind st.LamFree name).Value
-             gg f ("$fr:" + name)
+             ic f (tblIdx f.M name)
              if List.isEmpty free then refNull f "any"
              else
                  for k in free do
@@ -2392,10 +2435,8 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
     | PLit (LString raw) ->
         lg f slot
         let bytes = unescape raw
-        let dn, len = internStr st bytes
-        ic f 0
-        ic f len
-        arrNewData f "$str" dn
+        let dn, _ = internStr st bytes
+        gg f ("$sl:" + dn)
         callf f "$equal"
         gcAbs f "ref.cast" "i31"
         i31get f
@@ -2540,7 +2581,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           TailApp = refMapNew shallowExprHash
           Pod = dictNew (); StructFields = dictNew ()
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
-          SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u" }
+          SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u"
+          StrSegs = dictNew (); RecFieldTy = dictNew () }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -2785,6 +2827,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             else ("__desc", "r") :: fs0
         let names = fields |> List.map fst
         dictSet st.FieldsOf rn names
+        for fn, ty in fields do
+            if fn <> "__desc" && fn <> "__idhash" then dictSet st.RecFieldTy (rn, fn) ty
         names |> List.iteri (fun i fn ->
             dictSet st.FieldIdx (rn, fn) i
             if fn <> "__desc" && fn <> "__idhash" then dictSet st.FieldOwner fn rn)
@@ -2938,7 +2982,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         | _ -> ()
     for name, _, _ in vecToList st.LamBody do
         declFn m name "$u1"
-        globalFuncRef m ("$fr:" + name) name "$u1"
+        tblIdx m name |> ignore
     let mutable initN = 0
     for d in decls do
         match d with
@@ -2950,6 +2994,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             declFn m fname "$init_t"
         | _ -> ()
     declFn m "$_start" "$init_t"
+    declFn m "$strinit" "$init_t"
     exportFn m "_start" "$_start"
     // bodies, in declaration order
     rtCore m
@@ -3142,7 +3187,17 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         | _ -> ()
     let f = beginFn m []
     localsDone f
+    callf f "$strinit"
     for i in vecToList inits do callf f i
+    endFn f
+    // $strinit: build every hoisted literal, in intern order
+    let f = beginFn m []
+    localsDone f
+    for _, (dn, len) in dictPairs st.StrSegs do
+        ic f 0
+        ic f len
+        arrNewData f "$str" dn
+        gs f ("$sl:" + dn)
     endFn f
     // curried wrapper bodies: requested lazily during body emission, so their
     // decls sit after $_start in the function section — bodies land here in
@@ -3183,7 +3238,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                 callf f fname
                 if rk <> "u" then callf f (boxOfK rk)
             else
-                gg f ("$fr:" + fname + ".w" + string (k + 1))
+                ic f (tblIdx f.M (fname + ".w" + string (k + 1)))
                 lg f "$a"
                 lg f "$env"
                 gcT f "struct.new" "$cons"
