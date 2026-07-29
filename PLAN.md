@@ -2578,13 +2578,30 @@ bytes (down from 1.86 MB with the text emitter still aboard).
 - Gates: suite 445/445, fixpoint bin + bin self byte-identical (self-hosted
   module now 1,399,101 bytes, packed everywhere).
 
-### Still open (the last parity piece)
-- SCALARIZATION (typed rails): locals/params/returns of known scalar or
-  struct type on raw f64/i32 rails, struct params/returns as leaves, fused
-  `pts.[i].X` reads without boxing. Without it a hot loop still boxes each
-  intermediate ($off per read). This was the text emitter's sigKinds/
-  localKinds machinery — the deleted "struct params pass as scalars"
-  EmitTest is its gate; resurrect it when the rails land.
+### Scalarization — landed (rails + peephole)
+- RAIL LOCALS: a let-bound local whose rhs kind is statically known
+  (i/f/s/l via kindOfLite: literals, suffixed prims, packed reads, fused
+  POD leaves, other rail locals) and which no lambda mentions lives in a
+  RAW wasm local. Reads box, writes unbox.
+- EMIT-TIME PEEPHOLE (EmitBin callf/gcT/refI31): a box immediately
+  followed by its matching unbox — either direction, plus literal-box and
+  ref.i31 forms — cancels BOTH. Adjacency in a stack machine needs no
+  syntactic nesting, so rails + peephole compose to raw scalar code.
+- Statically-int `+` skips $addv.
+- THE GATE: "the hot loop allocates NOTHING" in EmitTests asserts the
+  disassembled summation loop has no box calls, no $addv, no struct.new —
+  and it doesn't: raw f64 accumulator, raw i32 counter, one $hwget per
+  element. Suite 446/446; fixpoint bin + bin self byte-identical (the
+  compiler shrank ~14KB from its own cancelled boxes).
+- Two-pass discipline: LocalKind clears BEFORE EACH pass (kindOfLite may
+  peek into a nested let-block whose binder only exists mid-pass), and
+  never leaks across monomorphized clones that share binder keys.
+
+### Possible further increments (not required by any gate)
+- Function-signature rails (text's sigKinds): typed params/returns for
+  known fns, so cross-function calls stop boxing arguments and results.
+- SoA struct arrays for non-POD structs (text's $sarr_) if a workload
+  ever wants them.
 
 ### The loop (unchanged, still the whole method)
 1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
