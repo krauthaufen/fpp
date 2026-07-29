@@ -1681,6 +1681,40 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | None ->
              err st ("binary: record with unknown type " + tyName)
              refNull f "any")
+    | EField (EIndex (nm, a, i), fname, _) when
+          (dictTryFind st.Pod nm).IsSome
+          && ((dictTryFind st.Pod nm).Value |> fun (placed, _, _) -> placed |> List.exists (fun (p, _, _) -> p = fname)) ->
+        // fusion: pts.[i].X reads ONE word out of the C image — no struct
+        // materialization, one box instead of the whole element
+        let placed, _, wd = (dictTryFind st.Pod nm).Value
+        let _, k, off = placed |> List.find (fun (p, _, _) -> p = fname)
+        emitNode st f lv a
+        emitNode st f lv i
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        ic f (off / 8)
+        ins f "i32.add"
+        callf f "$hwget"
+        let sh = (off % 8) * 8
+        (match k with
+         | "f" ->
+             ins f "f64.reinterpret_i64"
+             callf f "$off"
+         | "l" -> callf f "$ofl"
+         | "s" ->
+             (if sh <> 0 then
+                 lc f (int64 sh)
+                 ins f "i64.shr_u")
+             ins f "i32.wrap_i64"
+             ins f "f32.reinterpret_i32"
+             callf f "$oss"
+         | _ ->
+             (if sh <> 0 then
+                 lc f (int64 sh)
+                 ins f "i64.shr_u")
+             ins f "i32.wrap_i64"
+             callf f "$ofi")
     | EField (r, "Length", _) when not (dictTryFind st.FieldOwner "Length").IsSome ->
         // no record claims a Length field: this is the built-in one, across
         // strings and every array representation
