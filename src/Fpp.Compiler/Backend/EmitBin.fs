@@ -168,12 +168,19 @@ type Fn =
       mutable PatchAt : int
       /// >= 0: REPLAY mode — `local` maps onto pre-declared slots in call
       /// order instead of growing the vector (the two-pass body emission)
-      mutable Replay : int }
+      mutable Replay : int
+      /// the box/unbox cancellation peephole: the last (and the one before)
+      /// box-or-unbox emission, as (op, startOffset, endOffset). Validity is
+      /// positional — the entry only counts if NOTHING was emitted since
+      /// (Count = endOffset), so no other emitter needs to invalidate it.
+      mutable PeepLast : (string * int * int) option
+      mutable PeepPrev : (string * int * int) option }
 
 /// open a body: params get indices 0.., locals follow as they are created
 let beginFn (m : Mod) (paramNames : string list) : Fn =
     let f = { M = m; B = m.CodeBody; LocalIdx = dictNew (); LocalTys = vecNew ()
-              NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0; Replay = -1 }
+              NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0; Replay = -1
+              PeepLast = None; PeepPrev = None }
     f.PatchAt <- beginPatch m.CodeBody
     let mutable i = 0
     for p in paramNames do
@@ -236,11 +243,16 @@ let gci (f : Fn) (name : string) : unit =
     emitU32 f.B (gcByte name)
 /// GC op with one type immediate: struct.new $t, array.get $t, ref.cast...
 let gcT (f : Fn) (name : string) (tyName : string) : unit =
+    let at = f.B.Count
     gci f name
     (match name with
      | "ref.test" | "ref.cast" -> emitS32 f.B (tyIdx f.M tyName)
      | "ref.test_null" | "ref.cast_null" -> emitS32 f.B (tyIdx f.M tyName)
      | _ -> emitU32 f.B (tyIdx f.M tyName))
+    // a literal box is a peephole producer: `$tof` right after cancels it
+    if name = "struct.new" && (tyName = "$boxf" || tyName = "$boxs" || tyName = "$boxl") then
+        f.PeepPrev <- f.PeepLast
+        f.PeepLast <- Some ("new:" + tyName, at, f.B.Count)
 /// struct.get/set $t IDX
 let gcTF (f : Fn) (name : string) (tyName : string) (fieldIdx : int) : unit =
     gci f name
@@ -288,9 +300,47 @@ let gs (f : Fn) (name : string) : unit =
     emitByte f.B opGlobalSet
     emitU32 f.B (dictTryFind f.M.GlobalIdx name).Value
 
+/// which box producer a given unbox call cancels against
+let private peepPairOf (unboxName : string) : string list =
+    match unboxName with
+    | "$toi" -> [ "$ofi"; "ref.i31" ]
+    | "$tof" -> [ "$off"; "new:$boxf" ]
+    | "$tos" -> [ "$oss"; "new:$boxs" ]
+    | "$tol" -> [ "$ofl"; "new:$boxl" ]
+    | "$ofi" -> [ "$toi" ]
+    | "$off" -> [ "$tof" ]
+    | "$oss" -> [ "$tos" ]
+    | "$ofl" -> [ "$tol" ]
+    | _ -> []
+
+let private isPeepName (name : string) =
+    match name with
+    | "$toi" | "$tof" | "$tos" | "$tol" | "$ofi" | "$off" | "$oss" | "$ofl" -> true
+    | _ -> false
+
 let callf (f : Fn) (name : string) : unit =
-    emitByte f.B opCall
-    emitU32 f.B (funcIdx f.M name)
+    // the peephole: box immediately followed by its matching unbox (either
+    // direction) is the identity on the value — drop BOTH. Adjacency in the
+    // instruction stream means the second consumes exactly the first's
+    // result, so this needs no syntactic nesting.
+    let cancels =
+        match f.PeepLast with
+        | Some (op, at, endAt) when endAt = f.B.Count -> List.contains op (peepPairOf name)
+        | _ -> false
+    if cancels then
+        let _, at, _ = f.PeepLast.Value
+        f.B.Count <- at
+        f.PeepLast <- (match f.PeepPrev with
+                       | Some (_, _, pEnd) when pEnd = f.B.Count -> f.PeepPrev
+                       | _ -> None)
+        f.PeepPrev <- None
+    else
+        let at = f.B.Count
+        emitByte f.B opCall
+        emitU32 f.B (funcIdx f.M name)
+        if isPeepName name then
+            f.PeepPrev <- f.PeepLast
+            f.PeepLast <- Some (name, at, f.B.Count)
 let retCall (f : Fn) (name : string) : unit =
     emitByte f.B opReturnCall
     emitU32 f.B (funcIdx f.M name)
@@ -314,7 +364,12 @@ let gcAbs (f : Fn) (name : string) (heap : string) : unit =
     gci f name
     emitS32 f.B (heapByte heap - 0x80)  // abs heap types are NEGATIVE s33
 let i31get (f : Fn) : unit = gci f "i31.get_s"
-let refI31 (f : Fn) : unit = gci f "ref.i31"
+let refI31 (f : Fn) : unit =
+    let at = f.B.Count
+    gci f "ref.i31"
+    // an i31 wrap is a peephole producer: `$toi` right after reads it back
+    f.PeepPrev <- f.PeepLast
+    f.PeepLast <- Some ("ref.i31", at, f.B.Count)
 
 // blocks: named labels resolve to depths at branch sites
 let blockA (f : Fn) (label : string) : unit =

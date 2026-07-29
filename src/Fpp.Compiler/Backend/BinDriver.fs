@@ -56,6 +56,12 @@ type St =
       /// offset), sizeof, stride in i64 words) — the C image a pinned
       /// array exposes
       Pod : Dict<string, (string * string * int) list * int * int>
+      /// locals on a RAW scalar rail: binder key -> kind (i/f/s/l). Reads
+      /// box, writes unbox — and the peephole cancels both against their
+      /// producers/consumers, which is what makes a hot loop alloc-free
+      LocalKind : Dict<string * int, string>
+      /// mentioned inside some lambda: those can never be rail locals
+      InLambda : Dict<string * int, bool>
       /// struct-record fields with their declared TYPE names (uniform
       /// records erase types; POD navigation needs them back)
       StructFields : Dict<string, (string * string) list>
@@ -190,7 +196,7 @@ let private charCode (raw : string) : int =
 /// A local becomes a cell when it is let-bound, assigned somewhere, and
 /// mentioned inside a lambda. The test is per BINDING, so every read and
 /// write agrees on the representation. (Port of the text emitter's cellScan.)
-let private cellScan (decls : Decl list) : Dict<string * int, bool> =
+let private cellScan (decls : Decl list) : Dict<string * int, bool> * Dict<string * int, bool> =
     let letBound = dictNew<string * int, bool> ()
     let assigned = dictNew<string * int, bool> ()
     let inLambda = dictNew<string * int, bool> ()
@@ -248,7 +254,9 @@ let private cellScan (decls : Decl list) : Dict<string * int, bool> =
     for k, _ in dictPairs assigned do
         if (dictTryFind letBound k).IsSome && (dictTryFind inLambda k).IsSome then
             dictSet cells k true
-    cells
+    // the lambda-mentioned set travels too: a local a lambda reads can
+    // never live on a raw scalar rail (env slots are anyref)
+    cells, inLambda
 
 /// free variables of a body: referenced keys minus those bound inside
 let rec private freeWalk (bound : Dict<string * int, bool>) (acc : Vec<string * int>) (seen : Dict<string * int, bool>) (e : Expr) : unit =
@@ -406,8 +414,36 @@ let private castEq (f : Fn) : unit =
 /// the STATIC kind of an expression, where one is knowable without type
 /// state: enough to pick the rail a kindless conversion reads from. Uniform
 /// storage makes "u" safe everywhere else — the value carries its box.
-let rec private kindOfLite (e : Expr) : string =
+/// packed-array element classification: which $parr_* a primitive element
+/// type stores in. byte/sbyte are NOT here — they share $str (packed i8).
+let private parrK (nm : string) : string =
+    match nm with
+    | "int" | "bool" | "char" -> "i"
+    | "float16" -> "h"
+    | "float" -> "f"
+    | "float32" -> "s"
+    | "int64" -> "l"
+    | _ -> ""
+let private parrTy (k : string) = "$parr_" + k
+let private boxOfK (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
+let private unboxOfK (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
+/// packed reads need an explicit sign; a half reads unsigned
+let private getOpOfK (k : string) = if k = "h" then "array.get_u" else "array.get"
+
+let rec private kindOfLite (st : St) (e : Expr) : string =
+    let kindOfLite = kindOfLite st
     match e with
+    | EVar (v, _) | EVarI (v, _, _) ->
+        (match dictTryFind st.LocalKind (v.Path, v.Offset) with Some k -> k | None -> "u")
+    | EIndex (nm, _, _) ->
+        (match parrK nm with
+         | "" -> (if nm = "byte" || nm = "sbyte" then "i" elif nm = "$str" then "i" else "u")
+         | "h" -> "u"
+         | k -> k)
+    | EField (EIndex (nm, _, _), fname, _) when (dictTryFind st.Pod nm).IsSome ->
+        (match (dictTryFind st.Pod nm).Value |> fun (placed, _, _) -> placed |> List.tryFind (fun (p, _, _) -> p = fname) with
+         | Some (_, k, _) -> k
+         | None -> "u")
     | ELit (LFloat t) ->
         if t.EndsWith "h" || t.EndsWith "H" then "u"
         elif t.EndsWith "f" || t.EndsWith "F" then "s"
@@ -497,22 +533,6 @@ let rec private markTails (st : St) (e : Expr) : unit =
     | EIf (_, t, el) -> markTails st t; markTails st el
     | EMatch (_, cs) -> for _, _, b in cs do markTails st b
     | _ -> ()
-
-/// packed-array element classification: which $parr_* a primitive element
-/// type stores in. byte/sbyte are NOT here — they share $str (packed i8).
-let private parrK (nm : string) : string =
-    match nm with
-    | "int" | "bool" | "char" -> "i"
-    | "float16" -> "h"
-    | "float" -> "f"
-    | "float32" -> "s"
-    | "int64" -> "l"
-    | _ -> ""
-let private parrTy (k : string) = "$parr_" + k
-let private boxOfK (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
-let private unboxOfK (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
-/// packed reads need an explicit sign; a half reads unsigned
-let private getOpOfK (k : string) = if k = "h" then "array.get_u" else "array.get"
 
 /// collect the run of `let rec ... = fun` bindings heading a let spine.
 /// Grouping bindings that are NOT mutually recursive is harmless: their
@@ -694,7 +714,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              if (dictTryFind st.CellVars vk).IsSome then cellGet f
          | Some l ->
              lg f l
-             if (dictTryFind st.CellVars vk).IsSome then cellGet f
+             (match dictTryFind st.LocalKind vk with
+              | Some k -> callf f (boxOfK k)
+              | None -> if (dictTryFind st.CellVars vk).IsSome then cellGet f)
          | None ->
          match dictTryFind st.GlobalOf vk with
          | Some g -> gg f g
@@ -751,13 +773,29 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                         callf f "$patchmark"
                 cur <- groupBody
             | ELet (_, v, _, rhs, body) ->
-                emitNode st f lv rhs
-                // a captured mutable: the frame holds the CELL, not the value
-                if (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome then
-                    gcT f "struct.new" "$cell"
-                let l = freshLocal f "$bl" "anyref"
-                dictSet lv (v.Path, v.Offset) l
-                ls f l
+                let key = (v.Path, v.Offset)
+                let k = kindOfLite st rhs
+                if (dictTryFind st.CellVars key).IsNone
+                   && (dictTryFind st.InLambda key).IsNone
+                   && (k = "i" || k = "f" || k = "s" || k = "l") then
+                    // RAW RAIL: the local carries the scalar itself; the
+                    // unbox here cancels against the rhs's box, and every
+                    // read boxes (cancelled by scalar consumers in turn)
+                    emitNode st f lv rhs
+                    callf f (unboxOfK k)
+                    let ty = match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
+                    let l = freshLocal f "$tl" ty
+                    dictSet st.LocalKind key k
+                    dictSet lv key l
+                    ls f l
+                else
+                    emitNode st f lv rhs
+                    // a captured mutable: the frame holds the CELL, not the value
+                    if (dictTryFind st.CellVars key).IsSome then
+                        gcT f "struct.new" "$cell"
+                    let l = freshLocal f "$bl" "anyref"
+                    dictSet lv key l
+                    ls f l
                 cur <- body
             | _ -> walking <- false
         emitNode st f lv cur
@@ -1292,19 +1330,19 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              emitA ()
          | _, _ -> emitA ())
     | EApp (EUnknown "int64", [ a ]) ->
-        (match kindOfLite a with
+        (match kindOfLite st a with
          | "l" -> emitNode st f lv a
          | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i64.trunc_f64_s"; callf f "$ofl"
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i64.trunc_f32_s"; callf f "$ofl"
          | _ -> emitNode st f lv a; callf f "$toi"; ins f "i64.extend_i32_s"; callf f "$ofl")
     | EApp (EUnknown ("uint32" | "int"), [ a ]) ->
-        (match kindOfLite a with
+        (match kindOfLite st a with
          | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i32.trunc_f64_s"; callf f "$ofi"
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i32.trunc_f32_s"; callf f "$ofi"
          | "l" -> emitNode st f lv a; callf f "$tol"; ins f "i32.wrap_i64"; callf f "$ofi"
          | _ -> emitNode st f lv a)
     | EApp (EUnknown "string", [ a ]) ->
-        (match kindOfLite a with
+        (match kindOfLite st a with
          | "f" -> emitNode st f lv a; callf f "$tof"; callf f "$ftoa"
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
@@ -1401,6 +1439,15 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$prints"
         ic f 0
         refI31 f
+    | EPrim ("+", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
+        // both sides statically int: skip $addv's runtime dispatch — and on
+        // rail operands the un/box pairs cancel to a bare i32.add
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        ins f "i32.add"
+        callf f "$ofi"
     | EPrim ("+", [ a; b ]) ->
         emitNode st f lv a
         emitNode st f lv b
@@ -1792,6 +1839,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         (match dictTryFind lv (v.Path, v.Offset) with
          | Some l when not (l.StartsWith "@env:") ->
              emitNode st f lv rhs
+             (match dictTryFind st.LocalKind (v.Path, v.Offset) with
+              | Some k -> callf f (unboxOfK k)
+              | None -> ())
              ls f l
          | Some _ ->
              err st "binary: captured mutable (cells) not ported"
@@ -2387,10 +2437,18 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
 /// indices agree because both passes allocate in the same order.
 and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
                            (owner : string) (body : Expr) (needsResult : bool) : bool =
+    // rail-kind decisions are PER PASS: monomorphized clones share binder
+    // keys across functions, and within one body a kindOfLite peeking into a
+    // nested let-block must see the SAME (empty-so-far) state in the replay
+    // as the scratch saw — entries accumulate during a pass, never before it
+    let clearKinds () =
+        for k, _ in dictPairs st.LocalKind do dictRemove st.LocalKind k
+    clearKinds ()
     let scratchB = bytesNew ()
     let scratch =
         { M = f.M; B = scratchB; LocalIdx = dictNew (); LocalTys = vecNew ()
-          NParams = f.NParams; Labels = labelsNew (); PatchAt = 0; Replay = -1 }
+          NParams = f.NParams; Labels = labelsNew (); PatchAt = 0; Replay = -1
+          PeepLast = None; PeepPrev = None }
     for k, v in dictPairs f.LocalIdx do
         if (dictTryFind scratch.LocalIdx k).IsNone then dictSet scratch.LocalIdx k v
     let lv0 = dictNew<string * int, string> ()
@@ -2411,6 +2469,7 @@ and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
             let l = "$x" + string (vecLen f.LocalTys)
             local f l t
         localsDone f
+        clearKinds ()
         f.Replay <- 0
         let lv1 = dictNew<string * int, string> ()
         for k, v in dictPairs lv do dictSet lv1 k v
@@ -2429,12 +2488,13 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           CtorFns = dictNew (); LateFns = vecNew (); Externs = dictNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
           LamName = refMapNew (fun (_ : Expr) -> 7)
-          LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls
+          LamFree = dictNew (); LamBody = vecNew (); CellVars = fst (cellScan decls)
           ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew (fun (_ : Expr) -> 7)
-          Pod = dictNew (); StructFields = dictNew () }
+          Pod = dictNew (); StructFields = dictNew ()
+          LocalKind = dictNew (); InLambda = snd (cellScan decls) }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)

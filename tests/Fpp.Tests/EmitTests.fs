@@ -145,6 +145,46 @@ let noBoxGate =
             // and the program still computes
             Expect.equal (runProgram src) "4\n" "the packed loop sums X"
         }
+        test "the hot loop allocates NOTHING — scalars ride raw rails" {
+            // THE HOT-LOOP INVARIANT: summing packed struct fields performs
+            // zero allocations per iteration. Rail locals box at reads and
+            // unbox at writes; the emit-time peephole cancels every pair, so
+            // the loop that remains is loads, adds and stores.
+            let src =
+                String.concat "\n" [
+                    "module H"
+                    "[<Struct>]"
+                    "type V2d = { X : float; Y : float }"
+                    "let pts = [| { X = 3.0; Y = 4.0 }; { X = 1.0; Y = 2.0 } |]"
+                    "let go ="
+                    "    let mutable s = 0.0"
+                    "    for i in 0 .. pts.Length - 1 do"
+                    "        s <- s + pts.[i].X"
+                    "    print s"
+                    "" ]
+            let text = disassemble src
+            // find the summation loop (the one reading POD words) and walk
+            // to its matching `end` by indentation
+            let lines = text.Split '\n'
+            let mutable loopSeg = ""
+            let mutable i = 0
+            while loopSeg = "" && i < lines.Length do
+                if lines.[i].TrimStart().StartsWith "loop" then
+                    let indent = lines.[i].Length - lines.[i].TrimStart().Length
+                    let mutable j = i + 1
+                    while j < lines.Length
+                          && not (lines.[j].Trim() = "end"
+                                  && lines.[j].Length - lines.[j].TrimStart().Length = indent) do
+                        j <- j + 1
+                    let seg = String.concat "\n" (Array.sub lines i (j - i + 1))
+                    if seg.Contains "hwget" && seg.Contains "f64.add" then loopSeg <- seg
+                i <- i + 1
+            Expect.isTrue (loopSeg <> "") "the summation loop is found"
+            for alloc in [ "call $off"; "call $oss"; "call $ofl"; "call $ofi"
+                           "struct.new $box"; "struct.new $r_V2d"; "call $addv" ] do
+                Expect.isFalse (loopSeg.Contains alloc) (sprintf "'%s' in the hot loop" alloc)
+            Expect.equal (runProgram src) "4\n" "and the sum is right"
+        }
         test "a store into an int[] field builds a FLAT array" {
             // `r.Slots <- Array.zeroCreate n` used to build a UNIFORM array:
             // assignment did not unify through a dot target, so nothing
