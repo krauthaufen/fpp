@@ -2595,6 +2595,20 @@ needs `-W gc=y` (and exceptions once the tag lands).
 6. **Function values / partial application**: known fn used first-class or
    under-applied -> wrapper chain (.w0..wk cons-env) like requestWrappers;
    port the wrapper generator (text emitter ~line 3950) onto declFn/beginFn.
+6b. **Handoff notes from the arrays/cells work (188e70c, 72a6128 — gated
+   and kept: battery, targeted probes, full 424 suite, pushed):**
+   - `Array.zeroCreate` fills a PER-ELEMENT-KIND zero (ref.i31 0 for
+     numerics, boxed 0.0 for floats, null for refs) — array.new_default
+     would wrongly give null for a zero int under uniform boxing.
+   - cells: a cellScan prepass (ported from the text emitter) marks
+     let-bound mutables that a lambda mentions; frame holds a $cell, reads
+     dereference, the env slot shares the reference. Aliasing verified: a
+     closure's write is observed by the frame afterwards.
+   - NOT started, next in #7: local `let rec` lambdas — probe traps with
+     "capture not in scope at build site"; analysis says the binary path
+     needs only $patchmark, treating a single rec binding as a one-element
+     group. And partial application — probe fails "unbound variable add";
+     needs the requestWrappers-equivalent chain.
 7. **Runtime completion**: hashv cmpv cmpvBoxed lenv append printl printf64
    ftoa (BIG — float formatting; port last), balloc/pinh/unpinh (linear
    memory pins), patchself/patchmark (knot-tying — needed for local rec
