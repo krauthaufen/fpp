@@ -2607,8 +2607,13 @@ needs `-W gc=y` (and exceptions once the tag lands).
       semantically complete.
    b. Self-host: fixcorpus + `self` mode with stage-1 as .wasm bytes;
       fixpoint compares BYTES.
-   c. Then merge to main, flip EmitResult to bytes, delete the text emitter
-      (or keep behind a debug flag), and the name section for backtraces.
+   c. Then merge to main, flip EmitResult to bytes, and retire the text
+      emitter. ORDERING (adopted from review): the NAME SECTION lands BEFORE
+      the byte-fixpoint gate (b) — without it, a fixpoint divergence or trap
+      is diagnosed from raw byte offsets, and the bisector's
+      enclosing-function lookup should become a name-section lookup.
+      Delete-vs-debug-flag for the text emitter is the USER'S call at merge
+      time; recorded as an open decision, not a default.
 
 ### Gotchas already paid for (do not rediscover)
 - catch-clause label depths are relative OUTSIDE the try_table (its own
