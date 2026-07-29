@@ -241,4 +241,78 @@ let binaryWriter =
             Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
             Expect.equal out "-3041\n42\n" "itoa, prints, printi and putc agree with the text runtime"
         }
+        test "frame + closures: applyc drives a lambda from binary" {
+            // the full fixed frame, then a closure built with ref.func and
+            // applied twice through $applyc — the uniform calling convention
+            // every F++ program rides on — plus an exception thrown and
+            // caught through try_table. Output checked on stdout.
+            let m = modNew ()
+            frame m [ 1; 2 ] [ 2 ]
+            rtTypes2 m
+            tyFunc m "$main_t" [] []
+            rtDecls m
+            rtCoreDecls2 m
+            declFn m "$double" "$u1"
+            declFn m "$main" "$main_t"
+            exportFn m "_start" "$main"
+            rtCore m
+            rtCore2 m
+            // $double: fun a env -> a + a (via addv)
+            let f = beginFn m [ "$a"; "$env" ]
+            localsDone f
+            lg f "$a"
+            lg f "$a"
+            callf f "$addv"
+            endFn f
+            let f = beginFn m []
+            local f "$c" "anyref"
+            local f "$r" "anyref"
+            localsDone f
+            // closure: (struct.new $clo (ref.func $double) null)
+            rf f "$double"
+            refNull f "any"
+            gcT f "struct.new" "$clo"
+            ls f "$c"
+            // applyc (applyc c 10) — double twice: 40
+            lg f "$c"
+            ic f 10
+            callf f "$ofi"
+            callf f "$applyc"
+            ls f "$r"
+            lg f "$c"
+            lg f "$r"
+            callf f "$applyc"
+            callf f "$toi"
+            callf f "$printi"
+            ic f 10
+            callf f "$putc"
+            // try_table: throw 7, catch it, print it
+            blockA f "$caught"
+            tryTableA f "$caught"
+            ic f 7
+            callf f "$ofi"
+            throwExn f
+            refNull f "any"
+            endB f
+            br f "$caught"
+            endB f
+            callf f "$toi"
+            callf f "$printi"
+            ic f 10
+            callf f "$putc"
+            endFn f
+            let bytes = assemble m 17 true
+            let path = System.IO.Path.GetTempFileName () + ".wasm"
+            System.IO.File.WriteAllBytes (path, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + path)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd ()
+            let err = p.StandardError.ReadToEnd ()
+            p.WaitForExit ()
+            System.IO.File.Delete path
+            Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+            Expect.equal out "40\n7\n" "closures apply and exceptions catch, all from bytes"
+        }
     ]

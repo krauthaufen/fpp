@@ -637,3 +637,157 @@ let rtDecls (m : Mod) : unit =
     declFn m "$ndigits" "$rt_i2i"
     declFn m "$itoa" "$rt_i2a"
     declFn m "$prints" "$rt_s2v"
+
+// ---- exceptions ------------------------------------------------------------
+
+/// (try_table (catch $fppexn $lbl) ...) — one catch clause to a label;
+/// blocktype anyref, matching the text emitter's ETry shape
+let tryTableA (f : Fn) (catchLabel : string) : unit =
+    emitByte f.B opTryTable
+    emitBlockTypeVal f.B (valByte "anyref")
+    // clause label depths are relative to OUTSIDE the try_table — its own
+    // label does not count for its immediates (checked against wasm-tools'
+    // encoding of the same shape)
+    let d = labelDepth f.Labels catchLabel
+    pushLabel f.Labels ""
+    emitU32 f.B 1
+    emitByte f.B 0x00
+    emitU32 f.B 0
+    emitU32 f.B d
+
+let throwExn (f : Fn) : unit =
+    emitByte f.B (opByte "throw")
+    emitU32 f.B 0
+
+// ---- the fixed module frame ------------------------------------------------
+// The prelude types in the SAME order the text emitter declared them, so
+// every index is stable and documented in one place. `vArities` and
+// `tupArities` are the program-dependent tails.
+
+let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
+    tyFunc m "$u1" [ "anyref"; "anyref" ] [ "anyref" ]
+    tyStruct m "$clo" [ fldRef false "$u1"; fld false "anyref" ]
+    tyStruct m "$cell" [ fld true "anyref" ]
+    tyStruct m "$cons" [ fld true "anyref"; fld true "anyref" ]
+    tyArray m "$str" "i8"
+    tyStruct m "$boxf" [ fld false "f64" ]
+    tyStruct m "$boxi" [ fld true "i32" ]
+    tyArray m "$arr" "anyref"
+    tyArray m "$parr_i" "i32"
+    tyArray m "$parr_f" "f64"
+    tyArray m "$parr_s" "f32"
+    tyArray m "$parr_l" "i64"
+    tyArray m "$parr_h" "i16"
+    tyStruct m "$iter" [ fld false "i32"; fld true "anyref"; fld true "anyref"; fld true "i32" ]
+    tyArray m "$pk" "i64"
+    tyStruct m "$hnd" [ fldRefNull true "$pk"; fld true "i32"; fld true "i32" ]
+    tyStruct m "$boxl" [ fld false "i64" ]
+    tyStruct m "$boxs" [ fld false "f32" ]
+    tyFunc m "$exntag" [ "anyref" ] []
+    importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write"
+        [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+    exportMem m "memory"
+    tyArrayFuncref m "$vt"
+    tyStruct m "$desc" [ fld false "i32"; fldRef false "$vt" ]
+    tyStructSub m "$obj" "" true [ fld true "anyref" ]
+    tyStruct m "$du0" [ fld false "i32" ]
+    tyStruct m "$du1" [ fld false "i32"; fld false "anyref" ]
+    for k in vArities do
+        let mutable ps = []
+        let mutable i = 0
+        while i < k do
+            ps <- "anyref" :: ps
+            i <- i + 1
+        tyFunc m ("$v" + string k) ps [ "anyref" ]
+    for k in tupArities do
+        let mutable fs = []
+        let mutable i = 0
+        while i < k do
+            fs <- fld false "anyref" :: fs
+            i <- i + 1
+        tyStruct m ("$tup" + string k) fs
+    rtTypes m
+
+// ---- runtime: closures and boxing ------------------------------------------
+
+let rtCoreDecls2 (m : Mod) : unit =
+    declFn m "$applyc" "$u1"
+    declFn m "$ofi" "$rt_i2a"
+    declFn m "$toi" "$rt_a2i"
+    declFn m "$addv" "$u1"
+
+let rtTypes2 (m : Mod) : unit =
+    tyFunc m "$rt_a2i" [ "anyref" ] [ "i32" ]
+
+let rtCore2 (m : Mod) : unit =
+    // $applyc: call through the closure's code pointer with its env
+    let f = beginFn m [ "$f"; "$a" ]
+    localsDone f
+    lg f "$a"
+    lg f "$f"
+    gcT f "ref.cast" "$clo"
+    gcTF f "struct.get" "$clo" 1
+    lg f "$f"
+    gcT f "ref.cast" "$clo"
+    gcTF f "struct.get" "$clo" 0
+    callRef f "$u1"
+    endFn f
+    // $ofi: i31 when it fits, $boxi when it does not
+    let f = beginFn m [ "$n" ]
+    localsDone f
+    lg f "$n"
+    lg f "$n"
+    ic f 1
+    ins f "i32.shl"
+    ic f 1
+    ins f "i32.shr_s"
+    ins f "i32.eq"
+    ifA f
+    lg f "$n"
+    refI31 f
+    elseB f
+    lg f "$n"
+    gcT f "struct.new" "$boxi"
+    endB f
+    endFn f
+    // $toi
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcAbs f "ref.test" "i31"
+    ifV f "i32"
+    lg f "$v"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    elseB f
+    lg f "$v"
+    gcT f "ref.cast" "$boxi"
+    gcTF f "struct.get" "$boxi" 0
+    endB f
+    endFn f
+    // $addv: two i31s fast-path, strings concat later; int fallback
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"
+    gcAbs f "ref.test" "i31"
+    lg f "$b"
+    gcAbs f "ref.test" "i31"
+    ins f "i32.and"
+    ifA f
+    lg f "$a"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    lg f "$b"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i32.add"
+    refI31 f
+    elseB f
+    lg f "$a"
+    callf f "$toi"
+    lg f "$b"
+    callf f "$toi"
+    ins f "i32.add"
+    callf f "$ofi"
+    endB f
+    endFn f
