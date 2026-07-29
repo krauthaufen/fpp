@@ -133,6 +133,53 @@ let binBattery =
               "let go = print (List.sum (List.map double [1; 2; 3]))" ]
             "12\n"
 
+        expects "string concat, ordering, Length, indexing"
+            [ "let go ="
+              "    let s = \"hello\" + \" \" + \"world\""
+              "    print s"
+              "    print s.Length"
+              "    if \"abc\" < \"abd\" then print 1 else print 0"
+              "    print s.[4]" ]
+            "hello world\n11\n1\no\n"
+
+        expects "float arithmetic and printing"
+            [ "let go ="
+              "    let x = 1.5 + 2.25"
+              "    print x"
+              "    print (x * 2.0)"
+              "    if 1.5 < 2.5 then print 1 else print 0" ]
+            "3.75\n7.5\n1\n"
+
+        expects "conversions: int-of-string, string-of-int, float, truncation"
+            [ "let go ="
+              "    print (int \"42\")"
+              "    print (string 7)"
+              "    print (float 3)"
+              "    print (int 9.7)"
+              "    print (int64 5)" ]
+            "42\n7\n3\n9\n5\n"
+
+        expects "compare, max, min"
+            [ "let go ="
+              "    print (compare \"ab\" \"ac\")"
+              "    print (compare 7 3)"
+              "    print (max 3 9)"
+              "    print (min 2.5 1.5)" ]
+            "-1\n1\n9\n1.5\n"
+
+        expects "string builtins: Substring, IndexOf"
+            [ "let go ="
+              "    let s = \"hello world\""
+              "    print (s.Substring (6, 5))"
+              "    print (s.IndexOf 'w')"
+              "    print (s.Substring 6)" ]
+            "world\n6\nworld\n"
+
+        expects "sprintf compile-time expansion"
+            [ "let go ="
+              "    print (sprintf \"%d-%s\" 5 \"x\")" ]
+            "5-x\n"
+
         expects "arrays: zeroCreate, index get/set, Length"
             [ "let go ="
               "    let a = Array.zeroCreate 3"

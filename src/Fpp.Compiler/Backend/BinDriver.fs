@@ -278,6 +278,42 @@ let private requestWrapper (st : St) (f : Fn) (fname : string) (arity : int) : u
         vecAdd st.WrapperOrder fname
         for k in 0 .. arity - 1 do declFn f.M (fname + ".w" + string k) "$u1"
 
+/// cast to (ref null eq) — ref.eq's operand type
+let private castEq (f : Fn) : unit =
+    gci f "ref.cast_null"
+    emitS32 f.B (heapByte "eq" - 0x80)
+
+/// the STATIC kind of an expression, where one is knowable without type
+/// state: enough to pick the rail a kindless conversion reads from. Uniform
+/// storage makes "u" safe everywhere else — the value carries its box.
+let rec private kindOfLite (e : Expr) : string =
+    match e with
+    | ELit (LFloat t) ->
+        if t.EndsWith "h" || t.EndsWith "H" then "u"
+        elif t.EndsWith "f" || t.EndsWith "F" then "s"
+        else "f"
+    | ELit (LInt t) -> if t.EndsWith "L" then "l" else "i"
+    | EPrim (op, _) when
+        op.Length > 1 && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
+        let k = op.Substring (op.Length - 1)
+        if k = "f" || k = "s" || k = "l" then k else "u"
+    | EPrim (("-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"), _) -> "i"
+    | EPrim ("u-f", _) -> "f"
+    | EPrim ("u-s", _) -> "s"
+    | EPrim ("u-l", _) -> "l"
+    | ELet (_, _, _, _, body) -> kindOfLite body
+    | ESeq xs -> (match List.tryLast xs with Some x -> kindOfLite x | None -> "u")
+    | EIf (_, t, e2) ->
+        let a, b = kindOfLite t, kindOfLite e2
+        if a = b then a else "u"
+    | EApp (EUnknown n, [ _ ]) when n.Contains "#" ->
+        (match n.Substring (0, n.IndexOf "#") with
+         | "float" -> "f" | "float32" -> "s" | "int64" -> "l" | _ -> "u")
+    | EApp (EUnknown "int64", [ _ ]) -> "l"
+    | EApp (EUnknown "float", [ _ ]) -> "f"
+    | EApp (EUnknown "float32", [ _ ]) -> "s"
+    | _ -> "u"
+
 /// collect the run of `let rec ... = fun` bindings heading a let spine.
 /// Grouping bindings that are NOT mutually recursive is harmless: their
 /// markers are simply never captured, so patching finds nothing to do.
@@ -490,6 +526,212 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         callf f "$putc"
         ic f 0
         refI31 f
+    | EApp (EUnknown "$str.Substring", [ s; start ]) ->
+        let sl = freshLocal f "$sbs" "i32"
+        let sv = freshLocal f "$sbv" "anyref"
+        emitNode st f lv s
+        ls f sv
+        emitNode st f lv start
+        callf f "$toi"
+        ls f sl
+        lg f sv
+        gcT f "ref.cast" "$str"
+        lg f sl
+        lg f sv
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        lg f sl
+        ins f "i32.sub"
+        callf f "$strsub"
+    | EApp (EUnknown "$str.Substring#2", [ s; start; len ])
+    | EApp (EUnknown "strsub", [ s; start; len ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv start
+        callf f "$toi"
+        emitNode st f lv len
+        callf f "$toi"
+        callf f "$strsub"
+    | EApp (EUnknown "$str.StartsWith", [ s; p ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv p
+        gcT f "ref.cast" "$str"
+        callf f "$strStarts"
+        refI31 f
+    | EApp (EUnknown "$str.EndsWith", [ s; p ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv p
+        gcT f "ref.cast" "$str"
+        callf f "$strEnds"
+        refI31 f
+    | EApp (EUnknown "$str.Contains", [ s; p ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv p
+        gcT f "ref.cast" "$str"
+        ic f 0
+        callf f "$strFind"
+        ic f 0
+        ins f "i32.ge_s"
+        refI31 f
+    | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv p
+        gcT f "ref.cast" "$str"
+        ic f 0
+        callf f "$strFind"
+        callf f "$ofi"
+    | EApp (EUnknown "$str.IndexOf#2", [ s; c ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        callf f "$strFindChar"
+        callf f "$ofi"
+    | EApp (EUnknown "$str.IndexOf#3", [ s; p; from ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv p
+        gcT f "ref.cast" "$str"
+        emitNode st f lv from
+        callf f "$toi"
+        callf f "$strFind"
+        callf f "$ofi"
+    | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        callf f "$strLastFindChar"
+        callf f "$ofi"
+    | EApp (EUnknown "$str.Split", [ s; c ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        callf f "$strSplitChar"
+    | EApp (EUnknown "$str.Replace", [ s; a; b ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv b
+        gcT f "ref.cast" "$str"
+        callf f "$strReplace"
+    | EApp (EUnknown "$str.Trim", [ s ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        callf f "$strTrim"
+    | EApp (EUnknown "$str.TrimEnd", [ s; cs ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv cs
+        callf f "$strTrimEndChars"
+    | EApp (EUnknown "compare", [ a; b ]) ->
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$cmpv"
+        callf f "$ofi"
+    | EApp (EUnknown "hash", [ a ]) ->
+        emitNode st f lv a
+        callf f "$hashv"
+        callf f "$ofi"
+    | EApp (EUnknown "refEq", [ a; b ]) ->
+        emitNode st f lv a
+        castEq f
+        emitNode st f lv b
+        castEq f
+        ins f "ref.eq"
+        refI31 f
+    | EUnknown "$class:Ordered:compare:$ref" ->
+        // `compare` at a UNIFORM reference: the runtime compares structurally
+        requestWrapper st f "$cmpvBoxed" 2
+        rf f "$cmpvBoxed.w0"
+        refNull f "any"
+        gcT f "struct.new" "$clo"
+    | EApp (EUnknown n, [ a ]) when
+        n.Contains "#" && not (n.EndsWith "#h")
+        && not (n.StartsWith "float16#") && not (n.StartsWith "pad") ->
+        // conversions whose source kind inference resolved: target#srckind
+        let target = n.Substring (0, n.IndexOf "#")
+        let src = n.Substring (n.IndexOf "#" + 1)
+        let emitA () = emitNode st f lv a
+        let strA () = emitA (); gcT f "ref.cast" "$str"
+        let mask8 () = ic f 255; ins f "i32.and"
+        let sext8 () = ic f 24; ins f "i32.shl"; ic f 24; ins f "i32.shr_s"
+        (match target, src with
+         | "string", "t" -> emitA ()
+         | "int", "t" | "uint32", "t" -> strA (); callf f "$atoi"; callf f "$ofi"
+         | "int64", "t" -> strA (); callf f "$atol"; callf f "$ofl"
+         | "byte", "t" -> strA (); callf f "$atoi"; mask8 (); callf f "$ofi"
+         | "sbyte", "t" -> strA (); callf f "$atoi"; sext8 (); callf f "$ofi"
+         | "float", "t" -> strA (); callf f "$atof"; callf f "$off"
+         | "float32", "t" -> strA (); callf f "$atof"; ins f "f32.demote_f64"; callf f "$oss"
+         | "char", "t" ->
+             // Char.Parse: the single (first) character of the string
+             strA (); ic f 0; gcT f "array.get_u" "$str"; callf f "$ofi"
+         | "string", "f" -> emitA (); callf f "$tof"; callf f "$ftoa"
+         | "string", "s" -> emitA (); callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
+         | "string", "l" -> emitA (); callf f "$tol"; callf f "$ltoa"
+         | "string", "w" -> emitA (); callf f "$toi"; ins f "i64.extend_i32_u"; callf f "$ultoa"
+         | "string", "b" ->
+             // Boolean.ToString: "True"/"False", capital first
+             emitA (); callf f "$toi"; ins f "i32.eqz"
+             ifA f
+             for c in [ 70; 97; 108; 115; 101 ] do ic f c
+             arrNewFixed f "$str" 5
+             elseB f
+             for c in [ 84; 114; 117; 101 ] do ic f c
+             arrNewFixed f "$str" 4
+             endB f
+         | "byte", "f" -> emitA (); callf f "$tof"; ins f "i32.trunc_f64_s"; mask8 (); callf f "$ofi"
+         | "byte", "s" -> emitA (); callf f "$tos"; ins f "i32.trunc_f32_s"; mask8 (); callf f "$ofi"
+         | "byte", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; mask8 (); callf f "$ofi"
+         | "byte", _ -> emitA (); callf f "$toi"; mask8 (); callf f "$ofi"
+         | "sbyte", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; sext8 (); callf f "$ofi"
+         | "sbyte", _ -> emitA (); callf f "$toi"; sext8 (); callf f "$ofi"
+         | "string", "c" -> emitA (); callf f "$toi"; ic f 1; gcT f "array.new" "$str"
+         | "string", _ -> emitA (); callf f "$toi"; callf f "$itoa"
+         | "float", "f" -> emitA ()
+         | "float", "s" -> emitA (); callf f "$tos"; ins f "f64.promote_f32"; callf f "$off"
+         | "float", "l" -> emitA (); callf f "$tol"; ins f "f64.convert_i64_s"; callf f "$off"
+         | "float", _ -> emitA (); callf f "$toi"; ins f "f64.convert_i32_s"; callf f "$off"
+         | "float32", "s" -> emitA ()
+         | "float32", "f" -> emitA (); callf f "$tof"; ins f "f32.demote_f64"; callf f "$oss"
+         | "float32", "l" -> emitA (); callf f "$tol"; ins f "f32.convert_i64_s"; callf f "$oss"
+         | "float32", _ -> emitA (); callf f "$toi"; ins f "f32.convert_i32_s"; callf f "$oss"
+         | "int64", "l" -> emitA ()
+         | "int64", "f" -> emitA (); callf f "$tof"; ins f "i64.trunc_f64_s"; callf f "$ofl"
+         | "int64", "s" -> emitA (); callf f "$tos"; ins f "i64.trunc_f32_s"; callf f "$ofl"
+         | "int64", _ -> emitA (); callf f "$toi"; ins f "i64.extend_i32_s"; callf f "$ofl"
+         | _, "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; callf f "$ofi"
+         | _, "f" -> emitA (); callf f "$tof"; ins f "i32.trunc_f64_s"; callf f "$ofi"
+         | _, "s" -> emitA (); callf f "$tos"; ins f "i32.trunc_f32_s"; callf f "$ofi"
+         | _, "t" ->
+             err st ("binary: cannot convert a string to " + target)
+             emitA ()
+         | _, _ -> emitA ())
+    | EApp (EUnknown "int64", [ a ]) ->
+        (match kindOfLite a with
+         | "l" -> emitNode st f lv a
+         | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i64.trunc_f64_s"; callf f "$ofl"
+         | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i64.trunc_f32_s"; callf f "$ofl"
+         | _ -> emitNode st f lv a; callf f "$toi"; ins f "i64.extend_i32_s"; callf f "$ofl")
+    | EApp (EUnknown ("uint32" | "int"), [ a ]) ->
+        (match kindOfLite a with
+         | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i32.trunc_f64_s"; callf f "$ofi"
+         | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i32.trunc_f32_s"; callf f "$ofi"
+         | "l" -> emitNode st f lv a; callf f "$tol"; ins f "i32.wrap_i64"; callf f "$ofi"
+         | _ -> emitNode st f lv a)
+    | EApp (EUnknown "string", [ a ]) ->
+        (match kindOfLite a with
+         | "f" -> emitNode st f lv a; callf f "$tof"; callf f "$ftoa"
+         | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
+         | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
+         | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
     | EApp (EUnknown "printc", [ a ]) ->
         // a char prints as the character, not its code
         emitNode st f lv a
@@ -1139,6 +1381,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes4 m
     rtTypes5 m
     rtTypes6 m
+    rtTypes7 m
+    rtTypes8 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -1146,6 +1390,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls4 m
     rtDecls5 m
     rtDecls6 m
+    rtDecls7 m
+    rtDecls8 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -1160,6 +1406,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             emitU32 m.GlobalBody (tyIdx m "$du0")
             emitByte m.GlobalBody opEnd
     globalVt m "$duEq" (List.init (max tag 1) (fun _ -> "$eq_du_default"))
+    globalVt m "$duHash" (List.init (max tag 1) (fun _ -> "$hash_du_default"))
     // program globals + init function declarations
     let inits = vecNew<string> ()
     for d in decls do
@@ -1202,6 +1449,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtCore4 m
     rtCore5 m
     rtCore6 m
+    rtCore7 m [ 2; 3 ]
+    rtCore8 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do

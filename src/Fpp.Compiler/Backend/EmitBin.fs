@@ -1978,6 +1978,940 @@ let rtCore6 (m : Mod) : unit =
     refI31 f
     endFn f
 
+// ---- runtime: structural hash and comparison -------------------------------
+
+let rtTypes7 (m : Mod) : unit =
+    tyFunc m "$rt_aa2i" [ "anyref"; "anyref" ] [ "i32" ]
+
+let rtDecls7 (m : Mod) : unit =
+    declFn m "$hashv" "$rt_a2i"
+    declFn m "$cmpv" "$rt_aa2i"
+    declFn m "$cmpvBoxed" "$u1"
+    declFn m "$hash_du_default" "$v1"
+
+let rtCore7 (m : Mod) (tupArities : int list) : unit =
+    // $hashv: structural hash, representation-dispatched like $equal
+    let f = beginFn m [ "$v" ]
+    local f "$i" "i32"
+    local f "$h" "i32"
+    localsDone f
+    lg f "$v"
+    gcAbs f "ref.test" "i31"
+    ifE f
+    lg f "$v"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxi"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxi"
+    gcTF f "struct.get" "$boxi" 0
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxl"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxl"
+    gcTF f "struct.get" "$boxl" 0
+    ins f "i32.wrap_i64"
+    lg f "$v"
+    gcT f "ref.cast" "$boxl"
+    gcTF f "struct.get" "$boxl" 0
+    lc f 32L
+    ins f "i64.shr_u"
+    ins f "i32.wrap_i64"
+    ins f "i32.xor"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxf"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    ins f "i64.reinterpret_f64"
+    ins f "i32.wrap_i64"
+    lg f "$v"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    ins f "i64.reinterpret_f64"
+    lc f 32L
+    ins f "i64.shr_u"
+    ins f "i32.wrap_i64"
+    ins f "i32.xor"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$obj"
+    ifE f
+    lg f "$v"
+    lg f "$v"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    gcT f "ref.cast" "$desc"
+    gcTF f "struct.get" "$desc" 1
+    ic f 1
+    gcT f "array.get" "$vt"
+    gcT f "ref.cast" "$v1"
+    callRef f "$v1"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ret f
+    endB f
+    // arrays hash to their LENGTH: identity equality only obliges equal
+    // values to hash equally, and length is the one thing writes cannot
+    // change (see DIVERGENCES.md)
+    for ty in [ "$arr"; "$parr_i"; "$parr_f"; "$parr_s"; "$parr_l"; "$parr_h" ] do
+        lg f "$v"
+        gcT f "ref.test" ty
+        ifE f
+        lg f "$v"
+        gcT f "ref.cast" ty
+        gci f "array.len"
+        ret f
+        endB f
+    for n in tupArities do
+        let t = "$tup" + string n
+        lg f "$v"
+        gcT f "ref.test" t
+        ifE f
+        lg f "$v"
+        gcT f "ref.cast" t
+        gcTF f "struct.get" t 0
+        callf f "$hashv"
+        let mutable i = 1
+        while i < n do
+            ic f 31
+            ins f "i32.mul"
+            lg f "$v"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            callf f "$hashv"
+            ins f "i32.add"
+            i <- i + 1
+        ret f
+        endB f
+    for dt in [ "$du0"; "$du1" ] do
+        lg f "$v"
+        gcT f "ref.test" dt
+        ifE f
+        lg f "$v"
+        gg f "$duHash"
+        lg f "$v"
+        gcT f "ref.cast" dt
+        gcTF f "struct.get" dt 0
+        gcT f "array.get" "$vt"
+        gcT f "ref.cast" "$v1"
+        callRef f "$v1"
+        gcAbs f "ref.cast" "i31"
+        i31get f
+        ret f
+        endB f
+    lg f "$v"
+    gcT f "ref.test" "$str"
+    ifE f
+    ic f -2128831035
+    ls f "$h"
+    blockE f "$hd"
+    loopE f "$hgo"
+    lg f "$i"
+    lg f "$v"
+    gcT f "ref.cast" "$str"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$hd"
+    lg f "$h"
+    lg f "$v"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.xor"
+    ic f 16777619
+    ins f "i32.mul"
+    ls f "$h"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$hgo"
+    endB f
+    endB f
+    lg f "$h"
+    ret f
+    endB f
+    lg f "$v"
+    ins f "ref.is_null"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$cons"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    callf f "$hashv"
+    ic f 31
+    ins f "i32.mul"
+    lg f "$v"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    callf f "$hashv"
+    ins f "i32.xor"
+    ret f
+    endB f
+    ic f 1
+    endFn f
+    // $cmpv: structural three-way comparison
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$i" "i32"
+    local f "$la" "i32"
+    local f "$lb" "i32"
+    local f "$x" "i32"
+    local f "$y" "i32"
+    local f "$c" "i32"
+    localsDone f
+    lg f "$a"
+    gcT f "ref.test" "$str"
+    lg f "$b"
+    gcT f "ref.test" "$str"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$str"
+    lg f "$b"
+    gcT f "ref.cast" "$str"
+    callf f "$strcmp"
+    ret f
+    endB f
+    lg f "$a"
+    gcT f "ref.test" "$boxf"
+    lg f "$b"
+    gcT f "ref.test" "$boxf"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    lg f "$b"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    ins f "f64.lt"
+    ifE f
+    ic f -1
+    ret f
+    endB f
+    lg f "$a"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    lg f "$b"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    ins f "f64.gt"
+    ifE f
+    ic f 1
+    ret f
+    endB f
+    ic f 0
+    ret f
+    endB f
+    lg f "$a"
+    ins f "ref.is_null"
+    lg f "$b"
+    ins f "ref.is_null"
+    ins f "i32.and"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$a"
+    ins f "ref.is_null"
+    ifE f
+    ic f -1
+    ret f
+    endB f
+    lg f "$b"
+    ins f "ref.is_null"
+    ifE f
+    ic f 1
+    ret f
+    endB f
+    for n in tupArities do
+        // tuples compare LEXICOGRAPHICALLY, component by component
+        let t = "$tup" + string n
+        lg f "$a"
+        gcT f "ref.test" t
+        lg f "$b"
+        gcT f "ref.test" t
+        ins f "i32.and"
+        ifE f
+        for i in 0 .. n - 1 do
+            lg f "$a"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            lg f "$b"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            callf f "$cmpv"
+            ls f "$c"
+            lg f "$c"
+            ic f 0
+            ins f "i32.ne"
+            ifE f
+            lg f "$c"
+            ret f
+            endB f
+        ic f 0
+        ret f
+        endB f
+    lg f "$a"
+    gcT f "ref.test" "$cons"
+    lg f "$b"
+    gcT f "ref.test" "$cons"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    lg f "$b"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    callf f "$cmpv"
+    ls f "$c"
+    lg f "$c"
+    ic f 0
+    ins f "i32.ne"
+    ifE f
+    lg f "$c"
+    ret f
+    endB f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    lg f "$b"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    callf f "$cmpv"
+    ret f
+    endB f
+    // numeric / immediates
+    lg f "$a"
+    callf f "$toi"
+    ls f "$x"
+    lg f "$b"
+    callf f "$toi"
+    ls f "$y"
+    lg f "$x"
+    lg f "$y"
+    ins f "i32.lt_s"
+    ifE f
+    ic f -1
+    ret f
+    endB f
+    lg f "$x"
+    lg f "$y"
+    ins f "i32.gt_s"
+    ifE f
+    ic f 1
+    ret f
+    endB f
+    ic f 0
+    endFn f
+    // $cmpvBoxed: `compare` as a VALUE
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"
+    lg f "$b"
+    callf f "$cmpv"
+    callf f "$ofi"
+    endFn f
+    // $hash_du_default: tag, mixed with the payload's hash for a $du1
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.test" "$du1"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$du1"
+    gcTF f "struct.get" "$du1" 0
+    ic f 31
+    ins f "i32.mul"
+    lg f "$v"
+    gcT f "ref.cast" "$du1"
+    gcTF f "struct.get" "$du1" 1
+    callf f "$hashv"
+    ins f "i32.add"
+    refI31 f
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.cast" "$du0"
+    gcTF f "struct.get" "$du0" 0
+    refI31 f
+    endFn f
+
+// ---- runtime: builtin string members ---------------------------------------
+// .NET semantics, deliberately: an empty needle is found at `from`, a
+// missing one is -1, Replace scans left to right without overlapping.
+
+let rtTypes8 (m : Mod) : unit =
+    tyFunc m "$rt_sii2a" [ "$str"; "i32"; "i32" ] [ "anyref" ]
+    tyFunc m "$rt_ssi2i" [ "$str"; "$str"; "i32" ] [ "i32" ]
+    tyFunc m "$rt_si2i" [ "$str"; "i32" ] [ "i32" ]
+    tyFunc m "$rt_sss2a" [ "$str"; "$str"; "$str" ] [ "anyref" ]
+    tyFunc m "$rt_s2a" [ "$str" ] [ "anyref" ]
+    tyFunc m "$rt_sa2a" [ "$str"; "anyref" ] [ "anyref" ]
+
+let rtDecls8 (m : Mod) : unit =
+    declFn m "$strsub" "$rt_sii2a"
+    declFn m "$strFind" "$rt_ssi2i"
+    declFn m "$strFindChar" "$rt_si2i"
+    declFn m "$strLastFindChar" "$rt_si2i"
+    declFn m "$strStarts" "$rt_ss2i"
+    declFn m "$strEnds" "$rt_ss2i"
+    declFn m "$strSplitChar" "$rt_si2a"
+    declFn m "$strReplace" "$rt_sss2a"
+    declFn m "$strIsWs" "$rt_i2i"
+    declFn m "$strTrim" "$rt_s2a"
+    declFn m "$strTrimEndChars" "$rt_sa2a"
+
+let rtCore8 (m : Mod) : unit =
+    // $strsub
+    let f = beginFn m [ "$s"; "$start"; "$len" ]
+    local f "$r" "$str"
+    localsDone f
+    lg f "$len"
+    gcT f "array.new_default" "$str"
+    ls f "$r"
+    lg f "$r"
+    ic f 0
+    lg f "$s"
+    lg f "$start"
+    lg f "$len"
+    arrCopy f "$str" "$str"
+    lg f "$r"
+    endFn f
+    // $strFind
+    let f = beginFn m [ "$s"; "$p"; "$from" ]
+    local f "$i" "i32"
+    local f "$j" "i32"
+    local f "$ls" "i32"
+    local f "$lp" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$ls"
+    lg f "$p"
+    gci f "array.len"
+    ls f "$lp"
+    lg f "$from"
+    ls f "$i"
+    lg f "$i"
+    ic f 0
+    ins f "i32.lt_s"
+    ifE f
+    ic f 0
+    ls f "$i"
+    endB f
+    lg f "$lp"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$i"
+    lg f "$ls"
+    lg f "$i"
+    lg f "$ls"
+    ins f "i32.le_s"
+    ins f "select"
+    ret f
+    endB f
+    blockE f "$done"
+    loopE f "$outer"
+    lg f "$i"
+    lg f "$lp"
+    ins f "i32.add"
+    lg f "$ls"
+    ins f "i32.gt_s"
+    brIf f "$done"
+    ic f 0
+    ls f "$j"
+    blockE f "$mismatch"
+    loopE f "$inner"
+    lg f "$j"
+    lg f "$lp"
+    ins f "i32.ge_u"
+    ifE f
+    lg f "$i"
+    ret f
+    endB f
+    lg f "$s"
+    lg f "$i"
+    lg f "$j"
+    ins f "i32.add"
+    gcT f "array.get_u" "$str"
+    lg f "$p"
+    lg f "$j"
+    gcT f "array.get_u" "$str"
+    ins f "i32.ne"
+    brIf f "$mismatch"
+    lg f "$j"
+    ic f 1
+    ins f "i32.add"
+    ls f "$j"
+    br f "$inner"
+    endB f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$outer"
+    endB f
+    endB f
+    ic f -1
+    endFn f
+    // $strFindChar
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$i" "i32"
+    localsDone f
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    lg f "$i"
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    ic f -1
+    endFn f
+    // $strLastFindChar
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$i" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$i"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$i"
+    ic f 1
+    ins f "i32.sub"
+    ls f "$i"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    lg f "$i"
+    ret f
+    endB f
+    br f "$go"
+    endB f
+    endB f
+    ic f -1
+    endFn f
+    // $strStarts
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$i" "i32"
+    localsDone f
+    lg f "$p"
+    gci f "array.len"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.gt_u"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$p"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$p"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    ic f 1
+    endFn f
+    // $strEnds
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$i" "i32"
+    local f "$off" "i32"
+    localsDone f
+    lg f "$p"
+    gci f "array.len"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.gt_u"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$s"
+    gci f "array.len"
+    lg f "$p"
+    gci f "array.len"
+    ins f "i32.sub"
+    ls f "$off"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$p"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$off"
+    lg f "$i"
+    ins f "i32.add"
+    gcT f "array.get_u" "$str"
+    lg f "$p"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    ic f 1
+    endFn f
+    // $strSplitChar: n+1 pieces for n separators
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$n" "i32"
+    local f "$i" "i32"
+    local f "$start" "i32"
+    local f "$k" "i32"
+    local f "$r" "$arr"
+    localsDone f
+    ic f 1
+    ls f "$n"
+    blockE f "$cd"
+    loopE f "$cg"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$cd"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    lg f "$n"
+    ic f 1
+    ins f "i32.add"
+    ls f "$n"
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$cg"
+    endB f
+    endB f
+    lg f "$n"
+    gcT f "array.new_default" "$arr"
+    ls f "$r"
+    ic f 0
+    ls f "$i"
+    blockE f "$sd"
+    loopE f "$sg"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$sd"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    lg f "$r"
+    lg f "$k"
+    lg f "$s"
+    lg f "$start"
+    lg f "$i"
+    lg f "$start"
+    ins f "i32.sub"
+    callf f "$strsub"
+    gcT f "array.set" "$arr"
+    lg f "$k"
+    ic f 1
+    ins f "i32.add"
+    ls f "$k"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$start"
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$sg"
+    endB f
+    endB f
+    lg f "$r"
+    lg f "$k"
+    lg f "$s"
+    lg f "$start"
+    lg f "$s"
+    gci f "array.len"
+    lg f "$start"
+    ins f "i32.sub"
+    callf f "$strsub"
+    gcT f "array.set" "$arr"
+    lg f "$r"
+    endFn f
+    // $strReplace
+    let f = beginFn m [ "$s"; "$a"; "$b" ]
+    local f "$i" "i32"
+    local f "$at" "i32"
+    local f "$acc" "anyref"
+    localsDone f
+    ic f 0
+    gcT f "array.new_default" "$str"
+    ls f "$acc"
+    lg f "$a"
+    gci f "array.len"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$s"
+    ret f
+    endB f
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$s"
+    lg f "$a"
+    lg f "$i"
+    callf f "$strFind"
+    ls f "$at"
+    lg f "$at"
+    ic f 0
+    ins f "i32.lt_s"
+    brIf f "$done"
+    lg f "$acc"
+    gcT f "ref.cast" "$str"
+    lg f "$s"
+    lg f "$i"
+    lg f "$at"
+    lg f "$i"
+    ins f "i32.sub"
+    callf f "$strsub"
+    gcT f "ref.cast" "$str"
+    callf f "$strcat"
+    ls f "$acc"
+    lg f "$acc"
+    gcT f "ref.cast" "$str"
+    lg f "$b"
+    callf f "$strcat"
+    ls f "$acc"
+    // past the match, never into it: replacements do not overlap
+    lg f "$at"
+    lg f "$a"
+    gci f "array.len"
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$acc"
+    gcT f "ref.cast" "$str"
+    lg f "$s"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    lg f "$i"
+    ins f "i32.sub"
+    callf f "$strsub"
+    gcT f "ref.cast" "$str"
+    callf f "$strcat"
+    endFn f
+    // $strIsWs
+    let f = beginFn m [ "$c" ]
+    localsDone f
+    lg f "$c"
+    ic f 32
+    ins f "i32.eq"
+    for ws in [ 9; 10; 13; 11; 12 ] do
+        lg f "$c"
+        ic f ws
+        ins f "i32.eq"
+        ins f "i32.or"
+    endFn f
+    // $strTrim
+    let f = beginFn m [ "$s" ]
+    local f "$a" "i32"
+    local f "$b" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$b"
+    blockE f "$ld"
+    loopE f "$lg"
+    lg f "$a"
+    lg f "$b"
+    ins f "i32.ge_u"
+    brIf f "$ld"
+    lg f "$s"
+    lg f "$a"
+    gcT f "array.get_u" "$str"
+    callf f "$strIsWs"
+    ins f "i32.eqz"
+    brIf f "$ld"
+    lg f "$a"
+    ic f 1
+    ins f "i32.add"
+    ls f "$a"
+    br f "$lg"
+    endB f
+    endB f
+    blockE f "$rd"
+    loopE f "$rg"
+    lg f "$a"
+    lg f "$b"
+    ins f "i32.ge_u"
+    brIf f "$rd"
+    lg f "$s"
+    lg f "$b"
+    ic f 1
+    ins f "i32.sub"
+    gcT f "array.get_u" "$str"
+    callf f "$strIsWs"
+    ins f "i32.eqz"
+    brIf f "$rd"
+    lg f "$b"
+    ic f 1
+    ins f "i32.sub"
+    ls f "$b"
+    br f "$rg"
+    endB f
+    endB f
+    lg f "$s"
+    lg f "$a"
+    lg f "$b"
+    lg f "$a"
+    ins f "i32.sub"
+    callf f "$strsub"
+    endFn f
+    // $strTrimEndChars — the char array is UNIFORM here ($arr of i31), not
+    // the text emitter's packed i32 array; the read goes through $toi
+    let f = beginFn m [ "$s"; "$cs" ]
+    local f "$b" "i32"
+    local f "$j" "i32"
+    local f "$hit" "i32"
+    local f "$c" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$b"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$b"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$b"
+    ic f 1
+    ins f "i32.sub"
+    gcT f "array.get_u" "$str"
+    ls f "$c"
+    ic f 0
+    ls f "$hit"
+    ic f 0
+    ls f "$j"
+    blockE f "$sd"
+    loopE f "$sg"
+    lg f "$j"
+    lg f "$cs"
+    gcT f "ref.cast" "$arr"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$sd"
+    lg f "$cs"
+    gcT f "ref.cast" "$arr"
+    lg f "$j"
+    gcT f "array.get" "$arr"
+    callf f "$toi"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$hit"
+    br f "$sd"
+    endB f
+    lg f "$j"
+    ic f 1
+    ins f "i32.add"
+    ls f "$j"
+    br f "$sg"
+    endB f
+    endB f
+    lg f "$hit"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$b"
+    ic f 1
+    ins f "i32.sub"
+    ls f "$b"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$s"
+    ic f 0
+    lg f "$b"
+    callf f "$strsub"
+    endFn f
+
 let rtCore4 (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     localsDone f
