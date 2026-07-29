@@ -2532,3 +2532,96 @@ Notes for whoever continues: local declaration must happen BEFORE
 instructions (localsDone writes the grouped local vector); body order must
 match declFn order; abs-heap ref.cast uses NEGATIVE s33 (gcAbs); wasmtime
 needs `-W gc=y` (and exceptions once the tag lands).
+
+================================================================================
+## CONTINUE HERE — binary emitter (branch `binary-emitter`)
+================================================================================
+
+### State
+- `main`: text emitter, single case list (`nodeSkeleton` + skeleton replay),
+  420+ tests, self-host fixpoint byte-identical at ~42-46s. Untouched by the
+  branch work; keep it green.
+- `binary-emitter` (7 commits, all pushed): direct .wasm emission, no text
+  anywhere in that pipeline. PROVEN BY EXECUTION so far:
+    fact 10 -> 3628800; DU match; recursive list sum; tuple swap; record
+    construct/read/mutate; closure over captured local; and
+    List.sum (List.map (fun x -> x*x) [1;2;3]) -> 14  (prelude higher-order,
+    lifted lambda, env array, applyc/call_ref).
+
+### The files
+- `Backend/WasmBinary.fs` — writer + opcode/type tables. Execution-validated.
+- `Backend/EmitBin.fs` — module builder (index spaces, sections, declarative
+  elem for ref.func, DataCount), Fn contexts (named locals/labels, REPLAY
+  mode, freshLocal), the fixed `frame`, try_table/throw, and the ported
+  runtime (~15 fns: putc printi ndigits itoa prints applyc ofi toi addv
+  strcat eq_du_default equal printval + globalVt).
+- `Backend/BinDriver.fs` — Decl list -> bytes. St carries tags, fields,
+  globals, fns, lambdas. `emitNode`/`emitPat` are the case lists;
+  `emitWithLocals` is the two-pass (scratch then replay) body scheme;
+  unported bodies become UNREACHABLE STUBS with a warning naming the case.
+- Tests: `tests/Fpp.Tests/BinaryTests.fs` (SDK + runtime slices, executed).
+  Battery driver script shape: /tmp/binrun2.fsx pattern — inline as a real
+  test file early next session (BinBattery.fs: compile source, run wasmtime,
+  compare stdout).
+
+### The loop (this is the whole method)
+1. Write a small F++ program for the next feature.
+2. `EmitProgramWasm()` it; stub warnings on stderr NAME the missing case.
+3. Port that case into emitNode/emitPat (or the runtime fn into EmitBin).
+4. Run; wrong output or trap -> `wasm-tools print /tmp/x.wasm` and read.
+5. Suite (424) must stay green; commit per feature.
+
+### Next items, in order (each was already demanded by a stub warning)
+1. **BinBattery.fs**: promote the battery to the suite so regressions gate.
+2. **Class machinery**: DClass/DMembers -> $r_ types with __desc/__idhash
+   head fields (isObjRecord equivalent), $desc_ globals (globalVt exists),
+   member fns, EIfaceCall dispatch (the SHAPE is already ported inside
+   `equal`'s obj branch — reuse), ETypeTest, ECast true-branch, ctor calls.
+   This unlocks: seqs/for-loops (GetEnumerator/MoveNext/Current specials —
+   port `$iterNew/$iterNext/$iterCur/$isBuiltinSeq` from the blob), string
+   builtins on classes, and un-stubs most of the prelude residue.
+3. **EUnknown family**: hash (port $hashv — sibling of $equal, same dispatch
+   skeleton + $duHash vtable via globalVt), compare ($cmpv likewise),
+   $str.* builtins (flat call shapes; runtime fns strsub/strFind/... port
+   mechanically like strcat), conversions (n.Contains "#" table — mirror the
+   text case; floats need `parseFloat` at emission and `fc` with bits).
+4. **Captured mutable cells**: cellVars equivalent — a prepass marking
+   assigned-and-captured locals; their ELet allocates (struct.new $cell),
+   reads/writes go through struct.get/set 0; env slots share the cell.
+   (The text emitter's cellVars logic is the reference.)
+5. **Arrays**: EArray/EIndex/EIndexSet/EArrayLen/EArrayCreate — UNIFORM $arr
+   first (packed/POD parity is a later, separate pass; the binary path may
+   stay uniform until the oracle is green, then add representation parity).
+6. **Function values / partial application**: known fn used first-class or
+   under-applied -> wrapper chain (.w0..wk cons-env) like requestWrappers;
+   port the wrapper generator (text emitter ~line 3950) onto declFn/beginFn.
+7. **Runtime completion**: hashv cmpv cmpvBoxed lenv append printl printf64
+   ftoa (BIG — float formatting; port last), balloc/pinh/unpinh (linear
+   memory pins), patchself/patchmark (knot-tying — needed for local rec
+   closures; test with `let rec go = ... mapKids go ...` shapes).
+8. **letrec groups + rec lambdas** in the driver (ELet(true, ELam...) and
+   groups — text cases at EmitWasm ~1338/1371 are the reference).
+9. **Interfaces of records/classes done -> the GATES**:
+   a. ORACLE: run the whole OracleTests corpus through EmitProgramWasm,
+      compare stdout against the text path. When green, binary is
+      semantically complete.
+   b. Self-host: fixcorpus + `self` mode with stage-1 as .wasm bytes;
+      fixpoint compares BYTES.
+   c. Then merge to main, flip EmitResult to bytes, delete the text emitter
+      (or keep behind a debug flag), and the name section for backtraces.
+
+### Gotchas already paid for (do not rediscover)
+- catch-clause label depths are relative OUTSIDE the try_table (its own
+  label does not count). Checked against wasm-tools' encoding.
+- ref.func targets MUST be in the declarative elem segment (`rf` records).
+- abstract-heap ref.cast/test immediates are NEGATIVE s33 (gcAbs).
+- vtable array.get needs its type immediate ($vt).
+- declFn order must equal body-emission order; bodies are two-phase
+  (functions then inits) — interleaving corrupts slots.
+- REPLAY mode: locals must be named via freshLocal (counter advances in
+  both passes); naming by vecLen freezes and collides bindings.
+- $duEq/$duHash are indexed BY TAG: length = total tag count.
+- data segment names keyed by M.DataCount so scratch/real passes agree.
+- lambda capture list is filtered ONCE at discovery (globals/known fns are
+  not captures); build site and body must index the SAME list.
+- wasmtime needs `-W gc=y,exceptions=y` for these modules.
