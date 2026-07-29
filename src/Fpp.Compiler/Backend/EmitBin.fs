@@ -165,12 +165,15 @@ type Fn =
       mutable NParams : int
       Labels : Labels
       /// where this body's size patch started
-      mutable PatchAt : int }
+      mutable PatchAt : int
+      /// >= 0: REPLAY mode — `local` maps onto pre-declared slots in call
+      /// order instead of growing the vector (the two-pass body emission)
+      mutable Replay : int }
 
 /// open a body: params get indices 0.., locals follow as they are created
 let beginFn (m : Mod) (paramNames : string list) : Fn =
     let f = { M = m; B = m.CodeBody; LocalIdx = dictNew (); LocalTys = vecNew ()
-              NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0 }
+              NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0; Replay = -1 }
     f.PatchAt <- beginPatch m.CodeBody
     let mutable i = 0
     for p in paramNames do
@@ -180,8 +183,20 @@ let beginFn (m : Mod) (paramNames : string list) : Fn =
 
 /// a fresh named local of a given valtype name
 let local (f : Fn) (name : string) (ty : string) : unit =
-    dictSet f.LocalIdx name (f.NParams + vecLen f.LocalTys)
-    vecAdd f.LocalTys ty
+    if f.Replay >= 0 then
+        dictSet f.LocalIdx name (f.NParams + f.Replay)
+        f.Replay <- f.Replay + 1
+    else
+        dictSet f.LocalIdx name (f.NParams + vecLen f.LocalTys)
+        vecAdd f.LocalTys ty
+
+/// a fresh uniquely-named local — the counter advances in BOTH the scratch
+/// pass and the replay pass, so names agree across the two
+let freshLocal (f : Fn) (prefix : string) (ty : string) : string =
+    let n = if f.Replay >= 0 then f.Replay else vecLen f.LocalTys
+    let name = prefix + string n
+    local f name ty
+    name
 
 let localIdx (f : Fn) (name : string) : int =
     match dictTryFind f.LocalIdx name with

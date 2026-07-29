@@ -24,6 +24,7 @@ type St =
       GlobalOf : Dict<string * int, string>
       FnOf : Dict<string * int, string>
       ArityOf : Dict<string * int, int>
+      Warnings : Vec<string>
       mutable DataN : int }
 
 let private err (st : St) (msg : string) : unit = vecAdd st.Errors msg
@@ -34,8 +35,9 @@ let private mangle (v : VarId) : string =
 
 /// intern a string literal as a data segment, return its name and length
 let private internStr (st : St) (bytes : byte[]) : string * int =
-    let name = "$bd" + string st.DataN
-    st.DataN <- st.DataN + 1
+    // named by the MODULE's segment count: the scratch pass and the real
+    // pass then agree without shared mutable state of their own
+    let name = "$bd" + string st.M.DataCount
     dataSeg st.M name bytes
     name, bytes.Length
 
@@ -69,7 +71,7 @@ let private unescape (raw : string) : byte[] =
             i <- i + 1
     vecToArray out
 
-let rec private emitNode (st : St) (f : Fn) (e : Expr) : unit =
+let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
         let digits = s |> String.filter (fun c -> isDigit c || c = '-')
@@ -95,22 +97,74 @@ let rec private emitNode (st : St) (f : Fn) (e : Expr) : unit =
              refI31 f
          | last :: initRev ->
              for x in List.rev initRev do
-                 emitNode st f x
+                 emitNode st f lv x
                  ins f "drop"
-             emitNode st f last)
+             emitNode st f lv last)
+    | EVarI (v, sch, _) -> emitNode st f lv (EVar (v, sch))
     | EVar (v, _) ->
-        (match dictTryFind st.GlobalOf (v.Path, v.Offset) with
+        (match dictTryFind lv (v.Path, v.Offset) with
+         | Some l -> lg f l
+         | None ->
+         match dictTryFind st.GlobalOf (v.Path, v.Offset) with
          | Some g -> gg f g
          | None ->
              err st ("binary: unbound variable " + v.Name)
              refNull f "any")
+    | ELet (_, _, _, _, _) ->
+        // the let spine, iteratively, exactly like the text emitter
+        let mutable cur = e
+        let mutable walking = true
+        while walking do
+            match cur with
+            | ELet (_, v, _, rhs, body) ->
+                emitNode st f lv rhs
+                let l = freshLocal f "$bl" "anyref"
+                dictSet lv (v.Path, v.Offset) l
+                ls f l
+                cur <- body
+            | _ -> walking <- false
+        emitNode st f lv cur
+    | EIf (c, t, el) ->
+        emitNode st f lv c
+        callf f "$toi"
+        ifA f
+        emitNode st f lv t
+        elseB f
+        emitNode st f lv el
+        endB f
+    | EMatch (scrut, cases) ->
+        let sl = freshLocal f "$bm" "anyref"
+        let res = freshLocal f "$br" "anyref"
+        emitNode st f lv scrut
+        ls f sl
+        blockE f "$mdone"
+        let mutable ci = 0
+        for pat, guard, body in cases do
+            let lbl = "$mc" + string ci
+            ci <- ci + 1
+            blockE f lbl
+            emitPat st f lv lbl sl pat
+            (match guard with
+             | Some g ->
+                 emitNode st f lv g
+                 callf f "$toi"
+                 ins f "i32.eqz"
+                 brIf f lbl
+             | None -> ())
+            emitNode st f lv body
+            ls f res
+            br f "$mdone"
+            endB f
+        ins f "unreachable"
+        endB f
+        lg f res
     | ECtor (name, _, args) ->
         (match dictTryFind st.CaseArity name with
          | Some 0 -> gg f ("$c_" + name)
          | Some _ when not (List.isEmpty args) ->
              ic f (dictTryFind st.CaseTag name).Value
              (match args with
-              | [ one ] -> emitNode st f one
+              | [ one ] -> emitNode st f lv one
               | many ->
                   err st "binary: multi-payload ctor not ported"
                   refNull f "any")
@@ -119,37 +173,224 @@ let rec private emitNode (st : St) (f : Fn) (e : Expr) : unit =
              err st ("binary: ctor shape not ported: " + name)
              refNull f "any")
     | EApp (EUnknown "print", [ a ]) ->
-        emitNode st f a
+        emitNode st f lv a
         callf f "$printval"
         ic f 10
         callf f "$putc"
         ic f 0
         refI31 f
     | EApp (EUnknown "prints", [ a ]) ->
-        emitNode st f a
+        emitNode st f lv a
         gcT f "ref.cast" "$str"
         callf f "$prints"
         ic f 0
         refI31 f
     | EPrim ("+", [ a; b ]) ->
-        emitNode st f a
-        emitNode st f b
+        emitNode st f lv a
+        emitNode st f lv b
         callf f "$addv"
     | EPrim ("=", [ a; b ]) ->
-        emitNode st f a
-        emitNode st f b
+        emitNode st f lv a
+        emitNode st f lv b
         callf f "$equal"
     | EPrim (op, [ a; b ]) when List.contains op [ "-"; "*"; "/" ] ->
         let insn = match op with "-" -> "i32.sub" | "*" -> "i32.mul" | _ -> "i32.div_s"
-        emitNode st f a
+        emitNode st f lv a
         callf f "$toi"
-        emitNode st f b
+        emitNode st f lv b
         callf f "$toi"
         ins f insn
         callf f "$ofi"
-    | other ->
-        err st ("binary: expression case not ported yet")
+    | EPrim (op, [ a; b ]) when List.contains op [ "<"; ">"; "<="; ">=" ] ->
+        let insn = match op with "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | _ -> "i32.ge_s"
+        emitNode st f lv a
+        callf f "$toi"
+        emitNode st f lv b
+        callf f "$toi"
+        ins f insn
+        refI31 f
+    | EPrim ("<>", [ a; b ]) ->
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$equal"
+        gcAbs f "ref.cast" "i31"
+        i31get f
+        ins f "i32.eqz"
+        refI31 f
+    | EPrim ("::", [ a; b ]) ->
+        emitNode st f lv a
+        emitNode st f lv b
+        gcT f "struct.new" "$cons"
+    | EPrim ("&&", [ a; b ]) -> emitNode st f lv (EIf (a, b, ELit (LBool false)))
+    | EPrim ("||", [ a; b ]) -> emitNode st f lv (EIf (a, ELit (LBool true), b))
+    | EPrim ("u-", [ a ]) ->
+        ic f 0
+        emitNode st f lv a
+        callf f "$toi"
+        ins f "i32.sub"
+        callf f "$ofi"
+    | EPrim ("unot", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        ins f "i32.eqz"
+        refI31 f
+    | ETuple xs ->
+        for x in xs do emitNode st f lv x
+        gcT f "struct.new" ("$tup" + string (List.length xs))
+    | EListLit xs ->
+        for x in xs do emitNode st f lv x
         refNull f "any"
+        for _ in xs do gcT f "struct.new" "$cons"
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
+          (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
+        for a in args do emitNode st f lv a
+        callf f (dictTryFind st.FnOf (v.Path, v.Offset)).Value
+    | other ->
+        let tag =
+            match other with
+            | ELam _ -> "ELam" | EApp (EUnknown n, _) -> "EApp $" + n
+            | EApp _ -> "EApp" | EPrim (op, _) -> "EPrim " + op
+            | EField _ -> "EField" | EFieldSet _ -> "EFieldSet"
+            | ERecord _ -> "ERecord" | ERecordExt _ -> "ERecordExt"
+            | EIndex _ -> "EIndex" | EIndexSet _ -> "EIndexSet"
+            | EArray _ -> "EArray" | EArrayLen _ -> "EArrayLen"
+            | EArrayCreate _ -> "EArrayCreate" | EWhile _ -> "EWhile"
+            | EAssign _ -> "EAssign" | ETry _ -> "ETry"
+            | EIfaceCall _ -> "EIfaceCall" | ECast _ -> "ECast"
+            | ETypeTest _ -> "ETypeTest" | ETuple _ -> "ETuple"
+            | EListLit _ -> "EListLit" | EUnknown n -> "EUnknown " + n
+            | _ -> "?"
+        err st ("binary: not ported: " + tag)
+        refNull f "any"
+
+and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
+                    (failLbl : string) (slot : string) (p : Pat) : unit =
+    match p with
+    | PWild -> ()
+    | PVar (v, _) ->
+        let l = freshLocal f "$bp" "anyref"
+        dictSet lv (v.Path, v.Offset) l
+        lg f slot
+        ls f l
+    | PLit (LInt sIn) ->
+        let digits = sIn |> String.filter (fun c -> isDigit c || c = '-')
+        lg f slot
+        callf f "$toi"
+        ic f (if digits = "" then 0 else int digits)
+        ins f "i32.ne"
+        brIf f failLbl
+    | PLit (LBool b) ->
+        lg f slot
+        callf f "$toi"
+        ic f (if b then 1 else 0)
+        ins f "i32.ne"
+        brIf f failLbl
+    | PCtor (name, _, args) ->
+        (match dictTryFind st.CaseArity name, dictTryFind st.CaseTag name with
+         | Some 0, Some t ->
+             lg f slot
+             gcT f "ref.test" "$du0"
+             ins f "i32.eqz"
+             brIf f failLbl
+             lg f slot
+             gcT f "ref.cast" "$du0"
+             gcTF f "struct.get" "$du0" 0
+             ic f t
+             ins f "i32.ne"
+             brIf f failLbl
+         | Some _, Some t ->
+             lg f slot
+             gcT f "ref.test" "$du1"
+             ins f "i32.eqz"
+             brIf f failLbl
+             lg f slot
+             gcT f "ref.cast" "$du1"
+             gcTF f "struct.get" "$du1" 0
+             ic f t
+             ins f "i32.ne"
+             brIf f failLbl
+             (match args with
+              | [] -> ()
+              | [ sub ] ->
+                  let pl = freshLocal f "$bq" "anyref"
+                  lg f slot
+                  gcT f "ref.cast" "$du1"
+                  gcTF f "struct.get" "$du1" 1
+                  ls f pl
+                  emitPat st f lv failLbl pl sub
+              | _ -> err st "binary: multi-arg ctor pattern not ported")
+         | _ -> err st ("binary: unknown ctor in pattern " + name))
+    | PTuple ps ->
+        let t = "$tup" + string (List.length ps)
+        let mutable i = 0
+        for sub in ps do
+            let pl = freshLocal f "$bq" "anyref"
+            lg f slot
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            ls f pl
+            emitPat st f lv failLbl pl sub
+            i <- i + 1
+    | PCons (h, tl) ->
+        lg f slot
+        gcT f "ref.test" "$cons"
+        ins f "i32.eqz"
+        brIf f failLbl
+        let hl = freshLocal f "$bq" "anyref"
+        lg f slot
+        gcT f "ref.cast" "$cons"
+        gcTF f "struct.get" "$cons" 0
+        ls f hl
+        emitPat st f lv failLbl hl h
+        let tll = freshLocal f "$bq" "anyref"
+        lg f slot
+        gcT f "ref.cast" "$cons"
+        gcTF f "struct.get" "$cons" 1
+        ls f tll
+        emitPat st f lv failLbl tll tl
+    | PListLit [] ->
+        lg f slot
+        ins f "ref.is_null"
+        ins f "i32.eqz"
+        brIf f failLbl
+    | _ -> err st "binary: pattern case not ported yet"
+
+/// Emit a body whose locals are only discovered DURING emission: run the
+/// emission once into a scratch buffer (locals allocate in a deterministic
+/// order), then declare exactly those locals and splice the bytes. Local
+/// indices agree because both passes allocate in the same order.
+and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
+                           (owner : string) (body : Expr) (needsResult : bool) : bool =
+    let scratchB = bytesNew ()
+    let scratch =
+        { M = f.M; B = scratchB; LocalIdx = dictNew (); LocalTys = vecNew ()
+          NParams = f.NParams; Labels = labelsNew (); PatchAt = 0; Replay = -1 }
+    for k, v in dictPairs f.LocalIdx do
+        if (dictTryFind scratch.LocalIdx k).IsNone then dictSet scratch.LocalIdx k v
+    let lv0 = dictNew<string * int, string> ()
+    for k, v in dictPairs lv do dictSet lv0 k v
+    // the DRY RUN uses a throwaway error sink: a body that hits unported
+    // cases becomes an UNREACHABLE STUB (bring-up mode: vtable-rooted
+    // prelude members survive DCE but are never called by small programs).
+    // Reaching a stub at runtime traps loudly rather than misbehaving.
+    let probe = { st with Errors = vecNew () }
+    emitNode probe scratch lv0 body
+    if vecLen probe.Errors > 0 then
+        vecAdd st.Warnings ("stubbed " + owner + " (" + vecGet probe.Errors 0 + ")")
+        localsDone f
+        ins f "unreachable"
+        false
+    else
+        for t in vecToList scratch.LocalTys do
+            let l = "$x" + string (vecLen f.LocalTys)
+            local f l t
+        localsDone f
+        f.Replay <- 0
+        let lv1 = dictNew<string * int, string> ()
+        for k, v in dictPairs lv do dictSet lv1 k v
+        emitNode st f lv1 body
+        ignore needsResult
+        true
 
 /// the whole program: globals + per-decl init functions + _start
 let emitBinary (decls : Decl list) : byte[] * string list =
@@ -157,7 +398,7 @@ let emitBinary (decls : Decl list) : byte[] * string list =
     let st =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
           EnumConst = dictNew (); GlobalOf = dictNew (); FnOf = dictNew ()
-          ArityOf = dictNew (); DataN = 0 }
+          ArityOf = dictNew (); Warnings = vecNew (); DataN = 0 }
     // tags in declaration order, like the text prepass
     let mutable tag = 0
     for d in decls do
@@ -195,7 +436,11 @@ let emitBinary (decls : Decl list) : byte[] * string list =
     let inits = vecNew<string> ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam _) -> ()  // functions: next milestone
+        | DLet (_, v, _, ELam (ps, _)) ->
+            let fn = mangle v
+            dictSet st.FnOf (v.Path, v.Offset) fn
+            dictSet st.ArityOf (v.Path, v.Offset) (List.length ps)
+            declFn m fn ("$v" + string (List.length ps))
         | DLet (_, v, _, _) ->
             let g = mangle v
             dictSet st.GlobalOf (v.Path, v.Offset) g
@@ -218,14 +463,36 @@ let emitBinary (decls : Decl list) : byte[] * string list =
     rtCore2 m
     rtCore3 m [ 2; 3 ]
     rtCore4 m
+    // bodies in DECLARATION order: all functions first, then all inits —
+    // interleaving them put code into the wrong slots
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam (ps, body)) ->
+            let names = ps |> List.mapi (fun i _ -> "$a" + string i)
+            let f = beginFn m names
+            let lv = dictNew<string * int, string> ()
+            List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) ("$a" + string i)) ps
+            // locals must all exist before instructions: pre-scan the body
+            // is avoided by DECLARING lazily... which binary cannot do — so
+            // Fn allows locals before localsDone only. Pre-pass: count let/
+            // match binders by walking? Simpler: emit into a scratch, then
+            // splice. The scratch approach: emit body into a temp Bytes via
+            // a temp Fn, then copy. Implemented as: body Fn writes into the
+            // REAL code stream, and `local` is legal before localsDone —
+            // so we must know locals first. We pre-walk the body and create
+            // one anyref local per binder, keyed by the SAME naming scheme
+            // emitNode/emitPat use (vecLen LocalTys order).
+            emitWithLocals st f lv (mangle v) body true |> ignore
+            endFn f
+        | _ -> ()
     for d in decls do
         match d with
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) ->
             let f = beginFn m []
-            localsDone f
-            emitNode st f rhs
-            gs f (dictTryFind st.GlobalOf (v.Path, v.Offset)).Value
+            let lv = dictNew<string * int, string> ()
+            if emitWithLocals st f lv (mangle v) rhs true then
+                gs f (dictTryFind st.GlobalOf (v.Path, v.Offset)).Value
             endFn f
         | _ -> ()
     let f = beginFn m []
