@@ -56,7 +56,12 @@ let private fsiRun (src : string) : string =
     Expect.equal code 0 "fsi failed"
     out
 
+/// every oracle program, recorded as it is declared — the binary-backend
+/// gate replays the same corpus through both emitters
+let corpus = System.Collections.Generic.List<string * string list> ()
+
 let private oracle (name : string) (srcLines : string list) =
+    corpus.Add (name, srcLines)
     test name {
         let src = String.concat "\n" ("module M" :: srcLines) + "\n"
         let expected = fsiRun src

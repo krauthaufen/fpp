@@ -589,6 +589,9 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | None ->
              err st ("binary: record ext with unknown type " + rn)
              refNull f "any")
+    | ECtor (name, _, _) when (dictTryFind st.EnumConst name).IsSome ->
+        ic f (dictTryFind st.EnumConst name).Value
+        callf f "$ofi"
     | ECtor (name, _, args) ->
         (match dictTryFind st.CaseArity name with
          | Some 0 -> gg f ("$c_" + name)
@@ -1004,6 +1007,18 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
          | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
+    | EApp (EUnknown "printu", [ a ]) ->
+        // an unsigned value prints unsigned: widen the bit pattern
+        emitNode st f lv a
+        callf f "$toi"
+        ins f "i64.extend_i32_u"
+        callf f "$ultoa"
+        gcT f "ref.cast" "$str"
+        callf f "$prints"
+        ic f 10
+        callf f "$putc"
+        ic f 0
+        refI31 f
     | EApp (EUnknown "printb", [ a ]) ->
         // Boolean.ToString spells it with a capital
         emitNode st f lv a
@@ -1045,8 +1060,10 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         emitNode st f lv a
         emitNode st f lv b
         callf f "$equal"
-    | EPrim (op, [ a; b ]) when List.contains op [ "-"; "*"; "/" ] ->
-        let insn = match op with "-" -> "i32.sub" | "*" -> "i32.mul" | _ -> "i32.div_s"
+    | EPrim (op, [ a; b ]) when List.contains op [ "-"; "*"; "/"; "%" ] ->
+        let insn =
+            match op with
+            | "-" -> "i32.sub" | "*" -> "i32.mul" | "%" -> "i32.rem_s" | _ -> "i32.div_s"
         emitNode st f lv a
         callf f "$toi"
         emitNode st f lv b
@@ -1513,8 +1530,16 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
     match p with
     | PWild -> ()
     | PVar (v, _) ->
-        let l = freshLocal f "$bp" "anyref"
-        dictSet lv (v.Path, v.Offset) l
+        // or-alternatives bind the SAME identity: whichever alternative
+        // matches must write the one slot the shared body reads, so a
+        // binder already in scope reuses its slot instead of shadowing it
+        let l =
+            match dictTryFind lv (v.Path, v.Offset) with
+            | Some ex when not (ex.StartsWith "@env:") -> ex
+            | _ ->
+                let l = freshLocal f "$bp" "anyref"
+                dictSet lv (v.Path, v.Offset) l
+                l
         lg f slot
         ls f l
     | PLit (LInt sIn) ->
@@ -1554,16 +1579,15 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
              ic f t
              ins f "i32.ne"
              brIf f failLbl
-             (match args with
-              | [] -> ()
-              | [ sub ] ->
-                  let pl = freshLocal f "$bq" "anyref"
-                  lg f slot
-                  gcT f "ref.cast" "$du1"
-                  gcTF f "struct.get" "$du1" 1
-                  ls f pl
-                  emitPat st f lv failLbl pl sub
-              | _ -> err st "binary: multi-arg ctor pattern not ported")
+             // every sub-pattern matches against the ONE payload slot,
+             // exactly as the text emitter does (Lower tuples multi-payload)
+             for sub in args do
+                 let pl = freshLocal f "$bq" "anyref"
+                 lg f slot
+                 gcT f "ref.cast" "$du1"
+                 gcTF f "struct.get" "$du1" 1
+                 ls f pl
+                 emitPat st f lv failLbl pl sub
          | _ -> err st ("binary: unknown ctor in pattern " + name))
     | PTuple ps ->
         let t = "$tup" + string (List.length ps)
@@ -1596,6 +1620,113 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
     | PListLit [] ->
         lg f slot
         ins f "ref.is_null"
+        ins f "i32.eqz"
+        brIf f failLbl
+    | PListLit (p0 :: rest) ->
+        emitPat st f lv failLbl slot (PCons (p0, PListLit rest))
+    | PAs (inner, v, _) ->
+        let l =
+            match dictTryFind lv (v.Path, v.Offset) with
+            | Some ex when not (ex.StartsWith "@env:") -> ex
+            | _ ->
+                let l = freshLocal f "$bp" "anyref"
+                dictSet lv (v.Path, v.Offset) l
+                l
+        lg f slot
+        ls f l
+        emitPat st f lv failLbl slot inner
+    | POr alts ->
+        // try each alternative; any match jumps past the rest. All bind the
+        // same identities, and PVar's slot reuse makes them agree.
+        blockE f "$por"
+        let n = List.length alts
+        alts |> List.iteri (fun j alt ->
+            if j < n - 1 then
+                blockE f "$palt"
+                emitPat st f lv "$palt" slot alt
+                br f "$por"
+                endB f
+            else
+                emitPat st f lv failLbl slot alt)
+        endB f
+    | PLit (LString raw) ->
+        lg f slot
+        let bytes = unescape raw
+        let dn, len = internStr st bytes
+        ic f 0
+        ic f len
+        arrNewData f "$str" dn
+        callf f "$equal"
+        gcAbs f "ref.cast" "i31"
+        i31get f
+        ins f "i32.eqz"
+        brIf f failLbl
+    | PLit (LChar raw) ->
+        let bytes = unescape raw
+        lg f slot
+        callf f "$toi"
+        ic f (if bytes.Length > 0 then int bytes.[0] else 0)
+        ins f "i32.ne"
+        brIf f failLbl
+    | PLit (LFloat s) ->
+        let num = s |> String.filter (fun c -> isDigit c || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E')
+        lg f slot
+        callf f "$tof"
+        fc f (doubleBits (parseFloat num))
+        ins f "f64.ne"
+        brIf f failLbl
+    | PLit LNull ->
+        lg f slot
+        ins f "ref.is_null"
+        ins f "i32.eqz"
+        brIf f failLbl
+    | PLit LUnit -> ()
+    | PTypeTest tn ->
+        // `:? T` in a pattern: same tests as ETypeTest, branch to fail
+        let idOf () =
+            lg f slot
+            gcT f "ref.cast" "$obj"
+            gcTF f "struct.get" "$obj" 0
+            gcT f "ref.cast" "$desc"
+            gcTF f "struct.get" "$desc" 0
+        let classIdTest (classes : string list) =
+            let hits = classes |> List.filter (fun c -> (dictTryFind st.ObjRec c).IsSome)
+            lg f slot
+            gcT f "ref.test" "$obj"
+            ifV f "i32"
+            (match hits with
+             | [] -> ic f 0
+             | first :: rest ->
+                 idOf ()
+                 ic f (dictTryFind st.DescIdOf first).Value
+                 ins f "i32.eq"
+                 for c in rest do
+                     idOf ()
+                     ic f (dictTryFind st.DescIdOf c).Value
+                     ins f "i32.eq"
+                     ins f "i32.or")
+            elseB f
+            ic f 0
+            endB f
+        if tn = "list" then
+            lg f slot
+            ins f "ref.is_null"
+            lg f slot
+            gcT f "ref.test" "$cons"
+            ins f "i32.or"
+        elif tn = "array" then
+            lg f slot
+            callf f "$isArrayRep"
+        elif tn = "string" then
+            lg f slot
+            gcT f "ref.test" "$str"
+        elif (dictTryFind st.ObjRec tn).IsSome then
+            classIdTest (match dictTryFind st.SubsOf tn with Some s -> s | None -> [ tn ])
+        elif (dictTryFind st.IfaceName tn).IsSome then
+            classIdTest (match dictTryFind st.ImplsOf tn with Some s -> s | None -> [])
+        else
+            err st ("binary: cannot type-test pattern against " + tn)
+            ic f 0
         ins f "i32.eqz"
         brIf f failLbl
     | _ -> err st "binary: pattern case not ported yet"
@@ -1762,6 +1893,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                 dictSet st.CaseTag cn tag
                 dictSet st.CaseArity cn ar
                 tag <- tag + 1
+        | DEnum (_, cs) -> for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
     frame m vArities [ 2; 3 ]
     // record types: UNIFORM anyref fields (scalarization is a parity task,

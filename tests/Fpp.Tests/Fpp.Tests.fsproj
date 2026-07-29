@@ -19,6 +19,7 @@
     <Compile Include="BinaryTests.fs" />
     <Compile Include="BinBattery.fs" />
     <Compile Include="OracleTests.fs" />
+    <Compile Include="BinOracleTests.fs" />
     <Compile Include="LibraryTests.fs" />
     <Compile Include="ClassTests.fs" />
     <Compile Include="ProjectTests2.fs" />
