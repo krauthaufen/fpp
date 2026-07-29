@@ -25,6 +25,16 @@ type St =
       FnOf : Dict<string * int, string>
       ArityOf : Dict<string * int, int>
       Warnings : Vec<string>
+      /// record name -> field order; (record, field) -> slot
+      FieldsOf : Dict<string, string list>
+      FieldIdx : Dict<string * string, int>
+      /// field name -> owning record (last declaration wins, like the text)
+      FieldOwner : Dict<string, string>
+      /// each lifted lambda, keyed by its ELam NODE (reference identity):
+      /// name + captured keys in slot order
+      LamName : RefMap<Expr, string>
+      LamFree : Dict<string, (string * int) list>
+      LamBody : Vec<string * (VarId * Scheme) * Expr>
       mutable DataN : int }
 
 let private err (st : St) (msg : string) : unit = vecAdd st.Errors msg
@@ -71,6 +81,118 @@ let private unescape (raw : string) : byte[] =
             i <- i + 1
     vecToArray out
 
+/// free variables of a body: referenced keys minus those bound inside
+let rec private freeWalk (bound : Dict<string * int, bool>) (acc : Vec<string * int>) (seen : Dict<string * int, bool>) (e : Expr) : unit =
+    let note (v : VarId) =
+        let k = (v.Path, v.Offset)
+        if not (dictTryFind bound k).IsSome && not (dictTryFind seen k).IsSome then
+            dictSet seen k true
+            vecAdd acc k
+    let rec bindPat (p : Pat) =
+        match p with
+        | PVar (v, _) -> dictSet bound (v.Path, v.Offset) true
+        | PAs (inner, v, _) -> dictSet bound (v.Path, v.Offset) true; bindPat inner
+        | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter bindPat ps
+        | PCons (h, t) -> bindPat h; bindPat t
+        | _ -> ()
+    match e with
+    | EVar (v, _) | EVarI (v, _, _) -> note v
+    | EAssign (v, x) -> note v; freeWalk bound acc seen x
+    | ELam (ps, b) ->
+        for pv, _ in ps do dictSet bound (pv.Path, pv.Offset) true
+        freeWalk bound acc seen b
+    | ELet (_, v, _, rhs, b) ->
+        freeWalk bound acc seen rhs
+        dictSet bound (v.Path, v.Offset) true
+        freeWalk bound acc seen b
+    | EMatch (sc, cs) ->
+        freeWalk bound acc seen sc
+        for pt, g, b in cs do
+            bindPat pt
+            (match g with Some x -> freeWalk bound acc seen x | None -> ())
+            freeWalk bound acc seen b
+    | EApp (g, args) -> freeWalk bound acc seen g; for a in args do freeWalk bound acc seen a
+    | EIf (a, b, c) -> freeWalk bound acc seen a; freeWalk bound acc seen b; freeWalk bound acc seen c
+    | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) ->
+        for x in xs do freeWalk bound acc seen x
+    | ERecord (_, fs) -> for _, v in fs do freeWalk bound acc seen v
+    | ERecordExt (_, b, fs) -> freeWalk bound acc seen b; (for _, v in fs do freeWalk bound acc seen v)
+    | EField (r, _, _) -> freeWalk bound acc seen r
+    | EFieldSet (r, _, _, v) -> freeWalk bound acc seen r; freeWalk bound acc seen v
+    | EWhile (c, b) -> freeWalk bound acc seen c; freeWalk bound acc seen b
+    | EIfaceCall (_, _, r, args) -> freeWalk bound acc seen r; for a in args do freeWalk bound acc seen a
+    | ECast (_, x, _) | ETypeTest (_, x) | EArrayLen (_, x) -> freeWalk bound acc seen x
+    | EIndex (_, a, i) -> freeWalk bound acc seen a; freeWalk bound acc seen i
+    | EIndexSet (_, a, i, v) -> freeWalk bound acc seen a; freeWalk bound acc seen i; freeWalk bound acc seen v
+    | EArrayCreate (_, a, b) -> freeWalk bound acc seen a; freeWalk bound acc seen b
+    | ETry (b, cs) ->
+        freeWalk bound acc seen b
+        for pt, g, x in cs do
+            bindPat pt
+            (match g with Some gg -> freeWalk bound acc seen gg | None -> ())
+            freeWalk bound acc seen x
+    | _ -> ()
+
+/// discover every lambda in DFS order: curry multi-param, name it, record
+/// its free list (order = discovery order of the walk), queue its body
+let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : Expr) : unit =
+    match e with
+    | ELam (ps, body) ->
+        // curry to unary
+        (match ps with
+         | [ (pv, psch) ] ->
+             let name = "$blam" + string (vecLen st.LamBody)
+             refMapSet st.LamName e name
+             let bound = dictNew<string * int, bool> ()
+             dictSet bound (pv.Path, pv.Offset) true
+             let acc = vecNew<string * int> ()
+             freeWalk bound acc (dictNew ()) body
+             // captures exclude globals and known functions: those resolve
+             // directly wherever they are read. BOTH the build site and the
+             // body index this same filtered list, so slots cannot drift.
+             let captured =
+                 vecToList acc
+                 |> List.filter (fun k ->
+                     not (dictTryFind st.GlobalOf k).IsSome
+                     && not (dictTryFind st.FnOf k).IsSome)
+             dictSet st.LamFree name captured
+             vecAdd st.LamBody (name, (pv, psch), body)
+             let inner = dictNew<string * int, bool> ()
+             dictSet inner (pv.Path, pv.Offset) true
+             discoverLams st inner body
+         | (pv, psch) :: rest ->
+             let curried = ELam ([ (pv, psch) ], ELam (rest, body))
+             refMapSet st.LamName e (
+                 // name the SOURCE node by its curried head so emitNode
+                 // finds it: discover the curried form and alias
+                 let nm = "$blam" + string (vecLen st.LamBody)
+                 discoverLams st outer curried
+                 (match refMapTryFind st.LamName curried with Some n -> n | None -> nm))
+         | [] -> ())
+    | ELet (_, _, _, rhs, b) -> discoverLams st outer rhs; discoverLams st outer b
+    | EMatch (sc, cs) ->
+        discoverLams st outer sc
+        for _, g, b in cs do
+            (match g with Some x -> discoverLams st outer x | None -> ())
+            discoverLams st outer b
+    | EApp (g, args) -> discoverLams st outer g; for a in args do discoverLams st outer a
+    | EIf (a, b, c) -> discoverLams st outer a; discoverLams st outer b; discoverLams st outer c
+    | ESeq xs | ETuple xs | EListLit xs | EPrim (_, xs) | ECtor (_, _, xs) ->
+        for x in xs do discoverLams st outer x
+    | ERecord (_, fs) -> for _, v in fs do discoverLams st outer v
+    | EField (r, _, _) -> discoverLams st outer r
+    | EFieldSet (r, _, _, v) -> discoverLams st outer r; discoverLams st outer v
+    | EWhile (c, b) -> discoverLams st outer c; discoverLams st outer b
+    | EAssign (_, x) -> discoverLams st outer x
+    | EIfaceCall (_, _, r, args) -> discoverLams st outer r; for a in args do discoverLams st outer a
+    | ECast (_, x, _) | ETypeTest (_, x) -> discoverLams st outer x
+    | ETry (b, cs) ->
+        discoverLams st outer b
+        for _, g, x in cs do
+            (match g with Some gg -> discoverLams st outer gg | None -> ())
+            discoverLams st outer x
+    | _ -> ()
+
 let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
@@ -103,6 +225,11 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
     | EVarI (v, sch, _) -> emitNode st f lv (EVar (v, sch))
     | EVar (v, _) ->
         (match dictTryFind lv (v.Path, v.Offset) with
+         | Some l when l.StartsWith "@env:" ->
+             lg f "$env"
+             gcT f "ref.cast" "$arr"
+             ic f (int (l.Substring 5))
+             gcT f "array.get" "$arr"
          | Some l -> lg f l
          | None ->
          match dictTryFind st.GlobalOf (v.Path, v.Offset) with
@@ -234,6 +361,52 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         callf f "$toi"
         ins f "i32.eqz"
         refI31 f
+    | ERecord (tyName, fields) ->
+        let rn =
+            if tyName <> "" && tyName <> "?" && (dictTryFind st.FieldsOf tyName).IsSome then tyName
+            else
+                match fields |> List.tryPick (fun (fn, _) -> dictTryFind st.FieldOwner fn) with
+                | Some r -> r
+                | None -> ""
+        (match dictTryFind st.FieldsOf rn with
+         | Some order ->
+             for fname in order do
+                 (match fields |> List.tryFind (fun (fn, _) -> fn = fname) with
+                  | Some (_, v) -> emitNode st f lv v
+                  | None ->
+                      err st ("binary: missing field " + fname + " in " + rn)
+                      refNull f "any")
+             gcT f "struct.new" ("$r_" + rn)
+         | None ->
+             err st ("binary: record with unknown type " + tyName)
+             refNull f "any")
+    | EField (r, fname, owner) ->
+        let rn =
+            if owner <> "" && (dictTryFind st.FieldIdx (owner, fname)).IsSome then owner
+            else (match dictTryFind st.FieldOwner fname with Some x -> x | None -> "")
+        (match dictTryFind st.FieldIdx (rn, fname) with
+         | Some idx ->
+             emitNode st f lv r
+             gcT f "ref.cast" ("$r_" + rn)
+             gcTF f "struct.get" ("$r_" + rn) idx
+         | None ->
+             err st ("binary: unknown field " + fname)
+             refNull f "any")
+    | EFieldSet (r, fname, owner, v) ->
+        let rn =
+            if owner <> "" && (dictTryFind st.FieldIdx (owner, fname)).IsSome then owner
+            else (match dictTryFind st.FieldOwner fname with Some x -> x | None -> "")
+        (match dictTryFind st.FieldIdx (rn, fname) with
+         | Some idx ->
+             emitNode st f lv r
+             gcT f "ref.cast" ("$r_" + rn)
+             emitNode st f lv v
+             gcTF f "struct.set" ("$r_" + rn) idx
+             ic f 0
+             refI31 f
+         | None ->
+             err st ("binary: unknown field " + fname)
+             refNull f "any")
     | ETuple xs ->
         for x in xs do emitNode st f lv x
         gcT f "struct.new" ("$tup" + string (List.length xs))
@@ -245,6 +418,109 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
         for a in args do emitNode st f lv a
         callf f (dictTryFind st.FnOf (v.Path, v.Offset)).Value
+    | EAssign (v, rhs) ->
+        (match dictTryFind lv (v.Path, v.Offset) with
+         | Some l when not (l.StartsWith "@env:") ->
+             emitNode st f lv rhs
+             ls f l
+         | Some _ ->
+             err st "binary: captured mutable (cells) not ported"
+         | None ->
+             match dictTryFind st.GlobalOf (v.Path, v.Offset) with
+             | Some g ->
+                 emitNode st f lv rhs
+                 gs f g
+             | None -> err st ("binary: assignment to unknown " + v.Name))
+        ic f 0
+        refI31 f
+    | EWhile (c, b) ->
+        blockE f "$wbrk"
+        loopE f "$wgo"
+        emitNode st f lv c
+        callf f "$toi"
+        ins f "i32.eqz"
+        brIf f "$wbrk"
+        emitNode st f lv b
+        ins f "drop"
+        br f "$wgo"
+        endB f
+        endB f
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "failwith", [ a ]) ->
+        emitNode st f lv a
+        throwExn f
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "ignore", [ a ]) ->
+        emitNode st f lv a
+        ins f "drop"
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "isNull", [ a ]) ->
+        emitNode st f lv a
+        ins f "ref.is_null"
+        refI31 f
+    | EApp (EUnknown "$listLength", [ a ]) ->
+        // inline: walk the cons chain counting (the runtime's $listLength
+        // moves here once more programs demand it)
+        let cl = freshLocal f "$ll" "anyref"
+        let cn = freshLocal f "$lc" "anyref"
+        emitNode st f lv a
+        ls f cl
+        ic f 0
+        refI31 f
+        ls f cn
+        blockE f "$ldone"
+        loopE f "$lgo"
+        lg f cl
+        ins f "ref.is_null"
+        brIf f "$ldone"
+        lg f cn
+        callf f "$toi"
+        ic f 1
+        ins f "i32.add"
+        callf f "$ofi"
+        ls f cn
+        lg f cl
+        gcT f "ref.cast" "$cons"
+        gcTF f "struct.get" "$cons" 1
+        ls f cl
+        br f "$lgo"
+        endB f
+        endB f
+        lg f cn
+    | ELam (_, _) ->
+        (match refMapTryFind st.LamName e with
+         | Some name ->
+             // (struct.new $clo (ref.func $lam) env) — env slots hold the
+             // CURRENT values of the captured locals, read here at build
+             let free = (dictTryFind st.LamFree name).Value
+             rf f name
+             if List.isEmpty free then refNull f "any"
+             else
+                 for k in free do
+                     (match dictTryFind lv k with
+                      | Some l when l.StartsWith "@env:" ->
+                          lg f "$env"
+                          gcT f "ref.cast" "$arr"
+                          ic f (int (l.Substring 5))
+                          gcT f "array.get" "$arr"
+                      | Some l -> lg f l
+                      | None ->
+                          err st "binary: capture not in scope at build site"
+                          refNull f "any")
+                 arrNewFixed f "$arr" (List.length free)
+             gcT f "struct.new" "$clo"
+         | None ->
+             err st "binary: undiscovered lambda"
+             refNull f "any")
+    | EApp (g, args) ->
+        // generic application: the applyc chain
+        emitNode st f lv g
+        for a in args do
+            emitNode st f lv a
+            callf f "$applyc"
     | other ->
         let tag =
             match other with
@@ -393,12 +669,15 @@ and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
         true
 
 /// the whole program: globals + per-decl init functions + _start
-let emitBinary (decls : Decl list) : byte[] * string list =
+let emitBinary (decls : Decl list) : byte[] * string list * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
           EnumConst = dictNew (); GlobalOf = dictNew (); FnOf = dictNew ()
-          ArityOf = dictNew (); Warnings = vecNew (); DataN = 0 }
+          ArityOf = dictNew (); Warnings = vecNew ()
+          FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
+          LamName = refMapNew (fun (_ : Expr) -> 7)
+          LamFree = dictNew (); LamBody = vecNew () }
     // tags in declaration order, like the text prepass
     let mutable tag = 0
     for d in decls do
@@ -410,6 +689,18 @@ let emitBinary (decls : Decl list) : byte[] * string list =
                 tag <- tag + 1
         | _ -> ()
     frame m [ 1; 2; 3 ] [ 2; 3 ]
+    // record types: UNIFORM anyref fields (scalarization is a parity task,
+    // not a bring-up task); names as declared, stamped clones included
+    for d in decls do
+        match d with
+        | DRecord (rn, _, fs, _) ->
+            let names = fs |> List.map fst
+            dictSet st.FieldsOf rn names
+            names |> List.iteri (fun i fn ->
+                dictSet st.FieldIdx (rn, fn) i
+                dictSet st.FieldOwner fn rn)
+            tyStruct m ("$r_" + rn) (names |> List.map (fun _ -> fld true "anyref"))
+        | _ -> ()
     rtTypes2 m
     rtTypes3 m
     rtTypes4 m
@@ -446,6 +737,15 @@ let emitBinary (decls : Decl list) : byte[] * string list =
             dictSet st.GlobalOf (v.Path, v.Offset) g
             globalAnyref m g
         | _ -> ()
+    // lambdas discovered only AFTER globals/functions are registered, so
+    // the capture filter (below) can exclude them — a global or a known
+    // function resolves directly and is never an env slot
+    for d in decls do
+        match d with
+        | DLet (_, _, _, body) -> discoverLams st (dictNew ()) body
+        | _ -> ()
+    for name, _, _ in vecToList st.LamBody do
+        declFn m name "$u1"
     let mutable initN = 0
     for d in decls do
         match d with
@@ -485,6 +785,36 @@ let emitBinary (decls : Decl list) : byte[] * string list =
             emitWithLocals st f lv (mangle v) body true |> ignore
             endFn f
         | _ -> ()
+    // lambda bodies: param + env; captured keys read from the env array.
+    // The capture FILTER at each build site is "is it a local there", so the
+    // body maps every free key optimistically; unreached slots never read.
+    for name, (pv, _), body in vecToList st.LamBody do
+        let f = beginFn m [ "$a"; "$env" ]
+        let lv = dictNew<string * int, string> ()
+        dictSet lv (pv.Path, pv.Offset) "$a"
+        // env reads become locals loaded up front — one array.get per slot
+        let free = (dictTryFind st.LamFree name).Value
+        let scratchProbe = { st with Errors = vecNew () }
+        // slot mapping mirrors the build-site filter only at RUN time; the
+        // body binds each env slot to a fresh local before its code
+        let envLocals = free |> List.mapi (fun i k -> k, i)
+        let fB = f
+        // first pass probes; handled inside emitWithLocals — here we bind
+        // env slots as pseudo-locals via a prelude in the body: emit reads
+        // after localsDone. To keep the two-pass scheme, the prelude is part
+        // of a wrapper expression instead: read slots lazily at each use.
+        // Simplest correct: lv marks env keys with a sentinel handled in
+        // EVar; but two-pass naming needs stability — so bind ALL slots to
+        // locals here, before emitWithLocals, via direct emission:
+        // (locals must precede instructions, so this uses the scratch pass
+        // machinery: slot binds are emitted as part of the body by wrapping)
+        ignore envLocals
+        ignore scratchProbe
+        ignore fB
+        // sentinel scheme: "@env:i" in lv, resolved in emitNode's EVar case
+        free |> List.iteri (fun i k -> dictSet lv k ("@env:" + string i))
+        emitWithLocals st f lv name body true |> ignore
+        endFn f
     for d in decls do
         match d with
         | DLet (_, _, _, ELam _) -> ()
@@ -499,4 +829,4 @@ let emitBinary (decls : Decl list) : byte[] * string list =
     localsDone f
     for i in vecToList inits do callf f i
     endFn f
-    assemble m 17 true, vecToList st.Errors
+    assemble m 17 true, vecToList st.Errors, vecToList st.Warnings

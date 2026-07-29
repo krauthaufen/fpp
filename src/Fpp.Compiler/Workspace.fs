@@ -489,7 +489,8 @@ type Workspace() =
             let linked = Fpp.Core.Link.deadCodeEliminate opt
             if not (List.isEmpty monoErrs) then "", [||], monoErrs
             elif binary then
-                let bytes, berrs = Fpp.Backend.BinDriver.emitBinary linked
+                let bytes, berrs, warns = Fpp.Backend.BinDriver.emitBinary linked
+                for w in warns do System.Console.Error.WriteLine ("warn: " + w)
                 "", bytes, berrs
             else
                 let res = Fpp.Backend.EmitWasm.emit linked
