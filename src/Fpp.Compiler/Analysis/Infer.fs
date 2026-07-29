@@ -1406,6 +1406,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // stamped, instead of silently running the integer
                           // comparison at every type
                           unifyAt op.Offset lt rt
+                          // EQUALITY has no class (it is structural), so the
+                          // class branch below never records its operand
+                          // type — and without a type name the backend has
+                          // to fall back to the structural walk even where
+                          // the operand is an enum-like union or a scalar.
+                          // Record it here: homogeneous by the unify above.
+                          // ONLY an argument-free type constructor: a
+                          // generic one (SetLinked<'K>, StructTuple2<..>)
+                          // would put a new instantiation name into the
+                          // operator, and stamping reads those — which
+                          // renamed stamped records out from under their
+                          // callers. Arg-free names (NodeKind, TokenKind)
+                          // are exactly what the backend can exploit.
+                          if op.Text = "=" || op.Text = "<>" then
+                              (match prune lt with
+                               | TCon (_, []) -> vecAdd opTypesRaw (op.Offset, lt)
+                               | _ -> ())
                           (match Classes.operatorClass op.Text with
                            | Some cls when (dictTryFind classes.Classes cls).IsSome ->
                                let c = { Class = cls; Args = [ lt ]; Assoc = [] }
