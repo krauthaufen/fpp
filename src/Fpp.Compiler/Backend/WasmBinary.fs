@@ -87,6 +87,9 @@ let bytesToArray (b : Bytes) : byte[] =
 
 /// unsigned LEB128 (u32 domain; negative input is a caller bug)
 let emitU32 (b : Bytes) (v0 : int) : unit =
+    // arithmetic shift keeps a negative negative forever — and a negative
+    // here is always a failed name lookup, so say so instead of spinning
+    if v0 < 0 then failwith "emitU32: negative value (missing type/func/global index)"
     let mutable v = v0
     let mutable go = true
     while go do

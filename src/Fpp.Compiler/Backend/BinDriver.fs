@@ -49,6 +49,9 @@ type St =
       ImplsOf : Dict<string, string list>
       SubsOf : Dict<string, string list>
       BaseOf : Dict<string, string>
+      /// EApp nodes in tail position (by node identity): a full-arity call
+      /// to a known function there compiles to return_call
+      TailApp : RefMap<Expr, bool>
       /// curry wrappers requested for top-level functions used first-class:
       /// name -> arity, plus request order (bodies are emitted LAST, and
       /// their decls land last too, so decl order still equals body order)
@@ -323,6 +326,70 @@ let rec private kindOfLite (e : Expr) : string =
     | EApp (EUnknown "float", [ _ ]) -> "f"
     | EApp (EUnknown "float32", [ _ ]) -> "s"
     | _ -> "u"
+
+/// every tuple arity the program mentions, in expressions or patterns —
+/// the frame declares one $tupN per arity and the structural runtime
+/// (equal/hashv/cmpv) generates one branch per arity
+let private scanTupleArities (decls : Decl list) : int list =
+    let found = dictNew<int, bool> ()
+    let note (n : int) = if n >= 2 then dictSet found n true
+    let rec scanP (p : Pat) : unit =
+        match p with
+        | PTuple ps -> note (List.length ps); List.iter scanP ps
+        | PCtor (_, _, ps) | PListLit ps | POr ps -> List.iter scanP ps
+        | PCons (a, b) -> scanP a; scanP b
+        | PAs (inner, _, _) -> scanP inner
+        | _ -> ()
+    let rec scan (e : Expr) : unit =
+        match e with
+        | ETuple xs -> note (List.length xs); List.iter scan xs
+        | ELam (_, b) -> scan b
+        | ELet (_, _, _, r, b) -> scan r; scan b
+        | EMatch (sc, cs) ->
+            scan sc
+            for p, g, b in cs do
+                scanP p
+                (match g with Some g -> scan g | None -> ())
+                scan b
+        | ETry (b, cs) ->
+            scan b
+            for p, g, x in cs do
+                scanP p
+                (match g with Some g -> scan g | None -> ())
+                scan x
+        | EApp (g, args) -> scan g; List.iter scan args
+        | EIf (a, b, c) -> scan a; scan b; scan c
+        | ESeq xs | EListLit xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) -> List.iter scan xs
+        | ERecord (_, fs) -> for _, v in fs do scan v
+        | ERecordExt (_, b, fs) -> scan b; (for _, v in fs do scan v)
+        | EField (r, _, _) -> scan r
+        | EFieldSet (r, _, _, v) -> scan r; scan v
+        | EWhile (c, b) -> scan c; scan b
+        | EAssign (_, x) -> scan x
+        | EIfaceCall (_, _, r, args) -> scan r; List.iter scan args
+        | ECast (_, x, _) | ETypeTest (_, x) -> scan x
+        | EIndex (_, a, i) -> scan a; scan i
+        | EIndexSet (_, a, i, v) -> scan a; scan i; scan v
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> scan a
+        | EArrayCreate (_, n, v) -> scan n; scan v
+        | _ -> ()
+    for d in decls do
+        match d with
+        | DLet (_, _, _, body) -> scan body
+        | _ -> ()
+    dictPairs found |> List.map fst |> List.sort
+
+/// mark every EApp in TAIL position of a function body. All emitted
+/// functions return anyref, so a tail call is always type-legal; the emitter
+/// turns marked full-arity known calls into return_call.
+let rec private markTails (st : St) (e : Expr) : unit =
+    match e with
+    | EApp (_, _) -> refMapSet st.TailApp e true
+    | ELet (_, _, _, _, b) -> markTails st b
+    | ESeq xs -> (match List.tryLast xs with Some x -> markTails st x | None -> ())
+    | EIf (_, t, el) -> markTails st t; markTails st el
+    | EMatch (_, cs) -> for _, _, b in cs do markTails st b
+    | _ -> ()
 
 /// collect the run of `let rec ... = fun` bindings heading a let spine.
 /// Grouping bindings that are NOT mutually recursive is harmless: their
@@ -1007,6 +1074,37 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
          | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
+    | EApp (EUnknown "hexlower", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        ic f 16
+        ic f 0
+        callf f "$itobase"
+    | EApp (EUnknown "hexupper", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        ic f 16
+        ic f 1
+        callf f "$itobase"
+    | EApp (EUnknown "octal", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        ic f 8
+        ic f 0
+        callf f "$itobase"
+    | EApp (EUnknown (("hexlower64" | "hexupper64" | "octal64") as fn), [ a ]) ->
+        emitNode st f lv a
+        callf f "$tol"
+        lc f (if fn = "octal64" then 8L else 16L)
+        ic f (if fn = "hexupper64" then 1 else 0)
+        callf f "$ltobase"
+    | EApp (EUnknown "fixed6", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tof"
+        callf f "$ftoa6"
+    | EApp (EUnknown "showv", [ a ]) ->
+        emitNode st f lv a
+        callf f "$showv"
     | EApp (EUnknown "printu", [ a ]) ->
         // an unsigned value prints unsigned: widen the bit pattern
         emitNode st f lv a
@@ -1325,7 +1423,10 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
         for a in args do emitNode st f lv a
-        callf f (dictTryFind st.FnOf (v.Path, v.Offset)).Value
+        let fn = (dictTryFind st.FnOf (v.Path, v.Offset)).Value
+        // a marked tail call returns the callee's result as ours — no frame
+        // grows, which is what recursion at depth 1000000 needs
+        if (refMapTryFind st.TailApp e).IsSome then retCall f fn else callf f fn
     | EAssign (v, rhs) when (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome ->
         // the cell may live in this frame or in the closure's env; both reads
         // yield the SAME cell, and the write goes through it
@@ -1374,6 +1475,17 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         ic f 0
         refI31 f
     | EApp (EUnknown "failwith", [ a ]) ->
+        // the payload is Failure(msg), so `with Failure msg` matches it
+        (match dictTryFind st.CaseTag "Failure" with
+         | Some tg ->
+             ic f tg
+             emitNode st f lv a
+             gcT f "struct.new" "$du1"
+         | None -> emitNode st f lv a)
+        throwExn f
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "raise", [ a ]) ->
         emitNode st f lv a
         throwExn f
         ic f 0
@@ -1781,7 +1893,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls
           ObjRec = dictNew (); ClassName = dictNew (); DescIdOf = dictNew ()
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
-          SubsOf = dictNew (); BaseOf = dictNew () }
+          SubsOf = dictNew (); BaseOf = dictNew ()
+          TailApp = refMapNew (fun (_ : Expr) -> 7) }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -1883,19 +1996,26 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             |> List.choose (fun (i, mn) ->
                 slotImpl cn i mn |> Option.bind (fun v -> dictTryFind dletArity (v.Path, v.Offset))))
         |> List.distinct
-    let vArities = ([ 1; 2; 3 ] @ ifaceArities) |> List.distinct |> List.sort
+    // EVERY program function is declared at type $v<arity>, so the frame
+    // needs a $vN for each arity the program uses — not only the iface ones
+    let vArities =
+        ([ 1; 2; 3 ] @ ifaceArities @ (dictPairs dletArity |> List.map snd))
+        |> List.distinct |> List.sort
     // tags in declaration order, like the text prepass
     let mutable tag = 0
+    let caseOwner = dictNew<string, string> ()
     for d in decls do
         match d with
-        | DUnion (_, _, cases) ->
+        | DUnion (un, _, cases) ->
             for cn, ar in cases do
                 dictSet st.CaseTag cn tag
                 dictSet st.CaseArity cn ar
+                dictSet caseOwner cn un
                 tag <- tag + 1
         | DEnum (_, cs) -> for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
-    frame m vArities [ 2; 3 ]
+    let tupArities = ([ 2; 3 ] @ scanTupleArities decls) |> List.distinct |> List.sort
+    frame m vArities tupArities
     // record types: UNIFORM anyref fields (scalarization is a parity task,
     // not a bring-up task). Every OBJ record carries __desc; classes add
     // __idhash and inherit their base's fields as a prefix — that layout is
@@ -1928,6 +2048,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtTypes7 m
     rtTypes8 m
     rtTypes9 m
+    rtTypes10 m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -1938,6 +2059,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     rtDecls7 m
     rtDecls8 m
     rtDecls9 m
+    rtDecls10 m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -1951,8 +2073,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             emitU32 m.GlobalBody (gcByte "struct.new")
             emitU32 m.GlobalBody (tyIdx m "$du0")
             emitByte m.GlobalBody opEnd
-    globalVt m "$duEq" (List.init (max tag 1) (fun _ -> "$eq_du_default"))
-    globalVt m "$duHash" (List.init (max tag 1) (fun _ -> "$hash_du_default"))
+    // $duEq/$duHash are built AFTER program fns are declared (below): an
+    // Equals/GetHashCode override on a union fills its tags' slots
     // program globals + init function declarations
     let inits = vecNew<string> ()
     for d in decls do
@@ -2002,8 +2124,31 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                     | Some v -> (match slotFnName v with Some fn -> fn | None -> "")
                     | None -> "")
             cn, identity @ slots)
+    // union identity: structural by default, the union's own override where
+    // one is declared — indexed by case tag, which is globally unique
+    let duSlot (which : string) (dflt : string) (wantArity : int) : string list =
+        if tag = 0 then [ dflt ]
+        else
+            List.init tag (fun t ->
+                let owner =
+                    dictPairs st.CaseTag
+                    |> List.tryPick (fun (c, tg) -> if tg = t then dictTryFind caseOwner c else None)
+                match owner |> Option.bind (fun o -> identityImpl o which) with
+                | Some v ->
+                    (match dictTryFind dletArity (v.Path, v.Offset) with
+                     | Some a when a = wantArity -> mangle v
+                     | Some a when a = wantArity + 1 ->
+                         let ad = "$adaptdu" + string wantArity + "_" + string t
+                         vecAdd identityAdapters (ad, wantArity, mangle v)
+                         ad
+                     | _ -> dflt)
+                | None -> dflt)
+    let duEqSlots = duSlot "Equals" "$eq_du_default" 2
+    let duHashSlots = duSlot "GetHashCode" "$hash_du_default" 1
     for ad, arity, _ in vecToList identityAdapters do
         declFn m ad ("$v" + string arity)
+    globalVt m "$duEq" duEqSlots
+    globalVt m "$duHash" duHashSlots
     for cn, slots in descSlots do
         globalDesc m ("$desc_" + cn) (descId cn) slots
     // lambdas discovered only AFTER globals/functions are registered, so
@@ -2030,13 +2175,14 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     // bodies, in declaration order
     rtCore m
     rtCore2 m
-    rtCore3 m [ 2; 3 ]
+    rtCore3 m tupArities
     rtCore4 m
     rtCore5 m
     rtCore6 m
-    rtCore7 m [ 2; 3 ]
+    rtCore7 m tupArities
     rtCore8 m
     rtCore9 m
+    rtCore10 m
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
@@ -2046,6 +2192,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             let f = beginFn m names
             let lv = dictNew<string * int, string> ()
             List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) ("$a" + string i)) ps
+            markTails st body
             // locals must all exist before instructions: pre-scan the body
             // is avoided by DECLARING lazily... which binary cannot do — so
             // Fn allows locals before localsDone only. Pre-pass: count let/
@@ -2185,6 +2332,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
         ignore fB
         // sentinel scheme: "@env:i" in lv, resolved in emitNode's EVar case
         free |> List.iteri (fun i k -> dictSet lv k ("@env:" + string i))
+        markTails st body
         emitWithLocals st f lv name body true |> ignore
         endFn f
     for d in decls do

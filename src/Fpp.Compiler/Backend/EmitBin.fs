@@ -2988,6 +2988,293 @@ let rtCore8 (m : Mod) : unit =
     callf f "$strsub"
     endFn f
 
+// ---- runtime: printf-family formatting helpers ------------------------------
+
+let private F5EM7 = 0x3EA0C6F7A0B5ED8DL
+
+let rtDecls10 (m : Mod) : unit =
+    declFn m "$xput" "$rt_xput"
+    declFn m "$ltobase" "$rt_lbase2a"
+    declFn m "$itobase" "$rt_ibase2a"
+    declFn m "$ftoa6" "$rt_f2a"
+    declFn m "$showv" "$rt_a2a"
+
+let rtTypes10 (m : Mod) : unit =
+    tyFunc m "$rt_xput" [ "$str"; "i32"; "i64"; "i64"; "i32" ] [ "i32" ]
+    tyFunc m "$rt_lbase2a" [ "i64"; "i64"; "i32" ] [ "anyref" ]
+    tyFunc m "$rt_ibase2a" [ "i32"; "i32"; "i32" ] [ "anyref" ]
+
+let rtCore10 (m : Mod) : unit =
+    // $xput: hex/octal digits of an i64 magnitude
+    let f = beginFn m [ "$s"; "$p"; "$n"; "$base"; "$upper" ]
+    local f "$m" "i64"
+    local f "$d" "i32"
+    localsDone f
+    lg f "$n"
+    lg f "$base"
+    ins f "i64.div_u"
+    ls f "$m"
+    lg f "$m"
+    lc f 0L
+    ins f "i64.gt_u"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    lg f "$m"
+    lg f "$base"
+    lg f "$upper"
+    callf f "$xput"
+    ls f "$p"
+    endB f
+    lg f "$n"
+    lg f "$base"
+    ins f "i64.rem_u"
+    ins f "i32.wrap_i64"
+    ls f "$d"
+    lg f "$s"
+    lg f "$p"
+    lg f "$d"
+    ic f 10
+    ins f "i32.lt_u"
+    ifV f "i32"
+    ic f 48
+    lg f "$d"
+    ins f "i32.add"
+    elseB f
+    ic f 55
+    ic f 87
+    lg f "$upper"
+    ins f "select"
+    lg f "$d"
+    ins f "i32.add"
+    endB f
+    callf f "$sput"
+    endFn f
+    // $ltobase
+    let f = beginFn m [ "$n"; "$base"; "$upper" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    localsDone f
+    ic f 24
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$s"
+    ic f 0
+    lg f "$n"
+    lg f "$base"
+    lg f "$upper"
+    callf f "$xput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $itobase: an i32 formats via its UNSIGNED 32-bit reading
+    let f = beginFn m [ "$n"; "$base"; "$upper" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    localsDone f
+    ic f 24
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$s"
+    lg f "$p"
+    lg f "$n"
+    ins f "i64.extend_i32_u"
+    lc f 0xffffffffL
+    ins f "i64.and"
+    lg f "$base"
+    ins f "i64.extend_i32_u"
+    lg f "$upper"
+    callf f "$xput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $ftoa6: %f is .NET's fixed-six-decimals form
+    let f = beginFn m [ "$v" ]
+    local f "$s" "$str"
+    local f "$p" "i32"
+    local f "$ip" "f64"
+    local f "$frac" "f64"
+    local f "$k" "i32"
+    local f "$d" "i32"
+    localsDone f
+    ic f 40
+    gcT f "array.new_default" "$str"
+    ls f "$s"
+    lg f "$v"
+    lg f "$v"
+    ins f "f64.ne"
+    ifE f
+    for c in [ 78; 97; 78 ] do
+        lg f "$s"
+        lg f "$p"
+        ic f c
+        callf f "$sput"
+        ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    ret f
+    endB f
+    lg f "$v"
+    fc f 0L
+    ins f "f64.lt"
+    ifE f
+    lg f "$s"
+    lg f "$p"
+    ic f 45
+    callf f "$sput"
+    ls f "$p"
+    lg f "$v"
+    ins f "f64.neg"
+    ls f "$v"
+    endB f
+    lg f "$v"
+    fc f F1E18
+    ins f "f64.ge"
+    ifE f
+    lg f "$v"
+    callf f "$ftoa"
+    ret f
+    endB f
+    // round at the sixth decimal first, so 0.0000005 carries
+    lg f "$v"
+    fc f F5EM7
+    ins f "f64.add"
+    ls f "$v"
+    lg f "$v"
+    ins f "f64.floor"
+    ls f "$ip"
+    lg f "$s"
+    lg f "$p"
+    lg f "$ip"
+    ins f "i64.trunc_f64_s"
+    callf f "$lput"
+    ls f "$p"
+    lg f "$s"
+    lg f "$p"
+    ic f 46
+    callf f "$sput"
+    ls f "$p"
+    lg f "$v"
+    lg f "$ip"
+    ins f "f64.sub"
+    ls f "$frac"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$k"
+    ic f 6
+    ins f "i32.ge_s"
+    brIf f "$done"
+    lg f "$frac"
+    fc f F10
+    ins f "f64.mul"
+    ls f "$frac"
+    lg f "$frac"
+    ins f "f64.floor"
+    ins f "i32.trunc_f64_s"
+    ls f "$d"
+    lg f "$s"
+    lg f "$p"
+    ic f 48
+    lg f "$d"
+    ins f "i32.add"
+    callf f "$sput"
+    ls f "$p"
+    lg f "$frac"
+    lg f "$frac"
+    ins f "f64.floor"
+    ins f "f64.sub"
+    ls f "$frac"
+    lg f "$k"
+    ic f 1
+    ins f "i32.add"
+    ls f "$k"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$s"
+    lg f "$p"
+    callf f "$strTake"
+    endFn f
+    // $showv: %A at an unknown hole — dispatch on the representation
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    ins f "ref.is_null"
+    ifE f
+    for c in [ 110; 117; 108; 108 ] do ic f c
+    arrNewFixed f "$str" 4
+    ret f
+    endB f
+    lg f "$v"
+    gcAbs f "ref.test" "i31"
+    ifE f
+    lg f "$v"
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    callf f "$itoa"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxi"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxi"
+    gcTF f "struct.get" "$boxi" 0
+    callf f "$itoa"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxl"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxl"
+    gcTF f "struct.get" "$boxl" 0
+    callf f "$ltoa"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxf"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxf"
+    gcTF f "struct.get" "$boxf" 0
+    callf f "$ftoa"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$boxs"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$boxs"
+    gcTF f "struct.get" "$boxs" 0
+    ins f "f64.promote_f32"
+    callf f "$ftoa"
+    ret f
+    endB f
+    lg f "$v"
+    gcT f "ref.test" "$str"
+    ifE f
+    // %A quotes strings, as F# does
+    ic f 34
+    arrNewFixed f "$str" 1
+    lg f "$v"
+    gcT f "ref.cast" "$str"
+    callf f "$strcat"
+    gcT f "ref.cast" "$str"
+    ic f 34
+    arrNewFixed f "$str" 1
+    callf f "$strcat"
+    ret f
+    endB f
+    ic f 63
+    arrNewFixed f "$str" 1
+    endFn f
+
 // ---- runtime: enumeration protocol and object identity helpers -------------
 // Lists and arrays ARE seqs but carry no vtable: $iterNew wraps whichever
 // representation arrives, $iterNext/$iterCur drive it.
