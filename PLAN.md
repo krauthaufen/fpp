@@ -2554,21 +2554,24 @@ needs `-W gc=y` (and exceptions once the tag lands).
   ERecordExt), printf family (itobase/ltobase/ftoa6/showv), tail calls
   (markTails -> return_call for known full-arity calls).
 
-### Remaining to finish task #8 (the only open work)
-ALL MEASUREMENT GATES ARE GREEN (2026-07-29):
-- Oracle corpus 70/70 (text vs binary stdout identical).
-- Binary fixpoint: `dotnet fsi tests/bootstrap/fixpoint.fsx bin` — stage-1
-  (the compiler emitted as .wasm BYTES) runs and reproduces stage-0's
-  corpus bytes exactly.
-- Binary SELF-host: `... fixpoint.fsx bin self` — the binary-emitted
-  compiler compiles its own 24 sources to the byte-identical 1,863,929-byte
-  module it is. compiledrive-bin.fpp is the drive; byte[] ≡ $str packed
-  representation makes the bytesString identity true in both backends.
+### DONE — task #8 closed (2026-07-29, main at c689a43)
+The binary backend is THE backend. Merged to main; EmitWasm.fs deleted;
+Workspace emits bytes only (EmitProgramWasm / EmitProgramWasmRaw); the CLI
+writes .wasm; fixpoint.fsx is binary-only (drive: compiledrive-bin.fpp).
+Gates on the merged tree: suite 443 (+1 pending, see below), fixpoint `bin`
+and `bin self` both byte-identical — the self-hosted module is 1,350,391
+bytes (down from 1.86 MB with the text emitter still aboard).
 
-What remains is the MERGE, and it is the USER'S call:
-- merge `binary-emitter` to main; EmitResult -> bytes as the default
-  pipeline output;
-- text emitter: delete vs keep behind a debug flag (open decision, user's).
+### Open follow-ups (representation parity the text emitter had)
+- PACKED/POD arrays: float/int/half arrays are UNIFORM ($arr of boxed) in
+  the binary backend; the text emitter packed them ($parr_*, POD C-image,
+  SoA struct arrays, scalarized struct params/returns). This is the perf
+  work the user cared about ("no boxing anywhere") — port as its own pass.
+- Array.pin/unpin + linear-memory pin heap (balloc/pinh/unpinh): unported;
+  the FFI pin test is `ptest`-pending in FfiTests.fs.
+- Two EmitTests were deleted with the emitter (flat-array invariant,
+  scalarization invariant) — resurrect them as BINARY assertions when the
+  packed pass lands.
 
 ### The loop (unchanged, still the whole method)
 1. Write/pick a program; EmitProgramWasm(); stub warnings NAME the case.
