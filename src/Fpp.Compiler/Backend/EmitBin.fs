@@ -2719,6 +2719,7 @@ let rtDecls8 (m : Mod) : unit =
     declFn m "$strIsWs" "$rt_i2i"
     declFn m "$strTrim" "$rt_s2a"
     declFn m "$strTrimEndChars" "$rt_sa2a"
+    declFn m "$streq" "$rt_ss2i"
 
 let rtCore8 (m : Mod) : unit =
     // $strsub
@@ -3249,6 +3250,57 @@ let rtCore8 (m : Mod) : unit =
     ic f 0
     lg f "$b"
     callf f "$strsub"
+    endFn f
+    // $streq: identity, then length, then bytes
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    localsDone f
+    lg f "$a"
+    castEq f
+    lg f "$b"
+    castEq f
+    ins f "ref.eq"
+    ifE f
+    ic f 1
+    ret f
+    endB f
+    lg f "$a"
+    gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    lg f "$b"
+    gci f "array.len"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    blockE f "$d"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$d"
+    lg f "$a"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    lg f "$b"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ins f "i32.ne"
+    ifE f
+    ic f 0
+    ret f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    ic f 1
     endFn f
 
 // ---- runtime: printf-family formatting helpers ------------------------------

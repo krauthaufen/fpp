@@ -788,11 +788,31 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     ">>>"; "&&&"; "|||"; "^^^"; "<<<" ]
                           let suffix =
                               if not suffixable then
-                                  // halves must NOT fall through to structural
-                                  // $equal: comparing the i31 BIT PATTERN makes
+                                  // EQUALITY types too, where the operand kind
+                                  // resolved: a scalar or string `=` compiles
+                                  // to the machine instruction (or a byte
+                                  // compare) instead of structural $equal.
+                                  // Halves must not fall through either:
+                                  // comparing the i31 BIT PATTERN makes
                                   // -0.0h <> 0.0h and nan_h = nan_h
-                                  if (op.Text = "=" || op.Text = "<>")
-                                     && (dictTryFind opKinds op.Offset) = Some "h" then "h"
+                                  if op.Text = "=" || op.Text = "<>" then
+                                      match dictTryFind opKinds op.Offset with
+                                      | Some "h" -> "h"
+                                      | Some "t" -> "t"
+                                      | Some "l" -> "l"
+                                      | Some "f" -> "f"
+                                      | Some "s" -> "s"
+                                      | Some "w" | Some "b" | Some "c" -> "i"
+                                      | _ ->
+                                          match dictTryFind opTypes op.Offset with
+                                          | Some "int" | Some "bool" | Some "char" -> "i"
+                                          // a type variable or user type:
+                                          // resolved after stamping, exactly
+                                          // like the arithmetic suffixes —
+                                          // this is what specializes the
+                                          // GENERIC dict probe's key compare
+                                          | Some t when t <> "" -> "@" + t
+                                          | _ -> ""
                                   else ""
                               else
                                   match dictTryFind opKinds op.Offset with

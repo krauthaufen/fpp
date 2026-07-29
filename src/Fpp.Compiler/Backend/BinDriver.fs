@@ -1499,6 +1499,17 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         emitNode st f lv b
         callf f "$addv"
+    | EPrim (op, [ a; b ]) when op.StartsWith "=@" || op.StartsWith "<>@" ->
+        // an equality whose operand type the backend cannot spell is the
+        // STRUCTURAL one — records, unions, options all compare via $equal
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$equal"
+        (if op.StartsWith "<>@" then
+            gcAbs f "ref.cast" "i31"
+            i31get f
+            ins f "i32.eqz"
+            refI31 f)
     | EPrim ("=", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
         emitNode st f lv a
         callf f "$toi"
@@ -1564,6 +1575,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$toi"
         ins f "i32.eqz"
         refI31 f
+    | EPrim (("=t" | "<>t") as op, [ a; b ]) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        emitNode st f lv b
+        gcT f "ref.cast" "$str"
+        callf f "$streq"
+        (if op = "<>t" then ins f "i32.eqz")
+        refI31 f
     | EPrim (op, [ a; b ]) when
         op.Length > 1 && op.EndsWith "t"
         && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "<"; ">"; "<="; ">=" ] ->
@@ -1584,7 +1603,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EPrim (op, [ a; b ]) when
         op.Length > 1
         && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l" || op.EndsWith "i")
-        && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">=" ] ->
+        && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let baseOp = op.Substring (0, op.Length - 1)
         let kind = op.Substring (op.Length - 1)
         let un, box_, ty, flt =
@@ -1601,12 +1620,13 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             callf f un
             emitNode st f lv b
             callf f un
-            let cmp = List.contains baseOp [ "<"; ">"; "<="; ">=" ]
+            let cmp = List.contains baseOp [ "<"; ">"; "<="; ">="; "="; "<>" ]
             let insn =
                 match baseOp with
                 | "+" -> ty + ".add" | "-" -> ty + ".sub" | "*" -> ty + ".mul"
                 | "/" -> if flt then ty + ".div" else ty + ".div_s"
                 | "%" -> ty + ".rem_s"
+                | "=" -> ty + ".eq" | "<>" -> ty + ".ne"
                 | "<" -> if flt then ty + ".lt" else ty + ".lt_s"
                 | ">" -> if flt then ty + ".gt" else ty + ".gt_s"
                 | "<=" -> if flt then ty + ".le" else ty + ".le_s"

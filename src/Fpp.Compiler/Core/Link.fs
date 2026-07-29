@@ -48,7 +48,10 @@ let private withOpType (op : string) (name : string) : string =
     // extended) into an i32, so every operator on them is the integer one.
     // Leaving them out sent `<@byte` looking for an instance member — and
     // found the generated `compare`, whose own body is that comparison.
-    | "int" | "char" | "bool" | "byte" | "sbyte" -> baseOp
+    | "int" | "char" | "bool" | "byte" | "sbyte" ->
+        // int-shaped EQUALITY stays typed (i32.eq beats structural $equal);
+        // arithmetic on ints is already the bare default
+        if baseOp = "=" || baseOp = "<>" then baseOp + "i" else baseOp
     // a type whose instance has a body: still unresolved here, and emission
     // reports it rather than silently running the integer path
     | other -> baseOp + "@" + other
