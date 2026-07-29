@@ -35,9 +35,18 @@ type St =
       LamName : RefMap<Expr, string>
       LamFree : Dict<string, (string * int) list>
       LamBody : Vec<string * (VarId * Scheme) * Expr>
+      /// let-bound mutables that a lambda mentions: capture copies the env
+      /// BY VALUE, so these live in a one-field $cell and the copy that
+      /// lands in the closure's env is a copy of the CELL REFERENCE
+      CellVars : Dict<string * int, bool>
       mutable DataN : int }
 
 let private err (st : St) (msg : string) : unit = vecAdd st.Errors msg
+
+/// dereference a $cell already on the stack
+let private cellGet (f : Fn) : unit =
+    gcT f "ref.cast" "$cell"
+    gcTF f "struct.get" "$cell" 0
 
 let private mangle (v : VarId) : string =
     "$b" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_"
@@ -80,6 +89,69 @@ let private unescape (raw : string) : byte[] =
             vecAdd out (byte c)
             i <- i + 1
     vecToArray out
+
+/// A local becomes a cell when it is let-bound, assigned somewhere, and
+/// mentioned inside a lambda. The test is per BINDING, so every read and
+/// write agrees on the representation. (Port of the text emitter's cellScan.)
+let private cellScan (decls : Decl list) : Dict<string * int, bool> =
+    let letBound = dictNew<string * int, bool> ()
+    let assigned = dictNew<string * int, bool> ()
+    let inLambda = dictNew<string * int, bool> ()
+    let rec go (depth : int) (e : Expr) : unit =
+        let g = go depth
+        match e with
+        | EVar (v, _) | EVarI (v, _, _) ->
+            if depth > 0 then dictSet inLambda (v.Path, v.Offset) true
+        | ELam (_, b) -> go (depth + 1) b
+        | EAssign (v, x) ->
+            dictSet assigned (v.Path, v.Offset) true
+            if depth > 0 then dictSet inLambda (v.Path, v.Offset) true
+            g x
+        | ELet (_, v, _, r, b) ->
+            dictSet letBound (v.Path, v.Offset) true
+            g r
+            g b
+        | EApp (fn, args) -> g fn; List.iter g args
+        | EIf (a, b, c) -> g a; g b; g c
+        | EMatch (s, cs) ->
+            g s
+            for _, gd, b in cs do
+                (match gd with Some gd -> g gd | None -> ())
+                g b
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) ->
+            List.iter g xs
+        | ERecord (_, fs) -> for _, v in fs do g v
+        | ERecordExt (_, b, fs) -> g b; (for _, v in fs do g v)
+        | EField (r, _, _) -> g r
+        | EFieldSet (r, _, _, v) -> g r; g v
+        | EWhile (c, b) -> g c; g b
+        | EIndex (_, a, i) -> g a; g i
+        | EIndexSet (_, a, i, v) -> g a; g i; g v
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> g a
+        | EArrayCreate (_, n, v) -> g n; g v
+        | EIfaceCall (_, _, recv, args) -> g recv; List.iter g args
+        | ETry (b, cs) ->
+            g b
+            for _, gd, x in cs do
+                (match gd with Some gd -> g gd | None -> ())
+                g x
+        | _ -> ()
+    // a top-level function's own parameter lambdas ARE the function, not a
+    // capture boundary — its body compiles to a wasm function whose locals
+    // are locals
+    let rec skipParams (e : Expr) : Expr =
+        match e with
+        | ELam (_, b) -> skipParams b
+        | _ -> e
+    for d in decls do
+        match d with
+        | DLet (_, _, _, e) -> go 0 (skipParams e)
+        | _ -> ()
+    let cells = dictNew<string * int, bool> ()
+    for k, _ in dictPairs assigned do
+        if (dictTryFind letBound k).IsSome && (dictTryFind inLambda k).IsSome then
+            dictSet cells k true
+    cells
 
 /// free variables of a body: referenced keys minus those bound inside
 let rec private freeWalk (bound : Dict<string * int, bool>) (acc : Vec<string * int>) (seen : Dict<string * int, bool>) (e : Expr) : unit =
@@ -224,15 +296,21 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
              emitNode st f lv last)
     | EVarI (v, sch, _) -> emitNode st f lv (EVar (v, sch))
     | EVar (v, _) ->
-        (match dictTryFind lv (v.Path, v.Offset) with
+        let vk = (v.Path, v.Offset)
+        (match dictTryFind lv vk with
          | Some l when l.StartsWith "@env:" ->
              lg f "$env"
              gcT f "ref.cast" "$arr"
              ic f (int (l.Substring 5))
              gcT f "array.get" "$arr"
-         | Some l -> lg f l
+             // the env slot holds the CELL, shared with the frame that owns
+             // it — that sharing is the whole point; reading dereferences
+             if (dictTryFind st.CellVars vk).IsSome then cellGet f
+         | Some l ->
+             lg f l
+             if (dictTryFind st.CellVars vk).IsSome then cellGet f
          | None ->
-         match dictTryFind st.GlobalOf (v.Path, v.Offset) with
+         match dictTryFind st.GlobalOf vk with
          | Some g -> gg f g
          | None ->
              err st ("binary: unbound variable " + v.Name)
@@ -245,6 +323,9 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
             match cur with
             | ELet (_, v, _, rhs, body) ->
                 emitNode st f lv rhs
+                // a captured mutable: the frame holds the CELL, not the value
+                if (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome then
+                    gcT f "struct.new" "$cell"
                 let l = freshLocal f "$bl" "anyref"
                 dictSet lv (v.Path, v.Offset) l
                 ls f l
@@ -418,6 +499,24 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
         for a in args do emitNode st f lv a
         callf f (dictTryFind st.FnOf (v.Path, v.Offset)).Value
+    | EAssign (v, rhs) when (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome ->
+        // the cell may live in this frame or in the closure's env; both reads
+        // yield the SAME cell, and the write goes through it
+        (match dictTryFind lv (v.Path, v.Offset) with
+         | Some l when l.StartsWith "@env:" ->
+             lg f "$env"
+             gcT f "ref.cast" "$arr"
+             ic f (int (l.Substring 5))
+             gcT f "array.get" "$arr"
+         | Some l -> lg f l
+         | None ->
+             err st ("binary: cell not in scope: " + v.Name)
+             refNull f "any")
+        gcT f "ref.cast" "$cell"
+        emitNode st f lv rhs
+        gcTF f "struct.set" "$cell" 0
+        ic f 0
+        refI31 f
     | EAssign (v, rhs) ->
         (match dictTryFind lv (v.Path, v.Offset) with
          | Some l when not (l.StartsWith "@env:") ->
@@ -729,7 +828,7 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           ArityOf = dictNew (); Warnings = vecNew ()
           FieldsOf = dictNew (); FieldIdx = dictNew (); FieldOwner = dictNew (); DataN = 0
           LamName = refMapNew (fun (_ : Expr) -> 7)
-          LamFree = dictNew (); LamBody = vecNew () }
+          LamFree = dictNew (); LamBody = vecNew (); CellVars = cellScan decls }
     // tags in declaration order, like the text prepass
     let mutable tag = 0
     for d in decls do
