@@ -490,6 +490,58 @@ let rec private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e
         endB f
         endB f
         lg f cn
+    // ---- arrays: UNIFORM $arr (anyref elements) ---------------------------
+    // The element-kind name is carried but ignored: the binary path stays
+    // uniform until the oracle is green, and packed/POD parity is its own
+    // pass afterwards. Every element is therefore a boxed anyref, exactly
+    // like a closure env slot.
+    | EArray (_, xs) ->
+        for x in xs do emitNode st f lv x
+        arrNewFixed f "$arr" (List.length xs)
+    | EArrayCreate (nm, n, EUnknown "$zero") ->
+        // Array.zeroCreate. `array.new_default` would give NULL in every
+        // slot, which is right for a reference element and wrong for a
+        // numeric one — uniform boxing means a zero int is `ref.i31 0`, not
+        // null. So the zero is spelled per element kind and filled by
+        // array.new.
+        (match nm with
+         | "float" | "float32" | "double" | "single" ->
+             fc f 0L
+             gcT f "struct.new" "$boxf"
+         | "string" | "obj" | "" -> refNull f "any"
+         | _ when strLen nm > 0 && charAt nm 0 = '\'' -> refNull f "any"
+         | _ ->
+             ic f 0
+             refI31 f)
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new" "$arr"
+    | EArrayCreate (_, n, v) ->
+        // array.new takes the INIT VALUE first, then the length
+        emitNode st f lv v
+        emitNode st f lv n
+        callf f "$toi"
+        gcT f "array.new" "$arr"
+    | EIndex (_, a, i) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$arr"
+        emitNode st f lv i
+        callf f "$toi"
+        gcT f "array.get" "$arr"
+    | EIndexSet (_, a, i, v) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$arr"
+        emitNode st f lv i
+        callf f "$toi"
+        emitNode st f lv v
+        gcT f "array.set" "$arr"
+        ic f 0
+        refI31 f
+    | EArrayLen (_, a) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$arr"
+        gci f "array.len"
+        callf f "$ofi"
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name ->
