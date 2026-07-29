@@ -60,6 +60,14 @@ type St =
       /// box, writes unbox — and the peephole cancels both against their
       /// producers/consumers, which is what makes a hot loop alloc-free
       LocalKind : Dict<string * int, string>
+      /// known functions with SCALAR signatures: param kinds + return kind.
+      /// Calls unbox arguments and box results (both cancel on rails);
+      /// bodies receive raw params and return raw
+      SigKinds : Dict<string * int, string list * string>
+      SigByName : Dict<string, string list * string>
+      /// the CURRENT body's return kind — return_call is legal only when
+      /// callee and caller agree (the frame that would unbox is gone)
+      mutable CurRet : string
       /// mentioned inside some lambda: those can never be rail locals
       InLambda : Dict<string * int, bool>
       /// struct-record fields with their declared TYPE names (uniform
@@ -468,6 +476,11 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
     | EApp (EUnknown "int64", [ _ ]) -> "l"
     | EApp (EUnknown "float", [ _ ]) -> "f"
     | EApp (EUnknown "float32", [ _ ]) -> "s"
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
+          (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
+        (match dictTryFind st.SigKinds (v.Path, v.Offset) with
+         | Some (_, rk) -> rk
+         | None -> "u")
     | _ -> "u"
 
 /// every tuple arity the program mentions, in expressions or patterns —
@@ -1813,10 +1826,21 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              callf f fn
              if rk = "i" then callf f "$ofi"
          | None ->
-             for a in args do emitNode st f lv a
+             let pks, rk =
+                 match dictTryFind st.SigKinds (v.Path, v.Offset) with
+                 | Some (p, r) -> p, r
+                 | None -> (args |> List.map (fun _ -> "u")), "u"
+             for k, a in List.zip pks args do
+                 emitNode st f lv a
+                 if k <> "u" then callf f (unboxOfK k)
              // a marked tail call returns the callee's result as ours — no
-             // frame grows, which is what recursion at depth 1000000 needs
-             if (refMapTryFind st.TailApp e).IsSome then retCall f fn else callf f fn)
+             // frame grows; legal only when the return kinds AGREE, because
+             // the frame that would re-box is gone
+             if (refMapTryFind st.TailApp e).IsSome && rk = st.CurRet then
+                 retCall f fn
+             else
+                 callf f fn
+                 if rk <> "u" then callf f (boxOfK rk))
     | EAssign (v, rhs) when (dictTryFind st.CellVars (v.Path, v.Offset)).IsSome ->
         // the cell may live in this frame or in the closure's env; both reads
         // yield the SAME cell, and the write goes through it
@@ -2437,12 +2461,19 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
 /// indices agree because both passes allocate in the same order.
 and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
                            (owner : string) (body : Expr) (needsResult : bool) : bool =
+    emitWithLocalsK st f lv owner body []
+
+and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
+                            (owner : string) (body : Expr)
+                            (paramKinds : ((string * int) * string) list) : bool =
     // rail-kind decisions are PER PASS: monomorphized clones share binder
     // keys across functions, and within one body a kindOfLite peeking into a
     // nested let-block must see the SAME (empty-so-far) state in the replay
     // as the scratch saw — entries accumulate during a pass, never before it
     let clearKinds () =
         for k, _ in dictPairs st.LocalKind do dictRemove st.LocalKind k
+        // RAW params are rail entries from the first instruction on
+        for key, k in paramKinds do dictSet st.LocalKind key k
     clearKinds ()
     let scratchB = bytesNew ()
     let scratch =
@@ -2474,7 +2505,6 @@ and private emitWithLocals (st : St) (f : Fn) (lv : Dict<string * int, string>)
         let lv1 = dictNew<string * int, string> ()
         for k, v in dictPairs lv do dictSet lv1 k v
         emitNode st f lv1 body
-        ignore needsResult
         true
 
 /// the whole program: globals + per-decl init functions + _start
@@ -2494,7 +2524,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew (fun (_ : Expr) -> 7)
           Pod = dictNew (); StructFields = dictNew ()
-          LocalKind = dictNew (); InLambda = snd (cellScan decls) }
+          LocalKind = dictNew (); InLambda = snd (cellScan decls)
+          SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u" }
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
@@ -2636,6 +2667,35 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             |> List.distinct
             |> List.filter isObjRecord
         dictSet st.ImplsOf ifn impls
+    // functions reachable through a vtable keep the canonical all-anyref
+    // signature — that IS the dispatch contract, so no specialization
+    let ifaceImplKeys =
+        (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (_, ms) -> ms |> List.map (fun (_, v) -> v.Path, v.Offset))))
+        @ (classDecls
+           |> List.collect (fun (cn, _, _, _) ->
+                vtableSlots |> List.choose (fun (i, mn) -> slotImpl cn i mn |> Option.map (fun v -> v.Path, v.Offset))))
+        @ (declaredMembers
+           |> List.collect (fun (_, own) ->
+                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" then Some (v.Path, v.Offset) else None)))
+        @ (classDecls
+           |> List.collect (fun (_, _, own, _) ->
+                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" then Some (v.Path, v.Offset) else None)))
+    let isIfaceImpl (key : string * int) = List.contains key ifaceImplKeys
+    let scalarKindOfTy (t : Fpp.Analysis.Types.Type) : string =
+        match Fpp.Analysis.Types.prune t with
+        | Fpp.Analysis.Types.TCon ("float", []) -> "f"
+        | Fpp.Analysis.Types.TCon ("float32", []) -> "s"
+        | Fpp.Analysis.Types.TCon ("int64", []) -> "l"
+        | Fpp.Analysis.Types.TCon ("int", []) -> "i"
+        | _ -> "u"
+    let rec splitArrow (n : int) (t : Fpp.Analysis.Types.Type) : string list * string =
+        if n = 0 then [], scalarKindOfTy t
+        else
+            match Fpp.Analysis.Types.prune t with
+            | Fpp.Analysis.Types.TFun (a, b) ->
+                let ps, r = splitArrow (n - 1) b
+                scalarKindOfTy a :: ps, r
+            | other -> [], scalarKindOfTy other
     // arity of every top-level function, for iface dispatch types
     let dletArity = dictNew<string * int, int> ()
     for d in decls do
@@ -2763,11 +2823,29 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     let inits = vecNew<string> ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) ->
+        | DLet (_, v, sch, ELam (ps, _)) ->
             let fn = mangle v
             dictSet st.FnOf (v.Path, v.Offset) fn
             dictSet st.ArityOf (v.Path, v.Offset) (List.length ps)
-            declFn m fn ("$v" + string (List.length ps))
+            let pk, rk = splitArrow ps.Length sch.Body
+            // a lambda-captured param must stay uniform: the closure env is
+            // anyref, and the capture build site reads the slot RAW
+            let capturedScalar =
+                pk.Length = ps.Length
+                && (List.zip ps pk
+                    |> List.exists (fun ((pv : VarId, _), k) ->
+                        k <> "u" && (dictTryFind st.InLambda (pv.Path, pv.Offset)).IsSome))
+            if not (isIfaceImpl (v.Path, v.Offset)) && not capturedScalar
+               && pk.Length = ps.Length && (rk <> "u" || List.exists (fun k -> k <> "u") pk) then
+                dictSet st.SigKinds (v.Path, v.Offset) (pk, rk)
+                dictSet st.SigByName fn (pk, rk)
+                let wasmOf k = match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | "i" -> "i32" | _ -> "anyref"
+                let tn = "$sig_" + String.concat "" pk + "_" + rk
+                if tyIdx m tn < 0 then
+                    tyFunc m tn (pk |> List.map wasmOf) [ wasmOf rk ]
+                declFn m fn tn
+            else
+                declFn m fn ("$v" + string (List.length ps))
         | DLet (_, v, _, _) ->
             let g = mangle v
             dictSet st.GlobalOf (v.Path, v.Offset) g
@@ -2880,6 +2958,15 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             let f = beginFn m names
             let lv = dictNew<string * int, string> ()
             List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) ("$a" + string i)) ps
+            let pks, rk =
+                match dictTryFind st.SigKinds (v.Path, v.Offset) with
+                | Some (p, r) -> p, r
+                | None -> (ps |> List.map (fun _ -> "u")), "u"
+            let paramKinds =
+                List.zip ps pks
+                |> List.choose (fun ((pv : VarId, _), k) ->
+                    if k = "u" then None else Some ((pv.Path, pv.Offset), k))
+            st.CurRet <- rk
             markTails st body
             // locals must all exist before instructions: pre-scan the body
             // is avoided by DECLARING lazily... which binary cannot do — so
@@ -2891,7 +2978,9 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             // so we must know locals first. We pre-walk the body and create
             // one anyref local per binder, keyed by the SAME naming scheme
             // emitNode/emitPat use (vecLen LocalTys order).
-            emitWithLocals st f lv (mangle v) body true |> ignore
+            emitWithLocalsK st f lv (mangle v) body paramKinds |> ignore
+            if rk <> "u" then callf f (unboxOfK rk)
+            st.CurRet <- "u"
             endFn f
         | _ -> ()
     // generated identity bodies — a record compares and hashes over its
@@ -3058,16 +3147,23 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             let f = beginFn m [ "$a"; "$env" ]
             localsDone f
             if k = arity - 1 then
+                let pks, rk =
+                    match dictTryFind st.SigByName fname with
+                    | Some (p, r) -> p, r
+                    | None -> List.replicate arity "u", "u"
                 for j in 0 .. arity - 1 do
-                    if j = k then lg f "$a"
-                    else
+                    (if j = k then lg f "$a"
+                     else
                         lg f "$env"
                         for _ in 1 .. (k - 1 - j) do
                             gcT f "ref.cast" "$cons"
                             gcTF f "struct.get" "$cons" 1
                         gcT f "ref.cast" "$cons"
-                        gcTF f "struct.get" "$cons" 0
+                        gcTF f "struct.get" "$cons" 0)
+                    let pk = List.item j pks
+                    if pk <> "u" then callf f (unboxOfK pk)
                 callf f fname
+                if rk <> "u" then callf f (boxOfK rk)
             else
                 rf f (fname + ".w" + string (k + 1))
                 lg f "$a"
