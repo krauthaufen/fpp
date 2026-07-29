@@ -1300,6 +1300,19 @@ let rtCore3 (m : Mod) (tupArities : int list) (duEqDirect : bool) : unit =
         ifE f
         let mutable i = 0
         while i < n do
+            // per-component IDENTITY short-circuit: dict keys are tuples of
+            // shared refs and i31s, so a true match needs NO recursive calls
+            lg f "$a"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            castEq f
+            lg f "$b"
+            gcT f "ref.cast" t
+            gcTF f "struct.get" t i
+            castEq f
+            ins f "ref.eq"
+            ins f "i32.eqz"
+            ifE f
             lg f "$a"
             gcT f "ref.cast" t
             gcTF f "struct.get" t i
@@ -1314,6 +1327,7 @@ let rtCore3 (m : Mod) (tupArities : int list) (duEqDirect : bool) : unit =
             ic f 0
             refI31 f
             ret f
+            endB f
             endB f
             i <- i + 1
         ic f 1
