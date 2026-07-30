@@ -1594,6 +1594,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           i
                       | _ -> st.Fresh ())
                  | _ -> st.Fresh ())
+            | QuoteExpr ->
+                // Type the BODY like any other expression — that is what makes
+                // the quoted code resolve, report its own errors and hover. The
+                // quotation itself denotes code, not the value the body would
+                // produce.
+                n.Children
+                |> List.iter (fun c ->
+                    match c with
+                    | GNode m when isExprish m.NodeKind -> ignore (exprType (GNode m))
+                    | _ -> ())
+                TCon ("Code", [])
+            | SpliceExpr ->
+                // `%x` splices code in, so `x` must denote code; what the
+                // spliced fragment evaluates to is not known here, so the hole
+                // takes a fresh variable and the surrounding quote still checks
+                n.Children
+                |> List.iter (fun c ->
+                    match c with
+                    | GNode m when isExprish m.NodeKind ->
+                        let t = exprType (GNode m)
+                        let off = match tokensOf n |> List.tryHead with Some tk -> tk.Offset | None -> 0
+                        unifyAt off t (TCon ("Code", []))
+                    | _ -> ())
+                st.Fresh ()
             | ParenExpr ->
                 let vars = dictNew<string, Type> ()
                 let inner =

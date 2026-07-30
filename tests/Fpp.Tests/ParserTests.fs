@@ -1,6 +1,7 @@
 module Fpp.Tests.ParserTests
 
 open Expecto
+open Fpp
 open Fpp.Syntax
 open Fpp.Syntax.Parser
 
@@ -86,6 +87,26 @@ let quotationTests =
         test "an unclosed quotation is an error, not silence" {
             let r = parseRoot "let q = <@ 1 + 2\n"
             Expect.isNonEmpty r.Diagnostics "missing '@>' is reported"
+        }
+
+        test "quoted code is CHECKED code: types, diagnostics and hovers" {
+            // the reason the body is ordinary syntax rather than text
+            let src = "module M\nlet n = 41\nlet q = <@ n + 1 @>\n"
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" src
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "quoted code type checks in place"
+            // hover INSIDE the quotation reports the binding's real type
+            Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "<@ n" + 3)) (Some "let `n` : int")
+                "a name inside a quotation hovers as itself"
+            // and the quotation denotes code, not the value its body computes
+            Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "let q" + 4)) (Some "let `q` : Code")
+                "the quotation's own type is Code"
+        }
+
+        test "an error INSIDE a quotation is reported like any other" {
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" "module M\nlet q = <@ 1 + \"two\" @>\n"
+            Expect.isNonEmpty (ws.Diagnostics "m.fpp") "a type error in quoted code is still a type error"
         }
 
         test "quotation brackets do not disturb the operators they resemble" {
