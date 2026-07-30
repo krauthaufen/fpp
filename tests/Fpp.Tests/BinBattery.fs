@@ -256,6 +256,52 @@ let binBattery =
               "    with _ -> print 99" ]
             "1\n99\n"
 
+        // MapExt/HashMap/HashSet have no F# counterpart, so the oracle cannot
+        // judge them — these pin the combinators and delta operations against
+        // hand-computed answers instead.
+        expects "Map: MapExt combinators and deltas"
+            [ "let m = Map.ofList [ (1, \"a\"); (2, \"b\"); (3, \"c\") ]"
+              "let n = Map.ofList [ (2, \"B\"); (4, \"d\") ]"
+              "let sm (t : Map<int, string>) = String.concat \",\" (List.map (fun (k, v) -> string k + v) (Map.toList t))"
+              "let go ="
+              "    print (sm (Map.unionWith (fun k a b -> a + b) m n))"
+              "    print (sm (Map.union m n))"
+              "    print (sm (Map.difference m n))"
+              "    print (sm (Map.choose (fun k v -> if k > 1 then Some v else None) m))"
+              "    print (sm (Map.alter 2 (fun o -> None) m))"
+              "    print (sm (Map.choose2 (fun k x y -> match x, y with Some a, Some b -> Some (a + b) | Some a, None -> Some a | None, Some b -> Some b | _ -> None) m n))"
+              "    let d = Map.computeDelta m n"
+              "    print (String.concat \",\" (List.map (fun (k, op) -> string k + (match op with SetOp v -> \":=\" + v | RemoveOp -> \":del\")) (Map.toList d)))"
+              "    let st, eff = Map.applyDelta m d"
+              "    print (sm st + \" | \" + string (Map.count eff))"
+              "    let lo, at, hi = Map.split 2 m"
+              "    print (sm lo + \" | \" + (match at with Some v -> v | None -> \"-\") + \" | \" + sm hi)"
+              "    print (sm (Map.range 2 3 m))" ]
+            "1a,2bB,3c,4d\n1a,2B,3c,4d\n1a,3c\n2b,3c\n1a,3c\n1a,2bB,3c,4d\n1:del,2:=B,3:del,4:=d\n2B,4d | 4\n1a | b | 3c\n2b,3c\n"
+
+        expects "HashMap and HashSet: combinators, deltas, O(1) keySet"
+            [ "let h = HashMap.ofList [ (1, \"a\"); (2, \"b\"); (3, \"c\") ]"
+              "let g = HashMap.ofList [ (2, \"B\"); (4, \"d\") ]"
+              "let sh (t : HashNode<int, string>) = String.concat \",\" (List.map (fun (k, v) -> string k + v) (List.sortBy fst (HashMap.toList t)))"
+              "let sl (x : HashNode<int, int>) = String.concat \",\" (List.map (fun v -> string v) (List.sort (HashSet.toList x)))"
+              "let go ="
+              "    print (sh (HashMap.union h g))"
+              "    print (sh (HashMap.unionWith (fun k a b -> a + b) h g))"
+              "    print (sh (HashMap.difference h g))"
+              "    print (sh (HashMap.choose (fun k v -> if k > 1 then Some v else None) h))"
+              "    let d = HashMap.computeDelta h g"
+              "    print (String.concat \",\" (List.map (fun (k, op) -> string k + (match op with SetOp v -> \":=\" + v | RemoveOp -> \":del\")) (List.sortBy fst (HashMap.toList d))))"
+              "    let st, eff = HashMap.applyDelta h d"
+              "    print (sh st + \" | \" + string (HashMap.count eff))"
+              "    print (sl (HashMap.keySet h))"
+              "    let s1 = HashSet.ofList [ 1; 2; 3 ]"
+              "    let s2 = HashSet.ofList [ 3; 4 ]"
+              "    print (sl (HashSet.union s1 s2) + \" | \" + sl (HashSet.intersect s1 s2) + \" | \" + sl (HashSet.difference s1 s2))"
+              "    print (string (HashSet.isSubset (HashSet.ofList [1;2]) s1) + string (HashSet.isProperSubset s1 s1))"
+              "    let sd = HashSet.computeDelta s1 s2"
+              "    print (String.concat \",\" (List.map (fun (k, op) -> string k + (match op with SetOp _ -> \":+\" | RemoveOp -> \":-\")) (List.sortBy fst (HashMap.toList sd))))" ]
+            "1a,2B,3c,4d\n1a,2bB,3c,4d\n1a,3c\n2b,3c\n1:del,2:=B,3:del,4:=d\n2B,4d | 4\n1,2,3\n1,2,3,4 | 3 | 1,2\nTrueFalse\n1:-,2:-,4:+\n"
+
         expects "arrays: zeroCreate, index get/set, Length"
             [ "let go ="
               "    let a = Array.zeroCreate 3"

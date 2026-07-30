@@ -2981,6 +2981,9 @@ module Map =
     let toList (t : Map<'k, 'v>) : ('k * 'v) list = foldBack (fun k v acc -> (k, v) :: acc) t []
     let toSeq (t : Map<'k, 'v>) : ('k * 'v) seq = List.toSeq (toList t)
     let keys (t : Map<'k, 'v>) : 'k list = foldBack (fun k v acc -> k :: acc) t []
+    /// O(1) key view, the counterpart of HashMap.keySet: the SAME tree with
+    /// its values left unread. `keys` above stays O(n) — it builds a list.
+    let keySet (t : Map<'k, 'v>) : Map<'k, int> = unbox (box t)
     let values (t : Map<'k, 'v>) : 'v list = foldBack (fun k v acc -> v :: acc) t []
 
     let rec private ofListInto (acc : Map<'k, 'v>) (xs : ('k * 'v) list) : Map<'k, 'v> when Ordered<'k> =
@@ -3166,3 +3169,347 @@ module Map =
         filter (fun kk vv -> kk <= k) t
     let range (lo : 'k) (hi : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
         filter (fun kk vv -> kk >= lo && kk <= hi) t
+
+/// HashMap: the patricia-trie port (big-endian Okasaki-Gill over hashes with
+/// collision chains and cached counts). The types live at the top level so
+/// HashSet can share them.
+type HashLinked<'k, 'v> =
+    | HLNil
+    | HLCons of 'k * 'v * HashLinked<'k, 'v>
+
+type HashNode<'k, 'v> =
+    | HNEmpty
+    | HNLeaf of int * 'k * 'v * HashLinked<'k, 'v>
+    | HNInner of int * int * HashNode<'k, 'v> * HashNode<'k, 'v> * int
+
+module HashMap =
+    let maskHash (h : int) = h &&& 1073741823
+
+    let highestBitMask (x0 : int) =
+        let mutable x = x0
+        x <- x ||| (x >>> 1)
+        x <- x ||| (x >>> 2)
+        x <- x ||| (x >>> 4)
+        x <- x ||| (x >>> 8)
+        x <- x ||| (x >>> 16)
+        x ^^^ (x >>> 1)
+
+    let getPrefix (k : int) (m : int) = k &&& ~~~((m <<< 1) - 1)
+    let zeroBit (k : int) (m : int) = if (k &&& m) <> 0 then 1 else 0
+    let matchPrefixAndGetBit (h : int) (prefix : int) (m : int) =
+        if getPrefix h m = prefix then zeroBit h m else 2
+    let getMask (p0 : int) (p1 : int) = highestBitMask (p0 ^^^ p1)
+
+
+    let rec linkedCount (n : HashLinked<'k, 'v>) =
+        match n with
+        | HLNil -> 0
+        | HLCons (k, v, t) -> 1 + linkedCount t
+
+    let rec linkedAdd (key : 'k) (value : 'v) (n : HashLinked<'k, 'v>) =
+        match n with
+        | HLNil -> HLCons (key, value, HLNil)
+        | HLCons (k, v, t) ->
+            if k = key then HLCons (key, value, t)
+            else HLCons (k, v, linkedAdd key value t)
+
+    let rec linkedTryFind (key : 'k) (n : HashLinked<'k, 'v>) =
+        match n with
+        | HLNil -> None
+        | HLCons (k, v, t) ->
+            if k = key then Some v
+            else linkedTryFind key t
+
+    let rec linkedRemove (key : 'k) (n : HashLinked<'k, 'v>) =
+        match n with
+        | HLNil -> HLNil
+        | HLCons (k, v, t) ->
+            if k = key then t
+            else HLCons (k, v, linkedRemove key t)
+
+    let nodeCount (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> 0
+        | HNLeaf (h, k, v, rest) -> 1 + linkedCount rest
+        | HNInner (p, m, l, r, c) -> c
+
+    let newInner (prefix : int) (mask : int) (l : HashNode<'k, 'v>) (r : HashNode<'k, 'v>) =
+        match l, r with
+        | HNEmpty, x -> x
+        | x, HNEmpty -> x
+        | _ -> HNInner (prefix, mask, l, r, nodeCount l + nodeCount r)
+
+    let join (p0 : int) (t0 : HashNode<'k, 'v>) (p1 : int) (t1 : HashNode<'k, 'v>) =
+        let mask = getMask p0 p1
+        let prefix = getPrefix p0 mask
+        if zeroBit p0 mask = 0 then HNInner (prefix, mask, t0, t1, nodeCount t0 + nodeCount t1)
+        else HNInner (prefix, mask, t1, t0, nodeCount t0 + nodeCount t1)
+
+    let rec addNode (h : int) (key : 'k) (value : 'v) (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> HNLeaf (h, key, value, HLNil)
+        | HNLeaf (lh, lk, lv, rest) ->
+            if lh = h then
+                if lk = key then HNLeaf (lh, key, value, rest)
+                else
+                    match linkedTryFind key rest with
+                    | Some _ -> HNLeaf (lh, lk, lv, linkedAdd key value rest)
+                    | None -> HNLeaf (lh, lk, lv, linkedAdd key value rest)
+            else join h (HNLeaf (h, key, value, HLNil)) lh n
+        | HNInner (p, m, l, r, c) ->
+            let b = matchPrefixAndGetBit h p m
+            if b = 0 then newInner p m (addNode h key value l) r
+            elif b = 1 then newInner p m l (addNode h key value r)
+            else join h (HNLeaf (h, key, value, HLNil)) p n
+
+    let rec tryFindNode (h : int) (key : 'k) (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> None
+        | HNLeaf (lh, lk, lv, rest) ->
+            if lh = h then
+                if lk = key then Some lv
+                else linkedTryFind key rest
+            else None
+        | HNInner (p, m, l, r, c) ->
+            let b = matchPrefixAndGetBit h p m
+            if b = 0 then tryFindNode h key l
+            elif b = 1 then tryFindNode h key r
+            else None
+
+    let rec removeNode (h : int) (key : 'k) (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> HNEmpty
+        | HNLeaf (lh, lk, lv, rest) ->
+            if lh = h then
+                if lk = key then
+                    match rest with
+                    | HLNil -> HNEmpty
+                    | HLCons (rk, rv, rt) -> HNLeaf (lh, rk, rv, rt)
+                else HNLeaf (lh, lk, lv, linkedRemove key rest)
+            else n
+        | HNInner (p, m, l, r, c) ->
+            let b = matchPrefixAndGetBit h p m
+            if b = 0 then newInner p m (removeNode h key l) r
+            elif b = 1 then newInner p m l (removeNode h key r)
+            else n
+
+    let add (key : 'k) (value : 'v) (n : HashNode<'k, 'v>) = addNode (maskHash (hash key)) key value n
+    let tryFind (key : 'k) (n : HashNode<'k, 'v>) = tryFindNode (maskHash (hash key)) key n
+    let remove (key : 'k) (n : HashNode<'k, 'v>) = removeNode (maskHash (hash key)) key n
+
+
+    let empty = HNEmpty
+    let count (n : HashNode<'k, 'v>) = nodeCount n
+    let containsKey (key : 'k) (n : HashNode<'k, 'v>) =
+        match tryFind key n with
+        | Some v -> true
+        | None -> false
+    let findOr (d : 'v) (key : 'k) (n : HashNode<'k, 'v>) =
+        match tryFind key n with
+        | Some v -> v
+        | None -> d
+    let rec foldLinked (f : 's -> 'k -> 'v -> 's) (s : 's) (l : HashLinked<'k, 'v>) =
+        match l with
+        | HLNil -> s
+        | HLCons (k, v, t) -> foldLinked f (f s k v) t
+    let rec fold (f : 's -> 'k -> 'v -> 's) (s : 's) (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> s
+        | HNLeaf (h, k, v, rest) -> foldLinked f (f s k v) rest
+        | HNInner (p, m, l, r, c) -> fold f (fold f s l) r
+    let toList (n : HashNode<'k, 'v>) = fold (fun acc k v -> (k, v) :: acc) [] n
+    let rec ofListInto (acc : HashNode<'k, 'v>) (xs : ('k * 'v) list) =
+        match xs with
+        | (k, v) :: t -> ofListInto (add k v acc) t
+        | [] -> acc
+    let ofList (items : ('k * 'v) list) = ofListInto HNEmpty items
+
+
+    let emptyH = HNEmpty
+    let isEmpty (n : HashNode<'k, 'v>) =
+        match n with
+        | HNEmpty -> true
+        | HNLeaf (h, k, v, rest) -> false
+        | HNInner (p, m, l, r, c) -> false
+    let keys (n : HashNode<'k, 'v>) = fold (fun acc k v -> k :: acc) [] n
+    let values (n : HashNode<'k, 'v>) = fold (fun acc k v -> v :: acc) [] n
+    let alter (key : 'k) (f : Option<'v> -> Option<'v>) (n : HashNode<'k, 'v>) =
+        match f (tryFind key n) with
+        | Some nv -> add key nv n
+        | None -> remove key n
+    let change (key : 'k) (f : Option<'v> -> Option<'v>) (n : HashNode<'k, 'v>) = alter key f n
+    let update (key : 'k) (f : 'v -> 'v) (dflt : 'v) (n : HashNode<'k, 'v>) =
+        match tryFind key n with
+        | Some v -> add key (f v) n
+        | None -> add key dflt n
+    let map (f : 'k -> 'v -> 'w) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v -> add k (f k v) acc) HNEmpty n
+    let mapValues (f : 'v -> 'w) (n : HashNode<'k, 'v>) = map (fun k v -> f v) n
+    let filter (p : 'k -> 'v -> bool) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v -> if p k v then add k v acc else acc) HNEmpty n
+    let choose (f : 'k -> 'v -> Option<'w>) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v ->
+                match f k v with
+                | Some w -> add k w acc
+                | None -> acc) HNEmpty n
+    let exists (p : 'k -> 'v -> bool) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v -> if acc then true else p k v) false n
+    let forall (p : 'k -> 'v -> bool) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v -> if acc then p k v else false) true n
+    let unionWith (resolve : 'k -> 'v -> 'v -> 'v) (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) =
+        fold (fun acc k v ->
+                match tryFind k acc with
+                | Some old -> add k (resolve k old v) acc
+                | None -> add k v acc) a b
+    let union (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) = unionWith (fun k x y -> y) a b
+    let intersectWith (resolve : 'k -> 'v -> 'v -> 'v) (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) =
+        fold (fun acc k v ->
+                match tryFind k b with
+                | Some other -> add k (resolve k v other) acc
+                | None -> acc) HNEmpty a
+    let intersect (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) = intersectWith (fun k x y -> x) a b
+    let difference (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) =
+        fold (fun acc k v -> if containsKey k b then acc else add k v acc) HNEmpty a
+    let partition (p : 'k -> 'v -> bool) (n : HashNode<'k, 'v>) =
+        fold (fun acc k v ->
+                match acc with
+                | (yes, no) -> if p k v then (add k v yes, no) else (yes, add k v no))
+             (HNEmpty, HNEmpty) n
+    let choose2 (f : 'k -> Option<'v> -> Option<'w> -> Option<'x>) (a : HashNode<'k, 'v>) (b : HashNode<'k, 'w>) =
+        let withA =
+            fold (fun acc k v ->
+                    match f k (Some v) (tryFind k b) with
+                    | Some x -> add k x acc
+                    | None -> acc) HNEmpty a
+        fold (fun acc k w ->
+                if containsKey k a then acc
+                else
+                    match f k None (Some w) with
+                    | Some x -> add k x acc
+                    | None -> acc) withA b
+    let map2 (f : 'k -> Option<'v> -> Option<'w> -> 'x) (a : HashNode<'k, 'v>) (b : HashNode<'k, 'w>) =
+        choose2 (fun k x y -> Some (f k x y)) a b
+    // ---- the rest of the surface -------------------------------------------
+    let single (k : 'k) (v : 'v) : HashNode<'k, 'v> = add k v HNEmpty
+    let iter (f : 'k -> 'v -> unit) (n : HashNode<'k, 'v>) : unit =
+        fold (fun acc k v -> f k v) () n
+    let toArray (n : HashNode<'k, 'v>) : ('k * 'v)[] = Array.ofList (toList n)
+    let ofArray (xs : ('k * 'v)[]) : HashNode<'k, 'v> = ofList (Array.toList xs)
+    let toSeq (n : HashNode<'k, 'v>) : seq<'k * 'v> = List.toSeq (toList n)
+    let ofSeq (xs : seq<'k * 'v>) : HashNode<'k, 'v> = ofList (Seq.toList xs)
+    let find (k : 'k) (n : HashNode<'k, 'v>) : 'v =
+        match tryFind k n with
+        | Some v -> v
+        | None -> failwith "The given key was not present in the collection."
+    let tryRemove (k : 'k) (n : HashNode<'k, 'v>) : ('v * HashNode<'k, 'v>) option =
+        match tryFind k n with
+        | Some v -> Some (v, remove k n)
+        | None -> None
+    let unionMany (ns : HashNode<'k, 'v> list) : HashNode<'k, 'v> =
+        List.fold (fun acc n -> union acc n) HNEmpty ns
+    let tryPick (f : 'k -> 'v -> 'r option) (n : HashNode<'k, 'v>) : 'r option =
+        fold (fun acc k v -> match acc with Some _ -> acc | None -> f k v) None n
+    let pick (f : 'k -> 'v -> 'r option) (n : HashNode<'k, 'v>) : 'r =
+        match tryPick f n with
+        | Some r -> r
+        | None -> failwith "An index satisfying the predicate was not found in the collection."
+    /// O(1): the key set is THIS TRIE with its values left unread. Values
+    /// share one runtime representation, so no node is rebuilt — contrast
+    /// `keys`, which is O(n) because it materializes a list.
+    let keySet (n : HashNode<'k, 'v>) : HashNode<'k, int> = unbox (box n)
+    /// the delta carrying `a` to `b`
+    let computeDelta (a : HashNode<'k, 'v>) (b : HashNode<'k, 'v>) : HashNode<'k, ElementOperation<'v>> =
+        choose2 (fun k x y ->
+                    match x, y with
+                    | Some ov, Some nv -> if ov = nv then None else Some (SetOp nv)
+                    | None, Some nv -> Some (SetOp nv)
+                    | Some _, None -> Some RemoveOp
+                    | None, None -> None) a b
+    /// apply a delta; returns the new state and the delta that took effect
+    let applyDelta (n : HashNode<'k, 'v>) (delta : HashNode<'k, ElementOperation<'v>>) : HashNode<'k, 'v> * HashNode<'k, ElementOperation<'v>> =
+        let mutable state = n
+        let mutable eff = HNEmpty
+        for k, op in toList delta do
+            match op with
+            | SetOp v ->
+                match tryFind k state with
+                | Some old when old = v -> ()
+                | _ ->
+                    state <- add k v state
+                    eff <- add k (SetOp v) eff
+            | RemoveOp ->
+                if containsKey k state then
+                    state <- remove k state
+                    eff <- add k RemoveOp eff
+        state, eff
+
+/// HashSet IS a HashMap whose values are never read — the same trie, so
+/// HashMap.keySet is a reinterpret rather than a rebuild (see keySet).
+module HashSet =
+    let empty : HashNode<'k, int> = HNEmpty
+    let isEmpty (s : HashNode<'k, int>) : bool = HashMap.isEmpty s
+    let count (s : HashNode<'k, int>) : int = HashMap.count s
+    let add (k : 'k) (s : HashNode<'k, int>) : HashNode<'k, int> = HashMap.add k 0 s
+    let remove (k : 'k) (s : HashNode<'k, int>) : HashNode<'k, int> = HashMap.remove k s
+    let contains (k : 'k) (s : HashNode<'k, int>) : bool = HashMap.containsKey k s
+    let singleton (k : 'k) : HashNode<'k, int> = add k HNEmpty
+    let toList (s : HashNode<'k, int>) : 'k list = HashMap.keys s
+    let ofList (xs : 'k list) : HashNode<'k, int> =
+        List.fold (fun acc x -> add x acc) HNEmpty xs
+    let toArray (s : HashNode<'k, int>) : 'k[] = Array.ofList (toList s)
+    let ofArray (xs : 'k[]) : HashNode<'k, int> = ofList (Array.toList xs)
+    let toSeq (s : HashNode<'k, int>) : seq<'k> = List.toSeq (toList s)
+    let ofSeq (xs : seq<'k>) : HashNode<'k, int> = ofList (Seq.toList xs)
+    let fold (f : 's -> 'k -> 's) (st : 's) (s : HashNode<'k, int>) : 's =
+        HashMap.fold (fun acc k v -> f acc k) st s
+    let iter (f : 'k -> unit) (s : HashNode<'k, int>) : unit =
+        HashMap.fold (fun acc k v -> f k) () s
+    let exists (p : 'k -> bool) (s : HashNode<'k, int>) : bool =
+        HashMap.exists (fun k v -> p k) s
+    let forall (p : 'k -> bool) (s : HashNode<'k, int>) : bool =
+        HashMap.forall (fun k v -> p k) s
+    let filter (p : 'k -> bool) (s : HashNode<'k, int>) : HashNode<'k, int> =
+        HashMap.filter (fun k v -> p k) s
+    let union (a : HashNode<'k, int>) (b : HashNode<'k, int>) : HashNode<'k, int> =
+        HashMap.union a b
+    let unionMany (ss : HashNode<'k, int> list) : HashNode<'k, int> =
+        List.fold (fun acc s -> union acc s) HNEmpty ss
+    let intersect (a : HashNode<'k, int>) (b : HashNode<'k, int>) : HashNode<'k, int> =
+        HashMap.intersect a b
+    let difference (a : HashNode<'k, int>) (b : HashNode<'k, int>) : HashNode<'k, int> =
+        HashMap.difference a b
+    let isSubset (a : HashNode<'k, int>) (b : HashNode<'k, int>) : bool =
+        forall (fun k -> contains k b) a
+    let isSuperset (a : HashNode<'k, int>) (b : HashNode<'k, int>) : bool = isSubset b a
+    let isProperSubset (a : HashNode<'k, int>) (b : HashNode<'k, int>) : bool =
+        isSubset a b && count a < count b
+    let isProperSuperset (a : HashNode<'k, int>) (b : HashNode<'k, int>) : bool =
+        isSubset b a && count a > count b
+    let map (f : 'k -> 'j) (s : HashNode<'k, int>) : HashNode<'j, int> =
+        fold (fun acc k -> add (f k) acc) HNEmpty s
+    let choose (f : 'k -> 'j option) (s : HashNode<'k, int>) : HashNode<'j, int> =
+        fold (fun acc k -> match f k with Some j -> add j acc | None -> acc) HNEmpty s
+    let partition (p : 'k -> bool) (s : HashNode<'k, int>) : HashNode<'k, int> * HashNode<'k, int> =
+        filter p s, filter (fun k -> not (p k)) s
+    /// set deltas: SetOp means "present", RemoveOp means "gone"
+    let computeDelta (a : HashNode<'k, int>) (b : HashNode<'k, int>) : HashNode<'k, ElementOperation<int>> =
+        HashMap.choose2 (fun k x y ->
+                            match x, y with
+                            | Some _, Some _ -> None
+                            | None, Some _ -> Some (SetOp 0)
+                            | Some _, None -> Some RemoveOp
+                            | None, None -> None) a b
+    let applyDelta (s : HashNode<'k, int>) (delta : HashNode<'k, ElementOperation<int>>) : HashNode<'k, int> * HashNode<'k, ElementOperation<int>> =
+        let mutable state = s
+        let mutable eff = HNEmpty
+        for k, op in HashMap.toList delta do
+            match op with
+            | SetOp v ->
+                if not (contains k state) then
+                    state <- add k state
+                    eff <- HashMap.add k (SetOp 0) eff
+            | RemoveOp ->
+                if contains k state then
+                    state <- remove k state
+                    eff <- HashMap.add k RemoveOp eff
+        state, eff
