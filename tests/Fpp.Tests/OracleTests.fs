@@ -1286,6 +1286,9 @@ let oracleTests =
             "    print (string (Double.IsNaN nan) + string (Double.IsNaN 1.0))"
             "    print (string (Double.IsInfinity infinity) + string (Double.IsFinite 1.0))"
             "    print (string Int32.MaxValue + \" \" + string Int32.MinValue)"
+            "    print (string (Double.MaxValue = 1.7976931348623157e308))"
+            "    print (string (Double.MinValue = -1.7976931348623157e308))"
+            "    print (string (Double.Epsilon = 5e-324))"
         ]
         oracle "List: the zip3/transpose/scanBack family" [
             "let si (ys : int list) = String.concat \",\" (List.map (fun v -> string v) ys)"

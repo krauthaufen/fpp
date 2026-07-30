@@ -706,7 +706,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                     // and wrapping gives exactly the bit pattern the negation
                     // then turns into the intended value. An unhandled
                     // OverflowException here crashed the whole compile.
-                    int (int64 (parseInt64In 10 digits) &&& 0xFFFFFFFFL |> int32)
+                    // The SIGN is handled here, not by the parser: the two
+                    // hosts' parseInt64In disagree about a leading '-' (the
+                    // bootstrap one reads digits only), and that silently
+                    // turned every `-1` into `1` in the self-hosted stage.
+                    // int-of-int64 truncates, so an out-of-range magnitude
+                    // wraps to the bit pattern the negation then completes.
+                    let neg = digits.StartsWith "-"
+                    let mag = if neg then digits.Substring 1 else digits
+                    let v = int (parseInt64In 10 (if mag = "" then "0" else mag))
+                    if neg then 0 - v else v
         ic f v
         callf f "$ofi"
     | ELit (LInt s) ->

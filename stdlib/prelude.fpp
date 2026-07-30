@@ -697,9 +697,19 @@ module Double =
     let IsPositiveInfinity (x : float) : bool = x = infinity
     let IsNegativeInfinity (x : float) : bool = x = 0.0 - infinity
     let IsFinite (x : float) : bool = not (IsNaN x) && not (IsInfinity x)
-    let MaxValue : float = 1.7976931348623157e308
-    let MinValue : float = -1.7976931348623157e308
-    let Epsilon : float = 5e-324
+    // COMPUTED, not written as decimal literals: the two hosts parse floats
+    // with different code (.NET's correctly-rounded Double.Parse vs the
+    // bootstrap prelude's own parseFloat), and an extreme literal lands on
+    // different bits in the two stages — which the byte fixpoint catches.
+    // Every step below is exact in IEEE double.
+    let MaxValue : float = (2.0 - pown 2.0 (0 - 52)) * pown 2.0 1023
+    let MinValue : float = 0.0 - MaxValue
+    /// the smallest positive denormal, 2^-1074
+    let Epsilon : float =
+        let mutable e = 1.0
+        for _ in 1 .. 1074 do
+            e <- e / 2.0
+        e
 
 module Int32 =
     let MaxValue : int = 2147483647
