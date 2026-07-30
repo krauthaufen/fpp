@@ -2810,9 +2810,23 @@ prelude type with `Code.text` / `Code.ofText`. The interim representation is the
 code's SOURCE; carrying the AST is the next step and does not change how a
 quotation is written.
 
+SOUNDNESS FIX: a splice is PARENTHESISED when embedded. Composing code is not
+composing text — without it `<@ %b * 3 @>` over `b = <@ %a + 2 @>` rendered
+`1 + 2 * 3`, which MEANS `1 + (2*3)`, silently changing what the composition
+denotes. Now `((1 )+ 2 )* 3`. Pinned by the battery program.
+
 STILL TO DO, in order:
 1. **Code carries an AST**, not source text, so a plugin can match on and
-   rewrite quoted code rather than re-parse it.
+   rewrite quoted code rather than re-parse it. This is the remaining
+   COMPLETENESS item, and it also retires the last soundness worry: with an AST
+   there is no rendering step in the middle of composition at all, so
+   precedence, capture and formatting stop being questions about text. The
+   shape: a `Code` union over the quotable subset (literals, names, application,
+   binary operators, let-sequences, if, splice holes), lowering that maps each
+   expression node kind to a constructor, `Code.text` as a printer over it, and
+   a quotation of anything OUTSIDE the subset rejected at compile time rather
+   than falling back to text — a loud boundary beats a silent mixed
+   representation.
 2. DONE — a quoted body now gets its OWN block context (`parseBlock`), so a
    multi-line `let` sequence inside a quotation parses, checks and hovers like
    any other block.
