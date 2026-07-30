@@ -199,6 +199,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
         || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
+        || k = SplicePat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
@@ -1127,6 +1128,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | [] | [ _ ] -> ECtor (name, mono (TCon ("QPat", [])), args)
                         | many -> ECtor (name, mono (TCon ("QPat", [])), [ ETuple many ])
                     match m.NodeKind with
+                    // `%p` — the spliced value IS the pattern
+                    | SplicePat ->
+                        (match nodesOf m |> List.tryFind (fun x -> x.NodeKind = IdentExpr) with
+                         | Some idn -> lowerExpr (GNode idn)
+                         | None -> note (offsetOf m) "empty pattern splice")
                     | WildcardPat -> pctor "QWild" []
                     | ParenPat ->
                         (match nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) with

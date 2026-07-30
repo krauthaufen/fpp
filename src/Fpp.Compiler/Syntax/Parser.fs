@@ -396,11 +396,17 @@ let parse (src : string) : ParseResult =
 
     and canStartAtomPat () =
         s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket
+        // `| %p ->` — a spliced PATTERN, inside a quotation only
+        || isSpliceHere ()
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen) || s.IsOp ":?"
         || (s.IsOp "-" && (let n = s.Peek 1 in n.Kind = IntLit || n.Kind = FloatLit))
 
     and parseAtomPat (ctx : int) : Green =
-        if s.IsOp ":?" then
+        if isSpliceHere () then
+            let pct = s.Bump ()
+            let name = s.Bump ()
+            Green.node SplicePat [ pct; Green.node IdentExpr [ name ] ]
+        elif s.IsOp ":?" then
             // type-test pattern: `| :? HashSet<'K> as o ->`
             let op = s.Bump ()
             // the tested type may be a generic application: `:? HashSet<'K>`

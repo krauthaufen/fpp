@@ -58,6 +58,8 @@ type NodeKind =
     | WhileExpr
     | TryExpr
     // patterns
+    /// `%p` in PATTERN position inside a quotation
+    | SplicePat
     | WildcardPat
     | IdentPat
     | LiteralPat

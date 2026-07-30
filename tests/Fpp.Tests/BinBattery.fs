@@ -405,6 +405,15 @@ let binBattery =
         // generator needs to emit one declaration per field
         // the shape a deriving plugin emits: a MEMBER whose signature carries a
         // spliced type, and a record TYPE with a spliced field type
+        // splices reach every position: expression, TYPE, and PATTERN
+        expects "patterns can be spliced into a quoted match"
+            [ "let p : QPat = QCase (\"Some\", [ QVar \"v\" ])"
+              "let q : Code<int> = <@ match Some 1 with"
+              "                       | %p -> 1"
+              "                       | None -> 0 @>"
+              "let go = print (Code.render q.Raw)" ]
+            "match (Some 1) with\n    | Some v -> 1\n    | None -> 0\n"
+
         expects "members and record types can be quoted, with spliced types"
             [ "let ty : QTy = QTyName \"int\""
               "let t : QTy = QTyName \"string\""

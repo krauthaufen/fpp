@@ -407,6 +407,17 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                       | _ -> ())
                      List.fold (bindPat kind) env args
                  | [] -> env)
+            | SplicePat ->
+                // `%p` binds nothing here: the NAME is an ordinary value use
+                n.Children
+                |> List.iter (fun c ->
+                    match c with
+                    | GNode inner when inner.NodeKind = IdentExpr ->
+                        (match inner.Children |> List.choose (fun x -> match x with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                         | [ t ] -> (match lookupValue env t.Text with Some d -> record t d | None -> ())
+                         | _ -> ())
+                    | _ -> ())
+                env
             | k when isTypeKind k ->
                 walkType env g
                 env
