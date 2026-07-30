@@ -2854,9 +2854,32 @@ in that state and the wasm compiler died on every compile — the process work n
 lives in its own member, off the common path. Anything unlowerable belongs in a
 function that the self-hosted build never calls.
 
-STILL OPEN: quoting DECLARATIONS (`<@ type T = ... @>`, `<@ let f x = ... @>`)
-rather than expressions; splicing at type and pattern positions; and letting an
-F++ plugin return a `CodeTree` directly instead of printed source.
+DECLARATIONS CAN BE QUOTED: `<@ let f (x : int) : int = x + 1 @>` is a
+`Code<unit>` whose tree is `CDLet (name, params-with-types, return-type, body)`
+— what a generator actually wants to emit.
+
+TYPES CAN BE SPLICED: `<@ let f (x : %t) : %r = ... @>` with `t : QTy` puts the
+spliced type into the signature. `QTy` is `QTyName` / `QTyApp`, so a generator
+loops over a record's fields and emits one declaration per field carrying that
+field's own type. Three pieces were needed and each is easy to miss: the parser
+must accept `%t` in type position (canStartTypeAtom), Lower's `isTypeKind` must
+include `SpliceType` or the annotation is silently dropped, and the RESOLVER
+must walk into it — the spliced name is a VALUE use inside a type node, so the
+splice carries an `IdentExpr` and Resolve binds it with `lookupValue`.
+
+`Code.render` turns a tree back into source, and `Code.emit` prints it: the ONE
+place where code becomes text, at the boundary where a generator writes a file.
+Composition happens on trees. Hygienic names use `_q<offset>` rather than `#`,
+because rendered code has to parse back.
+
+An F++ plugin therefore builds what it emits as TREES — `CDLet`, `CBin`,
+`CField`, quotations with spliced types — and calls `Code.emit`. The test plugin
+does exactly that: no source strings anywhere in it.
+
+STILL OPEN: quoting TYPE declarations (`<@ type T = { ... } @>`) and members
+(`<@ member x.F () = ... @>`); splicing at pattern position; and handing a
+`CodeTree` across the plugin process boundary as data rather than as rendered
+source.
 
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
