@@ -567,7 +567,10 @@ let parse (src : string) : ParseResult =
             // makes it resolve, type check and hover like real code
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())
-            vecAdd acc (parseExpr ctx)
+            // the body gets its OWN block context, starting at its column, so a
+            // quoted `let` sequence spanning lines parses like any other block
+            // instead of being cut off at the enclosing expression's context
+            vecAdd acc (parseBlock ctx)
             if s.Is Operator && s.Cur.Text = "@>" then vecAdd acc (s.Bump ())
             else s.Diag "expected '@>' to close the quotation"
             Green.node QuoteExpr (vecToList acc)

@@ -84,6 +84,17 @@ let quotationTests =
             Expect.isGreaterThan (List.length (nodesOf BinaryExpr src)) 0 "with ordinary structure inside"
         }
 
+        test "a quoted block spans lines, like any other block" {
+            // the body gets its own offside context, so a quoted `let`
+            // sequence is real code rather than a one-line special case
+            let src = "module M\nlet q = <@ let x = 1\n           let y = 2\n           x + y @>\n"
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" src
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "a multi-line quoted block checks"
+            Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "let y" + 4)) (Some "let `y` : int")
+                "and its inner bindings hover"
+        }
+
         test "an unclosed quotation is an error, not silence" {
             let r = parseRoot "let q = <@ 1 + 2\n"
             Expect.isNonEmpty r.Diagnostics "missing '@>' is reported"
