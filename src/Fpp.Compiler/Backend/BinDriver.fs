@@ -843,6 +843,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                         callf f "$patchmark"
                 cur <- groupBody
             | ELet (_, v, _, rhs, body) ->
+                // a binding is a step point for a debugger
+                markSrc f v.Path v.Offset
                 let key = (v.Path, v.Offset)
                 let k = kindOfLite st rhs
                 if (dictTryFind st.CellVars key).IsNone
@@ -2791,7 +2793,11 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
         true
 
 /// the whole program: globals + per-decl init functions + _start
-let emitBinary (decls : Decl list) : byte[] * string list * string list =
+/// Emit, and report where each piece of code came from. `mapUrl` is written
+/// into a `sourceMappingURL` custom section when non-empty — a debugger reads
+/// it to find the map, and it changes the bytes, so it stays opt-in.
+let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
+        : byte[] * string list * string list * (int * string * int) list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
@@ -3057,6 +3063,8 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             else ("__desc", "r") :: fs0
         let names = fields |> List.map fst
         dictSet st.FieldsOf rn names
+        // what a debugger and a heap snapshot will call these fields
+        nameFields m ("$r_" + rn) names
         for fn, ty in fields do
             if fn <> "__desc" && fn <> "__idhash" then dictSet st.RecFieldTy (rn, fn) ty
         names |> List.iteri (fun i fn ->
@@ -3254,10 +3262,25 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
-            let names = ps |> List.mapi (fun i _ -> "$a" + string i)
+            // parameters keep the names they were WRITTEN with, so a debugger's
+            // scope view reads `p` rather than `a0`. Uniquified by position,
+            // since two parameters may share a spelling after inlining.
+            let names =
+                let raw =
+                    ps
+                    |> List.mapi (fun i (pv : VarId, _) ->
+                        if pv.Name = "" || pv.Name = "_" then "a" + string i else pv.Name)
+                // a suffix only where two parameters really do share a name
+                // a suffix only where two parameters really do share a name
+                raw
+                |> List.mapi (fun i n ->
+                    if (raw |> List.filter (fun x -> x = n) |> List.length) > 1 then "$" + n + string i
+                    else "$" + n)
             let f = beginFn m names
+            // this function's code starts here, and it came from there
+            markSrc f v.Path v.Offset
             let lv = dictNew<string * int, string> ()
-            List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) ("$a" + string i)) ps
+            List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) (List.item i names)) ps
             let pks, rk =
                 match dictTryFind st.SigKinds (v.Path, v.Offset) with
                 | Some (p, r) -> p, r
@@ -3481,4 +3504,14 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
                 gcT f "struct.new" "$cons"
                 gcT f "struct.new" "$clo"
             endFn f
-    assemble m 17 true, vecToList st.Errors, vecToList st.Warnings
+    let bytes = assembleWith m 17 true mapUrl
+    // positions were recorded relative to the code payload; shift them to
+    // absolute offsets in the file now that assembly has placed it
+    let positions =
+        vecToList m.SrcPos |> List.map (fun (off, path, srcOff) -> lastCodeStart + off, path, srcOff)
+    bytes, vecToList st.Errors, vecToList st.Warnings, positions
+
+/// the plain module: no positions, no source map
+let emitBinary (decls : Decl list) : byte[] * string list * string list =
+    let bytes, errs, warns, _ = emitBinaryWithPositions "" decls
+    bytes, errs, warns

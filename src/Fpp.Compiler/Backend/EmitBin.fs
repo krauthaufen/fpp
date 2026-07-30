@@ -19,7 +19,17 @@ open Fpp.Backend.WasmBinary
 //   validation requires the DataCount section.
 
 type Mod =
-    { TypeIdx : Dict<string, int>
+    { /// (offset into the code payload, source path, source offset) — what a
+      /// source map is made of. Recorded as code is emitted, resolved to
+      /// absolute file offsets once the module is assembled.
+      SrcPos : Vec<int * string * int>
+      /// struct type name -> its field names, in order. Without these a heap
+      /// snapshot shows `field 0`, `field 1`; with them, `X` and `Y`.
+      FieldNames : Vec<string * string list>
+      /// function index -> its locals' names, so a debugger's scope view says
+      /// `x` rather than `var3`
+      LocalNames : Vec<int * (int * string) list>
+      TypeIdx : Dict<string, int>
       TypeBody : Bytes
       mutable TypeCount : int
       ImportBody : Bytes
@@ -49,7 +59,7 @@ type Mod =
       DeclaredOrder : Vec<string> }
 
 let modNew () : Mod =
-    { TypeIdx = dictNew (); TypeBody = bytesNew (); TypeCount = 0
+    { SrcPos = vecNew (); FieldNames = vecNew (); LocalNames = vecNew (); TypeIdx = dictNew (); TypeBody = bytesNew (); TypeCount = 0
       ImportBody = bytesNew (); ImportCount = 0
       FuncIdx = dictNew (); FuncSigs = bytesNew (); FuncCount = 0; ImportedFuncs = 0
       GlobalIdx = dictNew (); GlobalBody = bytesNew (); GlobalCount = 0
@@ -118,6 +128,10 @@ let tyStructSub (m : Mod) (name : string) (base_ : string) (openSub : bool) (fs 
 
 let tyStruct (m : Mod) (name : string) (fs : FieldT list) : unit =
     tyStructSub m name "" false fs
+
+/// name a struct's fields, for the debugger and for heap snapshots
+let nameFields (m : Mod) (tyName : string) (names : string list) : unit =
+    vecAdd m.FieldNames (tyName, names)
 
 /// (type $name (array (mut ty)))
 let tyArray (m : Mod) (name : string) (elem : string) : unit =
@@ -207,6 +221,15 @@ let beginFn (m : Mod) (paramNames : string list) : Fn =
 
 /// a fresh named local of a given valtype name
 let local (f : Fn) (name : string) (ty : string) : unit =
+    // A local must never take a name a PARAMETER already holds: the name is
+    // the key, so rebinding it would silently repoint every read of that
+    // parameter at this slot. (It cost the HashMap tests: a prelude function
+    // with a parameter `h` met an emitter local `$h`.) Emitter-internal names
+    // are free to be reused; parameter names are not.
+    let name =
+        match dictTryFind f.LocalIdx name with
+        | Some i when i < f.NParams -> name + "'"
+        | _ -> name
     if f.Replay >= 0 then
         dictSet f.LocalIdx name (f.NParams + f.Replay)
         f.Replay <- f.Replay + 1
@@ -250,6 +273,12 @@ let localsDone (f : Fn) : unit =
 let endFn (f : Fn) : unit =
     emitByte f.B opEnd
     endPatch f.B f.PatchAt
+    // this function's index, and what its locals are called
+    let idx = f.M.ImportedFuncs + f.M.CodeCount
+    let names =
+        dictPairs f.LocalIdx
+        |> List.map (fun (n, i) -> i, (if n.StartsWith "$" then n.Substring 1 else n))
+    if not (List.isEmpty names) then vecAdd f.M.LocalNames (idx, names)
     f.M.CodeCount <- f.M.CodeCount + 1
 
 // ---- instructions ----------------------------------------------------------
@@ -471,9 +500,17 @@ let dataSeg (m : Mod) (name : string) (bytes : byte[]) : unit =
     emitByte m.DataBody 1
     emitVec m.DataBody bytes
 
+/// Note that the code being emitted right here comes from `path` at `off`.
+/// Called at the start of a function and at each statement, which is the
+/// granularity a debugger steps at.
+let markSrc (f : Fn) (path : string) (off : int) : unit =
+    if path <> "" && off >= 0 then vecAdd f.M.SrcPos (f.B.Count, path, off)
+
 // ---- final assembly --------------------------------------------------------
 
-let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
+let mutable lastCodeStart = 0
+
+let assembleWith (m : Mod) (memPages : int) (hasTag : bool) (mapUrl : string) : byte[] =
     let out = bytesNew ()
     for v in [ 0x00; 0x61; 0x73; 0x6D; 0x01; 0x00; 0x00; 0x00 ] do emitByte out v
     emitSection out 1 (fun b ->
@@ -535,11 +572,21 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
         emitSection out 12 (fun b -> emitU32 b m.DataCount)
     emitSection out 10 (fun b ->
         emitU32 b m.CodeCount
+        // where the code payload starts in the FILE: a source map's columns are
+        // absolute byte offsets, so every recorded position shifts by this
+        lastCodeStart <- b.Count
         emitBytes b (bytesToArray m.CodeBody))
     if m.DataCount > 0 then
         emitSection out 11 (fun b ->
             emitU32 b m.DataCount
             emitBytes b (bytesToArray m.DataBody))
+    // sourceMappingURL (custom, id 0): what makes a browser debugger show the
+    // .fpp files instead of wasm. Only when asked for — it changes the bytes,
+    // and the byte fixpoint compares them.
+    if mapUrl <> "" then
+        emitSection out 0 (fun b ->
+            emitVec b (stringBytes "sourceMappingURL")
+            emitVec b (stringBytes mapUrl))
     // name section (custom, id 0): function names, so a trap backtrace or a
     // fixpoint divergence is diagnosed by NAME rather than raw byte offset
     emitSection out 0 (fun b ->
@@ -569,7 +616,39 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] =
             emitVec tsub (stringBytes n)
         emitByte b 4
         emitU32 b tsub.Count
-        emitBytes b (bytesToArray tsub))
+        emitBytes b (bytesToArray tsub)
+        // local names (subsection 2): a debugger's scope view reads these
+        let locs = vecToList m.LocalNames |> List.filter (fun (_, ns) -> not (List.isEmpty ns))
+        if not (List.isEmpty locs) then
+            let lsub = bytesNew ()
+            emitU32 lsub (List.length locs)
+            for fi, ns in locs do
+                emitU32 lsub fi
+                emitU32 lsub (List.length ns)
+                for li, n in ns do
+                    emitU32 lsub li
+                    emitVec lsub (stringBytes n)
+            emitByte b 2
+            emitU32 b lsub.Count
+            emitBytes b (bytesToArray lsub)
+        // field names (subsection 10): a heap snapshot shows `X` instead of
+        // `field 0`, which is the difference between reading a snapshot and
+        // guessing at it
+        let flds =
+            vecToList m.FieldNames
+            |> List.filter (fun (t, ns) -> tyIdx m t >= 0 && not (List.isEmpty ns))
+        if not (List.isEmpty flds) then
+            let fsub = bytesNew ()
+            emitU32 fsub (List.length flds)
+            for t, ns in flds do
+                emitU32 fsub (tyIdx m t)
+                emitU32 fsub (List.length ns)
+                for i, n in List.indexed ns do
+                    emitU32 fsub i
+                    emitVec fsub (stringBytes n)
+            emitByte b 10
+            emitU32 b fsub.Count
+            emitBytes b (bytesToArray fsub))
     bytesToArray out
 
 // ---- the runtime, transliterated ------------------------------------------
@@ -4555,3 +4634,6 @@ let rtCore4 (m : Mod) : unit =
     ic f 63
     callf f "$putc"
     endFn f
+
+/// the plain module: no source map
+let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] = assembleWith m memPages hasTag ""

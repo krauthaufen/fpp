@@ -23,6 +23,7 @@
     <Compile Include="ClassTests.fs" />
     <Compile Include="ProjectTests2.fs" />
     <Compile Include="PluginTests.fs" />
+    <Compile Include="SourceMapTests.fs" />
     <Compile Include="LinkTests.fs" />
     <Compile Include="FfiTests.fs" />
     <Compile Include="BootstrapTests.fs" />

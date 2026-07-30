@@ -219,6 +219,8 @@ type Workspace() =
     let fppGenerators = vecNew<string * (string * string) list> ()
     /// generated path -> the generator that wrote it, for blaming diagnostics
     let generatedBy = dictNew<string, string> ()
+    /// where each piece of the last emitted module came from
+    let mutable lastPositions : (int * string * int) list = []
     /// hand-written text, captured before any generator rewrites a file: the
     /// INPUT to generation must stay what the human wrote, or a second compile
     /// would feed a generator its own output
@@ -619,6 +621,9 @@ type Workspace() =
 
 
     member private this.EmitCore (optimize : bool) : byte[] * string list =
+        this.EmitCoreMapped optimize ""
+
+    member private this.EmitCoreMapped (optimize : bool) (mapUrl : string) : byte[] * string list =
         this.RunGenerators ()
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
@@ -744,12 +749,28 @@ type Workspace() =
             let linked = Fpp.Core.Link.deadCodeEliminate opt
             if not (List.isEmpty monoErrs) then [||], monoErrs
             else
-                let bytes, berrs, warns = Fpp.Backend.BinDriver.emitBinary linked
+                let bytes, berrs, warns, positions =
+                    Fpp.Backend.BinDriver.emitBinaryWithPositions mapUrl linked
                 for w in warns do ewarn ("warn: " + w)
+                lastPositions <- positions
                 bytes, berrs
 
     /// The program as a direct .wasm module: bytes out, no text anywhere.
     member this.EmitProgramWasm () : byte[] * string list = this.EmitCore true
+
+    /// The program AND its source map. The module carries a `sourceMappingURL`
+    /// custom section naming `mapUrl`, so a browser loads the map and shows the
+    /// .fpp files — with their text embedded, so the sources need not be
+    /// fetchable separately.
+    member this.EmitProgramWasmWithSourceMap (mapUrl : string) : byte[] * string * string list =
+        let bytes, errs = this.EmitCoreMapped true mapUrl
+        let sources =
+            // the prelude too, under the path its declarations carry: stepping
+            // into a library function should show that function, not nothing
+            ("(builtin)", Fpp.Prelude.preludeSource ())
+            :: (this.ProjectFiles |> List.map (fun p -> p, this.FileText p))
+        let map = Fpp.Backend.SourceMap.build mapUrl lastPositions sources
+        bytes, map, errs
 
     /// Produce a fat-IR library from the current project files.
     member this.BuildLibrary () : string * string list =
