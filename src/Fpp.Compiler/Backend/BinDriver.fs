@@ -3054,7 +3054,14 @@ let emitBinary (decls : Decl list) : byte[] * string list * string list =
             dictSet st.FieldIdx (rn, fn) i
             if fn <> "__desc" && fn <> "__idhash" then dictSet st.FieldOwner fn rn)
         if not stf && isObjRecord rn then
-            let super = match baseOf rn with Some b when b <> rn -> "$r_" + b | _ -> "$obj"
+            // a FIELDLESS abstract base (all it declares is abstract members)
+            // is lowered without a record of its own, so there is no $r_ type
+            // to extend — such a class derives straight from $obj. Extending
+            // a name that was never declared handed tyStructSub index -1.
+            let super =
+                match baseOf rn with
+                | Some b when b <> rn && isObjRecord b -> "$r_" + b
+                | _ -> "$obj"
             tyStructSub m ("$r_" + rn) super false (names |> List.map (fun _ -> fld true "anyref"))
         else
             tyStruct m ("$r_" + rn) (names |> List.map (fun _ -> fld true "anyref"))

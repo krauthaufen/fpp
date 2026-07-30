@@ -279,6 +279,36 @@ let binBattery =
               "    print (sm (Map.range 2 3 m))" ]
             "1a,2bB,3c,4d\n1a,2B,3c,4d\n1a,3c\n2b,3c\n1a,3c\n1a,2bB,3c,4d\n1:del,2:=B,3:del,4:=d\n2B,4d | 4\n1a | b | 3c\n2b,3c\n"
 
+        // the shape the original HashMap/HashSet use: an abstract base with
+        // virtual members, dispatched through a base-typed reference, with
+        // GENERIC and mutually recursive node classes
+        expects "generic class hierarchy with virtual dispatch through the base"
+            [ "[<AbstractClass>]"
+              "type Node<'k>(kind : int) ="
+              "    member x.Kind = kind"
+              "    abstract member Count : unit -> int"
+              "    abstract member Add : 'k -> Node<'k>"
+              "type Leaf<'k>(key : 'k) ="
+              "    inherit Node<'k>(1)"
+              "    member x.Key = key"
+              "    override x.Count () = 1"
+              "    override x.Add (k : 'k) = Inner<'k>(Leaf<'k>(k) :> Node<'k>, x :> Node<'k>) :> Node<'k>"
+              "and Inner<'k>(l : Node<'k>, r : Node<'k>) ="
+              "    inherit Node<'k>(2)"
+              "    override x.Count () = l.Count () + r.Count ()"
+              "    override x.Add (k : 'k) = Inner<'k>(l.Add k, r) :> Node<'k>"
+              "let go ="
+              "    let a = Leaf<int>(1) :> Node<int>"
+              "    print (a.Count ())"
+              "    let b = a.Add 2"
+              "    print (b.Count ())"
+              "    print ((b.Add 3).Count ())"
+              "    print b.Kind"
+              "    let mutable total = 0"
+              "    for n in [ a; b ] do total <- total + n.Count ()"
+              "    print total" ]
+            "1\n2\n3\n2\n3\n"
+
         expects "Set: the MapExt surface over a value-less AVL tree"
             [ "let s1 = Set.ofList [ 3; 1; 4; 1; 5 ]"
               "let s2 = Set.ofList [ 4; 5; 9 ]"
