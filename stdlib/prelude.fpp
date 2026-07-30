@@ -3756,15 +3756,25 @@ type Gen<'a> =
       /// render a counterexample
       Render : 'a -> string }
 
-/// What `<@ ... @>` evaluates to. The quoted body is CHECKED code — it resolved
-/// and type checked where it was written — and this is the value that survives
-/// to run time. It currently carries the code's source; carrying the AST
-/// instead is the next step, and does not change how a quotation is written.
-type Code = { CodeText : string }
-
-module Code =
-    let text (c : Code) : string = c.CodeText
-    let ofText (t : string) : Code = { CodeText = t }
+/// What `<@ ... @>` evaluates to: the quoted code AS A TREE. The body was
+/// resolved and type checked where it was written, and this is that same code
+/// in a form a program can take apart — no source text anywhere, so nothing has
+/// to be parsed a second time and composition cannot lose to precedence or
+/// formatting. A quotation containing something outside this subset is a
+/// compile-time error, never a silent fallback.
+type Code =
+    | CInt of int
+    | CStr of string
+    | CBool of bool
+    /// a name as written
+    | CName of string
+    /// `f a b`
+    | CApp of Code * Code list
+    /// `a + b`, operator first
+    | CBin of string * Code * Code
+    /// `let n = value` followed by the rest
+    | CLet of string * Code * Code
+    | CIf of Code * Code * Code
 
 /// The conversions the generators need, under names `Gen` does not shadow.
 /// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a
