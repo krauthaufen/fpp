@@ -371,7 +371,9 @@ let binBattery =
               "    print (Code.text quoted)"
               "    print (Code.text c)"
               "    print (Code.text (Code.ofText \"hand made\"))" ]
-            "n + 1 \n1 + 2 * 3 \nhand made\n"
+            // the splices are PARENTHESISED: composing code must not lose to
+            // precedence, so `%b * 3` over `b = %a + 2` means (1 + 2) * 3
+            "n + 1 \n((1 )+ 2 )* 3 \nhand made\n"
 
         expects "a returned closure captures a scalar parameter"
             [ "let addN (n : int) = (fun x -> x * 2 + n)"

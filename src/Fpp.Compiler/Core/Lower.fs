@@ -923,8 +923,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         if t.Kind = Operator && (t.Text = "<@" || t.Text = "@>") then []
                         else [ strLit (Green.toText g) ]
                     | GNode m when m.NodeKind = SpliceExpr ->
+                        // PARENTHESISED. Splicing is composition of code, not
+                        // of text: without this `%b * 3` where `b` is `1 + 2`
+                        // renders `1 + 2 * 3`, which means 1 + (2*3) — the
+                        // spliced fragment silently loses to precedence.
                         (match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
-                         | inner :: _ -> [ EField (lowerExpr (GNode inner), "CodeText", "Code") ]
+                         | inner :: _ ->
+                             [ strLit "("
+                               EField (lowerExpr (GNode inner), "CodeText", "Code")
+                               strLit ")" ]
                          | [] -> [ strLit "" ])
                     | GNode m -> m.Children |> List.collect pieces
                 let parts = n.Children |> List.collect pieces
