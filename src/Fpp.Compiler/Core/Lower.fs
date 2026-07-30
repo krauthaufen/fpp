@@ -908,7 +908,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // denotes — a subtree, not text — so nothing is re-parsed and
                 // composition cannot be reinterpreted by precedence.
                 let str (t : string) = ELit (LString ("\"" + t.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""))
-                let ctor (name : string) (args : Expr list) = ECtor (name, mono (TCon ("Code", [])), args)
+                // a case with several payload fields takes them as ONE tuple
+                let ctor (name : string) (args : Expr list) =
+                    match args with
+                    | [] | [ _ ] -> ECtor (name, mono (TCon ("Code", [])), args)
+                    | many -> ECtor (name, mono (TCon ("Code", [])), [ ETuple many ])
                 let rec quote (m : GreenNode) : Expr =
                     let kids = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind)
                     match m.NodeKind with

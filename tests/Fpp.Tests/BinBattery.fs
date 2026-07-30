@@ -359,21 +359,34 @@ let binBattery =
         // so a scalar parameter it reads cannot live on a raw rail — the env
         // slot is anyref. Getting this wrong did not even produce a module
         // that validated.
-        // a quotation is CHECKED code that survives to run time as a Code
-        // value; splices compose, including a splice of a spliced quote
-        expects "quotations evaluate to code, and splices compose"
-            [ "let n = 41"
-              "let quoted = <@ n + 1 @>"
+        // A quotation survives to run time as a TREE, not as text: a splice
+        // grafts a SUBTREE, so composition cannot be reinterpreted by
+        // precedence and nothing is ever parsed a second time.
+        expects "quotations are trees, and a splice grafts a subtree"
+            [ "let rec shape (c : Code) ="
+              "    match c with"
+              "    | CInt v -> \"Int(\" + string v + \")\""
+              "    | CStr v -> \"Str\""
+              "    | CBool v -> \"Bool\""
+              "    | CName n -> \"Name(\" + n + \")\""
+              "    | CBin (op, l, r) -> \"Bin(\" + op + \",\" + shape l + \",\" + shape r + \")\""
+              "    | CApp (f, args) -> \"App(\" + shape f + \",\" + string (List.length args) + \")\""
+              "    | CLet (n, v, b) -> \"Let(\" + n + \",\" + shape v + \",\" + shape b + \")\""
+              "    | CIf (c2, t, e) -> \"If(\" + shape c2 + \",\" + shape t + \",\" + shape e + \")\""
+              "let n = 41"
+              "let f (x : int) = x"
               "let a = <@ 1 @>"
               "let b = <@ %a + 2 @>"
               "let c = <@ %b * 3 @>"
+              "let blk = <@ let y = f n"
+              "             if y > 1 then y + 1 else 0 @>"
               "let go ="
-              "    print (Code.text quoted)"
-              "    print (Code.text c)"
-              "    print (Code.text (Code.ofText \"hand made\"))" ]
-            // the splices are PARENTHESISED: composing code must not lose to
-            // precedence, so `%b * 3` over `b = %a + 2` means (1 + 2) * 3
-            "n + 1 \n((1 )+ 2 )* 3 \nhand made\n"
+              "    print (shape <@ n + 1 @>)"
+              "    print (shape c)"
+              "    print (shape blk)" ]
+            ("Bin(+,Name(n),Int(1))\n"
+             + "Bin(*,Bin(+,Int(1),Int(2)),Int(3))\n"
+             + "Let(y,App(Name(f),1),If(Bin(>,Name(y),Int(1)),Bin(+,Name(y),Int(1)),Int(0)))\n")
 
         expects "a returned closure captures a scalar parameter"
             [ "let addN (n : int) = (fun x -> x * 2 + n)"
