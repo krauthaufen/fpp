@@ -359,6 +359,20 @@ let binBattery =
         // so a scalar parameter it reads cannot live on a raw rail — the env
         // slot is anyref. Getting this wrong did not even produce a module
         // that validated.
+        // a quotation is CHECKED code that survives to run time as a Code
+        // value; splices compose, including a splice of a spliced quote
+        expects "quotations evaluate to code, and splices compose"
+            [ "let n = 41"
+              "let quoted = <@ n + 1 @>"
+              "let a = <@ 1 @>"
+              "let b = <@ %a + 2 @>"
+              "let c = <@ %b * 3 @>"
+              "let go ="
+              "    print (Code.text quoted)"
+              "    print (Code.text c)"
+              "    print (Code.text (Code.ofText \"hand made\"))" ]
+            "n + 1 \n1 + 2 * 3 \nhand made\n"
+
         expects "a returned closure captures a scalar parameter"
             [ "let addN (n : int) = (fun x -> x * 2 + n)"
               "let mulThen (a : int) (b : int) = (fun x -> x * a + b)"

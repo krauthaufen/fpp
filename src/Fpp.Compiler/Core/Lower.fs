@@ -902,6 +902,37 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | Some (LFloat s) -> ELit (LFloat ("-" + s))
                            | _ -> note (offsetOf n) "prefix")
                       | _ -> note (offsetOf n) "prefix"))
+            | QuoteExpr ->
+                // The body was type checked in place; what survives to run time
+                // is a Code value. Ordinary parts contribute their own source,
+                // a splice contributes the code the spliced value denotes.
+                let strLit (t : string) =
+                    let mutable esc = ""
+                    for ch in t do
+                        if ch = '\\' then esc <- esc + "\\\\"
+                        elif ch = '"' then esc <- esc + "\\\""
+                        elif ch = '\n' then esc <- esc + "\\n"
+                        elif ch = '\t' then esc <- esc + "\\t"
+                        elif ch = '\r' then esc <- ""
+                        else esc <- esc + string ch
+                    ELit (LString ("\"" + esc + "\""))
+                let rec pieces (g : Green) : Expr list =
+                    match g with
+                    | GToken t ->
+                        // the brackets themselves are not part of the code
+                        if t.Kind = Operator && (t.Text = "<@" || t.Text = "@>") then []
+                        else [ strLit (Green.toText g) ]
+                    | GNode m when m.NodeKind = SpliceExpr ->
+                        (match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
+                         | inner :: _ -> [ EField (lowerExpr (GNode inner), "CodeText", "Code") ]
+                         | [] -> [ strLit "" ])
+                    | GNode m -> m.Children |> List.collect pieces
+                let parts = n.Children |> List.collect pieces
+                let joined =
+                    match parts with
+                    | [] -> strLit ""
+                    | first :: rest -> List.fold (fun acc p -> EPrim ("+t", [ acc; p ])) first rest
+                ERecord ("Code", [ "CodeText", joined ])
             | ParenExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [] when (Green.tokens (GNode n) |> List.exists (fun t -> t.Kind = Operator && t.Text <> ":")) ->

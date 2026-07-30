@@ -3756,6 +3756,16 @@ type Gen<'a> =
       /// render a counterexample
       Render : 'a -> string }
 
+/// What `<@ ... @>` evaluates to. The quoted body is CHECKED code — it resolved
+/// and type checked where it was written — and this is the value that survives
+/// to run time. It currently carries the code's source; carrying the AST
+/// instead is the next step, and does not change how a quotation is written.
+type Code = { CodeText : string }
+
+module Code =
+    let text (c : Code) : string = c.CodeText
+    let ofText (t : string) : Code = { CodeText = t }
+
 /// The conversions the generators need, under names `Gen` does not shadow.
 /// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a
 /// call to the conversion of the same name applies the generator record — which
