@@ -595,7 +595,11 @@ let parse (src : string) : ParseResult =
             // quoted `let` sequence spanning lines parses like any other block
             // instead of being cut off at the enclosing expression's context
             quoteDepth <- quoteDepth + 1
-            vecAdd acc (parseBlock ctx)
+            // a quotation may hold a DECLARATION as readily as an expression:
+            // `type`, and `member` for the shape a deriving plugin emits
+            if s.IsKw "type" then vecAdd acc (parseTypeDecl ctx)
+            elif s.IsKw "member" then vecAdd acc (parseMember ())
+            else vecAdd acc (parseBlock ctx)
             quoteDepth <- quoteDepth - 1
             if s.Is Operator && s.Cur.Text = "@>" then vecAdd acc (s.Bump ())
             else s.Diag "expected '@>' to close the quotation"

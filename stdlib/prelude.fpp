@@ -3800,6 +3800,10 @@ type CodeTree =
     /// a plugin the thing it actually wants to emit; a parameter or return type
     /// that was not written is QTyName "".
     | CDLet of string * (string * QTy) list * QTy * CodeTree
+    /// `member self.Name (p : ty) ... : ret = body`
+    | CDMember of string * string * (string * QTy) list * QTy * CodeTree
+    /// `type Name = { field : ty; ... }`
+    | CDRecord of string * (string * QTy) list
 
 /// `Code<'t>` is quoted code KNOWN TO PRODUCE a 't — that is what lets a splice
 /// type check against the hole it fills. `Raw` is the tree underneath, for
@@ -3848,6 +3852,21 @@ module Code =
                 "\n" + pad (ind + 4) + "| " + renderPat p + " -> " + renderAt (ind + 4) b
             "match " + renderAt ind sc + " with"
             + String.concat "" (List.map (fun (p, b) -> arm p b) arms)
+        | CDMember (self, n, ps, ret, b) ->
+            let ps2 =
+                ps
+                |> List.map (fun (pn, pt) ->
+                    match pt with
+                    | QTyName "" -> pn
+                    | t -> "(" + pn + " : " + renderTy t + ")")
+                |> String.concat " "
+            let args = if List.isEmpty ps then " ()" else " " + ps2
+            let retTxt = match ret with QTyName "" -> "" | t -> " : " + renderTy t
+            "member " + self + "." + n + args + retTxt + " =\n" + pad (ind + 4) + renderAt (ind + 4) b
+        | CDRecord (n, fields) ->
+            "type " + n + " =\n" + pad (ind + 4) + "{ "
+            + String.concat "; " (List.map (fun (fn, ft) -> fn + " : " + renderTy ft) fields)
+            + " }"
         | CDLet (n, ps, ret, b) ->
             let ps2 =
                 ps

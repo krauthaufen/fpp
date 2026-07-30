@@ -403,6 +403,27 @@ let binBattery =
         // that merely spells the same
         // `: %ty` — a TYPE spliced into a quoted signature, which is what a
         // generator needs to emit one declaration per field
+        // the shape a deriving plugin emits: a MEMBER whose signature carries a
+        // spliced type, and a record TYPE with a spliced field type
+        expects "members and record types can be quoted, with spliced types"
+            [ "let ty : QTy = QTyName \"int\""
+              "let t : QTy = QTyName \"string\""
+              "let m : Code<unit> = <@ member x.Bla (a : %ty) : %ty = a @>"
+              "let r : Code<unit> = <@ type Row = { Id : int; Label : %t } @>"
+              "let go ="
+              "    (match m.Raw with"
+              "     | CDMember (self, name, ps, ret, body) ->"
+              "         print (self + \".\" + name)"
+              "         print (Code.renderTy ret)"
+              "         print (string (List.length ps))"
+              "     | _ -> print \"?\")"
+              "    (match r.Raw with"
+              "     | CDRecord (n, fs) ->"
+              "         print n"
+              "         print (String.concat \",\" (List.map (fun (f, ft) -> f + \":\" + Code.renderTy ft) fs))"
+              "     | _ -> print \"?\")" ]
+            "x.Bla\nint\n1\nRow\nId:int,Label:string\n"
+
         expects "types can be spliced into a quoted signature"
             [ "let t : QTy = QTyName \"string\""
               "let r : QTy = QTyApp (\"list\", [ QTyName \"int\" ])"

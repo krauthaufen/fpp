@@ -967,6 +967,47 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         (match kids with
                          | [ c; t; e ] -> ctor "CIf" [ quote c; quote t; quote e ]
                          | _ -> note (offsetOf m) "an `if` in a quotation needs an `else`")
+                    | MemberDecl ->
+                        // `<@ member x.Bla (a : %t) : %r = ... @>`
+                        let idents = Green.tokens (GNode m) |> List.filter (fun t -> t.Kind = Ident)
+                        let pats =
+                            nodesOf m |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
+                        let value = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
+                        let retTy = nodesOf m |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.tryHead
+                        let nameOf (x : GreenNode) =
+                            match Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                            | Some t -> t.Text
+                            | None -> "_"
+                        // `member x.Bla` — the receiver, then the member name
+                        (match idents, value with
+                         | selfTok :: nameTok :: _, Some v ->
+                             let ps =
+                                 pats
+                                 |> List.map (fun x ->
+                                     let ty = nodesOf x |> List.filter (fun y -> isTypeKind y.NodeKind) |> List.tryHead
+                                     ETuple [ str (fresh (nameOf x) (offsetOf x)); quoteTy ty ])
+                             ctor "CDMember"
+                                 [ str selfTok.Text; str nameTok.Text; EListLit ps; quoteTy retTy; quote v ]
+                         | _ -> note (offsetOf m) "member quotation needs a receiver, a name and a body")
+                    | TypeDecl ->
+                        // `<@ type R = { X : %t } @>`
+                        let nameTok = Green.tokens (GNode m) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+                        let fields =
+                            nodesOf m
+                            |> List.filter (fun x -> x.NodeKind = RecordRepr)
+                            |> List.collect nodesOf
+                            |> List.filter (fun x -> x.NodeKind = RecordField)
+                            |> List.map (fun f ->
+                                let fn =
+                                    match tokensOf f |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                                    | Some t -> t.Text
+                                    | None -> "_"
+                                let ft = nodesOf f |> List.filter (fun y -> isTypeKind y.NodeKind) |> List.tryHead
+                                ETuple [ str fn; quoteTy ft ])
+                        (match nameTok with
+                         | Some nt when not (List.isEmpty fields) ->
+                             ctor "CDRecord" [ str nt.Text; EListLit fields ]
+                         | _ -> note (offsetOf m) "only a record type can be quoted so far")
                     | LetDecl ->
                         // a quotation whose whole body is a `let` is a
                         // DECLARATION quote: `<@ let f (x : %t) : %r = ... @>`
