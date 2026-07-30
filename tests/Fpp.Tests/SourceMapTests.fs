@@ -76,6 +76,22 @@ let sourceMapTests =
             Expect.isNonEmpty onAddOne "the function's code maps to its declaration"
         }
 
+        test "debug names ride with the map, and only with it" {
+            let src = "module M\ntype Point = { X : int; Y : int }\nlet dist (p : Point) = p.X + p.Y\nlet go = print (dist { X = 3; Y = 4 })\n"
+            let dbg = Workspace()
+            dbg.SetFileText "m.fpp" src
+            let withNames, _, _ = dbg.EmitProgramWasmWithSourceMap "m.wasm.map"
+            let plainWs = Workspace()
+            plainWs.SetFileText "m.fpp" src
+            let plain, _ = plainWs.EmitProgramWasm ()
+            let dbgText = System.Text.Encoding.Latin1.GetString withNames
+            let plainText = System.Text.Encoding.Latin1.GetString plain
+            // a heap snapshot reads field names; a scope view reads parameter names
+            Expect.stringContains dbgText "__desc" "field names travel with a debug build"
+            Expect.isTrue (dbgText.Length > plainText.Length) "and they cost bytes"
+            Expect.isFalse (plainText.Contains "__desc") "a plain build ships none of it"
+        }
+
         test "no map is emitted unless one is asked for" {
             let ws = Workspace()
             ws.SetFileText "m.fpp" "module M\nlet go = print 1\n"

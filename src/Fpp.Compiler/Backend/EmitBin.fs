@@ -617,8 +617,13 @@ let assembleWith (m : Mod) (memPages : int) (hasTag : bool) (mapUrl : string) : 
         emitByte b 4
         emitU32 b tsub.Count
         emitBytes b (bytesToArray tsub)
-        // local names (subsection 2): a debugger's scope view reads these
-        let locs = vecToList m.LocalNames |> List.filter (fun (_, ns) -> not (List.isEmpty ns))
+        // local names (subsection 2): a debugger's scope view reads these.
+        // DEBUG ONLY — names cost a third of the module, which nobody should
+        // pay to ship. `mapUrl` is the switch: a build that wants a source map
+        // wants names with it.
+        let locs =
+            if mapUrl = "" then []
+            else vecToList m.LocalNames |> List.filter (fun (_, ns) -> not (List.isEmpty ns))
         if not (List.isEmpty locs) then
             let lsub = bytesNew ()
             emitU32 lsub (List.length locs)
@@ -635,8 +640,10 @@ let assembleWith (m : Mod) (memPages : int) (hasTag : bool) (mapUrl : string) : 
         // `field 0`, which is the difference between reading a snapshot and
         // guessing at it
         let flds =
-            vecToList m.FieldNames
-            |> List.filter (fun (t, ns) -> tyIdx m t >= 0 && not (List.isEmpty ns))
+            if mapUrl = "" then []
+            else
+                vecToList m.FieldNames
+                |> List.filter (fun (t, ns) -> tyIdx m t >= 0 && not (List.isEmpty ns))
         if not (List.isEmpty flds) then
             let fsub = bytesNew ()
             emitU32 fsub (List.length flds)
