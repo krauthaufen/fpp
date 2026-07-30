@@ -292,6 +292,11 @@ type GDecl =
     | GClassOf of string * string list * (string * GTy) list
     /// class name, head types, member bodies
     | GInstanceOf of string * GTy list * GMember list
+    /// Literal F++ source — quotation. Write the code, splice the holes with
+    /// `exText` / `tyText` (F# interpolation supplies the brackets F# keeps for
+    /// its own typed quotations), and `renderFileChecked` parses it so a
+    /// mistake is reported against the QUOTE rather than the assembled file.
+    | GQuote of string
 
 let rec tyText (t : GTy) : string =
     match t with
@@ -471,6 +476,18 @@ let declLines (d : GDecl) : string list =
     | GClassOf (name, tvs, members) ->
         ("class " + name + "<" + String.concat ", " (List.map (fun v -> "'" + v) tvs) + ">")
         :: (members |> List.map (fun (mn, mt) -> "    static " + mn + " : " + tyText mt))
+    | GQuote text ->
+        // trailing blank lines would stack up between declarations
+        let ls = text.Replace("\r", "").Split '\n' |> Array.toList
+        let rec trimTail (xs : string list) =
+            match List.rev xs with
+            | last :: rest when last.Trim () = "" -> trimTail (List.rev rest)
+            | _ -> xs
+        let rec trimHead (xs : string list) =
+            match xs with
+            | first :: rest when first.Trim () = "" -> trimHead rest
+            | _ -> xs
+        trimTail (trimHead ls)
     | GInstanceOf (name, heads, members) ->
         ("instance " + name + "<" + String.concat ", " (List.map tyText heads) + ">")
         :: (members
@@ -483,6 +500,10 @@ let declLines (d : GDecl) : string list =
                 | Some one -> [ head + " " + one ]
                 | None -> head :: exLines 8 m.MBody))
 
+/// An expression as source at a given indent — the splice helper. `tyText`
+/// does the same for a type.
+let exText (ind : int) (e : GEx) : string = String.concat "\n" (exLines ind e)
+
 /// A whole generated file. No module header on purpose: top-level bindings are
 /// what a later file can name without an `open`.
 let renderFile (decls : GDecl list) : string =
@@ -493,6 +514,25 @@ let renderFile (decls : GDecl list) : string =
         | GOpen _ -> declLines d
         | _ -> declLines d @ [ "" ]
     String.concat "\n" ("" :: (decls |> List.collect spaced)) + "\n"
+
+/// Render, and report every quoted fragment that does not parse. The message
+/// names the quote and its own line, so a broken template is a generator error
+/// rather than a puzzle in a file nobody wrote.
+let renderFileChecked (decls : GDecl list) : string * string list =
+    let problems = vecNew<string> ()
+    for d in decls do
+        match d with
+        | GQuote text ->
+            let parsed = Fpp.Syntax.Parser.parse (text + "\n")
+            for diag in parsed.Diagnostics do
+                // `min a b` and `Seq.toList` over a string both read
+                // differently in the self-hosted checker; keep it plain
+                let cut = if diag.Offset < text.Length then diag.Offset else text.Length
+                let upto = text.Substring (0, cut)
+                let line = List.length (Array.toList (upto.Split '\n'))
+                vecAdd problems ("quoted code does not parse at line " + string line + ": " + diag.Message)
+        | _ -> ()
+    renderFile decls, vecToList problems
 
 // ---- deriveGen: a property-test generator for every user type -------------
 // The generator a PerFile plugin could not write: it emits SOURCE, so the
