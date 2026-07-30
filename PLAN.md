@@ -2787,6 +2787,42 @@ self-application gates:
 * `min a b` reads as taking a TUPLE, and `Seq.toList` over a string does not
   resolve. Use an `if` and `String.Split` respectively.
 
+### Toward full Template Haskell — what is there, what is not
+TH has five parts. Three are in, two are not, and the two that are missing are
+the ones that need PARSER work rather than more library:
+
+DONE
+* **Compile-time code generation into the program.** Generators run before the
+  front end and their output is compiled like any other file.
+* **Reification.** `ProgramView` gives every hand-written type: name, kind, type
+  parameters, field names AND types as written, union cases with payload types,
+  declaring module, and now its `[<...>]` ATTRIBUTES. `[<Derive("Gen")>]` on a
+  type switches deriveGen from "everything" to exactly what was asked for —
+  the `$(deriveJSON ''Foo)` workflow in attribute clothing.
+* **Errors for generated code, as for any other code.** A generated file is
+  compiled normally, and every diagnostic in one names the GENERATOR, gives the
+  position inside what it produced, quotes that line and points a caret at the
+  column. `ws.GeneratedFiles` returns (path, generator, source), so generated
+  code is readable rather than a black box. Pinned by "a generator's mistakes
+  are reported against the generator".
+
+NOT DONE — and both need the parser, not the plugin API
+* **Splices at a position in USER source** — TH's `$(...)`. Today generation is
+  whole-file: a generator cannot expand `let x = $(makeLens "Foo")` in the
+  middle of someone's function. The design that fits: lex `$(name arg ...)`,
+  restrict arguments to LITERALS, resolve `name` against the registered
+  generators, run it during a pass BEFORE resolve, and graft the parsed result
+  into the green tree. Expression, declaration, type and pattern positions each
+  need a production.
+* **Quotation in the language itself**, hygienic. `GQuote` is literal source
+  with textual splices, so it has NO hygiene: a quoted `let x = ...` can capture
+  a spliced `x`. Real `<@ ... @>` over F++'s own AST, with `newName`-style
+  gensym, only becomes natural once plugins are written in F++ rather than F# —
+  which the compiler self-hosting makes possible.
+
+The honest summary: this is GHC's *deriving-plugin* power plus attribute
+targeting and real diagnostics, not yet TH's *splice-anywhere* power.
+
 ### Possible further increments (not required by any gate)
 
 
