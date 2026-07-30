@@ -2609,6 +2609,30 @@ and fns whose scalar param a LAMBDA captures (env slots are anyref; the
 capture build site reads slots raw). Wrappers adapt first-class uses.
 Gates: 446/446, fixpoint bin + bin self byte-identical.
 
+### NEXT: the OO HashMap/HashSet port (requested, not yet written)
+The original FSharp.Data.Adaptive HashMap/HashSet are a CLASS HIERARCHY with
+virtual members (HashMapNode base; Empty / NoCollisionLeaf / CollisionLeaf /
+Inner subclasses; Add/Remove/TryFind/Count/Map/Choose/Filter as abstract
+members), NOT the DU nodes our port uses. Rewriting them in that style is
+the outstanding request.
+
+WHAT WAS PROVEN POSSIBLE (battery: "generic class hierarchy with virtual
+dispatch through the base"): generic classes, mutually recursive `and`
+classes, abstract members overridden per subclass, virtual dispatch through
+a BASE-TYPED reference, upcasts, and dynamic dispatch over a heterogeneous
+list all work today.
+
+TWO COMPILER FACTS TO KNOW BEFORE STARTING:
+1. FIXED here: a fieldless abstract base is lowered WITHOUT a record, so a
+   derived class had nothing to extend and tyStructSub got base index -1
+   (a hard crash). Such a class now derives from $obj.
+2. STILL OPEN: a *completely* fieldless abstract base is dropped by LOWERING
+   altogether — no DRecord, no DClass, no constructor — so `inherit Node()`
+   fails with "unbound variable Node". Workaround that works now: give the
+   base one field (a kind tag, or the cached count the Inner node needs
+   anyway). Proper fix: keep a record for a fieldless class in Lower.
+
+### Possible further increments (not required by any gate)
 ### Possible further increments (not required by any gate)
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload
   ever wants them.
