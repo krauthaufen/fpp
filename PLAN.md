@@ -2894,6 +2894,33 @@ format between two separate compilations. The "spares us another parse" argument
 applies to composition INSIDE a program, and there it holds: quotations compose
 as trees, never as text.
 
+### Two plugins that show the machinery carries real work
+* **deriveToString** — a printer for every type it sees. Records print their
+  fields, structs the same with a `struct` marker, unions their case and
+  payload (a multi-field case prints as a tuple), classes their name and a
+  STABLE ID (the identity hash: same instance, same number). A field whose type
+  is another derived type uses THAT type's printer, so nesting prints properly;
+  `list` and `Option` fields print through their element's printer. A type it
+  cannot print is skipped and named in a comment, never half-derived.
+* **logCalls** — enter/exit tracing around every function, by REWRITING what the
+  user wrote. It cuts by the parse tree's spans, never by searching text, so a
+  body containing the word `let` or a string full of braces is not a hazard, and
+  it re-indents a multi-line body by the DIFFERENCE between where it sits and
+  where it must sit, so the body's own layout survives.
+
+Three things the plugins found, each fixed rather than worked around:
+* The view classified classes as "other". It now distinguishes record / union /
+  class / abbrev, and carries a class's member names.
+* A union case's payload types arrived as ONE blob (`int*string`). A case now
+  reports its payload types SEPARATELY, which is what any consumer needs.
+* A multi-field case was rendered `Both p0 p1` in pattern position, which binds
+  nothing — it holds a tuple and must be matched as `Both (p0, p1)`. Fixed in
+  both renderers.
+* `l.TrimStart ' '` did not check: only the char-ARRAY overload was registered.
+  .NET has both, so the char overload is registered and the runtime normalises a
+  single char into a one-element set — and BinDriver handles the `#2` overload
+  suffix the resolver appends.
+
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
 * **Source tier (Generator)** — runs before the front end, sees the program and
