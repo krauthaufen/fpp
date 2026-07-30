@@ -2804,12 +2804,19 @@ Landed:
   inner diagnostics) and itself denotes `Code`; a splice requires its operand to
   be `Code` and takes a fresh type for the hole.
 
+LOWERING LANDED: a quotation evaluates to a `Code` value, and splices compose —
+`<@ %b * 3 @>` where `b` is `<@ %a + 2 @>` renders `1 + 2 * 3`. `Code` is a real
+prelude type with `Code.text` / `Code.ofText`. The interim representation is the
+code's SOURCE; carrying the AST is the next step and does not change how a
+quotation is written.
+
 STILL TO DO, in order:
-1. **Lowering.** A quotation currently has no runtime value: a program that
-   EMITS one will fail to lower. It should build a Code value — carrying the
-   AST, not rendered text — with splices embedded at runtime.
-2. **`Code` as a real prelude type**, with the AST constructors it holds, so
-   `Code` can be pattern matched and composed by a plugin.
+1. **Code carries an AST**, not source text, so a plugin can match on and
+   rewrite quoted code rather than re-parse it.
+2. **A quoted `let` BLOCK.** `<@ let a = %inner` + a second line parses as an
+   error today: the body is parsed with the enclosing expression context, so a
+   multi-line block inside a quotation does not get its own offside context.
+   Single-line quotations and splices are unaffected.
 3. **Typed quotations** — `Code<'t>` so `<@ 1 + 1 @>` is `Code<int>` and a
    splice checks against the hole's expected type.
 4. **Hygiene** — `newName`-style gensym so a quoted binder cannot capture a
