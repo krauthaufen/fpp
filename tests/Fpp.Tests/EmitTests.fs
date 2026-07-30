@@ -133,6 +133,11 @@ let noBoxGate =
                     "    for i in 0 .. pts.Length - 1 do"
                     "        s <- s + pts.[i].X"
                     "    print s"
+                    // read every array: an unused binding whose initializer
+                    // has no effect is dead, representation and all
+                    "    print ints.[0]"
+                    "    print more.Length"
+                    "    print floats.Length"
                     "" ]
             let text = disassemble src
             Expect.stringContains text "array.new_fixed $pk" "V2d arrays are C-image packed"
@@ -143,7 +148,7 @@ let noBoxGate =
             Expect.isFalse (text.Contains "$setv") "no dispatching writer"
             Expect.isFalse (text.Contains "$creatv") "no dispatching allocator"
             // and the program still computes
-            Expect.equal (runProgram src) "4\n" "the packed loop sums X"
+            Expect.equal (runProgram src) "4\n1\n8\n2\n" "the packed loop sums X"
         }
         test "the hot loop allocates NOTHING — scalars ride raw rails" {
             // THE HOT-LOOP INVARIANT: summing packed struct fields performs

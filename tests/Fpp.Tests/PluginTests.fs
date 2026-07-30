@@ -198,6 +198,12 @@ let monoTests =
                     "let c = id2 \"s\""
                     "let d = id2 \"t\""
                     "let r = print (id2 5)"
+                    // the values must be READ: an unused binding whose
+                    // initializer has no effect is dead, clone and all
+                    "let ra = print a.X"
+                    "let rb = print b.A"
+                    "let rc = print c"
+                    "let rd = print d"
                     "" ])
             let bytes, errs = ws.EmitProgramWasmRaw ()
             let wat = System.Text.Encoding.Latin1.GetString bytes
@@ -235,6 +241,7 @@ let monoPropagationTests =
                     "let outer (y : 'b) = wrap (wrap y)"
                     "let a = outer { X = 1.0; Y = 2.0 }"
                     "let b = print (outer 5)"
+                    "let ra = print a.X"
                     "" ])
             let bytes, errs = ws.EmitProgramWasmRaw ()
             let wat = System.Text.Encoding.Latin1.GetString bytes

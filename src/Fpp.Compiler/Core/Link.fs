@@ -731,15 +731,110 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
                    |> List.concat)
             if not (parkOn n ms) then for k in ms do demand k
         | _ -> ()
-    // roots: value initializers (program effects)
+    // ---- which initializers have to run at all? -----------------------------
+    // A value binding is a root because its EFFECTS must happen. One that
+    // cannot have effects only needs to run if the value is read, and an
+    // unread pure global is dead weight: `HashMap.empty` alone would
+    // otherwise root a class hierarchy's entire vtable, in every program.
+    //
+    // Conservative throughout: unresolved names, dynamic dispatch, mutation,
+    // loops and exception handling all count as effects, and so does calling
+    // anything that has them. Only a binding PROVEN effect-free is skipped.
+    let directEffect = dictNew<string * int, bool> ()
+    let calleesOf = dictNew<string * int, (string * int) list> ()
+    let mutable sawEffect = false
+    let mutable callAcc = vecNew<string * int> ()
+    let rec walk (e : Expr) =
+        match e with
+        // an unresolved name is resolved by NAME at emit time, so what it
+        // does is unknown here
+        | EUnknown _ -> sawEffect <- true
+        | EIfaceCall (_, _, recv, args) -> sawEffect <- true; walk recv; List.iter walk args
+        | EAssign (_, x) -> sawEffect <- true; walk x
+        | EFieldSet (r, _, _, v) -> sawEffect <- true; walk r; walk v
+        | EIndexSet (_, a, i, v) -> sawEffect <- true; walk a; walk i; walk v
+        | EWhile (c, b) -> sawEffect <- true; walk c; walk b
+        | EArrayPin (_, a) -> sawEffect <- true; walk a
+        | EArrayUnpin (_, a) -> sawEffect <- true; walk a
+        | ETry (b, cs) ->
+            sawEffect <- true
+            walk b
+            for _, g, x in cs do
+                (match g with Some g -> walk g | None -> ())
+                walk x
+        // READING a name is pure, whatever the name holds: an effect happens
+        // when something is CALLED, so only the callee position is an edge
+        | EVarI (_, _, _) -> ()
+        | EVar (_, _) -> ()
+        | ELam (_, b) -> walk b
+        | EApp (f, args) ->
+            (match f with
+             | EVar (v, _) -> vecAdd callAcc (v.Path, v.Offset)
+             | EVarI (v, _, _) -> vecAdd callAcc (v.Path, v.Offset)
+             // calling something computed — a parameter holding a function,
+             // a field, a closure out of a list — has an unknown target
+             | _ -> sawEffect <- true; walk f)
+            List.iter walk args
+        | ELet (_, _, _, r, b) -> walk r; walk b
+        | EIf (a, b, c) -> walk a; walk b; walk c
+        | EMatch (s, cs) ->
+            walk s
+            for _, g, b in cs do
+                (match g with Some g -> walk g | None -> ())
+                walk b
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) -> List.iter walk xs
+        | ECtor (_, _, xs) -> List.iter walk xs
+        | ERecord (_, fs) -> for _, v in fs do walk v
+        | ERecordExt (_, bse, fs) -> walk bse; (for _, v in fs do walk v)
+        | EField (r, _, _) -> walk r
+        | ECast (_, x, _) -> walk x
+        | ETypeTest (_, x) -> walk x
+        | EArray (_, xs) -> List.iter walk xs
+        | EIndex (_, a, i) -> walk a; walk i
+        | EArrayLen (_, a) -> walk a
+        | EArrayCreate (_, n, v) -> walk n; walk v
+        | _ -> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, e) ->
+            sawEffect <- false
+            callAcc <- vecNew<string * int> ()
+            walk e
+            dictSet directEffect (v.Path, v.Offset) sawEffect
+            dictSet calleesOf (v.Path, v.Offset) (vecToList callAcc)
+        | _ -> ()
+    // propagate: a binding has effects if it does anything effectful itself or
+    // reaches something that does
+    let hasEffect = dictNew<string * int, bool> ()
+    for k, eff in dictPairs directEffect do
+        if eff then dictSet hasEffect k true
+    let mutable changed = true
+    while changed do
+        changed <- false
+        for k, cs in dictPairs calleesOf do
+            if not (dictTryFind hasEffect k).IsSome then
+                let reaches =
+                    cs
+                    |> List.exists (fun c ->
+                        // a name with no binding of its own here (a parameter
+                        // holding a function, a builtin) is opaque
+                        (dictTryFind hasEffect c).IsSome
+                        || not (dictTryFind directEffect c).IsSome)
+                if reaches then
+                    dictSet hasEffect k true
+                    changed <- true
+    let mustRun (k : string * int) = (dictTryFind hasEffect k).IsSome
+
+    // roots: value initializers that have effects to deliver
     for d in decls do
         match d with
         | DLet (_, v, _, e) ->
             (match e with
              | ELam _ -> ()
              | _ ->
-                 demand (v.Path, v.Offset)
-                 scan e)
+                 if mustRun (v.Path, v.Offset) then
+                     demand (v.Path, v.Offset)
+                     scan e)
         | _ -> ()
     let mutable i = 0
     while i < vecLen work do
@@ -758,6 +853,11 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         match d with
         | DLet (_, v, _, ELam _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
         | DExtern (v, _) -> (dictTryFind keep (v.Path, v.Offset)).IsSome
+        // a value nobody reads, whose initializer cannot have an effect, does
+        // not need to be computed — and dropping it drops whatever only its
+        // initializer reached
+        | DLet (_, v, _, _) ->
+            (dictTryFind keep (v.Path, v.Offset)).IsSome || mustRun (v.Path, v.Offset)
         | _ -> true)
 
 /// The bodies of the primitive instances. `instance Add<int,int>` declares
