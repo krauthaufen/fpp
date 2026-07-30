@@ -258,6 +258,161 @@ let generatorTests =
             Expect.stringContains src "let broken" "and its source can be read"
         }
 
+        test "a type provider: types from data the compiler never saw" {
+            // the type-provider shape — a generator reads EXTERNAL data at
+            // compile time (here a schema string; a real one would read a file
+            // or a service) and emits types the program then uses
+            let schema = "Person: Name string, Age int; City: Label string, Population int"
+            let provider : Fpp.Core.Plugins.Generator =
+                { GName = "provider"
+                  Generate =
+                    fun _ ->
+                        let decls =
+                            schema.Split ';'
+                            |> Array.toList
+                            |> List.map (fun (entry : string) ->
+                                let parts = entry.Split ':'
+                                let name = parts.[0].Trim ()
+                                let fields =
+                                    parts.[1].Split ','
+                                    |> Array.toList
+                                    |> List.map (fun (f : string) ->
+                                        let bits = f.Trim().Split ' '
+                                        bits.[0], GTyName (bits.[1]))
+                                // a loop over the schema, emitting a type each
+                                GRecordType (name, [], fields))
+                        [ "provided.fpp", renderFile decls ] }
+            let out =
+                runGenerated [ provider ]
+                    [ "types.fpp", [ "module Types"; "type Anchor = { A : int }" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "let go ="
+                        "    let p = { Name = \"ada\"; Age = 36 }"
+                        "    let c = { Label = \"london\"; Population = 9 }"
+                        "    print (p.Name + \"/\" + string p.Age)"
+                        "    print (c.Label + \"/\" + string c.Population)" ] ]
+            Expect.equal out "ada/36\nlondon/9\n" "provided types are ordinary types"
+        }
+
+        test "AOP: a loop over fields emitting members, with spliced types" {
+            // the shape asked for: loop the fields, emit a member per field,
+            // splice the field's TYPE into the signature. Quoted source with
+            // interpolated splices — no builder AST in sight.
+            let accessors : Fpp.Core.Plugins.Generator =
+                { GName = "accessors"
+                  Generate =
+                    fun view ->
+                        let opens =
+                            view.Types
+                            |> List.filter (fun t -> t.TKind = "record" && t.TModule <> "")
+                            |> List.map (fun t -> t.TModule)
+                            |> List.distinct
+                            |> List.map GOpen
+                        let perType =
+                            view.Types
+                            |> List.filter (fun t -> t.TKind = "record")
+                            |> List.map (fun t ->
+                                let members =
+                                    t.TFields
+                                    |> List.map (fun f ->
+                                        // <@ member x.GetBla () : %ty = ... @>
+                                        "    member x.Get" + f.FName + " () : " + f.FType
+                                        + " = " + exInline (GField (GVar "v", f.FName)))
+                                    |> String.concat "\n"
+                                GQuote ("type " + t.TName + "View (v : " + t.TName + ") =\n" + members))
+                        [ "accessors.fpp", renderFile (opens @ perType) ] }
+            let out =
+                runGenerated [ accessors ]
+                    [ "types.fpp", [ "module Types"; "type Point = { X : int; Y : int }"; "type Tagged = { Tag : string; Count : int }" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "open Types"
+                        "let go ="
+                        "    let p = PointView { X = 3; Y = 4 }"
+                        "    print (p.GetX () + p.GetY ())"
+                        "    let t = TaggedView { Tag = \"n\"; Count = 7 }"
+                        "    print (t.GetTag () + string (t.GetCount ()))" ] ]
+            Expect.equal out "7\nn7\n" "a member per field, each with the field's own type"
+        }
+
+        test "the view exposes values, not only types" {
+            // AOP needs to SEE functions: attributes on them drive wrappers
+            let tracer : Fpp.Core.Plugins.Generator =
+                { GName = "tracer"
+                  Generate =
+                    fun view ->
+                        let traced =
+                            view.Values
+                            |> List.filter (fun v -> v.VAttrs |> List.exists (fun (n, _) -> n = "Trace"))
+                            |> List.map (fun v -> v.VName)
+                        [ "traced.fpp", renderFile [ GValue ("tracedNames", [], None, GStr (String.concat "," traced)) ] ] }
+            let out =
+                runGenerated [ tracer ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "type Anchor = { A : int }"
+                        "[<Trace>]"
+                        "let watched (x : int) = x + 1"
+                        "let ignored (x : int) = x + 2" ]
+                      "main.fpp", [ "module Main"; "let go = print tracedNames" ] ]
+            Expect.equal out "watched\n" "only the attributed function is reported"
+        }
+
+        test "a plugin lowers `vertex { ... }` blocks anywhere in user code" {
+            // The shader-language shape: the user writes an embedded block
+            // WHEREVER they like, and a plugin lowers the whole thing to its
+            // own IR by REWRITING the file — augmenting with new declarations
+            // could not do this, because the block has to disappear.
+            let shaderc : Fpp.Core.Plugins.Generator =
+                { GName = "shaderc"
+                  Generate =
+                    fun view ->
+                        view.Sources
+                        |> List.filter (fun (_, text) -> text.Contains "vertex {")
+                        |> List.map (fun (path, text) ->
+                            // find each block and replace it with lowered IR
+                            let mutable out = text
+                            let mutable guard = 0
+                            while out.Contains "vertex {" && guard < 20 do
+                                guard <- guard + 1
+                                let start = out.IndexOf "vertex {"
+                                let close = out.IndexOf ("}", start)
+                                let body = out.Substring (start + 8, close - start - 8)
+                                let fields =
+                                    body.Split ';'
+                                    |> Array.toList
+                                    |> List.map (fun (f : string) -> f.Trim ())
+                                    |> List.filter (fun f -> f <> "")
+                                    |> List.map (fun f -> (f.Split '=').[0].Trim ())
+                                let lowered = "\"VERTEX_IR(" + String.concat "," fields + ")\""
+                                out <- out.Substring (0, start) + lowered + out.Substring (close + 1)
+                            path, out) }
+            let out =
+                runGenerated [ shaderc ]
+                    [ "main.fpp",
+                      [ "module Main"
+                        "let simple = vertex { pos = 1; color = 2 }"
+                        "let another = vertex { normal = 3 }"
+                        "let go ="
+                        "    print simple"
+                        "    print another" ] ]
+            Expect.equal out "VERTEX_IR(pos,color)\nVERTEX_IR(normal)\n"
+                "both embedded blocks were lowered, in place, by the plugin"
+        }
+
+        test "a rewritten file still gets its errors blamed on the plugin" {
+            let breaker : Fpp.Core.Plugins.Generator =
+                { GName = "breaker"
+                  Generate = fun view -> view.Sources |> List.map (fun (p, _) -> p, "let x = 1 +\n") }
+            let ws = Workspace()
+            ws.AddGenerator breaker
+            ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
+            let _, errs = ws.EmitProgramWasm ()
+            Expect.isNonEmpty errs "the rewritten file does not compile"
+            Expect.stringContains (List.head errs) "generator 'breaker'" "and the plugin that rewrote it is named"
+        }
+
         test "deriveGen skips what it cannot generate soundly" {
             let text =
                 generatedText [ Fpp.Core.Plugins.deriveGen ]

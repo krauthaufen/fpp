@@ -216,6 +216,10 @@ type Workspace() =
     let generators = vecNew<Fpp.Core.Plugins.Generator> ()
     /// generated path -> the generator that wrote it, for blaming diagnostics
     let generatedBy = dictNew<string, string> ()
+    /// hand-written text, captured before any generator rewrites a file: the
+    /// INPUT to generation must stay what the human wrote, or a second compile
+    /// would feed a generator its own output
+    let originalText = dictNew<string, string> ()
     let pluginErrors = vecNew<string> ()
 
     /// Register a compiler plugin (project config, never source annotations).
@@ -402,12 +406,32 @@ type Workspace() =
     /// than accumulates.
     member private this.RunGenerators () : unit =
         if vecLen generators > 0 then
+            for path in this.ProjectFiles do
+                if not (path.StartsWith Workspace.GeneratedPrefix)
+                   && not (dictTryFind originalText path).IsSome then
+                    dictSet originalText path (this.FileText path)
+            // parse the ORIGINAL text, never a rewritten file
+            for path in this.ProjectFiles do
+                match dictTryFind originalText path with
+                | Some t when t <> this.FileText path -> db.SetInput "text" path (box t)
+                | _ -> ()
             let types = vecNew<Fpp.Core.Plugins.GenTypeDecl> ()
             for path in this.ProjectFiles do
                 if not (path.StartsWith Workspace.GeneratedPrefix) then
                     let pr = this.ParseFile path
                     for t in Fpp.Core.Plugins.typeDeclsOf path pr.Root do vecAdd types t
-            let view : Fpp.Core.Plugins.ProgramView = { Types = vecToList types }
+            let values = vecNew<Fpp.Core.Plugins.GenValueDecl> ()
+            for path in this.ProjectFiles do
+                if not (path.StartsWith Workspace.GeneratedPrefix) then
+                    let pr = this.ParseFile path
+                    for v in Fpp.Core.Plugins.valueDeclsOf path pr.Root do vecAdd values v
+            let sources =
+                this.ProjectFiles
+                |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
+                |> List.map (fun p ->
+                    p, (match dictTryFind originalText p with Some t -> t | None -> this.FileText p))
+            let view : Fpp.Core.Plugins.ProgramView =
+                { Types = vecToList types; Values = vecToList values; Sources = sources }
             // A file sees only EARLIER files, so generated code goes directly
             // after the last file that declared a type: it can name every type
             // it derives from, and anything in a later file can name it. A
@@ -425,14 +449,25 @@ type Workspace() =
             for g in vecToList generators do
                 try
                     for name, src in g.Generate view do
-                        let path = Workspace.GeneratedPrefix + name
-                        dictSet generatedBy path g.GName
-                        db.SetInput "text" path (box src)
                         let files = this.ProjectFiles
-                        if not (List.contains path files) then
-                            let before = files |> List.truncate (anchorIndex + 1)
-                            let after = files |> List.skip (min (List.length files) (anchorIndex + 1))
-                            db.SetInput "project" "" (box (before @ [ path ] @ after))
+                        if List.contains name files && not (name.StartsWith Workspace.GeneratedPrefix) then
+                            // REWRITE: the generator returned a hand-written
+                            // path, so it replaces that file wholesale
+                            match dictTryFind generatedBy name with
+                            | Some other when other <> g.GName ->
+                                vecAdd pluginErrors
+                                    ("generators '" + other + "' and '" + g.GName + "' both rewrite " + name)
+                            | _ ->
+                                dictSet generatedBy name g.GName
+                                db.SetInput "text" name (box src)
+                        else
+                            let path = Workspace.GeneratedPrefix + name
+                            dictSet generatedBy path g.GName
+                            db.SetInput "text" path (box src)
+                            if not (List.contains path files) then
+                                let before = files |> List.truncate (anchorIndex + 1)
+                                let after = files |> List.skip (min (List.length files) (anchorIndex + 1))
+                                db.SetInput "project" "" (box (before @ [ path ] @ after))
                 with e -> vecAdd pluginErrors ("generator " + g.GName + " failed: " + e.Message)
 
     /// The files the generators produced this run: path, generator, source.

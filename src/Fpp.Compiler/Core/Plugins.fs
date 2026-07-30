@@ -61,8 +61,27 @@ type GenTypeDecl =
       /// than deriving for everything in sight
       TAttrs : (string * string list) list }
 
-/// What a generator gets to look at: the hand-written declarations.
-type ProgramView = { Types : GenTypeDecl list }
+type GenValueDecl =
+    { VName : string
+      /// parameters as written: name and, where annotated, type
+      VParams : (string * string) list
+      /// the return type when annotated, "" otherwise
+      VReturn : string
+      VFile : string
+      VModule : string
+      VAttrs : (string * string list) list }
+
+/// What a generator gets to look at: the hand-written declarations. Types AND
+/// values — deriving needs the first, anything AOP-shaped (tracing, wrapping,
+/// serialization entry points) needs the second.
+type ProgramView =
+    { Types : GenTypeDecl list
+      Values : GenValueDecl list
+      /// every hand-written file: path and its ORIGINAL text. A generator that
+      /// returns one of these paths REPLACES that file — the tier a shader
+      /// language or any source-to-source pass needs, where augmenting with
+      /// new declarations is not enough.
+      Sources : (string * string) list }
 
 type Generator =
     { GName : string
@@ -84,6 +103,75 @@ let private toks (n : GreenNode) =
 /// the source text of a type node, reassembled from its tokens
 let private typeText (n : GreenNode) =
     Green.tokens (GNode n) |> List.map (fun t -> t.Text) |> String.concat ""
+
+/// Every top-level value declaration in a parse tree, with its attributes.
+let valueDeclsOf (path : string) (root : GreenNode) : GenValueDecl list =
+    let out = vecNew<GenValueDecl> ()
+    let attrsOfList (m : GreenNode) : (string * string list) list =
+        let ts = Green.tokens (GNode m)
+        let names = ts |> List.filter (fun t -> t.Kind = Ident) |> List.map (fun t -> t.Text)
+        let args =
+            ts
+            |> List.filter (fun t -> t.Kind = StringLit)
+            |> List.map (fun t ->
+                let raw = t.Text
+                if raw.Length >= 2 && raw.StartsWith "\"" then raw.Substring (1, raw.Length - 2) else raw)
+        match names with
+        | [] -> []
+        | first :: _ -> [ first, args ]
+    let rec walk (modName : string) (pending : (string * string list) list) (n : GreenNode) =
+        let mutable scope = modName
+        let mutable attrs = pending
+        for c in n.Children |> List.choose (fun x -> match x with GNode m -> Some m | _ -> None) do
+            if c.NodeKind = AttributeList then attrs <- attrs @ attrsOfList c
+            elif c.NodeKind = ModuleHeader then
+                let nm =
+                    Green.tokens (GNode c)
+                    |> List.filter (fun t -> t.Kind = Ident)
+                    |> List.map (fun t -> t.Text)
+                    |> String.concat "."
+                if nm <> "" then scope <- nm
+            elif c.NodeKind = LetDecl then
+                // `let f (x : int) : string = ...` — the NAME is an IdentPat
+                // child, the parameters are the pattern children after it, and
+                // a return annotation is a bare type child
+                let kids = c.Children |> List.choose (fun x -> match x with GNode m -> Some m | _ -> None)
+                let firstIdent (m : GreenNode) =
+                    match Green.tokens (GNode m) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                    | Some t -> t.Text
+                    | None -> ""
+                let isPatNode (k : NodeKind) = k = IdentPat || k = ParenPat || k = TuplePat || k = WildcardPat
+                let pats = kids |> List.filter (fun m -> isPatNode m.NodeKind)
+                let retTy =
+                    kids
+                    |> List.filter (fun m -> isTypeNode m.NodeKind)
+                    |> List.map typeText
+                    |> List.tryHead
+                (match pats with
+                 | nameNode :: paramNodes ->
+                     vecAdd out
+                         { VName = firstIdent nameNode
+                           VParams =
+                             paramNodes
+                             |> List.map (fun pn ->
+                                 let ty =
+                                     pn.Children
+                                     |> List.choose (fun x -> match x with GNode m -> Some m | _ -> None)
+                                     |> List.filter (fun m -> isTypeNode m.NodeKind)
+                                     |> List.map typeText
+                                     |> List.tryHead
+                                 firstIdent pn, (match ty with Some t -> t | None -> ""))
+                           VReturn = (match retTy with Some t -> t | None -> "")
+                           VFile = path
+                           VModule = scope
+                           VAttrs = attrs }
+                 | [] -> ())
+                attrs <- []
+            else
+                walk scope [] c
+                attrs <- []
+    walk "" [] root
+    vecToList out
 
 /// Every type declaration in a parse tree, at any module depth.
 let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
@@ -528,6 +616,19 @@ let declLines (d : GDecl) : string list =
 /// An expression as source at a given indent — the splice helper. `tyText`
 /// does the same for a type.
 let exText (ind : int) (e : GEx) : string = String.concat "\n" (exLines ind e)
+
+/// An expression as ONE line, whatever its size. This is the splice to reach
+/// for inside a quoted template: it drops into any column without the author
+/// having to know the indentation, where a multi-line splice would land its
+/// continuation lines in the wrong place and break the off-side rule.
+let exInline (e : GEx) : string =
+    match inlineOf e with
+    | Some one -> one
+    | None ->
+        // shapes with no one-line form (a `let` sequence, a match) become one
+        // by parenthesising and joining — legal, just long
+        let joined = exLines 0 e |> List.map (fun (l : string) -> l.Trim ()) |> String.concat " "
+        "(" + joined + ")"
 
 /// A whole generated file. No module header on purpose: top-level bindings are
 /// what a later file can name without an `open`.
