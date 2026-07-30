@@ -2804,49 +2804,31 @@ Landed:
   inner diagnostics) and itself denotes `Code`; a splice requires its operand to
   be `Code` and takes a fresh type for the hole.
 
-LOWERING LANDED: a quotation evaluates to a `Code` value, and splices compose —
-`<@ %b * 3 @>` where `b` is `<@ %a + 2 @>` renders `1 + 2 * 3`. `Code` is a real
-prelude type with `Code.text` / `Code.ofText`. The interim representation is the
-code's SOURCE; carrying the AST is the next step and does not change how a
-quotation is written.
+CODE IS AN AST. `Code` is a union — CInt / CStr / CBool / CName / CApp / CBin /
+CLet / CIf — with NO text case and no printer. A quotation lowers straight to
+that tree, and a splice grafts the spliced Code value in as a SUBTREE. Three
+things follow, each pinned by a test:
+* Composition cannot be reinterpreted: `<@ %b * 3 @>` over `b = <@ %a + 2 @>`
+  is `Bin(*, Bin(+, Int 1, Int 2), Int 3)`. Precedence is not something a tree
+  can be wrong about, so the earlier parenthesising fix went away with the text.
+* Nothing is parsed twice — a plugin matches on the tree it is handed.
+* NO FALLBACK: a construct outside the quotable subset is a compile-time error
+  naming it (`not quotable in <@ @>: ListExpr`), never silent text.
 
-SOUNDNESS FIX: a splice is PARENTHESISED when embedded. Composing code is not
-composing text — without it `<@ %b * 3 @>` over `b = <@ %a + 2 @>` rendered
-`1 + 2 * 3`, which MEANS `1 + (2*3)`, silently changing what the composition
-denotes. Now `((1 )+ 2 )* 3`. Pinned by the battery program.
+Two parser rules keep it unambiguous, both pinned:
+* A quotation is an ATOM, so `f <@ 1 + 2 @>` applies `f` to quoted code.
+* `%` is a splice only when quoteDepth > 0 AND the next token is ADJACENT by
+  offset. `a % b` stays modulo everywhere, including inside a quotation; `%x`
+  splices. Trivia can hang off the PREVIOUS token, so adjacency is by offset,
+  not by an empty Leading list — the first attempt used Leading and read
+  `<@ 7 % 3 @>` as a splice.
 
-IN PROGRESS on branch `quotation-ast-wip`: `Code` rewritten as a real union
-(CInt/CStr/CBool/CName/CApp/CBin/CLet/CIf, no text case) and the lowering
-rewritten to build that tree — a splice grafts the Code value as a SUBTREE, so
-nothing is re-parsed and precedence cannot reinterpret a composition. It
-compiles but TRAPS at run time: something in the emitted constructor path is
-still a stub, and the probe used did not surface the warning. Next step is one
-debug cycle — run a quoted `<@ 1 + 2 @>` and read the `warn: stubbed` line to
-see which construction is unresolved (suspect the ECtor scheme passed for the
-case, or the `CApp of Code * Code list` payload arity).
+A multi-field union case takes its payload as ONE tuple in the IR; passing the
+fields as separate ECtor args emits "multi-payload ctor not ported".
 
-STILL TO DO, in order:
-1. **Code carries an AST**, not source text, so a plugin can match on and
-   rewrite quoted code rather than re-parse it. This is the remaining
-   COMPLETENESS item, and it also retires the last soundness worry: with an AST
-   there is no rendering step in the middle of composition at all, so
-   precedence, capture and formatting stop being questions about text. The
-   shape: a `Code` union over the quotable subset (literals, names, application,
-   binary operators, let-sequences, if, splice holes), lowering that maps each
-   expression node kind to a constructor, `Code.text` as a printer over it, and
-   a quotation of anything OUTSIDE the subset rejected at compile time rather
-   than falling back to text — a loud boundary beats a silent mixed
-   representation.
-2. DONE — a quoted body now gets its OWN block context (`parseBlock`), so a
-   multi-line `let` sequence inside a quotation parses, checks and hovers like
-   any other block.
-3. **Typed quotations** — `Code<'t>` so `<@ 1 + 1 @>` is `Code<int>` and a
-   splice checks against the hole's expected type.
-4. **Hygiene** — `newName`-style gensym so a quoted binder cannot capture a
-   spliced name.
-5. **Compile-time execution**, so a plugin written in F++ can run during
-   compilation and return quoted code. The compiler already compiles to wasm and
-   the gates already run wasm, so this is wiring rather than invention.
+STILL OPEN: typed `Code<'t>` so a splice checks against the hole's expected
+type; hygiene/gensym; widening the quotable subset (lists, matches, lambdas);
+and compile-time execution of F++-written plugins.
 
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
