@@ -2787,6 +2787,37 @@ self-application gates:
 * `min a b` reads as taking a TUPLE, and `Seq.toList` over a string does not
   resolve. Use an `if` and `String.Split` respectively.
 
+### IN-LANGUAGE QUOTATION — started, and where it stands
+`<@ ... @>` and `%splice` are REAL SYNTAX now, and the quoted body is parsed as
+ORDINARY code — which is the whole point: it resolves, type checks and hovers
+like anything else. Verified by tests: hovering `n` inside `<@ n + 1 @>` reports
+`let n : int`, the quotation itself has type `Code`, and a type error inside a
+quotation (`<@ 1 + "two" @>`) is reported like any other type error. No strings
+anywhere in the authoring path.
+
+Landed:
+* Lexer needed NOTHING — `<@` and `@>` already lex as single symbolic tokens.
+* Parser: `QuoteExpr` / `SpliceExpr` nodes; `canStartExpr` accepts them;
+  `infixPrec "@>" = 0` so the closer is not eaten as the append operator
+  (`x % y` and `xs @ ys` still parse as themselves — pinned by a test).
+* Infer: a quotation types its BODY normally (that is what produces hovers and
+  inner diagnostics) and itself denotes `Code`; a splice requires its operand to
+  be `Code` and takes a fresh type for the hole.
+
+STILL TO DO, in order:
+1. **Lowering.** A quotation currently has no runtime value: a program that
+   EMITS one will fail to lower. It should build a Code value — carrying the
+   AST, not rendered text — with splices embedded at runtime.
+2. **`Code` as a real prelude type**, with the AST constructors it holds, so
+   `Code` can be pattern matched and composed by a plugin.
+3. **Typed quotations** — `Code<'t>` so `<@ 1 + 1 @>` is `Code<int>` and a
+   splice checks against the hole's expected type.
+4. **Hygiene** — `newName`-style gensym so a quoted binder cannot capture a
+   spliced name.
+5. **Compile-time execution**, so a plugin written in F++ can run during
+   compilation and return quoted code. The compiler already compiles to wasm and
+   the gates already run wasm, so this is wiring rather than invention.
+
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
 * **Source tier (Generator)** — runs before the front end, sees the program and
