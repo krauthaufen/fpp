@@ -693,6 +693,101 @@ module Option =
     let toList (o : 'a option) : 'a list = match o with Some x -> [ x ] | None -> []
 
 // ---- tuple projections ----
+    let defaultWith (f : unit -> 'a) (o : 'a option) : 'a =
+        match o with Some x -> x | None -> f ()
+    let orElse (ifNone : 'a option) (o : 'a option) : 'a option =
+        match o with Some _ -> o | None -> ifNone
+    let orElseWith (f : unit -> 'a option) (o : 'a option) : 'a option =
+        match o with Some _ -> o | None -> f ()
+    let map2 (f : 'a -> 'b -> 'c) (a : 'a option) (b : 'b option) : 'c option =
+        match a, b with
+        | Some x, Some y -> Some (f x y)
+        | _ -> None
+    let map3 (f : 'a -> 'b -> 'c -> 'd) (a : 'a option) (b : 'b option) (c : 'c option) : 'd option =
+        match a, b, c with
+        | Some x, Some y, Some z -> Some (f x y z)
+        | _ -> None
+    let flatten (o : 'a option option) : 'a option =
+        match o with Some x -> x | None -> None
+    let count (o : 'a option) : int =
+        match o with Some _ -> 1 | None -> 0
+    let fold (f : 's -> 'a -> 's) (st : 's) (o : 'a option) : 's =
+        match o with Some x -> f st x | None -> st
+    let foldBack (f : 'a -> 's -> 's) (o : 'a option) (st : 's) : 's =
+        match o with Some x -> f x st | None -> st
+    let contains (v : 'a) (o : 'a option) : bool =
+        match o with Some x -> x = v | None -> false
+    let toArray (o : 'a option) : 'a[] =
+        match o with Some x -> [| x |] | None -> [||]
+    let get (o : 'a option) : 'a =
+        match o with
+        | Some x -> x
+        | None -> failwith "The option value was None"
+
+/// Result: the other half of F#'s error-handling pair. Ok/Error already
+/// exist as the type's cases; this is the module of operations over them.
+module Result =
+    let map (f : 'a -> 'b) (r : Result<'a, 'e>) : Result<'b, 'e> =
+        match r with
+        | Ok x -> Ok (f x)
+        | Error e -> Error e
+    let mapError (f : 'e -> 'f) (r : Result<'a, 'e>) : Result<'a, 'f> =
+        match r with
+        | Ok x -> Ok x
+        | Error e -> Error (f e)
+    let bind (f : 'a -> Result<'b, 'e>) (r : Result<'a, 'e>) : Result<'b, 'e> =
+        match r with
+        | Ok x -> f x
+        | Error e -> Error e
+    let isOk (r : Result<'a, 'e>) : bool =
+        match r with Ok _ -> true | Error _ -> false
+    let isError (r : Result<'a, 'e>) : bool =
+        match r with Ok _ -> false | Error _ -> true
+    let defaultValue (v : 'a) (r : Result<'a, 'e>) : 'a =
+        match r with Ok x -> x | Error _ -> v
+    let defaultWith (f : 'e -> 'a) (r : Result<'a, 'e>) : 'a =
+        match r with Ok x -> x | Error e -> f e
+    let toOption (r : Result<'a, 'e>) : 'a option =
+        match r with Ok x -> Some x | Error _ -> None
+    let toList (r : Result<'a, 'e>) : 'a list =
+        match r with Ok x -> [ x ] | Error _ -> []
+    let toArray (r : Result<'a, 'e>) : 'a[] =
+        match r with Ok x -> [| x |] | Error _ -> [||]
+    let count (r : Result<'a, 'e>) : int =
+        match r with Ok _ -> 1 | Error _ -> 0
+    let fold (f : 's -> 'a -> 's) (st : 's) (r : Result<'a, 'e>) : 's =
+        match r with Ok x -> f st x | Error _ -> st
+    let foldBack (f : 'a -> 's -> 's) (r : Result<'a, 'e>) (st : 's) : 's =
+        match r with Ok x -> f x st | Error _ -> st
+    let iter (f : 'a -> unit) (r : Result<'a, 'e>) : unit =
+        match r with Ok x -> f x | Error _ -> ()
+    let iterError (f : 'e -> unit) (r : Result<'a, 'e>) : unit =
+        match r with Ok _ -> () | Error e -> f e
+    let exists (p : 'a -> bool) (r : Result<'a, 'e>) : bool =
+        match r with Ok x -> p x | Error _ -> false
+    let forall (p : 'a -> bool) (r : Result<'a, 'e>) : bool =
+        match r with Ok x -> p x | Error _ -> true
+    let contains (v : 'a) (r : Result<'a, 'e>) : bool =
+        match r with Ok x -> x = v | Error _ -> false
+
+/// Char: the System.Char predicates, ASCII-faithful. Values at or above 128
+/// are left alone — F++ strings are byte sequences, so a "letter" beyond
+/// ASCII is a UTF-8 continuation the classifier must not claim.
+module Char =
+    let IsDigit (c : char) : bool = c >= '0' && c <= '9'
+    let IsLetter (c : char) : bool =
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+    let IsLetterOrDigit (c : char) : bool = IsLetter c || IsDigit c
+    let IsWhiteSpace (c : char) : bool =
+        c = ' ' || c = '\t' || c = '\n' || c = '\r' || int c = 11 || int c = 12
+    let IsUpper (c : char) : bool = c >= 'A' && c <= 'Z'
+    let IsLower (c : char) : bool = c >= 'a' && c <= 'z'
+    let ToUpper (c : char) : char = if IsLower c then char (int c - 32) else c
+    let ToLower (c : char) : char = if IsUpper c then char (int c + 32) else c
+    let IsPunctuation (c : char) : bool =
+        let i = int c
+        (i >= 33 && i <= 47) || (i >= 58 && i <= 64)
+        || (i >= 91 && i <= 96) || (i >= 123 && i <= 126)
 let defaultArg (o : 'a option) (dflt : 'a) : 'a =
     match o with
     | Some v -> v
@@ -1180,6 +1275,215 @@ module Array =
 
 
 // ---- List: the F# List module ----
+    let empty : 'a[] = [||]
+    let singleton (x : 'a) : 'a[] = [| x |]
+    let head (xs : 'a[]) : 'a =
+        if length xs = 0 then failwith "The input array was empty" else xs.[0]
+    let last (xs : 'a[]) : 'a =
+        if length xs = 0 then failwith "The input array was empty" else xs.[length xs - 1]
+    let tryHead (xs : 'a[]) : 'a option =
+        if length xs = 0 then None else Some xs.[0]
+    let tryLast (xs : 'a[]) : 'a option =
+        if length xs = 0 then None else Some xs.[length xs - 1]
+    let tryItem (i : int) (xs : 'a[]) : 'a option =
+        if i < 0 || i >= length xs then None else Some xs.[i]
+    let tail (xs : 'a[]) : 'a[] =
+        if length xs = 0 then failwith "The input array was empty" else skip 1 xs
+    let findIndex (p : 'a -> bool) (xs : 'a[]) : int =
+        let mutable i = 0
+        let mutable found = -1
+        while found < 0 && i < length xs do
+            if p xs.[i] then found <- i
+            i <- i + 1
+        if found < 0 then failwith "An index satisfying the predicate was not found in the collection."
+        else found
+    let tryFindIndex (p : 'a -> bool) (xs : 'a[]) : int option =
+        let mutable i = 0
+        let mutable found = None
+        while (match found with None -> true | Some _ -> false) && i < length xs do
+            if p xs.[i] then found <- Some i
+            i <- i + 1
+        found
+    let findBack (p : 'a -> bool) (xs : 'a[]) : 'a =
+        let mutable i = length xs - 1
+        let mutable found = None
+        while (match found with None -> true | Some _ -> false) && i >= 0 do
+            if p xs.[i] then found <- Some xs.[i]
+            i <- i - 1
+        match found with
+        | Some v -> v
+        | None -> failwith "An element satisfying the predicate was not found in the collection."
+    let tryFindBack (p : 'a -> bool) (xs : 'a[]) : 'a option =
+        let mutable i = length xs - 1
+        let mutable found = None
+        while (match found with None -> true | Some _ -> false) && i >= 0 do
+            if p xs.[i] then found <- Some xs.[i]
+            i <- i - 1
+        found
+    let tryFindIndexBack (p : 'a -> bool) (xs : 'a[]) : int option =
+        let mutable i = length xs - 1
+        let mutable found = None
+        while (match found with None -> true | Some _ -> false) && i >= 0 do
+            if p xs.[i] then found <- Some i
+            i <- i - 1
+        found
+    let takeWhile (p : 'a -> bool) (xs : 'a[]) : 'a[] =
+        let mutable n = 0
+        let mutable go = true
+        while go && n < length xs do
+            if p xs.[n] then n <- n + 1 else go <- false
+        sub xs 0 n
+    let skipWhile (p : 'a -> bool) (xs : 'a[]) : 'a[] =
+        let mutable n = 0
+        let mutable go = true
+        while go && n < length xs do
+            if p xs.[n] then n <- n + 1 else go <- false
+        sub xs n (length xs - n)
+    let partition (p : 'a -> bool) (xs : 'a[]) : 'a[] * 'a[] =
+        filter p xs, filter (fun x -> not (p x)) xs
+    let where (p : 'a -> bool) (xs : 'a[]) : 'a[] = filter p xs
+    let concat (xss : 'a[] list) : 'a[] =
+        let mutable total = 0
+        for xs in xss do total <- total + length xs
+        if total = 0 then [||]
+        else
+            let mutable first = [||]
+            for xs in xss do
+                if length xs > 0 && length first = 0 then first <- xs
+            let r = create total first.[0]
+            let mutable k = 0
+            for xs in xss do
+                for x in xs do
+                    r.[k] <- x
+                    k <- k + 1
+            r
+    let allPairs (xs : 'a[]) (ys : 'b[]) : ('a * 'b)[] =
+        let r = zeroCreate (length xs * length ys)
+        let mutable k = 0
+        for x in xs do
+            for y in ys do
+                r.[k] <- (x, y)
+                k <- k + 1
+        r
+    // Array is declared BEFORE List in this prelude, so these carry their
+    // own implementations rather than delegating. Key order is
+    // first-occurrence, as F#'s is.
+    let countBy (f : 'a -> 'k) (xs : 'a[]) : ('k * int)[] =
+        let keys = zeroCreate (length xs)
+        let counts = zeroCreate (length xs)
+        let mutable n = 0
+        for x in xs do
+            let k = f x
+            let mutable at = -1
+            let mutable i = 0
+            while at < 0 && i < n do
+                if keys.[i] = k then at <- i
+                i <- i + 1
+            if at < 0 then
+                keys.[n] <- k
+                counts.[n] <- 1
+                n <- n + 1
+            else counts.[at] <- counts.[at] + 1
+        let r = zeroCreate n
+        let mutable j = 0
+        while j < n do
+            r.[j] <- (keys.[j], counts.[j])
+            j <- j + 1
+        r
+    let groupBy (f : 'a -> 'k) (xs : 'a[]) : ('k * 'a[])[] =
+        let keys = zeroCreate (length xs)
+        let mutable n = 0
+        for x in xs do
+            let k = f x
+            let mutable at = -1
+            let mutable i = 0
+            while at < 0 && i < n do
+                if keys.[i] = k then at <- i
+                i <- i + 1
+            if at < 0 then
+                keys.[n] <- k
+                n <- n + 1
+        let r = zeroCreate n
+        let mutable j = 0
+        while j < n do
+            let kj = keys.[j]
+            r.[j] <- (kj, filter (fun x -> f x = kj) xs)
+            j <- j + 1
+        r
+    let splitInto (n : int) (xs : 'a[]) : 'a[][] =
+        let len = length xs
+        if len = 0 then [||]
+        else
+            let count = if n < len then n else len
+            let sz = len / count
+            let extra = len % count
+            let r = zeroCreate count
+            let mutable at = 0
+            let mutable i = 0
+            while i < count do
+                let take_ = if i < extra then sz + 1 else sz
+                r.[i] <- sub xs at take_
+                at <- at + take_
+                i <- i + 1
+            r
+    let splitAt (n : int) (xs : 'a[]) : 'a[] * 'a[] =
+        sub xs 0 n, sub xs n (length xs - n)
+    let exactlyOne (xs : 'a[]) : 'a =
+        if length xs = 1 then xs.[0]
+        elif length xs = 0 then failwith "The input sequence was empty"
+        else failwith "The input sequence contains more than one element"
+    let tryExactlyOne (xs : 'a[]) : 'a option =
+        if length xs = 1 then Some xs.[0] else None
+    let reduceBack (f : 'a -> 'a -> 'a) (xs : 'a[]) : 'a =
+        if length xs = 0 then failwith "The input array was empty"
+        else
+            let mutable acc = xs.[length xs - 1]
+            let mutable i = length xs - 2
+            while i >= 0 do
+                acc <- f xs.[i] acc
+                i <- i - 1
+            acc
+    let mapFold (f : 's -> 'a -> 'b * 's) (st : 's) (xs : 'a[]) : 'b[] * 's =
+        let r = zeroCreate (length xs)
+        let mutable s2 = st
+        let mutable i = 0
+        while i < length xs do
+            let y, s3 = f s2 xs.[i]
+            r.[i] <- y
+            s2 <- s3
+            i <- i + 1
+        r, s2
+    let insertAt (i : int) (v : 'a) (xs : 'a[]) : 'a[] =
+        let r = zeroCreate (length xs + 1)
+        let mutable k = 0
+        while k < i do
+            r.[k] <- xs.[k]
+            k <- k + 1
+        r.[i] <- v
+        while k < length xs do
+            r.[k + 1] <- xs.[k]
+            k <- k + 1
+        r
+    let removeAt (i : int) (xs : 'a[]) : 'a[] =
+        let r = zeroCreate (length xs - 1)
+        let mutable k = 0
+        while k < length xs do
+            if k < i then r.[k] <- xs.[k]
+            elif k > i then r.[k - 1] <- xs.[k]
+            k <- k + 1
+        r
+    let updateAt (i : int) (v : 'a) (xs : 'a[]) : 'a[] =
+        let r = copy xs
+        r.[i] <- v
+        r
+    let replicate (n : int) (v : 'a) : 'a[] = create n v
+    let average (xs : float[]) : float =
+        if length xs = 0 then failwith "The input array was empty"
+        else sum xs / float (length xs)
+    let averageBy (f : 'a -> float) (xs : 'a[]) : float =
+        if length xs = 0 then failwith "The input array was empty"
+        else sumBy f xs / float (length xs)
+    let reverse (xs : 'a[]) : 'a[] = rev xs
 module List =
     let length (xs : 'a list) =
         let mutable n = 0
@@ -1632,6 +1936,131 @@ module List =
         sortWith (fun a b -> compare (f b) (f a)) xs
 
 // ---- Seq: lazy combinators over the enumerator protocol ----
+    let empty : 'a list = []
+    let singleton (x : 'a) : 'a list = [ x ]
+    let partition (p : 'a -> bool) (xs : 'a list) : 'a list * 'a list =
+        let mutable yes = []
+        let mutable no = []
+        for x in xs do
+            if p x then yes <- x :: yes else no <- x :: no
+        rev yes, rev no
+    let takeWhile (p : 'a -> bool) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable go = true
+        for x in xs do
+            if go then
+                if p x then acc <- x :: acc else go <- false
+        rev acc
+    let skipWhile (p : 'a -> bool) (xs : 'a list) : 'a list =
+        let mutable rest = xs
+        let mutable go = true
+        while go do
+            match rest with
+            | h :: t when p h -> rest <- t
+            | _ -> go <- false
+        rest
+    let countBy (f : 'a -> 'k) (xs : 'a list) : ('k * int) list =
+        // first-occurrence key order, like F#
+        let mutable keys = []
+        let mutable counts = []
+        for x in xs do
+            let k = f x
+            if contains k keys then
+                counts <- map (fun (k2, c) -> if k2 = k then k2, c + 1 else k2, c) counts
+            else
+                keys <- k :: keys
+                counts <- counts @ [ k, 1 ]
+        counts
+    let groupBy (f : 'a -> 'k) (xs : 'a list) : ('k * 'a list) list =
+        let mutable keys = []
+        let mutable groups = []
+        for x in xs do
+            let k = f x
+            if contains k keys then
+                groups <- map (fun (k2, g) -> if k2 = k then k2, g @ [ x ] else k2, g) groups
+            else
+                keys <- k :: keys
+                groups <- groups @ [ k, [ x ] ]
+        groups
+    let allPairs (xs : 'a list) (ys : 'b list) : ('a * 'b) list =
+        let mutable acc = []
+        for x in xs do
+            for y in ys do
+                acc <- (x, y) :: acc
+        rev acc
+    let exactlyOne (xs : 'a list) : 'a =
+        match xs with
+        | [ x ] -> x
+        | [] -> failwith "The input sequence was empty"
+        | _ -> failwith "The input sequence contains more than one element"
+    let tryExactlyOne (xs : 'a list) : 'a option =
+        match xs with [ x ] -> Some x | _ -> None
+    let findBack (p : 'a -> bool) (xs : 'a list) : 'a = find p (rev xs)
+    let tryFindBack (p : 'a -> bool) (xs : 'a list) : 'a option = tryFind p (rev xs)
+    let findIndexBack (p : 'a -> bool) (xs : 'a list) : int =
+        length xs - 1 - findIndex p (rev xs)
+    let tryFindIndexBack (p : 'a -> bool) (xs : 'a list) : int option =
+        match tryFindIndex p (rev xs) with
+        | Some i -> Some (length xs - 1 - i)
+        | None -> None
+    let reduceBack (f : 'a -> 'a -> 'a) (xs : 'a list) : 'a =
+        match rev xs with
+        | [] -> failwith "The input list was empty"
+        | h :: t -> fold (fun acc x -> f x acc) h t
+    let where (p : 'a -> bool) (xs : 'a list) : 'a list = filter p xs
+    let insertAt (i : int) (v : 'a) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable k = 0
+        for x in xs do
+            if k = i then acc <- x :: v :: acc else acc <- x :: acc
+            k <- k + 1
+        if i = k then acc <- v :: acc
+        rev acc
+    let removeAt (i : int) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable k = 0
+        for x in xs do
+            if k <> i then acc <- x :: acc
+            k <- k + 1
+        rev acc
+    let updateAt (i : int) (v : 'a) (xs : 'a list) : 'a list =
+        let mutable acc = []
+        let mutable k = 0
+        for x in xs do
+            acc <- (if k = i then v else x) :: acc
+            k <- k + 1
+        rev acc
+    let mapFold (f : 's -> 'a -> 'b * 's) (st : 's) (xs : 'a list) : 'b list * 's =
+        let mutable acc = []
+        let mutable s2 = st
+        for x in xs do
+            let y, s3 = f s2 x
+            acc <- y :: acc
+            s2 <- s3
+        rev acc, s2
+    let splitInto (n : int) (xs : 'a list) : 'a list list =
+        // F# spreads the remainder over the EARLIER chunks
+        let len = length xs
+        if len = 0 then []
+        else
+            let count = if n < len then n else len
+            let sz = len / count
+            let extra = len % count
+            let mutable out = []
+            let mutable rest = xs
+            let mutable i = 0
+            while i < count do
+                let take_ = if i < extra then sz + 1 else sz
+                out <- take take_ rest :: out
+                rest <- skip take_ rest
+                i <- i + 1
+            rev out
+    let average (xs : float list) : float =
+        if isEmpty xs then failwith "The input list was empty"
+        else sum xs / float (length xs)
+    let averageBy (f : 'a -> float) (xs : 'a list) : float =
+        if isEmpty xs then failwith "The input list was empty"
+        else sumBy f xs / float (length xs)
 module Seq =
     let map (f : 'a -> 'b) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with
