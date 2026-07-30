@@ -659,6 +659,54 @@ extern let singleBits : float32 -> int
 extern let unbox : obj -> 'a
 
 // ---- Option: the F# Option module ----
+/// The F# math surface the Floating class does not carry as a member:
+/// these are ordinary functions over the class operations above.
+let floor (x : float) : float =
+    let t = truncate x
+    if x < 0.0 && t <> x then t - 1.0 else t
+let ceil (x : float) : float =
+    let t = truncate x
+    if x > 0.0 && t <> x then t + 1.0 else t
+/// F#'s `round` is Math.Round: HALF-TO-EVEN, so 2.5 -> 2 and 3.5 -> 4
+let round (x : float) : float =
+    let f = floor x
+    let d = x - f
+    if d > 0.5 then f + 1.0
+    elif d < 0.5 then f
+    else
+        let half = f / 2.0
+        if truncate half = half then f else f + 1.0
+let log10 (x : float) : float = log x / log 10.0
+let infinity : float = 1.0 / 0.0
+let nan : float = 0.0 / 0.0
+/// integer power, by squaring — F#'s pown
+let pown (x : float) (n : int) : float =
+    let mutable acc = 1.0
+    let mutable b = if n < 0 then 1.0 / x else x
+    let mutable k = if n < 0 then 0 - n else n
+    while k > 0 do
+        if k % 2 = 1 then acc <- acc * b
+        b <- b * b
+        k <- k / 2
+    acc
+
+/// System.Double's statics, as F# spells them
+module Double =
+    let IsNaN (x : float) : bool = x <> x
+    let IsInfinity (x : float) : bool = x = infinity || x = 0.0 - infinity
+    let IsPositiveInfinity (x : float) : bool = x = infinity
+    let IsNegativeInfinity (x : float) : bool = x = 0.0 - infinity
+    let IsFinite (x : float) : bool = not (IsNaN x) && not (IsInfinity x)
+    let MaxValue : float = 1.7976931348623157e308
+    let MinValue : float = -1.7976931348623157e308
+    let Epsilon : float = 5e-324
+
+module Int32 =
+    let MaxValue : int = 2147483647
+    // written as an expression: `-2147483648` lexes as unary minus applied
+    // to 2147483648, which does not fit in an int
+    let MinValue : int = 0 - 2147483647 - 1
+
 module Option =
     let isSome (o : 'a option) : bool = match o with Some _ -> true | None -> false
     let isNone (o : 'a option) : bool = match o with Some _ -> false | None -> true
@@ -1153,6 +1201,144 @@ module Array =
         sortWith (fun a b -> compare (f b) (f a)) xs
 
 
+    let zip3 (a : 'a[]) (b : 'b[]) (c : 'c[]) : ('a * 'b * 'c)[] =
+        let r = zeroCreate (length a)
+        let mutable i = 0
+        while i < length a do
+            r.[i] <- (a.[i], b.[i], c.[i])
+            i <- i + 1
+        r
+    let unzip3 (xs : ('a * 'b * 'c)[]) : 'a[] * 'b[] * 'c[] =
+        let ra = zeroCreate (length xs)
+        let rb = zeroCreate (length xs)
+        let rc = zeroCreate (length xs)
+        let mutable i = 0
+        while i < length xs do
+            let a, b, c = xs.[i]
+            ra.[i] <- a
+            rb.[i] <- b
+            rc.[i] <- c
+            i <- i + 1
+        ra, rb, rc
+    let map3 (f : 'a -> 'b -> 'c -> 'd) (a : 'a[]) (b : 'b[]) (c : 'c[]) : 'd[] =
+        let r = zeroCreate (length a)
+        let mutable i = 0
+        while i < length a do
+            r.[i] <- f a.[i] b.[i] c.[i]
+            i <- i + 1
+        r
+    let mapi2 (f : int -> 'a -> 'b -> 'c) (a : 'a[]) (b : 'b[]) : 'c[] =
+        let r = zeroCreate (length a)
+        let mutable i = 0
+        while i < length a do
+            r.[i] <- f i a.[i] b.[i]
+            i <- i + 1
+        r
+    let iteri2 (f : int -> 'a -> 'b -> unit) (a : 'a[]) (b : 'b[]) : unit =
+        let mutable i = 0
+        while i < length a do
+            f i a.[i] b.[i]
+            i <- i + 1
+    let foldBack2 (f : 'a -> 'b -> 's -> 's) (a : 'a[]) (b : 'b[]) (st : 's) : 's =
+        let mutable acc = st
+        let mutable i = length a - 1
+        while i >= 0 do
+            acc <- f a.[i] b.[i] acc
+            i <- i - 1
+        acc
+    let scanBack (f : 'a -> 's -> 's) (xs : 'a[]) (st : 's) : 's[] =
+        let r = zeroCreate (length xs + 1)
+        r.[length xs] <- st
+        let mutable i = length xs - 1
+        while i >= 0 do
+            r.[i] <- f xs.[i] r.[i + 1]
+            i <- i - 1
+        r
+    let mapFoldBack (f : 'a -> 's -> 'b * 's) (xs : 'a[]) (st : 's) : 'b[] * 's =
+        let r = zeroCreate (length xs)
+        let mutable acc = st
+        let mutable i = length xs - 1
+        while i >= 0 do
+            let y, s2 = f xs.[i] acc
+            r.[i] <- y
+            acc <- s2
+            i <- i - 1
+        r, acc
+    let transpose (xss : 'a[][]) : 'a[][] =
+        if length xss = 0 then [||]
+        else
+            let cols = length xss.[0]
+            let r = zeroCreate cols
+            let mutable j = 0
+            while j < cols do
+                let col = zeroCreate (length xss)
+                let mutable i = 0
+                while i < length xss do
+                    col.[i] <- xss.[i].[j]
+                    i <- i + 1
+                r.[j] <- col
+                j <- j + 1
+            r
+    let permute (f : int -> int) (xs : 'a[]) : 'a[] =
+        let r = zeroCreate (length xs)
+        let mutable i = 0
+        while i < length xs do
+            r.[f i] <- xs.[i]
+            i <- i + 1
+        r
+    let insertManyAt (i : int) (vs : 'a[]) (xs : 'a[]) : 'a[] =
+        let r = zeroCreate (length xs + length vs)
+        let mutable k = 0
+        while k < i do
+            r.[k] <- xs.[k]
+            k <- k + 1
+        let mutable j = 0
+        while j < length vs do
+            r.[i + j] <- vs.[j]
+            j <- j + 1
+        while k < length xs do
+            r.[k + length vs] <- xs.[k]
+            k <- k + 1
+        r
+    let removeManyAt (i : int) (n : int) (xs : 'a[]) : 'a[] =
+        let r = zeroCreate (length xs - n)
+        let mutable k = 0
+        while k < length xs do
+            if k < i then r.[k] <- xs.[k]
+            elif k >= i + n then r.[k - n] <- xs.[k]
+            k <- k + 1
+        r
+    let unfold (f : 's -> ('a * 's) option) (st : 's) : 'a[] =
+        let mutable acc = []
+        let mutable cur = st
+        let mutable go = true
+        while go do
+            match f cur with
+            | Some (v, s2) ->
+                acc <- v :: acc
+                cur <- s2
+            | None -> go <- false
+        // acc is reversed; write it back to front
+        let n =
+            let mutable c = 0
+            for _ in acc do c <- c + 1
+            c
+        let r = zeroCreate n
+        let mutable i = n - 1
+        for v in acc do
+            r.[i] <- v
+            i <- i - 1
+        r
+    /// F#'s sortInPlace* mutate; these do too, and return unit
+    let sortInPlaceWith (cmp : 'a -> 'a -> int) (xs : 'a[]) : unit =
+        let sorted = sortWith cmp xs
+        let mutable i = 0
+        while i < length xs do
+            xs.[i] <- sorted.[i]
+            i <- i + 1
+    let sortInPlace (xs : 'a[]) : unit when Ordered<'a> = sortInPlaceWith compare xs
+    let sortInPlaceBy (f : 'a -> 'k) (xs : 'a[]) : unit when Ordered<'k> =
+        sortInPlaceWith (fun a b -> compare (f a) (f b)) xs
 // ---- List: the F# List module ----
     let singleton (x : 'a) : 'a[] = [| x |]
     let head (xs : 'a[]) : 'a =
@@ -1362,6 +1548,10 @@ module Array =
         if length xs = 0 then failwith "The input array was empty"
         else sumBy f xs / float (length xs)
     let reverse (xs : 'a[]) : 'a[] = rev xs
+    let findIndexBack (p : 'a -> bool) (xs : 'a[]) : int =
+        match tryFindIndexBack p xs with
+        | Some i -> i
+        | None -> failwith "An index satisfying the predicate was not found in the collection."
 module List =
     let length (xs : 'a list) =
         let mutable n = 0
@@ -1813,6 +2003,84 @@ module List =
     let sortByDescending (f : 'a -> 'k) (xs : 'a list) : 'a list when Ordered<'k> =
         sortWith (fun a b -> compare (f b) (f a)) xs
 
+    let zip3 (a : 'a list) (b : 'b list) (c : 'c list) : ('a * 'b * 'c) list =
+        let mutable acc = []
+        let mutable i = 0
+        let n = length a
+        while i < n do
+            acc <- (item i a, item i b, item i c) :: acc
+            i <- i + 1
+        rev acc
+    let unzip3 (xs : ('a * 'b * 'c) list) : 'a list * 'b list * 'c list =
+        let mutable ra = []
+        let mutable rb = []
+        let mutable rc = []
+        for a, b, c in xs do
+            ra <- a :: ra
+            rb <- b :: rb
+            rc <- c :: rc
+        rev ra, rev rb, rev rc
+    let map3 (f : 'a -> 'b -> 'c -> 'd) (a : 'a list) (b : 'b list) (c : 'c list) : 'd list =
+        let mutable acc = []
+        let mutable i = 0
+        let n = length a
+        while i < n do
+            acc <- f (item i a) (item i b) (item i c) :: acc
+            i <- i + 1
+        rev acc
+    let mapi2 (f : int -> 'a -> 'b -> 'c) (a : 'a list) (b : 'b list) : 'c list =
+        let mutable acc = []
+        let mutable i = 0
+        let n = length a
+        while i < n do
+            acc <- f i (item i a) (item i b) :: acc
+            i <- i + 1
+        rev acc
+    let iteri2 (f : int -> 'a -> 'b -> unit) (a : 'a list) (b : 'b list) : unit =
+        let mutable i = 0
+        let n = length a
+        while i < n do
+            f i (item i a) (item i b)
+            i <- i + 1
+    let foldBack2 (f : 'a -> 'b -> 's -> 's) (a : 'a list) (b : 'b list) (st : 's) : 's =
+        let mutable acc = st
+        let mutable i = length a - 1
+        while i >= 0 do
+            acc <- f (item i a) (item i b) acc
+            i <- i - 1
+        acc
+    let scanBack (f : 'a -> 's -> 's) (xs : 'a list) (st : 's) : 's list =
+        let mutable acc = [ st ]
+        let mutable cur = st
+        let mutable i = length xs - 1
+        while i >= 0 do
+            cur <- f (item i xs) cur
+            acc <- cur :: acc
+            i <- i - 1
+        acc
+    let transpose (xss : 'a list list) : 'a list list =
+        if isEmpty xss then []
+        else
+            let cols = length (head xss)
+            let mutable out = []
+            let mutable j = cols - 1
+            while j >= 0 do
+                out <- map (fun (r : 'a list) -> item j r) xss :: out
+                j <- j - 1
+            out
+    let permute (f : int -> int) (xs : 'a list) : 'a list =
+        // f maps SOURCE index to DESTINATION index, as F# does
+        let n = length xs
+        let dst = Array.zeroCreate n
+        let mutable i = 0
+        for x in xs do
+            dst.[f i] <- x
+            i <- i + 1
+        Array.toList dst
+    let insertManyAt (i : int) (vs : 'a list) (xs : 'a list) : 'a list =
+        take i xs @ vs @ skip i xs
+    let removeManyAt (i : int) (n : int) (xs : 'a list) : 'a list =
+        take i xs @ skip (i + n) xs
 // ---- Seq: lazy combinators over the enumerator protocol ----
     let empty : 'a list = []
     let singleton (x : 'a) : 'a list = [ x ]
@@ -2380,6 +2648,15 @@ module Seq =
         sortWith (fun a b -> compare b a) xs
     let sortByDescending (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
         sortWith (fun a b -> compare (f b) (f a)) xs
+    let fold2 (f : 's -> 'a -> 'b -> 's) (st : 's) (a : seq<'a>) (b : seq<'b>) : 's =
+        List.fold2 f st (toList a) (toList b)
+    let forall2 (p : 'a -> 'b -> bool) (a : seq<'a>) (b : seq<'b>) : bool =
+        List.forall2 p (toList a) (toList b)
+    let zip3 (a : seq<'a>) (b : seq<'b>) (c : seq<'c>) : seq<'a * 'b * 'c> =
+        List.toSeq (List.zip3 (toList a) (toList b) (toList c))
+    let cast (xs : seq<'a>) : seq<'a> = xs
+    let unfold (f : 's -> ('a * 's) option) (st : 's) : seq<'a> =
+        List.toSeq (List.unfold f st)
 // ---- Set: the F# Set module ----
 // Comparison-ordered like F#'s, but backed by a sorted array rather than a
 // tree: membership is a binary search, and the structure-sharing a tree buys
@@ -2738,3 +3015,13 @@ module Map =
     let partition (p : 'k -> 'v -> bool) (m : Map<'k, 'v>) : Map<'k, 'v> * Map<'k, 'v> =
         filter p m, filter (fun k v -> not (p k v)) m
     let toArray (m : Map<'k, 'v>) : ('k * 'v)[] = Array.ofList (toList m)
+    /// F# 8's Map.minKeyValue / maxKeyValue — the entries are kept ordered,
+    /// so these are the ends of the list
+    let minKeyValue (m : Map<'k, 'v>) : 'k * 'v =
+        match toList m with
+        | [] -> failwith "The input map was empty"
+        | h :: _ -> h
+    let maxKeyValue (m : Map<'k, 'v>) : 'k * 'v =
+        match List.rev (toList m) with
+        | [] -> failwith "The input map was empty"
+        | h :: _ -> h

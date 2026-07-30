@@ -700,7 +700,13 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                 let digits = s |> String.filter (fun c -> isDigit c || c = '-')
                 if digits = "" then 0
                 elif isUnsigned then parseUInt32 digits
-                else int digits
+                else
+                    // WRAP rather than throw: `-2147483648` lexes as unary
+                    // minus over 2147483648, which does not fit an int32 —
+                    // and wrapping gives exactly the bit pattern the negation
+                    // then turns into the intended value. An unhandled
+                    // OverflowException here crashed the whole compile.
+                    int (int64 (parseInt64In 10 digits) &&& 0xFFFFFFFFL |> int32)
         ic f v
         callf f "$ofi"
     | ELit (LInt s) ->
