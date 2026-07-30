@@ -2826,9 +2826,37 @@ Two parser rules keep it unambiguous, both pinned:
 A multi-field union case takes its payload as ONE tuple in the IR; passing the
 fields as separate ECtor args emits "multi-payload ctor not ported".
 
-STILL OPEN: typed `Code<'t>` so a splice checks against the hole's expected
-type; hygiene/gensym; widening the quotable subset (lists, matches, lambdas);
-and compile-time execution of F++-written plugins.
+TYPED. `Code<'t>` is the handle, `CodeTree` the union underneath (`q.Raw`).
+A quotation is `Code<'t>` for whatever its body produces, and a splice is
+checked against the hole it fills: `<@ %s + 1 @>` with `s : Code<string>` is
+rejected with `no instance Add<string, int>`.
+
+HYGIENIC. Every binder inside a quotation — `let`, lambda parameters, pattern
+variables — is renamed to a name unique to that quotation site, and references
+within the same quotation follow the rename. A spliced fragment therefore keeps
+its own free names: `<@ let y = 5 / %body @>` where `body` is `<@ y + 1 @>`
+gives `Let(y#431, 5, y + 1)` — the spliced `y` is untouched, while a binder is
+still visible to its own body.
+
+QUOTABLE SUBSET: literals, names, application, binary operators, let-sequences,
+if, tuples, lists, lambdas, field access, and match with wildcard / variable /
+literal / constructor patterns. Anything else is a compile-time error naming it.
+
+PLUGINS CAN BE WRITTEN IN F++ ITSELF. `ws.AddFppGenerator name sources` compiles
+that plugin with this compiler, RUNS it (wasmtime, `FPP_WASMTIME` to override),
+and takes what it prints as a generated file. The plugin reads the program it is
+generating for from `viewTypes`, handed to it as ordinary F++ data. Its own
+compile errors are reported as the PLUGIN's, not the program's.
+
+A LESSON worth keeping: a function the self-hosted compiler cannot lower is
+stubbed WHOLE, so it traps on any call. Spawning a process put `RunGenerators`
+in that state and the wasm compiler died on every compile — the process work now
+lives in its own member, off the common path. Anything unlowerable belongs in a
+function that the self-hosted build never calls.
+
+STILL OPEN: quoting DECLARATIONS (`<@ type T = ... @>`, `<@ let f x = ... @>`)
+rather than expressions; splicing at type and pattern positions; and letting an
+F++ plugin return a `CodeTree` directly instead of printed source.
 
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
