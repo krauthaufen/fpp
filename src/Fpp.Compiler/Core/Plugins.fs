@@ -75,6 +75,76 @@ type GenValueDecl =
       VModule : string
       VAttrs : (string * string list) list }
 
+let private isPatNodeK (k : NodeKind) =
+    k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
+    || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
+    || k = SplicePat
+
+let private isTypeNode (k : NodeKind) =
+    k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
+    || k = FunType || k = AppType || k = PostfixType || k = ParenType
+
+let private isExprNode (k : NodeKind) =
+    not (isPatNodeK k) && not (isTypeNode k) && k <> TyParams && k <> AttributeList
+
+let private nodes (n : GreenNode) =
+    n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+
+let private toks (n : GreenNode) =
+    n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+
+/// the source text of a type node, reassembled from its tokens
+let private typeText (n : GreenNode) =
+    Green.tokens (GNode n) |> List.map (fun t -> t.Text) |> String.concat ""
+
+
+/// Where a node starts and ends in the source, so a rewrite can cut exactly.
+/// Where a node starts and ends in the source, so a rewrite can cut exactly.
+let nodeSpan (n : GreenNode) : int * int =
+    match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind <> Eof) with
+    | [] -> 0, 0
+    | toks ->
+        let first = List.head toks
+        let last = List.last toks
+        first.Offset, last.Offset + last.Text.Length
+
+// ---- the typed tree -------------------------------------------------------
+// A REAL typed tree: every node carries the type inference settled on, so a
+// plugin pattern matches on shape and reads types off the node rather than
+// looking offsets up in a side table. `TOther` keeps the walk TOTAL — a
+// construct without its own case still appears, with its kind and its type,
+// so nothing is silently dropped.
+
+type TExpr =
+    | TLit of string * string
+    | TName of string * string
+    | TApp of TExpr * TExpr list * string
+    | TBin of string * TExpr * TExpr * string
+    | TLam of string list * TExpr * string
+    | TLet of string * TExpr * TExpr * string
+    | TIf of TExpr * TExpr * TExpr * string
+    | TMatch of TExpr * (string * TExpr) list * string
+    | TField of TExpr * string * string
+    | TTuple of TExpr list * string
+    | TList of TExpr list * string
+    /// node kind and type, for a construct with no case of its own
+    | TOther of string * string
+
+/// the type of any node, without caring which shape it is
+let typeOfT (e : TExpr) : string =
+    match e with
+    | TLit (_, t) | TName (_, t) | TApp (_, _, t) | TBin (_, _, _, t)
+    | TLam (_, _, t) | TLet (_, _, _, t) | TIf (_, _, _, t)
+    | TMatch (_, _, t) | TField (_, _, t) | TTuple (_, t)
+    | TList (_, t) | TOther (_, t) -> t
+
+type TDecl =
+    /// name, parameters with their types, return type, body
+    | TDLet of string * (string * string) list * string * TExpr
+    /// name, kind ("record" | "union" | "class" | ...)
+    | TDType of string * string
+    | TDOther of string
+
 /// One hand-written file: its parse tree, and the type inference gave each
 /// DEFINITION in it. (Per-EXPRESSION types are not exposed: this compiler keeps
 /// typing in side tables keyed by definition, so that is what there is to give.)
@@ -82,7 +152,9 @@ type GenFile =
     { FPath : string
       FTree : GreenNode
       /// the type at a definition's offset, where inference has one
-      FTypeAt : int -> string option }
+      FTypeAt : int -> string option
+      /// the file as a TYPED TREE — every expression node with its type
+      FTast : TDecl list }
 
 /// What a generator RETURNS for a file.
 type GenOutput =
@@ -123,37 +195,119 @@ type Generator =
       Generate : ProgramView -> (string * GenOutput) list }
 
 /// the node kinds that spell a TYPE (Lower has its own copy, inside a closure)
-let private isPatNodeK (k : NodeKind) =
-    k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-    || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
-    || k = SplicePat
-
-let private isTypeNode (k : NodeKind) =
-    k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
-    || k = FunType || k = AppType || k = PostfixType || k = ParenType
-
-let private nodes (n : GreenNode) =
-    n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
-
-let private toks (n : GreenNode) =
-    n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
-
-/// the source text of a type node, reassembled from its tokens
-let private typeText (n : GreenNode) =
-    Green.tokens (GNode n) |> List.map (fun t -> t.Text) |> String.concat ""
-
-/// Where a node starts and ends in the source, so a rewrite can cut exactly.
-let private isExprNode (k : NodeKind) =
-    not (isPatNodeK k) && not (isTypeNode k) && k <> TyParams && k <> AttributeList
-
-/// Where a node starts and ends in the source, so a rewrite can cut exactly.
-let nodeSpan (n : GreenNode) : int * int =
-    match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind <> Eof) with
-    | [] -> 0, 0
-    | toks ->
-        let first = List.head toks
-        let last = List.last toks
-        first.Offset, last.Offset + last.Text.Length
+/// Build the typed tree for a file: the syntax, with each node's type read off
+/// what inference recorded for it.
+let tastOf (typeAt : int -> int -> string option) (root : GreenNode) : TDecl list =
+    let tyOf (n : GreenNode) =
+        let st, en = nodeSpan n
+        match typeAt st en with
+        | Some ty -> ty
+        | None -> "?"
+    let identOf (n : GreenNode) =
+        match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+        | Some t -> t.Text
+        | None -> "_"
+    let rec expr (n : GreenNode) : TExpr =
+        let kids = nodes n |> List.filter (fun x -> isExprNode x.NodeKind)
+        let ty = tyOf n
+        match n.NodeKind with
+        | LiteralExpr ->
+            (match toks n |> List.tryHead with
+             | Some t -> TLit (t.Text, ty)
+             | None -> TOther ("LiteralExpr", ty))
+        | IdentExpr -> TName (identOf n, ty)
+        | ParenExpr -> (match kids with [ one ] -> expr one | _ -> TTuple (List.map expr kids, ty))
+        | TupleExpr -> TTuple (List.map expr kids, ty)
+        | ListExpr ->
+            let items =
+                match kids with
+                | [ single ] when single.NodeKind = BlockExpr ->
+                    nodes single |> List.filter (fun x -> isExprNode x.NodeKind)
+                | other -> other
+            TList (List.map expr items, ty)
+        | BinaryExpr ->
+            let op = toks n |> List.tryFind (fun t -> t.Kind = Operator)
+            (match op, kids with
+             | Some o, [ l; r ] -> TBin (o.Text, expr l, expr r, ty)
+             | _ -> TOther ("BinaryExpr", ty))
+        | AppExpr ->
+            (match kids with
+             | f :: args -> TApp (expr f, List.map expr args, ty)
+             | [] -> TOther ("AppExpr", ty))
+        | LambdaExpr ->
+            let ps = nodes n |> List.filter (fun x -> x.NodeKind = IdentPat) |> List.map identOf
+            (match List.tryLast kids with
+             | Some b -> TLam (ps, expr b, ty)
+             | None -> TOther ("LambdaExpr", ty))
+        | DotExpr ->
+            let fld = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+            (match kids, fld with
+             | recv :: _, Some f -> TField (expr recv, f.Text, ty)
+             | _ -> TOther ("DotExpr", ty))
+        | IfExpr ->
+            (match kids with
+             | [ c; t; e ] -> TIf (expr c, expr t, expr e, ty)
+             | _ -> TOther ("IfExpr", ty))
+        | MatchExpr ->
+            let arms =
+                nodes n
+                |> List.filter (fun x -> x.NodeKind = MatchClause)
+                |> List.map (fun cl ->
+                    let pat =
+                        nodes cl
+                        |> List.tryFind (fun x -> isPatNodeK x.NodeKind)
+                        |> Option.map (fun x -> (Green.toText (GNode x)).Trim ())
+                    let body = nodes cl |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+                    (match pat with Some p -> p | None -> "_"),
+                    (match body with Some b -> expr b | None -> TOther ("MatchClause", "?")))
+            (match kids with
+             | scrut :: _ -> TMatch (expr scrut, arms, ty)
+             | [] -> TOther ("MatchExpr", ty))
+        | BlockExpr ->
+            (match nodes n with
+             | d :: rest when d.NodeKind = LetDecl ->
+                 let value = nodes d |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+                 let body = rest |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryHead
+                 (match value, body with
+                  | Some v, Some b -> TLet (identOf d, expr v, expr b, ty)
+                  | _ -> TOther ("BlockExpr", ty))
+             | inner :: _ when isExprNode inner.NodeKind -> expr inner
+             | _ -> TOther ("BlockExpr", ty))
+        | k -> TOther (string k, ty)
+    let decl (n : GreenNode) : TDecl =
+        match n.NodeKind with
+        | LetDecl ->
+            let pats = nodes n |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
+            let body = nodes n |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+            (match pats, body with
+             | nameNode :: paramNodes, Some b ->
+                 let ps =
+                     paramNodes
+                     |> List.map (fun pn ->
+                         let ty =
+                             nodes pn
+                             |> List.filter (fun y -> isTypeNode y.NodeKind)
+                             |> List.tryHead
+                             |> Option.map typeText
+                         identOf pn, (match ty with Some t -> t | None -> "?"))
+                 TDLet (identOf nameNode, ps, typeOfT (expr b), expr b)
+             | _ -> TDOther "LetDecl")
+        | TypeDecl ->
+            let kids = nodes n
+            let kind =
+                if kids |> List.exists (fun x -> x.NodeKind = UnionCase) then "union"
+                elif kids |> List.exists (fun x -> x.NodeKind = RecordRepr) then "record"
+                elif kids |> List.exists (fun x -> x.NodeKind = MemberDecl || x.NodeKind = ParenPat) then "class"
+                else "abbrev"
+            TDType (identOf n, kind)
+        | k -> TDOther (string k)
+    let rec top (n : GreenNode) : TDecl list =
+        nodes n
+        |> List.collect (fun c ->
+            if c.NodeKind = ModuleDef then top c
+            elif c.NodeKind = LetDecl || c.NodeKind = TypeDecl then [ decl c ]
+            else [])
+    top root
 
 /// Every top-level value declaration in a parse tree, with its attributes.
 let valueDeclsOf (path : string) (root : GreenNode) : GenValueDecl list =

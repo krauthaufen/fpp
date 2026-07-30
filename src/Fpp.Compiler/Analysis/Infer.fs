@@ -48,6 +48,11 @@ type InferResult =
       /// letters in OpKinds only cover the primitive types; this covers the
       /// rest, and survives into monomorphization.
       OpTypes : (int * string) list
+      /// EVERY expression node, keyed by its SPAN (start, end) -> its inferred
+      /// type, pretty-printed once unification settles. The span and not the
+      /// offset: a node and its leftmost descendant share a first token, so
+      /// offsets alone cannot tell `p.X` from `p`.
+      ExprTypes : (int * int * string) list
       /// offset -> the OWNER type at its instantiation (`Pair$int$int`), for
       /// record construction and field access. Distinct from MemberSites,
       /// which names the declaring type for member dispatch.
@@ -703,6 +708,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let pendingClassUses = vecNew<int * string * Constraint * bool> ()
     /// operator offset -> the left operand's type, for the backend
     let opTypesRaw = vecNew<int * Type> ()
+    let exprTypesRaw = vecNew<int * int * Type> ()
 
     let addWanted (offset : int) (c : Constraint) : unit = wanted <- wanted @ [ offset, c ]
 
@@ -1114,6 +1120,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         else "unknown"
 
     let rec exprType (g : Green) : Type =
+        let t = exprTypeOf g
+        // remember what every node came out as; pruning happens at the end,
+        // once unification has settled
+        (match g with
+         | GNode n ->
+             (match Green.tokens (GNode n) |> List.filter (fun tk -> tk.Kind <> Eof) with
+              | [] -> ()
+              | tks ->
+                  let first = List.head tks
+                  let last = List.last tks
+                  vecAdd exprTypesRaw (first.Offset, last.Offset + last.Text.Length, t))
+         | GToken _ -> ())
+        t
+
+    and exprTypeOf (g : Green) : Type =
         match g with
         | GToken _ -> st.Fresh ()
         | GNode n ->
@@ -3101,6 +3122,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       CtorSites = vecToList ctorSitesRaw
       ClassUses = vecToList classUsesRaw
       ClassPending = vecToList classPendingRaw
+      ExprTypes =
+        vecToList exprTypesRaw
+        |> List.map (fun (st, en, ty) -> st, en, Types.typeString (prune ty))
       OpTypes =
         vecToList opTypesRaw
         |> List.map (fun (off, ty) ->

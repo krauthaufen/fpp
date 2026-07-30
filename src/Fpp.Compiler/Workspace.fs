@@ -454,9 +454,19 @@ type Workspace() =
                                 inf.DefTypes
                                 |> List.tryPick (fun (o, _, ts) -> if o = off then Some ts else None)
                             | None -> None
+                    let tree = (this.ParseFile p).Root
+                    // one dictionary per file: a linear scan per node would be
+                    // quadratic in the size of the file
+                    let spanTypes = dictNew<int * int, string> ()
+                    (match dictTryFind checkedFiles.Files p with
+                     | Some (_, inf) -> for a, b, ts in inf.ExprTypes do dictSet spanTypes (a, b) ts
+                     | None -> ())
+                    let exprTypeAt (st : int) (en : int) : string option = dictTryFind spanTypes (st, en)
                     { FPath = p
-                      FTree = (this.ParseFile p).Root
-                      FTypeAt = typeAt } : Fpp.Core.Plugins.GenFile)
+                      FTree = tree
+                      FTypeAt = typeAt
+                      // the typed tree: syntax with every node's inferred type
+                      FTast = Fpp.Core.Plugins.tastOf exprTypeAt tree } : Fpp.Core.Plugins.GenFile)
             let view : Fpp.Core.Plugins.ProgramView =
                 { Types = vecToList types; Values = vecToList values
                   Sources = sources; Files = genFiles }

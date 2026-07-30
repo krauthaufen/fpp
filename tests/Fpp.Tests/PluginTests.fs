@@ -534,6 +534,60 @@ let generatorTests =
             Expect.equal out "42\n" "a returned tree renders back to the same program"
         }
 
+        test "a plugin gets a TYPED TREE: every node with its inferred type" {
+            let dump : Fpp.Core.Plugins.Generator =
+                { GName = "tastdump"
+                  GAfter = None
+                  Generate =
+                    fun view ->
+                        let rec show (e : TExpr) : string =
+                            match e with
+                            | TLit (v, t) -> v + ":" + t
+                            | TName (n, t) -> n + ":" + t
+                            | TBin (op, l, r, t) -> "(" + show l + " " + op + " " + show r + "):" + t
+                            | TApp (f, args, t) -> "(" + show f + " " + String.concat " " (List.map show args) + "):" + t
+                            | TLet (n, v, b, t) -> "(let " + n + " = " + show v + " in " + show b + "):" + t
+                            | TIf (c, a, b, t) -> "(if " + show c + " then " + show a + " else " + show b + "):" + t
+                            | TLam (ps, b, t) -> "(fun " + String.concat " " ps + " -> " + show b + "):" + t
+                            | TField (r, f, t) -> show r + "." + f + ":" + t
+                            | TMatch (sc, arms, t) ->
+                                "(match " + show sc + " | "
+                                + String.concat " | " (List.map (fun (p, b) -> p + " -> " + show b) arms) + "):" + t
+                            | TTuple (xs, t) -> "(" + String.concat ", " (List.map show xs) + "):" + t
+                            | TList (xs, t) -> "[" + String.concat "; " (List.map show xs) + "]:" + t
+                            | TOther (k, t) -> k + ":" + t
+                        let lines =
+                            view.Files
+                            // just the file under examination: the view is built
+                            // BEFORE generation, so a consumer of generated code
+                            // still has type variables where that code will be
+                            |> List.filter (fun f -> f.FPath = "types.fpp")
+                            |> List.collect (fun f -> f.FTast)
+                            |> List.choose (fun d ->
+                                match d with
+                                | TDLet (n, ps, ret, body) ->
+                                    Some (n + "(" + String.concat "," (List.map (fun (pn, pt) -> pn + ":" + pt) ps)
+                                          + ")->" + ret + " = " + show body)
+                                | TDType (n, k) -> Some ("type " + n + " (" + k + ")")
+                                | TDOther _ -> None)
+                        [ "tast.fpp", Source ("let tast = \"" + String.concat " | " lines + "\"\n") ] }
+            let out =
+                runGenerated [ dump ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "type Point = { X : int; Y : int }"
+                        "let pick (p : Point) (flag : bool) ="
+                        "    let s = p.X + p.Y"
+                        "    if flag then s else s + 1" ]
+                      "main.fpp", [ "module Main"; "let go = print tast" ] ]
+            Expect.equal out
+                ("type Point (record) | "
+                 + "pick(p:Point,flag:bool)->int = "
+                 + "(let s = (p:Point.X:int + p:Point.Y:int):int in "
+                 + "(if flag:bool then s:int else (s:int + 1:int):int):int):int\n")
+                "field access is int, the let and if are int, and the application carries its function type"
+        }
+
         test "a plugin can read the type inference gave each definition" {
             let sigdump : Fpp.Core.Plugins.Generator =
                 { GName = "sigdump"
