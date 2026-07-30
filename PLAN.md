@@ -2813,10 +2813,9 @@ quotation is written.
 STILL TO DO, in order:
 1. **Code carries an AST**, not source text, so a plugin can match on and
    rewrite quoted code rather than re-parse it.
-2. **A quoted `let` BLOCK.** `<@ let a = %inner` + a second line parses as an
-   error today: the body is parsed with the enclosing expression context, so a
-   multi-line block inside a quotation does not get its own offside context.
-   Single-line quotations and splices are unaffected.
+2. DONE — a quoted body now gets its OWN block context (`parseBlock`), so a
+   multi-line `let` sequence inside a quotation parses, checks and hovers like
+   any other block.
 3. **Typed quotations** — `Code<'t>` so `<@ 1 + 1 @>` is `Code<int>` and a
    splice checks against the hole's expected type.
 4. **Hygiene** — `newName`-style gensym so a quoted binder cannot capture a
