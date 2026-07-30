@@ -213,10 +213,15 @@ type Workspace() =
     do db.SetInput "project" "" (box ([] : string list))
     do db.SetInput "libs" "" (box ([] : (string * string) list))
     let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
+    let generators = vecNew<Fpp.Core.Plugins.Generator> ()
     let pluginErrors = vecNew<string> ()
 
     /// Register a compiler plugin (project config, never source annotations).
     member _.AddPlugin (p : Fpp.Core.Plugins.Plugin) : unit = vecAdd plugins p
+
+    /// A generator emits SOURCE before analysis, so it can declare types,
+    /// classes and instances — see the staging rule in Plugins.fs.
+    member _.AddGenerator (g : Fpp.Core.Plugins.Generator) : unit = vecAdd generators g
     member _.PluginErrors : string list = vecToList pluginErrors
 
     /// Run the per-file plugin pipeline, linting after each stage.
@@ -384,7 +389,51 @@ type Workspace() =
     /// through whatever survives the ones after it.
     member this.EmitProgramWasmRaw () : byte[] * string list = this.EmitCore false
 
+    /// Marks a file as generated: such files are compiled, but never shown to
+    /// a generator (the staging rule) and never regenerated from.
+    static member GeneratedPrefix = "(generated)/"
+
+    /// Run the registered generators ONCE over the hand-written declarations
+    /// and add their output as project files. Generated files land at the END
+    /// of the compile order, so they see every user declaration, and each
+    /// generator writes to a stable path, so running twice replaces rather
+    /// than accumulates.
+    member private this.RunGenerators () : unit =
+        if vecLen generators > 0 then
+            let types = vecNew<Fpp.Core.Plugins.GenTypeDecl> ()
+            for path in this.ProjectFiles do
+                if not (path.StartsWith Workspace.GeneratedPrefix) then
+                    let pr = this.ParseFile path
+                    for t in Fpp.Core.Plugins.typeDeclsOf path pr.Root do vecAdd types t
+            let view : Fpp.Core.Plugins.ProgramView = { Types = vecToList types }
+            // A file sees only EARLIER files, so generated code goes directly
+            // after the last file that declared a type: it can name every type
+            // it derives from, and anything in a later file can name it. A
+            // consumer therefore has to live in a later file than the types —
+            // the same staging F# projects and Template Haskell splices have.
+            let declaring =
+                vecToList types |> List.map (fun t -> t.TFile) |> List.distinct
+            let anchorIndex =
+                let files = this.ProjectFiles
+                files
+                |> List.mapi (fun i p -> i, p)
+                |> List.filter (fun (_, p) -> List.contains p declaring)
+                |> List.map fst
+                |> (fun idxs -> if List.isEmpty idxs then List.length files - 1 else List.max idxs)
+            for g in vecToList generators do
+                try
+                    for name, src in g.Generate view do
+                        let path = Workspace.GeneratedPrefix + name
+                        db.SetInput "text" path (box src)
+                        let files = this.ProjectFiles
+                        if not (List.contains path files) then
+                            let before = files |> List.truncate (anchorIndex + 1)
+                            let after = files |> List.skip (min (List.length files) (anchorIndex + 1))
+                            db.SetInput "project" "" (box (before @ [ path ] @ after))
+                with e -> vecAdd pluginErrors ("generator " + g.GName + " failed: " + e.Message)
+
     member private this.EmitCore (optimize : bool) : byte[] * string list =
+        this.RunGenerators ()
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()

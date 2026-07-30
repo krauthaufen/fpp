@@ -3756,6 +3756,16 @@ type Gen<'a> =
       /// render a counterexample
       Render : 'a -> string }
 
+/// The conversions the generators need, under names `Gen` does not shadow.
+/// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a
+/// call to the conversion of the same name applies the generator record — which
+/// traps at run time instead of failing to compile.
+let genCharOf (i : int) : char = char i
+let genStringOfChar (c : char) : string = string c
+let genFloatOf (i : int) : float = float i
+let genShowInt (x : int) : string = string x
+let genShowFloat (x : float) : string = string x
+
 module Gen =
     let rngCreate (seed : int) : PropRng =
         // zero is a fixed point of xorshift, so it can never be the state
@@ -3807,13 +3817,13 @@ module Gen =
                     let half = x / 2
                     let toward = if half = 0 || half = x then [ 0 ] else [ 0; half ]
                     if x < 0 then toward @ [ -x ] else toward)
-          Render = (fun x -> string x) }
+          Render = (fun x -> genShowInt x) }
 
     /// ints in a range: the generator to reach for when keys should COLLIDE
     let intRange (lo : int) (hi : int) : Gen<int> =
         { Draw = (fun r -> rngRange r lo hi)
           Smaller = (fun x -> if x = lo then [] else [ lo ])
-          Render = (fun x -> string x) }
+          Render = (fun x -> genShowInt x) }
 
     let bool : Gen<bool> =
         { Draw = (fun r -> rngBool r)
@@ -3821,9 +3831,9 @@ module Gen =
           Render = (fun b -> if b then "true" else "false") }
 
     let char : Gen<char> =
-        { Draw = (fun r -> char (rngRange r 97 122))
+        { Draw = (fun r -> genCharOf (rngRange r 97 122))
           Smaller = (fun c -> if c = 'a' then [] else [ 'a' ])
-          Render = (fun c -> "'" + string c + "'") }
+          Render = (fun c -> "'" + genStringOfChar c + "'") }
 
     let string : Gen<string> =
         { Draw =
@@ -3831,7 +3841,7 @@ module Gen =
                 let n = rngBelow r 6
                 let mutable s = ""
                 for i in 1 .. n do
-                    s <- s + string (char (rngRange r 97 122))
+                    s <- s + genStringOfChar (genCharOf (rngRange r 97 122))
                 s)
           Smaller =
             (fun s ->
@@ -3847,9 +3857,9 @@ module Gen =
                 if k = 0 then 0.0
                 elif k = 1 then 1.0
                 elif k = 2 then -1.0
-                else float (rngRange r -1000 1000) / 8.0)
+                else genFloatOf (rngRange r -1000 1000) / 8.0)
           Smaller = (fun x -> if x = 0.0 then [] else [ 0.0 ])
-          Render = (fun x -> string x) }
+          Render = (fun x -> genShowFloat x) }
 
     let option (g : Gen<'a>) : Gen<Option<'a>> =
         { Draw = (fun r -> if rngBelow r 4 = 0 then None else Some (g.Draw r))

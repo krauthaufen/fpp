@@ -20,6 +20,126 @@ let private runBytes (bytes : byte[]) =
     System.IO.File.Delete tmp
     o
 
+/// compile a multi-file program with generators registered, then run it
+let private runGenerated (gens : Fpp.Core.Plugins.Generator list) (files : (string * string list) list) : string =
+    let ws = Workspace()
+    for g in gens do ws.AddGenerator g
+    for path, lines in files do ws.SetFileText path (String.concat "\n" lines + "\n")
+    let bytes, errs = ws.EmitProgramWasm ()
+    Expect.isEmpty errs "the generated program must compile"
+    runBytes bytes
+
+/// the text a generator produced, for asserting on the code itself
+let private generatedText (gens : Fpp.Core.Plugins.Generator list) (files : (string * string list) list) : string =
+    let ws = Workspace()
+    for g in gens do ws.AddGenerator g
+    for path, lines in files do ws.SetFileText path (String.concat "\n" lines + "\n")
+    ws.EmitProgramWasm () |> ignore
+    ws.ProjectFiles
+    |> List.filter (fun p -> p.StartsWith "(generated)/")
+    |> List.map ws.FileText
+    |> String.concat "\n"
+
+[<Tests>]
+let generatorTests =
+    testList "generators (source-level plugins)" [
+        test "a generator emits a type, a class and an instance" {
+            // NONE of these is reachable for a post-lowering plugin: by then
+            // resolution and inference are over. This is the whole point of
+            // running before the front end.
+            let power : Fpp.Core.Plugins.Generator =
+                { GName = "power"
+                  Generate =
+                    fun view ->
+                        let names = view.Types |> List.map (fun t -> t.TName) |> List.sort
+                        [ "power.fpp",
+                          String.concat "\n"
+                            [ "// no module header: top-level bindings any later file can name"
+                              "type Tagged = { Tag : int; Label : string }"
+                              "class Described<'a>"
+                              "    static describe : 'a -> string"
+                              "instance Described<Tagged>"
+                              "    static describe (t : Tagged) = t.Label + \"#\" + string t.Tag"
+                              "instance Described<int>"
+                              "    static describe (i : int) = \"int:\" + string i"
+                              "let sawTypes = \"" + String.concat "," names + "\""
+                              "" ] ] }
+            let out =
+                runGenerated [ power ]
+                    [ "types.fpp", [ "module Types"; "type Point = { X : int; Y : int }"; "type Color = Red | Green | Blue" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "let go ="
+                        "    print (describe { Tag = 7; Label = \"seven\" })"
+                        "    print (describe 3)"
+                        "    print sawTypes" ] ]
+            Expect.equal out "seven#7\nint:3\nColor,Point\n" "generated class and instances dispatch, and the view saw the user types"
+        }
+
+        test "a generator sees hand-written declarations only" {
+            // the staging rule: one round, and no generator observes another's
+            // output, so the result never depends on registration order
+            let emitsAType : Fpp.Core.Plugins.Generator =
+                { GName = "emitsAType"
+                  Generate = fun _ -> [ "extra.fpp", "type Injected = { Q : int }\n" ] }
+            let reportsWhatItSaw : Fpp.Core.Plugins.Generator =
+                { GName = "reportsWhatItSaw"
+                  Generate =
+                    fun view ->
+                        let names = view.Types |> List.map (fun t -> t.TName) |> List.sort
+                        [ "report.fpp", "let seenByGenerator = \"" + String.concat "," names + "\"\n" ] }
+            let out =
+                runGenerated [ emitsAType; reportsWhatItSaw ]
+                    [ "types.fpp", [ "module Types"; "type Written = { W : int }" ]
+                      "main.fpp", [ "module Main"; "let go = print seenByGenerator" ] ]
+            Expect.equal out "Written\n" "Injected came from a generator, so no generator may see it"
+        }
+
+        test "deriveGen fuzzes the program's own types" {
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveGen ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "type Point = { X : int; Y : int }"
+                        "type Shape = Dot | Line of int | Named of string"
+                        "type Bag = { Items : list<int>; Tag : Option<string> }"
+                        "type Wrapped = { Inner : Point; Count : int }" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "open Types"
+                        "let go ="
+                        "    let gp = genPoint ()"
+                        "    Check.quick \"record fields are stable\" gp (fun p -> p.X = p.X && p.Y = p.Y)"
+                        "    Check.quick \"every shape renders\" (genShape ()) (fun s -> (genShape ()).Render s <> \"\")"
+                        "    Check.quick \"list and option fields\" (genBag ()) (fun b -> List.length b.Items >= 0)"
+                        "    Check.quick \"a nested user type\" (genWrapped ()) (fun w -> w.Inner.X = w.Inner.X)"
+                        // the derived Smaller shrinks field by field
+                        "    Check.quick \"shrinks per field\" gp (fun p -> p.X < 100 || p.Y < 100)" ] ]
+            Expect.equal out
+                ("record fields are stable: ok (200 cases)\n"
+                 + "every shape renders: ok (200 cases)\n"
+                 + "list and option fields: ok (200 cases)\n"
+                 + "a nested user type: ok (200 cases)\n"
+                 + "shrinks per field: falsified by { X = 127; Y = 127 }\n")
+                "derived generators draw, render and shrink"
+        }
+
+        test "deriveGen skips what it cannot generate soundly" {
+            let text =
+                generatedText [ Fpp.Core.Plugins.deriveGen ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "type Ok = { N : int }"
+                        "type Generic<'a> = { Value : 'a }"
+                        "type Tree = Leaf | Node of Tree" ]
+                      "main.fpp", [ "module Main"; "open Types"; "let go = print ((genOk ()).Render { N = 1 })" ] ]
+            Expect.stringContains text "genOk" "the plain record gets a generator"
+            Expect.stringContains text "Generic (generic)" "a generic type needs a generator per parameter"
+            Expect.stringContains text "Tree (recursive)" "a recursive type needs a size bound to terminate"
+            Expect.isFalse (text.Contains "let genTree") "no generator that would not terminate"
+        }
+    ]
+
 [<Tests>]
 let pluginTests =
     testList "compiler plugins" [
