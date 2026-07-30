@@ -2876,10 +2876,23 @@ An F++ plugin therefore builds what it emits as TREES — `CDLet`, `CBin`,
 `CField`, quotations with spliced types — and calls `Code.emit`. The test plugin
 does exactly that: no source strings anywhere in it.
 
-STILL OPEN: quoting TYPE declarations (`<@ type T = { ... } @>`) and members
-(`<@ member x.F () = ... @>`); splicing at pattern position; and handing a
-`CodeTree` across the plugin process boundary as data rather than as rendered
-source.
+MEMBERS AND RECORD TYPES CAN BE QUOTED TOO:
+`<@ member x.Bla (a : %ty) : %ty = a @>` and
+`<@ type Row = { Id : int; Label : %t } @>`. Splices now reach EVERY position —
+expression, type, and pattern (`| %p -> ...` with `p : QPat`). Each needed the
+same three-part wiring: the parser must accept `%` there (canStartAtom /
+canStartTypeAtom / canStartAtomPat), Lower's kind predicate must include the new
+node or the annotation is silently dropped, and Resolve must walk into it,
+because a spliced name is a VALUE use sitting in a type or pattern position.
+
+NOT DOING, deliberately: handing a `CodeTree` across the plugin PROCESS boundary
+as data instead of rendered source. Generated code has to go through the front
+end anyway — that is what reports its errors in the program's context — so a
+serialized tree would skip only the lexer and parser, the cheapest part, while
+adding a converter with its own bug surface. Source is the right interchange
+format between two separate compilations. The "spares us another parse" argument
+applies to composition INSIDE a program, and there it holds: quotations compose
+as trees, never as text.
 
 ### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
 Two tiers, and they cover different needs:
