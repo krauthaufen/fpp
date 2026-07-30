@@ -65,6 +65,39 @@ let parserRoundTripTests =
     ]
 
 [<Tests>]
+let quotationTests =
+    testList "quotation syntax" [
+        // The quoted body is ORDINARY syntax, which is the whole point: it is
+        // the same tree the resolver, the type checker and hover see, so
+        // quoted code is checked code rather than text.
+        roundTrips "a quotation round-trips" "let q = <@ 1 + 2 @>\n"
+        roundTrips "a splice round-trips" "let q = <@ 1 + %x @>\n"
+        roundTrips "a quoted let round-trips" "let q = <@ let a = 1\n           a + 2 @>\n"
+
+        test "the body parses as real syntax, not a token blob" {
+            let src = "let q = <@ 1 + %x @>\n"
+            Expect.equal (parseRoot src).Diagnostics [] "no diagnostics"
+            Expect.equal (List.length (nodesOf QuoteExpr src)) 1 "one quotation"
+            Expect.equal (List.length (nodesOf SpliceExpr src)) 1 "one splice"
+            // the inner expression is a normal binary expression
+            Expect.isGreaterThan (List.length (nodesOf BinaryExpr src)) 0 "with ordinary structure inside"
+        }
+
+        test "an unclosed quotation is an error, not silence" {
+            let r = parseRoot "let q = <@ 1 + 2\n"
+            Expect.isNonEmpty r.Diagnostics "missing '@>' is reported"
+        }
+
+        test "quotation brackets do not disturb the operators they resemble" {
+            // `@>` starts with the append operator and `%` is modulo: both
+            // still parse as themselves outside a quotation
+            Expect.equal (parseRoot "let a = x % y\n").Diagnostics [] "modulo"
+            Expect.equal (parseRoot "let b = xs @ ys\n").Diagnostics [] "append"
+            Expect.equal (List.length (nodesOf QuoteExpr "let a = x % y\n")) 0 "no stray quotation"
+        }
+    ]
+
+[<Tests>]
 let parserStructureTests =
     testList "parser structure" [
         test "class and instance are their own declarations" {

@@ -33,6 +33,11 @@ type NodeKind =
     | AppExpr
     | BinaryExpr
     | PrefixExpr
+    /// `<@ ... @>` — quoted CODE. Ordinary syntax inside, so it resolves, type
+    /// checks and hovers like any other expression.
+    | QuoteExpr
+    /// `%x` inside a quotation — splice the code that `x` denotes
+    | SpliceExpr
     | ParenExpr
     | BraceExpr
     | RecordExpr

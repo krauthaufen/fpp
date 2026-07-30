@@ -103,7 +103,10 @@ type private State(src : string, toks : Vec<Token>) =
 
 let private infixPrec (text : string) : int =
     // F#-style: precedence by leading characters. 0 = not an infix operator.
-    if text = "|" || text = "->" then 0
+    // quotation brackets are delimiters, never infix — `@>` would otherwise
+    // read as the append operator and swallow the closer
+    if text = "@>" || text = "<@" then 0
+    elif text = "|" || text = "->" then 0
     elif text = ":=" || text = "<-" then 1
     elif text = ".." || text = "..." then 4
     elif strLen text >= 2 && substr text 0 2 = "**" then 9
@@ -155,6 +158,8 @@ let parse (src : string) : ParseResult =
         || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
+        // a quotation, and a splice inside one, are expressions too
+        || (s.Is Operator && (s.IsText "<@" || s.IsText "%"))
 
     let canStartDecl () =
         s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
@@ -557,7 +562,21 @@ let parse (src : string) : ParseResult =
         scan 1 1
 
     and parseAtom (ctx : int) : Green =
-        if s.Is Ident then Green.node IdentExpr [ s.Bump () ]
+        if s.Is Operator && s.Cur.Text = "<@" then
+            // the quoted body is parsed as ORDINARY syntax — that is what
+            // makes it resolve, type check and hover like real code
+            let acc = vecNew<Green> ()
+            vecAdd acc (s.Bump ())
+            vecAdd acc (parseExpr ctx)
+            if s.Is Operator && s.Cur.Text = "@>" then vecAdd acc (s.Bump ())
+            else s.Diag "expected '@>' to close the quotation"
+            Green.node QuoteExpr (vecToList acc)
+        elif s.Is Operator && s.Cur.Text = "%" then
+            // a splice: `%x` names code to drop in here
+            let pct = s.Bump ()
+            let inner = parseAtom ctx
+            Green.node SpliceExpr [ pct; inner ]
+        elif s.Is Ident then Green.node IdentExpr [ s.Bump () ]
         elif isLiteral () || isLiteralKw () then Green.node LiteralExpr [ s.Bump () ]
         elif s.Is LParen then
             let lp = s.Bump ()
