@@ -2724,128 +2724,232 @@ module Seq =
     let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)
     let readonly (xs : seq<'a>) : seq<'a> = xs
     let delay (f : unit -> seq<'a>) : seq<'a> = f ()
-type Set<'a> = { SetItems : 'a[] }
-
-module Set =
-    /// index of `x`, or -(insertion point) - 1 when absent
-    let private search (s : Set<'a>) (x : 'a) : int when Ordered<'a> =
-        let mutable lo = 0
-        let mutable hi = s.SetItems.Length - 1
-        let mutable found = -1
-        while found < 0 && lo <= hi do
-            let mid = lo + (hi - lo) / 2
-            let c = compare s.SetItems.[mid] x
-            if c = 0 then found <- mid
-            elif c < 0 then lo <- mid + 1
-            else hi <- mid - 1
-        if found >= 0 then found else -lo - 1
-
-    let count (s : Set<'a>) : int = s.SetItems.Length
-    let isEmpty (s : Set<'a>) : bool = s.SetItems.Length = 0
-    let toArray (s : Set<'a>) : 'a[] = Array.copy s.SetItems
-    let toList (s : Set<'a>) : 'a list = Array.toList s.SetItems
-    let toSeq (s : Set<'a>) : seq<'a> = Array.toSeq (Array.copy s.SetItems)
-    let contains (x : 'a) (s : Set<'a>) : bool when Ordered<'a> = search s x >= 0
-
-    let ofArray (xs : 'a[]) : Set<'a> when Ordered<'a> =
-        let sorted = Array.sort xs
-        let items : 'a[] = Array.zeroCreate sorted.Length
-        let mutable n = 0
-        let mutable i = 0
-        while i < sorted.Length do
-            if n = 0 || compare items.[n - 1] sorted.[i] <> 0 then
-                items.[n] <- sorted.[i]
-                n <- n + 1
-            i <- i + 1
-        { SetItems = Array.sub items 0 n }
-
-    let ofList (xs : 'a list) : Set<'a> when Ordered<'a> = ofArray (List.toArray xs)
-    let ofSeq (xs : seq<'a>) : Set<'a> when Ordered<'a> = ofArray (Array.ofSeq xs)
-    let singleton (x : 'a) : Set<'a> = { SetItems = Array.create 1 x }
-    // NOTE (divergence): F#'s Set.empty is a VALUE. Here it takes unit,
-    // because a generic VALUE is not stamped per instantiation — its array
-    // would be the uniform one, and Set<int> code casts to the PACKED
-    // $parr_i, which traps. A unit function stamps per use and is correct.
-    let empty (u : unit) : Set<'a> = { SetItems = Array.zeroCreate 0 }
-
-    let add (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
-        let at = search s x
-        if at >= 0 then s
-        else
-            let ip = -at - 1
-            let items : 'a[] = Array.zeroCreate (s.SetItems.Length + 1)
-            let mutable i = 0
-            while i < ip do
-                items.[i] <- s.SetItems.[i]
-                i <- i + 1
-            items.[ip] <- x
-            while i < s.SetItems.Length do
-                items.[i + 1] <- s.SetItems.[i]
-                i <- i + 1
-            { SetItems = items }
-
-    let remove (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
-        let at = search s x
-        if at < 0 then s
-        else
-            let items : 'a[] = Array.zeroCreate (s.SetItems.Length - 1)
-            let mutable i = 0
-            while i < at do
-                items.[i] <- s.SetItems.[i]
-                i <- i + 1
-            while i < s.SetItems.Length - 1 do
-                items.[i] <- s.SetItems.[i + 1]
-                i <- i + 1
-            { SetItems = items }
-
-    let filter (p : 'a -> bool) (s : Set<'a>) : Set<'a> = { SetItems = Array.filter p s.SetItems }
-    let exists (p : 'a -> bool) (s : Set<'a>) : bool = Array.exists p s.SetItems
-    let forall (p : 'a -> bool) (s : Set<'a>) : bool = Array.forall p s.SetItems
-    let iter (f : 'a -> unit) (s : Set<'a>) : unit = Array.iter f s.SetItems
-    let fold (f : 'b -> 'a -> 'b) (state : 'b) (s : Set<'a>) : 'b = Array.fold f state s.SetItems
-    let map (f : 'a -> 'b) (s : Set<'a>) : Set<'b> when Ordered<'b> = ofArray (Array.map f s.SetItems)
-    let minElement (s : Set<'a>) : 'a = s.SetItems.[0]
-    let maxElement (s : Set<'a>) : 'a = s.SetItems.[s.SetItems.Length - 1]
-
-    let union (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
-        ofArray (Array.append a.SetItems b.SetItems)
-    let difference (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
-        { SetItems = Array.filter (fun x -> search b x < 0) a.SetItems }
-    let intersect (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
-        { SetItems = Array.filter (fun x -> search b x >= 0) a.SetItems }
-    let isSubset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
-        Array.forall (fun x -> search b x >= 0) a.SetItems
-    let isSuperset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> = isSubset b a
-
-// A height-balanced (AVL) tree map, ordered by structural `compare` — the
-// same shape F#'s Map has, and the same one `stdlib/mapext.fpp` already
-// exercises. A tree rather than the sorted array `Set` uses, because the
-// resolver threads an environment through every scope and rebuilds it by
-// `add` on the way down: a copying insert is quadratic over a file, a tree
-// insert shares all but the spine.
-//
-// `empty` is a nullary case, which makes it a syntactic value and therefore
-// generalizable — `let mutable env : Env = Map.empty` needs that.
-    let foldBack (f : 'a -> 's -> 's) (s : Set<'a>) (st : 's) : 's =
-        List.foldBack f (toList s) st
-    let partition (p : 'a -> bool) (s : Set<'a>) : Set<'a> * Set<'a> =
-        filter p s, filter (fun x -> not (p x)) s
-    let unionMany (ss : Set<'a> list) : Set<'a> =
-        List.fold (fun acc s -> union acc s) (empty ()) ss
-    let intersectMany (ss : Set<'a> list) : Set<'a> =
-        match ss with
-        | [] -> failwith "The input sequence was empty"
-        | h :: t -> List.fold (fun acc s -> intersect acc s) h t
-    let isProperSubset (a : Set<'a>) (b : Set<'a>) : bool =
-        isSubset a b && count a < count b
-    let isProperSuperset (a : Set<'a>) (b : Set<'a>) : bool =
-        isSuperset a b && count a > count b
 /// The delta vocabulary MapExt/HashMap deltas are expressed in. Named
 /// SetOp/RemoveOp because `Set` is already a type here (FSharp.Data.Adaptive
 /// spells the cases `Set` and `Remove`).
 type ElementOperation<'v> =
     | SetOp of 'v
     | RemoveOp
+
+/// Set is the same AVL tree Map is, with the value slot dropped: a node
+/// carries the element, its two children, its height and its count. That
+/// buys O(log n) add/remove (the old sorted-array form paid O(n) per insert)
+/// and the MapExt combinator surface below.
+type Set<'a> =
+    | SetEmpty
+    | SetNode of 'a * Set<'a> * Set<'a> * int * int
+
+module Set =
+    /// SetEmpty carries no payload, so this is a VALUE — the array form had
+    /// to be a unit function (see DIVERGENCES.md), which F# is not
+    let empty : Set<'a> = SetEmpty
+
+    let height (s : Set<'a>) : int =
+        match s with
+        | SetEmpty -> 0
+        | SetNode (k, l, r, h, c) -> h
+
+    let count (s : Set<'a>) : int =
+        match s with
+        | SetEmpty -> 0
+        | SetNode (k, l, r, h, c) -> c
+
+    let isEmpty (s : Set<'a>) : bool =
+        match s with
+        | SetEmpty -> true
+        | SetNode (k, l, r, h, c) -> false
+
+    let private mk (k : 'a) (l : Set<'a>) (r : Set<'a>) : Set<'a> =
+        let hl = height l
+        let hr = height r
+        let h = 1 + (if hl > hr then hl else hr)
+        SetNode (k, l, r, h, 1 + count l + count r)
+
+    let private rebalance (k : 'a) (l : Set<'a>) (r : Set<'a>) : Set<'a> =
+        let hl = height l
+        let hr = height r
+        if hl > hr + 1 then
+            match l with
+            | SetNode (lk, ll, lr, lh, lc) ->
+                if height ll >= height lr then mk lk ll (mk k lr r)
+                else
+                    match lr with
+                    | SetNode (lrk, lrl, lrr, lrh, lrc) -> mk lrk (mk lk ll lrl) (mk k lrr r)
+                    | SetEmpty -> mk k l r
+            | SetEmpty -> mk k l r
+        elif hr > hl + 1 then
+            match r with
+            | SetNode (rk, rl, rr, rh, rc) ->
+                if height rr >= height rl then mk rk (mk k l rl) rr
+                else
+                    match rl with
+                    | SetNode (rlk, rll, rlr, rlh, rlc) -> mk rlk (mk k l rll) (mk rk rlr rr)
+                    | SetEmpty -> mk k l r
+            | SetEmpty -> mk k l r
+        else mk k l r
+
+    let rec add (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        match s with
+        | SetEmpty -> SetNode (x, SetEmpty, SetEmpty, 1, 1)
+        | SetNode (k, l, r, h, c) ->
+            let d = compare x k
+            if d = 0 then SetNode (x, l, r, h, c)
+            elif d < 0 then rebalance k (add x l) r
+            else rebalance k l (add x r)
+
+    let rec contains (x : 'a) (s : Set<'a>) : bool when Ordered<'a> =
+        match s with
+        | SetEmpty -> false
+        | SetNode (k, l, r, h, c) ->
+            let d = compare x k
+            if d = 0 then true
+            elif d < 0 then contains x l
+            else contains x r
+
+    let rec tryMin (s : Set<'a>) : 'a option =
+        match s with
+        | SetEmpty -> None
+        | SetNode (k, l, r, h, c) ->
+            match l with
+            | SetEmpty -> Some k
+            | SetNode (a, b, cc, d, e) -> tryMin l
+
+    let rec tryMax (s : Set<'a>) : 'a option =
+        match s with
+        | SetEmpty -> None
+        | SetNode (k, l, r, h, c) ->
+            match r with
+            | SetEmpty -> Some k
+            | SetNode (a, b, cc, d, e) -> tryMax r
+
+    let rec private removeMinNode (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        match s with
+        | SetEmpty -> SetEmpty
+        | SetNode (k, l, r, h, c) ->
+            match l with
+            | SetEmpty -> r
+            | SetNode (a, b, cc, d, e) -> rebalance k (removeMinNode l) r
+
+    let rec remove (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        match s with
+        | SetEmpty -> SetEmpty
+        | SetNode (k, l, r, h, c) ->
+            let d = compare x k
+            if d < 0 then rebalance k (remove x l) r
+            elif d > 0 then rebalance k l (remove x r)
+            else
+                match l, r with
+                | SetEmpty, _ -> r
+                | _, SetEmpty -> l
+                | _, _ ->
+                    match tryMin r with
+                    | Some m -> rebalance m l (removeMinNode r)
+                    | None -> l
+
+    let rec fold (f : 's -> 'a -> 's) (st : 's) (s : Set<'a>) : 's =
+        match s with
+        | SetEmpty -> st
+        | SetNode (k, l, r, h, c) -> fold f (f (fold f st l) k) r
+
+    let rec foldBack (f : 'a -> 's -> 's) (s : Set<'a>) (st : 's) : 's =
+        match s with
+        | SetEmpty -> st
+        | SetNode (k, l, r, h, c) -> foldBack f l (f k (foldBack f r st))
+
+    let toList (s : Set<'a>) : 'a list = foldBack (fun k acc -> k :: acc) s []
+    let iter (f : 'a -> unit) (s : Set<'a>) : unit = fold (fun acc k -> f k) () s
+    let singleton (x : 'a) : Set<'a> = SetNode (x, SetEmpty, SetEmpty, 1, 1)
+    let ofList (xs : 'a list) : Set<'a> when Ordered<'a> =
+        List.fold (fun acc x -> add x acc) SetEmpty xs
+    let ofArray (xs : 'a[]) : Set<'a> when Ordered<'a> =
+        Array.fold (fun acc x -> add x acc) SetEmpty xs
+    let ofSeq (xs : seq<'a>) : Set<'a> when Ordered<'a> = ofList (Seq.toList xs)
+    let toArray (s : Set<'a>) : 'a[] = Array.ofList (toList s)
+    let toSeq (s : Set<'a>) : seq<'a> = List.toSeq (toList s)
+    let exists (p : 'a -> bool) (s : Set<'a>) : bool =
+        fold (fun acc k -> acc || p k) false s
+    let forall (p : 'a -> bool) (s : Set<'a>) : bool =
+        fold (fun acc k -> acc && p k) true s
+    let filter (p : 'a -> bool) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        fold (fun acc k -> if p k then add k acc else acc) SetEmpty s
+    let map (f : 'a -> 'b) (s : Set<'a>) : Set<'b> when Ordered<'b> =
+        fold (fun acc k -> add (f k) acc) SetEmpty s
+    let choose (f : 'a -> 'b option) (s : Set<'a>) : Set<'b> when Ordered<'b> =
+        fold (fun acc k -> match f k with Some b -> add b acc | None -> acc) SetEmpty s
+    let minElement (s : Set<'a>) : 'a =
+        match tryMin s with
+        | Some k -> k
+        | None -> failwith "The input set was empty"
+    let maxElement (s : Set<'a>) : 'a =
+        match tryMax s with
+        | Some k -> k
+        | None -> failwith "The input set was empty"
+    let removeMin (s : Set<'a>) : Set<'a> when Ordered<'a> = removeMinNode s
+    let removeMax (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        match tryMax s with
+        | Some k -> remove k s
+        | None -> s
+    let tryRemove (x : 'a) (s : Set<'a>) : Set<'a> option when Ordered<'a> =
+        if contains x s then Some (remove x s) else None
+    let tryItem (i : int) (s : Set<'a>) : 'a option = List.tryItem i (toList s)
+    let union (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        // fold the SMALLER into the larger
+        if count a < count b then fold (fun acc k -> add k acc) b a
+        else fold (fun acc k -> add k acc) a b
+    let unionMany (ss : Set<'a> list) : Set<'a> when Ordered<'a> =
+        List.fold (fun acc s -> union acc s) SetEmpty ss
+    let intersect (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        fold (fun acc k -> if contains k b then add k acc else acc) SetEmpty a
+    let intersectMany (ss : Set<'a> list) : Set<'a> when Ordered<'a> =
+        match ss with
+        | [] -> failwith "The input sequence was empty"
+        | h :: t -> List.fold (fun acc s -> intersect acc s) h t
+    let difference (a : Set<'a>) (b : Set<'a>) : Set<'a> when Ordered<'a> =
+        fold (fun acc k -> if contains k b then acc else add k acc) SetEmpty a
+    let partition (p : 'a -> bool) (s : Set<'a>) : Set<'a> * Set<'a> when Ordered<'a> =
+        filter p s, filter (fun k -> not (p k)) s
+    let isSubset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
+        forall (fun k -> contains k b) a
+    let isSuperset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> = isSubset b a
+    let isProperSubset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
+        isSubset a b && count a < count b
+    let isProperSuperset (a : Set<'a>) (b : Set<'a>) : bool when Ordered<'a> =
+        isSubset b a && count a > count b
+    /// everything strictly below / above an element, and whether it is present
+    let split (x : 'a) (s : Set<'a>) : Set<'a> * bool * Set<'a> when Ordered<'a> =
+        let mutable lo = SetEmpty
+        let mutable hi = SetEmpty
+        for k in toList s do
+            if k < x then lo <- add k lo
+            elif k > x then hi <- add k hi
+        lo, contains x s, hi
+    let withMin (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> = filter (fun k -> k >= x) s
+    let withMax (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> = filter (fun k -> k <= x) s
+    let range (lo : 'a) (hi : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
+        filter (fun k -> k >= lo && k <= hi) s
+    /// Set deltas are stated in SETS, not in a keyed map: Set is declared
+    /// before Map here, and (added, removed) is the natural shape for a
+    /// collection with no values. HashSet's delta IS keyed, because HashSet
+    /// is defined over HashMap (see HashSet.computeDelta).
+    let computeDelta (a : Set<'a>) (b : Set<'a>) : Set<'a> * Set<'a> when Ordered<'a> =
+        difference b a, difference a b
+    /// apply (added, removed); returns the new state and what took effect
+    let applyDelta (s : Set<'a>) (added : Set<'a>) (removed : Set<'a>) : Set<'a> * Set<'a> * Set<'a> when Ordered<'a> =
+        let effAdded = difference added s
+        let effRemoved = intersect removed s
+        let mutable state = s
+        for k in toList effAdded do
+            state <- add k state
+        for k in toList effRemoved do
+            state <- remove k state
+        state, effAdded, effRemoved
+    let neighbours (x : 'a) (s : Set<'a>) : 'a option * bool * 'a option when Ordered<'a> =
+        let mutable below = None
+        let mutable above = None
+        for k in toList s do
+            if k < x then below <- Some k
+            elif k > x && (match above with None -> true | Some _ -> false) then above <- Some k
+        below, contains x s, above
 
 type Map<'k, 'v> =
     | MapEmpty
@@ -2981,9 +3085,15 @@ module Map =
     let toList (t : Map<'k, 'v>) : ('k * 'v) list = foldBack (fun k v acc -> (k, v) :: acc) t []
     let toSeq (t : Map<'k, 'v>) : ('k * 'v) seq = List.toSeq (toList t)
     let keys (t : Map<'k, 'v>) : 'k list = foldBack (fun k v acc -> k :: acc) t []
-    /// O(1) key view, the counterpart of HashMap.keySet: the SAME tree with
-    /// its values left unread. `keys` above stays O(n) — it builds a list.
-    let keySet (t : Map<'k, 'v>) : Map<'k, int> = unbox (box t)
+    /// O(1) key VIEW: the same tree with its values left unread. Sound
+    /// because every value shares one runtime representation and no value is
+    /// ever read through it.
+    let keySetView (t : Map<'k, 'v>) : Map<'k, int> = unbox (box t)
+    /// the keys as a real Set. O(n): Set drops the value slot, so its nodes
+    /// are a different shape and the tree has to be rebuilt — the O(1) view
+    /// above is the one that shares structure.
+    let keySet (t : Map<'k, 'v>) : Set<'k> when Ordered<'k> =
+        foldBack (fun k v acc -> Set.add k acc) t SetEmpty
     let values (t : Map<'k, 'v>) : 'v list = foldBack (fun k v acc -> v :: acc) t []
 
     let rec private ofListInto (acc : Map<'k, 'v>) (xs : ('k * 'v) list) : Map<'k, 'v> when Ordered<'k> =

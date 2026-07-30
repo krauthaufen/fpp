@@ -147,18 +147,17 @@ a user-defined extension member on `option` do not resolve. `Option` itself
 carries no other members, and general extension members on builtins remain an
 open language feature.
 
-## `Set.empty` takes unit; there is no `Array.empty`
+## There is no `Array.empty`
 
-F# exposes both as VALUES. Here `Set.empty` is a unit function and
-`Array.empty` is absent, because a generic *value* is not stamped per
-instantiation: it is initialized once, at the canonical (uniform)
-representation. A `Set<int>`'s items are a PACKED `$parr_i`, so code
-stamped at int casts to that type and a uniform empty array traps.
+F# exposes it as a VALUE. It is absent here because a generic *value* is not
+stamped per instantiation: it would be initialized once, at the canonical
+(uniform) representation, and an `int[]`'s elements are a PACKED `$parr_i`,
+so code stamped at int casts to that type and a uniform empty array traps.
 
-A unit function stamps per use and builds the array at the right
-representation, which is why `Set.empty ()` is correct where the value
-form is not. `List.empty` and `Seq.empty` ARE values — lists and seqs are
-uniform, so nothing packs and there is nothing to get wrong.
+`List.empty`, `Seq.empty` and `Set.empty` ARE values: lists, seqs and (since
+Set became an AVL tree) sets carry no packed array, so there is nothing to
+get wrong. `Set.empty` used to take unit for exactly this reason and no
+longer does.
 
-Lifting this means monomorphizing generic value bindings (cloning the
-global per instantiation), the same treatment functions already get.
+Lifting this means monomorphizing generic value bindings (cloning the global
+per instantiation), the same treatment functions already get.
