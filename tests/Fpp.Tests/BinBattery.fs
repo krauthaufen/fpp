@@ -355,6 +355,25 @@ let binBattery =
               "    print (total [ 1; 2 ])" ]
             "1\n3\n2\n"
 
+        // a lambda INSIDE a function's own parameter lambda is a real closure,
+        // so a scalar parameter it reads cannot live on a raw rail — the env
+        // slot is anyref. Getting this wrong did not even produce a module
+        // that validated.
+        expects "a returned closure captures a scalar parameter"
+            [ "let addN (n : int) = (fun x -> x * 2 + n)"
+              "let mulThen (a : int) (b : int) = (fun x -> x * a + b)"
+              "let viaLet (n : int) ="
+              "    (fun x ->"
+              "        let doubled = x * 2"
+              "        doubled + n)"
+              "let go ="
+              "    print (addN 10 5)"
+              "    print (mulThen 3 4 5)"
+              "    print (viaLet 7 5)"
+              "    let f = addN 1"
+              "    print (f 2)" ]
+            "20\n19\n17\n5\n"
+
         expects "generic class hierarchy with virtual dispatch through the base"
             [ "[<AbstractClass>]"
               "type Node<'k>(kind : int) ="

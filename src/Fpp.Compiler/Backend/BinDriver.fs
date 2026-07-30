@@ -261,12 +261,17 @@ let private cellScan (decls : Decl list) : Dict<string * int, bool> * Dict<strin
                 (match gd with Some gd -> g gd | None -> ())
                 g x
         | _ -> ()
-    // a top-level function's own parameter lambdas ARE the function, not a
-    // capture boundary — its body compiles to a wasm function whose locals
-    // are locals
-    let rec skipParams (e : Expr) : Expr =
+    // A top-level function's own parameter lambda IS the function, not a
+    // capture boundary: its body compiles to a wasm function whose params are
+    // locals. Exactly ONE layer, though — `ArityOf` comes from that outermost
+    // lambda's param list, so any lambda INSIDE it is a real closure and the
+    // variables it reads are captures. Stripping every layer hid precisely
+    // that: `let f (n : int) = (fun x -> x + n)` left `n` unmarked, so the
+    // captured scalar went on a raw rail while the env slot stayed anyref, and
+    // the module did not even validate.
+    let skipParams (e : Expr) : Expr =
         match e with
-        | ELam (_, b) -> skipParams b
+        | ELam (_, b) -> b
         | _ -> e
     for d in decls do
         match d with

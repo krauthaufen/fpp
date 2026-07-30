@@ -236,6 +236,264 @@ let deriveShallowEquals =
         ds @ vecToList extra
     { Name = "deriveShallowEquals"; PerFile = perFile; WholeProgram = id }
 
+// ---- building generated code as DATA, not text ----------------------------
+//
+// Source is the wire format between a generator and the compiler, but nobody
+// should have to write it: indentation is significant, quotes need escaping,
+// and a missing paren surfaces as a parse error in a file the user never wrote.
+// Declarations are built as values here and rendered once, correctly.
+
+type GTy =
+    | GTyName of string
+    | GTyVar of string
+    | GTyApp of string * GTy list
+    | GTyFun of GTy * GTy
+    /// escape hatch: a type spelled exactly as given
+    | GTyRaw of string
+
+type GPat =
+    | GPWild
+    | GPVar of string
+    /// a union case and the names it binds
+    | GPCase of string * string list
+
+type GEx =
+    | GInt of int
+    | GStr of string
+    | GBool of bool
+    | GVar of string
+    | GApp of GEx * GEx list
+    | GBin of string * GEx * GEx
+    | GLam of string list * GEx
+    /// `let n = v` followed by the rest — a statement, so only valid in a body
+    | GLet of string * GEx * GEx
+    | GRec of (string * GEx) list
+    | GRecWith of GEx * (string * GEx) list
+    | GField of GEx * string
+    | GMatch of GEx * (GPat * GEx) list
+    | GIf of GEx * GEx * GEx
+    | GTuple of GEx list
+    | GList of GEx list
+    /// escape hatch: an expression spelled exactly as given
+    | GRaw of string
+
+type GMember =
+    { MName : string
+      MParams : (string * GTy option) list
+      MBody : GEx }
+
+type GDecl =
+    | GComment of string
+    | GOpen of string
+    | GValue of string * (string * GTy option) list * GTy option * GEx
+    | GRecordType of string * string list * (string * GTy) list
+    | GUnionType of string * string list * (string * GTy list) list
+    /// class name, type variables, member signatures
+    | GClassOf of string * string list * (string * GTy) list
+    /// class name, head types, member bodies
+    | GInstanceOf of string * GTy list * GMember list
+
+let rec tyText (t : GTy) : string =
+    match t with
+    | GTyName n -> n
+    | GTyVar v -> "'" + v
+    | GTyApp (n, args) -> n + "<" + String.concat ", " (List.map tyText args) + ">"
+    | GTyFun (a, b) -> "(" + tyText a + " -> " + tyText b + ")"
+    | GTyRaw s -> s
+
+/// F++ string literals take the same escapes F# does
+let strLit (s : string) : string =
+    let mutable out = ""
+    for ch in s do
+        if ch = '\\' then out <- out + "\\\\"
+        elif ch = '"' then out <- out + "\\\""
+        elif ch = '\n' then out <- out + "\\n"
+        elif ch = '\t' then out <- out + "\\t"
+        else out <- out + string ch
+    "\"" + out + "\""
+
+let private patText (p : GPat) : string =
+    match p with
+    | GPWild -> "_"
+    | GPVar v -> v
+    | GPCase (n, []) -> n
+    | GPCase (n, args) -> n + " " + String.concat " " args
+
+/// One line, or None when the shape needs several (a `let` sequence, a match).
+let rec private inlineOf (e : GEx) : string option =
+    // annotated because the self-hosted checker otherwise reads the result as
+    // IEnumerable<string> and String.concat wants a list
+    let all (xs : GEx list) : string list option =
+        let rendered = List.map inlineOf xs
+        if rendered |> List.exists (fun r -> r.IsNone) then None
+        else Some (rendered |> List.map (fun r -> match r with Some x -> x | None -> ""))
+    match e with
+    | GInt i -> Some (string i)
+    | GStr s -> Some (strLit s)
+    | GBool b -> Some (if b then "true" else "false")
+    | GVar v -> Some v
+    | GRaw s -> Some s
+    | GField (t, f) -> inlineOf t |> Option.map (fun x -> x + "." + f)
+    | GApp (f, args) ->
+        match inlineOf f, all args with
+        | Some fs, Some argTexts -> Some ("(" + fs + " " + String.concat " " argTexts + ")")
+        | _ -> None
+    | GBin (op, a, b) ->
+        match inlineOf a, inlineOf b with
+        | Some x, Some y -> Some ("(" + x + " " + op + " " + y + ")")
+        | _ -> None
+    | GLam (ps, body) ->
+        inlineOf body |> Option.map (fun b -> "(fun " + String.concat " " ps + " -> " + b + ")")
+    | GIf (c, t, f) ->
+        match inlineOf c, inlineOf t, inlineOf f with
+        | Some cs, Some ts, Some fs -> Some ("(if " + cs + " then " + ts + " else " + fs + ")")
+        | _ -> None
+    | GTuple xs -> all xs |> Option.map (fun (ts : string list) -> "(" + String.concat ", " ts + ")")
+    | GList xs -> all xs |> Option.map (fun (ts : string list) -> "[ " + String.concat "; " ts + " ]")
+    | GRec fields ->
+        // rendered per field rather than through List.map2: pairing two lists
+        // is one construct the self-hosted checker reads differently
+        let parts = fields |> List.map (fun (n, v) -> inlineOf v |> Option.map (fun t -> n + " = " + t))
+        if parts |> List.exists (fun (t : string option) -> t.IsNone) then None
+        else
+            let texts = parts |> List.map (fun (t : string option) -> match t with Some x -> x | None -> "")
+            Some ("{ " + String.concat "; " texts + " }")
+    | GRecWith (b, fields) ->
+        let parts = fields |> List.map (fun (n, v) -> inlineOf v |> Option.map (fun t -> n + " = " + t))
+        if parts |> List.exists (fun (t : string option) -> t.IsNone) then None
+        else
+            let texts = parts |> List.map (fun (t : string option) -> match t with Some x -> x | None -> "")
+            match inlineOf b with
+            | Some bs -> Some ("{ " + bs + " with " + String.concat "; " texts + " }")
+            | None -> None
+    // a `let` sequence is statements, and a match reads far better broken up
+    | GLet (_, _, _) -> None
+    | GMatch (_, _) -> None
+
+let private pad (n : int) = String.replicate n " "
+
+/// An expression as lines at the given indent. Anything that cannot be one
+/// line becomes several, with the layout the parser accepts.
+let rec exLines (ind : int) (e : GEx) : string list =
+    let fits (one : string) =
+        // generated code gets READ: keep a one-liner only while it is one
+        ind + one.Length <= 96
+    match inlineOf e with
+    | Some one when fits one -> [ pad ind + one ]
+    | _ ->
+        match e with
+        | GLet (n, v, rest) ->
+            (match inlineOf v with
+             | Some vs -> [ pad ind + "let " + n + " = " + vs ]
+             | None -> (pad ind + "let " + n + " =") :: exLines (ind + 4) v)
+            @ exLines ind rest
+        | GMatch (scr, arms) ->
+            let head =
+                match inlineOf scr with
+                | Some s -> pad ind + "match " + s + " with"
+                | None -> pad ind + "match " + String.concat " " (List.map (fun (l : string) -> l.Trim ()) (exLines 0 scr)) + " with"
+            head
+            :: (arms
+                |> List.collect (fun (p, body) ->
+                    match inlineOf body with
+                    | Some b -> [ pad ind + "| " + patText p + " -> " + b ]
+                    | None -> (pad ind + "| " + patText p + " ->") :: exLines (ind + 4) body))
+        | GRec fields ->
+            // `{ f = v` then the rest aligned under it, closing on the last
+            let rendered =
+                fields
+                |> List.map (fun (n, v) ->
+                    match inlineOf v with
+                    | Some vs -> [ n + " = " + vs ]
+                    | None ->
+                        let inner = exLines (ind + 6) v
+                        (n + " =") :: inner)
+            let flat =
+                rendered
+                |> List.mapi (fun i ls ->
+                    ls |> List.mapi (fun j l ->
+                        if i = 0 && j = 0 then pad ind + "{ " + l
+                        elif j = 0 then pad (ind + 2) + l
+                        else l))
+                |> List.concat
+            match List.rev flat with
+            | last :: before -> List.rev ((last + " }") :: before)
+            | [] -> [ pad ind + "{ }" ]
+        | GLam (ps, body) ->
+            let head = pad ind + "(fun " + String.concat " " ps + " ->"
+            let inner = exLines (ind + 4) body
+            (match List.rev inner with
+             | last :: before -> head :: List.rev ((last + ")") :: before)
+             | [] -> [ head + ")" ])
+        | GIf (c, t, f) ->
+            let cs = match inlineOf c with Some x -> x | None -> "(* cond *)"
+            (pad ind + "if " + cs + " then")
+            :: exLines (ind + 4) t
+            @ [ pad ind + "else" ]
+            @ exLines (ind + 4) f
+        | other ->
+            // every remaining shape is inline-able by construction
+            // never silently: an unbound name here names the bug in the error
+            [ pad ind + (match inlineOf other with Some x -> x | None -> "__generator_cannot_render__") ]
+
+let private paramText (ps : (string * GTy option) list) =
+    ps
+    |> List.map (fun (n, t) ->
+        match t with
+        | Some ty -> "(" + n + " : " + tyText ty + ")"
+        | None -> n)
+    |> String.concat " "
+
+let declLines (d : GDecl) : string list =
+    match d with
+    | GComment c -> [ "// " + c ]
+    | GOpen m -> [ "open " + m ]
+    | GValue (name, ps, ret, body) ->
+        let head =
+            "let " + name
+            + (if List.isEmpty ps then "" else " " + paramText ps)
+            + (match ret with Some t -> " : " + tyText t | None -> "")
+            + " ="
+        (match inlineOf body with
+         | Some one when one.Length + head.Length < 70 -> [ head + " " + one ]
+         | _ -> head :: exLines 4 body)
+    | GRecordType (name, ps, fields) ->
+        let tp = if List.isEmpty ps then "" else "<" + String.concat ", " (List.map (fun p -> "'" + p) ps) + ">"
+        [ "type " + name + tp + " ="
+          "    { " + String.concat "; " (fields |> List.map (fun (n, t) -> n + " : " + tyText t)) + " }" ]
+    | GUnionType (name, ps, cases) ->
+        let tp = if List.isEmpty ps then "" else "<" + String.concat ", " (List.map (fun p -> "'" + p) ps) + ">"
+        ("type " + name + tp + " =")
+        :: (cases
+            |> List.map (fun (cn, args) ->
+                if List.isEmpty args then "    | " + cn
+                else "    | " + cn + " of " + String.concat " * " (List.map tyText args)))
+    | GClassOf (name, tvs, members) ->
+        ("class " + name + "<" + String.concat ", " (List.map (fun v -> "'" + v) tvs) + ">")
+        :: (members |> List.map (fun (mn, mt) -> "    static " + mn + " : " + tyText mt))
+    | GInstanceOf (name, heads, members) ->
+        ("instance " + name + "<" + String.concat ", " (List.map tyText heads) + ">")
+        :: (members
+            |> List.collect (fun m ->
+                let head =
+                    "    static " + m.MName
+                    + (if List.isEmpty m.MParams then "" else " " + paramText m.MParams)
+                    + " ="
+                match inlineOf m.MBody with
+                | Some one -> [ head + " " + one ]
+                | None -> head :: exLines 8 m.MBody))
+
+/// A whole generated file. No module header on purpose: top-level bindings are
+/// what a later file can name without an `open`.
+let renderFile (decls : GDecl list) : string =
+    let spaced (d : GDecl) =
+        match d with
+        // a comment belongs to what follows it, and opens come in a block
+        | GComment _ -> declLines d
+        | GOpen _ -> declLines d
+        | _ -> declLines d @ [ "" ]
+    String.concat "\n" ("" :: (decls |> List.collect spaced)) + "\n"
+
 // ---- deriveGen: a property-test generator for every user type -------------
 // The generator a PerFile plugin could not write: it emits SOURCE, so the
 // values it produces are ordinary `Gen<T>` records built from the field types
@@ -298,77 +556,86 @@ let deriveGen =
                 | Some d ->
                     let ms = mentions isUser d
                     List.contains target ms || ms |> List.exists (fun m -> reaches (from :: seen) m target)
-        let out = vecNew<string> ()
+        let decls = vecNew<GDecl> ()
         let skipped = vecNew<string> ()
+        // one `Gen<T>` per type, as DATA — the renderer worries about layout
         for name, d in dictPairs named do
             let generic = not (List.isEmpty d.TParams)
             let recursive = reaches [] name name
             if generic then vecAdd skipped (name + " (generic)")
             elif recursive then vecAdd skipped (name + " (recursive)")
             else
-                // one generator per field or payload, bound up front
                 let parts =
                     if d.TKind = "record" then d.TFields |> List.map (fun f -> f.FName, f.FType)
                     else d.TCases |> List.collect (fun c -> c.CArgs |> List.mapi (fun i a -> c.CName + string i, a))
-                let resolved = parts |> List.map (fun (n, t) -> n, t, genExprFor isUser t)
-                if resolved |> List.exists (fun (_, _, e) -> e.IsNone) then
+                let resolved = parts |> List.map (fun (n, t) -> n, genExprFor isUser t)
+                if resolved |> List.exists (fun (_, e) -> e.IsNone) then
                     vecAdd skipped (name + " (unsupported field type)")
                 else
-                    let genOf (nm : string) =
-                        match resolved |> List.tryPick (fun (n, _, e) -> if n = nm then e else None) with
-                        | Some e -> e
-                        | None -> "Gen.int"
-                    let binds =
-                        resolved
-                        |> List.map (fun (n, _, e) -> "    let g_" + n + " = " + (match e with Some x -> x | None -> "Gen.int"))
-                        |> String.concat "\n"
-                    let body =
+                    let slot (n : string) = GVar ("g_" + n)
+                    let draw =
                         if d.TKind = "record" then
-                            let draws =
-                                d.TFields
-                                |> List.map (fun f -> f.FName + " = g_" + f.FName + ".Draw r")
-                                |> String.concat "; "
-                            let smalls =
+                            GLam ([ "r" ],
+                                  GRec (d.TFields |> List.map (fun f -> f.FName, GApp (GField (slot f.FName, "Draw"), [ GVar "r" ]))))
+                        else
+                            // pick a case, then draw its payload
+                            let n = List.length d.TCases
+                            let build (c : GenCase) =
+                                if List.isEmpty c.CArgs then GVar c.CName
+                                else
+                                    GApp (GVar c.CName,
+                                          c.CArgs |> List.mapi (fun j _ -> GApp (GField (slot (c.CName + string j), "Draw"), [ GVar "r" ])))
+                            let rec chain (i : int) (cs : GenCase list) =
+                                match cs with
+                                | [] -> GRaw "()"
+                                | [ last ] -> build last
+                                | c :: rest -> GIf (GBin ("=", GVar "k", GInt i), build c, chain (i + 1) rest)
+                            GLam ([ "r" ], GLet ("k", GApp (GVar "Gen.rngBelow", [ GVar "r"; GInt n ]), chain 0 d.TCases))
+                    let smaller =
+                        if d.TKind = "record" && not (List.isEmpty d.TFields) then
+                            // one candidate per field, each with that field shrunk
+                            let per =
                                 d.TFields
                                 |> List.map (fun f ->
-                                    "List.map (fun v -> { x with " + f.FName + " = v }) (g_" + f.FName + ".Smaller x." + f.FName + ")")
-                                |> String.concat " @ "
-                            let renders =
+                                    GApp (GVar "List.map",
+                                          [ GLam ([ "v" ], GRecWith (GVar "x", [ f.FName, GVar "v" ]))
+                                            GApp (GField (slot f.FName, "Smaller"), [ GField (GVar "x", f.FName) ]) ]))
+                            GLam ([ "x" ], per |> List.reduce (fun a b -> GBin ("@", a, b)))
+                        else GLam ([ "x" ], GList [])
+                    let render =
+                        if d.TKind = "record" then
+                            let body =
                                 d.TFields
-                                |> List.map (fun f -> "\"" + f.FName + " = \" + g_" + f.FName + ".Render x." + f.FName)
-                                |> String.concat " + \"; \" + "
-                            "    { Draw = (fun r -> { " + draws + " })\n"
-                            + "      Smaller = (fun x -> " + (if List.isEmpty d.TFields then "[]" else smalls) + ")\n"
-                            + "      Render = (fun x -> \"{ \" + " + renders + " + \" }\") }"
+                                |> List.map (fun f ->
+                                    GBin ("+", GStr (f.FName + " = "), GApp (GField (slot f.FName, "Render"), [ GField (GVar "x", f.FName) ])))
+                                |> List.reduce (fun a b -> GBin ("+", GBin ("+", a, GStr "; "), b))
+                            GLam ([ "x" ], GBin ("+", GBin ("+", GStr "{ ", body), GStr " }"))
                         else
-                            let n = List.length d.TCases
-                            let drawCase (i : int) (c : GenCase) =
-                                let build =
-                                    if List.isEmpty c.CArgs then c.CName
-                                    else c.CName + " " + (c.CArgs |> List.mapi (fun j _ -> "(g_" + c.CName + string j + ".Draw r)") |> String.concat " ")
-                                if i = 0 && n = 1 then "            " + build
-                                elif i = 0 then "            if k = " + string i + " then " + build
-                                elif i = n - 1 then "            else " + build
-                                else "            elif k = " + string i + " then " + build
-                            let renderCase (c : GenCase) =
-                                if List.isEmpty c.CArgs then "            | " + c.CName + " -> \"" + c.CName + "\""
-                                else
-                                    let pats = c.CArgs |> List.mapi (fun j _ -> "a" + string j) |> String.concat " "
-                                    let shows =
-                                        c.CArgs
-                                        |> List.mapi (fun j _ -> "g_" + c.CName + string j + ".Render a" + string j)
-                                        |> String.concat " + \" \" + "
-                                    "            | " + c.CName + " " + pats + " -> \"" + c.CName + " \" + " + shows
-                            "    { Draw =\n        (fun r ->\n            let k = Gen.rngBelow r " + string n + "\n"
-                            + (d.TCases |> List.mapi drawCase |> String.concat "\n") + ")\n"
-                            + "      Smaller = (fun x -> [])\n"
-                            + "      Render =\n        (fun x ->\n            match x with\n"
-                            + (d.TCases |> List.map renderCase |> String.concat "\n") + ") }"
-                    ignore (genOf "")
-                    vecAdd out
-                        ("/// generated by deriveGen\nlet gen" + name + " () : Gen<" + name + "> =\n"
-                         + (if binds = "" then "" else binds + "\n") + body)
-        if vecLen out = 0 then []
+                            GLam ([ "x" ],
+                                  GMatch (GVar "x",
+                                          d.TCases
+                                          |> List.map (fun c ->
+                                              let pats = c.CArgs |> List.mapi (fun j _ -> "a" + string j)
+                                              let body =
+                                                  if List.isEmpty c.CArgs then GStr c.CName
+                                                  else
+                                                      let shown =
+                                                          c.CArgs
+                                                          |> List.mapi (fun j _ ->
+                                                              GApp (GField (slot (c.CName + string j), "Render"), [ GVar ("a" + string j) ]))
+                                                          |> List.reduce (fun a b -> GBin ("+", GBin ("+", a, GStr " "), b))
+                                                      GBin ("+", GStr (c.CName + " "), shown)
+                                              GPCase (c.CName, pats), body)))
+                    // the field generators, bound before the record that uses them
+                    let body =
+                        List.foldBack
+                            (fun (n, e) acc ->
+                                GLet ("g_" + n, GRaw (match e with Some x -> x | None -> "Gen.int"), acc))
+                            resolved
+                            (GRec [ "Draw", draw; "Smaller", smaller; "Render", render ])
+                    vecAdd decls (GComment ("generated by deriveGen"))
+                    vecAdd decls (GValue ("gen" + name, [ "()", None ], Some (GTyApp ("Gen", [ GTyName name ])), body))
+        if vecLen decls = 0 then []
         else
             let opens =
                 view.Types
@@ -376,14 +643,13 @@ let deriveGen =
                 |> List.map (fun t -> t.TModule)
                 |> List.distinct
                 |> List.sort
-                |> List.map (fun m -> "open " + m)
+                |> List.map (fun m -> GOpen m)
             let header =
-                "// deriveGen: generators for the program's own types. No module header, so\n"
-                + "// these are top-level bindings any later file can name without an open.\n"
-                + (if vecLen skipped = 0 then ""
-                   else "// skipped: " + String.concat ", " (vecToList skipped) + "\n")
-            let opensText = if List.isEmpty opens then "" else String.concat "\n" opens + "\n"
-            [ "deriveGen.fpp", header + "\n" + opensText + "\n" + String.concat "\n\n" (vecToList out) + "\n" ]
+                [ GComment "deriveGen: generators for the program's own types."
+                  GComment "Built as declaration DATA and rendered — see GDecl in Plugins.fs." ]
+                @ (if vecLen skipped = 0 then []
+                   else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
+            [ "deriveGen.fpp", renderFile (header @ opens @ vecToList decls) ]
     { GName = "deriveGen"; Generate = generate }
 
 let builtinGenerators = [ deriveGen ]

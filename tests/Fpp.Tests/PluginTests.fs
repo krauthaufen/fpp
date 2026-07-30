@@ -3,6 +3,7 @@ module Fpp.Tests.PluginTests
 open Expecto
 open Fpp
 open Fpp.Core.Ir
+open Fpp.Core.Plugins
 
 let private wasmtime =
     System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
@@ -45,25 +46,29 @@ let generatorTests =
     testList "generators (source-level plugins)" [
         test "a generator emits a type, a class and an instance" {
             // NONE of these is reachable for a post-lowering plugin: by then
-            // resolution and inference are over. This is the whole point of
-            // running before the front end.
+            // resolution and inference are over. Built with the typed builder,
+            // so there is no source text, no escaping and no indentation here.
             let power : Fpp.Core.Plugins.Generator =
                 { GName = "power"
                   Generate =
                     fun view ->
                         let names = view.Types |> List.map (fun t -> t.TName) |> List.sort
+                        let describeBody (recv : string) (label : GEx) =
+                            GBin ("+", label, GApp (GVar "string", [ GField (GVar recv, "Tag") ]))
                         [ "power.fpp",
-                          String.concat "\n"
-                            [ "// no module header: top-level bindings any later file can name"
-                              "type Tagged = { Tag : int; Label : string }"
-                              "class Described<'a>"
-                              "    static describe : 'a -> string"
-                              "instance Described<Tagged>"
-                              "    static describe (t : Tagged) = t.Label + \"#\" + string t.Tag"
-                              "instance Described<int>"
-                              "    static describe (i : int) = \"int:\" + string i"
-                              "let sawTypes = \"" + String.concat "," names + "\""
-                              "" ] ] }
+                          renderFile
+                            [ GComment "built as declaration data, not text"
+                              GRecordType ("Tagged", [], [ "Tag", GTyName "int"; "Label", GTyName "string" ])
+                              GClassOf ("Described", [ "a" ], [ "describe", GTyFun (GTyVar "a", GTyName "string") ])
+                              GInstanceOf ("Described", [ GTyName "Tagged" ],
+                                [ { MName = "describe"
+                                    MParams = [ "t", Some (GTyName "Tagged") ]
+                                    MBody = describeBody "t" (GBin ("+", GField (GVar "t", "Label"), GStr "#")) } ])
+                              GInstanceOf ("Described", [ GTyName "int" ],
+                                [ { MName = "describe"
+                                    MParams = [ "i", Some (GTyName "int") ]
+                                    MBody = GBin ("+", GStr "int:", GApp (GVar "string", [ GVar "i" ])) } ])
+                              GValue ("sawTypes", [], None, GStr (String.concat "," names)) ] ] }
             let out =
                 runGenerated [ power ]
                     [ "types.fpp", [ "module Types"; "type Point = { X : int; Y : int }"; "type Color = Red | Green | Blue" ]
@@ -74,6 +79,34 @@ let generatorTests =
                         "    print (describe 3)"
                         "    print sawTypes" ] ]
             Expect.equal out "seven#7\nint:3\nColor,Point\n" "generated class and instances dispatch, and the view saw the user types"
+        }
+
+        test "the builder escapes and lays out what strings get wrong" {
+            // the three things that bit when this emitted text by hand
+            let tricky : Fpp.Core.Plugins.Generator =
+                { GName = "tricky"
+                  Generate =
+                    fun _ ->
+                        [ "tricky.fpp",
+                          renderFile
+                            [ GValue ("quoted", [], None, GStr "a \"quoted\" \\ backslash")
+                              // a lambda whose body is a let sequence: the layout
+                              // a hand-written string got wrong
+                              GValue ("counted", [ "n", Some (GTyName "int") ], None,
+                                      GLam ([ "x" ], GLet ("doubled", GBin ("*", GVar "x", GInt 2), GBin ("+", GVar "doubled", GVar "n"))))
+                              GValue ("matched", [ "o", Some (GTyApp ("Option", [ GTyName "int" ])) ], None,
+                                      GMatch (GVar "o", [ GPCase ("Some", [ "v" ]), GVar "v"; GPCase ("None", []), GInt 0 ])) ] ] }
+            let out =
+                runGenerated [ tricky ]
+                    [ "types.fpp", [ "module Types"; "type Anchor = { A : int }" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "let go ="
+                        "    print quoted"
+                        "    print (counted 10 5)"
+                        "    print (matched (Some 3))"
+                        "    print (matched None)" ] ]
+            Expect.equal out "a \"quoted\" \\ backslash\n20\n3\n0\n" "escaping, a let-bodied lambda and a match all render correctly"
         }
 
         test "a generator sees hand-written declarations only" {
