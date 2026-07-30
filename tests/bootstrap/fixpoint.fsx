@@ -221,6 +221,11 @@ let report (expected : string) (actual : string) =
             s.Substring(a, b - a).Replace("\n", "\\n")
         printfn "  stage-0: %s" (window expected)
         printfn "  stage-1: %s" (window actual)
+        // keep both answers: a first-differing-byte is rarely enough to see
+        // WHAT diverged, and re-running the wasm stage costs minutes
+        System.IO.File.WriteAllBytes (scratch + "/answer-stage0.wasm", System.Text.Encoding.Latin1.GetBytes expected)
+        System.IO.File.WriteAllBytes (scratch + "/answer-stage1.wasm", System.Text.Encoding.Latin1.GetBytes actual)
+        printfn "  both answers written to %s/answer-stage{0,1}.wasm" scratch
         1
 
 // ---- go ------------------------------------------------------------------
