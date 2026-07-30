@@ -124,6 +124,18 @@ let quotationTests =
             Expect.isNonEmpty (bad.Diagnostics "m.fpp") "a string splice does not fit an int hole"
         }
 
+        test "a DECLARATION can be quoted, and rendered back to source" {
+            // what a generator actually wants to emit
+            let ws = Workspace()
+            ws.SetFileText "m.fpp"
+                (String.concat "\n"
+                    [ "module M"
+                      "let d : Code<unit> = <@ let addOne x = x + 1 @>"
+                      "let go = print (Code.render d.Raw)"
+                      "" ])
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "a declaration quotation checks like any other code"
+        }
+
         test "an unclosed quotation is an error, not silence" {
             let r = parseRoot "let q = <@ 1 + 2\n"
             Expect.isNonEmpty r.Diagnostics "missing '@>' is reported"

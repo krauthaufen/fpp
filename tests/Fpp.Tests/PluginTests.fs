@@ -419,13 +419,18 @@ let generatorTests =
             // reads the program it generates for from `viewTypes`.
             let plugin =
                 String.concat "\n"
-                    [ "// derives a `describe<T>` for every record in the program"
+                    [ "// builds each declaration as a TREE and emits it: the"
+                      "// plugin never writes source strings"
+                      "let fieldOf (f : string) = CApp (CName \"string\", [ CField (CName \"x\", f) ])"
+                      "let rec joined (ms : (string * string) list) ="
+                      "    match ms with"
+                      "    | [] -> CStr \"\""
+                      "    | [ (f, t) ] -> fieldOf f"
+                      "    | (f, t) :: rest -> CBin (\"+\", CBin (\"+\", fieldOf f, CStr \";\"), joined rest)"
                       "let go ="
                       "    for (name, kind, members) in viewTypes do"
                       "        if kind = \"record\" then"
-                      "            print (\"let describe\" + name + \" (x : \" + name + \") =\")"
-                      "            let parts = List.map (fun (f, t) -> \"\\\"\" + f + \"=\\\" + string x.\" + f) members"
-                      "            print (\"    \" + String.concat \" + \\\";\\\" + \" parts)"
+                      "            Code.emit (CDLet (\"describe\" + name, [ \"x\" ], joined members))"
                       "" ]
             let ws = Workspace()
             ws.AddFppGenerator "describe" [ "plugin.fpp", plugin ]
@@ -435,7 +440,7 @@ let generatorTests =
             Expect.isEmpty errs "the generated program compiles"
             let generated = ws.GeneratedFiles |> List.map (fun (_, _, src) -> src) |> String.concat ""
             Expect.stringContains generated "let describePoint" "the F++ plugin wrote the function"
-            Expect.equal (runBytes bytes) "X=3;Y=4\n" "and the program uses it"
+            Expect.equal (runBytes bytes) "3;4\n" "and the program uses it"
         }
 
         test "an F++ plugin that does not compile is reported as such" {

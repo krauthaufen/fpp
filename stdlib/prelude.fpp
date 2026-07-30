@@ -3791,11 +3791,60 @@ type CodeTree =
     | CField of CodeTree * string
     /// `match scrutinee with | pat -> body | ...`
     | CMatch of CodeTree * (QPat * CodeTree) list
+    /// a DECLARATION: `let name p1 p2 = body`. Quoting one gives a plugin the
+    /// thing it actually wants to emit.
+    | CDLet of string * string list * CodeTree
 
 /// `Code<'t>` is quoted code KNOWN TO PRODUCE a 't — that is what lets a splice
 /// type check against the hole it fills. `Raw` is the tree underneath, for
 /// taking the code apart.
 type Code<'t> = { Raw : CodeTree }
+
+module Code =
+    let private pad (n : int) = String.replicate n " "
+
+    let rec renderPat (p : QPat) : string =
+        match p with
+        | QWild -> "_"
+        | QVar v -> v
+        | QInt v -> string v
+        | QCase (n, []) -> n
+        | QCase (n, ps) -> n + " " + String.concat " " (List.map renderPat ps)
+
+    /// Render a tree back to SOURCE. This is the boundary where code becomes
+    /// text — a generator writing a file, a plugin printing what it produced —
+    /// and nowhere else: composition happens on trees.
+    let rec renderAt (ind : int) (c : CodeTree) : string =
+        match c with
+        | CInt v -> string v
+        | CStr v -> "\"" + v + "\""
+        | CBool b -> if b then "true" else "false"
+        | CName n -> n
+        | CApp (f, args) ->
+            "(" + renderAt ind f + " " + String.concat " " (List.map (fun a -> renderAt ind a) args) + ")"
+        | CBin (op, l, r) -> "(" + renderAt ind l + " " + op + " " + renderAt ind r + ")"
+        | CIf (c2, t, e) -> "(if " + renderAt ind c2 + " then " + renderAt ind t + " else " + renderAt ind e + ")"
+        | CTuple xs -> "(" + String.concat ", " (List.map (fun x -> renderAt ind x) xs) + ")"
+        | CList xs -> "[ " + String.concat "; " (List.map (fun x -> renderAt ind x) xs) + " ]"
+        | CLam (ps, b) -> "(fun " + String.concat " " ps + " -> " + renderAt ind b + ")"
+        | CField (r, f) -> renderAt ind r + "." + f
+        // a `let` sequence is statements: F++ has no `let ... in`
+        | CLet (n, v, b) ->
+            "\n" + pad (ind + 4) + "let " + n + " = " + renderAt (ind + 4) v
+            + "\n" + pad (ind + 4) + renderAt (ind + 4) b
+        | CMatch (sc, arms) ->
+            let arm (p : QPat) (b : CodeTree) =
+                "\n" + pad (ind + 4) + "| " + renderPat p + " -> " + renderAt (ind + 4) b
+            "match " + renderAt ind sc + " with"
+            + String.concat "" (List.map (fun (p, b) -> arm p b) arms)
+        | CDLet (n, ps, b) ->
+            let ps2 = if List.isEmpty ps then "" else " " + String.concat " " ps
+            "let " + n + ps2 + " =\n" + pad (ind + 4) + renderAt (ind + 4) b
+
+    let render (c : CodeTree) : string = renderAt 0 c
+
+    /// print a declaration as source — what an F++ generator emits
+    let emit (c : CodeTree) : unit = print (render c)
 
 /// The conversions the generators need, under names `Gen` does not shadow.
 /// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a

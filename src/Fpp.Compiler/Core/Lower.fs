@@ -920,7 +920,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // binder that happens to share their spelling.
                 let renames = dictNew<string, string> ()
                 let fresh (nm : string) (off : int) =
-                    let unique = nm + "#" + string off
+                    // `_q` and not `#`: a renamed binder has to stay a legal
+                    // identifier, or rendered code would not parse back
+                    let unique = nm + "_q" + string off
                     dictSet renames nm unique
                     unique
                 let seen (nm : string) =
@@ -963,10 +965,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         (match kids with
                          | [ c; t; e ] -> ctor "CIf" [ quote c; quote t; quote e ]
                          | _ -> note (offsetOf m) "an `if` in a quotation needs an `else`")
+                    | LetDecl ->
+                        // a quotation whose whole body is a `let` is a
+                        // DECLARATION quote: `<@ let f x = x + 1 @>`
+                        let pats = nodesOf m |> List.filter (fun x -> x.NodeKind = IdentPat)
+                        let value = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
+                        (match pats, value with
+                         | nameNode :: paramNodes, Some v ->
+                             let nameOf (x : GreenNode) =
+                                 match tokensOf x |> List.tryHead with Some t -> t.Text | None -> "_"
+                             let ps = paramNodes |> List.map (fun x -> str (fresh (nameOf x) (offsetOf x)))
+                             ctor "CDLet" [ str (nameOf nameNode); EListLit ps; quote v ]
+                         | _ -> note (offsetOf m) "declaration quotation must bind a name")
                     | BlockExpr ->
                         // `let n = v` then the rest
                         (match nodesOf m with
-                         | d :: rest when d.NodeKind = LetDecl ->
+                         | d :: rest when d.NodeKind = LetDecl && (rest |> List.exists (fun x -> isExprish x.NodeKind)) ->
                              let nameTok =
                                  nodesOf d
                                  |> List.tryFind (fun x -> x.NodeKind = IdentPat)
@@ -980,6 +994,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   let unique = fresh nt.Text nt.Offset
                                   ctor "CLet" [ str unique; qv; quote b ]
                               | _ -> note (offsetOf m) "let in a quotation must bind a name to a value")
+                         | [ only ] when only.NodeKind = LetDecl -> quote only
                          | inner :: _ when isExprish inner.NodeKind -> quote inner
                          | _ -> note (offsetOf m) "block not quotable")
                     | TupleExpr -> ctor "CTuple" [ EListLit (List.map quote kids) ]
