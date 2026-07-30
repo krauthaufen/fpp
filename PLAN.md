@@ -2906,10 +2906,30 @@ returns `GenOutput` per file:
   by the compiler, so earlier spans stay valid. This is what a rewriting plugin
   should return: `logCalls` now does, and no longer juggles the whole file.
 
-Honest about the name: these are SYNTAX trees with typing in a side table, not a
-TAST. This compiler keeps types keyed by definition rather than hanging them on
-a typed tree, so `FTypeAt` is what there is to give — enough to be type-aware
-(`twice : int -> int`), short of a fully typed tree to pattern match on.
+`FTast` IS A TYPED TREE. `TDecl`/`TExpr` carry a type on EVERY node —
+`TDLet (name, params-with-types, return-type, body)` and `TLit / TName / TApp /
+TBin / TLam / TLet / TIf / TMatch / TField / TTuple / TList`, each with its
+inferred type, plus `TOther (kind, type)` so the walk stays TOTAL: a construct
+without its own case still appears with its kind and type rather than being
+dropped. `typeOfT` reads the type off any node.
+
+It is built from a new `InferResult.ExprTypes`, which records EVERY expression
+node keyed by its SPAN. The span and not the offset: a node and its leftmost
+descendant share a first token, so offset-keying reported `p.X` as `Point`
+rather than `int`, and a function's return type as `unit`. Per file the spans go
+into a dictionary, because a scan per node would be quadratic in file size.
+
+What a plugin sees, on `let pick (p : Point) (flag : bool) = let s = p.X + p.Y
+in if flag then s else s + 1`:
+
+    pick(p:Point,flag:bool)->int =
+      (let s = (p:Point.X:int + p:Point.Y:int):int in
+       (if flag:bool then s:int else (s:int + 1:int):int):int):int
+
+One thing to know: the view is built BEFORE generation, so a file that CONSUMES
+generated code still has type variables where that code will be. The types of
+hand-written code are settled; forward references to what a plugin will emit are
+not, and cannot be.
 
 PLACEMENT. A file sees only EARLIER files, so a generated one lands after the
 last file declaring a TYPE — or after the FIRST file when no file declares one,
