@@ -401,6 +401,23 @@ let binBattery =
         // HYGIENE: a binder inside a quotation is renamed per quotation site,
         // so a spliced fragment's free names cannot be captured by a binder
         // that merely spells the same
+        // `: %ty` — a TYPE spliced into a quoted signature, which is what a
+        // generator needs to emit one declaration per field
+        expects "types can be spliced into a quoted signature"
+            [ "let t : QTy = QTyName \"string\""
+              "let r : QTy = QTyApp (\"list\", [ QTyName \"int\" ])"
+              "let d : Code<unit> = <@ let f (x : %t) : %r = [ 1 ] @>"
+              "let go ="
+              "    match d.Raw with"
+              "    | CDLet (n, ps, ret, body) ->"
+              "        print n"
+              "        print (Code.renderTy ret)"
+              "        (match ps with"
+              "         | [ (pn, pt) ] -> print (Code.renderTy pt)"
+              "         | _ -> print \"?\")"
+              "    | _ -> print \"?\"" ]
+            "f\nlist<int>\nstring\n"
+
         expects "a quoted binder cannot capture a spliced name"
             [
               "let baseName (n : string) ="

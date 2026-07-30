@@ -303,10 +303,18 @@ let parse (src : string) : ParseResult =
 
     and canStartTypeAtom () =
         s.Is Ident || s.IsOp "'" || s.Is LParen || s.IsOp "#"
+        // `: %t` — a spliced TYPE, inside a quotation only
+        || isSpliceHere ()
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
 
     and parseAtomType (ctx : int) : Green =
-        if s.IsOp "#" then
+        if isSpliceHere () then
+            // the spliced name is an ordinary IdentExpr, so the resolver binds
+            // it like any other use and lowering can just lower it
+            let pct = s.Bump ()
+            let name = s.Bump ()
+            Green.node SpliceType [ pct; Green.node IdentExpr [ name ] ]
+        elif s.IsOp "#" then
             // flexible type `#seq<'a>` — "some subtype of". Argument
             // positions already widen, so the constraint adds nothing here.
             let h = s.Bump ()

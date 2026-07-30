@@ -70,6 +70,8 @@ type NodeKind =
     | AsPat
     | TypeTestPat
     // types
+    /// `%t` in TYPE position inside a quotation
+    | SpliceType
     | NamedType
     | VarType
     | AnonType

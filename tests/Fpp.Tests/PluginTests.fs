@@ -430,7 +430,7 @@ let generatorTests =
                       "let go ="
                       "    for (name, kind, members) in viewTypes do"
                       "        if kind = \"record\" then"
-                      "            Code.emit (CDLet (\"describe\" + name, [ \"x\" ], joined members))"
+                      "            Code.emit (CDLet (\"describe\" + name, [ (\"x\", QTyName name) ], QTyName \"string\", joined members))"
                       "" ]
             let ws = Workspace()
             ws.AddFppGenerator "describe" [ "plugin.fpp", plugin ]

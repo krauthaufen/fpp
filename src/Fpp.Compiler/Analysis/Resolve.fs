@@ -294,6 +294,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
+        || k = SpliceType
 
     /// Marks the boundary between top-level walking (defs are exported) and
     /// walking inside binding bodies (defs are local).
@@ -314,6 +315,20 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | GToken _ -> ()
         | GNode n ->
             match n.NodeKind with
+            // `%t` in type position: the spliced NAME is an ordinary value use,
+            // so it resolves like one rather than as a type name
+            | SpliceType ->
+                n.Children
+                |> List.iter (fun c ->
+                    match c with
+                    | GNode inner when inner.NodeKind = IdentExpr ->
+                        (match inner.Children |> List.choose (fun x -> match x with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                         | [ t ] ->
+                             (match lookupValue env t.Text with
+                              | Some d -> record t d
+                              | None -> ())
+                         | _ -> ())
+                    | _ -> ())
             | NamedType ->
                 let idents =
                     n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)

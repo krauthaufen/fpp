@@ -3762,6 +3762,11 @@ type Gen<'a> =
 /// to be parsed a second time and composition cannot lose to precedence or
 /// formatting. A quotation containing something outside this subset is a
 /// compile-time error, never a silent fallback.
+/// A TYPE inside quoted code — what `: %t` splices.
+type QTy =
+    | QTyName of string
+    | QTyApp of string * QTy list
+
 /// A pattern inside quoted code.
 type QPat =
     | QWild
@@ -3791,9 +3796,10 @@ type CodeTree =
     | CField of CodeTree * string
     /// `match scrutinee with | pat -> body | ...`
     | CMatch of CodeTree * (QPat * CodeTree) list
-    /// a DECLARATION: `let name p1 p2 = body`. Quoting one gives a plugin the
-    /// thing it actually wants to emit.
-    | CDLet of string * string list * CodeTree
+    /// a DECLARATION: `let name (p : ty) ... : ret = body`. Quoting one gives
+    /// a plugin the thing it actually wants to emit; a parameter or return type
+    /// that was not written is QTyName "".
+    | CDLet of string * (string * QTy) list * QTy * CodeTree
 
 /// `Code<'t>` is quoted code KNOWN TO PRODUCE a 't — that is what lets a splice
 /// type check against the hole it fills. `Raw` is the tree underneath, for
@@ -3802,6 +3808,11 @@ type Code<'t> = { Raw : CodeTree }
 
 module Code =
     let private pad (n : int) = String.replicate n " "
+
+    let rec renderTy (t : QTy) : string =
+        match t with
+        | QTyName n -> n
+        | QTyApp (n, args) -> n + "<" + String.concat ", " (List.map renderTy args) + ">"
 
     let rec renderPat (p : QPat) : string =
         match p with
@@ -3837,9 +3848,17 @@ module Code =
                 "\n" + pad (ind + 4) + "| " + renderPat p + " -> " + renderAt (ind + 4) b
             "match " + renderAt ind sc + " with"
             + String.concat "" (List.map (fun (p, b) -> arm p b) arms)
-        | CDLet (n, ps, b) ->
-            let ps2 = if List.isEmpty ps then "" else " " + String.concat " " ps
-            "let " + n + ps2 + " =\n" + pad (ind + 4) + renderAt (ind + 4) b
+        | CDLet (n, ps, ret, b) ->
+            let ps2 =
+                ps
+                |> List.map (fun (pn, pt) ->
+                    match pt with
+                    | QTyName "" -> pn
+                    | t -> "(" + pn + " : " + renderTy t + ")")
+                |> String.concat " "
+            let head = "let " + n + (if List.isEmpty ps then "" else " " + ps2)
+            let retTxt = match ret with QTyName "" -> "" | t -> " : " + renderTy t
+            head + retTxt + " =\n" + pad (ind + 4) + renderAt (ind + 4) b
 
     let render (c : CodeTree) : string = renderAt 0 c
 

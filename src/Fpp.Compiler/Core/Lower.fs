@@ -202,6 +202,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
         || k = FunType || k = AppType || k = PostfixType || k = ParenType
+        // `%t` in type position is a type node like any other
+        || k = SpliceType
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
 
     let litOf (t : Token) : Lit option =
@@ -967,15 +969,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> note (offsetOf m) "an `if` in a quotation needs an `else`")
                     | LetDecl ->
                         // a quotation whose whole body is a `let` is a
-                        // DECLARATION quote: `<@ let f x = x + 1 @>`
-                        let pats = nodesOf m |> List.filter (fun x -> x.NodeKind = IdentPat)
+                        // DECLARATION quote: `<@ let f (x : %t) : %r = ... @>`
+                        let pats =
+                            nodesOf m
+                            |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
                         let value = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
+                        // a bare type child is the RETURN annotation
+                        let retTy =
+                            nodesOf m |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.tryHead
                         (match pats, value with
                          | nameNode :: paramNodes, Some v ->
                              let nameOf (x : GreenNode) =
-                                 match tokensOf x |> List.tryHead with Some t -> t.Text | None -> "_"
-                             let ps = paramNodes |> List.map (fun x -> str (fresh (nameOf x) (offsetOf x)))
-                             ctor "CDLet" [ str (nameOf nameNode); EListLit ps; quote v ]
+                                 match Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                                 | Some t -> t.Text
+                                 | None -> "_"
+                             let ps =
+                                 paramNodes
+                                 |> List.map (fun x ->
+                                     let ty =
+                                         nodesOf x |> List.filter (fun y -> isTypeKind y.NodeKind) |> List.tryHead
+                                     ETuple [ str (fresh (nameOf x) (offsetOf x)); quoteTy ty ])
+                             ctor "CDLet" [ str (nameOf nameNode); EListLit ps; quoteTy retTy; quote v ]
                          | _ -> note (offsetOf m) "declaration quotation must bind a name")
                     | BlockExpr ->
                         // `let n = v` then the rest
@@ -1037,6 +1051,35 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              ctor "CMatch" [ quote scrut; EListLit arms ]
                          | [] -> note (offsetOf m) "match without a scrutinee")
                     | k -> note (offsetOf m) ("not quotable in <@ @>: " + string k)
+                and quoteTy (t : GreenNode option) : Expr =
+                    let tctor (name : string) (args : Expr list) =
+                        match args with
+                        | [] | [ _ ] -> ECtor (name, mono (TCon ("QTy", [])), args)
+                        | many -> ECtor (name, mono (TCon ("QTy", [])), [ ETuple many ])
+                    match t with
+                    | None -> tctor "QTyName" [ str "" ]
+                    | Some m ->
+                        match m.NodeKind with
+                        // `%t` — the spliced value IS the type
+                        | SpliceType ->
+                            (match nodesOf m |> List.tryFind (fun x -> x.NodeKind = IdentExpr) with
+                             | Some idn -> lowerExpr (GNode idn)
+                             | None -> note (offsetOf m) "empty type splice")
+                        | AppType ->
+                            let head =
+                                nodesOf m
+                                |> List.tryHead
+                                |> Option.bind (fun h -> Green.tokens (GNode h) |> List.filter (fun tk -> tk.Kind = Ident) |> List.tryLast)
+                            let args = nodesOf m |> List.skip (min 1 (List.length (nodesOf m)))
+                            (match head with
+                             | Some h ->
+                                 tctor "QTyApp" [ str h.Text; EListLit (args |> List.map (fun a -> quoteTy (Some a))) ]
+                             | None -> note (offsetOf m) "type not quotable")
+                        | _ ->
+                            (match Green.tokens (GNode m) |> List.filter (fun tk -> tk.Kind = Ident) |> List.tryLast with
+                             | Some tk -> tctor "QTyName" [ str tk.Text ]
+                             | None -> note (offsetOf m) "type not quotable")
+
                 and quotePat (m : GreenNode) : Expr =
                     let pctor (name : string) (args : Expr list) =
                         match args with
