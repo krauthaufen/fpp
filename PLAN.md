@@ -2815,6 +2815,16 @@ composing text — without it `<@ %b * 3 @>` over `b = <@ %a + 2 @>` rendered
 `1 + 2 * 3`, which MEANS `1 + (2*3)`, silently changing what the composition
 denotes. Now `((1 )+ 2 )* 3`. Pinned by the battery program.
 
+IN PROGRESS on branch `quotation-ast-wip`: `Code` rewritten as a real union
+(CInt/CStr/CBool/CName/CApp/CBin/CLet/CIf, no text case) and the lowering
+rewritten to build that tree — a splice grafts the Code value as a SUBTREE, so
+nothing is re-parsed and precedence cannot reinterpret a composition. It
+compiles but TRAPS at run time: something in the emitted constructor path is
+still a stub, and the probe used did not surface the warning. Next step is one
+debug cycle — run a quoted `<@ 1 + 2 @>` and read the `warn: stubbed` line to
+see which construction is unresolved (suspect the ECtor scheme passed for the
+case, or the `CApp of Code * Code list` payload arity).
+
 STILL TO DO, in order:
 1. **Code carries an AST**, not source text, so a plugin can match on and
    rewrite quoted code rather than re-parse it. This is the remaining
