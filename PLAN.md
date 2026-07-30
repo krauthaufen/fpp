@@ -2894,6 +2894,29 @@ format between two separate compilations. The "spares us another parse" argument
 applies to composition INSIDE a program, and there it holds: quotations compose
 as trees, never as text.
 
+### The plugin API: a tree per file in, a tree (or edits) out
+`ProgramView.Files` gives one `GenFile` per hand-written file — its PARSE TREE
+and `FTypeAt`, the type inference gave each DEFINITION in it. A generator
+returns `GenOutput` per file:
+* `Source text` — a whole file (what the deriving plugins emit).
+* `Tree node` — a syntax tree, rendered back by the compiler. Handing back the
+  tree you were given round-trips exactly, so a tree-shaped rewrite is possible
+  without touching text.
+* `Edits [ (start, end, text) ]` — surgical replacements applied BACK TO FRONT
+  by the compiler, so earlier spans stay valid. This is what a rewriting plugin
+  should return: `logCalls` now does, and no longer juggles the whole file.
+
+Honest about the name: these are SYNTAX trees with typing in a side table, not a
+TAST. This compiler keeps types keyed by definition rather than hanging them on
+a typed tree, so `FTypeAt` is what there is to give — enough to be type-aware
+(`twice : int -> int`), short of a fully typed tree to pattern match on.
+
+PLACEMENT. A file sees only EARLIER files, so a generated one lands after the
+last file declaring a TYPE — or after the FIRST file when no file declares one,
+because putting it last would hide it from every consumer. `GAfter` overrides it
+per generator, and naming a file that is not in the project is an error rather
+than a silent fallback.
+
 ### Two plugins that show the machinery carries real work
 * **deriveToString** — a printer for every type it sees. Records print their
   fields, structs the same with a `struct` marker, unions their case and
