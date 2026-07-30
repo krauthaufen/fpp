@@ -2669,7 +2669,45 @@ driven, and the corpus answer is back to 32436 bytes:
    representation) asserted on code reached only through unread values and had
    to start observing them.
 
+### DONE: property testing (generators + shrinking), and what it found
+`Gen`/`Check` in the prelude: generators are VALUES (`Gen.list (Gen.pair
+Gen.int Gen.int)`) carrying draw + shrink + render, and `Check.quick name gen
+prop` runs 200 cases from a fixed seed, shrinking a failure to the smallest
+counterexample it can reach. Battery programs cover the collections against
+ordered reference models, the shrink reports, and content equality.
+
+WHY NOT A TYPECLASS (`Arb<'a>`, which is what was tried first): monomorphization
+shares ONE canonical body across all reference instantiations, so a constraint
+discharged inside such a body has no head type left to resolve against. The
+payload came out as `$class:Arb:arb:$ref` and picked whichever instance
+registered under `$ref` — the TUPLE instance — while nested constraints stayed
+at type variables (`$class:Arb:arb:#10791`) and missed entirely. Generic
+instance heads work from CONCRETE call sites; they cannot be resolved from a
+canonical generic body without dictionary passing. Generators as values need no
+resolution at all.
+
+Fixed on the way: a generic instance head registered only under its MANGLED
+name (`list$<#28>`), so a constraint that knew just the head constructor
+(`list`) missed it. `instanceFunctions` now also registers the stripped head
+when it is unambiguous (battery: "a generic instance head resolves through a
+generic function").
+
+WHAT THE PROPERTIES FOUND (both fixed, see DIVERGENCES.md): collection equality
+compared TREE SHAPE rather than content (and object IDENTITY for the class-based
+HashMap/HashSet), and `List.init`/`String.init` applied their generator in
+descending index order where F# is ascending — which reversed the compiler's own
+vtable adapter emission and broke the byte fixpoint.
+
+STILL OPEN — deriving generators for USER types. A plugin cannot do it: plugins
+run after lowering, so they cannot add typeclass instances (resolution is over),
+and the post-lowering IR carries field KINDS ("i"/"r") rather than field types,
+which is not enough to build a typed generator. Deriving belongs in the front
+end where Infer still knows the types, emitting `Gen<T>` values for records and
+unions. Until then a user type needs a hand-written generator, which is a few
+lines with the combinators.
+
 ### Possible further increments (not required by any gate)
+
 ### Possible further increments (not required by any gate)
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload
   ever wants them.

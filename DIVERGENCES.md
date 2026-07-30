@@ -161,3 +161,29 @@ longer does.
 
 Lifting this means monomorphizing generic value bindings (cloning the global
 per instantiation), the same treatment functions already get.
+
+## Fixed while porting the FsCheck-style property tests
+
+These were REAL divergences from F#, found by property testing the collections
+against ordered reference models, and are fixed:
+
+* **Collection equality was structural over the TREE, not the content.**
+  `Map.ofList [(1,1);(2,2);(3,3)] = Map.ofList [(3,3);(2,2);(1,1)]` was `false`
+  (F#: `true`) because derived equality compared AVL shape, and insertion order
+  changes the rotations. Map and Set now declare `Equals`/`GetHashCode` over
+  their in-order contents. HashMap/HashSet are CLASSES, where `=` was identity
+  — an even worse trap — so `HashNode` declares content equality too
+  (count plus an entry-wise lookup, and an order-independent hash).
+  Equality on a Map/Set now costs a list of its entries; correctness first.
+* **`List.init` applied its generator in DESCENDING index order** (F# is
+  ascending). Invisible for pure generators, but the compiler's own vtable
+  builder appends to a vector inside the generator, so its adapter functions
+  came out reversed — a self-hosting divergence that only the byte fixpoint
+  caught. `String.init` had the same bug. Both are ascending now.
+
+## Known, and not divergences the tests can see
+
+* A user type whose name matches a PRELUDE type does not shadow it cleanly: the
+  program miscompiles (traps) instead of either shadowing or erroring. This is
+  why the property-testing RNG is called `PropRng` rather than `Rng` and its
+  helpers live inside `Gen` — two existing tests declare their own `type Rng`.
