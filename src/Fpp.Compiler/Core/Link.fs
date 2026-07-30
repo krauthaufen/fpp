@@ -685,17 +685,51 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EArrayPin (_, a) -> scan a
         | EArrayUnpin (_, a) -> scan a
         | _ -> ()
-    // roots: interface implementations. They are reached through a vtable,
-    // so no expression names them — a class that is constructed at all can
-    // have any of its interface methods called.
+    // roots: members reached through a vtable. Nothing names them, so
+    // scanning cannot find them — but only a class that is CONSTRUCTED can
+    // have any of them called, so park them on the constructor (the DLet over
+    // the type's own def) and demand them if and when construction turns out
+    // to be reachable. Demanding them outright keeps every class in every
+    // program: one class hierarchy in the prelude then costs each module its
+    // whole vtable, used or not.
+    //
+    // A class whose constructor cannot be identified falls back to the
+    // unconditional rule, which is never wrong, only bigger.
+    let ctorKey = dictNew<string, string * int> ()
     for d in decls do
         match d with
-        | DMembers (_, own) ->
-            for _, v in own do demand (v.Path, v.Offset)
-        | DClass (_, _, own, impls) ->
-            for _, v in own do demand (v.Path, v.Offset)
-            for _, ms in impls do
-                for _, v in ms do demand (v.Path, v.Offset)
+        | DLet (_, v, _, ELam _) -> dictSet ctorKey v.Name (v.Path, v.Offset)
+        | _ -> ()
+    let classNames = dictNew<string, bool> ()
+    for d in decls do
+        match d with
+        | DClass (n, _, _, _) -> dictSet classNames n true
+        | _ -> ()
+    /// members waiting for their class to be constructed somewhere
+    let onCtor = dictNew<string * int, (string * int) list> ()
+    /// did the members park on `cls`'s constructor?
+    let parkOn (cls : string) (ms : (string * int) list) =
+        match dictTryFind ctorKey cls with
+        | Some k ->
+            let prev = match dictTryFind onCtor k with Some p -> p | None -> []
+            dictSet onCtor k (ms @ prev)
+            true
+        | None -> false
+    for d in decls do
+        match d with
+        | DMembers (n, own) ->
+            let ms = own |> List.map (fun (_, v) -> v.Path, v.Offset)
+            // records and DUs declare members too, and those are not reached
+            // through a constructor function
+            if not (dictTryFind classNames n).IsSome || not (parkOn n ms) then
+                for k in ms do demand k
+        | DClass (n, _, own, impls) ->
+            let ms =
+                (own |> List.map (fun (_, v) -> v.Path, v.Offset))
+                @ (impls
+                   |> List.map (fun (_, mems) -> mems |> List.map (fun (_, v) -> v.Path, v.Offset))
+                   |> List.concat)
+            if not (parkOn n ms) then for k in ms do demand k
         | _ -> ()
     // roots: value initializers (program effects)
     for d in decls do
@@ -712,6 +746,11 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         let k = vecGet work i
         (match dictTryFind bodies k with
          | Some body -> scan body
+         | None -> ())
+        // this key is a constructor: everything reachable through the class's
+        // vtable becomes reachable with it
+        (match dictTryFind onCtor k with
+         | Some ms -> for m in ms do demand m
          | None -> ())
         i <- i + 1
     decls
