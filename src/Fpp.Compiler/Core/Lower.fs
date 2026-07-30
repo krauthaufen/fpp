@@ -904,42 +904,69 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> note (offsetOf n) "prefix"))
             | QuoteExpr ->
                 // The body was type checked in place; what survives to run time
-                // is a Code value. Ordinary parts contribute their own source,
-                // a splice contributes the code the spliced value denotes.
-                let strLit (t : string) =
-                    let mutable esc = ""
-                    for ch in t do
-                        if ch = '\\' then esc <- esc + "\\\\"
-                        elif ch = '"' then esc <- esc + "\\\""
-                        elif ch = '\n' then esc <- esc + "\\n"
-                        elif ch = '\t' then esc <- esc + "\\t"
-                        elif ch = '\r' then esc <- ""
-                        else esc <- esc + string ch
-                    ELit (LString ("\"" + esc + "\""))
-                let rec pieces (g : Green) : Expr list =
-                    match g with
-                    | GToken t ->
-                        // the brackets themselves are not part of the code
-                        if t.Kind = Operator && (t.Text = "<@" || t.Text = "@>") then []
-                        else [ strLit (Green.toText g) ]
-                    | GNode m when m.NodeKind = SpliceExpr ->
-                        // PARENTHESISED. Splicing is composition of code, not
-                        // of text: without this `%b * 3` where `b` is `1 + 2`
-                        // renders `1 + 2 * 3`, which means 1 + (2*3) — the
-                        // spliced fragment silently loses to precedence.
-                        (match nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) with
-                         | inner :: _ ->
-                             [ strLit "("
-                               EField (lowerExpr (GNode inner), "CodeText", "Code")
-                               strLit ")" ]
-                         | [] -> [ strLit "" ])
-                    | GNode m -> m.Children |> List.collect pieces
-                let parts = n.Children |> List.collect pieces
-                let joined =
-                    match parts with
-                    | [] -> strLit ""
-                    | first :: rest -> List.fold (fun acc p -> EPrim ("+t", [ acc; p ])) first rest
-                ERecord ("Code", [ "CodeText", joined ])
+                // is the code AS A TREE. A splice contributes the Code value it
+                // denotes — a subtree, not text — so nothing is re-parsed and
+                // composition cannot be reinterpreted by precedence.
+                let str (t : string) = ELit (LString ("\"" + t.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""))
+                // a case with several payload fields takes them as ONE tuple
+                let ctor (name : string) (args : Expr list) =
+                    match args with
+                    | [] | [ _ ] -> ECtor (name, mono (TCon ("Code", [])), args)
+                    | many -> ECtor (name, mono (TCon ("Code", [])), [ ETuple many ])
+                let rec quote (m : GreenNode) : Expr =
+                    let kids = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind)
+                    match m.NodeKind with
+                    | SpliceExpr ->
+                        (match kids with
+                         | inner :: _ -> lowerExpr (GNode inner)
+                         | [] -> note (offsetOf m) "empty splice")
+                    | ParenExpr ->
+                        (match kids with
+                         | inner :: _ -> quote inner
+                         | [] -> note (offsetOf m) "empty parentheses in a quotation")
+                    | LiteralExpr ->
+                        (match tokensOf m |> List.tryHead with
+                         | Some t when t.Kind = IntLit -> ctor "CInt" [ ELit (LInt t.Text) ]
+                         | Some t when t.Kind = StringLit -> ctor "CStr" [ ELit (LString t.Text) ]
+                         | Some t when t.Text = "true" -> ctor "CBool" [ ELit (LBool true) ]
+                         | Some t when t.Text = "false" -> ctor "CBool" [ ELit (LBool false) ]
+                         | _ -> note (offsetOf m) "literal not quotable")
+                    | IdentExpr ->
+                        (match tokensOf m |> List.tryHead with
+                         | Some t -> ctor "CName" [ str t.Text ]
+                         | None -> note (offsetOf m) "name not quotable")
+                    | BinaryExpr ->
+                        let op = tokensOf m |> List.tryFind (fun t -> t.Kind = Operator)
+                        (match op, kids with
+                         | Some o, [ l; r ] -> ctor "CBin" [ str o.Text; quote l; quote r ]
+                         | _ -> note (offsetOf m) "operator not quotable")
+                    | AppExpr ->
+                        (match kids with
+                         | f :: args -> ctor "CApp" [ quote f; EListLit (List.map quote args) ]
+                         | [] -> note (offsetOf m) "empty application")
+                    | IfExpr ->
+                        (match kids with
+                         | [ c; t; e ] -> ctor "CIf" [ quote c; quote t; quote e ]
+                         | _ -> note (offsetOf m) "an `if` in a quotation needs an `else`")
+                    | BlockExpr ->
+                        // `let n = v` then the rest
+                        (match nodesOf m with
+                         | d :: rest when d.NodeKind = LetDecl ->
+                             let nameTok =
+                                 nodesOf d
+                                 |> List.tryFind (fun x -> x.NodeKind = IdentPat)
+                                 |> Option.bind (fun x -> tokensOf x |> List.tryHead)
+                             let value = nodesOf d |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
+                             let body = rest |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryHead
+                             (match nameTok, value, body with
+                              | Some nt, Some v, Some b -> ctor "CLet" [ str nt.Text; quote v; quote b ]
+                              | _ -> note (offsetOf m) "let in a quotation must bind a name to a value")
+                         | inner :: _ when isExprish inner.NodeKind -> quote inner
+                         | _ -> note (offsetOf m) "block not quotable")
+                    | k -> note (offsetOf m) ("not quotable in <@ @>: " + string k)
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | body :: _ -> quote body
+                 | [] -> note (offsetOf n) "empty quotation")
             | ParenExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [] when (Green.tokens (GNode n) |> List.exists (fun t -> t.Kind = Operator && t.Text <> ":")) ->

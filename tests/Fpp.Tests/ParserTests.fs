@@ -95,6 +95,24 @@ let quotationTests =
                 "and its inner bindings hover"
         }
 
+        test "`%` is a splice only where it cannot be modulo" {
+            // adjacency decides, as in F#: `%x` splices, `a % b` divides. The
+            // quotation depth matters too — outside one, `%` is always modulo.
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" "module M\nlet a = 7 % 3\nlet q = <@ 7 % 3 @>\nlet r = <@ %q @>\n"
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "both readings coexist"
+            Expect.equal (List.length (nodesOf SpliceExpr "let r = <@ %q @>\n")) 1 "adjacent is a splice"
+            Expect.equal (List.length (nodesOf SpliceExpr "let q = <@ 7 % 3 @>\n")) 0 "spaced inside a quote is modulo"
+            Expect.equal (List.length (nodesOf SpliceExpr "let a = 7 % 3\n")) 0 "and outside a quote it always is"
+        }
+
+        test "a quotation is an atom: it can be an argument" {
+            let src = "module M\nlet f (c : Code) = c\nlet q = f <@ 1 + 2 @>\n"
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" src
+            Expect.isEmpty (ws.Diagnostics "m.fpp") "`f <@ ... @>` applies f to quoted code"
+        }
+
         test "an unclosed quotation is an error, not silence" {
             let r = parseRoot "let q = <@ 1 + 2\n"
             Expect.isNonEmpty r.Diagnostics "missing '@>' is reported"

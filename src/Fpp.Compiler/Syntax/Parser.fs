@@ -143,8 +143,23 @@ let parse (src : string) : ParseResult =
     let isLiteralKw () = s.IsKw "true" || s.IsKw "false" || s.IsKw "null"
 
     /// Can the current token start an atomic expression (an application arg)?
+    /// Depth of enclosing `<@ ... @>`, so `%` reads as a splice only inside a
+    /// quotation — outside one it is the modulo operator and must stay so.
+    let mutable quoteDepth = 0
+
+    /// `%x` with NOTHING between them is a splice; `a % b` is modulo. Adjacency
+    /// is the same rule F# uses, and it keeps the two unambiguous.
+    let isSpliceHere () =
+        // adjacency by OFFSET: trivia may hang off the previous token, so an
+        // empty Leading list does not mean the two tokens touch
+        quoteDepth > 0 && s.Is Operator && s.IsText "%"
+        && (s.Peek 1).Offset = s.Cur.Offset + 1
+
     let canStartAtom () =
         s.Is Ident || isLiteral () || isLiteralKw ()
+        // a quotation is an atom: `f <@ x @>` applies f to quoted code
+        || (s.Is Operator && s.IsText "<@")
+        || isSpliceHere ()
         || s.Is LParen || s.Is LBracket || s.Is LBrace
         || (s.IsOp "'" && (s.Peek 1).Kind = Ident)
         // a struct tuple can be an application argument: `f struct(a, b)`
@@ -158,8 +173,7 @@ let parse (src : string) : ParseResult =
         || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
-        // a quotation, and a splice inside one, are expressions too
-        || (s.Is Operator && (s.IsText "<@" || s.IsText "%"))
+        // quotations and splices come through canStartAtom
 
     let canStartDecl () =
         s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
@@ -570,11 +584,13 @@ let parse (src : string) : ParseResult =
             // the body gets its OWN block context, starting at its column, so a
             // quoted `let` sequence spanning lines parses like any other block
             // instead of being cut off at the enclosing expression's context
+            quoteDepth <- quoteDepth + 1
             vecAdd acc (parseBlock ctx)
+            quoteDepth <- quoteDepth - 1
             if s.Is Operator && s.Cur.Text = "@>" then vecAdd acc (s.Bump ())
             else s.Diag "expected '@>' to close the quotation"
             Green.node QuoteExpr (vecToList acc)
-        elif s.Is Operator && s.Cur.Text = "%" then
+        elif isSpliceHere () then
             // a splice: `%x` names code to drop in here
             let pct = s.Bump ()
             let inner = parseAtom ctx
