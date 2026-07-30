@@ -1275,7 +1275,6 @@ module Array =
 
 
 // ---- List: the F# List module ----
-    let empty : 'a[] = [||]
     let singleton (x : 'a) : 'a[] = [| x |]
     let head (xs : 'a[]) : 'a =
         if length xs = 0 then failwith "The input array was empty" else xs.[0]
@@ -2365,6 +2364,58 @@ module Seq =
 // tree: membership is a binary search, and the structure-sharing a tree buys
 // on `add`/`remove` is traded for a copy. Persistent either way — a Set value
 // is never mutated once built.
+    let empty : seq<'a> = List.toSeq []
+    let map2 (f : 'a -> 'b -> 'c) (a : seq<'a>) (b : seq<'b>) : seq<'c> =
+        List.toSeq (List.map2 f (toList a) (toList b))
+    let map3 (f : 'a -> 'b -> 'c -> 'd) (a : seq<'a>) (b : seq<'b>) (c : seq<'c>) : seq<'d> =
+        let la = toList a
+        let lb = toList b
+        let lc = toList c
+        let mutable acc = []
+        let mutable i = 0
+        let n = List.length la
+        while i < n do
+            acc <- f (List.item i la) (List.item i lb) (List.item i lc) :: acc
+            i <- i + 1
+        List.toSeq (List.rev acc)
+    let concat (xss : seq<seq<'a>>) : seq<'a> =
+        let mutable acc = []
+        for xs in xss do
+            for x in xs do acc <- x :: acc
+        List.toSeq (List.rev acc)
+    let item (i : int) (xs : seq<'a>) : 'a = List.item i (toList xs)
+    let tryItem (i : int) (xs : seq<'a>) : 'a option = List.tryItem i (toList xs)
+    let findIndex (p : 'a -> bool) (xs : seq<'a>) : int = List.findIndex p (toList xs)
+    let tryFindIndex (p : 'a -> bool) (xs : seq<'a>) : int option = List.tryFindIndex p (toList xs)
+    let maxBy (f : 'a -> 'k) (xs : seq<'a>) : 'a = List.maxBy f (toList xs)
+    let minBy (f : 'a -> 'k) (xs : seq<'a>) : 'a = List.minBy f (toList xs)
+    let takeWhile (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.takeWhile p (toList xs))
+    let skipWhile (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.skipWhile p (toList xs))
+    let countBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'k * int> =
+        List.toSeq (List.countBy f (toList xs))
+    let groupBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'k * seq<'a>> =
+        List.toSeq (List.map (fun (k, g) -> k, List.toSeq g) (List.groupBy f (toList xs)))
+    let allPairs (xs : seq<'a>) (ys : seq<'b>) : seq<'a * 'b> =
+        List.toSeq (List.allPairs (toList xs) (toList ys))
+    let exactlyOne (xs : seq<'a>) : 'a = List.exactlyOne (toList xs)
+    let tryExactlyOne (xs : seq<'a>) : 'a option = List.tryExactlyOne (toList xs)
+    let where (p : 'a -> bool) (xs : seq<'a>) : seq<'a> = filter p xs
+    let foldBack (f : 'a -> 's -> 's) (xs : seq<'a>) (st : 's) : 's =
+        List.foldBack f (toList xs) st
+    let mapFold (f : 's -> 'a -> 'b * 's) (st : 's) (xs : seq<'a>) : seq<'b> * 's =
+        let ys, s2 = List.mapFold f st (toList xs)
+        List.toSeq ys, s2
+    let average (xs : seq<float>) : float = List.average (toList xs)
+    let averageBy (f : 'a -> float) (xs : seq<'a>) : float = List.averageBy f (toList xs)
+    let splitInto (n : int) (xs : seq<'a>) : seq<'a list> =
+        List.toSeq (List.splitInto n (toList xs))
+    let zip (a : seq<'a>) (b : seq<'b>) : seq<'a * 'b> =
+        List.toSeq (List.zip (toList a) (toList b))
+    let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)
+    let readonly (xs : seq<'a>) : seq<'a> = xs
+    let delay (f : unit -> seq<'a>) : seq<'a> = f ()
 type Set<'a> = { SetItems : 'a[] }
 
 module Set =
@@ -2403,6 +2454,10 @@ module Set =
     let ofList (xs : 'a list) : Set<'a> when Ordered<'a> = ofArray (List.toArray xs)
     let ofSeq (xs : seq<'a>) : Set<'a> when Ordered<'a> = ofArray (Array.ofSeq xs)
     let singleton (x : 'a) : Set<'a> = { SetItems = Array.create 1 x }
+    // NOTE (divergence): F#'s Set.empty is a VALUE. Here it takes unit,
+    // because a generic VALUE is not stamped per instantiation — its array
+    // would be the uniform one, and Set<int> code casts to the PACKED
+    // $parr_i, which traps. A unit function stamps per use and is correct.
     let empty (u : unit) : Set<'a> = { SetItems = Array.zeroCreate 0 }
 
     let add (x : 'a) (s : Set<'a>) : Set<'a> when Ordered<'a> =
@@ -2463,6 +2518,20 @@ module Set =
 //
 // `empty` is a nullary case, which makes it a syntactic value and therefore
 // generalizable — `let mutable env : Env = Map.empty` needs that.
+    let foldBack (f : 'a -> 's -> 's) (s : Set<'a>) (st : 's) : 's =
+        List.foldBack f (toList s) st
+    let partition (p : 'a -> bool) (s : Set<'a>) : Set<'a> * Set<'a> =
+        filter p s, filter (fun x -> not (p x)) s
+    let unionMany (ss : Set<'a> list) : Set<'a> =
+        List.fold (fun acc s -> union acc s) (empty ()) ss
+    let intersectMany (ss : Set<'a> list) : Set<'a> =
+        match ss with
+        | [] -> failwith "The input sequence was empty"
+        | h :: t -> List.fold (fun acc s -> intersect acc s) h t
+    let isProperSubset (a : Set<'a>) (b : Set<'a>) : bool =
+        isSubset a b && count a < count b
+    let isProperSuperset (a : Set<'a>) (b : Set<'a>) : bool =
+        isSuperset a b && count a > count b
 type Map<'k, 'v> =
     | MapEmpty
     | MapNode of 'k * 'v * Map<'k, 'v> * Map<'k, 'v> * int * int
@@ -2623,3 +2692,28 @@ module Map =
 
     let forall (p : 'k -> 'v -> bool) (t : Map<'k, 'v>) : bool =
         fold (fun acc k v -> if acc then p k v else false) true t
+    let tryFindKey (p : 'k -> 'v -> bool) (m : Map<'k, 'v>) : 'k option =
+        let mutable found = None
+        for k, v in toList m do
+            match found with
+            | None -> if p k v then found <- Some k
+            | Some _ -> ()
+        found
+    let findKey (p : 'k -> 'v -> bool) (m : Map<'k, 'v>) : 'k =
+        match tryFindKey p m with
+        | Some k -> k
+        | None -> failwith "An index satisfying the predicate was not found in the collection."
+    let tryPick (f : 'k -> 'v -> 'r option) (m : Map<'k, 'v>) : 'r option =
+        let mutable found = None
+        for k, v in toList m do
+            match found with
+            | None -> found <- f k v
+            | Some _ -> ()
+        found
+    let pick (f : 'k -> 'v -> 'r option) (m : Map<'k, 'v>) : 'r =
+        match tryPick f m with
+        | Some r -> r
+        | None -> failwith "An index satisfying the predicate was not found in the collection."
+    let partition (p : 'k -> 'v -> bool) (m : Map<'k, 'v>) : Map<'k, 'v> * Map<'k, 'v> =
+        filter p m, filter (fun k v -> not (p k v)) m
+    let toArray (m : Map<'k, 'v>) : ('k * 'v)[] = Array.ofList (toList m)

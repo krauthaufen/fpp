@@ -146,3 +146,19 @@ uses.
 a user-defined extension member on `option` do not resolve. `Option` itself
 carries no other members, and general extension members on builtins remain an
 open language feature.
+
+## `Set.empty` takes unit; there is no `Array.empty`
+
+F# exposes both as VALUES. Here `Set.empty` is a unit function and
+`Array.empty` is absent, because a generic *value* is not stamped per
+instantiation: it is initialized once, at the canonical (uniform)
+representation. A `Set<int>`'s items are a PACKED `$parr_i`, so code
+stamped at int casts to that type and a uniform empty array traps.
+
+A unit function stamps per use and builds the array at the right
+representation, which is why `Set.empty ()` is correct where the value
+form is not. `List.empty` and `Seq.empty` ARE values — lists and seqs are
+uniform, so nothing packs and there is nothing to get wrong.
+
+Lifting this means monomorphizing generic value bindings (cloning the
+global per instantiation), the same treatment functions already get.
