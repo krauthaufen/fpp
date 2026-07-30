@@ -1708,12 +1708,18 @@ module List =
         | Some x -> x
         | None -> raise (KeyNotFoundException "no element was picked")
     let init (n : int) (f : int -> 'a) =
+        // F# applies `f` in ASCENDING index order, and a generator with side
+        // effects makes that observable: walking down from n-1 built the same
+        // list while running the effects backwards. The compiler's own vtable
+        // builder appends to a vector inside `f`, so this emitted its adapter
+        // functions in reverse — a self-hosting divergence the byte fixpoint
+        // caught and nothing else did.
         let mutable acc = []
-        let mutable i = n - 1
-        while i >= 0 do
+        let mutable i = 0
+        while i < n do
             acc <- f i :: acc
-            i <- i - 1
-        acc
+            i <- i + 1
+        rev acc
     let replicate (n : int) (value : 'a) =
         let mutable acc = []
         let mutable i = 0
@@ -2279,12 +2285,13 @@ module String =
             i <- i + 1
         concat "" parts
     let init (n : int) (f : int -> string) =
+        // ascending, like F# — see the note on List.init
         let mutable parts : string list = []
-        let mutable i = n - 1
-        while i >= 0 do
+        let mutable i = 0
+        while i < n do
             parts <- f i :: parts
-            i <- i - 1
-        concat "" parts
+            i <- i + 1
+        concat "" (List.rev parts)
     let exists (p : char -> bool) (s : string) =
         let mutable found = false
         let mutable i = 0
@@ -2739,6 +2746,21 @@ type Set<'a> =
     | SetEmpty
     | SetNode of 'a * Set<'a> * Set<'a> * int * int
 
+    /// the elements in order — the CANONICAL form of a set, independent of
+    /// whatever rotations the insertion order happened to produce
+    member x.Items () =
+        match x with
+        | SetEmpty -> []
+        | SetNode (v, l, r, _, _) -> l.Items () @ (v :: r.Items ())
+
+    /// Content equality. Derived equality would compare the TREE, so the same
+    /// elements added in a different order could compare unequal; F# compares
+    /// content, and so must this.
+    member x.Equals (o : Set<'a>) = x.Items () = o.Items ()
+
+    /// must agree with Equals, or a set used as a hash key goes missing
+    member x.GetHashCode () = hash (x.Items ())
+
 module Set =
     /// SetEmpty carries no payload, so this is a VALUE — the array form had
     /// to be a unit function (see DIVERGENCES.md), which F# is not
@@ -2954,6 +2976,21 @@ module Set =
 type Map<'k, 'v> =
     | MapEmpty
     | MapNode of 'k * 'v * Map<'k, 'v> * Map<'k, 'v> * int * int
+
+    /// the entries in key order — the CANONICAL form of a map, independent of
+    /// whatever rotations the insertion order happened to produce
+    member x.Pairs () =
+        match x with
+        | MapEmpty -> []
+        | MapNode (k, v, l, r, _, _) -> l.Pairs () @ ((k, v) :: r.Pairs ())
+
+    /// Content equality. Derived equality would compare the TREE, so the same
+    /// entries added in a different order could compare unequal; F# compares
+    /// content, and so must this.
+    member x.Equals (o : Map<'k, 'v>) = x.Pairs () = o.Pairs ()
+
+    /// must agree with Equals, or a map used as a hash key goes missing
+    member x.GetHashCode () = hash (x.Pairs ())
 
 module Map =
     let empty = MapEmpty
@@ -3336,6 +3373,23 @@ type HashNode<'k, 'v>(count : int) =
     abstract member RemoveKey : int -> 'k -> HashNode<'k, 'v>
     abstract member FoldWith : ('s -> 'k -> 'v -> 's) -> 's -> 's
 
+    /// Content equality: the same entries, whatever trie shape or collision
+    /// order produced them. Without this `=` on a class is IDENTITY, so two
+    /// maps with identical entries would compare unequal.
+    member x.Equals (o : HashNode<'k, 'v>) =
+        x.CountOf () = o.CountOf ()
+        && x.FoldWith
+            (fun acc k v ->
+                acc
+                && (match o.TryFind (hmMaskHash (hash k)) k with
+                    | Some v2 -> v2 = v
+                    | None -> false))
+            true
+
+    /// order-independent, so it agrees with Equals
+    member x.GetHashCode () =
+        x.FoldWith (fun acc k v -> acc + hash k * 31 + hash v) 0
+
     /// the branch holding this node (whose hash is p0) and `other` (at p1),
     /// which disagree somewhere above their common prefix
     member x.JoinWith (p0 : int) (p1 : int) (other : HashNode<'k, 'v>) =
@@ -3670,3 +3724,262 @@ module HashSet =
                     state <- remove k state
                     eff <- HashMap.add k RemoveOp eff
         state, eff
+
+// ---------------------------------------------------------------------------
+// Property testing: generators, shrinking, and a runner
+//
+// Generators are VALUES (`Gen.list Gen.int`), not typeclass instances. That is
+// not only a style choice: monomorphization shares ONE canonical body across
+// all reference instantiations, so a class constraint discharged inside such a
+// body has no head type left to resolve against — `Arb<list<'a>>` cannot be
+// found from a canonical caller. A generator passed as a value sidesteps
+// resolution entirely and composes the same way.
+//
+// Each generator carries three things: how to draw a value, how to shrink one
+// (so a failure reports the SMALLEST case, not the first), and how to print it.
+// ---------------------------------------------------------------------------
+
+/// xorshift32: tiny, deterministic, and good enough to find bugs. The state is
+/// explicit so a failing run replays exactly from its seed.
+///
+/// Named PropRng rather than Rng because a prelude type squats on the name for
+/// every program: `type Rng` is exactly what a user writes for their own
+/// generator, and a user type shadowing a prelude one does not resolve cleanly
+/// today. The helpers that go with it live inside `Gen` for the same reason.
+type PropRng = { mutable State : int }
+
+type Gen<'a> =
+    { /// draw one value
+      Draw : PropRng -> 'a
+      /// strictly smaller candidates, most-shrunk first; [] when atomic
+      Smaller : 'a -> list<'a>
+      /// render a counterexample
+      Render : 'a -> string }
+
+module Gen =
+    let rngCreate (seed : int) : PropRng =
+        // zero is a fixed point of xorshift, so it can never be the state
+        { State = if seed = 0 then 2463534242 else seed }
+
+    let rngNext (r : PropRng) : int =
+        let mutable x = r.State
+        x <- x ^^^ (x <<< 13)
+        x <- x ^^^ (x >>> 17)
+        x <- x ^^^ (x <<< 5)
+        r.State <- x
+        x
+
+    /// a non-negative draw below `n`
+    let rngBelow (r : PropRng) (n : int) : int =
+        if n <= 1 then 0
+        else
+            let v = rngNext r
+            let p = if v < 0 then -(v + 1) else v
+            p % n
+
+    let rngRange (r : PropRng) (lo : int) (hi : int) : int =
+        if hi <= lo then lo else lo + rngBelow r (hi - lo + 1)
+
+    let rngBool (r : PropRng) : bool = rngBelow r 2 = 0
+
+    let create (draw : PropRng -> 'a) (smaller : 'a -> list<'a>) (render : 'a -> string) : Gen<'a> =
+        { Draw = draw; Smaller = smaller; Render = render }
+
+    let constant (v : 'a) (render : 'a -> string) : Gen<'a> =
+        { Draw = (fun r -> v); Smaller = (fun x -> []); Render = render }
+
+    /// small values and boundaries find more bugs than uniform 32-bit noise
+    let int : Gen<int> =
+        { Draw =
+            (fun r ->
+                let k = rngBelow r 10
+                if k = 0 then 0
+                elif k = 1 then 1
+                elif k = 2 then -1
+                elif k = 3 then Int32.MaxValue
+                elif k = 4 then Int32.MinValue
+                elif k < 8 then rngRange r -20 20
+                else rngNext r)
+          Smaller =
+            (fun x ->
+                if x = 0 then []
+                else
+                    let half = x / 2
+                    let toward = if half = 0 || half = x then [ 0 ] else [ 0; half ]
+                    if x < 0 then toward @ [ -x ] else toward)
+          Render = (fun x -> string x) }
+
+    /// ints in a range: the generator to reach for when keys should COLLIDE
+    let intRange (lo : int) (hi : int) : Gen<int> =
+        { Draw = (fun r -> rngRange r lo hi)
+          Smaller = (fun x -> if x = lo then [] else [ lo ])
+          Render = (fun x -> string x) }
+
+    let bool : Gen<bool> =
+        { Draw = (fun r -> rngBool r)
+          Smaller = (fun b -> if b then [ false ] else [])
+          Render = (fun b -> if b then "true" else "false") }
+
+    let char : Gen<char> =
+        { Draw = (fun r -> char (rngRange r 97 122))
+          Smaller = (fun c -> if c = 'a' then [] else [ 'a' ])
+          Render = (fun c -> "'" + string c + "'") }
+
+    let string : Gen<string> =
+        { Draw =
+            (fun r ->
+                let n = rngBelow r 6
+                let mutable s = ""
+                for i in 1 .. n do
+                    s <- s + string (char (rngRange r 97 122))
+                s)
+          Smaller =
+            (fun s ->
+                if s = "" then []
+                elif s.Length = 1 then [ "" ]
+                else [ ""; s.Substring (0, s.Length / 2) ])
+          Render = (fun s -> "\"" + s + "\"") }
+
+    let float : Gen<float> =
+        { Draw =
+            (fun r ->
+                let k = rngBelow r 8
+                if k = 0 then 0.0
+                elif k = 1 then 1.0
+                elif k = 2 then -1.0
+                else float (rngRange r -1000 1000) / 8.0)
+          Smaller = (fun x -> if x = 0.0 then [] else [ 0.0 ])
+          Render = (fun x -> string x) }
+
+    let option (g : Gen<'a>) : Gen<Option<'a>> =
+        { Draw = (fun r -> if rngBelow r 4 = 0 then None else Some (g.Draw r))
+          Smaller =
+            (fun o ->
+                match o with
+                | None -> []
+                | Some v -> None :: List.map (fun s -> Some s) (g.Smaller v))
+          Render =
+            (fun o ->
+                match o with
+                | None -> "None"
+                | Some v -> "Some " + g.Render v) }
+
+    let pair (ga : Gen<'a>) (gb : Gen<'b>) : Gen<'a * 'b> =
+        { Draw = (fun r -> (ga.Draw r, gb.Draw r))
+          Smaller =
+            (fun p ->
+                let a, b = p
+                List.map (fun s -> (s, b)) (ga.Smaller a)
+                @ List.map (fun s -> (a, s)) (gb.Smaller b))
+          Render =
+            (fun p ->
+                let a, b = p
+                "(" + ga.Render a + ", " + gb.Render b + ")") }
+
+    let triple (ga : Gen<'a>) (gb : Gen<'b>) (gc : Gen<'c>) : Gen<'a * ('b * 'c)> =
+        pair ga (pair gb gc)
+
+    let listOf (maxLen : int) (g : Gen<'a>) : Gen<list<'a>> =
+        { Draw =
+            (fun r ->
+                let n = rngBelow r (maxLen + 1)
+                let mutable acc = []
+                for i in 1 .. n do
+                    acc <- g.Draw r :: acc
+                acc)
+          Smaller =
+            (fun xs ->
+                match xs with
+                | [] -> []
+                | h :: t ->
+                    // empty, without the head, halved, then a smaller head
+                    let halved = List.truncate (List.length xs / 2) xs
+                    [ [] ; t ; halved ] @ List.map (fun s -> s :: t) (g.Smaller h))
+          Render = (fun xs -> "[" + String.concat "; " (List.map (fun x -> g.Render x) xs) + "]") }
+
+    let list (g : Gen<'a>) : Gen<list<'a>> = listOf 12 g
+
+    let array (g : Gen<'a>) : Gen<'a[]> =
+        let lg = list g
+        { Draw = (fun r -> List.toArray (lg.Draw r))
+          Smaller = (fun xs -> List.map List.toArray (lg.Smaller (Array.toList xs)))
+          Render = (fun xs -> lg.Render (Array.toList xs)) }
+
+    let map (gk : Gen<'k>) (gv : Gen<'v>) : Gen<Map<'k, 'v>> =
+        let entries = list (pair gk gv)
+        { Draw = (fun r -> Map.ofList (entries.Draw r))
+          // one map with each key dropped
+          Smaller = (fun m -> List.map (fun k -> Map.remove k m) (Map.keys m))
+          Render =
+            (fun m ->
+                "map ["
+                + String.concat "; " (List.map (fun (k, v) -> gk.Render k + " -> " + gv.Render v) (Map.toList m))
+                + "]") }
+
+    let set (g : Gen<'a>) : Gen<Set<'a>> =
+        let items = list g
+        { Draw = (fun r -> Set.ofList (items.Draw r))
+          Smaller = (fun s -> List.map (fun x -> Set.remove x s) (Set.toList s))
+          Render = (fun s -> "set [" + String.concat "; " (List.map (fun x -> g.Render x) (Set.toList s)) + "]") }
+
+    let hashMap (gk : Gen<'k>) (gv : Gen<'v>) : Gen<HashNode<'k, 'v>> =
+        let entries = list (pair gk gv)
+        { Draw = (fun r -> HashMap.ofList (entries.Draw r))
+          Smaller = (fun m -> List.map (fun k -> HashMap.remove k m) (HashMap.keys m))
+          Render =
+            (fun m ->
+                "hashMap ["
+                + String.concat "; "
+                    (List.map (fun (k, v) -> gk.Render k + " -> " + gv.Render v)
+                              (List.sortBy (fun (k, v) -> gk.Render k) (HashMap.toList m)))
+                + "]") }
+
+    let hashSet (g : Gen<'a>) : Gen<HashNode<'a, int>> =
+        let items = list g
+        { Draw = (fun r -> HashSet.ofList (items.Draw r))
+          Smaller = (fun s -> List.map (fun x -> HashSet.remove x s) (HashSet.toList s))
+          Render =
+            (fun s ->
+                "hashSet ["
+                + String.concat "; " (List.map (fun x -> g.Render x) (List.sortBy (fun x -> g.Render x) (HashSet.toList s)))
+                + "]") }
+
+module Check =
+    /// cases per property: enough to find real bugs without slowing a suite
+    let count = 200
+
+    /// every run starts here, so a failure reproduces exactly
+    let seed = 20260730
+
+    /// Run a property and RETURN the outcome — a test can assert on the string
+    /// without a trap. A failing case is shrunk while it keeps failing, so the
+    /// report names the smallest counterexample found.
+    let runSeeded (sd : int) (name : string) (g : Gen<'a>) (p : 'a -> bool) : string =
+        let r = Gen.rngCreate sd
+        let mutable i = 0
+        let mutable failure = ""
+        while i < count && failure = "" do
+            let v = g.Draw r
+            if not (p v) then
+                let mutable cur = v
+                let mutable budget = 300
+                let mutable going = true
+                while going && budget > 0 do
+                    budget <- budget - 1
+                    match List.tryFind (fun c -> not (p c)) (g.Smaller cur) with
+                    | Some smaller -> cur <- smaller
+                    | None -> going <- false
+                failure <- name + ": falsified by " + g.Render cur
+            i <- i + 1
+        if failure = "" then name + ": ok (" + string count + " cases)" else failure
+
+    let run (name : string) (g : Gen<'a>) (p : 'a -> bool) : string = runSeeded seed name g p
+
+    /// run it and say so
+    let quick (name : string) (g : Gen<'a>) (p : 'a -> bool) : unit = print (run name g p)
+
+    /// run it and FAIL the program if the property does not hold
+    let required (name : string) (g : Gen<'a>) (p : 'a -> bool) : unit =
+        let outcome = run name g p
+        print outcome
+        if outcome <> name + ": ok (" + string count + " cases)" then failwith outcome

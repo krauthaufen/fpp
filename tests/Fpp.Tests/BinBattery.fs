@@ -282,6 +282,79 @@ let binBattery =
         // the shape the original HashMap/HashSet use: an abstract base with
         // virtual members, dispatched through a base-typed reference, with
         // GENERIC and mutually recursive node classes
+        // the FsCheck shape: generators are values, properties run over 200
+        // cases with a fixed seed, and HashMap/HashSet are checked against the
+        // ORDERED collections as reference models
+        expects "property tests: the collections against reference models"
+            [
+              "let kg = Gen.intRange 0 20"
+              "let hm = Gen.hashMap kg Gen.int"
+              "let hs = Gen.hashSet kg"
+              "let norm (m : HashNode<int, int>) = List.sortBy fst (HashMap.toList m)"
+              "let keysOf (m : HashNode<int, int>) = Set.ofList (HashMap.keys m)"
+              "let setOf (s : HashNode<int, int>) = Set.ofList (HashSet.toList s)"
+              "let go ="
+              "    Check.quick \"ofList agrees with Map\" (Gen.list (Gen.pair kg Gen.int)) (fun kvs -> norm (HashMap.ofList kvs) = Map.toList (Map.ofList kvs))"
+              "    Check.quick \"add then tryFind\" (Gen.triple kg Gen.int hm) (fun t -> HashMap.tryFind (fst t) (HashMap.add (fst t) (fst (snd t)) (snd (snd t))) = Some (fst (snd t)))"
+              "    Check.quick \"remove then absent\" (Gen.pair kg hm) (fun t -> not (HashMap.containsKey (fst t) (HashMap.remove (fst t) (snd t))))"
+              "    Check.quick \"count is the distinct keys\" hm (fun m -> HashMap.count m = Set.count (keysOf m))"
+              "    Check.quick \"union agrees with the model\" (Gen.pair hm hm) (fun t -> norm (HashMap.union (fst t) (snd t)) = Map.toList (Map.ofList (HashMap.toList (fst t) @ HashMap.toList (snd t))))"
+              "    Check.quick \"intersect keys agree\" (Gen.pair hm hm) (fun t -> keysOf (HashMap.intersect (fst t) (snd t)) = Set.intersect (keysOf (fst t)) (keysOf (snd t)))"
+              "    Check.quick \"difference keys agree\" (Gen.pair hm hm) (fun t -> keysOf (HashMap.difference (fst t) (snd t)) = Set.difference (keysOf (fst t)) (keysOf (snd t)))"
+              "    Check.quick \"filter agrees with the list\" hm (fun m -> norm (HashMap.filter (fun k v -> k % 2 = 0) m) = List.filter (fun (k, v) -> k % 2 = 0) (norm m))"
+              "    Check.quick \"keySet matches keys\" hm (fun m -> setOf (HashMap.keySet m) = keysOf m)"
+              "    Check.quick \"hashset union agrees with Set\" (Gen.pair hs hs) (fun t -> setOf (HashSet.union (fst t) (snd t)) = Set.union (setOf (fst t)) (setOf (snd t)))"
+              "    Check.quick \"hashset isSubset agrees with Set\" (Gen.pair hs hs) (fun t -> HashSet.isSubset (fst t) (snd t) = Set.isSubset (setOf (fst t)) (setOf (snd t)))"
+              "    Check.quick \"hashmap delta round-trip\" (Gen.pair hm hm) (fun t -> fst (HashMap.applyDelta (fst t) (HashMap.computeDelta (fst t) (snd t))) = snd t)"
+              "    Check.quick \"hashset delta round-trip\" (Gen.pair hs hs) (fun t -> fst (HashSet.applyDelta (fst t) (HashSet.computeDelta (fst t) (snd t))) = snd t)"
+              "    Check.quick \"Map delta round-trip\" (Gen.pair (Gen.map kg Gen.int) (Gen.map kg Gen.int)) (fun t -> fst (Map.applyDelta (fst t) (Map.computeDelta (fst t) (snd t))) = snd t)"
+              "    Check.quick \"computeDelta with self is empty\" hm (fun m -> HashMap.count (HashMap.computeDelta m m) = 0)" ]
+            "ofList agrees with Map: ok (200 cases)\nadd then tryFind: ok (200 cases)\nremove then absent: ok (200 cases)\ncount is the distinct keys: ok (200 cases)\nunion agrees with the model: ok (200 cases)\nintersect keys agree: ok (200 cases)\ndifference keys agree: ok (200 cases)\nfilter agrees with the list: ok (200 cases)\nkeySet matches keys: ok (200 cases)\nhashset union agrees with Set: ok (200 cases)\nhashset isSubset agrees with Set: ok (200 cases)\nhashmap delta round-trip: ok (200 cases)\nhashset delta round-trip: ok (200 cases)\nMap delta round-trip: ok (200 cases)\ncomputeDelta with self is empty: ok (200 cases)\n"
+
+        // a falsified property reports the SMALLEST case shrinking can reach,
+        // not the random one that first failed
+        expects "a falsified property shrinks its counterexample"
+            [
+              "let go ="
+              "    Check.quick \"ints are small\" Gen.int (fun x -> x < 100)"
+              "    Check.quick \"lists are short\" (Gen.list Gen.int) (fun xs -> List.length xs < 3)"
+              "    Check.quick \"no key is 7\" (Gen.hashMap (Gen.intRange 0 9) Gen.int) (fun m -> not (HashMap.containsKey 7 m))" ]
+            "ints are small: falsified by 127\nlists are short: falsified by [0; -9; -19]\nno key is 7: falsified by hashMap [7 -> 14]\n"
+
+        // Map/Set are AVL trees and HashMap/HashSet are classes, so DERIVED
+        // equality would compare tree shape and object identity: both would
+        // call equal contents unequal. F# compares content, and so do these.
+        expects "collection equality is content-based, not shape or identity"
+            [
+              "let go ="
+              "    print (Map.ofList [ (1, 1); (2, 2); (3, 3) ] = Map.ofList [ (3, 3); (2, 2); (1, 1) ])"
+              "    print (Set.ofList [ 1; 2; 3; 4; 5 ] = Set.ofList [ 5; 4; 3; 2; 1 ])"
+              "    print (HashMap.ofList [ (1, 1); (2, 2) ] = HashMap.ofList [ (2, 2); (1, 1) ])"
+              "    print (HashSet.ofList [ 1; 2; 3 ] = HashSet.ofList [ 3; 2; 1 ])"
+              "    print (Map.ofList [ (1, 1) ] = Map.ofList [ (1, 2) ])"
+              "    print (Map.empty = Map.ofList [ (1, 1) ])"
+              "    Check.quick \"set equality ignores insertion order\" (Gen.list Gen.int) (fun xs -> Set.ofList xs = Set.ofList (List.rev xs))"
+              "    Check.quick \"map equality ignores insertion order\" (Gen.list (Gen.pair Gen.int Gen.int)) (fun kvs -> Map.ofList kvs = Map.ofList (List.rev (List.rev kvs)))" ]
+            "True\nTrue\nTrue\nTrue\nFalse\nFalse\nset equality ignores insertion order: ok (200 cases)\nmap equality ignores insertion order: ok (200 cases)\n"
+
+        // a GENERIC instance head (`Sized<list<'a>>`) has to resolve from a
+        // generic function too, not only from a concrete call site
+        expects "a generic instance head resolves through a generic function"
+            [
+              "class Sized<'a>"
+              "    static size : 'a -> int"
+              "instance Sized<int>"
+              "    static size (x : int) = 1"
+              "instance Sized<list<'a>>"
+              "    when Sized<'a>"
+              "    static size (xs : list<'a>) = List.fold (fun acc x -> acc + size x) 0 xs"
+              "let total (xs : 'a) : int = size xs"
+              "let go ="
+              "    print (size 3)"
+              "    print (size [ 1; 2; 3 ])"
+              "    print (total [ 1; 2 ])" ]
+            "1\n3\n2\n"
+
         expects "generic class hierarchy with virtual dispatch through the base"
             [ "[<AbstractClass>]"
               "type Node<'k>(kind : int) ="

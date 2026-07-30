@@ -946,6 +946,34 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
                             let im = Classes.wrapperMember i index m
                             dictSet table key
                                 ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit)
+    // A GENERIC instance head registers under its mangled name — `list$<#28>`,
+    // `Map$<#31.#32>` — because that is what the head type prints as. A
+    // constraint discharged inside a generic function knows only the head
+    // constructor (`list`), so register that spelling too and head-based
+    // resolution finds the instance. Two instances of one class sharing a head
+    // constructor would be overlapping instances: there is nothing safe to
+    // pick, so those are left out rather than resolved arbitrarily.
+    let stripHead (n : string) =
+        let i = n.IndexOf "$<"
+        if i <= 0 then n else n.Substring (0, i)
+    let altCount = dictNew<string, int> ()
+    let altValue = dictNew<string, VarId * bool> ()
+    for key, value in dictPairs table do
+        let parts = key.Split '|'
+        if parts.Length = 3 then
+            let heads = parts.[2].Split '@' |> Array.toList
+            let stripped = heads |> List.map stripHead
+            if stripped <> heads then
+                let alt = parts.[0] + "|" + parts.[1] + "|" + String.concat "@" stripped
+                if not (dictTryFind table alt).IsSome then
+                    let prev = match dictTryFind altCount alt with Some c -> c | None -> 0
+                    dictSet altCount alt (prev + 1)
+                    dictSet altValue alt value
+    for alt, n in dictPairs altCount do
+        if n = 1 then
+            match dictTryFind altValue alt with
+            | Some v -> dictSet table alt v
+            | None -> ()
     table
 
 /// Monomorphize with no user instances in play.
