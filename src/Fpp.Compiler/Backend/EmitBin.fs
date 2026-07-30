@@ -2734,6 +2734,10 @@ let rtDecls8 (m : Mod) : unit =
     declFn m "$strTrim" "$rt_s2a"
     declFn m "$strTrimEndChars" "$rt_sa2a"
     declFn m "$streq" "$rt_ss2i"
+    declFn m "$strUpper" "$rt_s2a"
+    declFn m "$strLower" "$rt_s2a"
+    declFn m "$strChars" "$rt_s2a"
+    declFn m "$strTrimStartChars" "$rt_sa2a"
 
 let rtCore8 (m : Mod) : unit =
     // $strsub
@@ -3315,6 +3319,153 @@ let rtCore8 (m : Mod) : unit =
     endB f
     endB f
     ic f 1
+    endFn f
+    // $strUpper / $strLower: ASCII case mapping, byte for byte
+    for lowering in [ false; true ] do
+        let f = beginFn m [ "$s" ]
+        local f "$r" "$str"
+        local f "$i" "i32"
+        local f "$c" "i32"
+        localsDone f
+        lg f "$s"
+        gci f "array.len"
+        gcT f "array.new_default" "$str"
+        ls f "$r"
+        blockE f "$d"
+        loopE f "$go"
+        lg f "$i"
+        lg f "$s"
+        gci f "array.len"
+        ins f "i32.ge_u"
+        brIf f "$d"
+        lg f "$s"
+        lg f "$i"
+        gcT f "array.get_u" "$str"
+        ls f "$c"
+        lg f "$r"
+        lg f "$i"
+        lg f "$c"
+        ic f (if lowering then 65 else 97)
+        ins f "i32.ge_u"
+        lg f "$c"
+        ic f (if lowering then 90 else 122)
+        ins f "i32.le_u"
+        ins f "i32.and"
+        ifV f "i32"
+        lg f "$c"
+        ic f (if lowering then 32 else -32)
+        ins f "i32.add"
+        elseB f
+        lg f "$c"
+        endB f
+        gcT f "array.set" "$str"
+        lg f "$i"
+        ic f 1
+        ins f "i32.add"
+        ls f "$i"
+        br f "$go"
+        endB f
+        endB f
+        lg f "$r"
+        endFn f
+    // $strChars: the bytes as a PACKED char array (chars are i32 elements)
+    let f = beginFn m [ "$s" ]
+    local f "$r" "$parr_i"
+    local f "$i" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    gcT f "array.new_default" "$parr_i"
+    ls f "$r"
+    blockE f "$d"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$s"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$d"
+    lg f "$r"
+    lg f "$i"
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    gcT f "array.set" "$parr_i"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$r"
+    endFn f
+    // $strTrimStartChars — the mirror of $strTrimEndChars
+    let f = beginFn m [ "$s"; "$cs" ]
+    local f "$a" "i32"
+    local f "$j" "i32"
+    local f "$hit" "i32"
+    local f "$c" "i32"
+    local f "$n" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$n"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$a"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$a"
+    gcT f "array.get_u" "$str"
+    ls f "$c"
+    ic f 0
+    ls f "$hit"
+    ic f 0
+    ls f "$j"
+    blockE f "$sd"
+    loopE f "$sg"
+    lg f "$j"
+    lg f "$cs"
+    gcT f "ref.cast" "$parr_i"
+    gci f "array.len"
+    ins f "i32.ge_u"
+    brIf f "$sd"
+    lg f "$cs"
+    gcT f "ref.cast" "$parr_i"
+    lg f "$j"
+    gcT f "array.get" "$parr_i"
+    lg f "$c"
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$hit"
+    br f "$sd"
+    endB f
+    lg f "$j"
+    ic f 1
+    ins f "i32.add"
+    ls f "$j"
+    br f "$sg"
+    endB f
+    endB f
+    lg f "$hit"
+    ins f "i32.eqz"
+    brIf f "$done"
+    lg f "$a"
+    ic f 1
+    ins f "i32.add"
+    ls f "$a"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$s"
+    lg f "$a"
+    lg f "$n"
+    lg f "$a"
+    ins f "i32.sub"
+    callf f "$strsub"
     endFn f
 
 // ---- runtime: printf-family formatting helpers ------------------------------

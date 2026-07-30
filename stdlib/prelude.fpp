@@ -796,127 +796,6 @@ let fst (t : 'a * 'b) : 'a = match t with (a, _) -> a
 let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b
 
 // ---- String: the F# String module ----
-module String =
-    extern let strsub : string -> int -> int -> string
-    /// `sub s start count` — the slice, copied. A primitive because building
-    /// it out of concatenation is quadratic, and the lexer lives on it.
-    let sub (s : string) (start : int) (count : int) : string = strsub s start count
-    let length (s : string) = s.Length
-    /// Pairwise MERGE, not a left fold. `acc <- acc + sep + x` copies the
-    /// whole accumulator at every step, so joining n chunks of total length
-    /// L costs O(n*L) — and the compiler's own emitter joins a six-megabyte
-    /// module out of hundreds of thousands of chunks, which is why the
-    /// compiler compiled to wasm spent hours on a job it does natively in
-    /// seconds. Merging adjacent pairs copies each character O(log n) times.
-    ///
-    /// Cons and `+` are the only tools used: `Array` and `List` are declared
-    /// further down this file, and the merge is written as loops rather than
-    /// recursion because the first pass is half as long as the input.
-    let concat (sep : string) (strings : seq<string>) =
-        let mutable cur : string list = []
-        let mutable n = 0
-        let mutable first = true
-        for x in strings do
-            // the separator is folded in once, on the way into the merge
-            cur <- (if first then x else sep + x) :: cur
-            first <- false
-            n <- n + 1
-        // `cur` is REVERSED, and every pass flips the order again, so which
-        // side of a pair comes first alternates with it
-        let mutable reversed = true
-        while n > 1 do
-            let mutable out : string list = []
-            let mutable rest = cur
-            let mutable more = true
-            while more do
-                match rest with
-                | x :: y :: tail ->
-                    out <- (if reversed then y + x else x + y) :: out
-                    rest <- tail
-                | [ x ] ->
-                    out <- x :: out
-                    rest <- []
-                    more <- false
-                | [] -> more <- false
-            cur <- out
-            reversed <- not reversed
-            n <- (n + 1) / 2
-        match cur with
-        | [ one ] -> one
-        | _ -> ""
-
-    // both build through `concat`, for the reason spelled out there: a left
-    // fold over `+` copies the accumulator every step
-    let replicate (n : int) (s : string) =
-        let mutable parts : string list = []
-        let mutable i = 0
-        while i < n do
-            parts <- s :: parts
-            i <- i + 1
-        concat "" parts
-    let init (n : int) (f : int -> string) =
-        let mutable parts : string list = []
-        let mutable i = n - 1
-        while i >= 0 do
-            parts <- f i :: parts
-            i <- i - 1
-        concat "" parts
-    let exists (p : char -> bool) (s : string) =
-        let mutable found = false
-        let mutable i = 0
-        while i < s.Length do
-            if p s.[i] then found <- true
-            i <- i + 1
-        found
-    let forall (p : char -> bool) (s : string) =
-        let mutable ok = true
-        let mutable i = 0
-        while i < s.Length do
-            if not (p s.[i]) then ok <- false
-            i <- i + 1
-        ok
-    let iter (f : char -> unit) (s : string) =
-        let mutable i = 0
-        while i < s.Length do
-            f s.[i]
-            i <- i + 1
-    let iteri (f : int -> char -> unit) (s : string) =
-        let mutable i = 0
-        while i < s.Length do
-            f i s.[i]
-            i <- i + 1
-    let filter (p : char -> bool) (s : string) : string =
-        let mutable acc = ""
-        let mutable i = 0
-        while i < s.Length do
-            if p s.[i] then acc <- acc + string s.[i]
-            i <- i + 1
-        acc
-    let collect (f : char -> string) (s : string) : string =
-        let mutable acc = ""
-        let mutable i = 0
-        while i < s.Length do
-            acc <- acc + f s.[i]
-            i <- i + 1
-        acc
-    let toArray (s : string) : char[] = Array.init s.Length (fun i -> s.[i])
-    let toList (s : string) : char list = List.init s.Length (fun i -> s.[i])
-    let ofArray (cs : char[]) : string =
-        let mutable acc = ""
-        for c in cs do acc <- acc + string c
-        acc
-    let ofList (cs : char list) : string =
-        let mutable acc = ""
-        for c in cs do acc <- acc + string c
-        acc
-    let map (f : char -> char) (s : string) =
-        let mutable acc = ""
-        let mutable i = 0
-        while i < s.Length do
-            acc <- acc + string (f s.[i])
-            i <- i + 1
-        acc
-// ---- Array: the F# Array module ----
 module Array =
     extern let create : int -> 'a -> 'a[]
     extern let zeroCreate : int -> 'a[]
@@ -2060,6 +1939,148 @@ module List =
     let averageBy (f : 'a -> float) (xs : 'a list) : float =
         if isEmpty xs then failwith "The input list was empty"
         else sumBy f xs / float (length xs)
+// String sits AFTER Array and List: toArray/toList/mapi are written in
+// terms of Array.init, Array.length and List.init, and a module only sees
+// what precedes it.
+module String =
+    extern let strsub : string -> int -> int -> string
+    /// `sub s start count` — the slice, copied. A primitive because building
+    /// it out of concatenation is quadratic, and the lexer lives on it.
+    let sub (s : string) (start : int) (count : int) : string = strsub s start count
+    let length (s : string) = s.Length
+    /// Pairwise MERGE, not a left fold. `acc <- acc + sep + x` copies the
+    /// whole accumulator at every step, so joining n chunks of total length
+    /// L costs O(n*L) — and the compiler's own emitter joins a six-megabyte
+    /// module out of hundreds of thousands of chunks, which is why the
+    /// compiler compiled to wasm spent hours on a job it does natively in
+    /// seconds. Merging adjacent pairs copies each character O(log n) times.
+    ///
+    /// Cons and `+` are the only tools used: `Array` and `List` are declared
+    /// further down this file, and the merge is written as loops rather than
+    /// recursion because the first pass is half as long as the input.
+    let concat (sep : string) (strings : seq<string>) =
+        let mutable cur : string list = []
+        let mutable n = 0
+        let mutable first = true
+        for x in strings do
+            // the separator is folded in once, on the way into the merge
+            cur <- (if first then x else sep + x) :: cur
+            first <- false
+            n <- n + 1
+        // `cur` is REVERSED, and every pass flips the order again, so which
+        // side of a pair comes first alternates with it
+        let mutable reversed = true
+        while n > 1 do
+            let mutable out : string list = []
+            let mutable rest = cur
+            let mutable more = true
+            while more do
+                match rest with
+                | x :: y :: tail ->
+                    out <- (if reversed then y + x else x + y) :: out
+                    rest <- tail
+                | [ x ] ->
+                    out <- x :: out
+                    rest <- []
+                    more <- false
+                | [] -> more <- false
+            cur <- out
+            reversed <- not reversed
+            n <- (n + 1) / 2
+        match cur with
+        | [ one ] -> one
+        | _ -> ""
+
+    // both build through `concat`, for the reason spelled out there: a left
+    // fold over `+` copies the accumulator every step
+    let replicate (n : int) (s : string) =
+        let mutable parts : string list = []
+        let mutable i = 0
+        while i < n do
+            parts <- s :: parts
+            i <- i + 1
+        concat "" parts
+    let init (n : int) (f : int -> string) =
+        let mutable parts : string list = []
+        let mutable i = n - 1
+        while i >= 0 do
+            parts <- f i :: parts
+            i <- i - 1
+        concat "" parts
+    let exists (p : char -> bool) (s : string) =
+        let mutable found = false
+        let mutable i = 0
+        while i < s.Length do
+            if p s.[i] then found <- true
+            i <- i + 1
+        found
+    let forall (p : char -> bool) (s : string) =
+        let mutable ok = true
+        let mutable i = 0
+        while i < s.Length do
+            if not (p s.[i]) then ok <- false
+            i <- i + 1
+        ok
+    let iter (f : char -> unit) (s : string) =
+        let mutable i = 0
+        while i < s.Length do
+            f s.[i]
+            i <- i + 1
+    let iteri (f : int -> char -> unit) (s : string) =
+        let mutable i = 0
+        while i < s.Length do
+            f i s.[i]
+            i <- i + 1
+    let filter (p : char -> bool) (s : string) : string =
+        let mutable acc = ""
+        let mutable i = 0
+        while i < s.Length do
+            if p s.[i] then acc <- acc + string s.[i]
+            i <- i + 1
+        acc
+    let collect (f : char -> string) (s : string) : string =
+        let mutable acc = ""
+        let mutable i = 0
+        while i < s.Length do
+            acc <- acc + f s.[i]
+            i <- i + 1
+        acc
+    let toArray (s : string) : char[] = Array.init s.Length (fun i -> s.[i])
+    let toList (s : string) : char list = List.init s.Length (fun i -> s.[i])
+    let ofArray (cs : char[]) : string =
+        let mutable acc = ""
+        for c in cs do acc <- acc + string c
+        acc
+    let ofList (cs : char list) : string =
+        let mutable acc = ""
+        for c in cs do acc <- acc + string c
+        acc
+    let map (f : char -> char) (s : string) =
+        let mutable acc = ""
+        let mutable i = 0
+        while i < s.Length do
+            acc <- acc + string (f s.[i])
+            i <- i + 1
+        acc
+// ---- Array: the F# Array module ----
+    let mapi (f : int -> char -> char) (s : string) : string =
+        let cs = toArray s
+        let mutable i = 0
+        while i < Array.length cs do
+            cs.[i] <- f i cs.[i]
+            i <- i + 1
+        ofArray cs
+    /// System.String.Join is a .NET static: it is CALLED IN TUPLE FORM, and
+    /// the same source has to compile under F#, so the parameter is a tuple
+    let Join (sep : string, xs : string list) : string = concat sep xs
+    let IsNullOrEmpty (s : string) : bool = isNull s || length s = 0
+    let IsNullOrWhiteSpace (s : string) : bool =
+        if isNull s then true
+        else
+            let mutable ws = true
+            for c in toArray s do
+                if not (c = ' ' || c = '\t' || c = '\n' || c = '\r') then ws <- false
+            ws
 module Seq =
     let map (f : 'a -> 'b) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with

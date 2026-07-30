@@ -1251,6 +1251,30 @@ let oracleTests =
             "    print (string (Map.count ev) + \" \" + string (Map.count od))"
             "    print (string (Array.length (Map.toArray m)))"
         ]
+        oracle "string members: case, padding, insert, remove, char overloads" [
+            "let s = \"Hello World\""
+            "let go ="
+            "    print (s.ToUpper ())"
+            "    print (s.ToLower ())"
+            "    print (\"x\".PadLeft 4 + \"|\")"
+            "    print (\"x\".PadRight 4 + \"|\")"
+            "    print (\"toolong\".PadLeft 3 + \"|\")"
+            "    print (string (Array.length (s.ToCharArray ())))"
+            "    print (\"  hi  \".TrimStart [| ' ' |] + \"|\")"
+            "    print (s.Insert (5, \",\"))"
+            "    print (s.Remove 5)"
+            "    print (s.Remove (0, 6))"
+            "    print (string (s.StartsWith 'H') + string (s.StartsWith 'x'))"
+            "    print (string (s.EndsWith 'd') + string (s.EndsWith 'x'))"
+            "    print (string (s.Contains 'W') + string (s.Contains 'z'))"
+        ]
+        oracle "String module: mapi and the static helpers" [
+            "let go ="
+            "    print (String.mapi (fun i c -> if i % 2 = 0 then Char.ToUpper c else c) \"abcdef\")"
+            "    print (String.Join (\"-\", [ \"a\"; \"b\"; \"c\" ]))"
+            "    print (string (String.IsNullOrEmpty \"\") + string (String.IsNullOrEmpty \"x\"))"
+            "    print (string (String.IsNullOrWhiteSpace \"  \") + string (String.IsNullOrWhiteSpace \" x \"))"
+        ]
         oracle "Map agrees with F#'s" [
             "let mutable m : Map<string, int> = Map.empty"
             "let show (o : int option) = match o with Some v -> string v | None -> \"-\""

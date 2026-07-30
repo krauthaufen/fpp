@@ -1093,6 +1093,168 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv s
         gcT f "ref.cast" "$str"
         callf f "$strTrim"
+    | EApp (EUnknown "$str.ToUpper", [ s ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        callf f "$strUpper"
+    | EApp (EUnknown "$str.ToLower", [ s ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        callf f "$strLower"
+    // $strPad's flag means "content on the LEFT", so PadLeft (which pads on
+    // the left and right-aligns the content) passes 0
+    | EApp (EUnknown "$str.PadLeft", [ s; w ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv w
+        callf f "$toi"
+        ic f 32
+        ic f 0
+        callf f "$strPad"
+    | EApp (EUnknown "$str.PadRight", [ s; w ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv w
+        callf f "$toi"
+        ic f 32
+        ic f 1
+        callf f "$strPad"
+    | EApp (EUnknown "$str.ToCharArray", [ s ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        callf f "$strChars"
+    | EApp (EUnknown "$str.TrimStart", [ s; cs ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv cs
+        callf f "$strTrimStartChars"
+    | EApp (EUnknown "$str.Insert", [ s; i; v ]) ->
+        // s.[0..i-1] + v + s.[i..]
+        let sl = freshLocal f "$sia" "anyref"
+        let il = freshLocal f "$sii" "i32"
+        emitNode st f lv s
+        ls f sl
+        emitNode st f lv i
+        callf f "$toi"
+        ls f il
+        lg f sl
+        gcT f "ref.cast" "$str"
+        ic f 0
+        lg f il
+        callf f "$strsub"
+        gcT f "ref.cast" "$str"
+        emitNode st f lv v
+        gcT f "ref.cast" "$str"
+        callf f "$strcat"
+        gcT f "ref.cast" "$str"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        lg f il
+        lg f sl
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        lg f il
+        ins f "i32.sub"
+        callf f "$strsub"
+        gcT f "ref.cast" "$str"
+        callf f "$strcat"
+    | EApp (EUnknown "$str.Remove", [ s; i ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        ic f 0
+        emitNode st f lv i
+        callf f "$toi"
+        callf f "$strsub"
+    | EApp (EUnknown "$str.Remove#2", [ s; i; n ]) ->
+        // the head before i, then the tail after i+n
+        let sl = freshLocal f "$sra" "anyref"
+        let il = freshLocal f "$sri" "i32"
+        let nl = freshLocal f "$srn" "i32"
+        emitNode st f lv s
+        ls f sl
+        emitNode st f lv i
+        callf f "$toi"
+        ls f il
+        emitNode st f lv n
+        callf f "$toi"
+        ls f nl
+        lg f sl
+        gcT f "ref.cast" "$str"
+        ic f 0
+        lg f il
+        callf f "$strsub"
+        gcT f "ref.cast" "$str"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        lg f il
+        lg f nl
+        ins f "i32.add"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        lg f il
+        ins f "i32.sub"
+        lg f nl
+        ins f "i32.sub"
+        callf f "$strsub"
+        gcT f "ref.cast" "$str"
+        callf f "$strcat"
+    | EApp (EUnknown "$str.StartsWith#2", [ s; c ]) ->
+        // the CHAR overload: first byte, empty string is false
+        let sl = freshLocal f "$ssa" "anyref"
+        emitNode st f lv s
+        ls f sl
+        lg f sl
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        ic f 0
+        ins f "i32.gt_u"
+        ifV f "i32"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        ic f 0
+        gcT f "array.get_u" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        ins f "i32.eq"
+        elseB f
+        ic f 0
+        endB f
+        refI31 f
+    | EApp (EUnknown "$str.EndsWith#2", [ s; c ]) ->
+        let sl = freshLocal f "$sea" "anyref"
+        emitNode st f lv s
+        ls f sl
+        lg f sl
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        ic f 0
+        ins f "i32.gt_u"
+        ifV f "i32"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        lg f sl
+        gcT f "ref.cast" "$str"
+        gci f "array.len"
+        ic f 1
+        ins f "i32.sub"
+        gcT f "array.get_u" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        ins f "i32.eq"
+        elseB f
+        ic f 0
+        endB f
+        refI31 f
+    | EApp (EUnknown "$str.Contains#2", [ s; c ]) ->
+        emitNode st f lv s
+        gcT f "ref.cast" "$str"
+        emitNode st f lv c
+        callf f "$toi"
+        callf f "$strFindChar"
+        ic f 0
+        ins f "i32.ge_s"
+        refI31 f
     | EApp (EUnknown "$str.TrimEnd", [ s; cs ]) ->
         emitNode st f lv s
         gcT f "ref.cast" "$str"
