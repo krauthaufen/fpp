@@ -2787,6 +2787,38 @@ self-application gates:
 * `min a b` reads as taking a TUPLE, and `Seq.toList` over a string does not
   resolve. Use an `if` and `String.Split` respectively.
 
+### The plugin mechanism as a PLATFORM (deriving, providers, AOP, shaders)
+Two tiers, and they cover different needs:
+* **Source tier (Generator)** — runs before the front end, sees the program and
+  returns files. It can ADD declarations (deriving, fuzzing, serialization) and
+  now REWRITE hand-written files wholesale: return an existing path and that
+  file's text is replaced. `ProgramView` carries `Types` (with field types,
+  union payloads, module and ATTRIBUTES), `Values` (functions with their
+  parameters and attributes), and `Sources` (every hand-written file's ORIGINAL
+  text). Originals are snapshotted, so a generator is never fed its own output
+  on a second compile, and two generators rewriting one file is an error.
+* **IR tier (PerFile/WholeProgram)** — rewrites lowered core, for passes that
+  transform code rather than declare it.
+
+Proven by tests, one per use case: a TYPE PROVIDER emitting types from a schema
+string the compiler never saw; ATTRIBUTE-TARGETED deriving; an AOP-shaped loop
+over a record's fields emitting a member per field with the field's own type
+spliced into the signature; a SHADER-style plugin that finds `vertex { ... }`
+blocks anywhere in a file and lowers them in place; and errors in rewritten
+files blamed on the plugin that wrote them.
+
+WHAT IS STILL MISSING FOR THE `<@ ... @>` ERGONOMICS ASKED FOR: the quotation
+has to be OUR syntax, which means the plugin must be an F++ program rather than
+an F# one. Today a plugin is F# and quotes F++ as text (`GQuote`) with splices
+rendered by `exInline`/`tyText` — F# interpolation supplies the brackets, so
+there is no new language to learn, but there is also no hygiene and no typing of
+the quoted code. The end state: plugins written in F++, `<@ ... @>` over F++'s
+own AST, `%splice` typed against the program being compiled, `newName` for
+hygiene. That needs (a) lexer/parser support for the brackets and splices,
+(b) lowering a quotation to AST-building code, (c) an execution model that runs
+an F++ plugin at compile time — the self-hosted compiler already compiles to
+wasm, so running one is a matter of wiring, not invention.
+
 ### Toward full Template Haskell — what is there, what is not
 TH has five parts. Three are in, two are not, and the two that are missing are
 the ones that need PARSER work rather than more library:
