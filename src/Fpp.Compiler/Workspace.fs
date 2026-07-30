@@ -440,13 +440,26 @@ type Workspace() =
                 |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
                 |> List.map (fun p ->
                     p, (match dictTryFind originalText p with Some t -> t | None -> this.FileText p))
-            let trees =
+            let checkedFiles = this.ProjectCheck ()
+            let genFiles =
                 this.ProjectFiles
                 |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
-                |> List.map (fun p -> p, (this.ParseFile p).Root)
+                |> List.map (fun p ->
+                    let typeAt (off : int) : string option =
+                        match dictTryFind checkedFiles.Schemes (p + ":" + string off) with
+                        | Some sch -> Some (Analysis.Types.schemeString sch)
+                        | None ->
+                            match dictTryFind checkedFiles.Files p with
+                            | Some (_, inf) ->
+                                inf.DefTypes
+                                |> List.tryPick (fun (o, _, ts) -> if o = off then Some ts else None)
+                            | None -> None
+                    { FPath = p
+                      FTree = (this.ParseFile p).Root
+                      FTypeAt = typeAt } : Fpp.Core.Plugins.GenFile)
             let view : Fpp.Core.Plugins.ProgramView =
                 { Types = vecToList types; Values = vecToList values
-                  Sources = sources; Trees = trees }
+                  Sources = sources; Files = genFiles }
             // A file sees only EARLIER files, so generated code goes directly
             // after the last file that declared a type: it can name every type
             // it derives from, and anything in a later file can name it. A
@@ -454,21 +467,53 @@ type Workspace() =
             // the same staging F# projects and Template Haskell splices have.
             let declaring =
                 vecToList types |> List.map (fun t -> t.TFile) |> List.distinct
-            let anchorIndex =
+            // Generated code must land after what it reads and before what
+            // reads IT. The default is after the last file declaring a TYPE;
+            // with no types anywhere, after the FIRST file — putting it last
+            // would hide it from every consumer.
+            let defaultAnchor =
                 let files = this.ProjectFiles
-                files
-                |> List.mapi (fun i p -> i, p)
-                |> List.filter (fun (_, p) -> List.contains p declaring)
-                |> List.map fst
-                |> (fun idxs -> if List.isEmpty idxs then List.length files - 1 else List.max idxs)
+                let idxs =
+                    files
+                    |> List.mapi (fun i p -> i, p)
+                    |> List.filter (fun (_, p) -> List.contains p declaring)
+                    |> List.map fst
+                if List.isEmpty idxs then 0 else List.max idxs
+            let anchorFor (g : Fpp.Core.Plugins.Generator) =
+                match g.GAfter with
+                | Some want ->
+                    (match this.ProjectFiles |> List.mapi (fun i p -> i, p) |> List.tryFind (fun (_, p) -> p = want) with
+                     | Some (i, _) -> i
+                     | None ->
+                         vecAdd pluginErrors
+                             ("generator '" + g.GName + "' asks to emit after " + want + ", which is not a file here")
+                         defaultAnchor)
+                | None -> defaultAnchor
             // F++-written plugins live in their own member: a function that
             // cannot be lowered is stubbed WHOLE, so keeping this out of
             // RunGenerators is what lets the self-hosted compiler run at all
-            if vecLen fppGenerators > 0 then this.RunFppGenerators view anchorIndex
+            if vecLen fppGenerators > 0 then this.RunFppGenerators view defaultAnchor
 
             for g in vecToList generators do
+                let anchorIndex = anchorFor g
                 try
-                    for name, src in g.Generate view do
+                    for name, output in g.Generate view do
+                        let src =
+                            match output with
+                            | Fpp.Core.Plugins.Source t -> t
+                            | Fpp.Core.Plugins.Tree t -> Syntax.Green.toText (Syntax.GNode t)
+                            | Fpp.Core.Plugins.Edits es ->
+                                // back to front, so earlier spans stay valid
+                                let baseText =
+                                    match dictTryFind originalText name with
+                                    | Some t -> t
+                                    | None -> this.FileText name
+                                let ordered = es |> List.sortByDescending (fun (st, _, _) -> st)
+                                let mutable acc = baseText
+                                for st, en, rep in ordered do
+                                    if st >= 0 && en <= acc.Length && st <= en then
+                                        acc <- acc.Substring (0, st) + rep + acc.Substring en
+                                acc
                         let files = this.ProjectFiles
                         if List.contains name files && not (name.StartsWith Workspace.GeneratedPrefix) then
                             // REWRITE: the generator returned a hand-written

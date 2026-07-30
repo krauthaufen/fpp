@@ -75,6 +75,26 @@ type GenValueDecl =
       VModule : string
       VAttrs : (string * string list) list }
 
+/// One hand-written file: its parse tree, and the type inference gave each
+/// DEFINITION in it. (Per-EXPRESSION types are not exposed: this compiler keeps
+/// typing in side tables keyed by definition, so that is what there is to give.)
+type GenFile =
+    { FPath : string
+      FTree : GreenNode
+      /// the type at a definition's offset, where inference has one
+      FTypeAt : int -> string option }
+
+/// What a generator RETURNS for a file.
+type GenOutput =
+    /// the file's whole text
+    | Source of string
+    /// a syntax tree, rendered back to source by the compiler
+    | Tree of GreenNode
+    /// surgical replacements: (start, end, text), applied back-to-front so
+    /// earlier spans stay valid. This is the one to reach for when rewriting
+    /// what someone else wrote.
+    | Edits of (int * int * string) list
+
 /// What a generator gets to look at: the hand-written declarations. Types AND
 /// values — deriving needs the first, anything AOP-shaped (tracing, wrapping,
 /// serialization entry points) needs the second.
@@ -86,15 +106,21 @@ type ProgramView =
       /// language or any source-to-source pass needs, where augmenting with
       /// new declarations is not enough.
       Sources : (string * string) list
-      /// the same files PARSED. A rewriting plugin should cut by the tree's
-      /// spans, not by searching text.
-      Trees : (string * GreenNode) list }
+      /// the same files PARSED, each with what inference knows about it. A
+      /// rewriting plugin works from the tree and the types, never by searching
+      /// text.
+      Files : GenFile list }
 
 type Generator =
     { GName : string
-      /// returns (path, source) pairs; the path only names the file in
-      /// diagnostics, so keep it stable across runs
-      Generate : ProgramView -> (string * string) list }
+      /// Where new files land, since a file sees only EARLIER files: directly
+      /// after this hand-written one. `None` takes the default — after the last
+      /// file that declares a TYPE, or after the FIRST file when none does.
+      /// Set it when the default cannot be right for your program.
+      GAfter : string option
+      /// returns (path, output) pairs. A path that names a hand-written file
+      /// REWRITES it; any other path becomes a new generated file.
+      Generate : ProgramView -> (string * GenOutput) list }
 
 /// the node kinds that spell a TYPE (Lower has its own copy, inside a closure)
 let private isPatNodeK (k : NodeKind) =
@@ -770,7 +796,7 @@ let private mentions (isUser : string -> bool) (d : GenTypeDecl) : string list =
     |> List.distinct
 
 let deriveGen =
-    let generate (view : ProgramView) : (string * string) list =
+    let generate (view : ProgramView) : (string * GenOutput) list =
         // `[<Derive("Gen")>]` on any type switches deriveGen from "everything
         // in the program" to exactly what was asked for — the Template Haskell
         // workflow, where the splice names its target
@@ -884,8 +910,8 @@ let deriveGen =
                   GComment "Built as declaration DATA and rendered — see GDecl in Plugins.fs." ]
                 @ (if vecLen skipped = 0 then []
                    else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
-            [ "deriveGen.fpp", renderFile (header @ opens @ vecToList decls) ]
-    { GName = "deriveGen"; Generate = generate }
+            [ "deriveGen.fpp", Source (renderFile (header @ opens @ vecToList decls)) ]
+    { GName = "deriveGen"; GAfter = None; Generate = generate }
 
 // ---- deriveToString: a printer for every type in the program --------------
 // Records print their fields, unions their case and payload, classes their name
@@ -895,7 +921,7 @@ let deriveGen =
 // out in a placeholder.
 
 let deriveToString =
-    let generate (view : ProgramView) : (string * string) list =
+    let generate (view : ProgramView) : (string * GenOutput) list =
         let printable = dictNew<string, GenTypeDecl> ()
         for t in view.Types do
             if t.TKind = "record" || t.TKind = "union" || t.TKind = "class" then
@@ -1010,8 +1036,8 @@ let deriveToString =
                 [ GComment "deriveToString: a printer for the program's own types." ]
                 @ (if vecLen skipped = 0 then []
                    else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
-            [ "deriveToString.fpp", renderFile (header @ opens @ vecToList decls) ]
-    { GName = "deriveToString"; Generate = generate }
+            [ "deriveToString.fpp", Source (renderFile (header @ opens @ vecToList decls)) ]
+    { GName = "deriveToString"; GAfter = None; Generate = generate }
 
 // ---- logCalls: enter/exit tracing around every function -------------------
 // The AOP case: this one REWRITES what the user wrote rather than adding to it.
@@ -1020,17 +1046,16 @@ let deriveToString =
 // a hazard.
 
 let logCalls =
-    let generate (view : ProgramView) : (string * string) list =
-        view.Trees
-        |> List.choose (fun (path, root) ->
-            let text = view.Sources |> List.tryPick (fun (p, t) -> if p = path then Some t else None)
-            match text with
+    let generate (view : ProgramView) : (string * GenOutput) list =
+        view.Files
+        |> List.choose (fun f ->
+            let src = view.Sources |> List.tryPick (fun (p, t) -> if p = f.FPath then Some t else None)
+            match src with
             | None -> None
-            | Some src ->
-                let kids = nodes root
+            | Some text ->
                 // every top-level FUNCTION: a `let` with at least one parameter
-                let targets =
-                    kids
+                let edits =
+                    nodes f.FTree
                     |> List.filter (fun d -> d.NodeKind = LetDecl)
                     |> List.choose (fun d ->
                         let pats = nodes d |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
@@ -1043,53 +1068,42 @@ let logCalls =
                                 | None -> "?"
                             let dStart, _ = nodeSpan d
                             let bStart, bEnd = nodeSpan b
-                            Some (name, dStart, bStart, bEnd)
+                            // where the declaration sits decides the indent
+                            let lineStart =
+                                let before = text.Substring (0, dStart)
+                                let i = before.LastIndexOf '\n'
+                                if i < 0 then 0 else i + 1
+                            let indent = String.replicate (dStart - lineStart + 4) " "
+                            let bodyText = text.Substring (bStart, bEnd - bStart)
+                            let bodyLineStart =
+                                let before = text.Substring (0, bStart)
+                                let i = before.LastIndexOf '\n'
+                                if i < 0 then 0 else i + 1
+                            let bodyCol = bStart - bodyLineStart
+                            let targetCol = indent.Length + 4
+                            let shiftLine (l : string) =
+                                if targetCol >= bodyCol then String.replicate (targetCol - bodyCol) " " + l
+                                else
+                                    let drop = min (bodyCol - targetCol) (l.Length - (l.TrimStart ' ').Length)
+                                    l.Substring drop
+                            let bound =
+                                if not (bodyText.Contains "\n") then indent + "let __log = " + bodyText
+                                else
+                                    let lines = bodyText.Replace("\r", "").Split '\n' |> Array.toList
+                                    let rest = List.tail lines |> List.map shiftLine
+                                    indent + "let __log ="
+                                    + "\n" + String.replicate targetCol " " + List.head lines
+                                    + (if List.isEmpty rest then "" else "\n" + String.concat "\n" rest)
+                            let replacement =
+                                "\n" + indent + "print \"-> " + name + "\""
+                                + "\n" + bound
+                                + "\n" + indent + "print \"<- " + name + "\""
+                                + "\n" + indent + "__log"
+                            Some (bStart, bEnd, replacement)
                         | _ -> None)
-                if List.isEmpty targets then None
-                else
-                    // rewrite from the LAST body backwards, so earlier spans stay valid
-                    let mutable out = src
-                    for name, dStart, bStart, bEnd in List.rev targets do
-                        // the column the declaration starts at decides the indent
-                        let lineStart =
-                            let before = out.Substring (0, dStart)
-                            let i = before.LastIndexOf '\n'
-                            if i < 0 then 0 else i + 1
-                        let indent = String.replicate (dStart - lineStart + 4) " "
-                        let bodyText = out.Substring (bStart, bEnd - bStart)
-                        // Re-indent the body to sit under `let __log =`. The
-                        // shift is the DIFFERENCE between where the body starts
-                        // now and where it must start, applied to every line, so
-                        // the body's own internal layout survives.
-                        let bodyLineStart =
-                            let before = out.Substring (0, bStart)
-                            let i = before.LastIndexOf '\n'
-                            if i < 0 then 0 else i + 1
-                        let bodyCol = bStart - bodyLineStart
-                        let targetCol = indent.Length + 4
-                        let shiftLine (l : string) =
-                            if targetCol >= bodyCol then String.replicate (targetCol - bodyCol) " " + l
-                            else
-                                let drop = min (bodyCol - targetCol) (l.Length - (l.TrimStart ' ').Length)
-                                l.Substring drop
-                        let isMultiline = bodyText.Contains "\n"
-                        let bound =
-                            if not isMultiline then indent + "let __log = " + bodyText
-                            else
-                                let lines = bodyText.Replace("\r", "").Split '\n' |> Array.toList
-                                let rest = List.tail lines |> List.map shiftLine
-                                indent + "let __log ="
-                                + "\n" + String.replicate targetCol " " + List.head lines
-                                + (if List.isEmpty rest then "" else "\n" + String.concat "\n" rest)
-                        let replacement =
-                            "\n" + indent + "print \"-> " + name + "\""
-                            + "\n" + bound
-                            + "\n" + indent + "print \"<- " + name + "\""
-                            + "\n" + indent + "__log"
-                        out <- out.Substring (0, bStart) + replacement + out.Substring bEnd
-                    Some (path, out))
+                if List.isEmpty edits then None else Some (f.FPath, Edits edits))
 
-    { GName = "logCalls"; Generate = generate }
+    { GName = "logCalls"; GAfter = None; Generate = generate }
 
 let builtinGenerators = [ deriveGen; deriveToString; logCalls ]
 
