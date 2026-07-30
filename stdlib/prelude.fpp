@@ -2840,6 +2840,13 @@ module Set =
         isSubset a b && count a < count b
     let isProperSuperset (a : Set<'a>) (b : Set<'a>) : bool =
         isSuperset a b && count a > count b
+/// The delta vocabulary MapExt/HashMap deltas are expressed in. Named
+/// SetOp/RemoveOp because `Set` is already a type here (FSharp.Data.Adaptive
+/// spells the cases `Set` and `Remove`).
+type ElementOperation<'v> =
+    | SetOp of 'v
+    | RemoveOp
+
 type Map<'k, 'v> =
     | MapEmpty
     | MapNode of 'k * 'v * Map<'k, 'v> * Map<'k, 'v> * int * int
@@ -3035,3 +3042,127 @@ module Map =
         match List.rev (toList m) with
         | [] -> failwith "The input map was empty"
         | h :: _ -> h
+
+    // ---- MapExt: the combinator surface, tree-structural ------------------
+    /// the smallest binding, or None
+    let minBinding (t : Map<'k, 'v>) : ('k * 'v) option = tryMin t
+    /// the largest binding, or None
+    let maxBinding (t : Map<'k, 'v>) : ('k * 'v) option = tryMax t
+    let single (k : 'k) (v : 'v) : Map<'k, 'v> = MapNode (k, v, MapEmpty, MapEmpty, 1, 1)
+    let tryItem (i : int) (t : Map<'k, 'v>) : ('k * 'v) option = List.tryItem i (toList t)
+    /// remove the smallest binding; the map unchanged when empty
+    let removeMinBinding (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match tryMin t with
+        | Some (k, _) -> remove k t
+        | None -> t
+    let removeMaxBinding (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match tryMax t with
+        | Some (k, _) -> remove k t
+        | None -> t
+    /// Some (removed value, rest) when the key was present
+    let tryRemove (k : 'k) (t : Map<'k, 'v>) : ('v * Map<'k, 'v>) option when Ordered<'k> =
+        match tryFind k t with
+        | Some v -> Some (v, remove k t)
+        | None -> None
+    /// rewrite one key: the function sees its current binding and returns the
+    /// new one (None removes)
+    let alter (k : 'k) (f : 'v option -> 'v option) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match f (tryFind k t) with
+        | Some v -> add k v t
+        | None -> remove k t
+    /// map one key's value, inserting `dflt` first when it is absent
+    let update (k : 'k) (f : 'v -> 'v) (dflt : 'v) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        match tryFind k t with
+        | Some v -> add k (f v) t
+        | None -> add k dflt t
+    let mapValues (f : 'v -> 'w) (t : Map<'k, 'v>) : Map<'k, 'w> =
+        map (fun k v -> f v) t
+    let choose (f : 'k -> 'v -> 'w option) (t : Map<'k, 'v>) : Map<'k, 'w> when Ordered<'k> =
+        fold (fun acc k v ->
+                match f k v with
+                | Some w -> add k w acc
+                | None -> acc) MapEmpty t
+    let unionWith (resolve : 'k -> 'v -> 'v -> 'v) (a : Map<'k, 'v>) (b : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        // b wins by default, so fold a INTO b and resolve on collision
+        fold (fun acc k v ->
+                match tryFind k acc with
+                | Some other -> add k (resolve k v other) acc
+                | None -> add k v acc) b a
+    let union (a : Map<'k, 'v>) (b : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        unionWith (fun k x y -> y) a b
+    let unionMany (ts : Map<'k, 'v> list) : Map<'k, 'v> when Ordered<'k> =
+        List.fold (fun acc t -> union acc t) MapEmpty ts
+    let intersectWith (resolve : 'k -> 'v -> 'w -> 'x) (a : Map<'k, 'v>) (b : Map<'k, 'w>) : Map<'k, 'x> when Ordered<'k> =
+        fold (fun acc k v ->
+                match tryFind k b with
+                | Some other -> add k (resolve k v other) acc
+                | None -> acc) MapEmpty a
+    let intersect (a : Map<'k, 'v>) (b : Map<'k, 'w>) : Map<'k, 'v * 'w> when Ordered<'k> =
+        intersectWith (fun k x y -> (x, y)) a b
+    let difference (a : Map<'k, 'v>) (b : Map<'k, 'w>) : Map<'k, 'v> when Ordered<'k> =
+        fold (fun acc k v -> if containsKey k b then acc else add k v acc) MapEmpty a
+    /// over the UNION of both key sets: each key is offered whatever the two
+    /// maps hold for it, and None drops it from the result
+    let choose2 (f : 'k -> 'v option -> 'w option -> 'x option) (a : Map<'k, 'v>) (b : Map<'k, 'w>) : Map<'k, 'x> when Ordered<'k> =
+        let withA =
+            fold (fun acc k v ->
+                    match f k (Some v) (tryFind k b) with
+                    | Some x -> add k x acc
+                    | None -> acc) MapEmpty a
+        fold (fun acc k w ->
+                if containsKey k a then acc
+                else
+                    match f k None (Some w) with
+                    | Some x -> add k x acc
+                    | None -> acc) withA b
+    let map2 (f : 'k -> 'v option -> 'w option -> 'x) (a : Map<'k, 'v>) (b : Map<'k, 'w>) : Map<'k, 'x> when Ordered<'k> =
+        choose2 (fun k x y -> Some (f k x y)) a b
+    /// the delta that carries `a` to `b`: SetOp for added or changed keys,
+    /// RemoveOp for the ones only `a` had
+    let computeDelta (a : Map<'k, 'v>) (b : Map<'k, 'v>) : Map<'k, ElementOperation<'v>> when Ordered<'k> =
+        choose2 (fun k x y ->
+                    match x, y with
+                    | Some ov, Some nv -> if ov = nv then None else Some (SetOp nv)
+                    | None, Some nv -> Some (SetOp nv)
+                    | Some _, None -> Some RemoveOp
+                    | None, None -> None) a b
+    /// apply a delta, returning the new state AND the delta that actually
+    /// took effect (a Remove of an absent key changes nothing)
+    let applyDelta (t : Map<'k, 'v>) (delta : Map<'k, ElementOperation<'v>>) : Map<'k, 'v> * Map<'k, ElementOperation<'v>> when Ordered<'k> =
+        let mutable state = t
+        let mutable eff = MapEmpty
+        for k, op in toList delta do
+            match op with
+            | SetOp v ->
+                match tryFind k state with
+                | Some old when old = v -> ()
+                | _ ->
+                    state <- add k v state
+                    eff <- add k (SetOp v) eff
+            | RemoveOp ->
+                if containsKey k state then
+                    state <- remove k state
+                    eff <- add k RemoveOp eff
+        state, eff
+    /// the bindings on either side of a key, and the key's own binding
+    let neighbours (k : 'k) (t : Map<'k, 'v>) : ('k * 'v) option * ('k * 'v) option * ('k * 'v) option when Ordered<'k> =
+        let mutable below = None
+        let mutable above = None
+        for kk, vv in toList t do
+            if kk < k then below <- Some (kk, vv)
+            elif kk > k && (match above with None -> true | Some _ -> false) then above <- Some (kk, vv)
+        below, (match tryFind k t with Some v -> Some (k, v) | None -> None), above
+    /// everything strictly below / above a key, and the key's own binding
+    let split (k : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> * 'v option * Map<'k, 'v> when Ordered<'k> =
+        let mutable lo = MapEmpty
+        let mutable hi = MapEmpty
+        for kk, vv in toList t do
+            if kk < k then lo <- add kk vv lo
+            elif kk > k then hi <- add kk vv hi
+        lo, tryFind k t, hi
+    let withMin (k : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        filter (fun kk vv -> kk >= k) t
+    let withMax (k : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        filter (fun kk vv -> kk <= k) t
+    let range (lo : 'k) (hi : 'k) (t : Map<'k, 'v>) : Map<'k, 'v> when Ordered<'k> =
+        filter (fun kk vv -> kk >= lo && kk <= hi) t
