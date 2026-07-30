@@ -3824,7 +3824,9 @@ module Code =
         | QVar v -> v
         | QInt v -> string v
         | QCase (n, []) -> n
-        | QCase (n, ps) -> n + " " + String.concat " " (List.map renderPat ps)
+        | QCase (n, [ one ]) -> n + " " + renderPat one
+        // several payload fields are ONE tuple, and match as one
+        | QCase (n, ps) -> n + " (" + String.concat ", " (List.map renderPat ps) + ")"
 
     /// Render a tree back to SOURCE. This is the boundary where code becomes
     /// text — a generator writing a file, a plugin printing what it produced —

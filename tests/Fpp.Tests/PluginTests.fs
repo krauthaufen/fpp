@@ -454,6 +454,62 @@ let generatorTests =
                 "named as the plugin's, not the program's"
         }
 
+        test "deriveToString prints records, structs, unions, nesting and classes" {
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveToString ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "type Point = { X : int; Y : int }"
+                        "[<Struct>]"
+                        "type V2 = { A : float; B : float }"
+                        "type Shape = Dot | Line of int | Named of string | Both of int * string"
+                        "type Nested = { P : Point; Tags : list<string>; Note : Option<int> }"
+                        "type Thing(n : int) ="
+                        "    member x.N = n" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "open Types"
+                        "let go ="
+                        "    print (toStringPoint { X = 1; Y = 2 })"
+                        "    print (toStringV2 { A = 1.5; B = 2.5 })"
+                        "    print (toStringShape Dot)"
+                        "    print (toStringShape (Line 5))"
+                        "    print (toStringShape (Named \"hi\"))"
+                        "    print (toStringShape (Both (1, \"two\")))"
+                        "    print (toStringNested { P = { X = 3; Y = 4 }; Tags = [ \"a\"; \"b\" ]; Note = Some 7 })"
+                        "    print (toStringNested { P = { X = 0; Y = 0 }; Tags = []; Note = None })"
+                        // a class has no fields to show, so it prints its name and
+                        // a STABLE id: the same instance twice, the same number
+                        "    let t = Thing(9)"
+                        "    print (toStringThing t = toStringThing t)"
+                        "    print (toStringThing t <> toStringThing (Thing(9)))" ] ]
+            Expect.equal out
+                ("Point { X = 1; Y = 2 }\n"
+                 + "struct V2 { A = 1.5; B = 2.5 }\n"
+                 + "Dot\nLine 5\nNamed \"hi\"\nBoth (1, \"two\")\n"
+                 + "Nested { P = Point { X = 3; Y = 4 }; Tags = [\"a\"; \"b\"]; Note = Some 7 }\n"
+                 + "Nested { P = Point { X = 0; Y = 0 }; Tags = []; Note = None }\n"
+                 + "True\nTrue\n")
+                "every shape prints, and nesting uses the nested type's own printer"
+        }
+
+        test "logCalls wraps every function with enter and exit tracing" {
+            // the AOP case: this REWRITES what the user wrote, cutting by the
+            // parse tree's spans rather than searching the text
+            let out =
+                runGenerated [ Fpp.Core.Plugins.logCalls ]
+                    [ "main.fpp",
+                      [ "module Main"
+                        "let double (x : int) = x * 2"
+                        "let sum (a : int) (b : int) ="
+                        "    let t = double a"
+                        "    t + b"
+                        "let go ="
+                        "    print (sum 3 4)" ] ]
+            Expect.equal out "-> sum\n-> double\n<- double\n<- sum\n10\n"
+                "calls nest, and the value the function returns is untouched"
+        }
+
         test "deriveGen skips what it cannot generate soundly" {
             let text =
                 generatedText [ Fpp.Core.Plugins.deriveGen ]

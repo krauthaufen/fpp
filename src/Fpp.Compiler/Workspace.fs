@@ -440,8 +440,13 @@ type Workspace() =
                 |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
                 |> List.map (fun p ->
                     p, (match dictTryFind originalText p with Some t -> t | None -> this.FileText p))
+            let trees =
+                this.ProjectFiles
+                |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
+                |> List.map (fun p -> p, (this.ParseFile p).Root)
             let view : Fpp.Core.Plugins.ProgramView =
-                { Types = vecToList types; Values = vecToList values; Sources = sources }
+                { Types = vecToList types; Values = vecToList values
+                  Sources = sources; Trees = trees }
             // A file sees only EARLIER files, so generated code goes directly
             // after the last file that declared a type: it can name every type
             // it derives from, and anything in a later file can name it. A

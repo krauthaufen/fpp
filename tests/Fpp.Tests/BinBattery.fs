@@ -406,6 +406,15 @@ let binBattery =
         // the shape a deriving plugin emits: a MEMBER whose signature carries a
         // spliced type, and a record TYPE with a spliced field type
         // splices reach every position: expression, TYPE, and PATTERN
+        // both .NET overloads: a single char and a set of them
+        expects "TrimStart and TrimEnd take a char or a set"
+            [ "let go ="
+              "    print (\"xxhixx\".TrimStart 'x')"
+              "    print (\"xxhixx\".TrimStart [| 'x' |])"
+              "    print (\"hixx\".TrimEnd 'x')"
+              "    print (\"hixx\".TrimEnd [| 'x' |])" ]
+            "hixx\nhixx\nhi\nhi\n"
+
         expects "patterns can be spliced into a quoted match"
             [ "let p : QPat = QCase (\"Some\", [ QVar \"v\" ])"
               "let q : Code<int> = <@ match Some 1 with"

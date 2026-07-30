@@ -1143,7 +1143,10 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv s
         gcT f "ref.cast" "$str"
         callf f "$strChars"
-    | EApp (EUnknown "$str.TrimStart", [ s; cs ]) ->
+    // `TrimStart c` is the second overload; the runtime takes either a char or
+    // a set, so both spellings emit the same call
+    | EApp (EUnknown "$str.TrimStart", [ s; cs ])
+    | EApp (EUnknown "$str.TrimStart#2", [ s; cs ]) ->
         emitNode st f lv s
         gcT f "ref.cast" "$str"
         emitNode st f lv cs
@@ -1275,7 +1278,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f 0
         ins f "i32.ge_s"
         refI31 f
-    | EApp (EUnknown "$str.TrimEnd", [ s; cs ]) ->
+    | EApp (EUnknown "$str.TrimEnd", [ s; cs ])
+    | EApp (EUnknown "$str.TrimEnd#2", [ s; cs ]) ->
         emitNode st f lv s
         gcT f "ref.cast" "$str"
         emitNode st f lv cs

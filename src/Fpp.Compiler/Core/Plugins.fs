@@ -47,7 +47,9 @@ type GenCase =
 type GenTypeDecl =
     { TName : string
       TParams : string list
-      /// "record" | "union" | "other"
+      /// "record" | "union" | "class" | "abbrev" | "other". A class is
+      /// distinguished by having a constructor or members; an abbreviation by
+      /// being nothing but a type.
       TKind : string
       TFields : GenField list
       TCases : GenCase list
@@ -59,7 +61,9 @@ type GenTypeDecl =
       /// the `[<...>]` attributes written on it, name first then any literal
       /// arguments — this is how a generator is TOLD what to derive, rather
       /// than deriving for everything in sight
-      TAttrs : (string * string list) list }
+      TAttrs : (string * string list) list
+      /// for a class: the members it declares, by name
+      TMembers : string list }
 
 type GenValueDecl =
     { VName : string
@@ -81,7 +85,10 @@ type ProgramView =
       /// returns one of these paths REPLACES that file — the tier a shader
       /// language or any source-to-source pass needs, where augmenting with
       /// new declarations is not enough.
-      Sources : (string * string) list }
+      Sources : (string * string) list
+      /// the same files PARSED. A rewriting plugin should cut by the tree's
+      /// spans, not by searching text.
+      Trees : (string * GreenNode) list }
 
 type Generator =
     { GName : string
@@ -90,6 +97,11 @@ type Generator =
       Generate : ProgramView -> (string * string) list }
 
 /// the node kinds that spell a TYPE (Lower has its own copy, inside a closure)
+let private isPatNodeK (k : NodeKind) =
+    k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
+    || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
+    || k = SplicePat
+
 let private isTypeNode (k : NodeKind) =
     k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
     || k = FunType || k = AppType || k = PostfixType || k = ParenType
@@ -103,6 +115,19 @@ let private toks (n : GreenNode) =
 /// the source text of a type node, reassembled from its tokens
 let private typeText (n : GreenNode) =
     Green.tokens (GNode n) |> List.map (fun t -> t.Text) |> String.concat ""
+
+/// Where a node starts and ends in the source, so a rewrite can cut exactly.
+let private isExprNode (k : NodeKind) =
+    not (isPatNodeK k) && not (isTypeNode k) && k <> TyParams && k <> AttributeList
+
+/// Where a node starts and ends in the source, so a rewrite can cut exactly.
+let nodeSpan (n : GreenNode) : int * int =
+    match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind <> Eof) with
+    | [] -> 0, 0
+    | toks ->
+        let first = List.head toks
+        let last = List.last toks
+        first.Offset, last.Offset + last.Text.Length
 
 /// Every top-level value declaration in a parse tree, with its attributes.
 let valueDeclsOf (path : string) (root : GreenNode) : GenValueDecl list =
@@ -225,18 +250,40 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
                                CArgs =
                                  nodes c
                                  |> List.filter (fun x -> isTypeNode x.NodeKind)
-                                 |> List.map typeText }
+                                 // `Both of int * string` holds TWO things, and
+                                 // a consumer needs them apart, not as one blob
+                                 |> List.collect (fun x ->
+                                     if x.NodeKind = TupleType then
+                                         let parts = nodes x |> List.filter (fun y -> isTypeNode y.NodeKind)
+                                         if List.isEmpty parts then [ typeText x ] else List.map typeText parts
+                                     else [ typeText x ]) }
                     | None -> None)
             (match name with
              | Some nm ->
+                 let kids = nodes n
+                 let hasMembers = kids |> List.exists (fun x -> x.NodeKind = MemberDecl)
+                 let hasCtor = kids |> List.exists (fun x -> x.NodeKind = ParenPat)
+                 let isAbbrev =
+                     List.isEmpty cases && List.isEmpty fields && not hasMembers && not hasCtor
+                     && (kids |> List.exists (fun x -> isTypeNode x.NodeKind))
                  let kind =
                      if not (List.isEmpty cases) then "union"
                      elif not (List.isEmpty fields) then "record"
+                     elif hasMembers || hasCtor then "class"
+                     elif isAbbrev then "abbrev"
                      else "other"
                  vecAdd out
                      { TName = nm; TParams = tyParams; TKind = kind
                        TFields = fields; TCases = cases; TFile = path; TModule = modName
-                       TAttrs = pendingAttrs }
+                       TAttrs = pendingAttrs
+                       TMembers =
+                         nodes n
+                         |> List.filter (fun x -> x.NodeKind = MemberDecl)
+                         |> List.choose (fun x ->
+                             // `member x.Name ...` — the second ident is the name
+                             match Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) with
+                             | _ :: nm :: _ -> Some nm.Text
+                             | _ -> None) }
              | None -> ())
         // `module X` is a HEADER: a sibling of the declarations it scopes, not
         // their parent, so its name flows to the following siblings. A nested
@@ -435,7 +482,10 @@ let private patText (p : GPat) : string =
     | GPWild -> "_"
     | GPVar v -> v
     | GPCase (n, []) -> n
-    | GPCase (n, args) -> n + " " + String.concat " " args
+    | GPCase (n, [ one ]) -> n + " " + one
+    // a case with SEVERAL payload fields holds them as a tuple, and that is how
+    // it must be matched — `Both p0 p1` binds nothing useful
+    | GPCase (n, args) -> n + " (" + String.concat ", " args + ")"
 
 /// One line, or None when the shape needs several (a `let` sequence, a match).
 let rec private inlineOf (e : GEx) : string option =
@@ -484,9 +534,21 @@ let rec private inlineOf (e : GEx) : string option =
             match inlineOf b with
             | Some bs -> Some ("{ " + bs + " with " + String.concat "; " texts + " }")
             | None -> None
-    // a `let` sequence is statements, and a match reads far better broken up
+    // a `let` sequence is statements: no inline form exists
     | GLet (_, _, _) -> None
-    | GMatch (_, _) -> None
+    // a match DOES have one, and needs it: nested in an expression there is
+    // nowhere to break the line
+    | GMatch (scrut, arms) ->
+        let armTexts =
+            arms
+            |> List.map (fun (p, b) -> inlineOf b |> Option.map (fun t -> "| " + patText p + " -> " + t))
+        if armTexts |> List.exists (fun (t : string option) -> t.IsNone) then None
+        else
+            match inlineOf scrut with
+            | Some s ->
+                let texts = armTexts |> List.map (fun (t : string option) -> match t with Some x -> x | None -> "")
+                Some ("(match " + s + " with " + String.concat " " texts + ")")
+            | None -> None
 
 let private pad (n : int) = String.replicate n " "
 
@@ -825,7 +887,211 @@ let deriveGen =
             [ "deriveGen.fpp", renderFile (header @ opens @ vecToList decls) ]
     { GName = "deriveGen"; Generate = generate }
 
-let builtinGenerators = [ deriveGen ]
+// ---- deriveToString: a printer for every type in the program --------------
+// Records print their fields, unions their case and payload, classes their name
+// and a stable id (the identity hash: same instance, same number; different
+// instances, different numbers). A field whose type is another derived type
+// uses THAT type's printer, so nesting prints properly rather than bottoming
+// out in a placeholder.
+
+let deriveToString =
+    let generate (view : ProgramView) : (string * string) list =
+        let printable = dictNew<string, GenTypeDecl> ()
+        for t in view.Types do
+            if t.TKind = "record" || t.TKind = "union" || t.TKind = "class" then
+                dictSet printable t.TName t
+        let isPrintable (n : string) = (dictTryFind printable n).IsSome
+        let fnOf (n : string) = "toString" + n
+        /// the expression that prints `value`, or None when nothing sensible does
+        let rec printerFor (ty : string) (value : GEx) : GEx option =
+            let t = compact ty
+            if t = "int" || t = "float" || t = "bool" || t = "char" || t = "int64" then
+                Some (GApp (GVar "string", [ value ]))
+            elif t = "string" then
+                // a string prints as itself, quoted, so nesting stays readable
+                Some (GBin ("+", GBin ("+", GStr "\"", value), GStr "\""))
+            elif isPrintable t then Some (GApp (GVar (fnOf t), [ value ]))
+            elif t.StartsWith "list<" && t.EndsWith ">" then
+                inner t 5 1 value (fun item -> "[" , "]", "; ")
+            elif t.EndsWith "list" && t.Length > 4 then
+                listOf (t.Substring (0, t.Length - 4)) value
+            elif t.StartsWith "Option<" && t.EndsWith ">" then
+                optionOf (t.Substring (7, t.Length - 8)) value
+            elif t.EndsWith "option" && t.Length > 6 then
+                optionOf (t.Substring (0, t.Length - 6)) value
+            else None
+        and inner (t : string) (skip : int) (drop : int) (value : GEx) (_ : string -> string * string * string) =
+            listOf (t.Substring (skip, t.Length - skip - drop)) value
+        and listOf (elemTy : string) (value : GEx) : GEx option =
+            match printerFor elemTy (GVar "v") with
+            | Some p ->
+                // "[" + String.concat "; " (List.map (fun v -> <p>) xs) + "]"
+                let mapped = GApp (GVar "List.map", [ GLam ([ "v" ], p); value ])
+                let joined = GApp (GVar "String.concat", [ GStr "; "; mapped ])
+                Some (GBin ("+", GBin ("+", GStr "[", joined), GStr "]"))
+            | None -> None
+        and optionOf (elemTy : string) (value : GEx) : GEx option =
+            match printerFor elemTy (GVar "v") with
+            | Some p ->
+                Some (GMatch (value,
+                              [ GPCase ("Some", [ "v" ]), GBin ("+", GStr "Some ", p)
+                                GPCase ("None", []), GStr "None" ]))
+            | None -> None
+        let decls = vecNew<GDecl> ()
+        let skipped = vecNew<string> ()
+        for name, d in dictPairs printable do
+            if not (List.isEmpty d.TParams) then vecAdd skipped (name + " (generic)")
+            else
+                let isStruct = d.TAttrs |> List.exists (fun (a, _) -> a = "Struct")
+                let body =
+                    if d.TKind = "class" then
+                        // no fields to read: the name and a STABLE ID, which is
+                        // what identifies one instance from another
+                        Some (GBin ("+", GStr (name + "#"), GApp (GVar "string", [ GApp (GVar "hash", [ GVar "x" ]) ])))
+                    elif d.TKind = "record" then
+                        let parts =
+                            d.TFields
+                            |> List.map (fun f -> f.FName, printerFor f.FType (GField (GVar "x", f.FName)))
+                        if parts |> List.exists (fun (_, p) -> p.IsNone) then None
+                        else
+                            let rendered =
+                                parts
+                                |> List.map (fun (fn, p) ->
+                                    GBin ("+", GStr (fn + " = "), (match p with Some e -> e | None -> GStr "?")))
+                            let joined =
+                                match rendered with
+                                | [] -> GStr ""
+                                | first :: rest ->
+                                    List.fold (fun acc r -> GBin ("+", GBin ("+", acc, GStr "; "), r)) first rest
+                            let head = (if isStruct then "struct " else "") + name + " { "
+                            Some (GBin ("+", GBin ("+", GStr head, joined), GStr " }"))
+                    else
+                        // a union: one arm per case, payload printed by its type
+                        let arms =
+                            d.TCases
+                            |> List.map (fun c ->
+                                match c.CArgs with
+                                | [] -> Some (GPCase (c.CName, []), GStr c.CName)
+                                | [ one ] ->
+                                    (match printerFor one (GVar "p") with
+                                     | Some p -> Some (GPCase (c.CName, [ "p" ]), GBin ("+", GStr (c.CName + " "), p))
+                                     | None -> None)
+                                | many ->
+                                    // several payload fields: print them as a tuple
+                                    let names = many |> List.mapi (fun i _ -> "p" + string i)
+                                    let ps = List.map2 (fun t n -> printerFor t (GVar n)) many names
+                                    if ps |> List.exists (fun p -> p.IsNone) then None
+                                    else
+                                        let rendered = ps |> List.map (fun p -> match p with Some e -> e | None -> GStr "?")
+                                        let joined =
+                                            match rendered with
+                                            | [] -> GStr ""
+                                            | first :: rest ->
+                                                List.fold (fun acc r -> GBin ("+", GBin ("+", acc, GStr ", "), r)) first rest
+                                        Some (GPCase (c.CName, names),
+                                              GBin ("+", GBin ("+", GStr (c.CName + " ("), joined), GStr ")")))
+                        if arms |> List.exists (fun a -> a.IsNone) then None
+                        else Some (GMatch (GVar "x", arms |> List.map (fun a -> match a with Some x -> x | None -> (GPWild, GStr "?"))))
+                match body with
+                | None -> vecAdd skipped (name + " (a field or payload type has no printer)")
+                | Some b ->
+                    vecAdd decls (GComment ("generated by deriveToString"))
+                    vecAdd decls (GValue (fnOf name, [ "x", Some (GTyName name) ], Some (GTyName "string"), b))
+        if vecLen decls = 0 then []
+        else
+            let opens =
+                view.Types
+                |> List.filter (fun t -> isPrintable t.TName && t.TModule <> "")
+                |> List.map (fun t -> t.TModule)
+                |> List.distinct
+                |> List.sort
+                |> List.map GOpen
+            let header =
+                [ GComment "deriveToString: a printer for the program's own types." ]
+                @ (if vecLen skipped = 0 then []
+                   else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
+            [ "deriveToString.fpp", renderFile (header @ opens @ vecToList decls) ]
+    { GName = "deriveToString"; Generate = generate }
+
+// ---- logCalls: enter/exit tracing around every function -------------------
+// The AOP case: this one REWRITES what the user wrote rather than adding to it.
+// It cuts by the parse tree's spans — never by searching the text — so a body
+// that happens to contain the word `let`, or a string with braces in it, is not
+// a hazard.
+
+let logCalls =
+    let generate (view : ProgramView) : (string * string) list =
+        view.Trees
+        |> List.choose (fun (path, root) ->
+            let text = view.Sources |> List.tryPick (fun (p, t) -> if p = path then Some t else None)
+            match text with
+            | None -> None
+            | Some src ->
+                let kids = nodes root
+                // every top-level FUNCTION: a `let` with at least one parameter
+                let targets =
+                    kids
+                    |> List.filter (fun d -> d.NodeKind = LetDecl)
+                    |> List.choose (fun d ->
+                        let pats = nodes d |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
+                        let body = nodes d |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+                        match pats, body with
+                        | nameNode :: (_ :: _), Some b ->
+                            let name =
+                                match Green.tokens (GNode nameNode) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                                | Some t -> t.Text
+                                | None -> "?"
+                            let dStart, _ = nodeSpan d
+                            let bStart, bEnd = nodeSpan b
+                            Some (name, dStart, bStart, bEnd)
+                        | _ -> None)
+                if List.isEmpty targets then None
+                else
+                    // rewrite from the LAST body backwards, so earlier spans stay valid
+                    let mutable out = src
+                    for name, dStart, bStart, bEnd in List.rev targets do
+                        // the column the declaration starts at decides the indent
+                        let lineStart =
+                            let before = out.Substring (0, dStart)
+                            let i = before.LastIndexOf '\n'
+                            if i < 0 then 0 else i + 1
+                        let indent = String.replicate (dStart - lineStart + 4) " "
+                        let bodyText = out.Substring (bStart, bEnd - bStart)
+                        // Re-indent the body to sit under `let __log =`. The
+                        // shift is the DIFFERENCE between where the body starts
+                        // now and where it must start, applied to every line, so
+                        // the body's own internal layout survives.
+                        let bodyLineStart =
+                            let before = out.Substring (0, bStart)
+                            let i = before.LastIndexOf '\n'
+                            if i < 0 then 0 else i + 1
+                        let bodyCol = bStart - bodyLineStart
+                        let targetCol = indent.Length + 4
+                        let shiftLine (l : string) =
+                            if targetCol >= bodyCol then String.replicate (targetCol - bodyCol) " " + l
+                            else
+                                let drop = min (bodyCol - targetCol) (l.Length - (l.TrimStart ' ').Length)
+                                l.Substring drop
+                        let isMultiline = bodyText.Contains "\n"
+                        let bound =
+                            if not isMultiline then indent + "let __log = " + bodyText
+                            else
+                                let lines = bodyText.Replace("\r", "").Split '\n' |> Array.toList
+                                let rest = List.tail lines |> List.map shiftLine
+                                indent + "let __log ="
+                                + "\n" + String.replicate targetCol " " + List.head lines
+                                + (if List.isEmpty rest then "" else "\n" + String.concat "\n" rest)
+                        let replacement =
+                            "\n" + indent + "print \"-> " + name + "\""
+                            + "\n" + bound
+                            + "\n" + indent + "print \"<- " + name + "\""
+                            + "\n" + indent + "__log"
+                        out <- out.Substring (0, bStart) + replacement + out.Substring bEnd
+                    Some (path, out))
+
+    { GName = "logCalls"; Generate = generate }
+
+let builtinGenerators = [ deriveGen; deriveToString; logCalls ]
 
 let builtinPlugins = [ constFold; deriveShallowEquals ]
 

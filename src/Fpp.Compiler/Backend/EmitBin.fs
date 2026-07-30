@@ -3210,6 +3210,16 @@ let rtCore8 (m : Mod) : unit =
     local f "$hit" "i32"
     local f "$c" "i32"
     localsDone f
+    // one char or a set of them — see $strTrimStartChars
+    lg f "$cs"
+    gcT f "ref.test" "$parr_i"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$cs"
+    callf f "$toi"
+    arrNewFixed f "$parr_i" 1
+    ls f "$cs"
+    endB f
     lg f "$s"
     gci f "array.len"
     ls f "$b"
@@ -3407,6 +3417,18 @@ let rtCore8 (m : Mod) : unit =
     local f "$c" "i32"
     local f "$n" "i32"
     localsDone f
+    // `TrimStart c` passes ONE char where `TrimStart cs` passes an array: both
+    // are .NET overloads, so normalise the single char into a one-element set
+    // rather than making the caller know which shape the runtime wants
+    lg f "$cs"
+    gcT f "ref.test" "$parr_i"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$cs"
+    callf f "$toi"
+    arrNewFixed f "$parr_i" 1
+    ls f "$cs"
+    endB f
     lg f "$s"
     gci f "array.len"
     ls f "$n"
