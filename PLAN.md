@@ -2706,7 +2706,42 @@ end where Infer still knows the types, emitting `Gen<T>` values for records and
 unions. Until then a user type needs a hand-written generator, which is a few
 lines with the combinators.
 
+### DONE: source-level plugins (the Template Haskell shape)
+`Plugins.Generator` runs BEFORE the front end and returns SOURCE, which is then
+compiled like any other file — so it can declare TYPES, CLASSES and INSTANCES,
+none of which a PerFile plugin can reach (by then resolution and inference are
+over, and the IR keeps field KINDS rather than field types). Registered with
+`ws.AddGenerator`; zero cost when none is registered.
+
+THE STAGING RULE (as proposed): a generator sees the program's HAND-WRITTEN
+declarations only, never another generator's output, and generation runs exactly
+ONCE. Generated code may freely REFERENCE other generated code — it is all
+compiled together — it just cannot INSPECT it. One round, no fixpoint, and the
+output never depends on the order plugins were registered. Pinned by the test
+"a generator sees hand-written declarations only".
+
+TWO RULES THE EMITTED SOURCE MUST FOLLOW, both learned by getting them wrong:
+* NO module header. A `module X` header makes the bindings module-scoped, and a
+  later file then needs `open X`; without a header they are top-level, like the
+  prelude's, and any later file can name them.
+* A type NAME is visible across files, but a union CASE is not — so the view
+  carries `TModule` and generated code emits `open <M>` for each module that
+  declared a type it uses. Note `module X` is a HEADER: a SIBLING of the
+  declarations it scopes, not their parent.
+
+Generated files are inserted directly after the last file that declares a type,
+because a file sees only EARLIER files. A consumer of generated code therefore
+has to live in a later file than the types — the same staging an F# project or a
+Template Haskell splice has.
+
+`deriveGen` is the flagship: a `Gen<T>` for every record and union in the
+program, drawing, rendering and shrinking field by field. It SKIPS what it
+cannot do soundly and says so in a comment in the generated file — generic types
+(they need a generator per parameter) and recursive types (they need a size
+bound to terminate). Both limits are worth lifting later.
+
 ### Possible further increments (not required by any gate)
+
 
 ### Possible further increments (not required by any gate)
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload

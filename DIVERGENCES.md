@@ -187,3 +187,10 @@ against ordered reference models, and are fixed:
   program miscompiles (traps) instead of either shadowing or erroring. This is
   why the property-testing RNG is called `PropRng` rather than `Rng` and its
   helpers live inside `Gen` — two existing tests declare their own `type Rng`.
+* **A `let` binding shadows a builtin conversion inside its own body.** In
+  `let string : Gen<string> = ... string x ...` the inner `string` resolved to
+  the binding being defined rather than to the conversion, so the code applied a
+  record as a function and TRAPPED at run time instead of failing to compile.
+  F# resolves the builtin there (the binding is not recursive). The prelude now
+  routes those conversions through `genShowInt`/`genCharOf`/... — but the
+  underlying resolution difference is unfixed, and it is silent.
