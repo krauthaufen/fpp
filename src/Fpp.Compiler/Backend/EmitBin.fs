@@ -388,6 +388,14 @@ let callf (f : Fn) (name : string) : unit =
             f.PeepPrev <- f.PeepLast
             f.PeepLast <- Some (name, at, f.B.Count)
 let retCall (f : Fn) (name : string) : unit =
+    // a tail call REPLACES this frame: drop it before handing over, or a
+    // tail-recursive loop would climb the shadow stack forever
+    if (dictTryFind f.M.GlobalIdx "$dbgDepth").IsSome then
+        gg f "$dbgDepth"
+        emitByte f.B opI32Const
+        emitS32 f.B -1
+        ins f "i32.add"
+        gs f "$dbgDepth"
     emitByte f.B opReturnCall
     emitU32 f.B (funcIdx f.M name)
 let callRef (f : Fn) (tyName : string) : unit =
@@ -499,6 +507,26 @@ let dataSeg (m : Mod) (name : string) (bytes : byte[]) : unit =
     m.DataCount <- m.DataCount + 1
     emitByte m.DataBody 1
     emitVec m.DataBody bytes
+
+/// `depth <- depth + delta`, and where the depth grows, record the frame.
+/// `frameId` < 0 only adjusts the depth (what a tail call needs).
+let dbgFrame (f : Fn) (delta : int) (frameId : int) : unit =
+    if (dictTryFind f.M.GlobalIdx "$dbgDepth").IsSome then
+        gg f "$dbgDepth"
+        emitByte f.B opI32Const
+        emitS32 f.B delta
+        ins f "i32.add"
+        gs f "$dbgDepth"
+        if frameId >= 0 then
+            // frames[depth % cap] <- id, so a runaway stack cannot trap
+            gg f "$dbgFrames"
+            gg f "$dbgDepth"
+            emitByte f.B opI32Const
+            emitS32 f.B 512
+            ins f "i32.rem_u"
+            emitByte f.B opI32Const
+            emitS32 f.B frameId
+            gcT f "array.set" "$parr_i"
 
 /// Note that the code being emitted right here comes from `path` at `off`.
 /// Called at the start of a function and at each statement, which is the
@@ -1153,6 +1181,22 @@ let globalStrLit (m : Mod) (gname : string) : unit =
     emitByte m.GlobalBody opEnd
 
 /// a mutable i32 global with a constant initializer
+/// a mutable global holding a fresh packed-i32 array of `n` zeroes
+let globalArrI32 (m : Mod) (name : string) (n : int) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitByte m.GlobalBody 0x63          // (ref null $parr_i)
+    emitS32 m.GlobalBody (tyIdx m "$parr_i")
+    emitByte m.GlobalBody 1
+    emitByte m.GlobalBody opI32Const
+    emitS32 m.GlobalBody 0
+    emitByte m.GlobalBody opI32Const
+    emitS32 m.GlobalBody n
+    emitByte m.GlobalBody opGcPrefix
+    emitU32 m.GlobalBody (gcByte "array.new")
+    emitU32 m.GlobalBody (tyIdx m "$parr_i")
+    emitByte m.GlobalBody opEnd
+
 let globalI32Mut (m : Mod) (name : string) (init : int) : unit =
     dictSet m.GlobalIdx name m.GlobalCount
     m.GlobalCount <- m.GlobalCount + 1

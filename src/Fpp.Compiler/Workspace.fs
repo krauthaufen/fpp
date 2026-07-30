@@ -763,7 +763,10 @@ type Workspace() =
     /// .fpp files — with their text embedded, so the sources need not be
     /// fetchable separately.
     member this.EmitProgramWasmWithSourceMap (mapUrl : string) : byte[] * string * string list =
-        let bytes, errs = this.EmitCoreMapped true mapUrl
+        // NOT optimized: inlining dissolves frames and moves code between
+        // lines, and a debugger that disagrees with the source is worse than
+        // no debugger. A debug build is for stepping; ship the plain one.
+        let bytes, errs = this.EmitCoreMapped false mapUrl
         let sources =
             // the prelude too, under the path its declarations carry: stepping
             // into a library function should show that function, not nothing

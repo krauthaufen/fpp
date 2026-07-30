@@ -100,3 +100,85 @@ let sourceMapTests =
             Expect.isFalse (text.Contains "sourceMappingURL") "the default module carries no debug section"
         }
     ]
+
+let private wasmtime =
+    System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+    + "/.wasmtime/bin/wasmtime"
+
+let private runBytes (bytes : byte[]) : int * string =
+    let tmp = System.IO.Path.GetTempFileName () + ".wasm"
+    System.IO.File.WriteAllBytes (tmp, bytes)
+    let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + tmp)
+    psi.RedirectStandardOutput <- true
+    psi.RedirectStandardError <- true
+    use p = System.Diagnostics.Process.Start psi
+    let o = p.StandardOutput.ReadToEnd ()
+    p.StandardError.ReadToEnd () |> ignore
+    p.WaitForExit ()
+    System.IO.File.Delete tmp
+    p.ExitCode, o
+
+[<Tests>]
+let stackTests =
+    testList "the shadow stack" [
+        // wasm gives the guest no view of its own call stack, so a debug build
+        // keeps one. A plain build keeps none, and the same program still runs.
+        let program =
+            String.concat "\n"
+                [ "module M"
+                  // bound, not returned directly: a call in TAIL position
+                  // replaces its caller's frame, which would make the count
+                  // read oddly here
+                  "let inner (x : int) ="
+                  "    let d = Stack.depth ()"
+                  "    d"
+                  "let middle (x : int) = inner x + 0"
+                  "let outer (x : int) = middle x + 0"
+                  "let tailOuter (x : int) = inner x"
+                  "let go ="
+                  "    print (Stack.depth ())"
+                  "    print (outer 1)"
+                  "    print (tailOuter 1)"
+                  "    print (Stack.depth ())"
+                  "" ]
+
+        test "a debug build can see its own call depth" {
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" program
+            let bytes, _, errs = ws.EmitProgramWasmWithSourceMap "m.wasm.map"
+            Expect.isEmpty errs "compiles"
+            let code, out = runBytes bytes
+            Expect.equal code 0 "runs"
+            // 1 at the top; 4 through three non-tail calls; a TAIL call
+            // replaces its caller's frame rather than adding one, so that
+            // chain is shallower; back to 1 afterwards
+            Expect.equal out "1\n4\n2\n1\n" "depth tracks the real call chain, tail calls included"
+        }
+
+        test "a plain build carries no shadow stack, and still runs" {
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" program
+            let bytes, errs = ws.EmitProgramWasm ()
+            Expect.isEmpty errs "compiles"
+            let code, out = runBytes bytes
+            Expect.equal code 0 "runs"
+            Expect.equal out "0\n0\n0\n0\n" "no frames to report, and nothing breaks for asking"
+        }
+
+        test "frames are ids the name section resolves" {
+            let ws = Workspace()
+            ws.SetFileText "m.fpp"
+                (String.concat "\n"
+                    [ "module M"
+                      "let deep (x : int) ="
+                      "    let fs = Stack.frames ()"
+                      "    List.length fs"
+                      "let go = print (deep 1 > 0)"
+                      "" ])
+            let bytes, _, errs = ws.EmitProgramWasmWithSourceMap "m.wasm.map"
+            Expect.isEmpty errs "compiles"
+            let code, out = runBytes bytes
+            Expect.equal code 0 "runs"
+            Expect.equal out "True\n" "a frame list comes back with something in it"
+        }
+    ]

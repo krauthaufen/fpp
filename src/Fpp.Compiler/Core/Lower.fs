@@ -706,6 +706,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // NOT identity: the float is boxed, the bits are an
                           // integer — the emitters reinterpret
                           EApp (EUnknown bv.Name, [ bx ])
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ sx ] when
+                            (bv.Name = "stackDepth" || bv.Name = "stackFrame")
+                            && bv.Path = "(builtin)" ->
+                          // the shadow stack: a global read, not an import
+                          EApp (EUnknown bv.Name, [ sx ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])

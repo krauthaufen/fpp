@@ -3886,6 +3886,32 @@ module Code =
     /// print a declaration as source — what an F++ generator emits
     let emit (c : CodeTree) : unit = print (render c)
 
+/// The call stack, as the program itself can see it. A DEBUG build keeps a
+/// shadow stack — wasm exposes none of its own — and these read it. In a plain
+/// build the depth is 0 and every frame is 0, so code that reports a trace
+/// still runs; it just has nothing to report.
+/// how many frames are live right now (0 outside a debug build)
+extern let stackDepth : unit -> int
+/// the id of frame `i`, counting from 1 at the outermost
+extern let stackFrame : int -> int
+
+module Stack =
+    let depth () : int = stackDepth ()
+
+    /// the id of frame `i`, counting from 1 (the outermost). The id is the
+    /// function's index, which the module's name section maps to a name — so a
+    /// host, a source map, or the frame table beside it renders the name.
+    let frame (i : int) : int = stackFrame i
+
+    /// every live frame, outermost first
+    let frames () : list<int> =
+        let mutable acc = []
+        let mutable i = depth ()
+        while i >= 1 do
+            acc <- frame i :: acc
+            i <- i - 1
+        acc
+
 /// The conversions the generators need, under names `Gen` does not shadow.
 /// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a
 /// call to the conversion of the same name applies the generator record — which

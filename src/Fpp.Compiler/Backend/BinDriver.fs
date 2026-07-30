@@ -59,6 +59,8 @@ type St =
       /// locals on a RAW scalar rail: binder key -> kind (i/f/s/l). Reads
       /// box, writes unbox — and the peephole cancels both against their
       /// producers/consumers, which is what makes a hot loop alloc-free
+      /// the frame id to push for the function being emitted, -1 for none
+      mutable DbgFrame : int
       LocalKind : Dict<string * int, string>
       /// known functions with SCALAR signatures: param kinds + return kind.
       /// Calls unbox arguments and box results (both cancel on rails);
@@ -1460,6 +1462,20 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  throwExn f
              | None -> ins f "unreachable")
             endB f
+    // the shadow stack, readable from the program itself
+    | EApp (EUnknown "stackDepth", [ _ ]) ->
+        if (dictTryFind f.M.GlobalIdx "$dbgDepth").IsSome then gg f "$dbgDepth" else ic f 0
+        callf f "$ofi"
+    | EApp (EUnknown "stackFrame", [ i ]) ->
+        if (dictTryFind f.M.GlobalIdx "$dbgDepth").IsSome then
+            gg f "$dbgFrames"
+            emitNode st f lv i
+            callf f "$toi"
+            ic f 512
+            ins f "i32.rem_u"
+            gcT f "array.get" "$parr_i"
+        else ic f 0
+        callf f "$ofi"
     | EUnknown "hash" ->
         requestWrapper st f "$hashvBoxed" 1
         ic f (tblIdx f.M "$hashvBoxed.w0")
@@ -2785,6 +2801,8 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
             let l = "$x" + string (vecLen f.LocalTys)
             local f l t
         localsDone f
+        // the shadow-stack push goes here: after the locals, before the body
+        if st.DbgFrame >= 0 then dbgFrame f 1 st.DbgFrame
         clearKinds ()
         f.Replay <- 0
         let lv1 = dictNew<string * int, string> ()
@@ -2798,6 +2816,9 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
 /// it to find the map, and it changes the bytes, so it stays opt-in.
 let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         : byte[] * string list * string list * (int * string * int) list =
+    // a DEBUG build carries the shadow stack that makes a guest-visible
+    // stack trace possible; a plain one pays nothing for it
+    let debugBuild = mapUrl <> ""
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
@@ -2813,6 +2834,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
           Pod = dictNew (); StructFields = dictNew ()
+          DbgFrame = -1
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
           SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u"
           StrSegs = dictNew (); RecFieldTy = dictNew ()
@@ -3257,6 +3279,14 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     rtCore11 m
     rtCore12 m
     rtCore13 m
+    // ---- the shadow stack (debug builds) ---------------------------------
+    // wasm gives the guest no way to look at its own call stack, so a debug
+    // build keeps one: a depth counter and a ring of frame ids, maintained at
+    // entry, at exit, and BEFORE a tail call — where the frame is replaced
+    // rather than pushed.
+    if debugBuild then
+        globalI32Mut m "$dbgDepth" 0
+        globalArrI32 m "$dbgFrames" 512
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
     for d in decls do
@@ -3279,6 +3309,9 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             let f = beginFn m names
             // this function's code starts here, and it came from there
             markSrc f v.Path v.Offset
+            // the frame id is this function's index, which the name section
+            // already maps to a name
+            st.DbgFrame <- (if debugBuild then m.ImportedFuncs + m.CodeCount else -1)
             let lv = dictNew<string * int, string> ()
             List.iteri (fun i (pv : VarId, _) -> dictSet lv (pv.Path, pv.Offset) (List.item i names)) ps
             let pks, rk =
@@ -3301,8 +3334,11 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             // so we must know locals first. We pre-walk the body and create
             // one anyref local per binder, keyed by the SAME naming scheme
             // emitNode/emitPat use (vecLen LocalTys order).
-            emitWithLocalsK st f lv (mangle v) body paramKinds |> ignore
+            let emitted = emitWithLocalsK st f lv (mangle v) body paramKinds
+            st.DbgFrame <- -1
             if rk <> "u" then callf f (unboxOfK rk)
+            // and the pop, on the way out
+            if debugBuild && emitted then dbgFrame f -1 -1
             st.CurRet <- "u"
             endFn f
         | _ -> ()
