@@ -2734,14 +2734,60 @@ because a file sees only EARLIER files. A consumer of generated code therefore
 has to live in a later file than the types — the same staging an F# project or a
 Template Haskell splice has.
 
+GENERATED CODE IS BUILT AS DATA, NOT TEXT. `GDecl`/`GEx`/`GTy`/`GPat` in
+Plugins.fs describe declarations, and `renderFile` lays them out: escaping,
+indentation, the off-side rule and the no-module-header convention all live in
+the renderer, so a generator never writes source. Source remains the wire
+format (`Generate` returns strings), so the builder is a library, not a new
+plumbing layer, and a generator can still emit raw text with `GRaw`/`GTyRaw`.
+Layout rules the renderer knows: one line while it fits in 96 columns, records
+broken with fields aligned under `{`, a match always broken with its arms at the
+`match` column, and a lambda whose body is a `let` sequence indented with the
+closing paren on the last line. A shape it cannot lay out emits
+`__generator_cannot_render__` rather than a comment — a gap must be loud.
+
 `deriveGen` is the flagship: a `Gen<T>` for every record and union in the
 program, drawing, rendering and shrinking field by field. It SKIPS what it
 cannot do soundly and says so in a comment in the generated file — generic types
 (they need a generator per parameter) and recursive types (they need a size
 bound to terminate). Both limits are worth lifting later.
 
+### FIXED: a returned closure captured a scalar parameter as a raw rail
+`cellScan`'s `skipParams` stripped EVERY leading lambda of a top-level binding,
+on the theory that a function's parameter lambdas are the function. Only the
+OUTERMOST one is — `ArityOf` comes from its parameter list — so for
+`let f (n : int) = (fun x -> x + n)` the inner lambda's capture of `n` went
+unseen, `n` stayed on an i32 rail, and the closure env (anyref slots) was built
+from the raw i32. The module did not even validate:
+"expected anyref, found i32". Found by a generated program, pinned by the
+battery test "a returned closure captures a scalar parameter".
+
+### Two constructs the SELF-HOSTED checker reads differently
+Both hit while writing the builder, both worked in F# and failed the
+self-application gates:
+* `"" :: xs |> String.concat "\n"` — `::` versus `|>` grouping. Parenthesize.
+* `List.map2 f xs ys` — pairing two lists mis-infers with no prelude context
+  (the standalone inference gate). Render per element instead.
+
 ### Possible further increments (not required by any gate)
 
+
+### FIXED: a returned closure captured a scalar parameter as a raw rail
+`cellScan`'s `skipParams` stripped EVERY leading lambda of a top-level binding,
+on the theory that a function's parameter lambdas are the function. Only the
+OUTERMOST one is — `ArityOf` comes from its parameter list — so for
+`let f (n : int) = (fun x -> x + n)` the inner lambda's capture of `n` went
+unseen, `n` stayed on an i32 rail, and the closure env (anyref slots) was built
+from the raw i32. The module did not even validate:
+"expected anyref, found i32". Found by a generated program, pinned by the
+battery test "a returned closure captures a scalar parameter".
+
+### Two constructs the SELF-HOSTED checker reads differently
+Both hit while writing the builder, both worked in F# and failed the
+self-application gates:
+* `"" :: xs |> String.concat "\n"` — `::` versus `|>` grouping. Parenthesize.
+* `List.map2 f xs ys` — pairing two lists mis-infers with no prelude context
+  (the standalone inference gate). Render per element instead.
 
 ### Possible further increments (not required by any gate)
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload
