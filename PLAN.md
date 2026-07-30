@@ -2609,28 +2609,65 @@ and fns whose scalar param a LAMBDA captures (env slots are anyref; the
 capture build site reads slots raw). Wrappers adapt first-class uses.
 Gates: 446/446, fixpoint bin + bin self byte-identical.
 
-### NEXT: the OO HashMap/HashSet port (requested, not yet written)
-The original FSharp.Data.Adaptive HashMap/HashSet are a CLASS HIERARCHY with
-virtual members (HashMapNode base; Empty / NoCollisionLeaf / CollisionLeaf /
-Inner subclasses; Add/Remove/TryFind/Count/Map/Choose/Filter as abstract
-members), NOT the DU nodes our port uses. Rewriting them in that style is
-the outstanding request.
+### DONE: HashMap/HashSet as a real class hierarchy (main c0de47c)
+Both are now the original (FSharp.Data.Adaptive) shape: an abstract
+`HashNode<'k,'v>` base over a big-endian patricia trie with
+HashEmpty / HashLeaf / HashCollision / HashInner subclasses and abstract
+CountOf / TryFind / AddWith / RemoveKey / FoldWith. No union nodes anywhere.
+The module surface (including choose2/computeDelta/applyDelta and the O(1)
+keySet) is unchanged, so its battery programs pass untouched.
 
-WHAT WAS PROVEN POSSIBLE (battery: "generic class hierarchy with virtual
-dispatch through the base"): generic classes, mutually recursive `and`
-classes, abstract members overridden per subclass, virtual dispatch through
-a BASE-TYPED reference, upcasts, and dynamic dispatch over a heterogeneous
-list all work today.
+WHAT THE CLASS SUPPORT CAN AND CANNOT DO (learned the hard way here):
+* WORKS: generic classes, mutually recursive `and` classes, abstract members
+  overridden per subclass, METHOD-LEVEL generics on an abstract member
+  (`abstract member MapTo : ('k -> 'w) -> Node<'w>`), virtual dispatch through
+  a base-typed value, calling an abstract member on `x` from inside a concrete
+  base member, calling a concrete base member on a base-typed value.
+* FAILS 1: any member call or property read in an `inherit` ARGUMENT
+  (`inherit Node<'k>(1 + rest.Count)`) — emits "unknown field". Pass the value
+  in as a constructor parameter instead; that is why HashCollision and
+  HashInner both take their count.
+* FAILS 2: reading a PROPERTY (a zero-arg getter) on a base-typed value from
+  INSIDE the declaring rec group — Lower.fs:1454 falls back to a field access
+  under the member's own name ("Count"), and the record's field carries the
+  ctor-param name ("count"). METHOD calls resolve fine, which is why the
+  internal count accessor is `CountOf ()` and `Count` is for outside callers.
+* FAILS 3 (pre-existing): a class with NO members at all is dropped by
+  lowering, so `inherit Foo()` reports "unbound variable Foo". One member is
+  enough to keep it.
 
-TWO COMPILER FACTS TO KNOW BEFORE STARTING:
-1. FIXED here: a fieldless abstract base is lowered WITHOUT a record, so a
-   derived class had nothing to extend and tyStructSub got base index -1
-   (a hard crash). Such a class now derives from $obj.
-2. STILL OPEN: a *completely* fieldless abstract base is dropped by LOWERING
-   altogether — no DRecord, no DClass, no constructor — so `inherit Node()`
-   fails with "unbound variable Node". Workaround that works now: give the
-   base one field (a kind tag, or the cached count the Inner node needs
-   anyway). Proper fix: keep a record for a fieldless class in Lower.
+### TRAP: stdlib/prelude.fpp is an EmbeddedResource
+`src/Fpp.Compiler/Fpp.Compiler.fsproj` embeds it, so the IN-PROCESS compiler
+uses the prelude that was baked in at BUILD time while the wasm compiler reads
+the file from disk. Editing the prelude and running tests without rebuilding
+first therefore tests the OLD prelude, and the byte fixpoint reports a bogus
+divergence (stage-0 embedded/stale vs stage-1 on-disk/new). ALWAYS rebuild
+after touching the prelude. `fixpoint.fsx` now dumps both answers to
+/tmp/fpp-fixpoint/answer-stage{0,1}.wasm on a divergence, which is how this
+was diagnosed (diff their function-name lists).
+
+### DONE: two dead-code-elimination fixes the port forced (3cdd80f, a165c10)
+The hierarchy first made EVERY module 39% bigger (corpus answer 31752 ->
+44161 bytes) even for programs that never touch a HashMap, because
+`deadCodeEliminate` rooted things too eagerly. Both roots are now demand
+driven, and the corpus answer is back to 32436 bytes:
+1. A class's members are reached through a vtable, so nothing names them —
+   they used to be unconditional roots. They now park on the class's
+   CONSTRUCTOR and are demanded only where the class is actually constructed.
+   A class whose constructor cannot be identified keeps the old rule.
+2. A value binding was a root because its EFFECTS must run. An initializer
+   that provably cannot have effects only needs to run if the value is READ,
+   so unread pure values (and whatever only they reached) are now dropped.
+   `HashMap.empty` alone was rooting the whole hierarchy's vtable. The purity
+   analysis is conservative: unresolved names, dynamic dispatch, mutation,
+   loops, exception handling and calls to anything with those count as
+   effects, and calling a computed target (a parameter holding a function) is
+   opaque. Only the CALLEE position of an application is a call edge — an
+   early version treated every EVar as one, which made every function with a
+   parameter look effectful.
+   This is a REAL behaviour change: three tests (two stamping, one
+   representation) asserted on code reached only through unread values and had
+   to start observing them.
 
 ### Possible further increments (not required by any gate)
 ### Possible further increments (not required by any gate)
