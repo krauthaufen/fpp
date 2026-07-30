@@ -2746,6 +2746,22 @@ broken with fields aligned under `{`, a match always broken with its arms at the
 closing paren on the last line. A shape it cannot lay out emits
 `__generator_cannot_render__` rather than a comment — a gap must be loud.
 
+QUOTATION, AND WHY NOT F#'s `<@ @>`. A typed F# quotation denotes F# code and
+is checked against types that exist in the HOST process; generated F++ code
+names types the host has never heard of (the user's own types, `Gen<'a>`, the
+prelude), so `<@ ... @>` would reject it before the tree existed. `GQuote` is
+the borrowed idea instead: LITERAL F++ source for the boilerplate, with holes
+spliced as explicit builder expressions through `exText` / `tyText` (F# string
+interpolation supplies the brackets). `renderFileChecked` parses each quote and
+reports a bad one against the QUOTE and its own line, so a broken template is a
+generator error rather than a puzzle in a file nobody wrote. Quoted and built
+declarations mix freely in one file — see the test "quotation: literal code with
+spliced expressions".
+
+The natural end state is different: once plugins can be written in F++ itself
+(it self-hosts), it can have real `<@ @>` quotations over its OWN ast, typed
+against the program being compiled. That is the version worth building later.
+
 `deriveGen` is the flagship: a `Gen<T>` for every record and union in the
 program, drawing, rendering and shrinking field by field. It SKIPS what it
 cannot do soundly and says so in a comment in the generated file — generic types
@@ -2768,6 +2784,8 @@ self-application gates:
 * `"" :: xs |> String.concat "\n"` — `::` versus `|>` grouping. Parenthesize.
 * `List.map2 f xs ys` — pairing two lists mis-infers with no prelude context
   (the standalone inference gate). Render per element instead.
+* `min a b` reads as taking a TUPLE, and `Seq.toList` over a string does not
+  resolve. Use an `if` and `String.Split` respectively.
 
 ### Possible further increments (not required by any gate)
 
@@ -2788,6 +2806,8 @@ self-application gates:
 * `"" :: xs |> String.concat "\n"` — `::` versus `|>` grouping. Parenthesize.
 * `List.map2 f xs ys` — pairing two lists mis-infers with no prelude context
   (the standalone inference gate). Render per element instead.
+* `min a b` reads as taking a TUPLE, and `Seq.toList` over a string does not
+  resolve. Use an `if` and `String.Split` respectively.
 
 ### Possible further increments (not required by any gate)
 - SoA struct arrays for non-POD structs (text's $sarr_) if a workload
