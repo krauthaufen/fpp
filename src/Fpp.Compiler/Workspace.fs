@@ -214,6 +214,8 @@ type Workspace() =
     do db.SetInput "libs" "" (box ([] : (string * string) list))
     let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
     let generators = vecNew<Fpp.Core.Plugins.Generator> ()
+    /// generated path -> the generator that wrote it, for blaming diagnostics
+    let generatedBy = dictNew<string, string> ()
     let pluginErrors = vecNew<string> ()
 
     /// Register a compiler plugin (project config, never source annotations).
@@ -424,6 +426,7 @@ type Workspace() =
                 try
                     for name, src in g.Generate view do
                         let path = Workspace.GeneratedPrefix + name
+                        dictSet generatedBy path g.GName
                         db.SetInput "text" path (box src)
                         let files = this.ProjectFiles
                         if not (List.contains path files) then
@@ -432,11 +435,46 @@ type Workspace() =
                             db.SetInput "project" "" (box (before @ [ path ] @ after))
                 with e -> vecAdd pluginErrors ("generator " + g.GName + " failed: " + e.Message)
 
+    /// The files the generators produced this run: path, generator, source.
+    /// A generated file is compiled like any other, so it is worth being able
+    /// to read the thing the errors are about.
+    member this.GeneratedFiles : (string * string * string) list =
+        this.ProjectFiles
+        |> List.filter (fun p -> p.StartsWith Workspace.GeneratedPrefix)
+        |> List.map (fun p ->
+            p, (match dictTryFind generatedBy p with Some g -> g | None -> "?"), this.FileText p)
+
     member private this.EmitCore (optimize : bool) : byte[] * string list =
         this.RunGenerators ()
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
         let allDecls = vecNew<Fpp.Core.Ir.Decl> ()
+        // Nobody WROTE a generated file, so a bare position in one is useless:
+        // name the generator and quote the line it produced.
+        let blame (path : string) (line : int) (col : int) (msg : string) : string =
+            let where =
+                if line >= 0 then path + ":" + string (line + 1) + ":" + string (col + 1) + ": "
+                else path + ": "
+            match dictTryFind generatedBy path with
+            | Some who ->
+                let lines = (this.FileText path).Replace("\r", "").Split '\n'
+                let src = if line >= 0 && line < lines.Length then lines.[line] else ""
+                let caret =
+                    if src = "" then ""
+                    else "\n    " + String.replicate (max 0 col) " " + "^"
+                "generator '" + who + "' produced code that does not compile\n  " + where + msg
+                + (if src = "" then "" else "\n    " + src + caret)
+            | None -> where + msg
+        let lineColOf (path : string) (off : int) : int * int =
+            let text = this.FileText path
+            let cut = if off < text.Length then off else text.Length
+            let upto = (text.Substring (0, cut)).Replace ("\r", "")
+            let ls = upto.Split '\n'
+            ls.Length - 1, (if ls.Length > 0 then ls.[ls.Length - 1].Length else 0)
+        let blameAt (path : string) (off : int) (msg : string) : string =
+            let line, col = lineColOf path off
+            blame path line col msg
+
         let lowerOne (path : string) (root : Syntax.GreenNode) =
             match dictTryFind r.Files path with
             | Some (b, inf) ->
@@ -461,11 +499,11 @@ type Workspace() =
                 let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
-                    vecAdd errs (path + ": not lowerable at offset " + string off + ": " + why)
+                    vecAdd errs (blameAt path off ("not lowerable: " + why))
             | None -> ()
         for path in this.ProjectFiles do
             for d in this.Diagnostics path do
-                vecAdd errs (path + ":" + string (d.Line + 1) + ":" + string (d.Col + 1) + ": " + d.Message)
+                vecAdd errs (blame path d.Line d.Col d.Message)
         // builtin decls (Option etc.) come first — from the process cache
         let cached = BuiltinCache.force ()
         let bp = cached.Parse

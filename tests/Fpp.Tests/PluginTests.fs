@@ -209,6 +209,55 @@ let generatorTests =
                 "derived generators draw, render and shrink"
         }
 
+        test "attributes tell a generator what to derive" {
+            // the Template Haskell workflow: the splice names its target, so
+            // marking one type derives for THAT type and leaves the rest alone
+            let ws = Workspace()
+            ws.AddGenerator Fpp.Core.Plugins.deriveGen
+            ws.SetFileText "types.fpp"
+                (String.concat "\n"
+                    [ "module Types"
+                      "[<Derive(\"Gen\")>]"
+                      "type Point = { X : int; Y : int }"
+                      "type NotAsked = { Z : int }"
+                      "" ])
+            ws.SetFileText "main.fpp"
+                (String.concat "\n"
+                    [ "module Main"; "open Types"; "let go = print ((genPoint ()).Render { X = 1; Y = 2 })"; "" ])
+            let bytes, errs = ws.EmitProgramWasm ()
+            Expect.isEmpty errs "compiles"
+            let generated = ws.GeneratedFiles |> List.map (fun (_, _, src) -> src) |> String.concat "\n"
+            Expect.stringContains generated "genPoint" "the marked type is derived"
+            Expect.isFalse (generated.Contains "genNotAsked") "an unmarked type is left alone"
+            Expect.equal (runBytes bytes) "{ X = 1; Y = 2 }\n" "and the derived generator works"
+        }
+
+        test "a generator's mistakes are reported against the generator" {
+            // a generated file is compiled like any other, but NOBODY WROTE it:
+            // a bare path and position would be a puzzle, so the error names
+            // the generator and quotes the line it produced
+            let sloppy : Fpp.Core.Plugins.Generator =
+                { GName = "sloppy"
+                  Generate = fun _ -> [ "sloppy.fpp", "let ok (n : int) = n\nlet broken (x : int) = x + * 3\n" ] }
+            let ws = Workspace()
+            ws.AddGenerator sloppy
+            ws.SetFileText "types.fpp" "module Types\ntype Anchor = { A : int }\n"
+            ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
+            let _, errs = ws.EmitProgramWasm ()
+            Expect.isNonEmpty errs "broken generated code is an error"
+            let first = List.head errs
+            Expect.stringContains first "generator 'sloppy'" "the generator is named"
+            Expect.stringContains first "(generated)/sloppy.fpp:2:28" "with the position inside what it produced"
+            Expect.stringContains first "let broken (x : int) = x + * 3" "and the offending line quoted"
+            Expect.stringContains first "^" "with a caret at the column"
+            // the source it produced is retrievable, not a black box
+            let files = ws.GeneratedFiles
+            Expect.equal (List.length files) 1 "one generated file"
+            let _, who, src = List.head files
+            Expect.equal who "sloppy" "attributed to its generator"
+            Expect.stringContains src "let broken" "and its source can be read"
+        }
+
         test "deriveGen skips what it cannot generate soundly" {
             let text =
                 generatedText [ Fpp.Core.Plugins.deriveGen ]

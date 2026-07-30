@@ -55,7 +55,11 @@ type GenTypeDecl =
       /// the module that declares it, "" at file top level. A type NAME is
       /// visible across files regardless, but a union CASE is not: generated
       /// code has to `open` this.
-      TModule : string }
+      TModule : string
+      /// the `[<...>]` attributes written on it, name first then any literal
+      /// arguments — this is how a generator is TOLD what to derive, rather
+      /// than deriving for everything in sight
+      TAttrs : (string * string list) list }
 
 /// What a generator gets to look at: the hand-written declarations.
 type ProgramView = { Types : GenTypeDecl list }
@@ -84,6 +88,21 @@ let private typeText (n : GreenNode) =
 /// Every type declaration in a parse tree, at any module depth.
 let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
     let out = vecNew<GenTypeDecl> ()
+    let mutable pendingAttrs : (string * string list) list = []
+    let attrsOf (m : GreenNode) : (string * string list) list =
+        // `[<Derive("Gen")>]` — the first ident names it, string literals are
+        // its arguments
+        let ts = Green.tokens (GNode m)
+        let names = ts |> List.filter (fun t -> t.Kind = Ident) |> List.map (fun t -> t.Text)
+        let args =
+            ts
+            |> List.filter (fun t -> t.Kind = StringLit)
+            |> List.map (fun t ->
+                let raw = t.Text
+                if raw.Length >= 2 && raw.StartsWith "\"" then raw.Substring (1, raw.Length - 2) else raw)
+        match names with
+        | [] -> []
+        | first :: _ -> [ first, args ]
     let rec walk (modName : string) (n : GreenNode) =
         if n.NodeKind = TypeDecl then
             let name =
@@ -128,7 +147,8 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
                      else "other"
                  vecAdd out
                      { TName = nm; TParams = tyParams; TKind = kind
-                       TFields = fields; TCases = cases; TFile = path; TModule = modName }
+                       TFields = fields; TCases = cases; TFile = path; TModule = modName
+                       TAttrs = pendingAttrs }
              | None -> ())
         // `module X` is a HEADER: a sibling of the declarations it scopes, not
         // their parent, so its name flows to the following siblings. A nested
@@ -139,14 +159,19 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
             |> List.map (fun t -> t.Text)
             |> String.concat "."
         let mutable scope = modName
+        // an attribute list precedes the declaration it decorates
         for c in nodes n do
-            if c.NodeKind = ModuleHeader then
+            if c.NodeKind = AttributeList then pendingAttrs <- pendingAttrs @ attrsOf c
+            elif c.NodeKind = ModuleHeader then
                 let nm = nameOf c
                 if nm <> "" then scope <- nm
             elif c.NodeKind = ModuleDef then
                 let nm = nameOf c
                 walk (if nm = "" then scope else nm) c
-            else walk scope c
+            else
+                walk scope c
+                // attributes decorate ONE declaration
+                if c.NodeKind = TypeDecl then pendingAttrs <- []
     walk "" root
     vecToList out
 
@@ -583,9 +608,16 @@ let private mentions (isUser : string -> bool) (d : GenTypeDecl) : string list =
 
 let deriveGen =
     let generate (view : ProgramView) : (string * string) list =
+        // `[<Derive("Gen")>]` on any type switches deriveGen from "everything
+        // in the program" to exactly what was asked for — the Template Haskell
+        // workflow, where the splice names its target
+        let wants (t : GenTypeDecl) =
+            t.TAttrs |> List.exists (fun (n, args) -> n = "Derive" && List.contains "Gen" args)
+        let targeted = view.Types |> List.exists wants
         let named = dictNew<string, GenTypeDecl> ()
         for t in view.Types do
-            if t.TKind = "record" || t.TKind = "union" then dictSet named t.TName t
+            if (t.TKind = "record" || t.TKind = "union") && (not targeted || wants t) then
+                dictSet named t.TName t
         let isUser (n : string) = (dictTryFind named n).IsSome
         // a type that reaches itself needs a size-bounded generator; skip it
         let rec reaches (seen : string list) (from : string) (target : string) : bool =
