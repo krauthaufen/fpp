@@ -3032,6 +3032,43 @@ NOT DONE — and both need the parser, not the plugin API
 The honest summary: this is GHC's *deriving-plugin* power plus attribute
 targeting and real diagnostics, not yet TH's *splice-anywhere* power.
 
+### Tooling: debugging a wasm build as F++
+`ws.EmitProgramWasmWithSourceMap mapUrl` is the DEBUG build. It differs from the
+plain one on purpose, and only when asked for:
+* a **source map** (`Backend/SourceMap.fs`): one generated line, columns are
+  absolute byte offsets into the .wasm — the shape browsers already read. Chrome
+  resolves a frame's byte offset to a .fpp file, line and column, so a
+  breakpoint lands in F++ source. The sources' TEXT is embedded
+  (`sourcesContent`), so nothing needs fetching. Positions are recorded as code
+  is emitted (`markSrc`) at function entry and at every `let`, which is the
+  granularity a debugger steps at, and shifted to absolute offsets once assembly
+  places the code section.
+* a `sourceMappingURL` custom section naming the map.
+* **name sections** that make a heap snapshot readable: function names (always),
+  plus LOCAL names — parameters keep the names they were written with — and
+  FIELD names, so a snapshot shows `X` and `Y` rather than `field 0`.
+* a **shadow stack**: wasm shows the guest nothing of its own call stack, so a
+  debug build keeps a depth counter and a ring of frame ids. `Stack.depth ()`,
+  `Stack.frame i` and `Stack.frames ()` read it; a frame id is the function
+  index, which the name section maps to a name. Maintained at entry, at exit,
+  and BEFORE a tail call — where the frame is REPLACED, not pushed, so a
+  tail-recursive loop does not climb.
+* NOT optimized. Inlining dissolves frames and moves code between lines; a
+  debugger that disagrees with the source is worse than none.
+
+A plain build pays for none of it: no map, no names, no shadow stack, and the
+byte fixpoint is unchanged. Names alone were a third of the module.
+
+Two things worth knowing. A call in TAIL position replaces its caller's frame,
+so a trace shows what actually ran, not what the source suggests. And a local
+must never take a name a PARAMETER holds: the name is the key, so rebinding it
+silently repoints every read of that parameter — a prelude function with a
+parameter `h` met an emitter local `$h`, and only the HashMap tests noticed.
+
+STILL OPEN: rendering a trace to NAMES inside the guest (the ids are there; the
+names need an offset/length table and a data segment), and capturing a trace at
+`failwith` so an exception carries the stack it was raised from.
+
 ### Possible further increments (not required by any gate)
 
 
