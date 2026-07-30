@@ -413,6 +413,42 @@ let generatorTests =
             Expect.stringContains (List.head errs) "generator 'breaker'" "and the plugin that rewrote it is named"
         }
 
+        test "a plugin written in F++ itself, compiled and run at compile time" {
+            // the end of the line: the generator is not F# host code but an
+            // F++ PROGRAM, compiled and executed during this compilation. It
+            // reads the program it generates for from `viewTypes`.
+            let plugin =
+                String.concat "\n"
+                    [ "// derives a `describe<T>` for every record in the program"
+                      "let go ="
+                      "    for (name, kind, members) in viewTypes do"
+                      "        if kind = \"record\" then"
+                      "            print (\"let describe\" + name + \" (x : \" + name + \") =\")"
+                      "            let parts = List.map (fun (f, t) -> \"\\\"\" + f + \"=\\\" + string x.\" + f) members"
+                      "            print (\"    \" + String.concat \" + \\\";\\\" + \" parts)"
+                      "" ]
+            let ws = Workspace()
+            ws.AddFppGenerator "describe" [ "plugin.fpp", plugin ]
+            ws.SetFileText "types.fpp" "module Types\ntype Point = { X : int; Y : int }\n"
+            ws.SetFileText "main.fpp" "module Main\nopen Types\nlet go = print (describePoint { X = 3; Y = 4 })\n"
+            let bytes, errs = ws.EmitProgramWasm ()
+            Expect.isEmpty errs "the generated program compiles"
+            let generated = ws.GeneratedFiles |> List.map (fun (_, _, src) -> src) |> String.concat ""
+            Expect.stringContains generated "let describePoint" "the F++ plugin wrote the function"
+            Expect.equal (runBytes bytes) "X=3;Y=4\n" "and the program uses it"
+        }
+
+        test "an F++ plugin that does not compile is reported as such" {
+            let ws = Workspace()
+            ws.AddFppGenerator "broken" [ "plugin.fpp", "let go = print (1 +\n" ]
+            ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
+            let _, errs = ws.EmitProgramWasm ()
+            Expect.isNonEmpty errs "the plugin's own errors surface"
+            Expect.isTrue
+                (errs |> List.exists (fun (e : string) -> e.Contains "F++ generator 'broken' does not compile"))
+                "named as the plugin's, not the program's"
+        }
+
         test "deriveGen skips what it cannot generate soundly" {
             let text =
                 generatedText [ Fpp.Core.Plugins.deriveGen ]

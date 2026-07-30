@@ -913,6 +913,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match args with
                     | [] | [ _ ] -> ECtor (name, mono (TCon ("CodeTree", [])), args)
                     | many -> ECtor (name, mono (TCon ("CodeTree", [])), [ ETuple many ])
+                // HYGIENE: every binder inside a quotation is renamed to a name
+                // unique to this quotation site, and references to it inside
+                // the same quotation follow the rename. A spliced tree brings
+                // its own free names, which therefore cannot be captured by a
+                // binder that happens to share their spelling.
+                let renames = dictNew<string, string> ()
+                let fresh (nm : string) (off : int) =
+                    let unique = nm + "#" + string off
+                    dictSet renames nm unique
+                    unique
+                let seen (nm : string) =
+                    match dictTryFind renames nm with
+                    | Some u -> u
+                    | None -> nm
                 let rec quote (m : GreenNode) : Expr =
                     let kids = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind)
                     match m.NodeKind with
@@ -934,7 +948,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> note (offsetOf m) "literal not quotable")
                     | IdentExpr ->
                         (match tokensOf m |> List.tryHead with
-                         | Some t -> ctor "CName" [ str t.Text ]
+                         | Some t -> ctor "CName" [ str (seen t.Text) ]
                          | None -> note (offsetOf m) "name not quotable")
                     | BinaryExpr ->
                         let op = tokensOf m |> List.tryFind (fun t -> t.Kind = Operator)
@@ -960,7 +974,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              let value = nodesOf d |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
                              let body = rest |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryHead
                              (match nameTok, value, body with
-                              | Some nt, Some v, Some b -> ctor "CLet" [ str nt.Text; quote v; quote b ]
+                              | Some nt, Some v, Some b ->
+                                  // the value cannot see the binder; the body can
+                                  let qv = quote v
+                                  let unique = fresh nt.Text nt.Offset
+                                  ctor "CLet" [ str unique; qv; quote b ]
                               | _ -> note (offsetOf m) "let in a quotation must bind a name to a value")
                          | inner :: _ when isExprish inner.NodeKind -> quote inner
                          | _ -> note (offsetOf m) "block not quotable")
@@ -979,7 +997,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             |> List.filter (fun x -> x.NodeKind = IdentPat)
                             |> List.map (fun x ->
                                 match tokensOf x |> List.tryHead with
-                                | Some t -> str t.Text
+                                | Some t -> str (fresh t.Text t.Offset)
                                 | None -> str "_")
                         (match List.tryLast kids with
                          | Some body -> ctor "CLam" [ EListLit ps; quote body ]
@@ -1024,7 +1042,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // upper case names a case, lower case binds
                          | Some t when t.Text.Length > 0 && System.Char.IsUpper t.Text.[0] ->
                              pctor "QCase" [ str t.Text; EListLit [] ]
-                         | Some t -> pctor "QVar" [ str t.Text ]
+                         | Some t -> pctor "QVar" [ str (fresh t.Text t.Offset) ]
                          | None -> note (offsetOf m) "pattern not quotable")
                     | AppPat ->
                         (match nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) with

@@ -363,15 +363,25 @@ let binBattery =
         // grafts a SUBTREE, so composition cannot be reinterpreted by
         // precedence and nothing is ever parsed a second time.
         expects "quotations are trees, and a splice grafts a subtree"
-            [ "let rec shape (c : CodeTree) ="
+            [
+              "let baseName (n : string) ="
+              "    let mutable r = \"\""
+              "    let mutable i = 0"
+              "    let mutable stop = false"
+              "    while i < n.Length do"
+              "        if n.[i] = '#' then stop <- true"
+              "        elif not stop then r <- r + string n.[i]"
+              "        i <- i + 1"
+              "    if stop then r + \"*\" else r"
+              "let rec shape (c : CodeTree) ="
               "    match c with"
               "    | CInt v -> \"Int(\" + string v + \")\""
               "    | CStr v -> \"Str\""
               "    | CBool v -> \"Bool\""
-              "    | CName n -> \"Name(\" + n + \")\""
+              "    | CName n -> \"Name(\" + baseName n + \")\""
               "    | CBin (op, l, r) -> \"Bin(\" + op + \",\" + shape l + \",\" + shape r + \")\""
               "    | CApp (f, args) -> \"App(\" + shape f + \",\" + string (List.length args) + \")\""
-              "    | CLet (n, v, b) -> \"Let(\" + n + \",\" + shape v + \",\" + shape b + \")\""
+              "    | CLet (n, v, b) -> \"Let(\" + baseName n + \",\" + shape v + \",\" + shape b + \")\""
               "    | CIf (c2, t, e) -> \"If(\" + shape c2 + \",\" + shape t + \",\" + shape e + \")\""
               "let n = 41"
               "let f (x : int) = x"
@@ -386,7 +396,41 @@ let binBattery =
               "    print (shape blk.Raw)" ]
             ("Bin(+,Name(n),Int(1))\n"
              + "Bin(*,Bin(+,Int(1),Int(2)),Int(3))\n"
-             + "Let(y,App(Name(f),1),If(Bin(>,Name(y),Int(1)),Bin(+,Name(y),Int(1)),Int(0)))\n")
+             + "Let(y*,App(Name(f),1),If(Bin(>,Name(y*),Int(1)),Bin(+,Name(y*),Int(1)),Int(0)))\n")
+
+        // HYGIENE: a binder inside a quotation is renamed per quotation site,
+        // so a spliced fragment's free names cannot be captured by a binder
+        // that merely spells the same
+        expects "a quoted binder cannot capture a spliced name"
+            [
+              "let baseName (n : string) ="
+              "    let mutable r = \"\""
+              "    let mutable i = 0"
+              "    let mutable stop = false"
+              "    while i < n.Length do"
+              "        if n.[i] = '#' then stop <- true"
+              "        elif not stop then r <- r + string n.[i]"
+              "        i <- i + 1"
+              "    if stop then r + \"*\" else r"
+              "let rec shape (c : CodeTree) ="
+              "    match c with"
+              "    | CInt v -> string v"
+              "    | CName n -> baseName n"
+              "    | CBin (op, l, r) -> shape l + op + shape r"
+              "    | CLet (n, v, b) -> \"let \" + baseName n + \"=\" + shape v + \" in \" + shape b"
+              "    | _ -> \"?\""
+              "let y = 99"
+              "let body : Code<int> = <@ y + 1 @>"
+              "let captured : Code<int> = <@ let y = 5"
+              "                              %body @>"
+              "let ownBody : Code<int> = <@ let z = 5"
+              "                             z + 1 @>"
+              "let go ="
+              // the quoted binder is renamed (y*), the SPLICED y is not: no capture
+              "    print (shape captured.Raw)"
+              // and a binder is still visible to its own body
+              "    print (shape ownBody.Raw)" ]
+            "let y*=5 in y+1\nlet z*=5 in z*+1\n"
 
         expects "a returned closure captures a scalar parameter"
             [ "let addN (n : int) = (fun x -> x * 2 + n)"

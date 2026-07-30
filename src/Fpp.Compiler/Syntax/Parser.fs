@@ -480,7 +480,9 @@ let parse (src : string) : ParseResult =
                 lhs <- Green.node CastExpr [ lhs; op; parseType ctx ]
             elif s.Is Operator && allowed && not (s.IsOp "|") && not (s.IsOp "->") then
                 let prec = infixPrec s.Cur.Text
-                if prec >= minPrec && prec > 0 then
+                // an adjacent `%x` inside a quotation is a SPLICE, never the
+                // modulo operator continuing the expression on the line above
+                if prec >= minPrec && prec > 0 && not (isSpliceHere ()) then
                     let opText = s.Cur.Text
                     let op = s.Bump ()
                     let nextMin = if rightAssoc opText then prec else prec + 1

@@ -214,6 +214,9 @@ type Workspace() =
     do db.SetInput "libs" "" (box ([] : (string * string) list))
     let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
     let generators = vecNew<Fpp.Core.Plugins.Generator> ()
+    /// plugins written in F++ ITSELF: name and sources, compiled and RUN at
+    /// compile time
+    let fppGenerators = vecNew<string * (string * string) list> ()
     /// generated path -> the generator that wrote it, for blaming diagnostics
     let generatedBy = dictNew<string, string> ()
     /// hand-written text, captured before any generator rewrites a file: the
@@ -228,6 +231,13 @@ type Workspace() =
     /// A generator emits SOURCE before analysis, so it can declare types,
     /// classes and instances — see the staging rule in Plugins.fs.
     member _.AddGenerator (g : Fpp.Core.Plugins.Generator) : unit = vecAdd generators g
+
+    /// A generator written in F++ ITSELF. Its sources are compiled and RUN
+    /// during this compilation; whatever it prints becomes a generated file.
+    /// It reads the program it is generating for from `viewTypes`, which is
+    /// handed to it as ordinary F++ data.
+    member _.AddFppGenerator (name : string) (sources : (string * string) list) : unit =
+        vecAdd fppGenerators (name, sources)
     member _.PluginErrors : string list = vecToList pluginErrors
 
     /// Run the per-file plugin pipeline, linting after each stage.
@@ -405,7 +415,7 @@ type Workspace() =
     /// generator writes to a stable path, so running twice replaces rather
     /// than accumulates.
     member private this.RunGenerators () : unit =
-        if vecLen generators > 0 then
+        if vecLen generators > 0 || vecLen fppGenerators > 0 then
             for path in this.ProjectFiles do
                 if not (path.StartsWith Workspace.GeneratedPrefix)
                    && not (dictTryFind originalText path).IsSome then
@@ -446,6 +456,11 @@ type Workspace() =
                 |> List.filter (fun (_, p) -> List.contains p declaring)
                 |> List.map fst
                 |> (fun idxs -> if List.isEmpty idxs then List.length files - 1 else List.max idxs)
+            // F++-written plugins live in their own member: a function that
+            // cannot be lowered is stubbed WHOLE, so keeping this out of
+            // RunGenerators is what lets the self-hosted compiler run at all
+            if vecLen fppGenerators > 0 then this.RunFppGenerators view anchorIndex
+
             for g in vecToList generators do
                 try
                     for name, src in g.Generate view do
@@ -478,6 +493,70 @@ type Workspace() =
         |> List.filter (fun p -> p.StartsWith Workspace.GeneratedPrefix)
         |> List.map (fun p ->
             p, (match dictTryFind generatedBy p with Some g -> g | None -> "?"), this.FileText p)
+
+    /// Compile and RUN the plugins written in F++ itself. Kept separate
+    /// because it spawns a process: unlowerable in the self-hosted build, and a
+    /// stubbed function traps as a whole, so it must not sit on the common path.
+    member private this.RunFppGenerators (view : Fpp.Core.Plugins.ProgramView) (anchorIndex : int) : unit =
+        // ---- plugins written in F++, compiled and run right here -------
+        if vecLen fppGenerators > 0 then
+            let q (t : string) = "\"" + t.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
+            let typeRows =
+                view.Types
+                |> List.map (fun t ->
+                    let members =
+                        if t.TKind = "record" then
+                            t.TFields |> List.map (fun f -> "(" + q f.FName + ", " + q f.FType + ")")
+                        else
+                            t.TCases
+                            |> List.map (fun c ->
+                                "(" + q c.CName + ", " + q (match c.CArgs with a :: _ -> a | [] -> "") + ")")
+                    "      (" + q t.TName + ", " + q t.TKind + ", [ " + String.concat "; " members + " ])")
+            let viewSrc =
+                "// the program being compiled, as data for an F++ generator\n"
+                + "let viewTypes : (string * string * (string * string) list) list =\n"
+                + (if List.isEmpty typeRows then "    []\n"
+                   else "    [\n" + String.concat "\n" typeRows + " ]\n")
+            let wasmtime =
+                match System.Environment.GetEnvironmentVariable "FPP_WASMTIME" with
+                | null | "" ->
+                    System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+                    + "/.wasmtime/bin/wasmtime"
+                | p -> p
+            for gname, gsources in vecToList fppGenerators do
+                let pw = Workspace()
+                pw.SetFileText "(view)/view.fpp" viewSrc
+                for path, text in gsources do pw.SetFileText path text
+                let bytes, perrs = pw.EmitProgramWasm ()
+                if not (List.isEmpty perrs) then
+                    for e in perrs |> List.truncate 3 do
+                        vecAdd pluginErrors ("F++ generator '" + gname + "' does not compile: " + e)
+                else
+                    let tmp = System.IO.Path.GetTempFileName () + ".wasm"
+                    System.IO.File.WriteAllBytes (tmp, bytes)
+                    let psi =
+                        System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + tmp)
+                    psi.RedirectStandardOutput <- true
+                    psi.RedirectStandardError <- true
+                    use proc = System.Diagnostics.Process.Start psi
+                    let out = proc.StandardOutput.ReadToEnd ()
+                    let err = proc.StandardError.ReadToEnd ()
+                    proc.WaitForExit ()
+                    System.IO.File.Delete tmp
+                    if proc.ExitCode <> 0 then
+                        vecAdd pluginErrors
+                            ("F++ generator '" + gname + "' failed at run time: "
+                             + err.Substring (0, min 300 err.Length))
+                    else
+                        let path = Workspace.GeneratedPrefix + gname + ".fpp"
+                        dictSet generatedBy path gname
+                        db.SetInput "text" path (box out)
+                        let files = this.ProjectFiles
+                        if not (List.contains path files) then
+                            let before = files |> List.truncate (anchorIndex + 1)
+                            let after = files |> List.skip (min (List.length files) (anchorIndex + 1))
+                            db.SetInput "project" "" (box (before @ [ path ] @ after))
+
 
     member private this.EmitCore (optimize : bool) : byte[] * string list =
         this.RunGenerators ()
