@@ -1599,13 +1599,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // the quoted code resolve, report its own errors and hover. The
                 // quotation itself denotes code, not the value the body would
                 // produce.
-                n.Children
-                |> List.iter (fun c ->
-                    match c with
-                    | GNode m when isExprish m.NodeKind -> ignore (exprType (GNode m))
-                    | _ -> ())
-                TCon ("Code", [])
+                // the quotation is Code<'t> where 't is what the body produces
+                let bodyTy =
+                    n.Children
+                    |> List.choose (fun c ->
+                        match c with
+                        | GNode m when isExprish m.NodeKind -> Some (exprType (GNode m))
+                        | _ -> None)
+                    |> List.tryHead
+                TCon ("Code", [ (match bodyTy with Some t -> t | None -> st.Fresh ()) ])
             | SpliceExpr ->
+                let hole = st.Fresh ()
                 // `%x` splices code in, so `x` must denote code; what the
                 // spliced fragment evaluates to is not known here, so the hole
                 // takes a fresh variable and the surrounding quote still checks
@@ -1615,9 +1619,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | GNode m when isExprish m.NodeKind ->
                         let t = exprType (GNode m)
                         let off = match tokensOf n |> List.tryHead with Some tk -> tk.Offset | None -> 0
-                        unifyAt off t (TCon ("Code", []))
+                        // `%x` fills a hole of type 'a, and x must be Code<'a>
+                        unifyAt off t (TCon ("Code", [ hole ]))
                     | _ -> ())
-                st.Fresh ()
+                hole
             | ParenExpr ->
                 let vars = dictNew<string, Type> ()
                 let inner =

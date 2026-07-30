@@ -363,7 +363,7 @@ let binBattery =
         // grafts a SUBTREE, so composition cannot be reinterpreted by
         // precedence and nothing is ever parsed a second time.
         expects "quotations are trees, and a splice grafts a subtree"
-            [ "let rec shape (c : Code) ="
+            [ "let rec shape (c : CodeTree) ="
               "    match c with"
               "    | CInt v -> \"Int(\" + string v + \")\""
               "    | CStr v -> \"Str\""
@@ -381,9 +381,9 @@ let binBattery =
               "let blk = <@ let y = f n"
               "             if y > 1 then y + 1 else 0 @>"
               "let go ="
-              "    print (shape <@ n + 1 @>)"
-              "    print (shape c)"
-              "    print (shape blk)" ]
+              "    print (shape (<@ n + 1 @>).Raw)"
+              "    print (shape c.Raw)"
+              "    print (shape blk.Raw)" ]
             ("Bin(+,Name(n),Int(1))\n"
              + "Bin(*,Bin(+,Int(1),Int(2)),Int(3))\n"
              + "Let(y,App(Name(f),1),If(Bin(>,Name(y),Int(1)),Bin(+,Name(y),Int(1)),Int(0)))\n")

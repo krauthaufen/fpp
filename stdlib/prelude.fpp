@@ -3762,19 +3762,40 @@ type Gen<'a> =
 /// to be parsed a second time and composition cannot lose to precedence or
 /// formatting. A quotation containing something outside this subset is a
 /// compile-time error, never a silent fallback.
-type Code =
+/// A pattern inside quoted code.
+type QPat =
+    | QWild
+    | QVar of string
+    | QInt of int
+    /// a union case and the patterns it binds
+    | QCase of string * QPat list
+
+type CodeTree =
     | CInt of int
     | CStr of string
     | CBool of bool
     /// a name as written
     | CName of string
     /// `f a b`
-    | CApp of Code * Code list
+    | CApp of CodeTree * CodeTree list
     /// `a + b`, operator first
-    | CBin of string * Code * Code
+    | CBin of string * CodeTree * CodeTree
     /// `let n = value` followed by the rest
-    | CLet of string * Code * Code
-    | CIf of Code * Code * Code
+    | CLet of string * CodeTree * CodeTree
+    | CIf of CodeTree * CodeTree * CodeTree
+    | CTuple of CodeTree list
+    | CList of CodeTree list
+    /// `fun a b -> body`
+    | CLam of string list * CodeTree
+    /// `x.Field`
+    | CField of CodeTree * string
+    /// `match scrutinee with | pat -> body | ...`
+    | CMatch of CodeTree * (QPat * CodeTree) list
+
+/// `Code<'t>` is quoted code KNOWN TO PRODUCE a 't — that is what lets a splice
+/// type check against the hole it fills. `Raw` is the tree underneath, for
+/// taking the code apart.
+type Code<'t> = { Raw : CodeTree }
 
 /// The conversions the generators need, under names `Gen` does not shadow.
 /// Inside `module Gen`, `char`, `string` and `float` are the GENERATORS, and a

@@ -911,14 +911,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // a case with several payload fields takes them as ONE tuple
                 let ctor (name : string) (args : Expr list) =
                     match args with
-                    | [] | [ _ ] -> ECtor (name, mono (TCon ("Code", [])), args)
-                    | many -> ECtor (name, mono (TCon ("Code", [])), [ ETuple many ])
+                    | [] | [ _ ] -> ECtor (name, mono (TCon ("CodeTree", [])), args)
+                    | many -> ECtor (name, mono (TCon ("CodeTree", [])), [ ETuple many ])
                 let rec quote (m : GreenNode) : Expr =
                     let kids = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind)
                     match m.NodeKind with
                     | SpliceExpr ->
+                        // the spliced value is a typed handle; its TREE goes in
                         (match kids with
-                         | inner :: _ -> lowerExpr (GNode inner)
+                         | inner :: _ -> EField (lowerExpr (GNode inner), "Raw", "Code")
                          | [] -> note (offsetOf m) "empty splice")
                     | ParenExpr ->
                         (match kids with
@@ -963,9 +964,81 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | _ -> note (offsetOf m) "let in a quotation must bind a name to a value")
                          | inner :: _ when isExprish inner.NodeKind -> quote inner
                          | _ -> note (offsetOf m) "block not quotable")
+                    | TupleExpr -> ctor "CTuple" [ EListLit (List.map quote kids) ]
+                    | ListExpr ->
+                        // items arrive wrapped in a BlockExpr when separated
+                        let items =
+                            match kids with
+                            | [ single ] when single.NodeKind = BlockExpr ->
+                                nodesOf single |> List.filter (fun x -> isExprish x.NodeKind)
+                            | other -> other
+                        ctor "CList" [ EListLit (List.map quote items) ]
+                    | LambdaExpr ->
+                        let ps =
+                            nodesOf m
+                            |> List.filter (fun x -> x.NodeKind = IdentPat)
+                            |> List.map (fun x ->
+                                match tokensOf x |> List.tryHead with
+                                | Some t -> str t.Text
+                                | None -> str "_")
+                        (match List.tryLast kids with
+                         | Some body -> ctor "CLam" [ EListLit ps; quote body ]
+                         | None -> note (offsetOf m) "lambda without a body")
+                    | DotExpr ->
+                        let fieldTok = tokensOf m |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                        (match kids, fieldTok with
+                         | recv :: _, Some ft -> ctor "CField" [ quote recv; str ft.Text ]
+                         | _ -> note (offsetOf m) "field access not quotable")
+                    | MatchExpr ->
+                        let clauses = nodesOf m |> List.filter (fun x -> x.NodeKind = MatchClause)
+                        (match kids with
+                         | scrut :: _ ->
+                             let arms =
+                                 clauses
+                                 |> List.map (fun cl ->
+                                     let pat = nodesOf cl |> List.tryFind (fun x -> isPatKind x.NodeKind)
+                                     let body = nodesOf cl |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryLast
+                                     match pat, body with
+                                     | Some p, Some b -> ETuple [ quotePat p; quote b ]
+                                     | _ -> note (offsetOf cl) "match clause not quotable")
+                             ctor "CMatch" [ quote scrut; EListLit arms ]
+                         | [] -> note (offsetOf m) "match without a scrutinee")
                     | k -> note (offsetOf m) ("not quotable in <@ @>: " + string k)
+                and quotePat (m : GreenNode) : Expr =
+                    let pctor (name : string) (args : Expr list) =
+                        match args with
+                        | [] | [ _ ] -> ECtor (name, mono (TCon ("QPat", [])), args)
+                        | many -> ECtor (name, mono (TCon ("QPat", [])), [ ETuple many ])
+                    match m.NodeKind with
+                    | WildcardPat -> pctor "QWild" []
+                    | ParenPat ->
+                        (match nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) with
+                         | inner :: _ -> quotePat inner
+                         | [] -> note (offsetOf m) "empty pattern")
+                    | LiteralPat ->
+                        (match tokensOf m |> List.tryHead with
+                         | Some t when t.Kind = IntLit -> pctor "QInt" [ ELit (LInt t.Text) ]
+                         | _ -> note (offsetOf m) "literal pattern not quotable")
+                    | IdentPat ->
+                        (match tokensOf m |> List.tryHead with
+                         // upper case names a case, lower case binds
+                         | Some t when t.Text.Length > 0 && System.Char.IsUpper t.Text.[0] ->
+                             pctor "QCase" [ str t.Text; EListLit [] ]
+                         | Some t -> pctor "QVar" [ str t.Text ]
+                         | None -> note (offsetOf m) "pattern not quotable")
+                    | AppPat ->
+                        (match nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) with
+                         | head :: args ->
+                             let name =
+                                 match tokensOf head |> List.tryHead with
+                                 | Some t -> t.Text
+                                 | None -> "?"
+                             pctor "QCase" [ str name; EListLit (List.map quotePat args) ]
+                         | [] -> note (offsetOf m) "empty constructor pattern")
+                    | k -> note (offsetOf m) ("pattern not quotable in <@ @>: " + string k)
+                // the quotation itself is the typed handle over that tree
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
-                 | body :: _ -> quote body
+                 | body :: _ -> ERecord ("Code", [ "Raw", quote body ])
                  | [] -> note (offsetOf n) "empty quotation")
             | ParenExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

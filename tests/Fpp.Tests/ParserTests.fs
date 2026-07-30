@@ -107,10 +107,21 @@ let quotationTests =
         }
 
         test "a quotation is an atom: it can be an argument" {
-            let src = "module M\nlet f (c : Code) = c\nlet q = f <@ 1 + 2 @>\n"
+            let src = "module M\nlet f (c : Code<int>) = c\nlet q = f <@ 1 + 2 @>\n"
             let ws = Workspace()
             ws.SetFileText "m.fpp" src
             Expect.isEmpty (ws.Diagnostics "m.fpp") "`f <@ ... @>` applies f to quoted code"
+        }
+
+        test "a splice must fit the hole it fills" {
+            // Code<'t> knows what its body produces, so a splice is checked
+            // against the position it lands in
+            let ok = Workspace()
+            ok.SetFileText "m.fpp" "module M\nlet n : Code<int> = <@ 41 @>\nlet q : Code<int> = <@ %n + 1 @>\n"
+            Expect.isEmpty (ok.Diagnostics "m.fpp") "an int splice fits an int hole"
+            let bad = Workspace()
+            bad.SetFileText "m.fpp" "module M\nlet s : Code<string> = <@ \"hi\" @>\nlet q : Code<int> = <@ %s + 1 @>\n"
+            Expect.isNonEmpty (bad.Diagnostics "m.fpp") "a string splice does not fit an int hole"
         }
 
         test "an unclosed quotation is an error, not silence" {
@@ -128,8 +139,8 @@ let quotationTests =
             Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "<@ n" + 3)) (Some "let `n` : int")
                 "a name inside a quotation hovers as itself"
             // and the quotation denotes code, not the value its body computes
-            Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "let q" + 4)) (Some "let `q` : Code")
-                "the quotation's own type is Code"
+            Expect.equal (ws.HoverAt "m.fpp" (src.IndexOf "let q" + 4)) (Some "let `q` : Code<int>")
+                "the quotation is Code<int>: it knows what its body produces"
         }
 
         test "an error INSIDE a quotation is reported like any other" {
