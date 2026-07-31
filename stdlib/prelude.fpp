@@ -853,6 +853,40 @@ let defaultArg (o : 'a option) (dflt : 'a) : 'a =
 let fst (t : 'a * 'b) : 'a = match t with (a, _) -> a
 let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b
 
+// ---- Memory: the raw linear memory a pinned POD array lives in ----
+// `Array.pin` hands out an address in here, and the image at that address is
+// the C layout of the element struct. That is what makes shipping a V2d[]
+// a `memory.copy` rather than a walk over its elements: the bytes are
+// already the wire format.
+module Memory =
+    extern let memAlloc : int -> int
+    extern let memSize : unit -> int
+    extern let memCopy : int -> int -> int -> unit
+    extern let memLoadByte : int -> int
+    extern let memStoreByte : int -> int -> unit
+    extern let memLoadInt : int -> int
+    extern let memStoreInt : int -> int -> unit
+    extern let memLoadInt64 : int -> int64
+    extern let memStoreInt64 : int -> int64 -> unit
+    extern let memLoadFloat : int -> float
+    extern let memStoreFloat : int -> float -> unit
+    /// Bump-allocate `n` bytes, 8-aligned. This heap is never freed: it holds
+    /// pinned arrays and message buffers, both of which outlive the call that
+    /// made them and are handed to foreign code by address.
+    let alloc (n : int) : int = memAlloc n
+    /// Total linear memory, in bytes.
+    let size () : int = memSize ()
+    /// `copy dst src n` — one wasm memory.copy instruction.
+    let copy (dst : int) (src : int) (n : int) : unit = memCopy dst src n
+    let loadByte (p : int) : int = memLoadByte p
+    let storeByte (p : int) (v : int) : unit = memStoreByte p v
+    let loadInt (p : int) : int = memLoadInt p
+    let storeInt (p : int) (v : int) : unit = memStoreInt p v
+    let loadInt64 (p : int) : int64 = memLoadInt64 p
+    let storeInt64 (p : int) (v : int64) : unit = memStoreInt64 p v
+    let loadFloat (p : int) : float = memLoadFloat p
+    let storeFloat (p : int) (v : float) : unit = memStoreFloat p v
+
 // ---- String: the F# String module ----
 module Array =
     extern let create : int -> 'a -> 'a[]
@@ -4149,3 +4183,251 @@ module Check =
         let outcome = run name g p
         print outcome
         if outcome <> name + ": ok (" + string count + " cases)" then failwith outcome
+
+// ---- Serialize: a wire format the compiler writes both ends of ----
+// Nothing on the wire describes the wire. No header, no field name, no type
+// tag: the writer and the reader are generated from the SAME declaration, so
+// the shape is agreed at compile time and only the values travel. A union is
+// the one exception — which case it is is genuinely dynamic, so it carries a
+// one-byte tag.
+//
+// What makes this fast for the payloads that matter is that the interesting
+// ones are already in wire form. An array of an all-scalar struct — V2d[],
+// V3f[], anything `Memory` describes — is a C-layout image in linear memory,
+// so shipping it is a `memory.copy` of that image rather than a walk over its
+// elements. `Serialize` exposes that as `writeArray`/`readArray`: a per-
+// element-type decision, so a V2d[] blits while a string[] walks, and the
+// caller writes the same thing either way.
+
+type Buffer(initial : int) =
+    let mutable cap = if initial < 16 then 16 else initial
+    let mutable ptr = Memory.alloc (if initial < 16 then 16 else initial)
+    let mutable pos = 0
+    /// where the bytes are — hand this to foreign code
+    member x.Pointer = ptr
+    /// how many bytes have been written
+    member x.Length = pos
+    member x.Reset () : unit = pos <- 0
+    /// room for `n` more bytes. Growth re-allocates and copies once; a caller
+    /// that knows the size up front (`Buffer size`) never pays it.
+    member x.Reserve (n : int) : unit =
+        if pos + n > cap then
+            let mutable nc = cap * 2
+            while nc < pos + n do
+                nc <- nc * 2
+            let np = Memory.alloc nc
+            Memory.copy np ptr pos
+            ptr <- np
+            cap <- nc
+    member x.WriteByte (v : int) : unit =
+        x.Reserve 1
+        Memory.storeByte (ptr + pos) v
+        pos <- pos + 1
+    member x.WriteInt (v : int) : unit =
+        x.Reserve 4
+        Memory.storeInt (ptr + pos) v
+        pos <- pos + 4
+    member x.WriteInt64 (v : int64) : unit =
+        x.Reserve 8
+        Memory.storeInt64 (ptr + pos) v
+        pos <- pos + 8
+    member x.WriteFloat (v : float) : unit =
+        x.Reserve 8
+        Memory.storeFloat (ptr + pos) v
+        pos <- pos + 8
+    /// THE BLIT: `n` bytes straight from `src`, one memory.copy instruction,
+    /// whatever they mean.
+    member x.WriteBlock (src : int) (n : int) : unit =
+        x.Reserve n
+        Memory.copy (ptr + pos) src n
+        pos <- pos + n
+
+type Reader(start : int) =
+    let mutable p = start
+    member x.Position = p
+    member x.Skip (n : int) : unit = p <- p + n
+    member x.ReadByte () : int =
+        let v = Memory.loadByte p
+        p <- p + 1
+        v
+    member x.ReadInt () : int =
+        let v = Memory.loadInt p
+        p <- p + 4
+        v
+    member x.ReadInt64 () : int64 =
+        let v = Memory.loadInt64 p
+        p <- p + 8
+        v
+    member x.ReadFloat () : float =
+        let v = Memory.loadFloat p
+        p <- p + 8
+        v
+    /// the address of the next `n` bytes, consumed WITHOUT copying them —
+    /// the read side of `WriteBlock`
+    member x.Block (n : int) : int =
+        let a = p
+        p <- p + n
+        a
+
+class Serialize<'a>
+    static write : Buffer -> 'a -> unit
+    static read : Reader -> 'a
+    /// A whole array, LENGTH AND ALL. Separate from `write` because this is
+    /// where the element type gets to say "my arrays are already an image" —
+    /// the blit. It owns the framing too, because a generic body cannot even
+    /// ask a POD array for its length: such an array is a handle over a flat
+    /// word image, not the uniform reference array a generic body compiles
+    /// against. Keeping both the length and the data on this side means the
+    /// one generic instance below never touches an array's representation.
+    static writeArray : Buffer -> 'a[] -> unit
+    static readArray : Reader -> 'a[]
+
+instance Serialize<int>
+    static write (b : Buffer) (v : int) = b.WriteInt v
+    static read (r : Reader) = r.ReadInt ()
+    static writeArray (b : Buffer) (xs : int[]) =
+        let n = xs.Length
+        b.WriteInt n
+        b.Reserve (n * 4)
+        let mutable i = 0
+        while i < n do
+            b.WriteInt xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- r.ReadInt ()
+            i <- i + 1
+        xs
+
+instance Serialize<int64>
+    static write (b : Buffer) (v : int64) = b.WriteInt64 v
+    static read (r : Reader) = r.ReadInt64 ()
+    static writeArray (b : Buffer) (xs : int64[]) =
+        let n = xs.Length
+        b.WriteInt n
+        b.Reserve (n * 8)
+        let mutable i = 0
+        while i < n do
+            b.WriteInt64 xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- r.ReadInt64 ()
+            i <- i + 1
+        xs
+
+instance Serialize<float>
+    static write (b : Buffer) (v : float) = b.WriteFloat v
+    static read (r : Reader) = r.ReadFloat ()
+    static writeArray (b : Buffer) (xs : float[]) =
+        let n = xs.Length
+        b.WriteInt n
+        b.Reserve (n * 8)
+        let mutable i = 0
+        while i < n do
+            b.WriteFloat xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- r.ReadFloat ()
+            i <- i + 1
+        xs
+
+instance Serialize<bool>
+    static write (b : Buffer) (v : bool) = b.WriteByte (if v then 1 else 0)
+    static read (r : Reader) = r.ReadByte () <> 0
+    static writeArray (b : Buffer) (xs : bool[]) =
+        let n = xs.Length
+        b.WriteInt n
+        b.Reserve n
+        let mutable i = 0
+        while i < n do
+            b.WriteByte (if xs.[i] then 1 else 0)
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- r.ReadByte () <> 0
+            i <- i + 1
+        xs
+
+// A string is an i8 array at run time, so its characters ARE its bytes: the
+// wire form is the runtime form, and it round-trips exactly what the runtime
+// can hold.
+instance Serialize<string>
+    static write (b : Buffer) (v : string) =
+        let n = v.Length
+        b.WriteInt n
+        b.Reserve n
+        let mutable i = 0
+        while i < n do
+            b.WriteByte (int v.[i])
+            i <- i + 1
+    static read (r : Reader) =
+        let n = r.ReadInt ()
+        let cs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            cs.[i] <- string (char (r.ReadByte ()))
+            i <- i + 1
+        String.concat "" (Array.toList cs)
+    static writeArray (b : Buffer) (xs : string[]) =
+        let n = xs.Length
+        b.WriteInt n
+        let mutable i = 0
+        while i < n do
+            write b xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- read r
+            i <- i + 1
+        xs
+
+/// One array instance, delegating the interesting decision to the element
+/// type. This is why a `V2d[][]` still works: the inner instance blits, the
+/// outer one walks.
+instance Serialize<'a[]> when Serialize<'a>
+    static write (b : Buffer) (xs : 'a[]) = writeArray b xs
+    static read (r : Reader) = readArray r
+    // An array OF arrays is always a plain reference array whatever the leaf
+    // element is, so this body may touch its length: the flat-image case is
+    // one level down, and that level is `Serialize<'a>.writeArray` above.
+    static writeArray (b : Buffer) (xs : 'a[][]) =
+        let n = xs.Length
+        b.WriteInt n
+        let mutable i = 0
+        while i < n do
+            write b xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- read r
+            i <- i + 1
+        xs
+
+module Serialize =
+    /// Serialize one value into a fresh buffer.
+    let toBuffer (v : 'a) : Buffer =
+        let b = Buffer 64
+        write b v
+        b
+    /// Read one value back from an address.
+    let ofPointer (p : int) : 'a = read (Reader p)

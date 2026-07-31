@@ -493,11 +493,18 @@ let mem (f : Fn) (name : string) : unit =
     emitByte f.B (memByte name)
     let al =
         match name with
-        | "i32.store8" -> 0
-        | "i32.load" | "i32.store" | "f32.store" -> 2
+        | "i32.store8" | "i32.load8_u" -> 0
+        | "i32.load" | "i32.store" | "f32.store" | "f32.load" -> 2
         | _ -> 3
     emitU32 f.B al
     emitU32 f.B 0
+
+/// memory.copy dst src len — one instruction, the blit the serializer rides on
+let memCopy (f : Fn) : unit =
+    emitByte f.B 0xFC
+    emitU32 f.B 0x0A
+    emitByte f.B 0
+    emitByte f.B 0
 
 // ---- globals / exports / data ----------------------------------------------
 

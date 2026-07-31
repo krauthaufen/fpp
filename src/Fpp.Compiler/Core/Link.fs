@@ -81,6 +81,32 @@ let private substName (subst : Dict<string, string>) (n : string) =
                 i <- i + 1
         String.concat "" (vecToList out)
 
+/// Split an instantiation name into its constructor and arguments:
+/// `list$<int>` is "list" with ["int"], and `Map$<int.list$<int>>` is "Map"
+/// with ["int"; "list$<int>"]. Nesting is bracketed, so the split counts
+/// depth rather than taking the first separator.
+let splitInstName (n : string) : string * string list =
+    let i = n.IndexOf "$<"
+    if i <= 0 || not (n.EndsWith ">") then n, []
+    else
+        let head = n.Substring (0, i)
+        let inner = n.Substring (i + 2, strLen n - i - 3)
+        let args = vecNew<string> ()
+        let piece = vecNew<string> ()
+        let mutable depth = 0
+        let mutable k = 0
+        while k < strLen inner do
+            let ch = substr inner k 1
+            if ch = "<" then depth <- depth + 1
+            elif ch = ">" then depth <- depth - 1
+            if ch = "." && depth = 0 then
+                vecAdd args (String.concat "" (vecToList piece))
+                vecClear piece
+            else vecAdd piece ch
+            k <- k + 1
+        if vecLen piece > 0 then vecAdd args (String.concat "" (vecToList piece))
+        head, vecToList args
+
 let private mangleInst (name : string) (inst : string list) =
     name + "$" + String.concat "$" inst
 
@@ -297,7 +323,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         match e with
         | EVarI (v, _, inst) ->
             (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
-            && inst |> List.exists (fun t -> t = "" || t.StartsWith "#")
+            && inst |> List.exists (fun t -> t = "" || t.Contains "#")
         | ELam (_, b) -> callsLayoutDep b
         | EApp (f, args) -> callsLayoutDep f || anyOf args
         | ELet (_, _, _, r, b) -> callsLayoutDep r || callsLayoutDep b
@@ -347,6 +373,22 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     // `isTemplate` marks the original body of a layout-dependent generic:
     // it is never emitted (every use is stamped, DCE drops it), so demands
     // that are still symbolic there are not errors — they resolve in clones.
+    /// Demand one stamped copy of `v` at `i` and return the reference to it.
+    /// The worklist is what actually clones the body, so a reference that is
+    /// PRODUCED during rewriting (rather than walked over) has to enqueue the
+    /// work itself — `mapExpr` never revisits what its callback returns.
+    let stampRef (v : VarId) (sch : Scheme) (i : string list) (fallback : Expr) : Expr =
+        let key = (v.Path, v.Offset)
+        match dictTryFind bodies key with
+        | Some _ ->
+            let mangled = mangleFor v i
+            if not (dictTryFind seen mangled).IsSome then
+                dictSet seen mangled true
+                vecAdd queue (key, i)
+            EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000)
+                    Name = mangled }, substScheme i sch)
+        | None -> fallback
+
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
@@ -354,8 +396,12 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                 // propagate the caller's instantiation into nested demands
                 let inst =
                     inst0 |> List.map (fun t ->
-                        if t.StartsWith "#" then
-                            match dictTryFind subst t with
+                        if t.Contains "#" then
+                            // substName, not a whole-name lookup: an
+                            // instantiation may MENTION a variable rather
+                            // than be one (`list$<#42>`)
+                            match (let r = substName subst t
+                                   if r.Contains "#" then None else Some r) with
                             | Some concrete -> concrete
                             | None ->
                                 // outside a template an unsubstituted var is
@@ -388,10 +434,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                             // and nothing observes its layout here. Uniform
                             // is the right answer, and it keeps the use from
                             // naming a template that specialization removes.
-                            Stamp (inst |> List.map (fun t -> if t = "" || t.StartsWith "#" then "$ref" else t))
+                            Stamp (inst |> List.map (fun t -> if t = "" || t.Contains "#" then "$ref" else t))
                         elif nameless then
                             Unclassifiable "the type argument has no name to specialize on"
-                        elif inst |> List.exists (fun t -> t.StartsWith "#") then
+                        elif inst |> List.exists (fun t -> t.Contains "#") then
                             Unclassifiable "element layout is not statically known here"
                         else Stamp inst
                     else classify isStructName inst
@@ -480,12 +526,40 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                      // two-parameter one on the pair
                      let byOne = dictTryFind instanceFns (instanceKey cls memberName [ tn ])
                      let byTwo = dictTryFind instanceFns (instanceKey cls memberName [ tn; tn ])
-                     (match (match byOne with Some _ -> byOne | None -> byTwo) with
+                     // An instantiation names its arguments (`list$<int>`),
+                     // but an instance registers under its CONSTRUCTOR. So a
+                     // miss falls back to the constructor — and then hands
+                     // the arguments on as the instance's own instantiation,
+                     // which is what lets a GENERIC instance's `when` context
+                     // resolve here: `Sized<list<'a>>` reached at list$<int>
+                     // stamps its body at 'a = int.
+                     let hd, hdArgs = splitInstName tn
+                     let byHead =
+                         if hd = tn then None
+                         else
+                             match dictTryFind instanceFns (instanceKey cls memberName [ hd ]) with
+                             | Some v -> Some v
+                             | None -> dictTryFind instanceFns (instanceKey cls memberName [ hd; hd ])
+                     let chosen =
+                         match byOne with
+                         | Some _ -> byOne
+                         | None -> (match byTwo with Some _ -> byTwo | None -> byHead)
+                     (match chosen with
                       | Some (fn, takesUnit) ->
+                          // Only a template needs the instantiation; an
+                          // ordinary instance member is one body and naming
+                          // it with arguments would stamp copies nobody asked
+                          // for.
+                          let needsInst =
+                              (dictTryFind layoutDependent (fn.Path, fn.Offset)) = Some true
+                              && not (List.isEmpty hdArgs)
+                          let plain = EVar (fn, mono (TCon ("?", [])))
+                          let r =
+                              if needsInst then stampRef fn (mono (TCon ("?", []))) hdArgs plain
+                              else plain
                           // a value-like member (`static mempty = ...`) lifts
                           // as a function of unit, so the NAME applies it
-                          if takesUnit then EApp (EVar (fn, mono (TCon ("?", []))), [ ELit LUnit ])
-                          else EVar (fn, mono (TCon ("?", [])))
+                          if takesUnit then EApp (r, [ ELit LUnit ]) else r
                       | None -> EUnknown ("$class:" + cls + ":" + memberName + ":" + tn))
                  | _ -> EUnknown n)
             | ERecord (n, fs) -> ERecord (substName subst n, fs)

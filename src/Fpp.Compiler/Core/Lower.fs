@@ -32,6 +32,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
+
+    /// A reference to the instance member a class use resolved to. A GENERIC
+    /// instance is a template, so the reference carries the instantiation and
+    /// monomorphization stamps one body per element type — which is what
+    /// makes the instance's own `when` context resolve per use rather than
+    /// once for the whole program.
+    let classRef (im : Fpp.Analysis.Classes.InstMember) : Expr =
+        let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
+        let sch = mono (TCon ("?", []))
+        if List.isEmpty im.MInst then EVar (v, sch) else EVarI (v, sch, im.MInst)
+
     let mutable pendingStruct = false
     // Set while lowering the loop of a list comprehension: the loop's BODY
     // is the yielded element, so it accumulates instead of being evaluated
@@ -408,9 +419,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // a class member (`Zero`) is a name for whatever the
                       // selected instance provides
                       | Some im ->
-                          let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
-                          let sch = mono (TCon ("?", []))
-                          if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
+                          let r = classRef im
+                          if im.MTakesUnit then EApp (r, [ ELit LUnit ]) else r
                       | None ->
                      match dictTryFind classPending t.Offset with
                       // not resolved yet: the operand type is a variable of
@@ -711,6 +721,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             && bv.Path = "(builtin)" ->
                           // the shadow stack: a global read, not an import
                           EApp (EUnknown bv.Name, [ sx ])
+                      // raw linear memory: single instructions, not imports.
+                      // Every one of these is `mem`-prefixed in the prelude
+                      // precisely so this rule can claim them as a family.
+                      | (EVar (bv, _) | EVarI (bv, _, _)), margs when
+                            bv.Path = "(builtin)" && bv.Name.StartsWith "mem"
+                            && (bv.Name = "memAlloc" || bv.Name = "memSize" || bv.Name = "memCopy"
+                                || bv.Name.StartsWith "memLoad" || bv.Name.StartsWith "memStore") ->
+                          EApp (EUnknown bv.Name, margs)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])
@@ -844,8 +862,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           match dictTryFind classUses op.Offset with
                           | Some im ->
                               let call =
-                                  EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
-                                        [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                                  EApp (classRef im, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
                               // ordering has ONE operation: the predicates are
                               // notation for a test on its result
                               if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
@@ -896,8 +913,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | _ -> ""
                      match dictTryFind classUses op.Offset with
                      | Some im ->
-                         EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
-                               [ lowerExpr (GNode a) ])
+                         EApp (classRef im, [ lowerExpr (GNode a) ])
                      | None -> EPrim ("u" + op.Text + suffix, [ lowerExpr (GNode a) ])
                  | Some op, [] when (litOf op).IsSome -> ELit (litOf op).Value
                  | _, [ a ] -> lowerExpr (GNode a)
@@ -1197,9 +1213,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let body =
                          match dictTryFind classUses op.Offset with
                          | Some im ->
-                             let call =
-                                 EApp (EVar ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, mono (TCon ("?", []))),
-                                       [ la; lb ])
+                             let call = EApp (classRef im, [ la; lb ])
                              if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
                              else call
                          | None -> EPrim (op.Text + suffix, [ la; lb ])
@@ -1653,9 +1667,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // `Num.Zero` — the class says which member, the
                       // instance says which body
                       | Some im ->
-                          let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
-                          let sch = mono (TCon ("?", []))
-                          if im.MTakesUnit then EApp (EVar (v, sch), [ ELit LUnit ]) else EVar (v, sch)
+                          let r = classRef im
+                          if im.MTakesUnit then EApp (r, [ ELit LUnit ]) else r
                       | None ->
                      match dictTryFind classPending name.Offset with
                       | Some payload -> EUnknown ("$class:" + payload)

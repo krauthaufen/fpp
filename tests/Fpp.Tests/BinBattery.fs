@@ -355,6 +355,130 @@ let binBattery =
               "    print (total [ 1; 2 ])" ]
             "1\n3\n2\n"
 
+        // The same instance head at SEVERAL element types. One shared body
+        // per generic instance is unsound: `size` at a float list must run
+        // the float instance, not whichever one resolved first. This is the
+        // shape that silently ran the `int` body for every element type.
+        expects "a generic instance dispatches per element type"
+            [
+              "class Sized<'a>"
+              "    static size : 'a -> int"
+              "instance Sized<int>"
+              "    static size (x : int) = 1"
+              "instance Sized<float>"
+              "    static size (x : float) = 2"
+              "instance Sized<string>"
+              "    static size (s : string) = 3"
+              "instance Sized<list<'a>>"
+              "    when Sized<'a>"
+              "    static size (xs : list<'a>) = List.fold (fun acc x -> acc + size x) 0 xs"
+              "let go ="
+              "    print (size [ 1; 2; 3 ])"
+              "    print (size [ 1.0; 2.0; 3.0 ])"
+              "    print (size [ \"a\"; \"b\" ])"
+              "    print (size [ [ 1.0 ]; [ 2.0; 3.0 ] ])" ]
+            "3\n6\n6\n6\n"
+
+        // ...and through an instance over ARRAYS, where the element type also
+        // decides the REPRESENTATION: a generic body cannot ask a POD struct
+        // array for its length, so the instance must be stamped per element.
+        expects "a generic array instance dispatches per element type"
+            [
+              "class Sized<'a>"
+              "    static size : 'a -> int"
+              "instance Sized<int>"
+              "    static size (x : int) = 1"
+              "instance Sized<float>"
+              "    static size (x : float) = 2"
+              "instance Sized<'a[]>"
+              "    when Sized<'a>"
+              "    static size (xs : 'a[]) = size xs.[0]"
+              "let go ="
+              "    print (size [| 1; 2 |])"
+              "    print (size [| 1.0; 2.0 |])"
+              "    print (size [| [| 1.0 |] |])" ]
+            "1\n2\n2\n"
+
+        // The wire format the compiler writes both ends of. A pinned array of
+        // an all-scalar struct is already a C-layout image, so `writeArray`
+        // ships it with one memory.copy — and the reader lays it back down
+        // the same way. 4 length bytes + 3 * 16 = 52.
+        expects "a POD struct array serializes as a blit"
+            [
+              "[<Struct>]"
+              "type V2d = { X : float; Y : float }"
+              "instance Serialize<V2d>"
+              "    static write (b : Buffer) (v : V2d) ="
+              "        b.WriteFloat v.X"
+              "        b.WriteFloat v.Y"
+              "    static read (r : Reader) ="
+              "        let x = r.ReadFloat ()"
+              "        let y = r.ReadFloat ()"
+              "        { X = x; Y = y }"
+              "    static writeArray (b : Buffer) (xs : V2d[]) ="
+              "        let n = xs.Length"
+              "        b.WriteInt n"
+              "        b.WriteBlock (Array.pin xs) (n * 16)"
+              "    static readArray (r : Reader) ="
+              "        let n = r.ReadInt ()"
+              "        let xs : V2d[] = Array.zeroCreate n"
+              "        let p = Array.pin xs"
+              "        Memory.copy p (r.Block (n * 16)) (n * 16)"
+              "        xs"
+              "let go ="
+              "    let pts = [| { X = 1.5; Y = 2.25 }; { X = 10.0; Y = 0.5 }; { X = -3.0; Y = 7.0 } |]"
+              "    let b = Buffer 128"
+              "    write b pts"
+              "    print b.Length"
+              "    let got : V2d[] = read (Reader b.Pointer)"
+              "    print got.Length"
+              "    print got.[0].X"
+              "    print got.[2].Y" ]
+            "52\n3\n1.5\n7\n"
+
+        // Scalars, strings and nested arrays through the one generic array
+        // instance, which never touches an array's representation itself.
+        expects "the wire format round-trips scalars, strings and arrays"
+            [
+              "let go ="
+              "    let b = Buffer 64"
+              "    write b 42"
+              "    write b 3.5"
+              "    write b \"hello\""
+              "    write b [| 10; 20; 30 |]"
+              "    let r = Reader b.Pointer"
+              "    print (read r : int)"
+              "    print (read r : float)"
+              "    print (read r : string)"
+              "    let xs : int[] = read r"
+              "    print xs.[2]"
+              "    print b.Length" ]
+            "42\n3.5\nhello\n30\n37\n"
+
+        // Raw linear memory: the store the wire format is written into, and
+        // the one a pinned array already lives in — so a blit between them is
+        // a single instruction.
+        expects "raw memory stores, loads and blits"
+            [
+              "[<Struct>]"
+              "type V2d = { X : float; Y : float }"
+              "let go ="
+              "    let p = Memory.alloc 64"
+              "    Memory.storeInt p 42"
+              "    Memory.storeFloat (p + 8) 3.5"
+              "    Memory.storeByte (p + 16) 200"
+              "    Memory.storeInt64 (p + 24) 1234567890123L"
+              "    print (Memory.loadInt p)"
+              "    print (Memory.loadFloat (p + 8))"
+              "    print (Memory.loadByte (p + 16))"
+              "    print (Memory.loadInt64 (p + 24))"
+              "    let pts = [| { X = 1.5; Y = 2.25 }; { X = 10.0; Y = 0.5 } |]"
+              "    let dst = Memory.alloc 32"
+              "    Memory.copy dst (Array.pin pts) 32"
+              "    print (Memory.loadFloat dst)"
+              "    print (Memory.loadFloat (dst + 24))" ]
+            "42\n3.5\n200\n1234567890123\n1.5\n0.5\n"
+
         // a lambda INSIDE a function's own parameter lambda is a real closure,
         // so a scalar parameter it reads cannot live on a raw rail — the env
         // slot is anyref. Getting this wrong did not even produce a module

@@ -861,14 +861,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// instruction.
     let instanceMember (byName : bool) (c : Constraint) (memberName : string) : Classes.InstMember option =
         match Classes.select classes c.Class c.Args c.Assoc with
-        | Classes.Solved (inst, _) ->
+        | Classes.Solved (inst, sub) ->
+            // What the instance's own variables were matched to HERE. A
+            // generic instance body is a template like any other generic
+            // binding, and this is the instantiation that stamps it.
+            let instArgs =
+                inst.Params |> List.map (fun v ->
+                    match (match dictTryFind sub v.Id with
+                           | Some t -> Some t
+                           | None -> dictTryFind sub (prunedId v)) with
+                    | Some t ->
+                        (match prune t with
+                         // named like any other instantiation, ARGUMENTS and
+                         // all — an instance over `'a[]` reached at float[][]
+                         // must stamp at float[], not at a bare "array"
+                         | TCon (_, targs) when not (List.isEmpty targs) -> typeConName t
+                         | TCon (n, _) -> n
+                         | TVar tv -> "#" + string tv.Id
+                         | TTuple _ | TFun _ -> "$ref"
+                         | _ -> "")
+                    | None -> "")
+            let attach (k : Classes.InstMember) = { k with Classes.MInst = instArgs }
             match inst.Members |> List.tryPick (fun (m, k) -> if m = memberName then Some k else None) with
-            | Some k -> Some k
+            | Some k -> Some (attach k)
             | None when byName ->
                 (match dictTryFind classes.Classes c.Class with
                  | Some cd ->
                      (match cd.Members |> List.tryFindIndex (fun (m, _) -> m = memberName) with
-                      | Some index -> Some (Classes.wrapperMember inst index memberName)
+                      | Some index -> Some (attach (Classes.wrapperMember inst index memberName))
                       | None -> None)
                  | None -> None)
             | None -> None
@@ -2769,9 +2789,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some t, Some tn -> Some (t.Text, typeFromNode vars tn)
                     | _ -> None)
             let bodied = members |> List.filter (fun m -> not (isAssocDecl m) && hasBody m)
+            // The instance's OWN `when` context is a given while its bodies
+            // are checked, exactly as a function's declared context is inside
+            // that function. Without it the body's demand on the context
+            // class is an ordinary wanted: solving grounds it — or defaulting
+            // does — and every instantiation of a generic instance collapses
+            // onto whichever instance that picked. `size [1.0]` ran the `int`
+            // body for precisely this reason.
+            let context =
+                nodesOf n |> List.filter (fun m -> m.NodeKind = WhenDecl)
+                |> List.choose (constraintOf vars)
             match dictTryFind classes.Classes name with
             | None -> ()
             | Some cd ->
+                let savedGivens = givens
+                givens <- givens @ context
                 for m in bodied do
                     match memberNameOf m with
                     | None -> ()
@@ -2795,6 +2827,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 vecAdd diags (t.Offset, "class " + name + " has no member " + t.Text)
                                 None
                         inferInstanceMember expected t m
+                // Solve WHILE the context is still given. A member body's
+                // wanteds are otherwise pooled and solved at file level,
+                // where the context is long out of scope — and a wanted the
+                // context entails would there be ground out by defaulting.
+                solveWanted ()
+                givens <- savedGivens
 
     /// Pre-register the primary-constructor scheme of an `and`-chained type,
     /// so an EARLIER sibling's body can construct it. The real pass
@@ -2932,7 +2970,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         |> Option.map (fun t ->
                             t.Text,
                             { Classes.MPath = path; MOffset = t.Offset
-                              MName = t.Text; MTakesUnit = takesUnit }))
+                              MName = t.Text; MTakesUnit = takesUnit; MInst = [] }))
                   Builtin = builtin; Path = path; Offset = offset }
             Classes.addInstance classes inst
             match dictTryFind classes.Classes name with
@@ -3107,6 +3145,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             off,
             fresh |> List.map (fun f ->
                 match prune f with
+                // The name carries the ARGUMENTS. Dropping them is what left
+                // a constraint inside a generic function with nothing to
+                // dispatch on: `total` at list<int> and at list<float> were
+                // both just "list", so the `when Sized<'a>` of a generic
+                // `instance Sized<list<'a>>` had no element type to resolve.
+                // (This is only the INSTANTIATION name; a field owner is
+                // still named by its constructor alone — see `instName`.)
+                | TCon (_, args) when not (List.isEmpty args) -> typeConName f
                 | TCon (n, _) -> n
                 // still a variable: this use sits inside a generic body and
                 // instantiates at the ENCLOSING binding's type variable —

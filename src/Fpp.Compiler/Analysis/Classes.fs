@@ -39,7 +39,19 @@ type InstMember =
     { MPath : string
       MOffset : int
       MName : string
-      MTakesUnit : bool }
+      MTakesUnit : bool
+      /// The selected instance's OWN type arguments at this use site, named
+      /// the way an instantiation is named everywhere else. Empty when the
+      /// instance is not generic.
+      ///
+      /// Without this a use of `instance Sized<list<'a>> when Sized<'a>`
+      /// resolved to one shared body for every element type, and the
+      /// `Sized<'a>` its body depends on was whichever instance happened to
+      /// resolve first — so `size [1.0]` ran the `int` body. Carrying the
+      /// arguments here is what lets monomorphization stamp one copy per
+      /// element type, which is the only place the inner constraint can
+      /// become concrete.
+      MInst : string list }
 
 /// One instance. `Head` may mention variables listed in `Params` — those are
 /// the instance's own, freshened per match.
@@ -136,7 +148,8 @@ let wrapperMember (i : InstanceDef) (index : int) (memberName : string) : InstMe
     { MPath = i.Path
       MOffset = 2000000 + i.Offset * 8 + index
       MName = memberName
-      MTakesUnit = false }
+      MTakesUnit = false
+      MInst = [] }
 
 // ---- matching -------------------------------------------------------------
 

@@ -1479,6 +1479,83 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             gcT f "array.get" "$parr_i"
         else ic f 0
         callf f "$ofi"
+    // ---- raw linear memory ------------------------------------------------
+    // The pin heap is where a pinned POD array already lives, so a serializer
+    // that writes here can BLIT such an array instead of walking it: one
+    // memory.copy, whatever the element type.
+    | EApp (EUnknown "memAlloc", [ n ]) ->
+        emitNode st f lv n
+        callf f "$toi"
+        callf f "$balloc"
+        callf f "$ofi"
+    | EApp (EUnknown "memSize", [ _ ]) ->
+        emitByte f.B 0x3F
+        emitByte f.B 0
+        ic f 16
+        ins f "i32.shl"
+        callf f "$ofi"
+    | EApp (EUnknown "memCopy", [ dst; src; n ]) ->
+        emitNode st f lv dst
+        callf f "$toi"
+        emitNode st f lv src
+        callf f "$toi"
+        emitNode st f lv n
+        callf f "$toi"
+        memCopy f
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "memLoadByte", [ p ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        mem f "i32.load8_u"
+        callf f "$ofi"
+    | EApp (EUnknown "memStoreByte", [ p; v ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        emitNode st f lv v
+        callf f "$toi"
+        mem f "i32.store8"
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "memLoadInt", [ p ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        mem f "i32.load"
+        callf f "$ofi"
+    | EApp (EUnknown "memStoreInt", [ p; v ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        emitNode st f lv v
+        callf f "$toi"
+        mem f "i32.store"
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "memLoadInt64", [ p ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        mem f "i64.load"
+        callf f "$ofl"
+    | EApp (EUnknown "memStoreInt64", [ p; v ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        emitNode st f lv v
+        callf f "$tol"
+        mem f "i64.store"
+        ic f 0
+        refI31 f
+    | EApp (EUnknown "memLoadFloat", [ p ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        mem f "f64.load"
+        callf f "$off"
+    | EApp (EUnknown "memStoreFloat", [ p; v ]) ->
+        emitNode st f lv p
+        callf f "$toi"
+        emitNode st f lv v
+        callf f "$tof"
+        mem f "f64.store"
+        ic f 0
+        refI31 f
     | EUnknown "hash" ->
         requestWrapper st f "$hashvBoxed" 1
         ic f (tblIdx f.M "$hashvBoxed.w0")
