@@ -223,3 +223,37 @@ Two consequences worth knowing:
 * The listener arrives typed as `Event`. Which concrete type it really is comes
   from the event NAME, so a generated binding should type `addEventListener` by
   name (`"mousemove" -> MouseEvent`) rather than making callers downcast.
+
+## threads — what exists today (Chrome 150, measured)
+
+    python3 tests/tooling/coop-server.py     # COOP/COEP, or SharedArrayBuffer stays off
+    node tests/tooling/threads.js
+
+    crossOriginIsolated : true
+    sharedArrayBuffer   : true
+    memoryIsShared      : true
+    atomic     : 4 workers x 200000 atomic increments -> 800000 (expected 800000) in 76 ms
+    nonAtomic  : same without atomics -> 676438 (races lost 123,562 increments)
+
+Real parallelism, real shared state: four Workers instantiate the SAME module
+over ONE `WebAssembly.Memory({shared:true})` and hammer one address. With
+`i32.atomic.rmw.add` every increment lands; without atomics 123 562 of them are
+lost to races — which is the proof that the workers genuinely run at the same
+time on the same memory.
+
+What that does NOT cover, and it is the part that matters for this language:
+
+* Threads live in LINEAR MEMORY. Every F++ value is a wasm-GC object, and GC
+  objects CANNOT be shared between threads — shared structs are
+  `--experimental-wasm-shared` only (measured in wasm-features above). So a
+  record, a list, a HashMap cannot be handed to a worker today.
+* There is no thread SPAWN in wasm on the web: you create Workers in JS and each
+  instantiates the module. `wasi-threads` and shared-everything-threads are the
+  proposals that change this.
+* What IS shareable today is exactly what F++ already puts in linear memory:
+  PINNED POD arrays (`Array.pin`). That is the seam a parallel numeric kernel
+  would use — pin, hand the address to workers, unpin — while everything
+  GC-allocated stays on its own thread.
+* COOP/COEP headers are mandatory. Without cross-origin isolation
+  `SharedArrayBuffer` is simply absent, which is why the earlier probe reported
+  it as false.

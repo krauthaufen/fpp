@@ -1,0 +1,25 @@
+<!doctype html><meta charset="utf-8"><title>wasm threads</title>
+<script type="module">
+const r = { crossOriginIsolated: self.crossOriginIsolated, sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined' };
+if (self.crossOriginIsolated) {
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+  r.memoryIsShared = memory.buffer instanceof SharedArrayBuffer;
+  const view = new Int32Array(memory.buffer);
+  const N = 200000, WORKERS = 4;
+  const run = racy => new Promise(async resolve => {
+    Atomics.store(view, 0, 0);
+    let done = 0, total = 0;
+    const t = performance.now();
+    for (let i = 0; i < WORKERS; i++) {
+      const w = new Worker('threadworker.js', { type: 'module' });
+      w.onmessage = e => { total += e.data.ms; if (++done === WORKERS) resolve({ counter: Atomics.load(view, 0), wall: performance.now() - t }); };
+      w.postMessage({ memory, addr: 0, n: N, racy });
+    }
+  });
+  const atomic = await run(false);
+  r.atomic = `${WORKERS} workers x ${N} atomic increments -> ${atomic.counter} (expected ${WORKERS * N}) in ${atomic.wall.toFixed(0)} ms`;
+  const racy = await run(true);
+  r.nonAtomic = `same without atomics -> ${racy.counter} (races lost ${(WORKERS * N - racy.counter).toLocaleString()} increments)`;
+}
+window.results = r; window.ready = true;
+</script>
