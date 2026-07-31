@@ -14,6 +14,6 @@ node "$out/layout.js" | sed 's/^/  /'
 
 dotnet run --no-build -c Release --project "$root/src/Fpp.Cli" -- \
     build -o "$out/layout.wasm" layout.fpp >/dev/null
-echo "F++ (V3f V2d V2f V3i V3d strides):"
+echo "F++ (V3f V2d V2f V3i V3d C3b C4b Mixed strides):"
 "$HOME/.wasmtime/bin/wasmtime" run -W gc=y,exceptions=y "$out/layout.wasm" | sed 's/^/  /'
 rm -rf "$out"

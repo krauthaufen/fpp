@@ -56,6 +56,8 @@ type St =
       /// offset), sizeof, stride in i64 words) — the C image a pinned
       /// array exposes
       Pod : Dict<string, (string * string * int) list * int * int>
+      /// POD struct -> its alignment, which is also its backing word width
+      PodAlign : Dict<string, int>
       /// locals on a RAW scalar rail: binder key -> kind (i/f/s/l). Reads
       /// box, writes unbox — and the peephole cancels both against their
       /// producers/consumers, which is what makes a hot loop alloc-free
@@ -606,6 +608,12 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
 /// unbox instruction name for a POD leaf kind
 let private podUnbox (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
 
+/// the width of one backing word for this struct, and the suffix naming the
+/// accessors that speak it
+let private podW (st : St) (rn : string) : int =
+    match dictTryFind st.PodAlign rn with Some a -> a | None -> 4
+let private podTy (w : int) = match w with 1 -> "$pb" | 2 -> "$ph" | 4 -> "$pk" | _ -> "$pl"
+
 /// read one leaf (dotted path) out of a UNIFORM struct value held in local
 /// `vl`, leaving the UNBOXED scalar on the stack
 let rec private emitPodLeaf (st : St) (f : Fn) (rn : string) (vl : string) (path : string) (k : string) : unit =
@@ -627,56 +635,96 @@ let rec private emitPodLeaf (st : St) (f : Fn) (rn : string) (vl : string) (path
             rest <- rest.Substring (i + 1)
     callf f (podUnbox k)
 
-/// push 32-bit word `w` of the POD value in local `vl`. Alignment means each
-/// word belongs to exactly ONE leaf — a four-byte scalar fills it, an
-/// eight-byte one contributes its low or its high half — so there is nothing
-/// to combine here, only to select.
+/// push backing word `w` of the POD value in local `vl`. A leaf never
+/// straddles a word (see the layout), so each leaf that lands in this word
+/// contributes its bits shifted into place and the word is their union.
 and private emitPodWord (st : St) (f : Fn) (rn : string) (vl : string) (w : int) : unit =
     let placed, _, _ = (dictTryFind st.Pod rn).Value
-    let wide (k : string) = k = "f" || k = "l"
-    let covers (_, k, off) = if wide k then off / 4 = w || off / 4 + 1 = w else off / 4 = w
-    match placed |> List.tryFind covers with
-    | None -> ic f 0
-    | Some (fn, k, off) ->
+    let width = podW st rn
+    let wide = width = 8
+    let sizeOfK (k : string) = match k with "b" | "n" -> 1 | "h" -> 2 | "i" | "s" -> 4 | _ -> 8
+    let parts = placed |> List.filter (fun (_, _, off) -> off / width = w)
+    /// the leaf's bits, in the WORD's type, shifted to its place in the word
+    let one (fn : string, k : string, off : int) =
         emitPodLeaf st f rn vl fn k
-        if wide k then
-            (if k = "f" then ins f "i64.reinterpret_f64")
-            (if off / 4 + 1 = w then
-                lc f 32L
-                ins f "i64.shr_u")
-            ins f "i32.wrap_i64"
-        elif k = "s" then ins f "i32.reinterpret_f32"
+        // to raw bits, in the leaf's own width
+        (match k with
+         | "f" -> ins f "i64.reinterpret_f64"
+         | "s" -> ins f "i32.reinterpret_f32"
+         | "l" -> ()
+         | "b" | "n" ->
+             ic f 0xFF
+             ins f "i32.and"
+         | "h" ->
+             ic f 0xFFFF
+             ins f "i32.and"
+         | _ -> ())
+        // widen to the word, then shift into position
+        let narrow = sizeOfK k <= 4
+        if wide && narrow then ins f "i64.extend_i32_u"
+        let sh = (off % width) * 8
+        if sh <> 0 then
+            if wide then
+                lc f (int64 sh)
+                ins f "i64.shl"
+            else
+                ic f sh
+                ins f "i32.shl"
+    match parts with
+    | [] -> if wide then lc f 0L else ic f 0
+    | first :: restP ->
+        one first
+        for p in restP do
+            one p
+            ins f (if wide then "i64.or" else "i32.or")
 
 /// read the leaf of kind `k` at byte offset `off` out of the image: handle in
-/// `hl`, the element's word base in `bl`. A wide leaf spans two words and is
-/// reassembled from them; a narrow one is the word.
-and private emitPodLeafRead (st : St) (f : Fn) (hl : string) (bl : string) (k : string) (off : int) : unit =
-    let word (i : int) =
-        lg f hl
-        lg f bl
-        ic f i
-        ins f "i32.add"
-        callf f "$hwget"
+/// `hl`, the element's word base in `bl`.
+and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl : string) (k : string) (off : int) : unit =
+    let width = podW st rn
+    let wide = width = 8
+    let sfx = string width
+    lg f hl
+    lg f bl
+    ic f (off / width)
+    ins f "i32.add"
+    callf f ("$hwget" + sfx)
+    let sh = (off % width) * 8
+    if sh <> 0 then
+        if wide then
+            lc f (int64 sh)
+            ins f "i64.shr_u"
+        else
+            ic f sh
+            ins f "i32.shr_u"
+    // the word is i64 only when the struct is 8-aligned; a narrower leaf out
+    // of one has to come down to i32 first
+    let narrow = (match k with "b" | "n" | "h" | "i" | "s" -> true | _ -> false)
+    if wide && narrow then ins f "i32.wrap_i64"
     match k with
-    | "f" | "l" ->
-        word (off / 4)
-        ins f "i64.extend_i32_u"
-        word (off / 4 + 1)
-        ins f "i64.extend_i32_u"
-        lc f 32L
-        ins f "i64.shl"
-        ins f "i64.or"
-        if k = "f" then
-            ins f "f64.reinterpret_i64"
-            callf f "$off"
-        else callf f "$ofl"
+    | "f" ->
+        ins f "f64.reinterpret_i64"
+        callf f "$off"
+    | "l" -> callf f "$ofl"
     | "s" ->
-        word (off / 4)
         ins f "f32.reinterpret_i32"
         callf f "$oss"
-    | _ ->
-        word (off / 4)
+    | "h" ->
+        ic f 0xFFFF
+        ins f "i32.and"
         callf f "$ofi"
+    | "b" ->
+        ic f 0xFF
+        ins f "i32.and"
+        callf f "$ofi"
+    | "n" ->
+        // sbyte: the stored byte, sign-extended
+        ic f 24
+        ins f "i32.shl"
+        ic f 24
+        ins f "i32.shr_s"
+        callf f "$ofi"
+    | _ -> callf f "$ofi"
 
 /// materialize a UNIFORM $r_ struct of (possibly nested) `rn` from the POD
 /// words: handle in `hl`, word base in `bl`; `top`/`prefix` index the
@@ -689,7 +737,7 @@ and private emitPodBuild (st : St) (f : Fn) (top : string) (hl : string) (bl : s
             emitPodBuild st f top hl bl ty full
         else
             let _, k, off = placed |> List.find (fun (p, _, _) -> p = full)
-            emitPodLeafRead st f hl bl k off
+            emitPodLeafRead st f top hl bl k off
     gcT f "struct.new" ("$r_" + rn)
 
 and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
@@ -2123,7 +2171,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f wd
         ins f "i32.mul"
         ls f bl
-        emitPodLeafRead st f hl bl k off
+        emitPodLeafRead st f nm hl bl k off
     | EField (r, "Length", _) when not (dictTryFind st.FieldOwner "Length").IsSome ->
         // no record claims a Length field: this is the built-in one, across
         // strings and every array representation
@@ -2307,7 +2355,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             emitNode st f lv x
             ls f el
             for w in 0 .. wd - 1 do emitPodWord st f nm el w
-        arrNewFixed f "$pk" (List.length xs * wd)
+        arrNewFixed f (podTy (podW st nm)) (List.length xs * wd)
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2343,7 +2391,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             ic f w
             ins f "i32.add"
             emitPodWord st f nm vl w
-            callf f "$hwset"
+            callf f ("$hwset" + string (podW st nm))
         ic f 0
         refI31 f
     | EArrayCreate (nm, n, EUnknown "$zero") when (dictTryFind st.Pod nm).IsSome ->
@@ -2352,7 +2400,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$toi"
         ic f wd
         ins f "i32.mul"
-        gcT f "array.new_default" "$pk"
+        gcT f "array.new_default" (podTy (podW st nm))
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2370,7 +2418,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         lg f nl
         ic f wd
         ins f "i32.mul"
-        gcT f "array.new_default" "$pk"
+        gcT f "array.new_default" (podTy (podW st nm))
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2391,7 +2439,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             ic f w
             ins f "i32.add"
             emitPodWord st f nm vl w
-            callf f "$hwset"
+            callf f ("$hwset" + string (podW st nm))
         lg f jl
         ic f 1
         ins f "i32.add"
@@ -2403,14 +2451,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EArrayLen (nm, a) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
         emitNode st f lv a
-        callf f "$hlen"
+        callf f ("$hlen" + string (podW st nm))
         ic f wd
         ins f "i32.div_u"
         callf f "$ofi"
     | EArrayPin (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f "$pinh"
+            callf f ("$pinh" + string (podW st nm))
             callf f "$ofi"
          else
             err st "binary: Array.pin requires a POD struct array"
@@ -2418,18 +2466,18 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EArrayUnpin (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f "$unpinh"
+            callf f ("$unpinh" + string (podW st nm))
             callf f "$ofi"
          else
             err st "binary: Array.unpin requires a POD struct array"
             refNull f "any")
-    // the WORD count times 8 — the image's real size, padding and all, which
-    // is what a blit has to move and what no caller can work out for itself
+    // the word count times the word width — the image's real size, which is
+    // what a blit has to move and what no caller can work out for itself
     | EArrayBytes (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f "$hlen"
-            ic f 4
+            callf f ("$hlen" + string (podW st nm))
+            ic f (podW st nm)
             ins f "i32.mul"
             callf f "$ofi"
          else
@@ -2906,7 +2954,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
-          Pod = dictNew (); StructFields = dictNew ()
+          Pod = dictNew (); PodAlign = dictNew (); StructFields = dictNew ()
           DbgFrame = -1
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
           SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u"
@@ -2975,15 +3023,26 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     let isObjRecord (n : string) = rawRecords |> List.exists (fun (rn, _, stf) -> rn = n && not stf)
     // ---- POD layout (clang natural alignment), like the text backend ------
     let structNames = rawRecords |> List.filter (fun (_, _, stf) -> stf) |> List.map (fun (n, _, _) -> n)
+    // C's widths, so that every numeric type is blittable: one byte for a
+    // byte and for a bool (C's _Bool is one), two for a char (UTF-16) and a
+    // half, four and eight for the rest.
     let fieldKind (ty : string) : string =
         match ty with
         | "float" -> "f"
         | "float32" -> "s"
         | "int64" -> "l"
-        | "int" | "bool" | "char" | "float16" -> "i"
+        | "int" | "uint32" -> "i"
+        | "char" | "float16" -> "h"
+        | "byte" | "bool" -> "b"
+        | "sbyte" -> "n"
         | t when List.contains t structNames -> "S:" + t
         | _ -> "r"
-    let scalarSize (k : string) = if k = "i" || k = "s" then 4 else 8
+    let scalarSize (k : string) =
+        match k with
+        | "b" | "n" -> 1
+        | "h" -> 2
+        | "i" | "s" -> 4
+        | _ -> 8
     for rn, fs, stf in rawRecords do
         if stf then dictSet st.StructFields rn fs
     let rec computeLayout (rn : string) : bool =
@@ -2995,7 +3054,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 let ok =
                     fs |> List.forall (fun (_, ty) ->
                         let k = fieldKind ty
-                        if k = "i" || k = "f" || k = "s" || k = "l" then true
+                        if k <> "r" && not (k.StartsWith "S:") then true
                         elif k.StartsWith "S:" then
                             let sn = k.Substring 2
                             sn <> rn && computeLayout sn
@@ -3007,7 +3066,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                     let leaves = vecNew<string * string * int> ()
                     for fn, ty in fs do
                         let k = fieldKind ty
-                        if k = "i" || k = "f" || k = "s" || k = "l" then
+                        if k <> "r" && not (k.StartsWith "S:") then
                             let sz = scalarSize k
                             off <- ((off + sz - 1) / sz) * sz
                             vecAdd leaves (fn, k, off)
@@ -3023,12 +3082,15 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                             off <- off + nsz
                             if na > maxA then maxA <- na
                     let sizeof_ = ((off + maxA - 1) / maxA) * maxA
-                    // 32-BIT words: sizeof_ is always a multiple of four (the
-                    // widest alignment is four or eight), so an element is a
-                    // WHOLE number of words and the stride here is the stride
-                    // a C compiler would use. With 64-bit words a three-float
-                    // vector rounded from twelve bytes to sixteen.
-                    dictSet st.Pod rn (vecToList leaves, sizeof_, sizeof_ / 4)
+                    // The backing word is the struct's ALIGNMENT. A size is
+                    // always a multiple of its alignment, so an element is a
+                    // whole number of words and the stride is exactly C's —
+                    // for a three-byte colour as much as for a pair of
+                    // doubles. It also means a field never straddles a word:
+                    // its offset is a multiple of its own size, and the word
+                    // is a multiple of that too.
+                    dictSet st.PodAlign rn maxA
+                    dictSet st.Pod rn (vecToList leaves, sizeof_, sizeof_ / maxA)
                     true
     for rn in structNames do computeLayout rn |> ignore
     let objRecordNames = rawRecords |> List.filter (fun (_, _, stf) -> not stf) |> List.map (fun (n, _, _) -> n)

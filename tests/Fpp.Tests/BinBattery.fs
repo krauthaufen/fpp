@@ -448,6 +448,37 @@ let binBattery =
               "    print got.[2].Y" ]
             "52\n3\n1.5\n7\n"
 
+        // Every numeric type is blittable, and the backing store is chosen per
+        // struct from its ALIGNMENT — so a three-byte colour has a stride of
+        // three, not of four or eight. Byte-sized fields were not POD at all
+        // before: Array.pin rejected them outright.
+        expects "byte-sized structs get C's stride and read back"
+            [
+              "[<Struct>]"
+              "type C3b = { R : byte; G : byte; B : byte }"
+              "[<Struct>]"
+              "type C4b = { CR : byte; CG : byte; CB : byte; CA : byte }"
+              "[<Struct>]"
+              "type Mixed = { M : float; T : byte }"
+              "let go ="
+              "    let c3 = [| { R = 1uy; G = 2uy; B = 3uy }; { R = 250uy; G = 251uy; B = 252uy } |]"
+              "    let c4 = [| { CR = 10uy; CG = 20uy; CB = 30uy; CA = 40uy } |]"
+              "    let mx = [| { M = 1.5; T = 7uy }; { M = 2.5; T = 9uy } |]"
+              "    print (Array.byteSize c3)"
+              "    print (Array.byteSize c4)"
+              "    print (Array.byteSize mx)"
+              "    print (int c3.[1].R)"
+              "    print (int c3.[1].B)"
+              "    print mx.[1].M"
+              "    print (int mx.[1].T)"
+              // pinned, the bytes sit at stride 3 with nothing between them
+              "    let p = Array.pin c3"
+              "    print (Memory.loadByte p)"
+              "    print (Memory.loadByte (p + 3))"
+              "    print (Memory.loadByte (p + 5))"
+              "    print (int c3.[0].G)" ]
+            "6\n4\n32\n250\n252\n2.5\n9\n1\n250\n252\n2\n"
+
         // Scalars, strings and nested arrays through the one generic array
         // instance, which never touches an array's representation itself.
         expects "the wire format round-trips scalars, strings and arrays"

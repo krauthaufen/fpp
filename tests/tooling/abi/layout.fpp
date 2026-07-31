@@ -14,9 +14,21 @@ let a2 = [| { D1 = 1.0; D2 = 2.0 }; { D1 = 3.0; D2 = 4.0 } |]
 let f2 = [| { G1 = 1.0f; G2 = 2.0f }; { G1 = 3.0f; G2 = 4.0f } |]
 let i3 = [| { I1 = 1; I2 = 2; I3 = 3 }; { I1 = 4; I2 = 5; I3 = 6 } |]
 let d3 = [| { E1 = 1.0; E2 = 2.0; E3 = 3.0 }; { E1 = 4.0; E2 = 5.0; E3 = 6.0 } |]
+[<Struct>]
+type C3b = { R : byte; G : byte; B : byte }
+[<Struct>]
+type C4b = { CR : byte; CG : byte; CB : byte; CA : byte }
+[<Struct>]
+type Mixed = { M : float; T : byte }
+let c3 : C3b[] = Array.zeroCreate 2
+let c4 : C4b[] = Array.zeroCreate 2
+let mx : Mixed[] = Array.zeroCreate 2
 let go =
     print (Array.byteSize a3 / 2)
     print (Array.byteSize a2 / 2)
     print (Array.byteSize f2 / 2)
     print (Array.byteSize i3 / 2)
     print (Array.byteSize d3 / 2)
+    print (Array.byteSize c3 / 2)
+    print (Array.byteSize c4 / 2)
+    print (Array.byteSize mx / 2)

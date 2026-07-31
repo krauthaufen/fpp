@@ -281,7 +281,7 @@ let memByte (name : string) : int =
     | "i32.load" -> 0x28 | "i64.load" -> 0x29 | "f32.load" -> 0x2A | "f64.load" -> 0x2B
     | "i32.store" -> 0x36 | "i64.store" -> 0x37 | "f32.store" -> 0x38 | "f64.store" -> 0x39
     | "i32.store8" -> 0x3A
-    | "i32.load8_u" -> 0x2D
+    | "i32.load8_u" -> 0x2D | "i32.load16_u" -> 0x2F | "i32.store16" -> 0x3B
     | _ -> -1
 
 // ---- types ----------------------------------------------------------------

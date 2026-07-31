@@ -330,13 +330,22 @@ only the pointer travels.
       V3d sizeof=24 stride=24     24
 
 A pinned POD array is meant to be the array a C function would walk, so the
-stride has to be C's. It is because the backing store is 32-BIT words: every
-struct's size is a multiple of four, so an element occupies a whole number of
-words and the GC stride IS the C stride, with no rounding anywhere.
+stride has to be C's. It is, because the backing store is chosen PER STRUCT
+from its alignment — one, two, four or eight bytes. A size is always a
+multiple of its alignment, so an element is always a whole number of words and
+nothing is ever rounded up.
 
-Sixty-four-bit words made this wrong for any struct whose size is not a
-multiple of eight. `V3f` occupied 16 bytes instead of 12, so a foreign reader
-walking by 12 drifted by one float per element — invisible from inside F++,
-where both ends agreed, and wrong the moment anything else read the buffer.
+One fixed width cannot do that. Sixty-four-bit words gave `V3f` 16 bytes where
+C gives it 12, so a foreign reader walking by 12 drifted by one float per
+element — invisible from inside F++, where both ends agreed, and wrong the
+moment anything else read the buffer. Thirty-two-bit words fixed that but left
+`C3b` at 4 bytes instead of 3, and byte-sized fields were not blittable at all:
+`Array.pin` rejected them.
+
+Choosing per struct also made the wide types FASTER, because the word is now as
+wide as the field: reading an `f64` out of a `V2d[]` is one array read where
+32-bit words needed two and a shift. 32M field reads went from 999 ms to
+599 ms — the same cost as reading a float.
+
 The battery pins these strides as constants; this script is what checks them
 against a compiler rather than against a reading of the ABI.

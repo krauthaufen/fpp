@@ -140,7 +140,10 @@ let noBoxGate =
                     "    print floats.Length"
                     "" ]
             let text = disassemble src
-            Expect.stringContains text "array.new_fixed $pk" "V2d arrays are C-image packed"
+            // the backing store is chosen by the struct's ALIGNMENT, so a
+            // pair of doubles is backed by 64-bit words: one load per field,
+            // and a stride of 16 — exactly what C gives it
+            Expect.stringContains text "array.new_fixed $pl" "V2d arrays are C-image packed, 8-aligned"
             Expect.stringContains text "array.new_fixed $parr_i" "int arrays are flat i32"
             Expect.stringContains text "array.new_fixed $parr_f" "float arrays are flat f64"
             Expect.isFalse (text.Contains "$sarr_") "no SoA wrapper for POD structs"
