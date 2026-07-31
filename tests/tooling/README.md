@@ -115,3 +115,43 @@ A typed `Element`/`Node`/`Document` hierarchy generates DOWN to these. The
 compiler needs `externref` plumbing once (an opaque handle type, and `externref`
 rather than `anyref` in import signatures); everything above that is generated
 F++ code, which is what the source-level plugins already do.
+
+## jsabi-bench — what the boundary actually costs (Chrome 150, measured)
+
+    wasm-tools parse bench.wat -o bench.wasm
+    python3 -m http.server 8731 && node tests/tooling/jsabi-bench.js
+
+Building 20 000 elements (median of 7 runs):
+
+| | time | vs plain JS |
+|---|---|---|
+| plain JS | 28.8 ms | 1.00x |
+| wasm, generic get/set/invoke | 33.1 ms | **1.15x** |
+| wasm, one import per operation | 21.8 ms | **0.76x** |
+
+2 000 000 property get+set on a plain object:
+
+| | time | vs plain JS |
+|---|---|---|
+| plain JS | 3.3 ms | 1.00x |
+| wasm, generic ABI | 115.7 ms | **35x** |
+| pure wasm loop (the floor) | 4.0 ms | |
+
+Read it as ONE number: a boundary crossing costs roughly 30 ns, and nothing
+inlines across it.
+
+* Where each operation is real DOM work (microseconds), 30 ns vanishes — the
+  generic ABI lands within 15% of JS, and purpose-built imports BEAT it, because
+  the driving loop runs in wasm rather than in JS.
+* Where the work is a field access (nanoseconds), the crossing IS the work, and
+  it is catastrophic: JS optimises `o.counter = o.counter + 1` into inline-cached
+  machine code, wasm cannot.
+
+So: keep hot state in wasm-GC objects and cross at the granularity of DOM
+operations, never per field. A generated binding should also prefer a dedicated
+import per operation over generic `invoke` — same shape for the author, fewer
+crossings, and it measures faster than hand-written JS.
+
+Intern property names into globals (this file does, via `initNames`) — naming a
+property with a per-call `str(i)` costs an extra crossing each time, which was
+worth 46x -> 35x on the property loop alone.

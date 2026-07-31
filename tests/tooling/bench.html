@@ -1,0 +1,51 @@
+<!doctype html><meta charset="utf-8"><title>interop cost</title>
+<script type="module">
+const S = ['createElement','div','textContent','item','className','row','appendChild','counter'];
+const js = {
+  get: (o, k) => o[k], set: (o, k, v) => { o[k] = v; },
+  invoke1: (o, k, a) => o[k](a),
+  num: x => x, toNum: x => Number(x), str: i => S[i],
+};
+const dom = {
+  create: (d, tag) => d.createElement(tag),
+  text: (el, t) => { el.textContent = t; },
+  append: (p, c) => p.appendChild(c),
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('bench.wasm'), { js, dom });
+const X = instance.exports;
+X.initNames();   // intern property names once, as a real binding would
+
+const N = 20000, LOOPS = 2000000, REPS = 7;
+function fresh() { return document.createElement('div'); }
+function median(xs) { xs.sort((a, b) => a - b); return xs[xs.length >> 1]; }
+function time(f) {
+  const runs = [];
+  for (let r = 0; r < REPS; r++) { const t = performance.now(); f(); runs.push(performance.now() - t); }
+  return median(runs);
+}
+
+// --- building DOM elements, three ways -----------------------------------
+const plainBuild = time(() => {
+  const p = fresh();
+  for (let i = 0; i < N; i++) {
+    const el = document.createElement('div');
+    el.textContent = 'item'; el.className = 'row';
+    p.appendChild(el);
+  }
+});
+const genericBuild = time(() => X.buildGeneric(document, fresh(), N));
+const directBuild  = time(() => X.buildDirect(document, fresh(), N));
+
+// --- property traffic only ------------------------------------------------
+const obj = { counter: 0 };
+const plainProp = time(() => { let o = obj; o.counter = 0; for (let i = 0; i < LOOPS; i++) o.counter = o.counter + 1; });
+const genericProp = time(() => { obj.counter = 0; X.propLoop(obj, LOOPS); });
+const pureWasm = time(() => X.pureLoop(LOOPS));
+
+window.results = {
+  N, LOOPS,
+  build: { plainJs: plainBuild, generic: genericBuild, direct: directBuild },
+  props: { plainJs: plainProp, generic: genericProp, pureWasmFloor: pureWasm },
+};
+window.ready = true;
+</script>
