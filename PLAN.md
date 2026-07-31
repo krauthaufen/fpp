@@ -3059,11 +3059,20 @@ plain one on purpose, and only when asked for:
 A plain build pays for none of it: no map, no names, no shadow stack, and the
 byte fixpoint is unchanged. Names alone were a third of the module.
 
+SHADOWING. `let x` over a parameter `x` is two slots, and both are now visible:
+parameters keep the name they were written with, let-bound locals take theirs,
+and a binding that HIDES another shows as `x'`. So a scope view can tell the
+parameter from the binding that shadows it, rather than showing one of them as
+`bl2`. Display names live in their own table (`Fn.SrcNames`) keyed by slot —
+`LocalIdx` remains the key for reads, so a name shown to a human can never
+repoint what code reads.
+
 Two things worth knowing. A call in TAIL position replaces its caller's frame,
 so a trace shows what actually ran, not what the source suggests. And a local
 must never take a name a PARAMETER holds: the name is the key, so rebinding it
 silently repoints every read of that parameter — a prelude function with a
 parameter `h` met an emitter local `$h`, and only the HashMap tests noticed.
+That is exactly why display names are a separate table now.
 
 STILL OPEN: rendering a trace to NAMES inside the guest (the ids are there; the
 names need an offset/length table and a data segment), and capturing a trace at
