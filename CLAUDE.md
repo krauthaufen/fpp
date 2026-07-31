@@ -77,6 +77,19 @@ array is written field-by-field instead of via a materialised struct; and
 the same fix from opposite sides — never materialise a GC struct for a POD
 element.
 
+Innermost counted loops are unrolled twice: `while i < bound` whose body
+advances `i` by exactly one, where `bound` cannot move and the body is small
+(<= 60 nodes) and contains no other loop. The guard is the condition with
+`i + 1` in place of `i`, so two iterations run only when two are left and the
+remainder loop catches the last — no trip count, no arithmetic that could
+overflow where the original would not, and no reassociation.
+
+INNERMOST matters: unrolling a loop that contains another copies the inner
+one too, and copies multiply as 3^depth. A two-deep loop turned three element
+reads into twenty-seven before that condition went in. It buys 7% on a tight
+loop (191 ms -> 177 ms) and nothing on a loop whose body is already big
+enough to fall outside the size cap, for +3.2% module size.
+
 Two were tried, measured, and **reverted** for not paying: inlining `$toi`
 everywhere, and caching `i * stride` across an element's fields (the engine
 already does that one). Do not re-add them without a number.

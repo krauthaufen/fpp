@@ -868,6 +868,78 @@ and private podElemRootOf (st : St) (e : Expr) : ((string * string * string) lis
          | None -> None)
     | None -> None
 
+/// Can this loop be unrolled twice, and if so what is the guard that says
+/// two more iterations fit?
+///
+/// The shape looked for is the ordinary counted loop: `while i < bound` whose
+/// body advances `i` by exactly one, once, and where `bound` does not change
+/// while it runs. Then two iterations are safe exactly when the condition
+/// still holds of `i + 1`, so the guard is the condition with `i + 1` in
+/// place of `i` — no trip count, no arithmetic that could overflow where the
+/// original would not.
+///
+/// Unrolling costs a copy of the body, so it is only worth it for a body
+/// small enough that the loop's own overhead is a real share of the work.
+and private unrollGuard (st : St) (c : Expr) (b : Expr) : Expr option =
+    if not st.Opt then None
+    else
+        // the counter, and the comparison it rides in
+        match c with
+        | EPrim (op, [ EVar (iv, isch); bound ]) when
+              (op = "<" || op = "<=" || (op.StartsWith "<" && op <> "<>")) ->
+            let key = (iv.Path, iv.Offset)
+            // A call cannot reach a LOCAL, so calls in the body are harmless
+            // — unless the counter is captured, in which case it lives in a
+            // cell that a closure could write, or it is a global.
+            let reachable =
+                (dictTryFind st.CellVars key).IsSome || (dictTryFind st.GlobalOf key).IsSome
+            // `bound` must not move: a literal, or a variable nothing assigns
+            let mutable bumps = 0
+            let mutable otherAssign = false
+            let mutable boundAssigned = false
+            // INNERMOST loops only. Unrolling one that contains another copies
+            // the inner loop too, and the copies multiply with depth — three
+            // to the power of the nesting, which is how a two-deep loop turned
+            // three element reads into twenty-seven.
+            let mutable hasInnerLoop = false
+            let boundKey =
+                match bound with
+                | EVar (bv, _) -> Some (bv.Path, bv.Offset)
+                | _ -> None
+            let rec scan (x : Expr) : unit =
+                (match x with
+                 | EAssign (av, rhs) ->
+                     let ak = (av.Path, av.Offset)
+                     if ak = key then
+                         (match rhs with
+                          | EPrim ("+", [ EVar (rv, _); ELit (LInt "1") ]) when (rv.Path, rv.Offset) = key ->
+                              bumps <- bumps + 1
+                          | _ -> otherAssign <- true)
+                     if Some ak = boundKey then boundAssigned <- true
+                 | EWhile _ -> hasInnerLoop <- true
+                 | _ -> ())
+                podScanChildren scan x
+            scan b
+            // and small enough to be worth copying
+            let mutable size = 0
+            let rec count (x : Expr) : unit =
+                size <- size + 1
+                podScanChildren count x
+            count b
+            let boundReachable =
+                match boundKey with
+                // a global bound is only safe if it is a CONSTANT: those are
+                // emitted as their literal and nothing can write them
+                | Some bk ->
+                    (dictTryFind st.ConstGlobal bk).IsNone
+                    && ((dictTryFind st.CellVars bk).IsSome || (dictTryFind st.GlobalOf bk).IsSome)
+                | None -> false
+            if bumps = 1 && not otherAssign && not boundAssigned && not hasInnerLoop
+               && not reachable && not boundReachable && size <= 60 then
+                Some (EPrim (op, [ EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ]); bound ]))
+            else None
+        | _ -> None
+
 /// Push the handle. `hl` is normally a local, but for an array whose base a
 /// loop hoisted it is the GLOBAL's name — the write paths still want the
 /// handle itself, so fetch it straight from the global there.
@@ -2587,6 +2659,26 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         refI31 f
     | EWhile (c, b) ->
         let hoisted = podHoistLoop st f [ c; b ]
+        // Two bodies per test where the shape allows it. The remainder loop
+        // after it runs at most once, so nothing is skipped and nothing is
+        // reordered — the bodies execute in the same order, with the same
+        // values, just with one less branch between every other pair.
+        (match unrollGuard st c b with
+         | Some guard ->
+             blockE f "$wbrk2"
+             loopE f "$wgo2"
+             emitNode st f lv guard
+             callf f "$toi"
+             ins f "i32.eqz"
+             brIf f "$wbrk2"
+             emitNode st f lv b
+             ins f "drop"
+             emitNode st f lv b
+             ins f "drop"
+             br f "$wgo2"
+             endB f
+             endB f
+         | None -> ())
         blockE f "$wbrk"
         loopE f "$wgo"
         emitNode st f lv c
