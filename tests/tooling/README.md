@@ -432,6 +432,12 @@ had, seen from the read side.
     ./tests/tooling/perf/run.sh          # one shape,  191 ms vs 71 ms
     # shapes.c / shapes.fpp              # five shapes, 870 ms vs 249 ms
 
+Bounds checks were investigated here and turned out to be a non-yak: nothing
+in the emitted code checks a bound, because `array.get` checks it itself and
+wasm-GC offers no unchecked read. Pinning the array — which reads linear
+memory with a plain load, no per-element check — is worth 8%, 191 ms against
+175 ms. And `for i in 0 .. arr.Length - 1` already hoists its bound.
+
 Worth keeping honest: the single-shape number (2.7x) is the best case, and
 the mixed one (3.5x) is closer to what varied code sees. Every optimisation
 here was written against the single shape first and then found wanting on the

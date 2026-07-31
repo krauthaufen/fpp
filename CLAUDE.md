@@ -12,14 +12,14 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 534 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 536 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 534 tests missed — a `List.init` that counted down, an equality that
+bugs the 536 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
@@ -80,6 +80,18 @@ element.
 Two were tried, measured, and **reverted** for not paying: inlining `$toi`
 everywhere, and caching `i * stride` across an element's fields (the engine
 already does that one). Do not re-add them without a number.
+
+### Bounds checks: there is nothing to eliminate
+
+Worth knowing before someone sets out to write the pass. The compiler emits
+NO bounds check of its own — the check lives inside `array.get`, and wasm-GC
+has no unchecked variant to emit instead. The only path without a per-element
+check is a PINNED array, which reads linear memory with a plain load, and
+that is worth about 8% (191 ms against 175 ms on the vertex benchmark). It is
+not the gap to C.
+
+`for i in 0 .. arr.Length - 1` already evaluates the bound once: the loop
+body contains zero `array.len`. That one was checked, not assumed.
 
 ## Emitting wasm
 
