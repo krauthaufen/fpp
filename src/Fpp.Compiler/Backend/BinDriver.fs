@@ -58,6 +58,10 @@ type St =
       Pod : Dict<string, (string * string * int) list * int * int>
       /// POD struct -> its alignment, which is also its backing word width
       PodAlign : Dict<string, int>
+      /// POD struct -> "s" or "f" when every field is a float of the backing
+      /// width, so the array itself can hold floats and a read is the
+      /// `array.get` alone. "" otherwise.
+      PodKind : Dict<string, string>
       /// Whether to optimize at all. A debug build wants code that matches
       /// the source it came from: a hoisted base and an elided branch are
       /// both invisible in the source, and a debugger stepping through them
@@ -659,6 +663,11 @@ let private podUnbox (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" |
 /// accessors that speak it
 let private podW (st : St) (rn : string) : int =
     match dictTryFind st.PodAlign rn with Some a -> a | None -> 4
+let private podK (st : St) (rn : string) : string =
+    match dictTryFind st.PodKind rn with Some k -> k | None -> ""
+let private podSfxOf (st : St) (rn : string) : string =
+    Fpp.Backend.EmitBin.podSfx (podW st rn) (podK st rn)
+let private podRtOf (st : St) (rn : string) = Fpp.Backend.EmitBin.podRtK (podW st rn) (podK st rn)
 let private podTy (w : int) = match w with 1 -> "$pb" | 2 -> "$ph" | 4 -> "$pk" | _ -> "$pl"
 
 /// read one leaf (dotted path) out of a UNIFORM struct value held in local
@@ -691,6 +700,12 @@ and private emitPodWord (st : St) (f : Fn) (rn : string) (vl : string) (w : int)
 /// the same, with the leaves coming from wherever the caller says
 and private emitPodWordOf (st : St) (f : Fn) (rn : string) (push : string -> string -> unit) (w : int) : unit =
     let placed, _, _ = (dictTryFind st.Pod rn).Value
+    if podK st rn <> "" then
+        // one leaf per word, and the word IS the leaf: no bits to move
+        match placed |> List.tryFind (fun (_, _, off) -> off / podW st rn = w) with
+        | Some (fn, k, _) -> push fn k
+        | None -> (if podK st rn = "f" then fc f 0L else sc f 0)
+    else
     let width = podW st rn
     let wide = width = 8
     let sizeOfK (k : string) = match k with "b" | "n" -> 1 | "h" -> 2 | "i" | "s" -> 4 | _ -> 8
@@ -738,7 +753,7 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
     // the engine must assume it writes globals, so it cannot hoist the array
     // fetch or the casts that surround it out of a loop. Straight-line code
     // lets it. On a vertex sum this alone was 772ms -> 507ms.
-    let ty, vt, getOp, loadOp, _ = Fpp.Backend.EmitBin.podRt width
+    let ty, vt, getOp, loadOp, _ = podRtOf st rn
     let idx () =
         lg f bl
         ic f (off / width)
@@ -800,6 +815,10 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
          idx ()
          gcT f getOp ty
          endB f)
+    if podK st rn <> "" then
+        // the value came out of the array already
+        callf f (boxOfK k)
+    else
     let sh = (off % width) * 8
     if sh <> 0 then
         if wide then
@@ -948,7 +967,7 @@ and private unrollGuard (st : St) (c : Expr) (b : Expr) : Expr option =
 and private emitPodWordStore (st : St) (f : Fn) (nm : string) (hl : string) (bl : string) (w : int)
                              (pushValue : unit -> unit) : unit =
     let width = podW st nm
-    let ty, _, _, _, storeOp = Fpp.Backend.EmitBin.podRt width
+    let ty, _, _, _, storeOp = podRtOf st nm
     let everPinned = not st.Opt || (dictTryFind st.PinnedTypes nm).IsSome
     let idx () =
         lg f bl
@@ -959,7 +978,7 @@ and private emitPodWordStore (st : St) (f : Fn) (nm : string) (hl : string) (bl 
         podPushHandle st f hl
         idx ()
         pushValue ()
-        callf f ("$hwset" + string width)
+        callf f ("$hwset" + podSfxOf st nm)
     else
         (match dictTryFind st.PodBase hl with
          | Some (sto, _) -> lg f sto
@@ -1072,7 +1091,7 @@ and private podHoistLoop (st : St) (f : Fn) (parts : Expr list) : string list =
         for g, nm in dictPairs cand do
           if not (dictTryFind st.PodBase g).IsSome then
             let width = podW st nm
-            let ty, _, _, _, _ = Fpp.Backend.EmitBin.podRt width
+            let ty, _, _, _, _ = podRtOf st nm
             let sto = freshLocal f "$pbs" ty
             let ptr = freshLocal f "$pbp" "i32"
             // storage, kept NULLABLE: a pinned array has none, and the
@@ -2792,7 +2811,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             emitNode st f lv x
             ls f el
             for w in 0 .. wd - 1 do emitPodWord st f nm el w
-        arrNewFixed f (podTy (podW st nm)) (List.length xs * wd)
+        let arrTy, _, _, _, _ = podRtOf st nm
+        arrNewFixed f arrTy (List.length xs * wd)
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2881,7 +2901,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$toi"
         ic f wd
         ins f "i32.mul"
-        gcT f "array.new_default" (podTy (podW st nm))
+        let arrTy2, _, _, _, _ = podRtOf st nm
+        gcT f "array.new_default" arrTy2
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2899,7 +2920,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         lg f nl
         ic f wd
         ins f "i32.mul"
-        gcT f "array.new_default" (podTy (podW st nm))
+        let arrTy2, _, _, _, _ = podRtOf st nm
+        gcT f "array.new_default" arrTy2
         ic f 0
         ic f 0
         gcT f "struct.new" "$hnd"
@@ -2920,7 +2942,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             ic f w
             ins f "i32.add"
             emitPodWord st f nm vl w
-            callf f ("$hwset" + string (podW st nm))
+            callf f ("$hwset" + podSfxOf st nm)
         lg f jl
         ic f 1
         ins f "i32.add"
@@ -2932,14 +2954,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EArrayLen (nm, a) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
         emitNode st f lv a
-        callf f ("$hlen" + string (podW st nm))
+        callf f ("$hlen" + podSfxOf st nm)
         ic f wd
         ins f "i32.div_u"
         callf f "$ofi"
     | EArrayPin (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f ("$pinh" + string (podW st nm))
+            callf f ("$pinh" + podSfxOf st nm)
             callf f "$ofi"
          else
             err st "binary: Array.pin requires a POD struct array"
@@ -2947,7 +2969,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EArrayUnpin (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f ("$unpinh" + string (podW st nm))
+            callf f ("$unpinh" + podSfxOf st nm)
             callf f "$ofi"
          else
             err st "binary: Array.unpin requires a POD struct array"
@@ -2957,7 +2979,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EArrayBytes (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
-            callf f ("$hlen" + string (podW st nm))
+            callf f ("$hlen" + podSfxOf st nm)
             ic f (podW st nm)
             ins f "i32.mul"
             callf f "$ofi"
@@ -3435,7 +3457,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
-          Pod = dictNew (); PodAlign = dictNew (); PodBase = dictNew ()
+          Pod = dictNew (); PodAlign = dictNew (); PodKind = dictNew (); PodBase = dictNew ()
           ConstGlobal = dictNew (); PinnedTypes = dictNew (); PodElem = dictNew ()
           // a debug build keeps the code shaped like its source
           Opt = not debugBuild
@@ -3575,6 +3597,13 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                     // its offset is a multiple of its own size, and the word
                     // is a multiple of that too.
                     dictSet st.PodAlign rn maxA
+                    // homogeneous float struct: back it with a float array
+                    let leafList = vecToList leaves
+                    let allOf (k : string) = leafList |> List.forall (fun (_, lk, _) -> lk = k)
+                    dictSet st.PodKind rn
+                        (if maxA = 4 && allOf "s" then "s"
+                         elif maxA = 8 && allOf "f" then "f"
+                         else "")
                     dictSet st.Pod rn (vecToList leaves, sizeof_, sizeof_ / maxA)
                     true
     for rn in structNames do computeLayout rn |> ignore

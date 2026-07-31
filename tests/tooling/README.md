@@ -359,7 +359,7 @@ Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
     C native (gcc -O2)     45 ms
     C -> wasm (wasmtime)   59 ms     wasm itself costs ~31%
     .NET steady state     100 ms     JIT, native, real structs
-    F++ -> wasm (same)    149 ms
+    F++ -> wasm (same)    146 ms
 
 Both C and F++ run as wasm under the same wasmtime, so that pair is the fair
 one: 2.9x. The .NET figure is steady state — `vertices.dotnet.fs.txt` runs the
@@ -475,6 +475,18 @@ mixed one — nested structs fell off the fused path entirely and cost 20x
 until the field-chain flattening landed.
 
 ## perf/add and perf/read — where the gap to C actually is
+
+The backing store of a POD array is chosen from the struct's FIELDS, not just
+its alignment: a struct whose fields are all floats of the backing width gets
+a float array, so reading a field is the `array.get` alone. With integer words
+every float field was a load into a general register followed by a move across
+to the FPU — `mov` then `vmovd`, where C emits one `vmovss`. wasm-GC arrays
+cannot be aliased the way a JS `Float32Array` and `Int32Array` can share one
+buffer, so choosing the element type is the nearest thing available; the bytes
+are identical either way, so the C image is unaffected.
+
+The profile confirms it landed: the read is now `vcvtss2sd xmm1, xmm1,
+dword ptr [r9]`, with the load folded into the conversion.
 
 Two loops, each in C and in F++, both compiled to wasm and run under wasmtime.
 `add` is 20M iterations of one dependent `f64` add and nothing else. `read`

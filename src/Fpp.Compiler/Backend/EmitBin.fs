@@ -1048,6 +1048,8 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyArray m "$ph" "i16"
     tyArray m "$pk" "i32"
     tyArray m "$pl" "i64"
+    tyArray m "$pf32" "f32"
+    tyArray m "$pf64" "f64"
     tyStruct m "$hnd" [ fld true "anyref"; fld true "i32"; fld true "i32" ]
     tyStruct m "$boxl" [ fld false "i64" ]
     tyStruct m "$boxs" [ fld false "f32" ]
@@ -4239,33 +4241,62 @@ let rtCore12 (m : Mod) : unit =
 // pinned); unpinning copies back. The accessors dispatch on which side holds
 // the data. An eight-byte field spans two words and is assembled from them.
 
-/// The four POD backing widths, by struct alignment.
-let podWidths = [ 1; 2; 4; 8 ]
+/// Every backing a POD array can use: the four integer widths, plus a float
+/// array for structs whose fields are all floats of one width.
+let podWidths = [ 1, ""; 2, ""; 4, ""; 8, ""; 4, "s"; 8, "f" ]
 
 /// backing array type, wasm value type, array read, memory load/store
-let podRt (w : int) : string * string * string * string * string =
-    match w with
-    | 1 -> "$pb", "i32", "array.get_u", "i32.load8_u", "i32.store8"
-    | 2 -> "$ph", "i32", "array.get_u", "i32.load16_u", "i32.store16"
-    | 4 -> "$pk", "i32", "array.get", "i32.load", "i32.store"
-    | _ -> "$pl", "i64", "array.get", "i64.load", "i64.store"
+/// The backing store a POD struct's array uses. Width comes from the
+/// struct's alignment; KIND is "s" or "f" when every field is a float of
+/// exactly that width, and "" otherwise.
+///
+/// A homogeneous float struct is backed by a float array, so a field read is
+/// the `array.get` alone. Integer words would make it a load into a general
+/// register followed by a move across to the FPU — two instructions and a
+/// register-file crossing per field, where C emits one `vmovss`. The bytes
+/// are identical either way, so the C image and the FFI guarantee stand.
+let podSfx (w : int) (fk : string) : string =
+    if fk = "s" then "s" elif fk = "f" then "f" else string w
+
+let podRtK (w : int) (fk : string) : string * string * string * string * string =
+    if fk = "s" then "$pf32", "f32", "array.get", "f32.load", "f32.store"
+    elif fk = "f" then "$pf64", "f64", "array.get", "f64.load", "f64.store"
+    else
+        match w with
+        | 1 -> "$pb", "i32", "array.get_u", "i32.load8_u", "i32.store8"
+        | 2 -> "$ph", "i32", "array.get_u", "i32.load16_u", "i32.store16"
+        | 4 -> "$pk", "i32", "array.get", "i32.load", "i32.store"
+        | _ -> "$pl", "i64", "array.get", "i64.load", "i64.store"
+
+let podRt (w : int) : string * string * string * string * string = podRtK w ""
 
 let rtTypes13 (m : Mod) : unit =
     tyFunc m "$rt_ai2i2" [ "anyref"; "i32" ] [ "i32" ]
     tyFunc m "$rt_aii2v" [ "anyref"; "i32"; "i32" ] []
     tyFunc m "$rt_ai2l2" [ "anyref"; "i32" ] [ "i64" ]
     tyFunc m "$rt_ail2v2" [ "anyref"; "i32"; "i64" ] []
+    tyFunc m "$rt_ai2s2" [ "anyref"; "i32" ] [ "f32" ]
+    tyFunc m "$rt_ais2v" [ "anyref"; "i32"; "f32" ] []
+    tyFunc m "$rt_ai2f2" [ "anyref"; "i32" ] [ "f64" ]
+    tyFunc m "$rt_aif2v" [ "anyref"; "i32"; "f64" ] []
 
 let rtDecls13 (m : Mod) : unit =
     declFn m "$balloc" "$rt_i2i"
-    for w in podWidths do
-        let _, vt, _, _, _ = podRt w
+    for w, fk in podWidths do
+        let _, vt, _, _, _ = podRtK w fk
+        let sfx = podSfx w fk
+        let getTy =
+            match vt with
+            | "i64" -> "$rt_ai2l2" | "f32" -> "$rt_ai2s2" | "f64" -> "$rt_ai2f2" | _ -> "$rt_ai2i2"
+        let setTy =
+            match vt with
+            | "i64" -> "$rt_ail2v2" | "f32" -> "$rt_ais2v" | "f64" -> "$rt_aif2v" | _ -> "$rt_aii2v"
         // declared in the order the bodies are emitted below
-        declFn m ("$pinh" + string w) "$rt_a2i"
-        declFn m ("$unpinh" + string w) "$rt_a2i"
-        declFn m ("$hwget" + string w) (if vt = "i64" then "$rt_ai2l2" else "$rt_ai2i2")
-        declFn m ("$hwset" + string w) (if vt = "i64" then "$rt_ail2v2" else "$rt_aii2v")
-        declFn m ("$hlen" + string w) "$rt_a2i"
+        declFn m ("$pinh" + sfx) "$rt_a2i"
+        declFn m ("$unpinh" + sfx) "$rt_a2i"
+        declFn m ("$hwget" + sfx) getTy
+        declFn m ("$hwset" + sfx) setTy
+        declFn m ("$hlen" + sfx) "$rt_a2i"
 
 let rtCore13 (m : Mod) : unit =
     // $balloc: bump allocator over the pin pages, 8-aligned. It GROWS the
@@ -4311,8 +4342,9 @@ let rtCore13 (m : Mod) : unit =
     endFn f
     // The POD accessors, once per backing width. Everything here is the same
     // shape; only the word type and the memory op differ.
-    for w in podWidths do
-        let ty, vt, getOp, loadOp, storeOp = podRt w
+    for w, fk in podWidths do
+        let ty, vt, getOp, loadOp, storeOp = podRtK w fk
+        let hnd = "$hnd"
         // $pinh: copy the words to linear memory, drop the GC side
         let f = beginFn m [ "$h" ]
         local f "$s" "anyref"
