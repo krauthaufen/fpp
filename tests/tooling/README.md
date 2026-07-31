@@ -290,3 +290,30 @@ special headers.
 Caveat: a non-shared `WebAssembly.Memory`'s own buffer is not transferable —
 detaching it would break the instance. Copy the region into a fresh ArrayBuffer
 (one copy) and transfer that, or use COOP/COEP and share the memory outright.
+
+## worker — a typed worker over postMessage, in a real browser
+
+    python3 -m http.server 8733 --directory tests/tooling/worker
+    node tests/tooling/worker/run.js
+
+    Sum of 3 points  : answer 18 (expected 18), sent 57 B, got 21 B
+    Scale of 3 points: answer 3009 (expected 3009), sent 65 B, got 57 B
+    Sum of 10000 points: answer 150015000 (expected 150015000), sent 160009 B in 2.2 ms
+    bytes per point  : 16.00 (a V2d is 16)
+
+`geo.fpp` is ONE module, instantiated twice: once on the page and once inside
+the Worker, each with its own heap. `Worker<Geometry>` fixes `Command = Job`
+and `Reply = Answer` as associated types, so both ends of the crossing are
+generated from that one declaration and cannot disagree.
+
+The wire has no header, no field names and no type tags — only a 4-byte
+length so a host that cannot see the F++ types knows how much to hand over,
+and one byte per union to say which case. A `V2d[]` costs exactly 16 bytes
+per point, because a pinned array of an all-scalar struct IS its own C-layout
+image: `writeArray` ships it with one `memory.copy` rather than walking it.
+
+Copies per hop, on a page with no cross-origin isolation: pin (GC -> linear,
+free if the array is already pinned), one copy out to a fresh ArrayBuffer,
+the transfer itself (a move, free), and one copy into the other instance's
+memory. With COOP/COEP and a shared memory the two middle steps go away and
+only the pointer travels.

@@ -499,6 +499,16 @@ let mem (f : Fn) (name : string) : unit =
     emitU32 f.B al
     emitU32 f.B 0
 
+/// memory.size, in pages
+let memSizeIns (f : Fn) : unit =
+    emitByte f.B 0x3F
+    emitByte f.B 0
+
+/// memory.grow by the pages on the stack; leaves the old size (or -1)
+let memGrowIns (f : Fn) : unit =
+    emitByte f.B 0x40
+    emitByte f.B 0
+
 /// memory.copy dst src len — one instruction, the blit the serializer rides on
 let memCopy (f : Fn) : unit =
     emitByte f.B 0xFC
@@ -4224,9 +4234,15 @@ let rtDecls13 (m : Mod) : unit =
     declFn m "$hlen" "$rt_a2i"
 
 let rtCore13 (m : Mod) : unit =
-    // $balloc: bump allocator over the pin pages, 8-aligned
+    // $balloc: bump allocator over the pin pages, 8-aligned. It GROWS the
+    // memory when the bump runs past the end — a pinned array is exactly the
+    // kind of thing that is bigger than whatever the module happened to start
+    // with, and a host reading it through the exported memory has no other
+    // way to make room.
     let f = beginFn m [ "$bytes" ]
     local f "$p" "i32"
+    local f "$end" "i32"
+    local f "$need" "i32"
     localsDone f
     gg f "$heap"
     ls f "$p"
@@ -4237,6 +4253,25 @@ let rtCore13 (m : Mod) : unit =
     ins f "i32.add"
     ic f -8
     ins f "i32.and"
+    ls f "$end"
+    // pages the bump needs, rounded up
+    lg f "$end"
+    ic f 65535
+    ins f "i32.add"
+    ic f 16
+    ins f "i32.shr_u"
+    ls f "$need"
+    lg f "$need"
+    memSizeIns f
+    ins f "i32.gt_s"
+    ifE f
+    lg f "$need"
+    memSizeIns f
+    ins f "i32.sub"
+    memGrowIns f
+    ins f "drop"
+    endB f
+    lg f "$end"
     gs f "$heap"
     lg f "$p"
     endFn f

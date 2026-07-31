@@ -1,0 +1,42 @@
+<!doctype html><meta charset="utf-8"><title>typed worker</title>
+<script type="module">
+window.onerror = e => { window.results = ['page error: ' + e]; window.ready = true; };
+const log = [];
+import { wasiImports } from './wasi.js';
+let inst = null;
+const m = await WebAssembly.instantiateStreaming(fetch('geo.wasm'),
+  wasiImports(() => inst.exports.memory));
+inst = m.instance;
+inst.exports._start();
+const host = inst.exports;
+
+const w = new Worker('geoworker.js', { type: 'module' });
+const roundTrip = p => new Promise(res => {
+  const n = host.msgLength(p);
+  const out = new Uint8Array(n);
+  out.set(new Uint8Array(host.memory.buffer, p, n));
+  w.onmessage = e => {
+    if (e.data.error) { res({ answer: 'worker error: ' + e.data.error, sent: n, got: 0 }); return; }
+    const back = new Uint8Array(e.data.buf);
+    const q = host.reserve(back.length);
+    new Uint8Array(host.memory.buffer, q, back.length).set(back);
+    let ans;
+    try { ans = host.readAnswer(q); } catch (err) { ans = 'readAnswer failed: ' + err; }
+    res({ answer: ans, sent: n, got: back.length });
+  };
+  w.postMessage({ buf: out.buffer }, [out.buffer]);
+});
+
+const r1 = await roundTrip(host.makeSum(3));
+log.push(`Sum of 3 points  : answer ${r1.answer} (expected 18), sent ${r1.sent} B, got ${r1.got} B`);
+const r2 = await roundTrip(host.makeScale(3));
+log.push(`Scale of 3 points: answer ${r2.answer} (expected 3009), sent ${r2.sent} B, got ${r2.got} B`);
+const big = 10000;
+const t0 = performance.now();
+const r3 = await roundTrip(host.makeSum(big));
+const dt = performance.now() - t0;
+log.push(`Sum of ${big} points: answer ${r3.answer} (expected 150015000), sent ${r3.sent} B in ${dt.toFixed(1)} ms`);
+log.push(`bytes per point  : ${((r3.sent - 9) / big).toFixed(2)} (a V2d is 16)`);
+window.results = log;
+window.ready = true;
+</script>
