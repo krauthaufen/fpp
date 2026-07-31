@@ -155,3 +155,38 @@ crossings, and it measures faster than hand-written JS.
 Intern property names into globals (this file does, via `initNames`) — naming a
 property with a per-call `str(i)` costs an extra crossing each time, which was
 worth 46x -> 35x on the property loop alone.
+
+## Making the generic path cheaper — and whether to bother
+
+`jsabi-bench2.js` (2 000 000 property get+set, Chrome 150):
+
+| | time | vs plain JS | per crossing |
+|---|---|---|---|
+| plain JS | 3.3 ms | 1.0x | |
+| generic, values BOXED through externref (4 crossings) | 84.0 ms | 25.5x | 11 ns |
+| generic, TYPED accessors (2 crossings) | 51.3 ms | 15.5x | 13 ns |
+| typed + monomorphic accessor built with `new Function` | 55.2 ms | 16.7x | 14 ns |
+| a dedicated import per property (2 crossings) | 45.7 ms | 13.8x | 11 ns |
+
+* A crossing costs ~11 ns and that is the whole story: it does not matter
+  whether the JS side is generic `o[k]` or a purpose-built `o.counter`.
+* TYPING the accessors is the win — `getNum`/`setNum` instead of
+  `get`+`toNum`/`num`+`set` halves the crossings: 25.5x -> 15.5x, free.
+* Specialising the JS side with `new Function` MADE IT SLOWER. Measured, dropped.
+* Dedicated imports beat typed-generic by only 12%.
+
+`import-cost.js` — what "one import per operation" costs if you emit them all:
+
+| imports | module | build the JS glue | compile | instantiate |
+|---|---|---|---|---|
+| 40 | 1.3 KB | 0.1 ms | 0.5 ms | 0.0 ms |
+| 500 | 16.8 KB | 0.5 ms | 0.4 ms | 0.3 ms |
+| 2000 | 70.0 KB | 1.8 ms | 0.4 ms | 1.2 ms |
+| 5000 | 178.4 KB | 4.6 ms | 1.3 ms | 3.2 ms |
+
+But that ceiling is never reached, because DEAD-CODE ELIMINATION ALREADY PRUNES
+UNUSED IMPORTS: declare 300 `extern`s, use two, and the module contains exactly
+`domOp7` and `domOp42`. So a generated binding costs only what a program
+touches — generate the whole WebIDL surface as typed `extern`s and let the
+compiler drop the rest. The typed generic primitives stay for the genuinely
+dynamic cases, where the property name is not known until run time.

@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>cheaper generic</title>
+<script type="module">
+const S = ['createElement','div','textContent','item','className','row','appendChild','counter'];
+// v2's trick: build a monomorphic accessor per interned name ONCE, so the JS
+// side sees `o.counter`, not `o[k]` with a varying k
+const getters = S.map(n => new Function('o', 'return o.' + n));
+const setters = S.map(n => new Function('o', 'v', 'o.' + n + ' = v'));
+const NAME = 'counter';
+const js = {
+  get: (o, k) => o[k], set: (o, k, v) => { o[k] = v; },
+  num: x => x, toNum: x => Number(x), str: i => S[i],
+  getNum: (o, k) => o[k], setNum: (o, k, v) => { o[k] = v; },
+  getNumAt: (o, i) => getters[i + 7](o), setNumAt: (o, i, v) => setters[i + 7](o, v),
+  getCounter: o => o.counter, setCounter: (o, v) => { o.counter = v; },
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('bench2.wasm'), { js });
+const X = instance.exports;
+X.initNames();
+
+const LOOPS = 2000000, REPS = 7;
+const median = xs => (xs.sort((a, b) => a - b), xs[xs.length >> 1]);
+const time = f => { const r = []; for (let i = 0; i < REPS; i++) { const t = performance.now(); f(); r.push(performance.now() - t); } return median(r); };
+const obj = { counter: 0 };
+const plain = time(() => { obj.counter = 0; for (let i = 0; i < LOOPS; i++) obj.counter = obj.counter + 1; });
+const v0 = time(() => { obj.counter = 0; X.v0(obj, LOOPS); });
+const v1 = time(() => { obj.counter = 0; X.v1(obj, LOOPS); });
+const v2 = time(() => { obj.counter = 0; X.v2(obj, LOOPS); });
+const v3 = time(() => { obj.counter = 0; X.v3(obj, LOOPS); });
+window.results = { LOOPS, plain, v0, v1, v2, v3 };
+window.ready = true;
+</script>

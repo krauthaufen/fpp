@@ -1,0 +1,24 @@
+<!doctype html><meta charset="utf-8"><title>import cost</title>
+<script type="module">
+const median = xs => (xs.sort((a,b)=>a-b), xs[xs.length>>1]);
+const out = [];
+for (const n of [40, 500, 2000, 5000]) {
+  const bytes = new Uint8Array(await (await fetch('imports' + n + '.wasm')).arrayBuffer());
+  // the JS side must also PROVIDE every one of them
+  const t0 = performance.now();
+  const dom = {};
+  for (let i = 0; i < n; i++) dom['op_' + i + '_setAttributeNS'] = (a, b) => a;
+  const glueMs = performance.now() - t0;
+  const comp = [], inst = [];
+  for (let r = 0; r < 5; r++) {
+    const a = performance.now();
+    const m = await WebAssembly.compile(bytes);
+    const b = performance.now();
+    await WebAssembly.instantiate(m, { dom });
+    inst.push(performance.now() - b);
+    comp.push(b - a);
+  }
+  out.push({ n, bytes: bytes.length, glueMs, compile: median(comp), instantiate: median(inst) });
+}
+window.results = out; window.ready = true;
+</script>
