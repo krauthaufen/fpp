@@ -471,3 +471,35 @@ the mixed one (3.5x) is closer to what varied code sees. Every optimisation
 here was written against the single shape first and then found wanting on the
 mixed one — nested structs fell off the fused path entirely and cost 20x
 until the field-chain flattening landed.
+
+## perf/add and perf/read — where the gap to C actually is
+
+Two loops, each in C and in F++, both compiled to wasm and run under wasmtime.
+`add` is 20M iterations of one dependent `f64` add and nothing else. `read`
+is the same loop with ONE field read from a 1M-element `V3f[]` added to it.
+
+    add    C 39 ms    F++ 41 ms     parity
+    read   C 49 ms    F++ 115 ms
+
+So the loop, the counter, the branch and the floating-point chain are already
+at C's speed. The ENTIRE gap is the per-element read: about 0.5 ns in C and
+about 3 ns here, and everything else that looked like a cause was a
+distraction.
+
+What it is NOT, each ruled out by measurement rather than argument:
+
+* not instruction count — strength reduction took nine multiplies out of the
+  vertex loop for no gain at all
+* not the GC array — pinning it, so reads become plain linear-memory loads
+  exactly like C's, changes nothing (111 ms against 115)
+* not the bounds check — worth 8%, and pinned reads have none
+* not the engine — the C reference is wasm under the same wasmtime
+* not unroll depth alone — going from 2x to 4x wins 14% on this loop and
+  nothing on the three-read one
+
+C unrolls this loop 5x and folds each field's offset into the load
+(`f32.load offset=1740`), which keeps several independent loads in flight
+against a serial add chain. That is the leading remaining hypothesis and it
+is NOT yet demonstrated: 4x unrolling should have shown more of the win than
+it did. The next step is a profiler on the generated code, not another round
+of reading disassembly.
