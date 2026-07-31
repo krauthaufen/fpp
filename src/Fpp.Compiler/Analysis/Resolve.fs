@@ -371,7 +371,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 | Some d -> record (List.last idents) d
                 | None -> ()
 
-    let rec bindPat (kind : DefKind) (env : Env) (g : Green) : Env =
+    /// `inCase` marks a pattern in MATCH position, where a bare uppercase
+    /// identifier is a union case and never a binder. A parameter or a `let`
+    /// pattern is a binding position, where such a name is an ordinary (if
+    /// unconventional) binder — so the rule cannot simply apply everywhere.
+    let rec bindPatIn (inCase : bool) (kind : DefKind) (env : Env) (g : Green) : Env =
         match g with
         | GToken _ -> env
         | GNode n ->
@@ -389,12 +393,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                              env
                          | _ ->
                              if t.Text = "_" then env
+                             // F# reads a pattern identifier that starts with
+                             // an UPPERCASE letter as a union case, never as
+                             // a new binding. Binding it shadowed the case for
+                             // the rest of the clause, so in `| None -> None`
+                             // the body's `None` was the pattern's binder and
+                             // took its type from the scrutinee — a false
+                             // mismatch, and only where the case could not be
+                             // resolved, which is the dogfooding gate exactly.
+                             elif inCase && strLen t.Text > 0
+                                  && charAt t.Text 0 >= 'A' && charAt t.Text 0 <= 'Z' then
+                                 env
                              else
                                  let d = define kind t
                                  Map.add t.Text d env
                  | _ -> env)
             | StructTuplePat ->
-                n.Children |> List.fold (fun e c -> bindPat kind e c) env
+                n.Children |> List.fold (fun e c -> bindPatIn inCase kind e c) env
             | WildcardPat | LiteralPat -> env
             | AppPat ->
                 (match n.Children with
@@ -405,7 +420,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                            | GToken t :: _ when t.Kind = Ident -> recordQualifiedCase env hn.Children
                            | _ -> ())
                       | _ -> ())
-                     List.fold (bindPat kind) env args
+                     List.fold (bindPatIn inCase kind) env args
                  | [] -> env)
             | SplicePat ->
                 // `%p` binds nothing here: the NAME is an ordinary value use
@@ -421,12 +436,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | k when isTypeKind k ->
                 walkType env g
                 env
-            | _ -> List.fold (bindPat kind) env n.Children
+            | _ -> List.fold (bindPatIn inCase kind) env n.Children
 
     // ---- expressions ------------------------------------------------------
 
     /// Flatten a pure identifier spine `a.b.c`; None if any segment is not a
     /// plain identifier.
+
+    /// binding position: a `let`, a parameter, a `for`
+    let bindPat (kind : DefKind) (env : Env) (g : Green) : Env = bindPatIn false kind env g
     let rec flattenSpine (g : Green) : Token list option =
         match g with
         | GNode n when n.NodeKind = IdentExpr ->
@@ -553,7 +571,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     match c with
                     | GNode cl when cl.NodeKind = MatchClause ->
                         let pats = cl.Children |> List.filter (fun x -> match x with GNode p -> isPatKind p.NodeKind | _ -> false)
-                        let inner = List.fold (bindPat DefParam) env pats
+                        let inner = List.fold (bindPatIn true DefParam) env pats
                         for x in cl.Children do
                             match x with
                             | GNode p when isPatKind p.NodeKind -> ()

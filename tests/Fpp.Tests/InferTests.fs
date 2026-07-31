@@ -178,6 +178,38 @@ let inferSelfTests =
             // on the compiler's own (valid) sources
             Expect.equal diags 0 "zero type diagnostics on own sources"
         }
+
+        test "an uppercase identifier in a case pattern is a CASE, not a binder" {
+            // F# reads a pattern identifier starting uppercase as a union
+            // case. Binding it instead shadowed the case for the rest of the
+            // clause: in `| None -> None` the body's `None` became the
+            // pattern's binder and took its type from the SCRUTINEE, so a
+            // match whose result differed from what it matched on reported a
+            // mismatch that was not there. It only bit where the case could
+            // not be resolved — which is this file's own dogfooding gate,
+            // since that infers each source with no prelude.
+            let src =
+                String.concat "\n"
+                    [ "module R"
+                      "let outer (e : int) : (string * string) option ="
+                      "    let rec root (x : int) : (int * string) option = None"
+                      "    match root e with"
+                      "    | Some (k, path) -> Some (path, path)"
+                      "    | None -> None"
+                      "" ]
+            Expect.isEmpty (inferSrc src).Diagnostics "no false mismatch"
+        }
+
+        test "a LOWERCASE identifier in a case pattern still binds" {
+            let src =
+                String.concat "\n"
+                    [ "module R"
+                      "let f (o : int) : int ="
+                      "    match o with"
+                      "    | n -> n + 1"
+                      "" ]
+            Expect.isEmpty (inferSrc src).Diagnostics "binding still works"
+        }
     ]
 
 [<Tests>]

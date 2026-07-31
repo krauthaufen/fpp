@@ -32,8 +32,9 @@ Three details that will bite:
   disabled.
 * **The dogfooding gate infers every `*.fs` in the repo with an empty
   prelude** and demands zero diagnostics. So compiler source has to be
-  F++-inferable, not merely valid F#. Nested tuple-option return types are
-  known to trip it — see `tests/known-issues/`.
+  F++-inferable with NOTHING resolved — no prelude, no union cases. That is
+  harsh on purpose: it is how a false positive in inference gets caught. It
+  found the pattern-binder bug below.
 
 ## Measure, do not reason
 
@@ -90,6 +91,17 @@ already does that one). Do not re-add them without a number.
   `freshLocal` will desynchronise them.
 * `wasm-tools validate -f all out.wasm` gives a far better message than the
   runtime does.
+
+## Pattern identifiers
+
+An identifier in a CASE pattern that starts with an uppercase letter names a
+union case; it never binds. F# technically binds it (with warning FS0049) if
+no case resolves, and this compiler's own source did exactly that once — a
+list pattern `[ inner; GNodePat ]`. That is the shape to avoid: name pattern
+binders in lowercase.
+
+The strict rule applies only in match/try clauses. A `let`, a parameter or a
+`for` still binds whatever name it is given, uppercase included.
 
 ## F# shape that keeps biting
 

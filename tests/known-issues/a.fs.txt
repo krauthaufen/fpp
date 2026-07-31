@@ -1,6 +1,0 @@
-module R
-let outer (e : int) : ((string * string * string) list * string) option =
-    let rec root (x : int) : ((string * int) * string) option = None
-    match root e with
-    | Some (k, path) -> None
-    | None -> None

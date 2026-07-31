@@ -851,27 +851,22 @@ and private emitPodBuild (st : St) (f : Fn) (top : string) (hl : string) (bl : s
             emitPodLeafRead st f top hl bl k off
     gcT f "struct.new" ("$r_" + rn)
 
-/// The local a field chain is rooted at, if any.
-and private podElemVarKey (e : Expr) : (string * int) option =
-    match e with
-    | EField (EVar (v, _), _, _) -> Some (v.Path, v.Offset)
-    | EField (inner, _, _) -> podElemVarKey inner
-    | _ -> None
-
-/// The dotted leaf that chain names — "" when it is not a chain over a local.
-and private podElemPath (e : Expr) : string =
-    match e with
-    | EField (EVar (_, _), fn, _) -> fn
-    | EField (inner, fn, _) ->
-        let p = podElemPath inner
-        if p = "" then "" else p + "." + fn
-    | _ -> ""
-
-/// The fields a chain's root was split into, empty when it was not split.
-and private podElemSlots (st : St) (e : Expr) : (string * string * string) list =
-    match podElemVarKey e with
-    | Some k -> (match dictTryFind st.PodElem k with Some slots -> slots | None -> [])
-    | None -> []
+/// The split element a field chain reads from, and which of its leaves.
+and private podElemRootOf (st : St) (e : Expr) : ((string * string * string) list * string) option =
+    let rec root (x : Expr) : ((string * int) * string) option =
+        match x with
+        | EField (EVar (v, _), fn, _) -> Some ((v.Path, v.Offset), fn)
+        | EField (inner, fn, _) ->
+            (match root inner with
+             | Some (k, p) -> Some (k, p + "." + fn)
+             | None -> None)
+        | _ -> None
+    match root e with
+    | Some (k, path) ->
+        (match dictTryFind st.PodElem k with
+         | Some slots -> Some (slots, path)
+         | None -> None)
+    | None -> None
 
 /// Push the handle. `hl` is normally a local, but for an array whose base a
 /// loop hoisted it is the GLOBAL's name — the write paths still want the
@@ -2461,9 +2456,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              refNull f "any")
     // a field of a POD element that was split into locals
     | EField _ when
-          (podElemSlots st e |> List.exists (fun (p, _, _) -> p = podElemPath e)) ->
-        let fname = podElemPath e
-        let _, kd, l = podElemSlots st e |> List.find (fun (p, _, _) -> p = fname)
+          (match podElemRootOf st e with
+           | Some (slots, path) -> slots |> List.exists (fun (p, _, _) -> p = path)
+           | None -> false) ->
+        let slots, fname = (podElemRootOf st e).Value
+        let _, kd, l = slots |> List.find (fun (p, _, _) -> p = fname)
         lg f l
         callf f (boxOfK kd)
     | EField _ when

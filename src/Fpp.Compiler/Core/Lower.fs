@@ -333,8 +333,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | many -> PTuple (List.map lowerPat many))
         | AsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
-             | [ inner; GNodePat ] ->
-                 (match tokensOf GNodePat |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+             | [ inner; namePat ] ->
+                 (match tokensOf namePat |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
                   | Some d -> PAs (lowerPat inner, varIdOf d, schemeOf d)
                   | None -> lowerPat inner)
              | [ inner ] -> lowerPat inner
