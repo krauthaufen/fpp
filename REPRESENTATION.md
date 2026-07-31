@@ -4,12 +4,24 @@
 primitives are NEVER boxed unless mathematically unavoidable (tier-3:
 polymorphic recursion / first-class polymorphism), and flat layouts are the
 ONLY layouts — no runtime representation dispatch. Vector types (V2d etc.)
-are the primary workload; `V2d[]` is SoA-flat (one typed field-array per
-field), `int[]`/`float[]`/... are typed scalar arrays, and generic array
-access without a statically known element type is a compile-time error
-until specialization serves it. The remaining transient boxing at the
-expression layer (locals/temporaries) is scheduled for deletion via typed
-emission — see Stage 4.5.
+are the primary workload. An array of an all-scalar struct is one flat image
+in **exactly C's layout** — same field offsets, same stride — so a C function
+or a JavaScript typed-array view can walk it as-is; `int[]`/`float[]`/... are
+typed scalar arrays, and generic array access without a statically known
+element type is a compile-time error until specialization serves it.
+
+The image's backing store is chosen PER STRUCT from its alignment: 1, 2, 4 or
+8 bytes. A struct's size is always a multiple of its alignment, so an element
+is always a whole number of backing words and nothing is ever rounded up —
+which is what makes a 3-byte colour have a stride of 3 and a pair of doubles
+a stride of 16. One fixed width cannot do that: 64-bit words gave `V3f` 16
+bytes where C gives it 12, and 32-bit words gave `C3b` 4 where C gives it 3.
+`tests/tooling/abi/run.sh` checks these strides against what emscripten
+actually emits, rather than against a reading of the ABI.
+
+Every numeric type is blittable: `byte`/`sbyte`/`bool` are one byte (C's
+`_Bool` is one), `char` and `float16` are two, `int`/`uint32`/`float32` four,
+`int64`/`float` eight.
 
 How values are laid out at runtime, per backend. The core constraint (from
 DESIGN.md): GADTs force polymorphic recursion, so whole-program

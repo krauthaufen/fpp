@@ -1,0 +1,6 @@
+module R
+let outer (e : int) : (string * string) option =
+    let rec root (x : int) : (int * string) option = None
+    match root e with
+    | Some (k, path) -> Some (path, path)
+    | None -> None

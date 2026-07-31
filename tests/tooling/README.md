@@ -359,6 +359,13 @@ Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
     C -O2   71 ms
     F++    191 ms      (2.7x)
 
+`shapes.c` / `shapes.fpp` run the same comparison over five struct shapes at
+once — a 12-byte vector, a pair of doubles, a 4-byte colour, a mixed
+double+byte, and a NESTED struct of two points — reading and writing all of
+them. That one is 870 ms against C's 249 ms (3.5x). The nested struct is why
+it is not 2.7x: it was 20x until field chains like `e.[i].Lo.PX` were taught
+to fuse, which is the shape a benchmark over one struct type never exercises.
+
 Two things dominated before, and neither was the read.
 
 Storing a record literal into a POD array used to materialize a GC struct and
@@ -407,9 +414,26 @@ point at.
     the whole benchmark     656 ms -> 191 ms
     let e = v.[i]           57.6 s -> 10.0 s
 
+`let e = v.[i]` is no longer a cliff. It used to materialise a GC struct per
+element — 57.6 s — and now splits the element into unboxed locals, which is
+the same value since a POD element is a value: 202 ms, level with reading the
+fields directly. It only applies when every use in the body IS a field read;
+anything that wants the element itself still gets one.
+
 An offset cache for `i * stride` across the fields of one element was tried
 and dropped: it made no difference, so the engine is already doing it.
 
 `let e = v.[i]` also remains: it materializes the element and is ~60x slower
 than reading its fields directly — the same allocation problem the store side
 had, seen from the read side.
+
+## perf/shapes — does it hold for structs other than the one benchmarked?
+
+    ./tests/tooling/perf/run.sh          # one shape,  191 ms vs 71 ms
+    # shapes.c / shapes.fpp              # five shapes, 870 ms vs 249 ms
+
+Worth keeping honest: the single-shape number (2.7x) is the best case, and
+the mixed one (3.5x) is closer to what varied code sees. Every optimisation
+here was written against the single shape first and then found wanting on the
+mixed one — nested structs fell off the fused path entirely and cost 20x
+until the field-chain flattening landed.

@@ -7,7 +7,11 @@ no runtime to install alongside the program.
 - **DESIGN.md** — the language, and why each decision went the way it did
 - **PLAN.md** — what is built, what is not, in the order it is being built
 - **DIVERGENCES.md** — every deliberate departure from F#, with its reason
+- **REPRESENTATION.md** — how values are laid out at run time
+- **CLAUDE.md** — how to work in this repo: the gates, and what they cost
 - **editors/README.md** — VS Code, Rider, Visual Studio
+- **tests/tooling/README.md** — the harnesses that measure rather than assume
+- **tests/known-issues/** — the smallest program that shows each open bug
 
 ## Getting started
 
@@ -34,7 +38,7 @@ curl https://wasmtime.dev/install.sh -sSf | bash
 git clone git@github.com:krauthaufen/fpp.git
 cd fpp
 dotnet build -c Release
-dotnet test  -c Release          # 304 tests; exits non-zero if any fail
+dotnet test  -c Release          # 534 tests; exits non-zero if any fail
 ```
 
 The suite includes the oracle gate: every program in it is also valid F#, so

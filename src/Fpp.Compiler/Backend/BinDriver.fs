@@ -63,6 +63,12 @@ type St =
       /// both invisible in the source, and a debugger stepping through them
       /// has nothing to point at.
       mutable Opt : bool
+      /// A local bound to a POD ELEMENT, split into one unboxed local per
+      /// field. `let v = pts.[i]` used to build a GC struct with boxed fields
+      /// — an allocation per element, which is ruinous while a large POD
+      /// array is live. Snapshotting the fields instead is exactly the same
+      /// value, since a POD element is a value.
+      PodElem : Dict<string * int, (string * string * string) list>
       /// POD types the program ever pins. An access to a type that is never
       /// pinned cannot be looking at linear memory, so it needs no test for
       /// it — which takes a branch out of every element read.
@@ -488,6 +494,29 @@ let private parrK (nm : string) : string =
     | "int64" -> "l"
     | _ -> ""
 let private parrTy (k : string) = "$parr_" + k
+/// A chain of field accesses rooted at an array element, flattened to the
+/// dotted path the layout names its leaves by: `e.[i].Lo.PX` is "Lo.PX".
+/// Without this a nested struct fell off the fused path and materialised the
+/// whole element — three allocations per access for a box of two points.
+let rec private podFieldChain (e : Expr) : (string * Expr * Expr * string) option =
+    match e with
+    | EField (EIndex (nm, a, i), fn, _) -> Some (nm, a, i, fn)
+    | EField (inner, fn, _) ->
+        (match podFieldChain inner with
+         | Some (nm, a, i, p) -> Some (nm, a, i, p + "." + fn)
+         | None -> None)
+    | _ -> None
+
+/// which split element (and which leaf of it) a field chain names
+let rec private podVarChainOf (key : string * int) (e : Expr) : string option =
+    match e with
+    | EField (EVar (v, _), fn, _) when (v.Path, v.Offset) = key -> Some fn
+    | EField (inner, fn, _) ->
+        (match podVarChainOf key inner with
+         | Some p -> Some (p + "." + fn)
+         | None -> None)
+    | _ -> None
+
 let private boxOfK (k : string) = match k with "f" -> "$off" | "s" -> "$oss" | "l" -> "$ofl" | _ -> "$ofi"
 let private unboxOfK (k : string) = match k with "f" -> "$tof" | "s" -> "$tos" | "l" -> "$tol" | _ -> "$toi"
 /// packed reads need an explicit sign; a half reads unsigned
@@ -822,6 +851,28 @@ and private emitPodBuild (st : St) (f : Fn) (top : string) (hl : string) (bl : s
             emitPodLeafRead st f top hl bl k off
     gcT f "struct.new" ("$r_" + rn)
 
+/// The local a field chain is rooted at, if any.
+and private podElemVarKey (e : Expr) : (string * int) option =
+    match e with
+    | EField (EVar (v, _), _, _) -> Some (v.Path, v.Offset)
+    | EField (inner, _, _) -> podElemVarKey inner
+    | _ -> None
+
+/// The dotted leaf that chain names — "" when it is not a chain over a local.
+and private podElemPath (e : Expr) : string =
+    match e with
+    | EField (EVar (_, _), fn, _) -> fn
+    | EField (inner, fn, _) ->
+        let p = podElemPath inner
+        if p = "" then "" else p + "." + fn
+    | _ -> ""
+
+/// The fields a chain's root was split into, empty when it was not split.
+and private podElemSlots (st : St) (e : Expr) : (string * string * string) list =
+    match podElemVarKey e with
+    | Some k -> (match dictTryFind st.PodElem k with Some slots -> slots | None -> [])
+    | None -> []
+
 /// Push the handle. `hl` is normally a local, but for an array whose base a
 /// loop hoisted it is the GLOBAL's name — the write paths still want the
 /// handle itself, so fetch it straight from the global there.
@@ -1098,6 +1149,56 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                 markSrc f v.Path v.Offset
                 let nameIt (l : string) = nameLocal f l v.Name
                 let key = (v.Path, v.Offset)
+                // A POD element read into a local: take the fields, not the
+                // struct. Only when every use in the body IS a field read —
+                // anything that wants the element itself still gets one.
+                let elemSplit =
+                    if not st.Opt then None
+                    else
+                        match rhs with
+                        | EIndex (nm, a, i) when (dictTryFind st.Pod nm).IsSome
+                                                 && (dictTryFind st.CellVars key).IsNone
+                                                 && (dictTryFind st.InLambda key).IsNone ->
+                            let placed, _, _ = (dictTryFind st.Pod nm).Value
+                            if List.length placed > 8 then None
+                            else
+                                let mutable ok = true
+                                let rec chk (x : Expr) : unit =
+                                    match podVarChainOf key x with
+                                    | Some path ->
+                                        // a chain that lands on a leaf is fine;
+                                        // one that stops at an inner struct is
+                                        // asking for the struct itself
+                                        if not (placed |> List.exists (fun (p, _, _) -> p = path)) then ok <- false
+                                    | None ->
+                                        match x with
+                                        | EVar (bv, _) when (bv.Path, bv.Offset) = key -> ok <- false
+                                        | _ -> podScanChildren chk x
+                                chk body
+                                if ok then Some (nm, a, i, placed) else None
+                        | _ -> None
+                match elemSplit with
+                | Some (nm, a, i, placed) ->
+                    let _, _, wd = (dictTryFind st.Pod nm).Value
+                    let hl = podHandleLocal st f lv a
+                    let bl = freshLocal f "$peb" "i32"
+                    emitNode st f lv i
+                    callf f "$toi"
+                    ic f wd
+                    ins f "i32.mul"
+                    ls f bl
+                    let slots =
+                        placed |> List.map (fun (path, kd, off) ->
+                            let ty = match kd with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
+                            let l = freshLocal f "$pef" ty
+                            emitPodLeafRead st f nm hl bl kd off
+                            callf f (podUnbox kd)
+                            ls f l
+                            path, kd, l)
+                    dictSet st.PodElem key slots
+                    // the spine has to advance on THIS path too
+                    cur <- body
+                | None ->
                 let k = kindOfLite st rhs
                 if (dictTryFind st.CellVars key).IsNone
                    && (dictTryFind st.InLambda key).IsNone
@@ -2358,9 +2459,21 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | None ->
              err st ("binary: record with unknown type " + tyName)
              refNull f "any")
-    | EField (EIndex (nm, a, i), fname, _) when
-          (dictTryFind st.Pod nm).IsSome
-          && ((dictTryFind st.Pod nm).Value |> fun (placed, _, _) -> placed |> List.exists (fun (p, _, _) -> p = fname)) ->
+    // a field of a POD element that was split into locals
+    | EField _ when
+          (podElemSlots st e |> List.exists (fun (p, _, _) -> p = podElemPath e)) ->
+        let fname = podElemPath e
+        let _, kd, l = podElemSlots st e |> List.find (fun (p, _, _) -> p = fname)
+        lg f l
+        callf f (boxOfK kd)
+    | EField _ when
+          (match podFieldChain e with
+           | Some (nm, _, _, path) ->
+               (dictTryFind st.Pod nm).IsSome
+               && ((dictTryFind st.Pod nm).Value
+                   |> fun (placed, _, _) -> placed |> List.exists (fun (p, _, _) -> p = path))
+           | None -> false) ->
+        let nm, a, i, fname = (podFieldChain e).Value
         // fusion: pts.[i].X reads that field straight out of the image — no
         // struct materialization, one box instead of the whole element
         let placed, _, wd = (dictTryFind st.Pod nm).Value
@@ -2580,11 +2693,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     // V3f[] took 3246ms that way and 210ms without the allocation.
     | EIndexSet (nm, a, i, ERecord (rn, fs)) when
           (dictTryFind st.Pod nm).IsSome
-          && rn = nm
-          // only a FLAT record: a nested struct field would need its own
-          // literal to take apart, and falling back is always correct
-          && ((dictTryFind st.Pod nm).Value
-              |> fun (placed, _, _) -> placed |> List.forall (fun (p, _, _) -> not (p.Contains "."))) ->
+          && rn = nm ->
         let placed, _, wd = (dictTryFind st.Pod nm).Value
         let hl = podHandleLocal st f lv a
         let bl = freshLocal f "$shb" "i32"
@@ -2593,20 +2702,27 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f wd
         ins f "i32.mul"
         ls f bl
-        // Each field once, in source order, into an UNBOXED local. Boxing
-        // them would only trade one allocation per element for three: the
-        // whole point is that nothing is allocated at all.
+        // Each leaf once, in source order, into an UNBOXED local. Boxing them
+        // would only trade one allocation per element for several: the whole
+        // point is that nothing is allocated at all. A nested literal is
+        // walked into its leaves — `{ Lo = { PX = ..` is the leaf "Lo.PX".
         let railOf (k : string) = match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
         let slot = dictNew<string, string> ()
-        for fn, fe in fs do
-            match placed |> List.tryFind (fun (p, _, _) -> p = fn) with
-            | Some (_, k, _) ->
-                let l = freshLocal f "$shf" (railOf k)
-                emitNode st f lv fe
-                callf f (podUnbox k)
-                ls f l
-                dictSet slot fn l
-            | None -> ()
+        let rec take (prefix : string) (fields : (string * Expr) list) : unit =
+            for fn, fe in fields do
+                let full = if prefix = "" then fn else prefix + "." + fn
+                match fe with
+                | ERecord (sub, subFs) when (dictTryFind st.StructFields sub).IsSome -> take full subFs
+                | _ ->
+                    match placed |> List.tryFind (fun (p, _, _) -> p = full) with
+                    | Some (_, k, _) ->
+                        let l = freshLocal f "$shf" (railOf k)
+                        emitNode st f lv fe
+                        callf f (podUnbox k)
+                        ls f l
+                        dictSet slot full l
+                    | None -> ()
+        take "" fs
         for w in 0 .. wd - 1 do
             podPushHandle st f hl
             lg f bl
@@ -3208,7 +3324,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
           Pod = dictNew (); PodAlign = dictNew (); PodBase = dictNew ()
-          ConstGlobal = dictNew (); PinnedTypes = dictNew ()
+          ConstGlobal = dictNew (); PinnedTypes = dictNew (); PodElem = dictNew ()
           // a debug build keeps the code shaped like its source
           Opt = not debugBuild
           StructFields = dictNew ()
