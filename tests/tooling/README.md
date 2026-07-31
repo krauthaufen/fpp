@@ -317,3 +317,26 @@ free if the array is already pinned), one copy out to a fresh ArrayBuffer,
 the transfer itself (a move, free), and one copy into the other instance's
 memory. With COOP/COEP and a shared memory the two middle steps go away and
 only the pointer travels.
+
+## abi — the pinned array stride, against a real C compiler
+
+    ./tests/tooling/abi/run.sh
+
+    emscripten:                 F++:
+      V3f sizeof=12 stride=12     12
+      V2d sizeof=16 stride=16     16
+      V2f sizeof=8  stride=8       8
+      V3i sizeof=12 stride=12     12
+      V3d sizeof=24 stride=24     24
+
+A pinned POD array is meant to be the array a C function would walk, so the
+stride has to be C's. It is because the backing store is 32-BIT words: every
+struct's size is a multiple of four, so an element occupies a whole number of
+words and the GC stride IS the C stride, with no rounding anywhere.
+
+Sixty-four-bit words made this wrong for any struct whose size is not a
+multiple of eight. `V3f` occupied 16 bytes instead of 12, so a foreign reader
+walking by 12 drifted by one float per element — invisible from inside F++,
+where both ends agreed, and wrong the moment anything else read the buffer.
+The battery pins these strides as constants; this script is what checks them
+against a compiler rather than against a reading of the ABI.

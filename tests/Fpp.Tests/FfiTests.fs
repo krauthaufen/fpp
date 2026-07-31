@@ -90,6 +90,66 @@ let ffiTests =
             else
                 Expect.equal out "1425\n10.5\n3.75\n" "foreign reader saw C layout"
         }
+        test "a 12-byte struct array has C's stride, not a padded one" {
+            // THE ABI PROOF, for the case that used to be wrong: clang and
+            // emscripten give `struct { float a, b, c; }` a size of 12 and an
+            // array of them a stride of 12. A backing store of 64-bit words
+            // would round that to 16 and every element after the first would
+            // sit four bytes late — invisible until a foreign reader walks the
+            // array. The reader below walks it at stride 12, as C does.
+            let ws = Workspace()
+            ws.SetFileText "pin3.fpp"
+                (String.concat "\n" [
+                    "module Pin3"
+                    "[<Struct>]"
+                    "type V3f = { A : float32; B : float32; C : float32 }"
+                    "extern let sum3 : int -> int -> int"
+                    "let pts = [| { A = 1.0f; B = 2.0f; C = 3.0f }; { A = 4.0f; B = 5.0f; C = 6.0f }; { A = 7.0f; B = 8.0f; C = 9.0f } |]"
+                    "let ptr = Array.pin pts"
+                    "let n = print (Array.byteSize pts)"
+                    "let s = print (sum3 ptr 3)"
+                    "let live = print (pts.[2].C)"
+                    "" ])
+            let bytes, errs = ws.EmitProgramWasm ()
+            Expect.isEmpty errs "compiles"
+            let dir = System.IO.Path.GetTempPath()
+            let envPath = dir + "fppcsum3.wat"
+            let progPath = dir + "fpppin3.wasm"
+            // stride 12, three floats each: exactly what a C `V3f*` walk is
+            System.IO.File.WriteAllText(envPath,
+                String.concat "\n" [
+                    "(module"
+                    "  (import \"mainmem\" \"memory\" (memory 17))"
+                    "  (func (export \"sum3\") (param $p i32) (param $n i32) (result i32)"
+                    "    (local $i i32) (local $a f32)"
+                    "    (block $d (loop $go"
+                    "      (br_if $d (i32.ge_u (local.get $i) (local.get $n)))"
+                    "      (local.set $a (f32.add (local.get $a) (f32.add (f32.add"
+                    "        (f32.load (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 12))))"
+                    "        (f32.load (i32.add (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 12))) (i32.const 4))))"
+                    "        (f32.load (i32.add (i32.add (local.get $p) (i32.mul (local.get $i) (i32.const 12))) (i32.const 8))))))"
+                    "      (local.set $i (i32.add (local.get $i) (i32.const 1)))"
+                    "      (br $go)))"
+                    "    (i32.trunc_f32_s (local.get $a))))" ])
+            System.IO.File.WriteAllBytes(progPath, bytes)
+            let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+            let psi =
+                System.Diagnostics.ProcessStartInfo(
+                    home + "/.wasmtime/bin/wasmtime",
+                    "run -W exceptions=y -W gc=y --preload env=" + envPath + " " + progPath)
+            psi.RedirectStandardOutput <- true
+            psi.RedirectStandardError <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd()
+            let err = p.StandardError.ReadToEnd()
+            p.WaitForExit()
+            if p.ExitCode <> 0 then
+                Expect.stringContains err "memory" (sprintf "unexpected failure: %s" err)
+            else
+                // 36 bytes for three elements (not 48), 1+..+9 = 45, and the
+                // array still reads correctly from F++ while pinned
+                Expect.equal out "36\n45\n9\n" "C stride, and the array still works"
+        }
         test "extern types are checked" {
             let ws = Workspace()
             ws.SetFileText "f.fpp" "module F\nextern let mul3 : int -> int\nlet bad = mul3 \"nope\"\n"

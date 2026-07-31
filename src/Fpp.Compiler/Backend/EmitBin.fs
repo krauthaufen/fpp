@@ -1037,7 +1037,7 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyArray m "$parr_l" "i64"
     tyArray m "$parr_h" "i16"
     tyStruct m "$iter" [ fld false "i32"; fld true "anyref"; fld true "anyref"; fld true "i32" ]
-    tyArray m "$pk" "i64"
+    tyArray m "$pk" "i32"
     tyStruct m "$hnd" [ fldRefNull true "$pk"; fld true "i32"; fld true "i32" ]
     tyStruct m "$boxl" [ fld false "i64" ]
     tyStruct m "$boxs" [ fld false "f32" ]
@@ -4216,21 +4216,29 @@ let rtCore12 (m : Mod) : unit =
     endFn f
 
 // ---- runtime: POD word handles and the linear-memory pin heap ---------------
-// A POD struct array is a $hnd over i64 words ($pk) — C-image layout.
-// Pinning copies the words into linear memory (the GC side is dropped while
-// pinned); unpinning copies back. The word accessors dispatch on which side
-// currently holds the data.
+// A POD struct array is a $hnd over 32-bit words ($pk), laid out exactly as a
+// C compiler lays out an array of that struct. THIRTY-TWO bits is what makes
+// that true rather than approximately true: every struct's size is a multiple
+// of four, so an element occupies a whole number of words and the GC stride IS
+// the C stride. With 64-bit words a three-float vector would round up from
+// twelve bytes to sixteen, and a foreign reader walking the array by twelve —
+// which is what clang and emscripten emit — would drift by one float per
+// element.
+//
+// Pinning therefore copies word for word (the GC side is dropped while
+// pinned); unpinning copies back. The accessors dispatch on which side holds
+// the data. An eight-byte field spans two words and is assembled from them.
 
 let rtTypes13 (m : Mod) : unit =
-    tyFunc m "$rt_ai2l" [ "anyref"; "i32" ] [ "i64" ]
-    tyFunc m "$rt_ail2v" [ "anyref"; "i32"; "i64" ] []
+    tyFunc m "$rt_ai2i2" [ "anyref"; "i32" ] [ "i32" ]
+    tyFunc m "$rt_aii2v" [ "anyref"; "i32"; "i32" ] []
 
 let rtDecls13 (m : Mod) : unit =
     declFn m "$balloc" "$rt_i2i"
     declFn m "$pinh" "$rt_a2i"
     declFn m "$unpinh" "$rt_a2i"
-    declFn m "$hwget" "$rt_ai2l"
-    declFn m "$hwset" "$rt_ail2v"
+    declFn m "$hwget" "$rt_ai2i2"
+    declFn m "$hwset" "$rt_aii2v"
     declFn m "$hlen" "$rt_a2i"
 
 let rtCore13 (m : Mod) : unit =
@@ -4299,7 +4307,7 @@ let rtCore13 (m : Mod) : unit =
     gci f "array.len"
     ls f "$n"
     lg f "$n"
-    ic f 8
+    ic f 4
     ins f "i32.mul"
     callf f "$balloc"
     ls f "$p"
@@ -4311,14 +4319,14 @@ let rtCore13 (m : Mod) : unit =
     brIf f "$d"
     lg f "$p"
     lg f "$i"
-    ic f 8
+    ic f 4
     ins f "i32.mul"
     ins f "i32.add"
     lg f "$s"
     gcT f "ref.cast" "$pk"
     lg f "$i"
     gcT f "array.get" "$pk"
-    mem f "i64.store"
+    mem f "i32.store"
     lg f "$i"
     ic f 1
     ins f "i32.add"
@@ -4379,10 +4387,10 @@ let rtCore13 (m : Mod) : unit =
     lg f "$i"
     lg f "$p"
     lg f "$i"
-    ic f 8
+    ic f 4
     ins f "i32.mul"
     ins f "i32.add"
-    mem f "i64.load"
+    mem f "i32.load"
     gcT f "array.set" "$pk"
     lg f "$i"
     ic f 1
@@ -4409,15 +4417,15 @@ let rtCore13 (m : Mod) : unit =
     gcT f "ref.cast" "$hnd"
     gcTF f "struct.get" "$hnd" 0
     ins f "ref.is_null"
-    ifV f "i64"
+    ifV f "i32"
     lg f "$h"
     gcT f "ref.cast" "$hnd"
     gcTF f "struct.get" "$hnd" 1
     lg f "$i"
-    ic f 8
+    ic f 4
     ins f "i32.mul"
     ins f "i32.add"
-    mem f "i64.load"
+    mem f "i32.load"
     elseB f
     lg f "$h"
     gcT f "ref.cast" "$hnd"
@@ -4439,11 +4447,11 @@ let rtCore13 (m : Mod) : unit =
     gcT f "ref.cast" "$hnd"
     gcTF f "struct.get" "$hnd" 1
     lg f "$i"
-    ic f 8
+    ic f 4
     ins f "i32.mul"
     ins f "i32.add"
     lg f "$v"
-    mem f "i64.store"
+    mem f "i32.store"
     elseB f
     lg f "$h"
     gcT f "ref.cast" "$hnd"
