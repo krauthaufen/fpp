@@ -788,6 +788,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // inside this very pass — the fuel counter never fires
                     if not failed then vecAdd queue (offset, c)
                 | Classes.Deferred -> vecAdd survivors (offset, c)
+                | Classes.Ambiguous insts ->
+                    // overlapping instances that order neither way. More
+                    // information cannot break the tie, so say so here
+                    // rather than letting the use fall through unresolved.
+                    if isGround c then
+                        progress <- true
+                        vecAdd diags
+                            (offset,
+                             "overlapping instances for " + c.Class + "<"
+                             + String.concat ", " (List.map typeString c.Args)
+                             + ">: " + String.concat " and " (insts |> List.map (fun i ->
+                                 i.Class + "<" + String.concat ", " (List.map typeString i.Head) + ">"))
+                             + " — neither is more specific")
+                    else vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
                     if isGround c then
                         progress <- true
@@ -3071,6 +3085,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if byName then
                 let tn =
                     match c.Args |> List.tryHead |> Option.map prune with
+                    | Some (TCon (_, targs) as ct) when not (List.isEmpty targs) -> typeConName ct
                     | Some (TCon (n, _)) -> n
                     | Some (TVar v) -> "#" + string v.Id
                     | _ -> ""

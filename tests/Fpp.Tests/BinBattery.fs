@@ -34,6 +34,18 @@ let private runProgram (lines : string list) : string =
 let private expects (name : string) (src : string list) (stdout : string) =
     test name { Expect.equal (runProgram src) stdout "program stdout" }
 
+/// A program that must NOT compile, and the phrase the diagnostic has to
+/// carry. Refusing is a feature here, so it needs a gate of its own.
+let private rejects (name : string) (src : string list) (phrase : string) =
+    test name {
+        let ws = Fpp.Workspace ()
+        ws.SetFileText "p.fpp" (String.concat "\n" src + "\n")
+        let _, errs = ws.EmitProgramWasm ()
+        let joined = String.concat " | " errs
+        Expect.isTrue (joined.Contains phrase)
+            (sprintf "expected a diagnostic containing %A, got: %s" phrase joined)
+    }
+
 [<Tests>]
 let binBattery =
     testList "binary battery" [
@@ -536,6 +548,65 @@ let binBattery =
               "    match answer with"
               "    | Total v -> print (v.X + v.Y)" ]
             "57\n40\n"
+
+        // OVERLAPPING instances: a blanket instance and one that overtakes it
+        // for a specific element type. The specific one wins — including from
+        // inside a body generic in its whole argument, where the blanket
+        // instance matched exactly while the variable was still open. That
+        // case is the one that makes overlap unsound if selection commits
+        // early, so it is the one worth pinning.
+        expects "the more specific instance wins, even under genericity"
+            [
+              "[<Struct>]"
+              "type V2d = { X : float; Y : float }"
+              "class Show2<'a>"
+              "    static show2 : 'a -> string"
+              "instance Show2<int>"
+              "    static show2 (x : int) = \"i\" + string x"
+              "instance Show2<V2d>"
+              "    static show2 (v : V2d) = \"v\""
+              "instance Show2<'a[]>"
+              "    when Show2<'a>"
+              "    static show2 (xs : 'a[]) = \"[\" + string xs.Length + \" generic]\""
+              "instance Show2<V2d[]>"
+              "    static show2 (xs : V2d[]) = \"[\" + string xs.Length + \" blit]\""
+              "let describe (x : 'b) : string when Show2<'b> = show2 x"
+              "let go ="
+              "    print (show2 [| 1; 2; 3 |])"
+              "    print (show2 [| { X = 1.0; Y = 2.0 } |])"
+              "    print (describe [| 1; 2; 3 |])"
+              "    print (describe [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |])"
+              "    print (describe 7)" ]
+            "[3 generic]\n[1 blit]\n[3 generic]\n[2 blit]\ni7\n"
+
+        // Instances that overlap without ordering are REFUSED. Picking one
+        // would make the program's meaning depend on declaration order.
+        rejects "instances that order neither way are refused"
+            [
+              "type Pair<'a, 'b> = { A : 'a; B : 'b }"
+              "class P<'t>"
+              "    static p : 't -> string"
+              "instance P<Pair<int, 'b>>"
+              "    static p (x : Pair<int, 'b>) = \"left\""
+              "instance P<Pair<'a, bool>>"
+              "    static p (x : Pair<'a, bool>) = \"right\""
+              "let go = print (p { A = 1; B = true })" ]
+            "neither is more specific"
+
+        // ...but the same pair is fine wherever only one of them applies.
+        expects "overlapping heads still resolve where only one applies"
+            [
+              "type Pair<'a, 'b> = { A : 'a; B : 'b }"
+              "class P<'t>"
+              "    static p : 't -> string"
+              "instance P<Pair<int, 'b>>"
+              "    static p (x : Pair<int, 'b>) = \"left\""
+              "instance P<Pair<'a, bool>>"
+              "    static p (x : Pair<'a, bool>) = \"right\""
+              "let go ="
+              "    print (p { A = 1; B = 2 })"
+              "    print (p { A = \"s\"; B = true })" ]
+            "left\nright\n"
 
         // Raw linear memory: the store the wire format is written into, and
         // the one a pinned array already lives in — so a blit between them is

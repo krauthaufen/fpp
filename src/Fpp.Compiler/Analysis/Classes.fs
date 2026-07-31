@@ -194,6 +194,20 @@ let rec private compatible (ps : Set<int>) (pat : Type) (tgt : Type) : bool =
     | TVar _, _ -> false
     | _ -> false
 
+/// Is `b`'s head, with `b`'s OWN variables free, a match for `a`'s head?
+/// That is: is every type `a` accepts also accepted by `b`? `'a[]` matches
+/// `V2d[]` this way, and not the other way round — which is exactly what
+/// makes `V2d[]` the more specific of the two.
+let private headSubsumes (b : InstanceDef) (a : InstanceDef) : bool =
+    let ps = b.Params |> List.map (fun v -> v.Id) |> Set.ofList
+    let sub = dictNew<int, Type> ()
+    b.Head.Length = a.Head.Length && List.forall2 (matchTy ps sub) b.Head a.Head
+
+/// `a` is STRICTLY more specific than `b`: b accepts everything a does, and
+/// a does not accept everything b does.
+let moreSpecific (a : InstanceDef) (b : InstanceDef) : bool =
+    headSubsumes b a && not (headSubsumes a b)
+
 type Selection =
     /// the instance, and the substitution for its own variables
     | Solved of InstanceDef * Dict<int, Type>
@@ -202,6 +216,10 @@ type Selection =
     | Improve of InstanceDef
     /// several instances could still apply; ask again when more is known
     | Deferred
+    /// several EXACT matches, none more specific than the others. Unlike
+    /// Deferred this cannot improve with more information — the overlap
+    /// itself is the problem.
+    | Ambiguous of InstanceDef list
     | NoInstance
 
 /// Pick the instance for `cls` at `args`. `assoc` are the associated-type
@@ -218,11 +236,35 @@ let select (t : Tables) (cls : string) (args : Type list) (assoc : (string * Typ
             if i.Head.Length = args.Length
                && List.forall2 (matchTy ps sub) i.Head args then Some (i, sub)
             else None)
+    /// Could a STRICTLY more specific instance than `chosen` still apply once
+    /// the target's own variables are known? If so, committing now would
+    /// answer a question the use site has not finished asking: inside a body
+    /// generic in 'a, `Serialize<'a[]>` matches exactly, yet at 'a = V2d the
+    /// specific instance is the right one. Deferring sends the constraint
+    /// down the path that resolves after monomorphization, where the element
+    /// type is a concrete name and the choice is no longer a guess.
+    let overtakable (chosen : InstanceDef) =
+        cands |> List.exists (fun j ->
+            not (System.Object.ReferenceEquals (j, chosen))
+            && moreSpecific j chosen
+            && (let ps = j.Params |> List.map (fun v -> v.Id) |> Set.ofList
+                j.Head.Length = args.Length && List.forall2 (compatible ps) j.Head args))
+    let settle (i : InstanceDef) (sub : Dict<int, Type>) =
+        if overtakable i then Deferred else Solved (i, sub)
     match exact with
-    | [ (i, sub) ] -> Solved (i, sub)
-    // coherence makes two exact matches impossible; if it is ever violated,
-    // refusing to choose beats choosing arbitrarily
-    | _ :: _ :: _ -> Deferred
+    | [ (i, sub) ] -> settle i sub
+    // OVERLAPPING instances: the most specific one wins, and it has to be
+    // unique. Two that merely differ — `C<int, 'b>` and `C<'a, bool>` at
+    // `C<int, bool>` — order neither way, and picking arbitrarily is how a
+    // program's meaning starts depending on declaration order.
+    | _ :: _ :: _ ->
+        let maximal =
+            exact |> List.filter (fun (i, _) ->
+                not (exact |> List.exists (fun (j, _) ->
+                        not (System.Object.ReferenceEquals (i, j)) && moreSpecific j i)))
+        (match maximal with
+         | [ (i, sub) ] -> settle i sub
+         | _ -> Ambiguous (maximal |> List.map fst))
     | [] ->
         let possible =
             cands |> List.filter (fun i ->

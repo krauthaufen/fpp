@@ -107,6 +107,22 @@ let splitInstName (n : string) : string * string list =
         if vecLen piece > 0 then vecAdd args (String.concat "" (vecToList piece))
         head, vecToList args
 
+/// Does an instance head PATTERN accept this concrete instantiation name?
+/// A `#n` stands for one of the instance's own variables and accepts
+/// anything, so `list$<#28>` accepts `list$<int>`.
+let rec nameMatches (pat : string) (name : string) : bool =
+    if pat.StartsWith "#" then true
+    else
+        let ph, pa = splitInstName pat
+        let nh, na = splitInstName name
+        ph = nh && pa.Length = na.Length && List.forall2 nameMatches pa na
+
+/// How general a head pattern is: the number of variables it leaves open.
+/// Fewer is more specific, which is how the overlapping instance wins.
+let rec nameHoles (pat : string) : int =
+    if pat.StartsWith "#" then 1
+    else splitInstName pat |> snd |> List.sumBy nameHoles
+
 let private mangleInst (name : string) (inst : string list) =
     name + "$" + String.concat "$" inst
 
@@ -540,10 +556,38 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              match dictTryFind instanceFns (instanceKey cls memberName [ hd ]) with
                              | Some v -> Some v
                              | None -> dictTryFind instanceFns (instanceKey cls memberName [ hd; hd ])
+                     // Neither the exact name nor the constructor found one:
+                     // scan the class' instance heads as PATTERNS. This is
+                     // what resolves `list$<int>` against `instance C<list<'a>>`
+                     // once overlapping instances make the constructor alone
+                     // ambiguous — and among several matches the one with the
+                     // fewest open variables wins, which is the same
+                     // most-specific rule the checker used.
+                     let byPattern () =
+                         let prefix = cls + "|" + memberName + "|"
+                         let hits = vecNew<int * (VarId * bool)> ()
+                         for key, value in dictPairs instanceFns do
+                             if key.StartsWith prefix then
+                                 let heads = key.Substring(strLen prefix).Split '@' |> Array.toList
+                                 match heads with
+                                 | [ h ] when nameMatches h tn -> vecAdd hits (nameHoles h, value)
+                                 | [ h1; h2 ] when nameMatches h1 tn && nameMatches h2 tn ->
+                                     vecAdd hits (nameHoles h1, value)
+                                 | _ -> ()
+                         let ranked = vecToList hits |> List.sortBy fst
+                         match ranked with
+                         | [] -> None
+                         | [ (_, v) ] -> Some v
+                         // a tie at the same generality is the ambiguity the
+                         // checker already rejects; leave it unresolved
+                         | (n1, v) :: (n2, _) :: _ -> if n1 < n2 then Some v else None
                      let chosen =
                          match byOne with
                          | Some _ -> byOne
-                         | None -> (match byTwo with Some _ -> byTwo | None -> byHead)
+                         | None ->
+                             match byTwo with
+                             | Some _ -> byTwo
+                             | None -> (match byHead with Some _ -> byHead | None -> byPattern ())
                      (match chosen with
                       | Some (fn, takesUnit) ->
                           // Only a template needs the instantiation; an
