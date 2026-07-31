@@ -92,6 +92,37 @@ let sourceMapTests =
             Expect.isFalse (plainText.Contains "__desc") "a plain build ships none of it"
         }
 
+        test "a mapped line points at one place, not at scratch buffers" {
+            // Body emission runs a SCRATCH pass into a separate buffer before
+            // writing the real one. Recording positions during that pass put
+            // offsets in the map that named nothing — a breakpoint on
+            // `let doubled` stopped inside `putc`. Each line should map to a
+            // handful of real offsets, not a spray of them.
+            let src =
+                String.concat "\n"
+                    [ "module Prog"
+                      "let compute (a : int) (b : int) ="
+                      "    let sum = a + b"
+                      "    let doubled = sum * 2"
+                      "    doubled"
+                      "let go = print (compute 3 4)"
+                      "" ]
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" src
+            let _, map, errs = ws.EmitProgramWasmWithSourceMap "prog.wasm.map"
+            Expect.isEmpty errs "compiles"
+            let sources =
+                let i = map.IndexOf "\"sources\":["
+                let j = map.IndexOf ']'
+                map.Substring(i + 11, j - i - 11).Split ',' |> Array.map (fun s -> s.Trim '"')
+            let mine = segments map |> List.filter (fun (_, s, _, _) -> sources.[s] = "prog.fpp")
+            Expect.isNonEmpty mine "the user's code is mapped"
+            for line in mine |> List.map (fun (_, _, l, _) -> l) |> List.distinct do
+                let hits = mine |> List.filter (fun (_, _, l, _) -> l = line)
+                Expect.isLessThanOrEqual (List.length hits) 2
+                    ("line " + string (line + 1) + " maps to one or two offsets, not a scratch pass's worth")
+        }
+
         test "no map is emitted unless one is asked for" {
             let ws = Workspace()
             ws.SetFileText "m.fpp" "module M\nlet go = print 1\n"

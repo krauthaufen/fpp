@@ -562,7 +562,12 @@ let dbgFrame (f : Fn) (delta : int) (frameId : int) : unit =
 /// Called at the start of a function and at each statement, which is the
 /// granularity a debugger steps at.
 let markSrc (f : Fn) (path : string) (off : int) : unit =
-    if path <> "" && off >= 0 then vecAdd f.M.SrcPos (f.B.Count, path, off)
+    // ONLY while writing the real code stream. Body emission runs a scratch
+    // pass into a separate buffer first, and an offset into that buffer names
+    // nothing — it pointed breakpoints at whatever function happened to live
+    // at the same number in the real module.
+    if path <> "" && off >= 0 && System.Object.ReferenceEquals (f.B, f.M.CodeBody) then
+        vecAdd f.M.SrcPos (f.B.Count, path, off)
 
 // ---- final assembly --------------------------------------------------------
 
