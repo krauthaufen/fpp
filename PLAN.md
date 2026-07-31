@@ -3074,6 +3074,29 @@ silently repoints every read of that parameter — a prelude function with a
 parameter `h` met an emitter local `$h`, and only the HashMap tests noticed.
 That is exactly why display names are a separate table now.
 
+VERIFIED IN THE REAL TOOLS (`tests/tooling/`, run by hand — they need a display,
+Chrome and VS Code):
+* CHROME. A breakpoint at the byte offset our map gives for `let doubled = ...`
+  pauses inside `$compute` — and the locals read
+  `$a=3, $b=4, $sum=7, $doubled=0, $a'=null`: parameters and let-bindings under
+  the names they were written with, the shadowing binding as `a'`, and values
+  exactly right for that line (a, b, sum computed; doubled and a' not yet).
+  This FOUND A BUG: `markSrc` also fired during the SCRATCH emission pass, whose
+  offsets index a different buffer — a breakpoint on `let doubled` stopped
+  inside `putc`. Positions are now recorded only while writing the real code
+  stream, with a regression test.
+* VS CODE. The editor's own extension-test host, so the whole chain is live:
+  VS Code -> extension -> LSP client -> Fpp.Lsp -> compiler. Hovering `double`
+  in the playground gives
+  `let double : 'a -> 'b when Add<'a, 'a> with Result = 'b` — the generic scheme
+  WITH its inferred constraint — at the definition and at both use sites, and
+  `parameter x : 'a` on the parameter.
+
+Two traps worth remembering: `Debugger.setBreakpointByUrl` on a `.fpp` URL does
+not bind from raw CDP (source-map resolution is the DevTools FRONTEND's job), and
+VS Code needs `--password-store=basic` or a keyring dialog blocks startup so the
+extension host never runs.
+
 STILL OPEN: rendering a trace to NAMES inside the guest (the ids are there; the
 names need an offset/length table and a data segment), and capturing a trace at
 `failwith` so an exception carries the stack it was raised from.
