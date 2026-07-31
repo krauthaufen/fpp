@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>wasm features</title>
+<script type="module">
+const r = {};
+const load = async n => new Uint8Array(await (await fetch(n)).arrayBuffer());
+// 1. JS string builtins — JS strings held as externref, no copy
+try {
+  const m = new WebAssembly.Module(await load('jsstr.wasm'), { builtins: ['js-string'] });
+  const i = new WebAssembly.Instance(m, {});
+  const s = 'hello wasm';
+  r.jsStringBuiltins = 'YES len("' + s + '")=' + i.exports.len(s) +
+    ' concat=' + JSON.stringify(i.exports.cat('a', 'b'));
+} catch (e) { r.jsStringBuiltins = 'no: ' + e.message.slice(0, 90); }
+// 2. threads over linear memory
+r.sharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined';
+r.crossOriginIsolated = self.crossOriginIsolated;
+try {
+  const m = new WebAssembly.Module(await load('threads.wasm'));
+  const i = new WebAssembly.Instance(m, {});
+  i.exports.bump(0); i.exports.bump(0);
+  r.sharedMemoryAtomics = 'YES, counter=' + new Int32Array(i.exports.mem.buffer)[0];
+} catch (e) { r.sharedMemoryAtomics = 'no: ' + e.message.slice(0, 90); }
+// 3. shared-everything threads: SHARED gc structs across workers
+try {
+  new WebAssembly.Module(await load('sharedgc.wasm'));
+  r.sharedGcStructs = 'YES';
+} catch (e) { r.sharedGcStructs = 'no: ' + e.message.slice(0, 90); }
+// 4. JSPI, for async without blocking
+r.jspi = typeof WebAssembly.Suspending === 'function';
+r.workers = typeof Worker === 'function';
+window.features = r; window.ready = true;
+</script>

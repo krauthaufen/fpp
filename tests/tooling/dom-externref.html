@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>wasm dom</title>
+<div id="root"></div>
+<script type="module">
+const strings = ['div', 'made by wasm, holding JS objects directly'];
+const imports = {
+  dom: {
+    createElement: tag => document.createElement(tag),
+    setText: (el, text) => { el.textContent = text; },
+    appendChild: (parent, child) => parent.appendChild(child),
+    literal: i => strings[i],
+  }
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('dom.wasm'), imports);
+instance.exports.build(document.getElementById('root'));
+window.result = document.getElementById('root').innerHTML;
+window.ready = true;
+</script>
