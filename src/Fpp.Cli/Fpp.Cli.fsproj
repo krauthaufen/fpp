@@ -15,4 +15,7 @@
     <ProjectReference Include="../Fpp.Compiler/Fpp.Compiler.fsproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="native/*.c" CopyToOutputDirectory="PreserveNewest" LinkBase="native" />
+  </ItemGroup>
 </Project>
