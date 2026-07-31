@@ -190,3 +190,36 @@ UNUSED IMPORTS: declare 300 `extern`s, use two, and the module contains exactly
 touches — generate the whole WebIDL surface as typed `extern`s and let the
 compiler drop the rest. The typed generic primitives stay for the genuinely
 dynamic cases, where the property name is not known until run time.
+
+## events — the event object, and handlers that carry state
+
+`events.wat` installs a WASM FUNCTION as a `mousemove` listener and, from
+inside wasm, reads the event's `type` (a string), `clientX`/`clientY` (numbers),
+the NESTED `target.id`, and calls `preventDefault()` on it. Measured result:
+
+    wasm read from the event : mousemove|37|91|stage
+    event.preventDefault() called from wasm: true
+
+So every field, nested object and method on an event is reachable. Cost is a
+non-issue here: ten fields is ~110 ns, and even at 240 Hz that is 26 us per
+second of wall clock. Events are not where the boundary hurts — tight field
+loops are.
+
+`closures.wat` is the part that actually needs designing. An F++ lambda is a
+struct of code plus captured environment, not a bare `funcref`, so JS cannot
+call it directly. The bridge is three lines:
+
+* wasm exports ONE `applyCallback(closure, event)`,
+* the JS import `makeCallback(clo)` returns `ev => applyCallback(clo, ev)`,
+* the closure travels as `anyref` — a GC reference, no table, no leak.
+
+Measured: two listeners built from the same code with different captured state,
+fed events with `detail` 5, 7 and 100, end up holding 12 and 100. Captured
+state and the event object are both live inside the handler.
+
+Two consequences worth knowing:
+* `preventDefault()` must happen synchronously, so a handler that defers to a
+  promise before deciding has already lost the chance.
+* The listener arrives typed as `Event`. Which concrete type it really is comes
+  from the event NAME, so a generated binding should type `addEventListener` by
+  name (`"mousemove" -> MouseEvent`) rather than making callers downcast.

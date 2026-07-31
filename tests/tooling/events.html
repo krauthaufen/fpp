@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>events into wasm</title>
+<div id="stage" style="width:200px;height:100px">stage</div>
+<script type="module">
+const S = ['clientX','clientY','type','target','id','preventDefault','textContent','|'];
+const js = {
+  getNum: (o, k) => o[k], getRef: (o, k) => o[k], getStr: (o, k) => o[k],
+  invoke0: (o, k) => o[k](), setStr: (o, k, v) => { o[k] = v; },
+  concat: (a, b) => a + b, str: i => S[i], numToStr: x => String(x),
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('events.wasm'), { js });
+instance.exports.init();
+const stage = document.getElementById('stage');
+// the LISTENER IS A WASM FUNCTION
+stage.addEventListener('mousemove', instance.exports.listener());
+const ev = new MouseEvent('mousemove', { clientX: 37, clientY: 91, cancelable: true });
+const notCancelled = stage.dispatchEvent(ev);
+window.result = { fromWasm: instance.exports.report(), defaultPrevented: ev.defaultPrevented, dispatchReturned: notCancelled };
+window.ready = true;
+</script>

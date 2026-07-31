@@ -1,0 +1,22 @@
+<!doctype html><meta charset="utf-8"><title>closures as listeners</title>
+<div id="a">a</div><div id="b">b</div>
+<script type="module">
+const S = ['detail','addEventListener','tick'];
+let exports;
+const js = {
+  // the whole bridge: hold the closure, hand JS a function that calls back in
+  makeCallback: clo => (ev) => exports.applyCallback(clo, ev),
+  invoke2: (o, k, a, b) => o[k](a, b),
+  getNum: (o, k) => o[k], str: i => S[i],
+  global: n => globalThis[n], getRef: (o, k) => o[k],
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('closures.wasm'), { js });
+exports = instance.exports;
+const a = document.getElementById('a'), b = document.getElementById('b');
+exports.install(a, b);
+a.dispatchEvent(new CustomEvent('tick', { detail: 5 }));
+a.dispatchEvent(new CustomEvent('tick', { detail: 7 }));
+b.dispatchEvent(new CustomEvent('tick', { detail: 100 }));
+window.result = { a: exports.hits1(), b: exports.hits2() };
+window.ready = true;
+</script>

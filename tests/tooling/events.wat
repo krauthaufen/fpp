@@ -1,0 +1,51 @@
+;; A wasm function IS the listener. The event arrives as externref, and every
+;; field, nested object and method is reachable from inside wasm.
+(module
+  (import "js" "getNum"  (func $getNum  (param externref externref) (result f64)))
+  (import "js" "getRef"  (func $getRef  (param externref externref) (result externref)))
+  (import "js" "getStr"  (func $getStr  (param externref externref) (result externref)))
+  (import "js" "invoke0" (func $invoke0 (param externref externref) (result externref)))
+  (import "js" "setStr"  (func $setStr  (param externref externref externref)))
+  (import "js" "concat"  (func $concat  (param externref externref) (result externref)))
+  (import "js" "str"     (func $str     (param i32) (result externref)))
+  (import "js" "numToStr"(func $numToStr(param f64) (result externref)))
+
+  (global $nClientX (mut externref) (ref.null extern))
+  (global $nClientY (mut externref) (ref.null extern))
+  (global $nType    (mut externref) (ref.null extern))
+  (global $nTarget  (mut externref) (ref.null extern))
+  (global $nId      (mut externref) (ref.null extern))
+  (global $nPrevent (mut externref) (ref.null extern))
+  (global $nTextC   (mut externref) (ref.null extern))
+  (global $nSep     (mut externref) (ref.null extern))
+  (global $out      (mut externref) (ref.null extern))
+
+  (func (export "init")
+    (global.set $nClientX (call $str (i32.const 0)))
+    (global.set $nClientY (call $str (i32.const 1)))
+    (global.set $nType    (call $str (i32.const 2)))
+    (global.set $nTarget  (call $str (i32.const 3)))
+    (global.set $nId      (call $str (i32.const 4)))
+    (global.set $nPrevent (call $str (i32.const 5)))
+    (global.set $nTextC   (call $str (i32.const 6)))
+    (global.set $nSep     (call $str (i32.const 7))))
+
+  ;; the listener: reads scalars, a STRING, a NESTED object's field, and calls
+  ;; a METHOD on the event — everything a handler actually needs
+  (func $onMove (param $ev externref)
+    (local $target externref) (local $s externref)
+    (local.set $target (call $getRef (local.get $ev) (global.get $nTarget)))
+    (local.set $s (call $getStr (local.get $ev) (global.get $nType)))
+    (local.set $s (call $concat (local.get $s) (global.get $nSep)))
+    (local.set $s (call $concat (local.get $s) (call $numToStr (call $getNum (local.get $ev) (global.get $nClientX)))))
+    (local.set $s (call $concat (local.get $s) (global.get $nSep)))
+    (local.set $s (call $concat (local.get $s) (call $numToStr (call $getNum (local.get $ev) (global.get $nClientY)))))
+    (local.set $s (call $concat (local.get $s) (global.get $nSep)))
+    (local.set $s (call $concat (local.get $s) (call $getStr (local.get $target) (global.get $nId))))
+    ;; a method ON the event object
+    (drop (call $invoke0 (local.get $ev) (global.get $nPrevent)))
+    (global.set $out (local.get $s)))
+  (elem declare func $onMove)
+  (func (export "listener") (result funcref) (ref.func $onMove))
+  (func (export "report") (result externref) (global.get $out))
+)
