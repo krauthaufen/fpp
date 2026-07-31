@@ -58,6 +58,19 @@ type St =
       Pod : Dict<string, (string * string * int) list * int * int>
       /// POD struct -> its alignment, which is also its backing word width
       PodAlign : Dict<string, int>
+      /// Whether to optimize at all. A debug build wants code that matches
+      /// the source it came from: a hoisted base and an elided branch are
+      /// both invisible in the source, and a debugger stepping through them
+      /// has nothing to point at.
+      mutable Opt : bool
+      /// POD types the program ever pins. An access to a type that is never
+      /// pinned cannot be looking at linear memory, so it needs no test for
+      /// it — which takes a branch out of every element read.
+      PinnedTypes : Dict<string, bool>
+      /// A top-level `let` bound to a LITERAL. Reading it as a global costs
+      /// a load and an unbox at every use — inside a loop condition, every
+      /// iteration — when the value was known at compile time all along.
+      ConstGlobal : Dict<string * int, Expr>
       /// A POD array whose base has been hoisted out of the loop being
       /// emitted: global name -> (typed storage local, pin-pointer local).
       /// Nothing in a loop changes either, so fetching them once turns every
@@ -703,7 +716,14 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
         ins f "i32.add"
     // the word, however it has to be reached — everything after this is the
     // same either way, so the match must not swallow it
+    let everPinned = not st.Opt || (dictTryFind st.PinnedTypes rn).IsSome
     (match dictTryFind st.PodBase hl with
+     | Some (sto, _) when not everPinned ->
+         // nothing in the program pins this type, so the storage is there:
+         // the load, and nothing else
+         lg f sto
+         idx ()
+         gcT f getOp ty
      | Some (sto, ptr) ->
          // the base was hoisted: no global read, no casts, just the load
          lg f sto
@@ -720,6 +740,15 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
          idx ()
          gcT f getOp ty
          endB f
+     | None when not everPinned ->
+         // never pinned anywhere, so the storage is always there: read it
+         // without asking whether this array happens to be in linear memory
+         lg f hl
+         gcT f "ref.cast" "$hnd"
+         gcTF f "struct.get" "$hnd" 0
+         gcT f "ref.cast" ty
+         idx ()
+         gcT f getOp ty
      | None ->
          lg f hl
          gcT f "ref.cast" "$hnd"
@@ -866,7 +895,7 @@ and private podHandleLocal (st : St) (f : Fn) (lv : Dict<string * int, string>) 
 /// to the end of the loop, and code on another path must not read them.
 and private podHoistLoop (st : St) (f : Fn) (parts : Expr list) : string list =
     let cand = dictNew<string, string> ()
-    let mutable blocked = false
+    let mutable blocked = not st.Opt
     let rec scan (e : Expr) : unit =
         // pinning MOVES the storage, so a loop that pins keeps its base fresh
         (match e with
@@ -990,6 +1019,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  ins f "drop"
              emitNode st f lv last)
     | EVarI (v, sch, _) -> emitNode st f lv (EVar (v, sch))
+    | EVar (v, _) when st.Opt && (dictTryFind st.ConstGlobal (v.Path, v.Offset)).IsSome
+                       && not (dictTryFind lv (v.Path, v.Offset)).IsSome ->
+        emitNode st f lv (dictTryFind st.ConstGlobal (v.Path, v.Offset)).Value
     | EVar (v, _) ->
         let vk = (v.Path, v.Offset)
         (match dictTryFind lv vk with
@@ -3176,6 +3208,9 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
           Pod = dictNew (); PodAlign = dictNew (); PodBase = dictNew ()
+          ConstGlobal = dictNew (); PinnedTypes = dictNew ()
+          // a debug build keeps the code shaped like its source
+          Opt = not debugBuild
           StructFields = dictNew ()
           DbgFrame = -1
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
@@ -3509,6 +3544,19 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // Equals/GetHashCode override on a union fills its tags' slots
     // program globals + init function declarations
     let inits = vecNew<string> ()
+    // A top-level binding is only constant if nothing ever assigns to it.
+    let assignedVars = dictNew<string * int, bool> ()
+    let rec scanAssign (e : Expr) : unit =
+        (match e with
+         | EAssign (v, _) -> dictSet assignedVars (v.Path, v.Offset) true
+         | EArrayPin (nm, _) | EArrayUnpin (nm, _) | EArrayBytes (nm, _) ->
+             dictSet st.PinnedTypes nm true
+         | _ -> ())
+        podScanChildren scanAssign e
+    for d in decls do
+        match d with
+        | DLet (_, _, _, body) -> scanAssign body
+        | _ -> ()
     for d in decls do
         match d with
         | DLet (_, v, sch, ELam (ps, _)) ->
@@ -3534,10 +3582,14 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 declFn m fn tn
             else
                 declFn m fn ("$v" + string (List.length ps))
-        | DLet (_, v, _, _) ->
+        | DLet (isRec, v, _, rhs) ->
             let g = mangle v
             dictSet st.GlobalOf (v.Path, v.Offset) g
             globalAnyref m g
+            (match rhs with
+             | ELit _ when not isRec && not (dictTryFind assignedVars (v.Path, v.Offset)).IsSome ->
+                 dictSet st.ConstGlobal (v.Path, v.Offset) rhs
+             | _ -> ())
         | _ -> ()
     // generated identity per obj record, then the descriptor globals — the
     // member fns those vtables reference are all declared by now

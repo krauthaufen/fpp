@@ -357,7 +357,7 @@ against a compiler rather than against a reading of the ABI.
 Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
 
     C -O2   71 ms
-    F++    328 ms      (4.6x)
+    F++    191 ms      (2.7x)
 
 Two things dominated before, and neither was the read.
 
@@ -388,10 +388,27 @@ pins is left alone, since pinning moves the storage.
     fill + 20M reads        441 ms -> 193 ms
     the whole benchmark     656 ms -> 328 ms
 
-What is left is the loop condition. `while i < n` reads `n` from a global and
-calls `$toi` to unbox it, every iteration — and a call is a barrier, so it
-also stops the engine hoisting anything of its own. Hand-editing that away
-took the same program to 209 ms (2.9x C), which is the next target.
+Two more followed, and neither is loop-specific:
+
+A top-level `let` bound to a literal is now the literal at its use sites. It
+was a global load plus an unbox — in `while i < n`, on every iteration.
+
+An element read no longer asks whether the array is pinned unless the program
+pins that type SOMEWHERE. Nothing else can put a POD array in linear memory,
+so if no `Array.pin` mentions the type, the test is dead and every read drops
+a branch. That one step was 298 ms -> 191 ms.
+
+All three are off in a debug build: hoisted bases and elided branches are
+invisible in the source, and a debugger stepping through them has nothing to
+point at.
+
+    filling a 1M V3f[]      189 ms -> 50 ms
+    fill + 20M reads        441 ms -> 146 ms
+    the whole benchmark     656 ms -> 191 ms
+    let e = v.[i]           57.6 s -> 10.0 s
+
+An offset cache for `i * stride` across the fields of one element was tried
+and dropped: it made no difference, so the engine is already doing it.
 
 `let e = v.[i]` also remains: it materializes the element and is ~60x slower
 than reading its fields directly — the same allocation problem the store side
