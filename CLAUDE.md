@@ -90,6 +90,24 @@ reads into twenty-seven before that condition went in. It buys 7% on a tight
 loop (191 ms -> 177 ms) and nothing on a loop whose body is already big
 enough to fall outside the size cap, for +3.2% module size.
 
+### Strength reduction: written, measured, reverted (bug not found)
+
+Induction-variable strength reduction for POD element offsets — one multiply
+before the loop per stride, an add where the counter is bumped — was built and
+verified to fire: `i32.mul` in the vertex loop went from nine to one. It won
+about 1% there, and 15-20% on loops with a single read per iteration
+(146 ms -> 120 ms, 202 ms -> 181 ms).
+
+It also hung the compiler on one program, and the hang was NOT the obvious
+suspects: disabling the registration alone did not fix it, and the failing
+program has no loop of its own. Unshipped rather than shipped broken. If you
+pick it up, start by finding that hang, not by rewriting the pass.
+
+The 1% is itself the lesson: nine multiplies per iteration cost almost
+nothing, because they are independent and the CPU issues them alongside
+everything else. Counting instructions predicted ~19 cycles of savings and
+delivered ~0.5. Instruction count is not the gap to C.
+
 Two were tried, measured, and **reverted** for not paying: inlining `$toi`
 everywhere, and caching `i * stride` across an element's fields (the engine
 already does that one). Do not re-add them without a number.
