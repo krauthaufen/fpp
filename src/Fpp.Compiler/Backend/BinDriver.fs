@@ -639,6 +639,10 @@ let rec private emitPodLeaf (st : St) (f : Fn) (rn : string) (vl : string) (path
 /// straddles a word (see the layout), so each leaf that lands in this word
 /// contributes its bits shifted into place and the word is their union.
 and private emitPodWord (st : St) (f : Fn) (rn : string) (vl : string) (w : int) : unit =
+    emitPodWordOf st f rn (fun path k -> emitPodLeaf st f rn vl path k) w
+
+/// the same, with the leaves coming from wherever the caller says
+and private emitPodWordOf (st : St) (f : Fn) (rn : string) (push : string -> string -> unit) (w : int) : unit =
     let placed, _, _ = (dictTryFind st.Pod rn).Value
     let width = podW st rn
     let wide = width = 8
@@ -646,7 +650,7 @@ and private emitPodWord (st : St) (f : Fn) (rn : string) (vl : string) (w : int)
     let parts = placed |> List.filter (fun (_, _, off) -> off / width = w)
     /// the leaf's bits, in the WORD's type, shifted to its place in the word
     let one (fn : string, k : string, off : int) =
-        emitPodLeaf st f rn vl fn k
+        push fn k
         // to raw bits, in the leaf's own width
         (match k with
          | "f" -> ins f "i64.reinterpret_f64"
@@ -2371,6 +2375,62 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ins f "i32.mul"
         ls f bl
         emitPodBuild st f nm hl bl nm ""
+    // Storing a record LITERAL into a POD array: write the fields straight
+    // into the image. The obvious lowering materializes a GC struct and then
+    // reads it back apart, and that allocation is ruinous — not for its own
+    // cost, but because a live POD array is large, so a million short-lived
+    // structs make the collector trace it over and over. Filling a 1M-element
+    // V3f[] took 3246ms that way and 210ms without the allocation.
+    | EIndexSet (nm, a, i, ERecord (rn, fs)) when
+          (dictTryFind st.Pod nm).IsSome
+          && rn = nm
+          // only a FLAT record: a nested struct field would need its own
+          // literal to take apart, and falling back is always correct
+          && ((dictTryFind st.Pod nm).Value
+              |> fun (placed, _, _) -> placed |> List.forall (fun (p, _, _) -> not (p.Contains "."))) ->
+        let placed, _, wd = (dictTryFind st.Pod nm).Value
+        let hl = freshLocal f "$sha" "anyref"
+        let bl = freshLocal f "$shb" "i32"
+        emitNode st f lv a
+        ls f hl
+        emitNode st f lv i
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        ls f bl
+        // Each field once, in source order, into an UNBOXED local. Boxing
+        // them would only trade one allocation per element for three: the
+        // whole point is that nothing is allocated at all.
+        let railOf (k : string) = match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
+        let slot = dictNew<string, string> ()
+        for fn, fe in fs do
+            match placed |> List.tryFind (fun (p, _, _) -> p = fn) with
+            | Some (_, k, _) ->
+                let l = freshLocal f "$shf" (railOf k)
+                emitNode st f lv fe
+                callf f (podUnbox k)
+                ls f l
+                dictSet slot fn l
+            | None -> ()
+        for w in 0 .. wd - 1 do
+            lg f hl
+            lg f bl
+            ic f w
+            ins f "i32.add"
+            emitPodWordOf st f nm (fun path k ->
+                match dictTryFind slot path with
+                | Some l -> lg f l
+                | None ->
+                    // a field the literal omits cannot happen for a record,
+                    // but zero is the honest answer if it ever does
+                    (match k with
+                     | "f" -> fc f 0L
+                     | "s" -> sc f 0
+                     | "l" -> lc f 0L
+                     | _ -> ic f 0)) w
+            callf f ("$hwset" + string (podW st nm))
+        ic f 0
+        refI31 f
     | EIndexSet (nm, a, i, v) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
         let hl = freshLocal f "$pha" "anyref"

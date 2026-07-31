@@ -349,3 +349,31 @@ wide as the field: reading an `f64` out of a `V2d[]` is one array read where
 
 The battery pins these strides as constants; this script is what checks them
 against a compiler rather than against a reading of the ABI.
+
+## perf — the same vertex loop in C and in F++
+
+    ./tests/tooling/perf/run.sh
+
+Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
+
+    C -O2   71 ms
+    F++    919 ms      (13x)
+
+Two things dominated before, and neither was the read.
+
+Storing a record literal into a POD array used to materialize a GC struct and
+read it straight back apart. The allocation is cheap in isolation — a million
+of them against a one-element array costs 289 ms — but a live POD array is
+LARGE, so a million short-lived objects make the collector trace 12 MB over
+and over. Filling the array cost 3246 ms that way and 189 ms once the fields
+are written straight into the image, unboxed. That is the whole difference
+between 3615 ms and 919 ms here.
+
+Reads were never the problem: 20M POD field reads cost about 100 ms, roughly
+5 ns each, against ~1.7 ns for a packed primitive array. An early reading of
+this benchmark blamed the reads and was wrong — the fill was being counted as
+read time.
+
+What remains is `let e = v.[i]`, which materializes the element and is still
+~60x slower than reading its fields directly. It is the same allocation
+problem seen from the read side and wants the same treatment.
