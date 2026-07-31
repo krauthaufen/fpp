@@ -356,8 +356,31 @@ against a compiler rather than against a reading of the ABI.
 
 Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
 
-    C -O2   71 ms
-    F++    191 ms      (2.7x)
+    C native (gcc -O2)     45 ms
+    C -> wasm (wasmtime)   59 ms     wasm itself costs ~31%
+    .NET steady state     100 ms     JIT, native, real structs
+    F++ -> wasm (same)    174 ms
+
+Both C and F++ run as wasm under the same wasmtime, so that pair is the fair
+one: 2.9x. The .NET figure is steady state — `vertices.dotnet.fs` runs the
+measurement ten times in-process and the first round (155 ms) is JIT warmup,
+after which it sits flat at 100. Worth noting that nothing here reaches C:
+.NET, with a mature JIT and no wasm in the way, is 2.2x native C on this loop.
+
+Where the remaining F++ gap is, exactly. For one field read clang emits
+
+    f32.load offset=1728
+
+having strength-reduced the index into a walking pointer and folded the
+field's byte offset into the load. F++ emits seven instructions, rebuilding
+the address from scratch:
+
+    local.get 3  local.get 13  i32.const 2  i32.add
+    i32.const 4  i32.mul  i32.add  i32.load
+
+Six extra ALU ops per read, three reads per iteration: 18. Measured overhead
+over C-on-wasm is 5.45 ns per iteration, about 19 cycles. That is the 18 ops
+— not the GC, not the bounds check (8%), not the engine.
 
 `shapes.c` / `shapes.fpp` run the same comparison over five struct shapes at
 once — a 12-byte vector, a pair of doubles, a 4-byte colour, a mixed
