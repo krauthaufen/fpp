@@ -909,6 +909,9 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
                  if mustRun (v.Path, v.Offset) then
                      demand (v.Path, v.Offset)
                      scan e)
+        // an exported function is a root: the HOST is the caller, and
+        // nothing in the program names it
+        | DExport (v, _) -> demand (v.Path, v.Offset)
         | _ -> ()
     let mutable i = 0
     while i < vecLen work do

@@ -84,6 +84,9 @@ type Decl =
     | DLet of bool * VarId * Scheme * Expr
     /// foreign import: name resolves in the host's "env" module
     | DExtern of VarId * Scheme
+    /// `[<Export>] let f (x : int) : int` — a function the HOST calls. The
+    /// name is what the wasm export is called.
+    | DExport of VarId * string
     | DUnion of string * string list * (string * int) list
     /// name, type params, fields as (name, kind "f|s|l|i|r"), isStruct
     | DRecord of string * string list * (string * string) list * bool
@@ -194,6 +197,7 @@ and private orProduct (ps : Pat list) : Pat list list =
 let printDecl (d : Decl) : string =
     match d with
     | DExtern (v, _) -> "extern " + v.Name
+    | DExport (v, n) -> "export " + v.Name + " as " + n
     | DLet (r, v, _, e) -> "let" + (if r then " rec " else " ") + v.Name + " = " + printExpr e
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")

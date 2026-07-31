@@ -4431,3 +4431,71 @@ module Serialize =
         b
     /// Read one value back from an address.
     let ofPointer (p : int) : 'a = read (Reader p)
+
+// ---- Worker: a typed message loop on the far side of a channel ----
+// The channel itself is bytes — a worker has its own heap and cannot be
+// handed a reference — so the types have to survive a crossing. They do
+// because BOTH ends are generated from one declaration: `Command` and
+// `Reply` are associated types, so the instance fixes them once and the
+// encode on this side and the decode on that side cannot disagree.
+//
+// Nothing here knows how the bytes travel. `serve` is the worker's whole
+// loop and `encodeCommand`/`decodeReply` are the host's; a `postMessage`
+// transfer, a shared buffer and a pipe all carry the same message.
+
+/// Which worker is on the other end. The type parameter is the whole point:
+/// it is what makes `post` accept that worker's commands and nothing else.
+/// It is also the WITNESS the four crossings below take — a member whose
+/// arguments never mention 'w cannot be dispatched from inside a generic
+/// body, because nothing there says which instance it belongs to.
+type WorkerHandle<'w>(id : int) =
+    /// the host's name for the channel
+    member x.Id = id
+
+class Worker<'w>
+    type Command
+    type Reply
+    /// The worker's state, built INSIDE the worker — it never crosses.
+    static create : unit -> 'w
+    static handle : 'w -> Command -> Reply
+    // The four crossings. An instance writes these as `write b v` / `read r`
+    // and they resolve there, where Command and Reply are concrete.
+    static writeCommand : WorkerHandle<'w> -> Buffer -> Command -> unit
+    static readCommand : WorkerHandle<'w> -> Reader -> Command
+    static writeReply : WorkerHandle<'w> -> Buffer -> Reply -> unit
+    static readReply : WorkerHandle<'w> -> Reader -> Reply
+
+module Worker =
+    /// A message is its own byte length followed by its bytes, so a host that
+    /// cannot see these types still knows how much to hand over. That length
+    /// is the ONLY thing on the wire that is not payload.
+    let encodeCommand (h : WorkerHandle<'w>) (cmd : 'c) : Buffer
+        when Worker<'w> with Command = 'c =
+        let b = Buffer 64
+        b.WriteInt 0
+        writeCommand h b cmd
+        Memory.storeInt b.Pointer (b.Length - 4)
+        b
+
+    /// Host side: the reply that came back at `p`.
+    let decodeReply (h : WorkerHandle<'w>) (p : int) : 'r
+        when Worker<'w> with Reply = 'r =
+        readReply h (Reader (p + 4))
+
+    /// WORKER side: the whole loop for one message. Decode the command at
+    /// `p`, run it, encode the reply, and answer with its address. Export a
+    /// one-line wrapper around this and the worker is done:
+    ///
+    ///     [<Export>]
+    ///     let dispatch (p : int) : int = Worker.serve theWorker p
+    let serve (self : WorkerHandle<'w>) (w : 'w) (p : int) : int when Worker<'w> =
+        let cmd = readCommand self (Reader (p + 4))
+        let reply = handle w cmd
+        let b = Buffer 64
+        b.WriteInt 0
+        writeReply self b reply
+        Memory.storeInt b.Pointer (b.Length - 4)
+        b.Pointer
+
+    /// How many bytes the message at `p` occupies, header included.
+    let messageLength (p : int) : int = Memory.loadInt p + 4

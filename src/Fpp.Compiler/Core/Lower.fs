@@ -44,6 +44,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if List.isEmpty im.MInst then EVar (v, sch) else EVarI (v, sch, im.MInst)
 
     let mutable pendingStruct = false
+    let mutable pendingExport = false
     // Set while lowering the loop of a list comprehension: the loop's BODY
     // is the yielded element, so it accumulates instead of being evaluated
     // for effect. Consumed on entry to the body, so a nested loop inside it
@@ -2461,8 +2462,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> vecAdd notes (offsetOf n, "extern shape"))
             | LetDecl ->
                 (match lowerLetParts n with
-                 | Some (SimpleLet (isRec, v, sch, rhs, _)) -> vecAdd decls (DLet (isRec, v, sch, rhs))
+                 | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
+                     vecAdd decls (DLet (isRec, v, sch, rhs))
+                     if pendingExport then vecAdd decls (DExport (v, v.Name))
                  | _ -> vecAdd notes (offsetOf n, "top-level let shape"))
+                pendingExport <- false
             | TypeDecl ->
                 lowerTypeDecl n
                 pendingStruct <- false
@@ -2478,6 +2482,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | AttributeList ->
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
                     pendingStruct <- true
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Export") then
+                    pendingExport <- true
             | ModuleHeader | OpenDecl -> ()
             | k when isExprish k ->
                 vecAdd decls (DLet (false, { Path = path; Offset = offsetOf n; Name = "_it" }, mono tUnit, lowerExpr g))

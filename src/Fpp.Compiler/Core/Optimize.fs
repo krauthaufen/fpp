@@ -230,6 +230,7 @@ let uncurryTupleArgs (decls : Decl list) : Decl list =
                 for _, v in ms do dictSet pinned (v.Path, v.Offset) true
         | DMembers (_, own) -> for _, v in own do dictSet pinned (v.Path, v.Offset) true
         | DExtern (v, _) -> dictSet pinned (v.Path, v.Offset) true
+        | DExport (v, _) -> dictSet pinned (v.Path, v.Offset) true
         | _ -> ()
     let candInfo = dictNew<string * int, string * (VarId * Scheme) list * Scheme> ()
     for d in decls do

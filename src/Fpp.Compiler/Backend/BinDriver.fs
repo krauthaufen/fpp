@@ -3343,6 +3343,32 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     declFn m "$_start" "$init_t"
     declFn m "$strinit" "$init_t"
     exportFn m "_start" "$_start"
+    // `[<Export>]`: one wrapper per exported function, with a REAL scalar
+    // signature so the host passes numbers rather than reference values.
+    // The wrapper boxes on the way in and unboxes on the way out, which is
+    // the same crossing an extern makes in the other direction.
+    let exports =
+        decls |> List.choose (fun d ->
+            match d with
+            | DExport (v, n) ->
+                (match dictTryFind st.FnOf (v.Path, v.Offset), dictTryFind st.ArityOf (v.Path, v.Offset) with
+                 | Some fn, Some 1 ->
+                     // the callee may already ride a scalar rail, in which
+                     // case it takes and returns i32 and the wrapper is a
+                     // pure forward — box only where the rail is uniform
+                     let pk, rk =
+                         match dictTryFind st.SigKinds (v.Path, v.Offset) with
+                         | Some (pks, r) -> (match pks with [ k ] -> k | _ -> "a"), r
+                         | None -> "a", "a"
+                     Some (v, n, fn, pk, rk)
+                 | _ ->
+                     err st ("binary: [<Export>] " + n + " must be a function of one int argument")
+                     None)
+            | _ -> None)
+    if not (List.isEmpty exports) then tyFunc m "$exp_i2i" [ "i32" ] [ "i32" ]
+    for _, n, _, _, _ in exports do
+        declFn m ("$export$" + n) "$exp_i2i"
+        exportFn m n ("$export$" + n)
     // bodies, in declaration order
     rtCore m
     rtCore2 m
@@ -3575,6 +3601,17 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         arrNewData f "$str" dn
         gs f ("$sl:" + dn)
     endFn f
+    // export wrappers: declared right after $strinit, so their bodies land
+    // here — before the lazily requested curried wrappers, exactly as the
+    // function section orders them
+    for _, _, fn, pk, rk in exports do
+        let f = beginFn m [ "$p" ]
+        localsDone f
+        lg f "$p"
+        if pk <> "i" then callf f "$ofi"
+        callf f fn
+        if rk <> "i" then callf f "$toi"
+        endFn f
     // curried wrapper bodies: requested lazily during body emission, so their
     // decls sit after $_start in the function section — bodies land here in
     // request order. Each .wk before the last conses its arg onto the env;
