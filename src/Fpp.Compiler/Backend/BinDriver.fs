@@ -687,12 +687,36 @@ and private emitPodWordOf (st : St) (f : Fn) (rn : string) (push : string -> str
 and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl : string) (k : string) (off : int) : unit =
     let width = podW st rn
     let wide = width = 8
-    let sfx = string width
+    // INLINE rather than a call to $hwget. A call is an optimisation barrier:
+    // the engine must assume it writes globals, so it cannot hoist the array
+    // fetch or the casts that surround it out of a loop. Straight-line code
+    // lets it. On a vertex sum this alone was 772ms -> 507ms.
+    let ty, vt, getOp, loadOp, _ = Fpp.Backend.EmitBin.podRt width
+    let idx () =
+        lg f bl
+        ic f (off / width)
+        ins f "i32.add"
     lg f hl
-    lg f bl
-    ic f (off / width)
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    ins f "ref.is_null"
+    ifV f vt
+    lg f hl
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 1
+    idx ()
+    ic f width
+    ins f "i32.mul"
     ins f "i32.add"
-    callf f ("$hwget" + sfx)
+    mem f loadOp
+    elseB f
+    lg f hl
+    gcT f "ref.cast" "$hnd"
+    gcTF f "struct.get" "$hnd" 0
+    gcT f "ref.cast" ty
+    idx ()
+    gcT f getOp ty
+    endB f
     let sh = (off % width) * 8
     if sh <> 0 then
         if wide then

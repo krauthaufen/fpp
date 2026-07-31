@@ -357,7 +357,7 @@ against a compiler rather than against a reading of the ABI.
 Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
 
     C -O2   71 ms
-    F++    919 ms      (13x)
+    F++    656 ms      (9x)
 
 Two things dominated before, and neither was the read.
 
@@ -374,6 +374,23 @@ Reads were never the problem: 20M POD field reads cost about 100 ms, roughly
 this benchmark blamed the reads and was wrong — the fill was being counted as
 read time.
 
-What remains is `let e = v.[i]`, which materializes the element and is still
-~60x slower than reading its fields directly. It is the same allocation
-problem seen from the read side and wants the same treatment.
+Reads are emitted INLINE rather than as a call to `$hwget`. A call is an
+optimisation barrier — the engine has to assume it writes globals, so it
+cannot hoist the array fetch or the surrounding casts out of a loop.
+
+Two things still stand between this and C, both measured by hand-editing the
+emitted wasm and re-running it (each verified to still print the right sum):
+
+    F++ today                        656 ms    9x C
+    + nothing called in the loop     507 ms    7x C
+    + array base hoisted out of it   209 ms    2.9x C
+
+The second is the prize and it is ordinary loop-invariant code motion: every
+read re-does `global.get`, `ref.cast $hnd`, `struct.get`, `ref.cast $pk`,
+none of which change across iterations. Hoisting them into locals is what
+takes this into the 1-3x band. It needs care around `Array.pin` inside a
+loop, which invalidates a hoisted base.
+
+`let e = v.[i]` also remains: it materializes the element and is ~60x slower
+than reading its fields directly — the same allocation problem the store side
+had, seen from the read side.

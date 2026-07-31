@@ -185,7 +185,9 @@ let noBoxGate =
                                   && lines.[j].Length - lines.[j].TrimStart().Length = indent) do
                         j <- j + 1
                     let seg = String.concat "\n" (Array.sub lines i (j - i + 1))
-                    if seg.Contains "hwget" && seg.Contains "f64.add" then loopSeg <- seg
+                    // the POD read is emitted INLINE (no $hwget call), so the
+                    // marker is the handle it reads through
+                    if seg.Contains "$hnd" && seg.Contains "f64.add" then loopSeg <- seg
                 i <- i + 1
             Expect.isTrue (loopSeg <> "") "the summation loop is found"
             for alloc in [ "call $off"; "call $oss"; "call $ofl"; "call $ofi"
