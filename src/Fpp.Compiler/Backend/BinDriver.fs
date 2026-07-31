@@ -254,7 +254,7 @@ let private cellScan (decls : Decl list) : Dict<string * int, bool> * Dict<strin
         | EWhile (c, b) -> g c; g b
         | EIndex (_, a, i) -> g a; g i
         | EIndexSet (_, a, i, v) -> g a; g i; g v
-        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> g a
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> g a
         | EArrayCreate (_, n, v) -> g n; g v
         | EIfaceCall (_, _, recv, args) -> g recv; List.iter g args
         | ETry (b, cs) ->
@@ -409,7 +409,7 @@ let rec private discoverLams (st : St) (outer : Dict<string * int, bool>) (e : E
     | EWhile (c, b) -> discoverLams st outer c; discoverLams st outer b
     | EAssign (_, x) -> discoverLams st outer x
     | EIfaceCall (_, _, r, args) -> discoverLams st outer r; for a in args do discoverLams st outer a
-    | ECast (_, x, _) | ETypeTest (_, x) | EArrayLen (_, x) | EArrayPin (_, x) | EArrayUnpin (_, x) ->
+    | ECast (_, x, _) | ETypeTest (_, x) | EArrayLen (_, x) | EArrayPin (_, x) | EArrayUnpin (_, x) | EArrayBytes (_, x) ->
         discoverLams st outer x
     | ERecordExt (_, b, fs) ->
         discoverLams st outer b
@@ -572,7 +572,7 @@ let private scanTupleArities (decls : Decl list) : int list =
         | ECast (_, x, _) | ETypeTest (_, x) -> scan x
         | EIndex (_, a, i) -> scan a; scan i
         | EIndexSet (_, a, i, v) -> scan a; scan i; scan v
-        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> scan a
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> scan a
         | EArrayCreate (_, n, v) -> scan n; scan v
         | _ -> ()
     for d in decls do
@@ -2441,6 +2441,18 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             callf f "$ofi"
          else
             err st "binary: Array.unpin requires a POD struct array"
+            refNull f "any")
+    // the WORD count times 8 — the image's real size, padding and all, which
+    // is what a blit has to move and what no caller can work out for itself
+    | EArrayBytes (nm, a) ->
+        (if (dictTryFind st.Pod nm).IsSome then
+            emitNode st f lv a
+            callf f "$hlen"
+            ic f 8
+            ins f "i32.mul"
+            callf f "$ofi"
+         else
+            err st "binary: Array.byteSize requires a POD struct array"
             refNull f "any")
     | EArray (nm, xs) when parrK nm <> "" ->
         // packed primitive array: unboxed elements, no per-element GC object

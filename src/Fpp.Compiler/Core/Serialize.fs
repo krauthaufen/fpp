@@ -160,6 +160,7 @@ let rec private encExpr (e : Expr) : Sx =
     | EArrayCreate (nm, n, v) -> L [ A "eC"; S nm; encExpr n; encExpr v ]
     | EArrayPin (nm, a) -> L [ A "eP"; S nm; encExpr a ]
     | EArrayUnpin (nm, a) -> L [ A "eU"; S nm; encExpr a ]
+    | EArrayBytes (nm, a) -> L [ A "eB"; S nm; encExpr a ]
     | EIfaceCall (i, m, r, args) -> L (A "ei" :: S i :: S m :: encExpr r :: List.map encExpr args)
     | ECast (t, e, d) -> L [ A "ec"; S t; encExpr e; A (if d then "1" else "0") ]
     | ETypeTest (t, e) -> L [ A "ett"; S t; encExpr e ]
@@ -316,6 +317,7 @@ let rec private decExpr (x : Sx) : Expr =
     | L [ A "eC"; S nm; n; v ] -> EArrayCreate (nm, decExpr n, decExpr v)
     | L [ A "eP"; S nm; a ] -> EArrayPin (nm, decExpr a)
     | L [ A "eU"; S nm; a ] -> EArrayUnpin (nm, decExpr a)
+    | L [ A "eB"; S nm; a ] -> EArrayBytes (nm, decExpr a)
     | L (A "ei" :: S i :: S m :: r :: args) -> EIfaceCall (i, m, decExpr r, List.map decExpr args)
     | L [ A "ec"; S t; e; A d ] -> ECast (t, decExpr e, d = "1")
     | L [ A "ett"; S t; e ] -> ETypeTest (t, decExpr e)

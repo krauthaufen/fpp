@@ -170,6 +170,7 @@ let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =
         | EArrayCreate (n, a, b) -> EArrayCreate (n, r a, r b)
         | EArrayPin (n, a) -> EArrayPin (n, r a)
         | EArrayUnpin (n, a) -> EArrayUnpin (n, r a)
+        | EArrayBytes (n, a) -> EArrayBytes (n, r a)
         | ETry (b, cs) -> ETry (r b, cs |> List.map (fun (p, g, x) -> p, Option.map r g, r x))
         | other -> other
     f e2
@@ -197,7 +198,7 @@ let stampRecords (decls : Decl list) : Decl list =
                      | EField (_, _, o) | EFieldSet (_, _, o, _) -> note o
                      | EArray (n, _) | EIndex (n, _, _) | EIndexSet (n, _, _, _)
                      | EArrayLen (n, _) | EArrayCreate (n, _, _)
-                     | EArrayPin (n, _) | EArrayUnpin (n, _) -> note n
+                     | EArrayPin (n, _) | EArrayUnpin (n, _) | EArrayBytes (n, _) -> note n
                      | _ -> ())
                     x)
                 e |> ignore
@@ -292,7 +293,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EIndexSet (n, a, i, v) -> symbolic n || anyOf [ a; i; v ]
         | EArrayLen (n, a) -> symbolic n || usesLayoutVar a
         | EArrayCreate (n, a, b) -> symbolic n || anyOf [ a; b ]
-        | EArrayPin (n, a) | EArrayUnpin (n, a) -> symbolic n || usesLayoutVar a
+        | EArrayPin (n, a) | EArrayUnpin (n, a) | EArrayBytes (n, a) -> symbolic n || usesLayoutVar a
         | ELam (_, b) -> usesLayoutVar b
         | EApp (f, args) -> usesLayoutVar f || anyOf args
         | ELet (_, _, _, r, b) -> usesLayoutVar r || usesLayoutVar b
@@ -362,7 +363,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | EArray (_, xs) -> anyOf xs
         | EIndex (_, a, i) -> anyOf [ a; i ]
         | EIndexSet (_, a, i, v) -> anyOf [ a; i; v ]
-        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> callsLayoutDep a
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> callsLayoutDep a
         | EArrayCreate (_, a, b) -> anyOf [ a; b ]
         | ETry (b, cs) ->
             callsLayoutDep b
@@ -616,6 +617,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             | EArrayCreate (n, a, b) -> EArrayCreate (substName subst n, a, b)
             | EArrayPin (n, a) -> EArrayPin (substName subst n, a)
             | EArrayUnpin (n, a) -> EArrayUnpin (substName subst n, a)
+            | EArrayBytes (n, a) -> EArrayBytes (substName subst n, a)
             | other -> other)
 
     /// Give a clone its own binder identities. Two stamped copies of the
@@ -801,7 +803,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EArrayLen (_, a) -> scan a
         | EArrayCreate (_, n, v) -> scan n; scan v
         | EArrayPin (_, a) -> scan a
-        | EArrayUnpin (_, a) -> scan a
+        | EArrayUnpin (_, a) | EArrayBytes (_, a) -> scan a
         | _ -> ()
     // roots: members reached through a vtable. Nothing names them, so
     // scanning cannot find them — but only a class that is CONSTRUCTED can
@@ -874,6 +876,7 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | EWhile (c, b) -> sawEffect <- true; walk c; walk b
         | EArrayPin (_, a) -> sawEffect <- true; walk a
         | EArrayUnpin (_, a) -> sawEffect <- true; walk a
+        | EArrayBytes (_, a) -> walk a
         | ETry (b, cs) ->
             sawEffect <- true
             walk b

@@ -71,6 +71,9 @@ type Expr =
     | EArrayCreate of string * Expr * Expr
     | EArrayPin of string * Expr
     | EArrayUnpin of string * Expr
+    /// how many BYTES a pinned POD array occupies — the blit length, without
+    /// anyone outside the compiler having to know the element's layout
+    | EArrayBytes of string * Expr
     /// interface name, method name, receiver, arguments — dispatched
     /// through the receiver's vtable, not bound to any one implementation
     | EIfaceCall of string * string * Expr * Expr list
@@ -152,6 +155,7 @@ let rec printExpr (e : Expr) : string =
     | EArrayCreate (_, n, v) -> "(Array.create " + printExpr n + " " + printExpr v + ")"
     | EArrayPin (_, a) -> "(Array.pin " + printExpr a + ")"
     | EArrayUnpin (_, a) -> "(Array.unpin " + printExpr a + ")"
+    | EArrayBytes (_, a) -> "(Array.byteSize " + printExpr a + ")"
     | EAssign (v, e) -> "(" + v.Name + " <- " + printExpr e + ")"
     | EIfaceCall (i, m, r, args) ->
         "(" + i + "::" + m + " " + String.concat " " (List.map printExpr (r :: args)) + ")"

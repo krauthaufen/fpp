@@ -237,6 +237,113 @@ let generatorTests =
             Expect.equal (runBytes bytes) "{ X = 1; Y = 2 }\n" "and the derived generator works"
         }
 
+        test "deriveSerialize writes both ends, and a POD array blits" {
+            // no serialization code anywhere in the program: nested records,
+            // a union with a multi-field payload, a list, and a V2d[] that
+            // travels as its own image. 73 bytes is the whole message —
+            // 16 per point, so the array really did blit.
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveSerialize ]
+                    [ "types.fpp",
+                      [ "module Types"
+                        "[<Struct>]"
+                        "type V2d = { X : float; Y : float }"
+                        "type Colour = Red | Green | Custom of int"
+                        "type Shape ="
+                        "    | Dot of V2d"
+                        "    | Poly of V2d[] * Colour"
+                        "type Doc = { Title : string; Shapes : list<Shape>; Version : int }" ]
+                      "main.fpp",
+                      [ "module Main"
+                        "open Types"
+                        "let d = { Title = \"hi\"; Shapes = [ Dot { X = 1.0; Y = 2.0 }; Poly ([| { X = 3.0; Y = 4.0 }; { X = 5.0; Y = 6.0 } |], Custom 7) ]; Version = 3 }"
+                        "let go ="
+                        "    let b = Buffer 64"
+                        "    write b d"
+                        "    print b.Length"
+                        "    let back : Doc = read (Reader b.Pointer)"
+                        "    print back.Title"
+                        "    print back.Version"
+                        "    print (List.length back.Shapes)"
+                        "    match List.head (List.rev back.Shapes) with"
+                        "    | Poly (pts, c) ->"
+                        "        print pts.Length"
+                        "        print pts.[1].Y"
+                        "        (match c with"
+                        "         | Custom n -> print n"
+                        "         | _ -> print \"?\")"
+                        "    | Dot _ -> print \"?\"" ] ]
+            Expect.equal out "73\nhi\n3\n2\n2\n6\n7\n" "the derived round trip"
+        }
+
+        test "a hand-written Serialize instance wins over the derived one" {
+            // the derived and the hand-written instance would have the SAME
+            // head, and specificity cannot order those — so the override has
+            // to work by the generator never emitting a rival.
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveSerialize ]
+                    [ "t.fpp",
+                      [ "module T"
+                        "type Tag = { N : int }"
+                        "instance Serialize<Tag>"
+                        "    static write (b : Buffer) (x : Tag) = b.WriteInt (x.N * 100)"
+                        "    static read (r : Reader) = { N = r.ReadInt () / 100 }"
+                        "    static writeArray (b : Buffer) (xs : Tag[]) = failwith \"n/a\""
+                        "    static readArray (r : Reader) = failwith \"n/a\"" ]
+                      "m.fpp",
+                      [ "module M"
+                        "open T"
+                        "let go ="
+                        "    let b = Buffer 32"
+                        "    write b { N = 7 }"
+                        "    print (Memory.loadInt b.Pointer)"
+                        "    let back : Tag = read (Reader b.Pointer)"
+                        "    print back.N" ] ]
+            Expect.equal out "700\n7\n" "the hand-written encoding is the one that ran"
+        }
+
+        test "asking to derive something underivable is an error at the type" {
+            // the point of [<Derive>] is that it was ASKED for: staying quiet
+            // would send the user to a missing-instance error at some later
+            // call site instead of the declaration responsible.
+            let ws = Workspace()
+            ws.AddGenerator Fpp.Core.Plugins.deriveSerialize
+            ws.SetFileText "t.fpp"
+                (String.concat "\n"
+                    [ "module T"
+                      "type Opaque = { F : int -> int }"
+                      "[<Derive(\"Serialize\")>]"
+                      "type Holder = { Name : string; Fn : Opaque }"
+                      "let go = print 1"
+                      "" ])
+            let _, errs = ws.EmitProgramWasm ()
+            Expect.isNonEmpty errs "the request cannot be honoured, so it is an error"
+            let first = List.head errs
+            Expect.stringContains first "t.fpp:4:" "positioned at the type that asked"
+            Expect.stringContains first "cannot derive Serialize for Holder" "and it names the type"
+            Expect.stringContains first "deriveSerialize" "and the generator"
+        }
+
+        test "unasked, an underivable type is skipped and the rest still derives" {
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveSerialize ]
+                    [ "t.fpp",
+                      [ "module T"
+                        "type Opaque = { F : int -> int }"
+                        "type Holder = { Name : string; Fn : Opaque }"
+                        "type Fine = { A : int; B : string }" ]
+                      "m.fpp",
+                      [ "module M"
+                        "open T"
+                        "let go ="
+                        "    let b = Buffer 32"
+                        "    write b { A = 5; B = \"ok\" }"
+                        "    let back : Fine = read (Reader b.Pointer)"
+                        "    print back.A"
+                        "    print back.B" ] ]
+            Expect.equal out "5\nok\n" "the derivable type still works"
+        }
+
         test "a generator's mistakes are reported against the generator" {
             // a generated file is compiled like any other, but NOBODY WROTE it:
             // a bare path and position would be a puzzle, so the error names

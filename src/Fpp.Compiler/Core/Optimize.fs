@@ -48,6 +48,7 @@ let rec private mapChildrenWith (r : Expr -> Expr) (e : Expr) : Expr =
         | EArrayCreate (n, a, b) -> EArrayCreate (n, r a, r b)
         | EArrayPin (n, a) -> EArrayPin (n, r a)
         | EArrayUnpin (n, a) -> EArrayUnpin (n, r a)
+        | EArrayBytes (n, a) -> EArrayBytes (n, r a)
         | ETry (b, cs) -> ETry (r b, cs |> List.map (fun (p, g, x) -> p, Option.map r g, r x))
         | other -> other
 
@@ -76,7 +77,7 @@ let rec private sizeOf (e : Expr) : int =
     | EAssign (_, x) -> 1 + sizeOf x
     | EIndex (_, a, i) -> 1 + sizeOf a + sizeOf i
     | EIndexSet (_, a, i, v) -> 1 + sizeOf a + sizeOf i + sizeOf v
-    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) -> 1 + sizeOf a
+    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> 1 + sizeOf a
     | EArrayCreate (_, a, b) -> 1 + sizeOf a + sizeOf b
     | ETry (b, cs) -> 1 + sizeOf b + List.fold (fun a (_, _, x) -> a + sizeOf x) 0 cs
     | _ -> 1

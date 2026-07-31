@@ -893,6 +893,10 @@ module Array =
     extern let zeroCreate : int -> 'a[]
     extern let pin : 'a[] -> int
     extern let unpin : 'a[] -> int
+    /// The bytes a pinned POD struct array occupies — what a blit has to
+    /// move. Not `Length * sizeof`: an element is padded out to whole words,
+    /// so this is the only number that is right for every struct.
+    extern let byteSize : 'a[] -> int
     let length (xs : 'a[]) = xs.Length
     let isEmpty (xs : 'a[]) = xs.Length = 0
     let item (i : int) (xs : 'a[]) = xs.[i]
@@ -4412,6 +4416,36 @@ instance Serialize<'a[]> when Serialize<'a>
         b.WriteInt n
         let mutable i = 0
         while i < n do
+            write b xs.[i]
+            i <- i + 1
+    static readArray (r : Reader) =
+        let n = r.ReadInt ()
+        let xs = Array.zeroCreate n
+        let mutable i = 0
+        while i < n do
+            xs.[i] <- read r
+            i <- i + 1
+        xs
+
+instance Serialize<list<'a>> when Serialize<'a>
+    static write (b : Buffer) (xs : list<'a>) =
+        b.WriteInt (List.length xs)
+        let mutable cur = xs
+        while not (List.isEmpty cur) do
+            write b (List.head cur)
+            cur <- List.tail cur
+    static read (r : Reader) =
+        let n = r.ReadInt ()
+        let mutable acc = []
+        let mutable i = 0
+        while i < n do
+            acc <- read r :: acc
+            i <- i + 1
+        List.rev acc
+    static writeArray (b : Buffer) (xs : list<'a>[]) =
+        b.WriteInt xs.Length
+        let mutable i = 0
+        while i < xs.Length do
             write b xs.[i]
             i <- i + 1
     static readArray (r : Reader) =

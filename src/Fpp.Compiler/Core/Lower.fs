@@ -706,6 +706,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "unpin" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
                           EArrayUnpin (nm, pa)
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ pa ] when bv.Name = "byteSize" && bv.Path = "(builtin)" ->
+                          let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
+                          EArrayBytes (nm, pa)
                       // box/unbox are type-level: every value is already a
                       // reference, so both are the identity at runtime
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when

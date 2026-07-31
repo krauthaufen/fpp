@@ -437,6 +437,11 @@ type Workspace() =
                 if not (path.StartsWith Workspace.GeneratedPrefix) then
                     let pr = this.ParseFile path
                     for v in Fpp.Core.Plugins.valueDeclsOf path pr.Root do vecAdd values v
+            let instances = vecNew<Fpp.Core.Plugins.GenInstanceDecl> ()
+            for path in this.ProjectFiles do
+                if not (path.StartsWith Workspace.GeneratedPrefix) then
+                    let pr = this.ParseFile path
+                    for i in Fpp.Core.Plugins.instanceDeclsOf path pr.Root do vecAdd instances i
             let sources =
                 this.ProjectFiles
                 |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
@@ -471,6 +476,7 @@ type Workspace() =
                       FTast = Fpp.Core.Plugins.tastOf exprTypeAt tree } : Fpp.Core.Plugins.GenFile)
             let view : Fpp.Core.Plugins.ProgramView =
                 { Types = vecToList types; Values = vecToList values
+                  Instances = vecToList instances
                   Sources = sources; Files = genFiles }
             // A file sees only EARLIER files, so generated code goes directly
             // after the last file that declared a type: it can name every type
@@ -510,10 +516,28 @@ type Workspace() =
                 let anchorIndex = anchorFor g
                 try
                     for name, output in g.Generate view do
+                      match output with
+                      | Fpp.Core.Plugins.Diagnostics ds ->
+                        // a generator's own errors, against a file the user
+                        // wrote: positioned like any other diagnostic
+                        for off, msg in ds do
+                            let text = match dictTryFind originalText name with
+                                       | Some t -> t
+                                       | None -> this.FileText name
+                            let cut = if off < text.Length then off else text.Length
+                            let upto = (text.Substring (0, cut)).Replace ("\r", "")
+                            let ls = upto.Split '\n'
+                            let line = ls.Length
+                            let col = (if ls.Length > 0 then ls.[ls.Length - 1].Length else 0) + 1
+                            vecAdd pluginErrors
+                                (name + ":" + string line + ":" + string col + ": " + msg
+                                 + " (" + g.GName + ")")
+                      | _ ->
                         let src =
                             match output with
                             | Fpp.Core.Plugins.Source t -> t
                             | Fpp.Core.Plugins.Tree t -> Syntax.Green.toText (Syntax.GNode t)
+                            | Fpp.Core.Plugins.Diagnostics _ -> ""
                             | Fpp.Core.Plugins.Edits es ->
                                 // back to front, so earlier spans stay valid
                                 let baseText =

@@ -54,6 +54,10 @@ type GenTypeDecl =
       TFields : GenField list
       TCases : GenCase list
       TFile : string
+      /// where the type's NAME sits in TFile — what a generator's diagnostic
+      /// points at, so an error about a derived instance lands on the
+      /// declaration that asked for it rather than in generated code
+      TOffset : int
       /// the module that declares it, "" at file top level. A type NAME is
       /// visible across files regardless, but a union CASE is not: generated
       /// code has to `open` this.
@@ -166,13 +170,32 @@ type GenOutput =
     /// earlier spans stay valid. This is the one to reach for when rewriting
     /// what someone else wrote.
     | Edits of (int * int * string) list
+    /// (offset, message) against the file this output is paired with, which
+    /// must be a HAND-WRITTEN one. A generator that cannot derive something
+    /// says so here, at the declaration responsible — the alternative is
+    /// staying silent and letting the user meet the problem later, at a call
+    /// site, as a missing instance.
+    | Diagnostics of (int * string) list
 
 /// What a generator gets to look at: the hand-written declarations. Types AND
 /// values — deriving needs the first, anything AOP-shaped (tracing, wrapping,
 /// serialization entry points) needs the second.
+/// One instance the program already declares: the class, and its head types
+/// spelled as written.
+type GenInstanceDecl =
+    { IClass : string
+      IHead : string list
+      IFile : string }
+
 type ProgramView =
     { Types : GenTypeDecl list
       Values : GenValueDecl list
+      /// what the program ALREADY has an instance for. A generator derives
+      /// around these rather than over them: a hand-written instance and a
+      /// derived one have the same head, and specificity cannot break that
+      /// tie, so the hand-written one has to win by the derived one never
+      /// being emitted.
+      Instances : GenInstanceDecl list
       /// every hand-written file: path and its ORIGINAL text. A generator that
       /// returns one of these paths REPLACES that file — the tier a shader
       /// language or any source-to-source pass needs, where augmenting with
@@ -310,6 +333,38 @@ let tastOf (typeAt : int -> int -> string option) (root : GreenNode) : TDecl lis
     top root
 
 /// Every top-level value declaration in a parse tree, with its attributes.
+/// Every instance the program declares, by class and head. A deriving
+/// generator consults this so a hand-written instance simply keeps its type
+/// out of the derived set.
+let instanceDeclsOf (path : string) (root : GreenNode) : GenInstanceDecl list =
+    let out = vecNew<GenInstanceDecl> ()
+    let rec go (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            if n.NodeKind = InstanceDecl then
+                (match nodes n |> List.tryFind (fun x -> isTypeNode x.NodeKind) with
+                 | Some hd when hd.NodeKind = AppType ->
+                     (match nodes hd with
+                      | h :: rest ->
+                          let cls =
+                              Green.tokens (GNode h) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                          let args =
+                              rest |> List.filter (fun x -> isTypeNode x.NodeKind)
+                              |> List.map (fun x -> (Green.toText (GNode x)).Trim ())
+                          (match cls with
+                           | Some c -> vecAdd out { IClass = c.Text; IHead = args; IFile = path }
+                           | None -> ())
+                      | [] -> ())
+                 | Some hd ->
+                     (match Green.tokens (GNode hd) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                      | Some c -> vecAdd out { IClass = c.Text; IHead = []; IFile = path }
+                      | None -> ())
+                 | None -> ())
+            for c in n.Children do go c
+    go (GNode root)
+    vecToList out
+
 let valueDeclsOf (path : string) (root : GreenNode) : GenValueDecl list =
     let out = vecNew<GenValueDecl> ()
     let attrsOfList (m : GreenNode) : (string * string list) list =
@@ -455,6 +510,9 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
                  vecAdd out
                      { TName = nm; TParams = tyParams; TKind = kind
                        TFields = fields; TCases = cases; TFile = path; TModule = modName
+                       TOffset = (match Green.tokens (GNode n) |> List.tryFind (fun t -> t.Kind = Ident && t.Text = nm) with
+                                  | Some t -> t.Offset
+                                  | None -> 0)
                        TAttrs = pendingAttrs
                        TMembers =
                          nodes n
@@ -1193,6 +1251,250 @@ let deriveToString =
             [ "deriveToString.fpp", Source (renderFile (header @ opens @ vecToList decls)) ]
     { GName = "deriveToString"; GAfter = None; Generate = generate }
 
+// ---- deriveSerialize: the wire format, written by the compiler ------------
+// Nobody should hand-write a serializer: the two ends have to agree exactly,
+// and "exactly" is what a generator is for. Every record, union and struct
+// gets an instance whose write and read are each other's inverse by
+// construction — field order for a record, a case tag then the payload for a
+// union, and for an array of an all-scalar struct a BLIT, because such an
+// array is already its own image.
+//
+// Three rules make it usable rather than merely automatic:
+//   - a hand-written instance wins, by this never emitting one for that type;
+//   - `[<Derive("Serialize")>]` narrows deriving to the marked types, and for
+//     those a type that cannot be serialized is an ERROR, at the declaration;
+//   - unmarked, it derives what it can and says what it skipped.
+
+let deriveSerialize =
+    let generate (view : ProgramView) : (string * GenOutput) list =
+        let byName = dictNew<string, GenTypeDecl> ()
+        for t in view.Types do dictSet byName t.TName t
+        /// what the program already has a Serialize instance for
+        let handWritten = dictNew<string, bool> ()
+        for i in view.Instances do
+            if i.IClass = "Serialize" then
+                for h in i.IHead do dictSet handWritten (compact h) true
+        let isStructType (n : string) =
+            match dictTryFind byName n with
+            | Some d -> d.TAttrs |> List.exists (fun (a, _) -> a = "Struct")
+            | None -> false
+        let scalar (t : string) =
+            t = "int" || t = "int64" || t = "float" || t = "bool" || t = "string"
+        /// the element of an array type, however it is spelled
+        let elemOf (t : string) : string option =
+            if t.EndsWith "[]" then Some (t.Substring (0, t.Length - 2))
+            elif t.StartsWith "array<" && t.EndsWith ">" then Some (t.Substring (6, t.Length - 7))
+            else None
+        let listElemOf (t : string) : string option =
+            if t.StartsWith "list<" && t.EndsWith ">" then Some (t.Substring (5, t.Length - 6))
+            elif t.EndsWith "list" && t.Length > 4 then Some (t.Substring (0, t.Length - 4))
+            else None
+        /// A struct whose fields are all scalars or other such structs: its
+        /// arrays are a flat image, so they blit. Exactly the rule the backend
+        /// uses to decide the same thing.
+        let rec isPod (n : string) : bool =
+            isStructType n
+            && (match dictTryFind byName n with
+                | Some d ->
+                    not (List.isEmpty d.TFields)
+                    && d.TFields |> List.forall (fun f ->
+                        let ft = compact f.FType
+                        ft = "int" || ft = "float" || ft = "int64" || ft = "bool"
+                        || (ft <> n && isPod ft))
+                | None -> false)
+        /// Can a value of this type cross? `depth` stops a type that contains
+        /// itself from asking forever.
+        let rec canCarry (depth : int) (t : string) : bool =
+            let ty = compact t
+            if depth > 12 then false
+            elif scalar ty then true
+            elif (dictTryFind handWritten ty).IsSome then true
+            elif (dictTryFind byName ty).IsSome then
+                match dictTryFind byName ty with
+                | Some d when List.isEmpty d.TParams && (d.TKind = "record" || d.TKind = "union") ->
+                    // its own fields have to cross too
+                    (d.TFields |> List.forall (fun f -> canCarry (depth + 1) f.FType))
+                    && (d.TCases |> List.forall (fun c -> c.CArgs |> List.forall (canCarry (depth + 1))))
+                | _ -> false
+            else
+                match elemOf ty with
+                | Some e -> canCarry (depth + 1) e
+                | None ->
+                    match listElemOf ty with
+                    | Some e -> canCarry (depth + 1) e
+                    | None -> false
+        /// why not, for the diagnostic
+        let rec firstBad (depth : int) (t : string) : string option =
+            let ty = compact t
+            if canCarry depth ty then None
+            elif depth > 12 then Some ty
+            else
+                match dictTryFind byName ty with
+                | Some d when List.isEmpty d.TParams && (d.TKind = "record" || d.TKind = "union") ->
+                    let fromFields = d.TFields |> List.tryPick (fun f -> firstBad (depth + 1) f.FType)
+                    (match fromFields with
+                     | Some x -> Some x
+                     | None -> d.TCases |> List.tryPick (fun c -> c.CArgs |> List.tryPick (firstBad (depth + 1))))
+                | _ -> Some ty
+        let wanted (d : GenTypeDecl) =
+            d.TAttrs |> List.exists (fun (a, args) -> a = "Derive" && List.contains "Serialize" args)
+        let marked = view.Types |> List.filter wanted
+        let explicit = not (List.isEmpty marked)
+        let considered =
+            if explicit then marked
+            else view.Types |> List.filter (fun d -> d.TKind = "record" || d.TKind = "union")
+        // a diagnostic goes to the file that declares the type
+        let diags = dictNew<string, Vec<int * string>> ()
+        let report (d : GenTypeDecl) (msg : string) =
+            let v =
+                match dictTryFind diags d.TFile with
+                | Some v -> v
+                | None ->
+                    let v = vecNew<int * string> ()
+                    dictSet diags d.TFile v
+                    v
+            vecAdd v (d.TOffset, msg)
+        let bytesOf (xs : GEx) = GApp (GVar "Array.byteSize", [ xs ])
+        let decls = vecNew<GDecl> ()
+        let skipped = vecNew<string> ()
+        for d in considered do
+            let name = d.TName
+            if (dictTryFind handWritten name).IsSome then
+                // the user wrote one: theirs wins, and it wins by this
+                // never emitting a competing head
+                ()
+            elif not (List.isEmpty d.TParams) then
+                if explicit then report d ("cannot derive Serialize for the generic type " + name
+                                           + ": derive it for each instantiation instead")
+                else vecAdd skipped (name + " (generic)")
+            elif d.TKind <> "record" && d.TKind <> "union" then
+                if explicit then report d ("cannot derive Serialize for " + name
+                                           + ": only records, structs and unions have a fixed shape to write")
+                else vecAdd skipped (name + " (not a record or union)")
+            elif not (canCarry 0 name) then
+                let why = match firstBad 0 name with Some x -> x | None -> "one of its fields"
+                if explicit then
+                    report d ("cannot derive Serialize for " + name + ": " + why
+                              + " has no Serialize instance — write one, or leave it out of the message")
+                else vecAdd skipped (name + " (" + why + " does not serialize)")
+            else
+                let pod = isPod name
+                let arrTy = GTyRaw (name + "[]")
+                // ---- write / read ----
+                let writeBody, readBody =
+                    if d.TKind = "record" then
+                        let ws =
+                            d.TFields
+                            |> List.mapi (fun i f ->
+                                "__w" + string i, GApp (GVar "write", [ GVar "b"; GField (GVar "x", f.FName) ]))
+                        let wb = List.foldBack (fun (n, e) acc -> GLet (n, e, acc)) ws (GRaw "()")
+                        let rb =
+                            List.foldBack
+                                (fun (f : GenField) acc -> GLet ("__" + f.FName, GApp (GVar "read", [ GVar "r" ]), acc))
+                                d.TFields
+                                (GRec (d.TFields |> List.map (fun f -> f.FName, GVar ("__" + f.FName))))
+                        wb, rb
+                    else
+                        let arms =
+                            d.TCases
+                            |> List.mapi (fun i c ->
+                                let tag = GApp (GField (GVar "b", "WriteByte"), [ GInt i ])
+                                match c.CArgs with
+                                | [] -> GPCase (c.CName, []), tag
+                                | args ->
+                                    let names = args |> List.mapi (fun j _ -> "p" + string j)
+                                    let writes =
+                                        names |> List.mapi (fun j n ->
+                                            "__w" + string j, GApp (GVar "write", [ GVar "b"; GVar n ]))
+                                    let body =
+                                        List.foldBack (fun (n, e) acc -> GLet (n, e, acc)) writes (GRaw "()")
+                                    GPCase (c.CName, names), GLet ("__t", tag, body))
+                        let wb = GMatch (GVar "x", arms)
+                        // read: the tag decides the case
+                        let build (c : GenCase) =
+                            match c.CArgs with
+                            | [] -> GVar c.CName
+                            | [ _ ] -> GApp (GVar c.CName, [ GApp (GVar "read", [ GVar "r" ]) ])
+                            | many ->
+                                // several payload fields arrive as one tuple,
+                                // and they have to be read IN ORDER
+                                let names = many |> List.mapi (fun j _ -> "q" + string j)
+                                List.foldBack
+                                    (fun n acc -> GLet (n, GApp (GVar "read", [ GVar "r" ]), acc))
+                                    names
+                                    (GApp (GVar c.CName, [ GTuple (names |> List.map GVar) ]))
+                        let rec chain (i : int) (cs : GenCase list) : GEx =
+                            match cs with
+                            | [] -> GRaw ("failwith \"unknown " + name + " case\"")
+                            | [ last ] -> build last
+                            | c :: rest ->
+                                GIf (GBin ("=", GVar "__t", GInt i), build c, chain (i + 1) rest)
+                        let rb = GLet ("__t", GApp (GField (GVar "r", "ReadByte"), [ GRaw "()" ]), chain 0 d.TCases)
+                        wb, rb
+                // ---- writeArray / readArray ----
+                let writeArrayBody =
+                    if pod then
+                        GLet ("__n", GApp (GField (GVar "b", "WriteInt"), [ GField (GVar "xs", "Length") ]),
+                              GApp (GField (GVar "b", "WriteBlock"),
+                                    [ GApp (GVar "Array.pin", [ GVar "xs" ]); bytesOf (GVar "xs") ]))
+                    else
+                        GLet ("__n", GApp (GField (GVar "b", "WriteInt"), [ GField (GVar "xs", "Length") ]),
+                              GRaw ("let mutable __i = 0\n"
+                                    + "        while __i < xs.Length do\n"
+                                    + "            write b xs.[__i]\n"
+                                    + "            __i <- __i + 1"))
+                let readArrayBody =
+                    if pod then
+                        GLet ("__n", GApp (GField (GVar "r", "ReadInt"), [ GRaw "()" ]),
+                          GLet ("__xs", GRaw ("(Array.zeroCreate __n : " + name + "[])"),
+                            GLet ("__c",
+                                  GApp (GVar "Memory.copy",
+                                        [ GApp (GVar "Array.pin", [ GVar "__xs" ])
+                                          GApp (GField (GVar "r", "Block"), [ bytesOf (GVar "__xs") ])
+                                          bytesOf (GVar "__xs") ]),
+                                  GVar "__xs")))
+                    else
+                        GLet ("__n", GApp (GField (GVar "r", "ReadInt"), [ GRaw "()" ]),
+                          GLet ("__xs", GRaw ("(Array.zeroCreate __n : " + name + "[])"),
+                            GRaw ("let mutable __i = 0\n"
+                                  + "        while __i < __n do\n"
+                                  + "            __xs.[__i] <- read r\n"
+                                  + "            __i <- __i + 1\n"
+                                  + "        __xs")))
+                vecAdd decls (GComment ("Serialize for " + name
+                                        + (if pod then " (arrays blit: the struct is a flat image)" else "")))
+                vecAdd decls
+                    (GInstanceOf ("Serialize", [ GTyName name ],
+                        [ { MName = "write"
+                            MParams = [ "b", Some (GTyName "Buffer"); "x", Some (GTyName name) ]
+                            MBody = writeBody }
+                          { MName = "read"
+                            MParams = [ "r", Some (GTyName "Reader") ]
+                            MBody = readBody }
+                          { MName = "writeArray"
+                            MParams = [ "b", Some (GTyName "Buffer"); "xs", Some arrTy ]
+                            MBody = writeArrayBody }
+                          { MName = "readArray"
+                            MParams = [ "r", Some (GTyName "Reader") ]
+                            MBody = readArrayBody } ]))
+        let diagOutputs =
+            dictPairs diags |> List.map (fun (file, v) -> file, Diagnostics (vecToList v))
+        if vecLen decls = 0 then diagOutputs
+        else
+            let opens =
+                considered
+                |> List.filter (fun t -> t.TModule <> "")
+                |> List.map (fun t -> t.TModule)
+                |> List.distinct
+                |> List.sort
+                |> List.map GOpen
+            let header =
+                [ GComment "deriveSerialize: the program's own types, on the wire." ]
+                @ (if vecLen skipped = 0 then []
+                   else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
+            diagOutputs @ [ "deriveSerialize.fpp", Source (renderFile (header @ opens @ vecToList decls)) ]
+    { GName = "deriveSerialize"; GAfter = None; Generate = generate }
+
 // ---- logCalls: enter/exit tracing around every function -------------------
 // The AOP case: this one REWRITES what the user wrote rather than adding to it.
 // It cuts by the parse tree's spans — never by searching the text — so a body
@@ -1259,7 +1561,7 @@ let logCalls =
 
     { GName = "logCalls"; GAfter = None; Generate = generate }
 
-let builtinGenerators = [ deriveGen; deriveToString; logCalls ]
+let builtinGenerators = [ deriveGen; deriveToString; deriveSerialize; logCalls ]
 
 let builtinPlugins = [ constFold; deriveShallowEquals ]
 
