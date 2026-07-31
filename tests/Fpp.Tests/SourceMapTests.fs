@@ -165,6 +165,39 @@ let stackTests =
             Expect.equal out "0\n0\n0\n0\n" "no frames to report, and nothing breaks for asking"
         }
 
+        test "shadowing: right values, and both bindings visible by name" {
+            // `let x` over a parameter `x` is two slots. The values must follow
+            // the source, and a scope view must be able to tell them apart —
+            // the shadowing binding shows as `x'`.
+            let src =
+                String.concat "\n"
+                    [ "module M"
+                      "let f (x : int) ="
+                      "    let y = x + 1"
+                      "    let x = y * 10"
+                      "    let z = x + 100"
+                      "    z"
+                      // `h` is also the name of an emitter-internal local:
+                      // a local must never take a parameter's name
+                      "let g (h : int) ="
+                      "    let h = h * 2"
+                      "    h + 1"
+                      "let go ="
+                      "    print (f 1)"
+                      "    print (g 5)"
+                      "" ]
+            let ws = Workspace()
+            ws.SetFileText "m.fpp" src
+            let bytes, _, errs = ws.EmitProgramWasmWithSourceMap "m.wasm.map"
+            Expect.isEmpty errs "compiles"
+            let code, out = runBytes bytes
+            Expect.equal code 0 "runs"
+            Expect.equal out "120\n11\n" "the shadowing binding is what the code reads"
+            let text = System.Text.Encoding.Latin1.GetString bytes
+            Expect.stringContains text "x'" "the shadowing `x` is named apart from the parameter"
+            Expect.stringContains text "h'" "and so is the one that collides with an emitter local"
+        }
+
         test "frames are ids the name section resolves" {
             let ws = Workspace()
             ws.SetFileText "m.fpp"

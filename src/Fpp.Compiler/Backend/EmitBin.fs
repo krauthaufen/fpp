@@ -188,7 +188,10 @@ let tblIdx (m : Mod) (fname : string) : int =
 // ---- function bodies -------------------------------------------------------
 
 type Fn =
-    { M : Mod
+    { /// local index -> the name it was WRITTEN with. Display only: LocalIdx
+      /// stays the key, so a debugger name can never repoint a read.
+      SrcNames : Dict<int, string>
+      M : Mod
       B : Bytes
       LocalIdx : Dict<string, int>
       /// local valtypes in order, AFTER the params
@@ -209,7 +212,7 @@ type Fn =
 
 /// open a body: params get indices 0.., locals follow as they are created
 let beginFn (m : Mod) (paramNames : string list) : Fn =
-    let f = { M = m; B = m.CodeBody; LocalIdx = dictNew (); LocalTys = vecNew ()
+    let f = { SrcNames = dictNew (); M = m; B = m.CodeBody; LocalIdx = dictNew (); LocalTys = vecNew ()
               NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0; Replay = -1
               PeepLast = None; PeepPrev = None }
     f.PatchAt <- beginPatch m.CodeBody
@@ -278,6 +281,25 @@ let endFn (f : Fn) : unit =
     let names =
         dictPairs f.LocalIdx
         |> List.map (fun (n, i) -> i, (if n.StartsWith "$" then n.Substring 1 else n))
+        // a name the source used beats a generated one
+        |> List.map (fun (i, n) ->
+            match dictTryFind f.SrcNames i with
+            | Some src -> i, src
+            | None -> i, n)
+        // one name per slot, and SHADOWED bindings stay distinguishable: two
+        // `x`s in one function are two slots, and a reader must be able to tell
+        // which is which
+        |> List.sortBy fst
+        |> List.fold
+            (fun acc (i, n) ->
+                match acc with
+                | (j, _) :: _ when j = i -> acc
+                | _ ->
+                    let taken = acc |> List.filter (fun (_, m) -> m = n || m.StartsWith (n + "'"))
+                    let n2 = if List.isEmpty taken then n else n + String.replicate (List.length taken) "'"
+                    (i, n2) :: acc)
+            []
+        |> List.rev
     if not (List.isEmpty names) then vecAdd f.M.LocalNames (idx, names)
     f.M.CodeCount <- f.M.CodeCount + 1
 
@@ -507,6 +529,14 @@ let dataSeg (m : Mod) (name : string) (bytes : byte[]) : unit =
     m.DataCount <- m.DataCount + 1
     emitByte m.DataBody 1
     emitVec m.DataBody bytes
+
+/// Record what a local was called in the source. Display only — it changes
+/// what a debugger shows, never which slot anything reads.
+let nameLocal (f : Fn) (localName : string) (srcName : string) : unit =
+    if srcName <> "" && srcName <> "_" then
+        match dictTryFind f.LocalIdx localName with
+        | Some idx -> dictSet f.SrcNames idx srcName
+        | None -> ()
 
 /// `depth <- depth + delta`, and where the depth grows, record the frame.
 /// `frameId` < 0 only adjusts the depth (what a tail call needs).

@@ -847,6 +847,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             | ELet (_, v, _, rhs, body) ->
                 // a binding is a step point for a debugger
                 markSrc f v.Path v.Offset
+                let nameIt (l : string) = nameLocal f l v.Name
                 let key = (v.Path, v.Offset)
                 let k = kindOfLite st rhs
                 if (dictTryFind st.CellVars key).IsNone
@@ -859,6 +860,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                     callf f (unboxOfK k)
                     let ty = match k with "f" -> "f64" | "s" -> "f32" | "l" -> "i64" | _ -> "i32"
                     let l = freshLocal f "$tl" ty
+                    nameIt l
                     dictSet st.LocalKind key k
                     dictSet lv key l
                     ls f l
@@ -868,6 +870,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                     if (dictTryFind st.CellVars key).IsSome then
                         gcT f "struct.new" "$cell"
                     let l = freshLocal f "$bl" "anyref"
+                    nameIt l
                     dictSet lv key l
                     ls f l
                 cur <- body
@@ -2778,7 +2781,7 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
     clearKinds ()
     let scratchB = bytesNew ()
     let scratch =
-        { M = f.M; B = scratchB; LocalIdx = dictNew (); LocalTys = vecNew ()
+        { SrcNames = dictNew (); M = f.M; B = scratchB; LocalIdx = dictNew (); LocalTys = vecNew ()
           NParams = f.NParams; Labels = labelsNew (); PatchAt = 0; Replay = -1
           PeepLast = None; PeepPrev = None }
     for k, v in dictPairs f.LocalIdx do
