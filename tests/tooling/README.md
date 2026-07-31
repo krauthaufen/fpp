@@ -378,9 +378,14 @@ the address from scratch:
     local.get 3  local.get 13  i32.const 2  i32.add
     i32.const 4  i32.mul  i32.add  i32.load
 
-Six extra ALU ops per read, three reads per iteration: 18. Measured overhead
-over C-on-wasm is 5.45 ns per iteration, about 19 cycles. That is the 18 ops
-— not the GC, not the bounds check (8%), not the engine.
+Six extra ALU ops per read, three reads per iteration: 18. That LOOKS like
+the 5.45 ns of measured overhead per iteration, about 19 cycles.
+
+It is not. Strength reduction was then built, and took the nine multiplies in
+the loop down to one — for no gain at all (175 ms without it, 172 with, and
+slower on two other benchmarks). Those ops are independent, so the CPU issues
+them alongside the work that matters. The gap is somewhere else, and counting
+instructions will not find it.
 
 `shapes.c` / `shapes.fpp` run the same comparison over five struct shapes at
 once — a 12-byte vector, a pair of doubles, a 4-byte colour, a mixed
