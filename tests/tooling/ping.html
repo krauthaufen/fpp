@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>postMessage cost</title>
+<script type="module">
+const r = { crossOriginIsolated: self.crossOriginIsolated,
+            sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+            workers: typeof Worker === 'function' };
+const w = new Worker('pingworker.js', { type: 'module' });
+const round = (buf, transfer) => new Promise(res => {
+  w.onmessage = e => res(e.data.buf);
+  transfer ? w.postMessage({ buf, transfer }, [buf]) : w.postMessage({ buf, transfer });
+});
+const median = xs => (xs.sort((a,b)=>a-b), xs[xs.length>>1]);
+async function bench(bytes, transfer) {
+  const runs = [];
+  for (let i = 0; i < 9; i++) {
+    let buf = new ArrayBuffer(bytes);
+    const t = performance.now();
+    buf = await round(buf, transfer);
+    runs.push(performance.now() - t);
+  }
+  return median(runs);
+}
+r.results = [];
+for (const bytes of [1024, 1 << 20, 16 << 20]) {
+  r.results.push({ bytes,
+    copy: await bench(bytes, false),
+    transfer: await bench(bytes, true) });
+}
+// and a plain object, the structured-clone case
+const obj = { xs: Array.from({ length: 50000 }, (_, i) => i), name: 'state' };
+const objRound = () => new Promise(res => { w.onmessage = e => res(e.data); w.postMessage({ buf: new ArrayBuffer(8), obj }); });
+const t0 = performance.now(); await objRound(); r.objectClone = performance.now() - t0;
+window.results = r; window.ready = true;
+</script>

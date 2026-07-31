@@ -257,3 +257,36 @@ What that does NOT cover, and it is the part that matters for this language:
 * COOP/COEP headers are mandatory. Without cross-origin isolation
   `SharedArrayBuffer` is simply absent, which is why the earlier probe reported
   it as false.
+
+## postmessage — workers WITHOUT cross-origin isolation
+
+    python3 -m http.server 8731        # no COOP/COEP on purpose
+    node tests/tooling/postmessage.js
+
+    page is cross-origin isolated : false | SharedArrayBuffer: false | Worker: true
+    round trip to a worker and back (median of 9):
+        1 KB   copy    0.10 ms   transfer   0.100 ms
+        1 MB   copy    2.60 ms   transfer   0.100 ms
+       16 MB   copy   69.80 ms   transfer   0.300 ms
+      structured clone of a 50k-element array: 4.50 ms
+
+Workers and `postMessage` need NO isolation — only `SharedArrayBuffer` does. So
+a worker pool is available everywhere, and the cost depends entirely on how the
+data travels:
+
+* COPY (structured clone): ~2.6 ms per MB, and it scales with size — 16 MB costs
+  70 ms per hop. A 50 000-element JS array costs 4.5 ms just to clone.
+* TRANSFER (an ArrayBuffer in the transfer list): 0.1-0.3 ms REGARDLESS of size.
+  It is a move, not a copy: the sender loses the buffer. 16 MB crosses 230x
+  faster than copying it.
+
+For this language that maps cleanly onto what already exists: GC objects
+(records, lists, HashMap) cannot cross without being serialized, but a PINNED
+POD array is bytes in linear memory, so it can be handed over as a transferred
+ArrayBuffer for the price of a move. A worker pool that owns its own module
+instance and exchanges pinned buffers is the design that works today with no
+special headers.
+
+Caveat: a non-shared `WebAssembly.Memory`'s own buffer is not transferable —
+detaching it would break the instance. Copy the region into a fresh ArrayBuffer
+(one copy) and transfer that, or use COOP/COEP and share the memory outright.
