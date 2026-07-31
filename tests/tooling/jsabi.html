@@ -1,0 +1,27 @@
+<!doctype html><meta charset="utf-8"><title>js abi</title>
+<script type="module">
+// interned literals: created ONCE, then reused as externref — no per-call
+// string marshalling
+const S = ['document','body','createElement','button','textContent',
+           'made through get/set/invoke','id','made','addEventListener','click',
+           'appendChild','Date','title','getUTCFullYear',''];
+const js = {
+  global: name => globalThis[name],
+  get: (o, k) => o[k],
+  set: (o, k, v) => { o[k] = v; },
+  invoke1: (o, k, a) => o[k](a),
+  invoke2: (o, k, a, b) => o[k](a, b),
+  construct1: (C, a) => new C(a),
+  num: x => x,
+  toNum: x => Number(x),
+  func: f => f,                    // a wasm funcref arrives as a callable
+  str: i => S[i],
+};
+const { instance } = await WebAssembly.instantiateStreaming(fetch('jsabi.wasm'), { js });
+instance.exports.build();
+const btn = document.getElementById('made');
+window.before = { html: btn.outerHTML, clicks: instance.exports.clicks() };
+btn.click(); btn.click();          // JS calls back INTO wasm
+window.after = { clicks: instance.exports.clicks() };
+window.ready = true;
+</script>

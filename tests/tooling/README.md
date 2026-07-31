@@ -83,3 +83,35 @@ Why each matters for a DOM binding:
   shared between workers yet. Anything GC-allocated is per-thread until
   shared-everything-threads ships; across workers you either share linear
   memory or message-pass, and message-passing serializes.
+
+## jsabi — all of JS through a handful of primitives
+
+    wasm-tools parse jsabi.wat -o jsabi.wasm
+    python3 -m http.server 8731 && node tests/tooling/jsabi.js
+
+Nothing DOM-specific is imported — no `createElement`, no `appendChild`. Ten
+generic primitives reach everything:
+
+    global(name)              globalThis lookup, the bootstrap
+    get(o, k) / set(o, k, v)  properties; an index is just a numeric key
+    invoke1/2(o, k, args...)  method call with `this`
+    construct1(C, a)          `new`
+    func(funcref)             a WASM function handed to JS as a callback
+    num / toNum               numbers across
+    str(i)                    interned literals
+
+Measured result: `<button id="made" title="1970">made through get/set/invoke</button>`
+— element created, properties set, appended, `new Date(0).getUTCFullYear()`
+evaluated — and after two JS-side `.click()`s the wasm counter reads 2, so a
+wasm function really was installed as an event listener and called back.
+
+Two things that make or break it:
+* INTERN the property names. They are `externref`s created once (the `S` table),
+  not strings marshalled per call. That is where the cost would otherwise be.
+* Keep the glue monomorphic — each import does one thing, so the engine's inline
+  caches stay happy.
+
+A typed `Element`/`Node`/`Document` hierarchy generates DOWN to these. The
+compiler needs `externref` plumbing once (an opaque handle type, and `externref`
+rather than `anyref` in import signatures); everything above that is generated
+F++ code, which is what the source-level plugins already do.
