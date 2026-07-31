@@ -357,7 +357,7 @@ against a compiler rather than against a reading of the ABI.
 Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
 
     C -O2   71 ms
-    F++    656 ms      (9x)
+    F++    328 ms      (4.6x)
 
 Two things dominated before, and neither was the read.
 
@@ -378,18 +378,20 @@ Reads are emitted INLINE rather than as a call to `$hwget`. A call is an
 optimisation barrier — the engine has to assume it writes globals, so it
 cannot hoist the array fetch or the surrounding casts out of a loop.
 
-Two things still stand between this and C, both measured by hand-editing the
-emitted wasm and re-running it (each verified to still print the right sum):
+The base of every POD array a loop touches is now HOISTED out of it. Nothing
+about that base — the storage and the pin pointer — can change while the loop
+runs, so an access that used to be `global.get`, `ref.cast $hnd`,
+`struct.get`, `ref.cast $pk`, `array.get` is now just the load. A loop that
+pins is left alone, since pinning moves the storage.
 
-    F++ today                        656 ms    9x C
-    + nothing called in the loop     507 ms    7x C
-    + array base hoisted out of it   209 ms    2.9x C
+    filling a 1M V3f[]      189 ms -> 51 ms
+    fill + 20M reads        441 ms -> 193 ms
+    the whole benchmark     656 ms -> 328 ms
 
-The second is the prize and it is ordinary loop-invariant code motion: every
-read re-does `global.get`, `ref.cast $hnd`, `struct.get`, `ref.cast $pk`,
-none of which change across iterations. Hoisting them into locals is what
-takes this into the 1-3x band. It needs care around `Array.pin` inside a
-loop, which invalidates a hoisted base.
+What is left is the loop condition. `while i < n` reads `n` from a global and
+calls `$toi` to unbox it, every iteration — and a call is a barrier, so it
+also stops the engine hoisting anything of its own. Hand-editing that away
+took the same program to 209 ms (2.9x C), which is the next target.
 
 `let e = v.[i]` also remains: it materializes the element and is ~60x slower
 than reading its fields directly — the same allocation problem the store side

@@ -58,6 +58,11 @@ type St =
       Pod : Dict<string, (string * string * int) list * int * int>
       /// POD struct -> its alignment, which is also its backing word width
       PodAlign : Dict<string, int>
+      /// A POD array whose base has been hoisted out of the loop being
+      /// emitted: global name -> (typed storage local, pin-pointer local).
+      /// Nothing in a loop changes either, so fetching them once turns every
+      /// element access into a single load.
+      PodBase : Dict<string, string * string>
       /// locals on a RAW scalar rail: binder key -> kind (i/f/s/l). Reads
       /// box, writes unbox — and the peephole cancels both against their
       /// producers/consumers, which is what makes a hot loop alloc-free
@@ -696,27 +701,47 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
         lg f bl
         ic f (off / width)
         ins f "i32.add"
-    lg f hl
-    gcT f "ref.cast" "$hnd"
-    gcTF f "struct.get" "$hnd" 0
-    ins f "ref.is_null"
-    ifV f vt
-    lg f hl
-    gcT f "ref.cast" "$hnd"
-    gcTF f "struct.get" "$hnd" 1
-    idx ()
-    ic f width
-    ins f "i32.mul"
-    ins f "i32.add"
-    mem f loadOp
-    elseB f
-    lg f hl
-    gcT f "ref.cast" "$hnd"
-    gcTF f "struct.get" "$hnd" 0
-    gcT f "ref.cast" ty
-    idx ()
-    gcT f getOp ty
-    endB f
+    // the word, however it has to be reached — everything after this is the
+    // same either way, so the match must not swallow it
+    (match dictTryFind st.PodBase hl with
+     | Some (sto, ptr) ->
+         // the base was hoisted: no global read, no casts, just the load
+         lg f sto
+         ins f "ref.is_null"
+         ifV f vt
+         lg f ptr
+         idx ()
+         ic f width
+         ins f "i32.mul"
+         ins f "i32.add"
+         mem f loadOp
+         elseB f
+         lg f sto
+         idx ()
+         gcT f getOp ty
+         endB f
+     | None ->
+         lg f hl
+         gcT f "ref.cast" "$hnd"
+         gcTF f "struct.get" "$hnd" 0
+         ins f "ref.is_null"
+         ifV f vt
+         lg f hl
+         gcT f "ref.cast" "$hnd"
+         gcTF f "struct.get" "$hnd" 1
+         idx ()
+         ic f width
+         ins f "i32.mul"
+         ins f "i32.add"
+         mem f loadOp
+         elseB f
+         lg f hl
+         gcT f "ref.cast" "$hnd"
+         gcTF f "struct.get" "$hnd" 0
+         gcT f "ref.cast" ty
+         idx ()
+         gcT f getOp ty
+         endB f)
     let sh = (off % width) * 8
     if sh <> 0 then
         if wide then
@@ -767,6 +792,124 @@ and private emitPodBuild (st : St) (f : Fn) (top : string) (hl : string) (bl : s
             let _, k, off = placed |> List.find (fun (p, _, _) -> p = full)
             emitPodLeafRead st f top hl bl k off
     gcT f "struct.new" ("$r_" + rn)
+
+/// Push the handle. `hl` is normally a local, but for an array whose base a
+/// loop hoisted it is the GLOBAL's name — the write paths still want the
+/// handle itself, so fetch it straight from the global there.
+and private podPushHandle (st : St) (f : Fn) (hl : string) : unit =
+    if (dictTryFind st.PodBase hl).IsSome then gg f hl else lg f hl
+
+/// every sub-expression, exhaustively — a case missed here could hide an
+/// `Array.pin` and let a stale base be hoisted over it
+and private podScanChildren (g : Expr -> unit) (e : Expr) : unit =
+    match e with
+    | ELam (_, b) -> g b
+    | EApp (h, args) -> g h; List.iter g args
+    | ELet (_, _, _, r, b) -> g r; g b
+    | EIf (a, b, c) -> g a; g b; g c
+    | EMatch (s, cs) ->
+        g s
+        for _, gd, b in cs do
+            (match gd with Some x -> g x | None -> ())
+            g b
+    | ETuple xs | EListLit xs | ESeq xs -> List.iter g xs
+    | EPrim (_, xs) -> List.iter g xs
+    | ECtor (_, _, xs) -> List.iter g xs
+    | ERecord (_, fs) -> for _, v in fs do g v
+    | ERecordExt (_, b, fs) ->
+        g b
+        for _, v in fs do g v
+    | EField (x, _, _) -> g x
+    | EIfaceCall (_, _, recv, args) -> g recv; List.iter g args
+    | ECast (_, x, _) -> g x
+    | ETypeTest (_, x) -> g x
+    | EFieldSet (x, _, _, v) -> g x; g v
+    | EWhile (c, b) -> g c; g b
+    | EAssign (_, x) -> g x
+    | EArray (_, xs) -> List.iter g xs
+    | EIndex (_, a, i) -> g a; g i
+    | EIndexSet (_, a, i, v) -> g a; g i; g v
+    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> g a
+    | EArrayCreate (_, a, b) -> g a; g b
+    | ETry (b, cs) ->
+        g b
+        for _, gd, x in cs do
+            (match gd with Some y -> g y | None -> ())
+            g x
+    | _ -> ()
+
+/// The handle a POD access reads through. When the array is a top-level
+/// binding whose base this loop already hoisted, the key IS the global name
+/// and nothing is emitted; otherwise the handle goes into a fresh local as
+/// before.
+and private podHandleLocal (st : St) (f : Fn) (lv : Dict<string * int, string>) (a : Expr) : string =
+    let hoisted =
+        match a with
+        | EVar (v, _) ->
+            (match dictTryFind st.GlobalOf (v.Path, v.Offset) with
+             | Some g when (dictTryFind st.PodBase g).IsSome -> Some g
+             | _ -> None)
+        | _ -> None
+    match hoisted with
+    | Some g -> g
+    | None ->
+        let hl = freshLocal f "$pha" "anyref"
+        emitNode st f lv a
+        ls f hl
+        hl
+
+/// Hoist the base of every POD array a loop reads out of the loop. The base —
+/// the storage and the pin pointer — cannot change while the loop runs, so
+/// fetching it once turns each access from `global.get; ref.cast; struct.get;
+/// ref.cast; array.get` into a single load. Returns the globals registered,
+/// for the caller to drop afterwards: the locals only hold the base from here
+/// to the end of the loop, and code on another path must not read them.
+and private podHoistLoop (st : St) (f : Fn) (parts : Expr list) : string list =
+    let cand = dictNew<string, string> ()
+    let mutable blocked = false
+    let rec scan (e : Expr) : unit =
+        // pinning MOVES the storage, so a loop that pins keeps its base fresh
+        (match e with
+         | EArrayPin _ | EArrayUnpin _ -> blocked <- true
+         | _ -> ())
+        let note (nm : string) (a : Expr) =
+            match a with
+            | EVar (v, _) when (dictTryFind st.Pod nm).IsSome ->
+                (match dictTryFind st.GlobalOf (v.Path, v.Offset) with
+                 | Some g -> dictSet cand g nm
+                 | None -> ())
+            | _ -> ()
+        (match e with
+         | EIndex (nm, a, _) | EIndexSet (nm, a, _, _) -> note nm a
+         | EField (EIndex (nm, a, _), _, _) -> note nm a
+         | _ -> ())
+        podScanChildren scan e
+    for p in parts do scan p
+    if blocked then []
+    else
+        let out = vecNew<string> ()
+        // an enclosing loop may already have hoisted it; re-doing it here
+        // would only clobber that registration and drop it early
+        for g, nm in dictPairs cand do
+          if not (dictTryFind st.PodBase g).IsSome then
+            let width = podW st nm
+            let ty, _, _, _, _ = Fpp.Backend.EmitBin.podRt width
+            let sto = freshLocal f "$pbs" ty
+            let ptr = freshLocal f "$pbp" "i32"
+            // storage, kept NULLABLE: a pinned array has none, and the
+            // pointer path below is exactly what serves that case
+            gg f g
+            gcT f "ref.cast" "$hnd"
+            gcTF f "struct.get" "$hnd" 0
+            gcT f "ref.cast_null" ty
+            ls f sto
+            gg f g
+            gcT f "ref.cast" "$hnd"
+            gcTF f "struct.get" "$hnd" 1
+            ls f ptr
+            dictSet st.PodBase g (sto, ptr)
+            vecAdd out g
+        vecToList out
 
 and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
@@ -2190,10 +2333,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         // struct materialization, one box instead of the whole element
         let placed, _, wd = (dictTryFind st.Pod nm).Value
         let _, k, off = placed |> List.find (fun (p, _, _) -> p = fname)
-        let hl = freshLocal f "$pfh" "anyref"
+        let hl = podHandleLocal st f lv a
         let bl = freshLocal f "$pfb" "i32"
-        emitNode st f lv a
-        ls f hl
         emitNode st f lv i
         callf f "$toi"
         ic f wd
@@ -2303,6 +2444,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f 0
         refI31 f
     | EWhile (c, b) ->
+        let hoisted = podHoistLoop st f [ c; b ]
         blockE f "$wbrk"
         loopE f "$wgo"
         emitNode st f lv c
@@ -2314,6 +2456,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         br f "$wgo"
         endB f
         endB f
+        for g in hoisted do dictRemove st.PodBase g
         ic f 0
         refI31 f
     | EApp (EUnknown "failwith", [ a ]) ->
@@ -2389,10 +2532,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "struct.new" "$hnd"
     | EIndex (nm, a, i) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
-        let hl = freshLocal f "$pha" "anyref"
+        let hl = podHandleLocal st f lv a
         let bl = freshLocal f "$phb" "i32"
-        emitNode st f lv a
-        ls f hl
         emitNode st f lv i
         callf f "$toi"
         ic f wd
@@ -2413,10 +2554,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
           && ((dictTryFind st.Pod nm).Value
               |> fun (placed, _, _) -> placed |> List.forall (fun (p, _, _) -> not (p.Contains "."))) ->
         let placed, _, wd = (dictTryFind st.Pod nm).Value
-        let hl = freshLocal f "$sha" "anyref"
+        let hl = podHandleLocal st f lv a
         let bl = freshLocal f "$shb" "i32"
-        emitNode st f lv a
-        ls f hl
         emitNode st f lv i
         callf f "$toi"
         ic f wd
@@ -2437,7 +2576,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                 dictSet slot fn l
             | None -> ()
         for w in 0 .. wd - 1 do
-            lg f hl
+            podPushHandle st f hl
             lg f bl
             ic f w
             ins f "i32.add"
@@ -2457,11 +2596,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         refI31 f
     | EIndexSet (nm, a, i, v) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
-        let hl = freshLocal f "$pha" "anyref"
+        let hl = podHandleLocal st f lv a
         let bl = freshLocal f "$phb" "i32"
         let vl = freshLocal f "$phv" "anyref"
-        emitNode st f lv a
-        ls f hl
         emitNode st f lv i
         callf f "$toi"
         ic f wd
@@ -2470,7 +2607,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         ls f vl
         for w in 0 .. wd - 1 do
-            lg f hl
+            podPushHandle st f hl
             lg f bl
             ic f w
             ins f "i32.add"
@@ -3038,7 +3175,8 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
           SlotOf = dictNew (); IfaceName = dictNew (); ImplsOf = dictNew ()
           SubsOf = dictNew (); BaseOf = dictNew ()
           TailApp = refMapNew shallowExprHash
-          Pod = dictNew (); PodAlign = dictNew (); StructFields = dictNew ()
+          Pod = dictNew (); PodAlign = dictNew (); PodBase = dictNew ()
+          StructFields = dictNew ()
           DbgFrame = -1
           LocalKind = dictNew (); InLambda = snd (cellScan decls)
           SigKinds = dictNew (); SigByName = dictNew (); CurRet = "u"
