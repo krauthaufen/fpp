@@ -940,6 +940,38 @@ and private unrollGuard (st : St) (c : Expr) (b : Expr) : Expr option =
             else None
         | _ -> None
 
+/// Store one backing word. The read path was inlined, hoisted and stripped of
+/// its pin test long before this one was, and the asymmetry cost more than
+/// everything the read path gained: filling a 1M-element array called a
+/// runtime function three times per element, each re-reading the global and
+/// casting twice. Same treatment here.
+and private emitPodWordStore (st : St) (f : Fn) (nm : string) (hl : string) (bl : string) (w : int)
+                             (pushValue : unit -> unit) : unit =
+    let width = podW st nm
+    let ty, _, _, _, storeOp = Fpp.Backend.EmitBin.podRt width
+    let everPinned = not st.Opt || (dictTryFind st.PinnedTypes nm).IsSome
+    let idx () =
+        lg f bl
+        ic f w
+        ins f "i32.add"
+    if everPinned then
+        // the array may be in linear memory: the runtime function decides
+        podPushHandle st f hl
+        idx ()
+        pushValue ()
+        callf f ("$hwset" + string width)
+    else
+        (match dictTryFind st.PodBase hl with
+         | Some (sto, _) -> lg f sto
+         | None ->
+             podPushHandle st f hl
+             gcT f "ref.cast" "$hnd"
+             gcTF f "struct.get" "$hnd" 0
+             gcT f "ref.cast" ty)
+        idx ()
+        pushValue ()
+        gcT f "array.set" ty
+
 /// Push the handle. `hl` is normally a local, but for an array whose base a
 /// loop hoisted it is the GLOBAL's name — the write paths still want the
 /// handle itself, so fetch it straight from the global there.
@@ -2813,22 +2845,18 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                     | None -> ()
         take "" fs
         for w in 0 .. wd - 1 do
-            podPushHandle st f hl
-            lg f bl
-            ic f w
-            ins f "i32.add"
-            emitPodWordOf st f nm (fun path k ->
-                match dictTryFind slot path with
-                | Some l -> lg f l
-                | None ->
-                    // a field the literal omits cannot happen for a record,
-                    // but zero is the honest answer if it ever does
-                    (match k with
-                     | "f" -> fc f 0L
-                     | "s" -> sc f 0
-                     | "l" -> lc f 0L
-                     | _ -> ic f 0)) w
-            callf f ("$hwset" + string (podW st nm))
+            emitPodWordStore st f nm hl bl w (fun () ->
+                emitPodWordOf st f nm (fun path k ->
+                    match dictTryFind slot path with
+                    | Some l -> lg f l
+                    | None ->
+                        // a field the literal omits cannot happen for a
+                        // record, but zero is the honest answer if it ever does
+                        (match k with
+                         | "f" -> fc f 0L
+                         | "s" -> sc f 0
+                         | "l" -> lc f 0L
+                         | _ -> ic f 0)) w)
         ic f 0
         refI31 f
     | EIndexSet (nm, a, i, v) when (dictTryFind st.Pod nm).IsSome ->
@@ -2844,12 +2872,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         ls f vl
         for w in 0 .. wd - 1 do
-            podPushHandle st f hl
-            lg f bl
-            ic f w
-            ins f "i32.add"
-            emitPodWord st f nm vl w
-            callf f ("$hwset" + string (podW st nm))
+            emitPodWordStore st f nm hl bl w (fun () -> emitPodWord st f nm vl w)
         ic f 0
         refI31 f
     | EArrayCreate (nm, n, EUnknown "$zero") when (dictTryFind st.Pod nm).IsSome ->

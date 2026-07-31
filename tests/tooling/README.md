@@ -359,12 +359,14 @@ Fill a 1M-element `V3f[]`, then sum every component 20 times: 60M reads.
     C native (gcc -O2)     45 ms
     C -> wasm (wasmtime)   59 ms     wasm itself costs ~31%
     .NET steady state     100 ms     JIT, native, real structs
-    F++ -> wasm (same)    174 ms
+    F++ -> wasm (same)    149 ms
 
 Both C and F++ run as wasm under the same wasmtime, so that pair is the fair
-one: 2.9x. The .NET figure is steady state — `vertices.dotnet.fs` runs the
+one: 2.9x. The .NET figure is steady state — `vertices.dotnet.fs.txt` runs the
 measurement ten times in-process and the first round (155 ms) is JIT warmup,
-after which it sits flat at 100. Worth noting that nothing here reaches C:
+after which it sits flat at 100. (It carries a `.txt` suffix for the same
+reason the known-issue repros did: the dogfooding gate infers every `*.fs` in
+the repo, and this one is F#, not F++. Copy it into an `fsproj` to run it.) Worth noting that nothing here reaches C:
 .NET, with a mature JIT and no wasm in the way, is 2.2x native C on this loop.
 
 Where the remaining F++ gap is, exactly. For one field read clang emits
@@ -479,12 +481,19 @@ Two loops, each in C and in F++, both compiled to wasm and run under wasmtime.
 is the same loop with ONE field read from a 1M-element `V3f[]` added to it.
 
     add    C 39 ms    F++ 41 ms     parity
-    read   C 49 ms    F++ 115 ms
+    read   C 49 ms    F++ 94 ms
 
 So the loop, the counter, the branch and the floating-point chain are already
-at C's speed. The ENTIRE gap is the per-element read: about 0.5 ns in C and
-about 3 ns here, and everything else that looked like a cause was a
-distraction.
+at C's speed, and the gap is in touching the array.
+
+Splitting it further: with zero read iterations, the FILL of a 1M-element
+array cost 49 ms on its own. Writes had never been given any of what the read
+path got — every word went through a runtime call that re-read the global and
+cast twice, three calls per element. Inlining stores the same way took the
+fill to 26 ms and the vertex benchmark from 175 ms to 149.
+
+That is the second time the fill was mistaken for read cost. Measure it with
+the read loop set to zero iterations BEFORE attributing anything.
 
 What it is NOT, each ruled out by measurement rather than argument:
 
