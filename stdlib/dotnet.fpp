@@ -13,6 +13,7 @@ module Stdlib
 
 open System
 open System.Collections.Generic
+open System.Runtime.CompilerServices
 open System.Text
 
 // ---- ResizeArray --------------------------------------------------------
@@ -178,6 +179,57 @@ let s5 =
     sb.Append 'a' |> ignore
     sb.Append 'b' |> ignore
     print (sb.ToString ())
+
+// ---- WeakReference, ConditionalWeakTable, TryGetValue -------------------
+//
+// The weak types are STRONG here (DIVERGENCES.md): wasm-GC has no weak
+// references and no finalizers. Everything below holds a live reference
+// throughout, which is exactly where the two agree — .NET cannot collect
+// what is still reachable either.
+
+type Cell(n : int) =
+    member x.N = n
+
+let cellA = Cell 7
+let cellB = Cell 9
+
+let w0 =
+    let w = WeakReference<Cell>(cellA)
+    match w.TryGetTarget () with
+    | (true, t) -> print t.N
+    | _ -> print (0 - 1)
+
+let cwt = ConditionalWeakTable<Cell, string>()
+let w1 =
+    cwt.Add (cellA, "first")
+    cwt.Add (cellB, "second")
+    match cwt.TryGetValue cellB with
+    | (true, v) -> print v
+    | _ -> print "missing"
+// IDENTITY, not structure: two cells holding the same number are different
+// keys, in both languages
+let w2 =
+    match cwt.TryGetValue (Cell 7) with
+    | (true, v) -> print v
+    | _ -> print "missing"
+let w3 = print (if cwt.Remove cellA then 1 else 0)
+let w4 =
+    match cwt.TryGetValue cellA with
+    | (true, v) -> print v
+    | _ -> print "gone"
+
+// the byref out-parameter, which F# hands over as a tuple
+let w5 =
+    let td = Dictionary<string, int>()
+    td.["k"] <- 5
+    match td.TryGetValue "k" with
+    | (true, v) -> print v
+    | _ -> print (0 - 1)
+let w6 =
+    let td = Dictionary<string, int>()
+    match td.TryGetValue "nope" with
+    | (true, v) -> print v
+    | _ -> print (0 - 1)
 
 // ---- System.Math --------------------------------------------------------
 

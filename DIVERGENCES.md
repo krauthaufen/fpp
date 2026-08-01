@@ -241,11 +241,26 @@ generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
 
-## The .NET collections carry no byref members
+## Weak references are STRONG, and byref members are absent bar one
 
-`TryGetValue`, `TryPop`, `Remove(item, out removed)` and every other method
-whose .NET signature needs a byref out-parameter are absent — F++ has no
-byref. Use `ContainsKey` and the indexer.
+`WeakReference<'a>` and `ConditionalWeakTable<'k,'v>` exist and hold their
+targets. wasm-GC has no weak references and no finalizers: there is no way
+to observe that a value became unreachable and no way to be told, so
+`TryGetTarget` always succeeds and a table entry lives until it is removed.
+
+**The divergence has teeth.** Reading through one behaves identically — .NET
+cannot collect what is still reachable either. What changes is a graph that
+relied on weakness to drop its dead half: it keeps it. A cache keyed on
+objects grows until its entries are removed explicitly.
+
+`ConditionalWeakTable` compares keys by IDENTITY, as .NET's does; two
+structurally equal keys are two entries.
+
+`TryGetValue` IS there, on `Dictionary` and on `ConditionalWeakTable`. F#
+hands a byref out-parameter over as a TUPLE, and that shape is expressible:
+`match d.TryGetValue k with | (true, v) -> ...` is one source for both
+languages. Every other byref member — `TryPop`, `Remove(item, out removed)`
+— is absent.
 
 `StringBuilder.Append` takes a string or a char; .NET's numeric overloads
 are not there, so write `sb.Append (string x)`.

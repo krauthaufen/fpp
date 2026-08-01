@@ -28,11 +28,13 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **4291 of 22,635** — through
+The port parses and type-checks from line 1 to **4325 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
 `HashCollections.fs`, `Operations`, and into `Deltas`. Everything past the
 frontier is unknown, not known-bad: the errors after the first are a
 cascade until the first is fixed.
+
+The frontier is now ONE construct: intrinsic type extensions.
 
 ## What is replaced, and what it became
 
@@ -66,8 +68,11 @@ not port work.
   inline Add v = ...` — the library augments its own types in the file that
   declares them. DIVERGENCES.md already lists extension members as an open
   feature; this is the intrinsic case, which is the easier half.
-* **`sprintf` with several specifiers including `%A`.** `sprintf
-  "Add%d(%A)" cnt value` mistypes; a single-specifier format is fine.
+* ~~`sprintf` with several specifiers including `%A`~~ — this was not the
+  format at all. `sprintf "Rem%d(%A)" -cnt value` passes `-cnt`, and F#'s
+  ADJACENT-PREFIX rule is what says so: a `-` with whitespace before and
+  none after negates what follows, where `a - b` subtracts. F++ had the rule
+  for numeric literals only, so `-cnt` parsed as subtraction. Fixed.
 
 ## The work list beyond the frontier
 
@@ -78,8 +83,9 @@ is actually coming:
 | --- | --- | --- |
 | `lock` / `Monitor` (58 + 32) | 90 | real types in the prelude; a single-threaded runtime enters and exits every lock, which is the honest implementation, not a stub |
 | `Interlocked` | 13 | same — the increment is atomic when there is one thread |
-| `WeakReference` | 34 | **the hard one.** wasm-GC has no weak references and no finalizers. A strong reference is correct but never collects; this needs its own decision, and it must be written down as a divergence |
-| `ConditionalWeakTable` | 3 | a `Dictionary` keyed on identity, same caveat |
+| ~~`WeakReference`~~ | 34 | **done.** A strong `WeakReference<'a>` in the prelude: reading through one is identical, and what changes — a graph that relied on weakness to drop its dead half keeps it — is written down in DIVERGENCES.md |
+| ~~`ConditionalWeakTable`~~ | 3 | **done.** An identity-keyed table in the prelude. The library's use is a per-object callback cache with an explicit `Remove`, so the behaviour is the same until something dies with callbacks attached |
+| ~~byref `TryGetValue`~~ | — | **done.** F# hands the out-parameter over as a tuple, which IS expressible |
 | reflection outside ShallowEquality (`typeof<>` in AdaptiveValue, HashSet, HashMap, IndexList, History, Cache) | ~30 | read each: most are `typeof<'a>` used as a cache key or a null test, which a typeclass or a constrained function answers |
 | `IDisposable` / `use` | 25 | `use` is scoped disposal; F++ has neither yet |
 | computation expressions (`ComputationExpressions.fs`, `seq { }`) | 2 files | builders |

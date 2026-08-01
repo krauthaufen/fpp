@@ -507,20 +507,27 @@ let parse (src : string) : ParseResult =
         lhs
 
     and parseApp (ctx : int) : Green =
-        // F#'s prefix-minus rule: `f -1` (space before the minus, none after
-        // a numeric literal) is application of a negative literal
-        let isNegLitArg () =
+        // F#'s ADJACENT-PREFIX rule: in argument position, a `-` with
+        // whitespace before it and none after negates what follows — `f -1`
+        // and `f -x` both pass one argument, where `f - x` subtracts. The
+        // spacing IS the disambiguation, and F# code relies on it:
+        // `sprintf "Rem%d(%A)" -cnt value` passes -cnt, and reading that as
+        // subtraction makes a nonsense of the whole application.
+        let isNegArg () =
             s.IsOp "-" && s.GapBefore
             && (let n = s.Peek 1 in
-                (n.Kind = IntLit || n.Kind = FloatLit) && n.Offset = s.Cur.Offset + 1)
+                n.Offset = s.Cur.Offset + 1
+                && (n.Kind = IntLit || n.Kind = FloatLit || n.Kind = Ident || n.Kind = LParen))
         let parseArg () =
-            if isNegLitArg () then Green.node PrefixExpr [ s.Bump (); s.Bump () ]
+            if isNegArg () then
+                let op = s.Bump ()
+                Green.node PrefixExpr [ op; parsePostfix ctx ]
             else parsePostfix ctx
         let head = parsePostfix ctx
-        if (canStartAtom () || isNegLitArg ()) && (s.SameLine || s.CurCol > ctx) then
+        if (canStartAtom () || isNegArg ()) && (s.SameLine || s.CurCol > ctx) then
             let acc = vecNew<Green> ()
             vecAdd acc head
-            while (canStartAtom () || isNegLitArg ()) && (s.SameLine || s.CurCol > ctx) do
+            while (canStartAtom () || isNegArg ()) && (s.SameLine || s.CurCol > ctx) do
                 vecAdd acc (parseArg ())
             Green.node AppExpr (vecToList acc)
         else head

@@ -4910,6 +4910,15 @@ type Dictionary<'k, 'v>() =
     member x.Clear () : unit =
         dcount <- 0
         dslots <- Array.zeroCreate dslots.Length
+    /// .NET's byref out-parameter, which F# sees as a TUPLE — so
+    /// `match d.TryGetValue k with | (true, v) -> ...` is one source for
+    /// both languages. The miss returns whatever the value array holds at
+    /// zero, exactly as .NET returns `default`, and the flag is what says
+    /// which happened.
+    member x.TryGetValue (k : 'k) : bool * 'v =
+        let e = dslots.[x.SlotOf k]
+        if e = 0 then (false, dvals.[0])
+        else (true, dvals.[e - 1])
     member x.KeyArray () : 'k[] = Array.init dcount (fun i -> dkeys.[i])
     member x.ValueArray () : 'v[] = Array.init dcount (fun i -> dvals.[i])
     /// .NET hands back a KeyCollection; what every caller does with it is
@@ -5028,6 +5037,68 @@ type MutableHashSet<'a>() =
         (x.ToArray () :> seq<'a>).GetEnumerator ()
     interface IEnumerable<'a> with
         member x.GetEnumerator () = (x.ToArray () :> seq<'a>).GetEnumerator ()
+
+/// System.WeakReference — a STRONG reference.
+///
+/// wasm-GC has no weak references and no finalizers: there is no way to
+/// observe that a value became unreachable, and no way to be told. So this
+/// holds its target and `TryGetTarget` always succeeds. Every program that
+/// only READS through a weak reference behaves identically; what changes is
+/// that nothing collected through one is ever released, so a graph that
+/// relied on weakness to drop its dead half keeps it.
+///
+/// This is a divergence with teeth, and it is written down in
+/// DIVERGENCES.md rather than hidden here.
+type WeakReference<'a>(value : 'a) =
+    member x.TryGetTarget () : bool * 'a = (true, value)
+    member x.Target = value
+    member x.IsAlive = true
+
+/// System.Runtime.CompilerServices.ConditionalWeakTable — an IDENTITY-keyed
+/// table, strong for the same reason WeakReference is.
+///
+/// Identity, not structure: the .NET table compares keys by reference, and
+/// the values it holds are keyed on objects whose structural equality would
+/// be both wrong and expensive. Linear probing over insertion-ordered
+/// entries, like Dictionary, but the probe tests `ReferenceEquals`.
+type ConditionalWeakTable<'k, 'v>() =
+    let mutable ckeys : 'k[] = Array.zeroCreate 8
+    let mutable cvals : 'v[] = Array.zeroCreate 8
+    let mutable ccount = 0
+    member x.IndexOf (k : 'k) : int =
+        let mutable found = 0 - 1
+        let mutable i = 0
+        while i < ccount do
+            if found < 0 && System.Object.ReferenceEquals (ckeys.[i], k) then found <- i
+            i <- i + 1
+        found
+    member x.TryGetValue (k : 'k) : bool * 'v =
+        let i = x.IndexOf k
+        if i < 0 then (false, cvals.[0])
+        else (true, cvals.[i])
+    member x.Add (k : 'k, v : 'v) : unit =
+        if ccount >= ckeys.Length then
+            let nk : 'k[] = Array.zeroCreate (ckeys.Length * 2)
+            let nv : 'v[] = Array.zeroCreate (cvals.Length * 2)
+            Array.blit ckeys 0 nk 0 ccount
+            Array.blit cvals 0 nv 0 ccount
+            ckeys <- nk
+            cvals <- nv
+        ckeys.[ccount] <- k
+        cvals.[ccount] <- v
+        ccount <- ccount + 1
+    member x.Remove (k : 'k) : bool =
+        let i = x.IndexOf k
+        if i < 0 then false
+        else
+            let mutable j = i
+            while j < ccount - 1 do
+                ckeys.[j] <- ckeys.[j + 1]
+                cvals.[j] <- cvals.[j + 1]
+                j <- j + 1
+            ccount <- ccount - 1
+            true
+    member x.Count = ccount
 
 /// System.Text.StringBuilder. Appending is O(1) — the chunks are joined once,
 /// by the pairwise merge in String.concat, when the text is asked for. A left
