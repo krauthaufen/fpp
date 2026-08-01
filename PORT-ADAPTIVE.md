@@ -68,9 +68,13 @@ there and beyond:
   or promotion of that storage to a cell.
 * **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
   parses, stays in the tree and no longer counts as a type parameter — but
-  it is still inert. The PREREQUISITE is now in place: a type declaration
-  carries class constraints (`type Box<'a> when Ordered<'a> = ...`), so the
-  translation is a rewrite from the F# spelling to the F++ one:
+  it is still inert, and so — as it turns out — is the F++ spelling. A type
+  declaration now PARSES `when C<'a>`, but nothing reads it: `Box<Opaque>`
+  is accepted where `Opaque` has no `Ordered` instance. Inference still
+  derives what a member's body needs, which is what made an early test look
+  like it worked. So the order is: make a type-level constraint BIND (a
+  given for the members, and a check at every instantiation), then translate
+  the F# spelling onto it:
 
   | F# | F++ |
   | --- | --- |

@@ -241,6 +241,18 @@ generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
 
+## A class constraint on a TYPE declaration is not enforced
+
+`type Box<'a> when Ordered<'a> = ...` parses, and so does F#'s own
+`type Box<'a when 'a : comparison>`. Neither BINDS: nothing pushes the
+constraint into the members as a given, and nothing checks it at an
+instantiation, so `Box<Opaque>` is accepted where `Opaque` has no instance.
+What does work is inference — a member whose body calls `compare` gets
+`Ordered` from that — which is why the declaration looks like it works
+until you write a type that does not satisfy it.
+
+Constraints on a `let` or a member signature ARE enforced.
+
 ## The integer types, and which are int-shaped
 
 `sbyte`, `byte`, `int16`, `uint16`, `int`, `uint32`, `int64` and `uint64`
