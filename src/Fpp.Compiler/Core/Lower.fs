@@ -837,7 +837,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             | None -> None)
                                        | None -> None)
                                   | None -> None
-                          (match indexSetter with
+                          // `p <- v` where p is a BYREF parameter: the store
+                          // goes into the cell, which inference marked by
+                          // recording the target's owner
+                          let byrefTarget =
+                              if l.NodeKind <> IdentExpr then None
+                              else
+                                  match Green.tokens (GNode l) |> List.tryFind (fun t -> t.Kind = Ident) with
+                                  | Some t when (dictTryFind fieldOwners t.Offset) = Some "ByRefCell" ->
+                                      (match lowerExpr (GNode l) with
+                                       | EVar (v, sch) -> Some (EVar (v, sch))
+                                       | _ -> None)
+                                  | _ -> None
+                          (match byrefTarget with
+                           | Some cell -> EFieldSet (cell, "Contents", "ByRefCell", lowerExpr (GNode r))
+                           | None ->
+                          match indexSetter with
                            | Some (fn, recv, i) -> EApp (fn, [ recv; i; lowerExpr (GNode r) ])
                            | None ->
                           match propSetter with
@@ -2226,7 +2241,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let tyParams =
             nodesOf n
             |> List.filter (fun m -> m.NodeKind = TyParams)
-            |> List.collect (fun m -> Green.tokens (GNode m))
+            // NOT the inline constraint's own identifiers: `'Key : comparison`
+            // names a class, not a parameter
+            |> List.collect (fun m ->
+                    m.Children
+                    |> List.collect (fun c ->
+                        match c with
+                        | GNode w when w.NodeKind = WhenDecl -> []
+                        | other -> Green.tokens other))
             |> List.filter (fun t -> t.Kind = Ident && t.Text <> "_")
             |> List.map (fun t -> t.Text)
         let caseNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = UnionCase)

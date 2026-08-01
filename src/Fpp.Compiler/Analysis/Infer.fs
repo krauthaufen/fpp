@@ -1649,6 +1649,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               && (match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                                   | Some t -> (dictTryFind recordFieldTargets t.Offset).IsSome
                                   | None -> false)
+                          // `p <- v` where p is a BYREF: the write goes
+                          // through the cell, and what it must fit is the
+                          // cell's CONTENT. Recorded under the target's own
+                          // offset as a field owner, which is what lowering
+                          // reads to emit the store.
+                          let byrefTarget =
+                              if l.NodeKind <> IdentExpr then None
+                              else
+                                  match prune lt with
+                                  | TCon ("ByRefCell", [ inner ]) ->
+                                      (match Green.tokens (GNode l) |> List.tryFind (fun t -> t.Kind = Ident) with
+                                       | Some t -> Some (t.Offset, inner)
+                                       | None -> None)
+                                  | _ -> None
+                          (match byrefTarget with
+                           | Some (off, inner) ->
+                               vecAdd fieldOwnersRaw (off, "ByRefCell")
+                               unifyArg op.Offset inner rt
+                           | None -> ())
                           // an INDEXER target ties the same way: `set_Item`'s
                           // value parameter is the getter's result type
                           let isIndexer =
@@ -1657,7 +1676,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               && (match Green.tokens (GNode l) |> List.tryHead with
                                   | Some t -> (dictTryFind indexerTargets t.Offset).IsSome
                                   | None -> false)
-                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
+                          if op.Text = "<-" && byrefTarget.IsNone
+                             && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
                               unifyArg op.Offset lt rt
                           tUnit
                       | _ -> st.Fresh ())
@@ -2517,8 +2537,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let tyParams = vecNew<Type> ()
         for m in nodesOf n do
             if m.NodeKind = TyParams then
-                // 'a sits inside VarType nodes — walk all descendant tokens
-                for t in Green.tokens (GNode m) do
+                // 'a sits inside VarType nodes — walk all descendant tokens,
+                // but NOT those of an inline constraint (`'Key : comparison`),
+                // whose identifiers name a class rather than a parameter
+                let paramToks =
+                    m.Children
+                    |> List.collect (fun c ->
+                        match c with
+                        | GNode w when w.NodeKind = WhenDecl -> []
+                        | other -> Green.tokens other)
+                for t in paramToks do
                     if t.Kind = Ident && t.Text <> "_" && not (dictTryFind vars t.Text).IsSome then
                         let v = st.Fresh ()
                         dictSet vars t.Text v

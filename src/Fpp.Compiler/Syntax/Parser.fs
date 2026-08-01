@@ -360,9 +360,24 @@ let parse (src : string) : ParseResult =
                 go <- false
             elif s.Is Comma then vecAdd acc (s.Bump ())
             elif canStartTypeAtom () then vecAdd acc (parseType ctx)
+            elif s.IsKw "when" then
+                // F#'s INLINE constraint: `type MapExt<'Key, 'Value when 'Key
+                // : comparison>`. Its own node, so that the tokens are still
+                // there (the parse stays lossless) but the identifiers in it
+                // are not mistaken for type PARAMETERS — that is how MapExt
+                // came to have four.
+                let cons = vecNew<Green> ()
+                let mutable depth = 0
+                let mutable more = true
+                while more && not s.AtEof && s.SameLine do
+                    s.SplitGt ()
+                    if s.IsOp "<" then depth <- depth + 1; vecAdd cons (s.Bump ())
+                    elif s.IsOp ">" && depth > 0 then depth <- depth - 1; vecAdd cons (s.Bump ())
+                    elif s.IsOp ">" then more <- false
+                    else vecAdd cons (s.Bump ())
+                vecAdd acc (Green.node WhenDecl (vecToList cons))
             else
-                // constraints (`when 'm : Monad`) and anything else we do not
-                // model yet: absorb tokens verbatim
+                // anything else we do not model yet: absorb tokens verbatim
                 vecAdd acc (s.Bump ())
         vecToList acc
 

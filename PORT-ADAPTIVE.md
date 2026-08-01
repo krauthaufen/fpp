@@ -28,16 +28,28 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **7451 of 22,635** — through
+The port parses and type-checks from line 1 to **8027 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
-`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, and most of
-`MapExt.fs`. Everything past the frontier is unknown, not known-bad: the
+`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, all 3,908 lines
+of `MapExt.fs`, and into `IndexList.fs`. Everything past the frontier is unknown, not known-bad: the
 errors after the first are a cascade until the first is fixed.
 
-The frontier is `byref`. MapExt declares four (`TryRemove`,
-`TryGetValue`), and the call sites pass `&x` on mutable FIELDS —
-`Interlocked.Increment(&currentId)`, `weak.TryGetTarget(&old)` — so both
-halves are needed, not just the declaration.
+The frontier is inside `IndexList.fs`. Two things are known to be waiting
+there and beyond:
+
+* **`&x` at a call site.** The byref DECLARATION works — a byref is a
+  one-field cell and `value <- v` writes through it — but taking the address
+  of a mutable field (`Interlocked.Increment(&currentId)`,
+  `weak.TryGetTarget(&old)`) is not built. The plan is copy-in/copy-out
+  around the call, which is what a byref means single-threaded.
+* **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
+  parses and is kept in the tree, and no longer counts as a type parameter
+  — but it is inert. Each of F#'s constraints has a meaning F++ can express
+  as a class: `comparison` is `Ordered<'a>`, `equality` is structural `=`,
+  and `unmanaged` is the important one — it is exactly the POD/blittable
+  property the layout machinery already computes. Wiring them needs
+  type-level constraints (`type X<'a> when C<'a>`), which a type
+  declaration does not accept yet; a `let` signature does.
 
 ## What is replaced, and what it became
 

@@ -1423,3 +1423,38 @@ let verboseClassTests =
             Expect.equal out "21\n42\n" "the delimiters are delimiters"
         }
     ]
+
+[<Tests>]
+let byrefTests =
+    testList "byref parameters" [
+        test "a byref out-parameter is written through" {
+            let out =
+                run [ "type Store(n : int) ="
+                      "    let mutable v = n"
+                      "    member x.TryGet (key : int, value : byref<int>) : bool ="
+                      "        if key = 0 then"
+                      "            value <- v"
+                      "            true"
+                      "        else false"
+                      "let s = Store 42"
+                      "let cell = { Contents = 0 }"
+                      "let a = print (if s.TryGet (0, cell) then 1 else 0)"
+                      "let b = print cell.Contents"
+                      "let c = print (if s.TryGet (1, cell) then 1 else 0)" ]
+            Expect.equal out "1\n42\n0\n" "the write lands in the cell"
+        }
+        test "an inline type-parameter constraint is not a type parameter" {
+            // `type MapExt<'Key, 'Value when 'Key : comparison>` — every
+            // identifier in the constraint used to count as another
+            // parameter, so the type had four and its own constructor did
+            // not match its annotations
+            let out =
+                run [ "type Box<'a, 'b when 'a : comparison>(x : 'a, y : 'b) ="
+                      "    member p.X = x"
+                      "    member p.Y = y"
+                      "let b = Box<int, string>(3, \"a\")"
+                      "let a = print b.X"
+                      "let c = print b.Y" ]
+            Expect.equal out "3\na\n" "two parameters, not four"
+        }
+    ]

@@ -715,6 +715,17 @@ type Result<'t, 'e> =
 // in its body and the case patterns at its use sites are rewritten onto the
 // corresponding case. One type per case count; the payload of a case that
 // carries several values is a tuple, which is what F# does too.
+/// A BYREF parameter — `member x.TryGetValue (k, value : byref<'v>)`.
+///
+/// wasm has no address of a local, so a byref is a one-field CELL and the
+/// call site copies in and out around the call: `f (&x)` builds a cell from
+/// `x`, calls, and writes the cell back into `x`. Single-threaded, that is
+/// exactly what a real byref does; what it is not is an alias, so two
+/// byrefs to the same variable do not see each other's writes mid-call.
+type ByRefCell<'a> = { mutable Contents : 'a }
+type byref<'a> = ByRefCell<'a>
+type outref<'a> = ByRefCell<'a>
+
 type ActiveChoice2<'a, 'b> =
     | Choice2Of1 of 'a
     | Choice2Of2 of 'b

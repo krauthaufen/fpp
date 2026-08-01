@@ -39,7 +39,7 @@ curl https://wasmtime.dev/install.sh -sSf | bash
 git clone git@github.com:krauthaufen/fpp.git
 cd fpp
 dotnet build -c Release
-dotnet test  -c Release          # 560 tests; exits non-zero if any fail
+dotnet test  -c Release          # 562 tests; exits non-zero if any fail
 ```
 
 The suite includes the oracle gate: every program in it is also valid F#, so
