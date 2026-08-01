@@ -2342,11 +2342,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
         // a type whose members are all abstract declares an interface: no
         // storage, no constructor — dispatch is a separate concern
+        // `type X with member ...` — an intrinsic type EXTENSION. It carries
+        // no representation (that is the marker: `with` where `=` would be),
+        // so it declares no record, no constructor and no vtable slot. Its
+        // members are ordinary functions of the receiver, attached to a type
+        // declared elsewhere — which is what an extension member IS, in F#
+        // as here: static dispatch, resolved by the receiver's type.
+        let isExtension =
+            tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "with")
+            && not (tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = "="))
         let isInterface =
-            not (List.isEmpty memberNodes) && memberNodes |> List.forall isAbstract
+            not isExtension
+            && not (List.isEmpty memberNodes) && memberNodes |> List.forall isAbstract
         // a class is anything with instance storage or a constructor
         let isClass =
-            not isInterface
+            not isExtension
+            && not isInterface
             && List.isEmpty cases && List.isEmpty recordFields && List.isEmpty valFields
             && (ctorPat.IsSome || baseName.IsSome || not (List.isEmpty classLets) || not (List.isEmpty memberNodes))
 

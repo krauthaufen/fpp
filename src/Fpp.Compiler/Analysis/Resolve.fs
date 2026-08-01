@@ -786,14 +786,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         let nameTok = firstIdentToken n.Children
         let typeName = match nameTok with Some t -> t.Text | None -> "?"
         let exportHere = atExportLevel
+        // `type X with member ...` names a type declared ELSEWHERE. Defining
+        // the name again would shadow the real declaration — and with it the
+        // constructor, so `X(...)` at a later call site resolved to the
+        // extension and found nothing to call.
+        let isExtension =
+            (n.Children |> List.exists (fun c ->
+                match c with GToken t -> t.Kind = Keyword && t.Text = "with" | _ -> false))
+            && not (n.Children |> List.exists (fun c ->
+                match c with GToken t -> t.Kind = Operator && t.Text = "=" | _ -> false))
         let mutable outer = env
         match nameTok with
-        | Some t ->
+        | Some t when not isExtension ->
             let d = define DefType t
             outer <- Map.add t.Text d outer
             outer <- Map.add (typeKey t.Text) d outer
             if exportHere then exportDef d
-        | None -> ()
+        | _ -> ()
         for c in n.Children do
             match c with
             | GNode u when u.NodeKind = UnionCase ->

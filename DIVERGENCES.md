@@ -115,8 +115,8 @@ surface; the fix belongs in the compiler.
 
 **The divergence.** The set is CLOSED. `s.ToUpper()` or `s.PadLeft 3` do not
 resolve, and neither does a user-defined extension member on `string` or on
-any other builtin — general extension members remain an open language
-feature. The bounded set was derived from what the compiler's own sources
+any other builtin. `type X with member ...` DOES work for a declared type or
+interface (see below); what stays out of reach is extending a BUILTIN. The bounded set was derived from what the compiler's own sources
 call; growing it is a one-line registration plus a primitive, deliberately
 so.
 
@@ -240,6 +240,17 @@ way. The member's own quantified variable is not the one the class is
 generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
+
+## Type extensions are intrinsic only
+
+`type X with member x.Foo () = ...` adds members to a type declared
+elsewhere — a class, a record, a union or an INTERFACE — and they resolve on
+any value of that type, dispatched statically, as F# dispatches them. What
+is not there: extending a builtin (`string`, `int`, an array), and
+`[<Extension>]`-style extension methods from another assembly. The
+extension declares nothing — no record, no constructor, no vtable slot — so
+an interface extension is a function of the receiver, not a new slot every
+implementer must fill.
 
 ## Weak references are STRONG, and byref members are absent bar one
 

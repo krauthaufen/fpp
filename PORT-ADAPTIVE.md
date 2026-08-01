@@ -28,13 +28,16 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **4325 of 22,635** — through
+The port parses and type-checks from line 1 to **4334 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
 `HashCollections.fs`, `Operations`, and into `Deltas`. Everything past the
 frontier is unknown, not known-bad: the errors after the first are a
 cascade until the first is fixed.
 
-The frontier is now ONE construct: intrinsic type extensions.
+The frontier is now ONE construct: a multi-case ACTIVE PATTERN,
+`let inline (|Add|Rem|) (d : SetOperation<'T>)`. There is exactly one in the
+whole library, so it is a choice: build active patterns, or let the port
+rewrite this one. Active patterns are ordinary F# and worth having.
 
 ## What is replaced, and what it became
 
@@ -64,10 +67,15 @@ statics is not expressible yet. Eight call sites, in three files.
 Both of these are F# the library actually writes, so they are compiler work,
 not port work.
 
-* **Intrinsic type extensions.** `type SetOperation<'T> with static member
-  inline Add v = ...` — the library augments its own types in the file that
-  declares them. DIVERGENCES.md already lists extension members as an open
-  feature; this is the intrinsic case, which is the easier half.
+* ~~**Intrinsic type extensions**~~ — **done.** `type X with member ...`
+  adds members to a type declared elsewhere: no representation, no
+  constructor, no vtable slot, just functions of the receiver resolved by
+  its type. The 19 in the library are mostly on INTERFACES
+  (`IAdaptiveValue`, `IOpReader`, `IAdaptiveHashSet`, `IAdaptiveObject` ×3),
+  which is how the library hangs a fluent API off them, and that works. Two
+  traps: the extension must not re-define the type's NAME (it shadowed the
+  real declaration, and with it the constructor), and it declares neither a
+  record nor a class.
 * ~~`sprintf` with several specifiers including `%A`~~ — this was not the
   format at all. `sprintf "Rem%d(%A)" -cnt value` passes `-cnt`, and F#'s
   ADJACENT-PREFIX rule is what says so: a `-` with whitespace before and

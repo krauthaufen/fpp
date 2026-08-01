@@ -1285,3 +1285,66 @@ let perInstantiationVtableTests =
             Expect.equal out "7\n2\n11\n" "packed elements, and still a seq"
         }
     ]
+
+[<Tests>]
+let typeExtensionTests =
+    testList "intrinsic type extensions" [
+        test "members added to a type declared earlier" {
+            let out =
+                run [ "type Pair(a : int, b : int) ="
+                      "    member x.A = a"
+                      "    member x.B = b"
+                      "type Pair with"
+                      "    member x.Sum = x.A + x.B"
+                      "    static member Make (n : int) = Pair(n, n)"
+                      "let p = Pair(3, 4)"
+                      "let a = print p.Sum"
+                      "let b = print (Pair.Make 5).Sum" ]
+            Expect.equal out "7\n10\n" "instance and static, and the ctor still resolves"
+        }
+        test "an extension does not shadow the type it extends" {
+            // it used to define the NAME again, which hid the real
+            // declaration and with it the constructor
+            let out =
+                run [ "type Box(n : int) ="
+                      "    member x.N = n"
+                      "type Box with"
+                      "    member x.Twice = x.N * 2"
+                      "let b = Box 21"
+                      "let a = print b.N"
+                      "let c = print b.Twice" ]
+            Expect.equal out "21\n42\n" "Box(21) still calls the constructor"
+        }
+        test "a GENERIC type gains members per instantiation" {
+            let out =
+                run [ "type Op<'T>(value : 'T, cnt : int) ="
+                      "    member x.Value = value"
+                      "    member x.Count = cnt"
+                      "type Op<'T> with"
+                      "    static member Add (v : 'T) = Op<'T>(v, 1)"
+                      "    member x.Inverse = Op<'T>(x.Value, 0 - x.Count)"
+                      "let o = Op<int>.Add 5"
+                      "let a = print o.Value"
+                      "let b = print o.Count"
+                      "let c = print o.Inverse.Count" ]
+            Expect.equal out "5\n1\n-1\n" "static and instance, at int"
+        }
+        test "an INTERFACE gains members, dispatched statically" {
+            // the shape FSharp.Data.Adaptive uses most: an interface with a
+            // fluent API hung off it. An extension is not a vtable slot —
+            // it is a function of the receiver, resolved by its type
+            let out =
+                run [ "type IShape ="
+                      "    abstract member Area : unit -> int"
+                      "type IShape with"
+                      "    member x.Doubled = x.Area () * 2"
+                      "    member x.Describe (label : string) = label + \":\" + string (x.Area ())"
+                      "type Sq(s : int) ="
+                      "    interface IShape with"
+                      "        member x.Area () = s * s"
+                      "let sh = Sq 3 :> IShape"
+                      "let a = print sh.Doubled"
+                      "let b = print (sh.Describe \"sq\")" ]
+            Expect.equal out "18\nsq:9\n" "through an interface value"
+        }
+    ]

@@ -999,7 +999,14 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
         if s.Is LParen && s.SameLine then
             vecAdd acc (parseAtomPat typeCol)
-        if s.IsOp "=" then
+        // `type X with member ... ` — an INTRINSIC TYPE EXTENSION: members
+        // for a type declared elsewhere, and no representation of its own.
+        // The `with` in place of `=` is what says so, and it is the whole
+        // marker: a TypeDecl carrying no representation is an extension.
+        if s.IsKw "with" then
+            vecAdd acc (s.Bump ())
+            parseTypeBody acc typeCol
+        elif s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if isTypeBodyStart () && not s.SameLine && s.CurCol > typeCol then
                 ()   // class/interface body only — handled below
