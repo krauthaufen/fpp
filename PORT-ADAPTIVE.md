@@ -28,17 +28,20 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **4381 of 22,635** — through
+The port parses and type-checks from line 1 to **6233 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
-`HashCollections.fs`, `Operations`, `Deltas`, and into `Index.fs`.
-Everything past the frontier is unknown, not known-bad: the errors after
-the first are a cascade until the first is fixed.
+`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, and well into
+`MapExt.fs`. Everything past the frontier is unknown, not known-bad: the
+errors after the first are a cascade until the first is fixed.
 
-The frontier is a TYPE error now rather than a parse error, which is
-progress of a different kind: `Index.fs` does `uint64` arithmetic, and
-`uint64` does not exist — not in the prelude, not in the compiler. It is a
-new primitive type, with its own tower of instances and unsigned
-operations, the way `uint32` already is.
+The frontier is an inline `let … in` with a TUPLE pattern:
+
+```fsharp
+else let (n,_,_) = withMinExclusiveN cmp minKey node.Left in n
+```
+
+which types as `unit`. PLAN.md already parks this one ("inline `let ... in`
+destructure"), so it is a known gap rather than a new discovery.
 
 ## What is replaced, and what it became
 
@@ -102,6 +105,7 @@ is actually coming:
 
 | what | hits | the answer |
 | --- | --- | --- |
+| ~~`uint64`, `int16`, `uint16`~~ | — | **done.** New primitive types, and the missing halves of `byte`/`sbyte`'s tower with them. uint64 is unsigned on the i64 rail (`div_u`, `lt_u`, `shr_u`); int16/uint16 are int-shaped like byte/sbyte, narrowed by the conversion. Pinned against .NET in `stdlib/dotnet.fpp` |
 | `lock` / `Monitor` (58 + 32) | 90 | real types in the prelude; a single-threaded runtime enters and exits every lock, which is the honest implementation, not a stub |
 | `Interlocked` | 13 | same — the increment is atomic when there is one thread |
 | ~~`WeakReference`~~ | 34 | **done.** A strong `WeakReference<'a>` in the prelude: reading through one is identical, and what changes — a graph that relied on weakness to drop its dead half keeps it — is written down in DIVERGENCES.md |

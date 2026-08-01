@@ -573,6 +573,7 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
         (match n.Substring (0, n.IndexOf "#") with
          | "float" -> "f" | "float32" -> "s" | "int64" -> "l" | _ -> "u")
     | EApp (EUnknown "int64", [ _ ]) -> "l"
+    | EApp (EUnknown "uint64", [ _ ]) -> "l"
     | EApp (EUnknown "float", [ _ ]) -> "f"
     | EApp (EUnknown "float32", [ _ ]) -> "s"
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
@@ -708,7 +709,7 @@ and private emitPodWordOf (st : St) (f : Fn) (rn : string) (push : string -> str
     else
     let width = podW st rn
     let wide = width = 8
-    let sizeOfK (k : string) = match k with "b" | "n" -> 1 | "h" -> 2 | "i" | "s" -> 4 | _ -> 8
+    let sizeOfK (k : string) = match k with "b" | "n" -> 1 | "h" | "m" -> 2 | "i" | "s" -> 4 | _ -> 8
     let parts = placed |> List.filter (fun (_, _, off) -> off / width = w)
     /// the leaf's bits, in the WORD's type, shifted to its place in the word
     let one (fn : string, k : string, off : int) =
@@ -721,7 +722,7 @@ and private emitPodWordOf (st : St) (f : Fn) (rn : string) (push : string -> str
          | "b" | "n" ->
              ic f 0xFF
              ins f "i32.and"
-         | "h" ->
+         | "h" | "m" ->
              ic f 0xFFFF
              ins f "i32.and"
          | _ -> ())
@@ -846,6 +847,13 @@ and private emitPodLeafRead (st : St) (f : Fn) (rn : string) (hl : string) (bl :
     | "b" ->
         ic f 0xFF
         ins f "i32.and"
+        callf f "$ofi"
+    | "m" ->
+        // int16: the stored half, sign-extended
+        ic f 16
+        ins f "i32.shl"
+        ic f 16
+        ins f "i32.shr_s"
         callf f "$ofi"
     | "n" ->
         // sbyte: the stored byte, sign-extended
@@ -2068,6 +2076,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         let strA () = emitA (); gcT f "ref.cast" "$str"
         let mask8 () = ic f 255; ins f "i32.and"
         let sext8 () = ic f 24; ins f "i32.shl"; ic f 24; ins f "i32.shr_s"
+        let mask16 () = ic f 0xFFFF; ins f "i32.and"
+        let sext16 () = ic f 16; ins f "i32.shl"; ic f 16; ins f "i32.shr_s"
         (match target, src with
          | "string", "t" -> emitA ()
          | "int", "t" | "uint32", "t" -> strA (); callf f "$atoi"; callf f "$ofi"
@@ -2094,6 +2104,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | "string", "s" -> emitA (); callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "string", "l" -> emitA (); callf f "$tol"; callf f "$ltoa"
          | "string", "w" -> emitA (); callf f "$toi"; ins f "i64.extend_i32_u"; callf f "$ultoa"
+         | "string", "v" -> emitA (); callf f "$tol"; callf f "$ultoa"
          | "string", "b" ->
              // Boolean.ToString: "True"/"False", capital first
              emitA (); callf f "$toi"; ins f "i32.eqz"
@@ -2104,6 +2115,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              for c in [ 84; 114; 117; 101 ] do ic f c
              arrNewFixed f "$str" 4
              endB f
+         | "uint16", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; mask16 (); callf f "$ofi"
+         | "uint16", "f" -> emitA (); callf f "$tof"; ins f "i32.trunc_f64_s"; mask16 (); callf f "$ofi"
+         | "uint16", "s" -> emitA (); callf f "$tos"; ins f "i32.trunc_f32_s"; mask16 (); callf f "$ofi"
+         | "uint16", _ -> emitA (); callf f "$toi"; mask16 (); callf f "$ofi"
+         | "int16", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; sext16 (); callf f "$ofi"
+         | "int16", "f" -> emitA (); callf f "$tof"; ins f "i32.trunc_f64_s"; sext16 (); callf f "$ofi"
+         | "int16", "s" -> emitA (); callf f "$tos"; ins f "i32.trunc_f32_s"; sext16 (); callf f "$ofi"
+         | "int16", _ -> emitA (); callf f "$toi"; sext16 (); callf f "$ofi"
          | "byte", "f" -> emitA (); callf f "$tof"; ins f "i32.trunc_f64_s"; mask8 (); callf f "$ofi"
          | "byte", "s" -> emitA (); callf f "$tos"; ins f "i32.trunc_f32_s"; mask8 (); callf f "$ofi"
          | "byte", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; mask8 (); callf f "$ofi"
@@ -2136,6 +2155,15 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | "l" -> emitNode st f lv a
          | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i64.trunc_f64_s"; callf f "$ofl"
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i64.trunc_f32_s"; callf f "$ofl"
+         | _ -> emitNode st f lv a; callf f "$toi"; ins f "i64.extend_i32_s"; callf f "$ofl")
+    | EApp (EUnknown "uint64", [ a ]) ->
+        (match kindOfLite st a with
+         | "l" -> emitNode st f lv a
+         | "f" -> emitNode st f lv a; callf f "$tof"; ins f "i64.trunc_f64_u"; callf f "$ofl"
+         | "s" -> emitNode st f lv a; callf f "$tos"; ins f "i64.trunc_f32_u"; callf f "$ofl"
+         // an int widens UNSIGNED into a uint64: `uint64 -1` is 2^64-1 only
+         // if the source was already unsigned, and F# agrees
+         | "w" -> emitNode st f lv a; callf f "$toi"; ins f "i64.extend_i32_u"; callf f "$ofl"
          | _ -> emitNode st f lv a; callf f "$toi"; ins f "i64.extend_i32_s"; callf f "$ofl")
     | EApp (EUnknown ("uint32" | "int"), [ a ]) ->
         (match kindOfLite st a with
@@ -2421,6 +2449,33 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             | "<<<" -> "i32.shl" | _ -> "i32.shr_u"
         ins f insn
         if cmp then refI31 f else callf f "$ofi"
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "v"
+        && List.contains (op.Substring (0, op.Length - 1))
+            [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>"; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+        // the UNSIGNED long family: uint64 semantics on the i64 rail. The
+        // representation is int64's — same bits, same box — and only the
+        // operations that READ the sign differ.
+        let baseOp = op.Substring (0, op.Length - 1)
+        emitNode st f lv a
+        callf f "$tol"
+        emitNode st f lv b
+        (match baseOp with
+         | "<<<" | ">>>" ->
+             // the shift count is an int
+             callf f "$toi"
+             ins f "i64.extend_i32_u"
+         | _ -> callf f "$tol")
+        let cmp = List.contains baseOp [ "<"; ">"; "<="; ">="; "="; "<>" ]
+        ins f (match baseOp with
+               | "+" -> "i64.add" | "-" -> "i64.sub" | "*" -> "i64.mul"
+               | "/" -> "i64.div_u" | "%" -> "i64.rem_u"
+               | "=" -> "i64.eq" | "<>" -> "i64.ne"
+               | "<" -> "i64.lt_u" | ">" -> "i64.gt_u"
+               | "<=" -> "i64.le_u" | ">=" -> "i64.ge_u"
+               | "&&&" -> "i64.and" | "|||" -> "i64.or" | "^^^" -> "i64.xor"
+               | "<<<" -> "i64.shl" | _ -> "i64.shr_u")
+        if cmp then refI31 f else callf f "$ofl"
     | EPrim (op, [ a; b ]) when
         op.Length > 1 && op.EndsWith "l"
         && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
@@ -3537,9 +3592,10 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         match ty with
         | "float" -> "f"
         | "float32" -> "s"
-        | "int64" -> "l"
+        | "int64" | "uint64" -> "l"
         | "int" | "uint32" -> "i"
-        | "char" | "float16" -> "h"
+        | "char" | "float16" | "uint16" -> "h"
+        | "int16" -> "m"
         | "byte" | "bool" -> "b"
         | "sbyte" -> "n"
         | t when List.contains t structNames -> "S:" + t
@@ -3547,6 +3603,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     let scalarSize (k : string) =
         match k with
         | "b" | "n" -> 1
+        | "m" -> 2
         | "h" -> 2
         | "i" | "s" -> 4
         | _ -> 8
@@ -3653,6 +3710,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         | Fpp.Analysis.Types.TCon ("float", []) -> "f"
         | Fpp.Analysis.Types.TCon ("float32", []) -> "s"
         | Fpp.Analysis.Types.TCon ("int64", []) -> "l"
+        | Fpp.Analysis.Types.TCon ("uint64", []) -> "l"
         | Fpp.Analysis.Types.TCon ("int", []) -> "i"
         | _ -> "u"
     let rec splitArrow (n : int) (t : Fpp.Analysis.Types.Type) : string list * string =

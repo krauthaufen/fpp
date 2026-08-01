@@ -1014,10 +1014,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let literalType (t : Token) : Type =
         match t.Kind with
         | IntLit ->
-            // integer literal suffixes: 5L int64, 5u uint32, 5uy byte, 5y sbyte
-            if t.Text.EndsWith "L" then TCon ("int64", [])
-            elif t.Text.EndsWith "uy" then TCon ("byte", [])
-            elif t.Text.EndsWith "y" then TCon ("sbyte", [])
+            // integer literal suffixes, F#'s: 5y sbyte, 5uy byte, 5s int16,
+            // 5us uint16, 5u/5ul uint32, 5L int64, 5UL uint64. The longer
+            // ones are tested FIRST — `5UL` ends with `L` too.
+            if t.Text.EndsWith "UL" || t.Text.EndsWith "uL"
+               || t.Text.EndsWith "Ul" || t.Text.EndsWith "uLL" then TCon ("uint64", [])
+            elif t.Text.EndsWith "L" then TCon ("int64", [])
+            elif t.Text.EndsWith "uy" || t.Text.EndsWith "UY" then TCon ("byte", [])
+            elif t.Text.EndsWith "y" || t.Text.EndsWith "Y" then TCon ("sbyte", [])
+            elif t.Text.EndsWith "us" || t.Text.EndsWith "US" then TCon ("uint16", [])
+            elif t.Text.EndsWith "s" || t.Text.EndsWith "S" then TCon ("int16", [])
             elif t.Text.EndsWith "u" || t.Text.EndsWith "U" then tUInt
             else tInt
         | FloatLit ->
@@ -1252,7 +1258,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -1328,7 +1334,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (TCon ("int64", []))
-                              | Some t when (t.Text = "int" || t.Text = "uint32")
+                              | Some t when (t.Text = "int" || t.Text = "uint32" || t.Text = "int16" || t.Text = "uint16")
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (if t.Text = "int" then tInt else tUInt)
@@ -3217,6 +3223,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon ("float16", []) -> "h"
         | TCon ("int64", []) -> "l"
         | TCon ("uint32", []) -> "w"
+        | TCon ("uint64", []) -> "v"
         | TCon ("string", []) -> "t"
         // conversions and print need these; operator suffixes filter them
         | TCon ("bool", []) -> "b"

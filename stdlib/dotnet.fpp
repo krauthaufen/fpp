@@ -277,6 +277,40 @@ let n10 = print (if Double.IsNaN (0.0 / 0.0) then 1 else 0)
 let n11 = print (if Double.IsInfinity (1.0 / 0.0) then 1 else 0)
 let n12 = print (if Single.IsNaN (0.0f / 0.0f) then 1 else 0)
 
+// ---- the integer types ---------------------------------------------------
+//
+// uint64 is where signed and unsigned genuinely differ: the subtraction
+// wraps, and the comparison against MaxValue is false if the bits are read
+// signed. Printed through `string`, which is the unsigned conversion —
+// `print` boxes, and a box carries no signedness.
+
+let u0 = print (string (10UL + 5UL))
+let u1 = print (string (10UL - 20UL))
+let u2 = print (string (10UL * 3UL))
+let u3 = print (string (10UL / 3UL))
+let u4 = print (string (10UL % 3UL))
+let u5 = print (if 10UL < 20UL then 1 else 0)
+let u6 = print (if UInt64.MaxValue > 10UL then 1 else 0)
+let u7 = print (string UInt64.MaxValue)
+let u8 = print (string (uint64 7))
+let u9 = print (string (1UL <<< 40))
+let u10 = print (string (UInt64.MaxValue >>> 60))
+
+let i0 = print (int (300s + 44s))
+let i1 = print (int (300s * 2s))
+let i2 = print (int Int16.MinValue)
+let i3 = print (int Int16.MaxValue)
+let i4 = print (int (int16 -5))
+let i5 = print (int (65535us))
+let i6 = print (int UInt16.MaxValue)
+let i7 = print (int (10us + 5us))
+
+let y0 = print (int (200uy + 20uy))
+let y1 = print (int (200uy / 3uy))
+let y2 = print (int (100y - 120y))
+let y3 = print (int (byte 300))
+let y4 = print (int (sbyte -5))
+
 // ---- the F# collection functions that were missing ----------------------
 
 let c0 = print (List.compareWith compare [ 1; 2 ] [ 1; 2; 3 ])

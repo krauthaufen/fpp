@@ -148,10 +148,104 @@ instance Abs<float32>
 instance MinMax<float32>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
+// ---- uint64: the same tower as uint32, on the 64-bit rail --------------
+instance Add<uint64, uint64>
+    type Result = uint64
+instance Sub<uint64, uint64>
+    type Result = uint64
+instance Mul<uint64, uint64>
+    type Result = uint64
+instance Div<uint64, uint64>
+    type Result = uint64
+instance Rem<uint64, uint64>
+    type Result = uint64
+instance Num<uint64>
+    static Zero = 0UL
+    static One = 1UL
+instance Integral<uint64>
+instance Ordered<uint64>
+instance MinMax<uint64>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
+
+// ---- int16 and uint16: int-SHAPED, so the operators are the integer ones
+// and only the WIDTH (and, for int16, the sign extension) differs
+instance Add<int16, int16>
+    type Result = int16
+instance Sub<int16, int16>
+    type Result = int16
+instance Mul<int16, int16>
+    type Result = int16
+instance Div<int16, int16>
+    type Result = int16
+instance Rem<int16, int16>
+    type Result = int16
+instance Num<int16>
+    static Zero = 0s
+    static One = 1s
+instance Integral<int16>
+instance Ordered<int16>
+instance Neg<int16>
+instance Abs<int16>
+instance MinMax<int16>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
+
+instance Add<uint16, uint16>
+    type Result = uint16
+instance Sub<uint16, uint16>
+    type Result = uint16
+instance Mul<uint16, uint16>
+    type Result = uint16
+instance Div<uint16, uint16>
+    type Result = uint16
+instance Rem<uint16, uint16>
+    type Result = uint16
+instance Num<uint16>
+    static Zero = 0us
+    static One = 1us
+instance Integral<uint16>
+instance Ordered<uint16>
+instance MinMax<uint16>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
+
+// byte and sbyte carry the whole tower too: int-SHAPED like int16, so the
+// operators are the integer ones and the conversion is what narrows
+instance Add<byte, byte>
+    type Result = byte
+instance Sub<byte, byte>
+    type Result = byte
+instance Mul<byte, byte>
+    type Result = byte
+instance Div<byte, byte>
+    type Result = byte
+instance Rem<byte, byte>
+    type Result = byte
+instance Num<byte>
+    static Zero = 0uy
+    static One = 1uy
+instance Integral<byte>
 instance Ordered<byte>
 instance MinMax<byte>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
+instance Add<sbyte, sbyte>
+    type Result = sbyte
+instance Sub<sbyte, sbyte>
+    type Result = sbyte
+instance Mul<sbyte, sbyte>
+    type Result = sbyte
+instance Div<sbyte, sbyte>
+    type Result = sbyte
+instance Rem<sbyte, sbyte>
+    type Result = sbyte
+instance Num<sbyte>
+    static Zero = 0y
+    static One = 1y
+instance Integral<sbyte>
+instance Neg<sbyte>
+instance Abs<sbyte>
 instance Ordered<sbyte>
 instance MinMax<sbyte>
     static min a b = if a < b then a else b
@@ -807,6 +901,20 @@ module Int64 =
 module UInt32 =
     let MaxValue : uint32 = 4294967295u
     let MinValue : uint32 = 0u
+
+module UInt64 =
+    // 2^64 - 1, built rather than written: the literal does not fit an int64
+    // and the two hosts must not disagree about what it parsed to
+    let MaxValue : uint64 = 0UL - 1UL
+    let MinValue : uint64 = 0UL
+
+module Int16 =
+    let MaxValue : int16 = 32767s
+    let MinValue : int16 = 0s - 32767s - 1s
+
+module UInt16 =
+    let MaxValue : uint16 = 65535us
+    let MinValue : uint16 = 0us
 
 module Boolean =
     /// .NET compares case-insensitively and trims, and accepts nothing else

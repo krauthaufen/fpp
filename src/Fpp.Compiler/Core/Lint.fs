@@ -59,6 +59,9 @@ let lint (decls : Decl list) : string list =
         // was a false mismatch on every `v = 0L` in the compiler
         | LInt t ->
             if t.EndsWith "L" then TCon ("int64", [])
+            elif t.EndsWith "UL" || t.EndsWith "uL" then TCon ("uint64", [])
+            elif t.EndsWith "us" || t.EndsWith "US" then TCon ("uint16", [])
+            elif t.EndsWith "s" || t.EndsWith "S" then TCon ("int16", [])
             elif t.EndsWith "u" || t.EndsWith "U" then TCon ("uint32", [])
             else tInt
         | LFloat _ -> tFloat

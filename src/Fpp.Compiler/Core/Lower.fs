@@ -486,7 +486,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
@@ -1693,7 +1693,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // the zero of whatever type the context resolved
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 (match dictTryFind memberSites t.Offset with
-                 | Some "int" | Some "bool" | Some "char" | Some "uint32" -> ELit (LInt "0")
+                 | Some "int" | Some "bool" | Some "char" | Some "uint32"
+                 | Some "int16" | Some "uint16" -> ELit (LInt "0")
+                 | Some "uint64" -> ELit (LInt "0L")
                  | Some "int64" -> ELit (LInt "0L")
                  | Some "float" -> ELit (LFloat "0.0")
                  | Some "float32" -> ELit (LFloat "0.0f")

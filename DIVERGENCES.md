@@ -241,6 +241,21 @@ generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
 
+## The integer types, and which are int-shaped
+
+`sbyte`, `byte`, `int16`, `uint16`, `int`, `uint32`, `int64` and `uint64`
+all exist, with the full numeric tower. Two rails carry them: `int64` and
+`uint64` are 64-bit, everything else is int-SHAPED — held in an i32, already
+masked (or sign-extended) — so the operators on a `byte` or an `int16` are
+the integer ones and the CONVERSION is what narrows.
+
+Signedness shows up exactly where it should: `10UL - 20UL` wraps to
+18446744073709551606, and `UInt64.MaxValue > 10UL` is true, which it would
+not be if the bits were read signed. `string` on a `uint64` prints unsigned;
+`print` boxes, and a box carries no signedness, so print through `string`.
+
+`nativeint` and `unativeint` are absent.
+
 ## Active patterns are multi-case and total
 
 `let (|Add|Rem|) x = ...` works: the pattern's cases construct in its body

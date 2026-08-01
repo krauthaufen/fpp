@@ -43,12 +43,16 @@ let private withOpType (op : string) (name : string) : string =
     | "float16" -> baseOp + "h"
     | "int64" -> baseOp + "l"
     | "uint32" -> baseOp + "w"
+    | "uint64" -> baseOp + "v"
     | "string" -> baseOp + "t"
     // byte and sbyte are int-SHAPED: the value is already masked (or sign
     // extended) into an i32, so every operator on them is the integer one.
     // Leaving them out sent `<@byte` looking for an instance member — and
     // found the generated `compare`, whose own body is that comparison.
-    | "int" | "char" | "bool" | "byte" | "sbyte" ->
+    // int16 and uint16 are int-SHAPED like byte and sbyte: the value is
+    // already masked (or sign extended) into an i32, so every operator on
+    // them is the integer one
+    | "int" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" ->
         // int-shaped EQUALITY stays typed (i32.eq beats structural $equal);
         // arithmetic on ints is already the bare default
         if baseOp = "=" || baseOp = "<>" then baseOp + "i" else baseOp
