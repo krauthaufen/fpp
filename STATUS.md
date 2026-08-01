@@ -4,7 +4,7 @@ A handover. What is built, what it is being built towards, and what is known
 to be wrong — written so the next session can start without re-deriving any
 of it.
 
-Gates at the time of writing (all green, `main` at `53703ff`):
+Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
 573 tests
