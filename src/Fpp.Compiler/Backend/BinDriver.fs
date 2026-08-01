@@ -1806,6 +1806,17 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  elseB f
                  dispatch ()
                  endB f
+             elif iface = "IEnumerator" && mname = "Dispose" then
+                 // the built-in list/array iterator has no vtable and holds
+                 // nothing to release, so disposing it is a no-op
+                 lg f t
+                 gcT f "ref.test" "$iter"
+                 ifA f
+                 ic f 0
+                 refI31 f
+                 elseB f
+                 dispatch ()
+                 endB f
              else dispatch ()
          | None ->
              err st ("binary: no dispatch slot for " + iface + "." + mname)

@@ -268,6 +268,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let indexerTok (base_ : int) (name : string) (br : Token) : Token =
         { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + br.Offset }
 
+    /// A member call the source has no token for — the enumerator protocol,
+    /// an indexer, `use`'s Dispose. Inference parked the access at a
+    /// synthetic offset derived from the construct's first token; this reads
+    /// what it bound to and builds the call, through the vtable when the
+    /// owner is an interface and as a lifted function otherwise.
+    let synthCall (base_ : int) (fo : int) (name : string) (recv : Expr) (withUnit : bool) : Expr option =
+        let t = { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + fo }
+        match memberAt t with
+        | None -> None
+        | Some (owner, d) ->
+            let args = if withUnit then [ ELit LUnit ] else []
+            match dictTryFind ifaces owner with
+            | Some ms when ms |> List.exists (fun (m, _) -> m = name) ->
+                Some (EIfaceCall (owner, name, recv, args))
+            | _ -> Some (EApp (memberFn t d, recv :: args))
+
+    /// `try body finally fin` needs no node of its own: catching everything,
+    /// running the finalizer and rethrowing IS the semantics, and the
+    /// finalizer on the normal path completes it. It is emitted twice — only
+    /// one copy ever runs, and a closure to share it would cost an
+    /// allocation per entry for code that is typically one call.
+    let tryFinally (uniq : int) (body : Expr) (fin : Expr) : Expr =
+        let anon = mono (TCon ("?", []))
+        let exSch = mono (TCon ("exn", []))
+        let resV = { Path = path; Offset = 93000000 + uniq; Name = "_fin" }
+        let exV = { Path = path; Offset = 94000000 + uniq; Name = "_finExn" }
+        ELet (false, resV, anon,
+              ETry (body,
+                    [ PVar (exV, exSch), None,
+                      ESeq [ fin; EApp (EUnknown "raise", [ EVar (exV, exSch) ]) ] ]),
+              ESeq [ fin; EVar (resV, anon) ])
+
     // ---- patterns ---------------------------------------------------------
 
     /// The identifier a pattern is NAMED by. A qualified case
@@ -1940,6 +1972,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ c; b ] -> EWhile (lowerExpr (GNode c), lowerExpr (GNode b))
                  | _ -> note (offsetOf n) "while shape")
+            | TryExpr when
+                    n.Children
+                    |> List.exists (fun c ->
+                        match c with
+                        | GToken t -> t.Kind = Keyword && t.Text = "finally"
+                        | _ -> false) ->
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ b; f ] ->
+                     tryFinally (offsetOf n) (lowerExpr (GNode b)) (lowerExpr (GNode f))
+                 | [ b ] -> lowerExpr (GNode b)
+                 | _ -> note (offsetOf n) "try/finally shape")
             | TryExpr ->
                 let body =
                     nodesOf n
@@ -1978,6 +2021,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | [ last ] when last.NodeKind <> LetDecl -> lowerExpr (GNode last)
         | item :: rest ->
             if item.NodeKind = LetDecl then
+                // `use x = e` is `let` plus disposal at the end of the scope:
+                // the rest of the block becomes the body of a try/finally
+                // whose finalizer is the Dispose inference parked at the
+                // `use` keyword's synthetic offset
+                let disposeOf (v : VarId) (sch : Scheme) (tail : Expr) : Expr =
+                    if not (item.Children
+                            |> List.exists (fun c ->
+                                match c with
+                                | GToken t -> t.Kind = Keyword && t.Text = "use"
+                                | _ -> false)) then tail
+                    else
+                        match synthCall 95000000 (offsetOf item) "Dispose" (EVar (v, sch)) true with
+                        | Some d -> tryFinally (offsetOf item) tail d
+                        // nothing bound: the receiver's type never took
+                        // shape. Inference has already said so for a type it
+                        // KNOWS; here the binding is just a `let`
+                        | None -> tail
                 match lowerLetParts item with
                 | Some (SimpleLet (isRec, v, sch, rhs, cont)) ->
                     let tail =
@@ -1985,7 +2045,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some c, [] -> c
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
-                    ELet (isRec, v, sch, rhs, tail)
+                    ELet (isRec, v, sch, rhs, disposeOf v sch tail)
                 | Some (DestructureLet (pat, rhs, cont)) ->
                     let tail =
                         match cont, rest with

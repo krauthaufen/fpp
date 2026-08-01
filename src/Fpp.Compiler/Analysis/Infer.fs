@@ -1942,6 +1942,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               first
                           else tUnit)
                  | [] -> st.Fresh ())
+            | TryExpr when
+                    n.Children
+                    |> List.exists (fun c ->
+                        match c with
+                        | GToken t -> t.Kind = Keyword && t.Text = "finally"
+                        | _ -> false) ->
+                // `try B finally F`: the value is B's and F is run for its
+                // effect only, so it must NOT unify with the result
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ b; f ] ->
+                     let r = exprType (GNode b)
+                     exprType (GNode f) |> ignore
+                     r
+                 | [ b ] -> exprType (GNode b)
+                 | ms ->
+                     for m in ms do exprType (GNode m) |> ignore
+                     st.Fresh ())
             | TryExpr ->
                 let result = st.Fresh ()
                 let exnTy = TCon ("exn", [])
@@ -2540,6 +2557,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | None -> unify nameTy funTy |> ignore)
             ignore isRec   // rec already works: the name's tvar was bound before the body
             st.ExitLevel ()
+            // `use x = e` disposes at the end of the scope. There is no
+            // `Dispose` token to key on, so the access is parked at a
+            // synthetic offset off the `use` keyword, exactly as the
+            // enumerator protocol parks its three
+            if paramPats.IsEmpty
+               && (tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "use")) then
+                let fo =
+                    match tokensOf n |> List.tryHead with
+                    | Some t -> t.Offset
+                    | None -> 0
+                let dTy = st.Fresh ()
+                if not (tryResolveDot false (95000000 + fo) resultTy dTy "Dispose") then
+                    vecAdd pendingDots (95000000 + fo, resultTy, dTy, "Dispose")
+                unify dTy (TFun (tUnit, tUnit)) |> ignore
             // generalize and overwrite the monomorphic scheme. A MUTABLE
             // binding never generalizes (the value restriction): its cell is
             // one location, and quantifying it hands every read a fresh copy
@@ -3308,6 +3339,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if tryResolveDot false offset recvTy result name then progress <- true
             else vecAdd still (offset, recvTy, result, name)
         parked <- vecToList still
+    // `use x = e` on a type that declares no Dispose. Say it HERE, where the
+    // type is known: lowering sees only a member that did not bind, and it
+    // falls back to a plain `let` — which is right for a receiver whose type
+    // nothing pinned down, and wrong to do quietly for one we know.
+    for offset, recvTy, _, name in parked do
+        if offset >= 95000000 && name = "Dispose" then
+            match prune recvTy with
+            | TCon (tn, _) when (dictTryFind knownTypes tn).IsSome ->
+                vecAdd diags (offset - 95000000, tn + " declares no Dispose member, so `use` has nothing to call")
+            | _ -> ()
     // a use that never took shape (the member passed as a VALUE, say) can
     // wait no longer: force the tie, which binds in declaration order
     for offset, recvTy, result, name in parked do

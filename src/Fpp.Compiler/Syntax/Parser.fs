@@ -198,6 +198,7 @@ let parse (src : string) : ParseResult =
     let isBlockStopKw () =
         s.IsKw "then" || s.IsKw "else" || s.IsKw "elif" || s.IsKw "with"
         || s.IsKw "end" || s.IsKw "in" || s.IsKw "done" || s.IsKw "to" || s.IsKw "downto"
+        || s.IsKw "finally"
 
     let isCloser () = s.Is RParen || s.Is RBracket || s.Is RBrace || s.Is Comma || s.Is Semicolon
 
@@ -849,11 +850,17 @@ let parse (src : string) : ParseResult =
             let acc = vecNew<Green> ()
             let tcol = s.CurCol
             vecAdd acc (s.Bump ())
-            if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock tcol)
+            if canStartExpr () || s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseBlock tcol)
             if s.IsKw "with" then
                 vecAdd acc (s.Bump ())
                 parseClauses acc tcol
-            else s.Diag "expected 'with' in try"
+            elif s.IsKw "finally" then
+                // `try B finally F`: the finalizer is a BLOCK, not a clause
+                // list, and the `finally` keyword in the node is what tells
+                // the two shapes apart downstream
+                vecAdd acc (s.Bump ())
+                if canStartExpr () || s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseBlock tcol)
+            else s.Diag "expected 'with' or 'finally' in try"
             Green.node TryExpr (vecToList acc)
         elif s.IsKw "while" then
             let acc = vecNew<Green> ()

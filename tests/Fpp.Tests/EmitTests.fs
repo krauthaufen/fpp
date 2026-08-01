@@ -915,3 +915,84 @@ let tupleSpecializationTests =
             Expect.equal out "1\ntwo\nabsent\n" "one shared body, two independent tables"
         }
     ]
+
+[<Tests>]
+let disposalTests =
+    let res =
+        [ "type Res(n : int) ="
+          "    member x.N = n"
+          "    member x.Dispose () = printfn \"disposed %d\" n"
+          "    interface IDisposable with"
+          "        member x.Dispose () = x.Dispose ()" ]
+    testList "try/finally and use" [
+        test "the finalizer runs on both paths, and the value is the body's" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let f (bang : bool) ="
+                    "    try"
+                    "        if bang then failwith \"boom\""
+                    "        7"
+                    "    finally"
+                    "        printfn \"fin\""
+                    "let go ="
+                    "    printfn \"got %d\" (f false)"
+                    "    try f true |> ignore with Failure m -> printfn \"caught %s\" m"
+                    "" ])
+            Expect.equal out "fin\ngot 7\nfin\ncaught boom\n" "finalizer on the normal and the raising path"
+        }
+        test "use disposes at the end of the scope, and when the scope raises" {
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ res @
+                    [ "let scope (bang : bool) ="
+                      "    use r = Res 1"
+                      "    printfn \"using %d\" r.N"
+                      "    if bang then failwith \"boom\""
+                      "let go ="
+                      "    scope false"
+                      "    try scope true with Failure m -> printfn \"caught %s\" m"
+                      "" ]))
+            Expect.equal out "using 1\ndisposed 1\nusing 1\ndisposed 1\ncaught boom\n"
+                            "disposal on the normal and the raising path"
+        }
+        test "use through IDisposable dispatches on the vtable" {
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ res @
+                    [ "let go ="
+                      "    use d = (Res 7 :> IDisposable)"
+                      "    printfn \"in scope\""
+                      "" ]))
+            Expect.equal out "in scope\ndisposed 7\n" "the interface's Dispose is the one called"
+        }
+        test "an enumerator is disposable, and a wrapper passes it on" {
+            // .NET's IEnumerator<'T> inherits IDisposable and real F# leans
+            // on it: `use e = xs.GetEnumerator()` is how a library walks a
+            // sequence it did not build.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let walk (xs : seq<int>) ="
+                    "    use e = xs.GetEnumerator ()"
+                    "    let mutable s = 0"
+                    "    while e.MoveNext () do s <- s + e.Current"
+                    "    s"
+                    "let go = printfn \"%d\" (walk (Seq.map (fun x -> x * 2) ([ 1; 2; 3 ] :> seq<int>)))"
+                    "" ])
+            Expect.equal out "12\n" "the built-in list iterator disposes as a no-op"
+        }
+        test "use on a known type with no Dispose is a diagnostic" {
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module M"
+                "type Plain(n : int) ="
+                "    member x.N = n"
+                "let go ="
+                "    use p = Plain 1"
+                "    printfn \"%d\" p.N"
+                "" ])
+            let ds = ws.Diagnostics "prog.fpp"
+            Expect.isNonEmpty ds "a type that declares no Dispose cannot be used with `use`"
+        }
+    ]

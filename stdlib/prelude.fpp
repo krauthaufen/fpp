@@ -721,9 +721,19 @@ instance Floating<float16>
     static atan x = float16 (atan (float32 x))
     static atan2 y x = float16 (atan2 (float32 y) (float32 x))
     static pow a b = float16 (pow (float32 a) (float32 b))
+/// `use x = e` calls this at the end of the scope. wasm-GC has no
+/// finalizers, so disposal is only ever what the program asks for — there is
+/// no collector to fall back on, and a leaked handle stays leaked.
+type IDisposable =
+    abstract member Dispose : unit -> unit
+/// .NET's `IEnumerator<'T>` inherits `IDisposable`, and real F# relies on it:
+/// `use e = xs.GetEnumerator()` is how a library walks a sequence it did not
+/// build. Every implementation therefore carries a `Dispose`, and a wrapping
+/// enumerator passes it on to the one it wraps.
 type IEnumerator<'a> =
     abstract member MoveNext : unit -> bool
     abstract member Current : 'a
+    abstract member Dispose : unit -> unit
 type IEnumerable<'a> =
     abstract member GetEnumerator : unit -> IEnumerator<'a>
 type seq<'a> = IEnumerable<'a>
@@ -2708,7 +2718,8 @@ module Seq =
                 let en = xs.GetEnumerator()
                 { new IEnumerator<'b> with
                     member _.MoveNext() = en.MoveNext()
-                    member _.Current = f en.Current } }
+                    member _.Current = f en.Current
+                    member _.Dispose() = en.Dispose() } }
     let filter (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2721,7 +2732,8 @@ module Seq =
                             if en.MoveNext() then found <- p en.Current
                             else more <- false
                         found
-                    member _.Current = en.Current } }
+                    member _.Current = en.Current
+                    member _.Dispose() = en.Dispose() } }
     let truncate (n : int) (xs : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2734,7 +2746,8 @@ module Seq =
                             k <- k + 1
                             true
                         else false
-                    member _.Current = en.Current } }
+                    member _.Current = en.Current
+                    member _.Dispose() = en.Dispose() } }
     let take (n : int) (xs : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2747,7 +2760,8 @@ module Seq =
                             k <- k + 1
                             true
                         else failwith "the sequence has fewer elements than Seq.take asked for"
-                    member _.Current = en.Current } }
+                    member _.Current = en.Current
+                    member _.Dispose() = en.Dispose() } }
     let skip (n : int) (xs : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2764,7 +2778,8 @@ module Seq =
                                 else ok <- false
                             if ok then en.MoveNext() else false
                         else en.MoveNext()
-                    member _.Current = en.Current } }
+                    member _.Current = en.Current
+                    member _.Dispose() = en.Dispose() } }
     let append (a : seq<'a>) (b : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2778,7 +2793,8 @@ module Seq =
                             second <- true
                             en <- b.GetEnumerator()
                             en.MoveNext()
-                    member _.Current = en.Current } }
+                    member _.Current = en.Current
+                    member _.Dispose() = en.Dispose() } }
     let init (n : int) (f : int -> 'a) : seq<'a> =
         { new IEnumerable<'a> with
             member _.GetEnumerator() =
@@ -2789,7 +2805,8 @@ module Seq =
                             i <- i + 1
                             true
                         else false
-                    member _.Current = f i } }
+                    member _.Current = f i
+                    member _.Dispose() = () } }
     let singleton (value : 'a) : seq<'a> = init 1 (fun _ -> value)
     let replicate (n : int) (value : 'a) : seq<'a> = init n (fun _ -> value)
     let mapi (f : int -> 'a -> 'b) (xs : seq<'a>) : seq<'b> =
@@ -2803,7 +2820,8 @@ module Seq =
                             i <- i + 1
                             true
                         else false
-                    member _.Current = f i en.Current } }
+                    member _.Current = f i en.Current
+                    member _.Dispose() = en.Dispose() } }
     let choose (f : 'a -> option<'b>) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with
             member _.GetEnumerator() =
@@ -2825,7 +2843,8 @@ module Seq =
                     member _.Current =
                         match cur with
                         | Some y -> y
-                        | None -> failwith "the sequence is exhausted" } }
+                        | None -> failwith "the sequence is exhausted"
+                    member _.Dispose() = en.Dispose() } }
     let collect (f : 'a -> seq<'b>) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with
             member _.GetEnumerator() =
@@ -2849,7 +2868,12 @@ module Seq =
                     member _.Current =
                         match inner with
                         | Some en -> en.Current
-                        | None -> failwith "the sequence is exhausted" } }
+                        | None -> failwith "the sequence is exhausted"
+                    member _.Dispose() =
+                        (match inner with
+                         | Some en -> en.Dispose()
+                         | None -> ())
+                        outer.Dispose() } }
     let exists (p : 'a -> bool) (xs : seq<'a>) =
         let mutable found = false
         for x in xs do
@@ -3079,7 +3103,8 @@ module Seq =
                     member _.MoveNext () =
                         i <- i + 1
                         true
-                    member _.Current = f i } }
+                    member _.Current = f i
+                    member _.Dispose () = () } }
     let tail (xs : seq<'a>) : seq<'a> = List.toSeq (List.tail (toList xs))
     let mapi2 (f : int -> 'a -> 'b -> 'c) (a : seq<'a>) (b : seq<'b>) : seq<'c> =
         List.toSeq (List.mapi2 f (toList a) (toList b))
