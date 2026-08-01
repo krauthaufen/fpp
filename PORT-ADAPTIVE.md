@@ -28,16 +28,17 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **4334 of 22,635** — through
+The port parses and type-checks from line 1 to **4381 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
-`HashCollections.fs`, `Operations`, and into `Deltas`. Everything past the
-frontier is unknown, not known-bad: the errors after the first are a
-cascade until the first is fixed.
+`HashCollections.fs`, `Operations`, `Deltas`, and into `Index.fs`.
+Everything past the frontier is unknown, not known-bad: the errors after
+the first are a cascade until the first is fixed.
 
-The frontier is now ONE construct: a multi-case ACTIVE PATTERN,
-`let inline (|Add|Rem|) (d : SetOperation<'T>)`. There is exactly one in the
-whole library, so it is a choice: build active patterns, or let the port
-rewrite this one. Active patterns are ordinary F# and worth having.
+The frontier is a TYPE error now rather than a parse error, which is
+progress of a different kind: `Index.fs` does `uint64` arithmetic, and
+`uint64` does not exist — not in the prelude, not in the compiler. It is a
+new primitive type, with its own tower of instances and unsigned
+operations, the way `uint32` already is.
 
 ## What is replaced, and what it became
 
@@ -67,6 +68,18 @@ statics is not expressible yet. Eight call sites, in three files.
 Both of these are F# the library actually writes, so they are compiler work,
 not port work.
 
+* ~~**Multi-case active patterns**~~ — **done.** `let (|Add|Rem|) d = ...`
+  compiles to a function returning an `ActiveChoice`, with the cases
+  rewritten onto its constructors in the body and onto its case patterns at
+  every use, where the scrutinee goes through the function first. The
+  rewrite fires only when EVERY clause head belongs to one active pattern,
+  so an ordinary union case that merely shares a name keeps its meaning.
+  Partial patterns (`(|Foo|_|)`) are not built — the library has none.
+* ~~**The verbose class syntax**~~ — **done.** `type X = class ... end`,
+  and the same for `struct` and `interface`; the keywords are delimiters and
+  what is between them is the ordinary body. `interface` is ambiguous — it
+  also opens an interface IMPLEMENTATION as the first thing in a body — and
+  a type name after it is what tells them apart.
 * ~~**Intrinsic type extensions**~~ — **done.** `type X with member ...`
   adds members to a type declared elsewhere: no representation, no
   constructor, no vtable slot, just functions of the receiver resolved by

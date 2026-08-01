@@ -615,6 +615,24 @@ type option<'a> = Option<'a>
 type Result<'t, 'e> =
     | Ok of 't
     | Error of 'e
+
+// The result of a multi-case ACTIVE PATTERN. `let (|Add|Rem|) x = ...`
+// compiles to a function returning one of these, and both the constructors
+// in its body and the case patterns at its use sites are rewritten onto the
+// corresponding case. One type per case count; the payload of a case that
+// carries several values is a tuple, which is what F# does too.
+type ActiveChoice2<'a, 'b> =
+    | Choice2Of1 of 'a
+    | Choice2Of2 of 'b
+type ActiveChoice3<'a, 'b, 'c> =
+    | Choice3Of1 of 'a
+    | Choice3Of2 of 'b
+    | Choice3Of3 of 'c
+type ActiveChoice4<'a, 'b, 'c, 'd> =
+    | Choice4Of1 of 'a
+    | Choice4Of2 of 'b
+    | Choice4Of3 of 'c
+    | Choice4Of4 of 'd
 type exn =
     | Failure of string
     | InvalidCast of string

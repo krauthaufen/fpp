@@ -1348,3 +1348,78 @@ let typeExtensionTests =
             Expect.equal out "18\nsq:9\n" "through an interface value"
         }
     ]
+
+[<Tests>]
+let activePatternTests =
+    testList "multi-case active patterns" [
+        test "the pattern's cases construct in its body and match at its uses" {
+            let out =
+                run [ "type Op(v : int, c : int) ="
+                      "    member x.V = v"
+                      "    member x.C = c"
+                      "let (|Add|Rem|) (d : Op) ="
+                      "    if d.C > 0 then Add(d.C, d.V)"
+                      "    else Rem(0 - d.C, d.V)"
+                      "let describe (d : Op) ="
+                      "    match d with"
+                      "    | Add(n, v) -> \"add \" + string n + \" \" + string v"
+                      "    | Rem(n, v) -> \"rem \" + string n + \" \" + string v"
+                      "let a = print (describe (Op(7, 1)))"
+                      "let b = print (describe (Op(9, 0 - 2)))" ]
+            Expect.equal out "add 1 7\nrem 2 9\n" "the scrutinee goes through the function"
+        }
+        test "literal payloads and a wildcard clause" {
+            // the shape FSharp.Data.Adaptive matches on: `| Add(1, v) ->`
+            let out =
+                run [ "type Op(v : int, c : int) ="
+                      "    member x.V = v"
+                      "    member x.C = c"
+                      "let (|Add|Rem|) (d : Op) ="
+                      "    if d.C > 0 then Add(d.C, d.V)"
+                      "    else Rem(0 - d.C, d.V)"
+                      "let classify (d : Op) ="
+                      "    match d with"
+                      "    | Add(1, v) -> \"one add \" + string v"
+                      "    | Add(n, v) -> \"many add \" + string n"
+                      "    | Rem(1, v) -> \"one rem \" + string v"
+                      "    | _ -> \"other\""
+                      "let a = print (classify (Op(7, 1)))"
+                      "let b = print (classify (Op(7, 3)))"
+                      "let c = print (classify (Op(5, 0 - 1)))"
+                      "let d = print (classify (Op(5, 0 - 4)))" ]
+            Expect.equal out "one add 7\nmany add 3\none rem 5\nother\n" "all four clauses"
+        }
+        test "a union case that merely SHARES a name is not rewritten" {
+            // the rewrite fires only when every clause head belongs to one
+            // active pattern, so an ordinary union keeps its meaning
+            let out =
+                run [ "type Thing ="
+                      "    | Add of int"
+                      "    | Other"
+                      "let name (t : Thing) ="
+                      "    match t with"
+                      "    | Add n -> \"union \" + string n"
+                      "    | Other -> \"other\""
+                      "let a = print (name (Add 3))"
+                      "let b = print (name Other)" ]
+            Expect.equal out "union 3\nother\n" "no active pattern in sight"
+        }
+    ]
+
+[<Tests>]
+let verboseClassTests =
+    testList "the verbose class syntax" [
+        test "type X = class ... end, with val fields" {
+            let out =
+                run [ "type Node ="
+                      "    class"
+                      "        val mutable public Value : int"
+                      "        new(v : int) = { Value = v }"
+                      "        member x.Doubled = x.Value * 2"
+                      "    end"
+                      "let n = Node(21)"
+                      "let a = print n.Value"
+                      "let b = print n.Doubled" ]
+            Expect.equal out "21\n42\n" "the delimiters are delimiters"
+        }
+    ]

@@ -241,6 +241,18 @@ generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
 
+## Active patterns are multi-case and total
+
+`let (|Add|Rem|) x = ...` works: the pattern's cases construct in its body
+and match at its uses, literal payloads included. It compiles to a function
+returning an `ActiveChoice`, and a match whose clause heads are all cases of
+one active pattern passes its scrutinee through that function first. A
+clause set that mixes them with anything else does not, so a union case
+that merely shares a name is untouched.
+
+PARTIAL active patterns (`(|Foo|_|)`, returning an option) and parameterised
+ones (`(|Foo|) arg x`) are not implemented.
+
 ## Type extensions are intrinsic only
 
 `type X with member x.Foo () = ...` adds members to a type declared

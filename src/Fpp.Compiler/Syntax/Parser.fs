@@ -203,6 +203,71 @@ let parse (src : string) : ParseResult =
         && List.isEmpty (s.Peek 1).Leading && List.isEmpty (s.Peek 1).Trailing
         && (s.Peek 2).Kind = RParen && List.isEmpty (s.Peek 2).Leading
 
+    /// `(|Add|Rem|)` — a multi-case ACTIVE PATTERN name. Seven adjacent
+    /// tokens, all of them fused into one identifier, the way `(+)` is.
+    let activePatternCases () : string list =
+        if not (s.Is LParen && List.isEmpty s.Cur.Trailing) then []
+        else
+            let mutable i = 1
+            let mutable names = []
+            let mutable ok = true
+            let mutable fin = false
+            // ( | Name | Name | )
+            while ok && not fin do
+                let bar = s.Peek i
+                if bar.Kind = Operator && bar.Text = "|" && List.isEmpty bar.Trailing then
+                    let nm = s.Peek (i + 1)
+                    if nm.Kind = Ident && List.isEmpty nm.Leading && List.isEmpty nm.Trailing then
+                        names <- names @ [ nm.Text ]
+                        i <- i + 2
+                    elif nm.Kind = RParen && not (List.isEmpty names) then
+                        fin <- true
+                    else ok <- false
+                else ok <- false
+            if ok && fin && List.length names >= 2 && List.length names <= 4 then names else []
+
+    let atActivePatternName () = not (List.isEmpty (activePatternCases ()))
+
+    /// The function an active pattern becomes, and the choice case each of
+    /// its cases becomes. Recorded as the definition is parsed, and read at
+    /// every later use — which is why a definition has to precede its uses,
+    /// as it does in F#.
+    let apFunctionOf = dictNew<string, string> ()      // case -> function
+    let apIndexOf = dictNew<string, string> ()         // case -> choice case
+
+    /// Rename identifiers through a parsed subtree. Used only for the
+    /// active-pattern desugar, where a case name has to become the choice
+    /// case it compiles to.
+    let rec renameIdents (m : Dict<string, string>) (g : Green) : Green =
+        match g with
+        | GToken t when t.Kind = Ident ->
+            (match dictTryFind m t.Text with
+             | Some r -> GToken { t with Text = r }
+             | None -> g)
+        | GToken _ -> g
+        | GNode n -> Green.node n.NodeKind (n.Children |> List.map (renameIdents m))
+
+    /// Every case of every active pattern seen so far, mapped to the choice
+    /// case it becomes.
+    let apRenames () : Dict<string, string> = apIndexOf
+
+    let bumpActivePatternName () : Green =
+        let names = activePatternCases ()
+        let l = s.Cur
+        let fname = "$ap$" + String.concat "$" names
+        let n = List.length names
+        names |> List.iteri (fun i c ->
+            dictSet apFunctionOf c fname
+            dictSet apIndexOf c ("Choice" + string n + "Of" + string (i + 1)))
+        // ( |A |B ... |) — a bar and a name per case, one closing bar, two
+        // parens: 2n + 3 tokens
+        let mutable k = 0
+        while k < 2 * n + 3 do
+            s.Bump () |> ignore
+            k <- k + 1
+        GToken { Kind = Ident; Text = fname
+                 Leading = l.Leading; Trailing = []; Offset = l.Offset }
+
     let bumpOperatorName () : Green =
         let l = s.Cur
         let op = s.Peek 1
@@ -866,11 +931,52 @@ let parse (src : string) : ParseResult =
     and parseMatch (ctx : int) : Green =
         let acc = vecNew<Green> ()
         let matchCol = s.CurCol
-        vecAdd acc (s.Bump ())
-        vecAdd acc (parseExpr matchCol)
+        let kwTok = s.Cur
+        let kw = s.Bump ()
+        vecAdd acc kw
+        let scrutinee = parseExpr matchCol
+        vecAdd acc scrutinee
         if s.IsKw "with" then vecAdd acc (s.Bump ()) else s.Diag "expected 'with'"
-        parseClauses acc matchCol
-        Green.node MatchExpr (vecToList acc)
+        let clauses = vecNew<Green> ()
+        parseClauses clauses matchCol
+        // `match e with | Add (c, v) -> ...` where Add is an active
+        // pattern's case: the scrutinee goes THROUGH the pattern's function
+        // first, and the case becomes the choice case it compiles to. The
+        // whole clause set has to agree — one case of one active pattern is
+        // what says this match is that pattern's, and a name that merely
+        // collides with a real union case elsewhere never gets rewritten.
+        let clauseHeads =
+            vecToList clauses
+            |> List.collect (fun c ->
+                match c with
+                | GNode n when n.NodeKind = MatchClause ->
+                    // the clause's FIRST identifier is its case head
+                    (match Green.tokens c |> List.tryFind (fun t -> t.Kind = Ident) with
+                     | Some t -> [ t.Text ]
+                     | None -> [])
+                | _ -> [])
+        let apFns =
+            clauseHeads |> List.choose (fun h -> dictTryFind apFunctionOf h) |> List.distinct
+        match apFns with
+        | [ fn ] when clauseHeads |> List.forall (fun h -> (dictTryFind apFunctionOf h).IsSome || h = "_") ->
+            let acc2 = vecNew<Green> ()
+            vecAdd acc2 kw
+            let call =
+                Green.node AppExpr
+                    [ Green.node IdentExpr
+                        // a SYNTHETIC offset: every table downstream is
+                        // keyed by it, and sharing the scrutinee's would make
+                        // two different things one
+                        [ GToken { Kind = Ident; Text = fn; Leading = []; Trailing = []
+                                   Offset = 80000000 + kwTok.Offset } ]
+                      scrutinee ]
+            vecAdd acc2 call
+            for i in 2 .. vecLen acc - 1 do vecAdd acc2 (vecGet acc i)
+            for c in vecToList clauses do vecAdd acc2 (renameIdents (apRenames ()) c)
+            Green.node MatchExpr (vecToList acc2)
+        | _ ->
+            for c in vecToList clauses do vecAdd acc c
+            Green.node MatchExpr (vecToList acc)
 
     and parseClauses (acc : Vec<Green>) (col : int) : unit =
         let finishClause (c : Vec<Green>) (barCol : int) : unit =
@@ -946,8 +1052,15 @@ let parse (src : string) : ParseResult =
         vecAdd acc (s.Bump ())   // let / use / and
         while s.IsKw "rec" || s.IsKw "inline" || s.IsKw "mutable" || s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" do
             vecAdd acc (s.Bump ())
-        // binding name / pattern
-        vecAdd acc (parseAtomPat letCol)
+        // binding name / pattern. `let (|Add|Rem|) x = ...` binds a name the
+        // pattern parser cannot read; it becomes the function the active
+        // pattern compiles to, and the cases are recorded for its uses.
+        let mutable isActivePattern = false
+        if atActivePatternName () then
+            isActivePattern <- true
+            vecAdd acc (Green.node IdentPat [ bumpActivePatternName () ])
+        else
+            vecAdd acc (parseAtomPat letCol)
         if s.Is Comma then
             // tuple destructuring: `let leading, p = scanLeading pos`
             while s.Is Comma && s.SameLine do
@@ -969,7 +1082,12 @@ let parse (src : string) : ParseResult =
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"
-            else vecAdd acc (parseBlock letCol)
+            else
+                let body = parseBlock letCol
+                // in an active pattern's own body, `Add (x, y)` CONSTRUCTS
+                // the case: rename it to the choice case the pattern
+                // compiles to
+                vecAdd acc (if isActivePattern then renameIdents (apRenames ()) body else body)
         elif not pendingExtern then s.Diag "expected '=' in binding"
         pendingExtern <- false
         if s.IsKw "in" && s.SameLine then
@@ -1008,7 +1126,20 @@ let parse (src : string) : ParseResult =
             parseTypeBody acc typeCol
         elif s.IsOp "=" then
             vecAdd acc (s.Bump ())
-            if isTypeBodyStart () && not s.SameLine && s.CurCol > typeCol then
+            // F#'s VERBOSE form: `type X = class ... end`, and the same for
+            // struct and interface. The keyword and its `end` are pure
+            // delimiters — what is between them is the ordinary body — so
+            // they are consumed and dropped.
+            // `interface` is ambiguous: it opens the verbose form, but it
+            // also opens an interface IMPLEMENTATION as the first thing in
+            // an ordinary body (`type Rng(n) =` / `interface IEnumerable<int>
+            // with`). A type NAME after it means the latter.
+            if s.IsKw "class" || s.IsKw "struct"
+               || (s.IsKw "interface" && (s.Peek 1).Kind <> Ident) then
+                s.Bump () |> ignore
+                parseTypeBody acc typeCol
+                if s.IsKw "end" then s.Bump () |> ignore
+            elif isTypeBodyStart () && not s.SameLine && s.CurCol > typeCol then
                 ()   // class/interface body only — handled below
             elif s.IsOp "|" then parseUnionCases acc typeCol
             elif s.Is LBrace then vecAdd acc (parseRecordRepr typeCol)
