@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-573 tests
+575 tests
 corpus fixpoint    46699 bytes, byte-identical
-self-host fixpoint 1513728 bytes, byte-identical
+self-host fixpoint 1514339 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -70,12 +70,13 @@ real ones: most were 10–60 lines.
 
 ### Qualification
 
-Two holes were found by writing ONE program that qualifies everything, and
-both are fixed:
+Three holes were found by writing programs that qualify everything, and all
+three are fixed:
 
 * a qualified CONSTRUCTOR took the primary overload whatever its arity
 * a STATIC member through a qualified type did not resolve at all
   (`Inner.Box.Make`)
+* a qualified BASE class did not parse (`inherit Inner.Base(s)`)
 
 Both were the same mistake in two places: searching a head for its FIRST
 identifier, which on a dotted name is the module. The rule, now in
@@ -84,10 +85,18 @@ Lower must agree on which token they key by — the static-member fix needed
 BOTH sides, because inference bound the member while emission still built a
 closure over it.
 
+The base-class fix carries its own lesson: the qualified spine has to STAY
+in the tree — the resolver binds the path through it, and dropping it broke
+losslessness — while the readers take the last segment. And the name is the
+last segment of the NamedType NODE, not the last token of the inherit:
+`inherit HashNode<'k, 'v>(0)` ends in a type ARGUMENT, so reading tokens
+blindly renamed the base to `'v`.
+
 Verified working: qualified functions, values, constructors (with and
-without explicit type arguments), static members, union cases in expressions
-AND in patterns, record-literal field labels, type annotations, generic type
-applications.
+without explicit type arguments), static members, base classes (generic
+ones too), interface implementations, union cases in expressions AND in
+patterns, record-literal field labels, type annotations, generic type
+applications, and modules nested two deep.
 
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in
 `Infer.fs` and `Lower.fs`. Each is the same question, and each is right only
@@ -96,6 +105,15 @@ want reading one at a time rather than a blind sweep, since some genuinely
 mean the first.
 
 ### Still missing for the port
+
+One hole is left, found the same way and not yet fixed:
+
+```fsharp
+let i = Inner.Colour.Green 7    // "unknown field Green"
+```
+
+a union case named through its TYPE as well as its module. `Inner.Green 7`
+works; it is the three-segment form that does not.
 
 * **computation expressions** — `ComputationExpressions.fs` and `seq { }`.
   The only remaining item that is a real feature rather than a small gap.

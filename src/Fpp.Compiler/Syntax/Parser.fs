@@ -1251,10 +1251,22 @@ let parse (src : string) : ParseResult =
                 // parse the base type by hand: a full parseType would eat the
                 // constructor arguments as a parenthesised type
                 if s.Is Ident then
-                    let idt = s.Bump ()
+                    // a QUALIFIED base: `inherit Inner.Base(s)`. The spine is
+                    // modules and the LAST segment names the type, so the
+                    // dots are walked here rather than left to parseType,
+                    // which would eat the constructor arguments as a
+                    // parenthesised type.
+                    // every token stays in the tree — the resolver binds the
+                    // qualified path, and the parse stays lossless — while
+                    // the readers take the LAST segment as the type's name
+                    let parts = vecNew<Green> ()
+                    vecAdd parts (s.Bump ())
+                    while s.IsOp "." && s.SameLine && (s.Peek 1).Kind = Ident do
+                        vecAdd parts (s.Bump ())
+                        vecAdd parts (s.Bump ())
                     if s.IsOp "<" && s.SameLine then
-                        vecAdd a (Green.node AppType (Green.node NamedType [ idt ] :: parseAngleArgs typeCol))
-                    else vecAdd a (Green.node NamedType [ idt ])
+                        vecAdd a (Green.node AppType (Green.node NamedType (vecToList parts) :: parseAngleArgs typeCol))
+                    else vecAdd a (Green.node NamedType (vecToList parts))
                 else vecAdd a (parseType typeCol)
                 if s.Is LParen && s.SameLine then vecAdd a (parseAtom typeCol)
                 vecAdd acc (Green.node InheritDecl (vecToList a))

@@ -12,14 +12,14 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 573 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 575 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 573 tests missed — a `List.init` that counted down, an equality that
+bugs the 575 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 

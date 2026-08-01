@@ -2353,14 +2353,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let ctorPat = nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind)
         // `inherit Base(args)`: the base contributes the object's prefix
         let inheritNode = nodesOf n |> List.tryFind (fun m -> m.NodeKind = InheritDecl)
-        let baseName =
-            inheritNode
-            |> Option.bind (fun i -> Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead)
-            |> Option.map (fun t -> t.Text)
+        // The base's name is the LAST segment of its dotted path — and the
+        // path lives in the NamedType node, NOT in every token of the
+        // inherit: `inherit HashNode<'k, 'v>(0)` ends in a type ARGUMENT.
+        let rec baseNameTok (g : GreenNode) : Token option =
+            if g.NodeKind = NamedType then
+                Green.tokens (GNode g) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+            else
+                match nodesOf g |> List.tryFind (fun m -> m.NodeKind = NamedType || m.NodeKind = AppType) with
+                | Some inner -> baseNameTok inner
+                | None -> Green.tokens (GNode g) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+        let baseTok = inheritNode |> Option.bind baseNameTok
+        let baseName = baseTok |> Option.map (fun t -> t.Text)
         let baseCtorCall =
             match inheritNode, baseName with
             | Some i, Some bn ->
-                let bt = (Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.head)
+                let bt = match baseTok with Some t -> t | None -> Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.head
                 let bdef = dictTryFind useDefs bt.Offset
                 let args =
                     nodesOf i

@@ -1620,6 +1620,41 @@ let qualifiedCtorTests =
                       "let b = print made.V" ]
             Expect.equal out "7\n3\n" "constructor and static member both qualify"
         }
+        test "a QUALIFIED base class" {
+            // `inherit Inner.Base(s)`. The spine has to stay in the tree —
+            // the resolver binds the qualified path through it — and the
+            // name is the last segment of the NamedType, NOT the last token
+            // of the inherit: `inherit HashNode<'k, 'v>(0)` ends in a type
+            // ARGUMENT.
+            let out =
+                run [ "module Inner ="
+                      "    type Base(n : int) ="
+                      "        member x.N = n"
+                      "type Sq(s : int) ="
+                      "    inherit Inner.Base(s)"
+                      "    member x.S = s"
+                      "let a = Sq 4"
+                      "let p = print a.N"
+                      "let q = print a.S" ]
+            Expect.equal out "4\n4\n" "the base is found through its path"
+        }
+        test "a qualified INTERFACE, and a generic base, still work" {
+            let out =
+                run [ "module Inner ="
+                      "    type IShape ="
+                      "        abstract member Area : unit -> int"
+                      "    type Holder<'a>(v : 'a) ="
+                      "        member x.V = v"
+                      "    type Sub<'a>(v : 'a) ="
+                      "        inherit Inner.Holder<'a>(v)"
+                      "        member x.Twice = v"
+                      "type Sq(s : int) ="
+                      "    interface Inner.IShape with"
+                      "        member x.Area () = s * s"
+                      "let a = print ((Sq 4 :> Inner.IShape).Area ())"
+                      "let b = print (Inner.Sub<int>(9)).V" ]
+            Expect.equal out "16\n9\n" "generic qualified base, qualified interface"
+        }
         test "everything else qualifies too" {
             let out =
                 run [ "module Inner ="
