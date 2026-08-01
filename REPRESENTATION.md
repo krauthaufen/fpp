@@ -23,6 +23,31 @@ Every numeric type is blittable: `byte`/`sbyte`/`bool` are one byte (C's
 `_Bool` is one), `char` and `float16` are two, `int`/`uint32`/`float32` four,
 `int64`/`float` eight.
 
+The backing store's ELEMENT TYPE follows the struct's fields, not just its
+width: a struct whose fields are all floats of the backing width is backed by
+a float array, so reading a field is the `array.get` alone. Integer words
+would make every float field a load into a general register followed by a move
+across to the FPU. wasm-GC arrays cannot be aliased the way a JS
+`Float32Array` and `Int32Array` share one buffer, so choosing the element type
+is the nearest thing available. The bytes are identical either way.
+
+### Where this rests, and why
+
+An array element read costs about 1.4-2x what C pays, and that is the
+accepted resting point. What remains between here and C is the array-object
+indirection and its bounds check, and closing it would mean holding arrays in
+linear memory as raw pointers — which needs a collector of our own, because
+wasm offers NO stack introspection (so roots must be published to a shadow
+stack by every function) and NO finalizers or weak references (so a GC handle
+cannot own and release a linear-memory block). That is a tax on every function
+to win on array reads specifically, and it was judged not to pay.
+
+Zero-copy is coming from the other direction instead: an explicitly managed
+`Buffer<'t>` with reinterpreting views, which puts manual lifetime exactly
+where it is tolerable — few, large, long-lived allocations — and leaves the
+GC heap alone. `Array.pin` copies in and out precisely because arrays live in
+the GC heap; a Buffer never would.
+
 How values are laid out at runtime, per backend. The core constraint (from
 DESIGN.md): GADTs force polymorphic recursion, so whole-program
 monomorphization is off the table — there must always be a **uniform
