@@ -60,12 +60,10 @@ errors after the first are a cascade until the first is fixed.
 The frontier is inside `IndexList.fs`. Two things are known to be waiting
 there and beyond:
 
-* **`&x` on a mutable LOCATION.** `&x` parses and types, and FORWARDING a
-  byref parameter to another (`x.TryGetValue(key, &value)`) hands the same
-  cell on, which is the whole of what MapExt needs. Taking the address of a
-  mutable field or local (`Interlocked.Increment(&currentId)`,
-  `weak.TryGetTarget(&old)`) still needs copy-in/copy-out around the call,
-  or promotion of that storage to a cell.
+* ~~**`&x` on a mutable LOCATION**~~ — **done.** Forwarding a byref
+  parameter hands the same cell on; taking the address of a mutable local or
+  field copies in and out around the call, in both the tuple form
+  (`m.TryGetValue(k, &v)`) and the curried one (`bump &current`).
 * **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
   parses, stays in the tree and no longer counts as a type parameter — but
   **done.** Both spellings bind and are enforced — the constraint travels on

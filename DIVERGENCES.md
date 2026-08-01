@@ -318,8 +318,18 @@ structurally equal keys are two entries.
 `TryGetValue` IS there, on `Dictionary` and on `ConditionalWeakTable`. F#
 hands a byref out-parameter over as a TUPLE, and that shape is expressible:
 `match d.TryGetValue k with | (true, v) -> ...` is one source for both
-languages. Every other byref member — `TryPop`, `Remove(item, out removed)`
-— is absent.
+languages.
+
+**byref itself works.** A byref is a one-field CELL — wasm has no address of
+a local — and `&x` on a mutable local or field copies IN and OUT around the
+call: the callee gets a cell built from the location, and the location is
+written back when the call returns. Forwarding one byref parameter to
+another hands the same cell on, with no copy.
+
+What that is NOT is an ALIAS. A callee that reaches the same location by
+another route does not see the write until the call ends, and two byrefs to
+one location do not see each other. Single-threaded, and for the
+out-parameter shape everything actually uses, it is indistinguishable.
 
 `StringBuilder.Append` takes a string or a char; .NET's numeric overloads
 are not there, so write `sb.Append (string x)`.

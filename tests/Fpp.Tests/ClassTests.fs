@@ -1531,6 +1531,43 @@ let byrefTests =
                       "let b = print cell.Contents" ]
             Expect.equal out "1\n42\n" "the same cell is handed on"
         }
+        test "&x on a mutable LOCAL copies in and out around the call" {
+            let out =
+                run [ "type Store(n : int) ="
+                      "    let mutable v = n"
+                      "    member x.TryGet (key : int, value : byref<int>) : bool ="
+                      "        if key = 0 then"
+                      "            value <- v"
+                      "            true"
+                      "        else false"
+                      "let s = Store 42"
+                      "let go ="
+                      "    let mutable got = 0"
+                      "    let ok = s.TryGet (0, &got)"
+                      "    print (if ok then 1 else 0)"
+                      "    print got"
+                      "    let mutable other = 7"
+                      "    let no = s.TryGet (1, &other)"
+                      "    print (if no then 1 else 0)"
+                      "    print other" ]
+            Expect.equal out "1\n42\n0\n7\n" "written back on a hit, unchanged on a miss"
+        }
+        test "&x on a mutable FIELD, as a curried argument" {
+            // `Interlocked.Increment(&currentId)` is this shape
+            let out =
+                run [ "let bump (cell : byref<int>) : int ="
+                      "    cell <- cell.Contents + 1"
+                      "    cell.Contents"
+                      "type Counter() ="
+                      "    let mutable current = 0"
+                      "    member x.Next () = bump &current"
+                      "    member x.Value = current"
+                      "let c = Counter()"
+                      "let a = print (c.Next ())"
+                      "let b = print (c.Next ())"
+                      "let d = print c.Value" ]
+            Expect.equal out "1\n2\n2\n" "the field carries the write back"
+        }
         test "an inline type-parameter constraint is not a type parameter" {
             // `type MapExt<'Key, 'Value when 'Key : comparison>` — every
             // identifier in the constraint used to count as another

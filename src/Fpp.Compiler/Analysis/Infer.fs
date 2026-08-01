@@ -1741,6 +1741,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> ())
                      tBool
                  | Some t when t.Text = "&" ->
+                     // record which kind this is: forwarding an existing
+                     // cell, or taking the address of a LOCATION, which the
+                     // call site has to copy in and out around the call
+                     (match inner with
+                      | [ i ] ->
+                          (match prune i with
+                           | TCon ("ByRefCell", _) -> vecAdd fieldOwnersRaw (t.Offset, "ByRefCell")
+                           | _ -> vecAdd fieldOwnersRaw (t.Offset, "ByRefCopy"))
+                      | _ -> ())
                      // `&x` for a byref argument. Forwarding a byref
                      // parameter (`f (key, &value)` where value is already
                      // one) hands the SAME cell on; anything else is a

@@ -970,6 +970,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             PWild, None, ELit LUnit ])))
             | PrefixExpr ->
                 (match tokensOf n |> List.tryHead, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 // `&x`. Forwarding a byref parameter hands the SAME cell on;
+                 // taking the address of a LOCATION leaves a marker that
+                 // `fixAddrs` turns into copy-in/copy-out around the call.
+                 | Some op, [ a ] when op.Text = "&" ->
+                     let lowered = lowerExpr (GNode a)
+                     (match dictTryFind fieldOwners op.Offset with
+                      | Some "ByRefCell" -> lowered
+                      | _ -> EApp (EUnknown "$addr", [ lowered ]))
                  | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
                      let suffix =
                          match dictTryFind opKinds op.Offset with
@@ -2553,6 +2561,69 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             Some (nm.Text, nodesOf m |> List.filter (fun p -> isPatKind p.NodeKind) |> List.length)
                         | _ -> None)))
 
+    /// Copy-in/copy-out for `&location`. wasm has no address of a local, so
+    /// the call gets a CELL built from the location, and the location is
+    /// written back from the cell afterwards. Single-threaded that is what a
+    /// byref does; what it is NOT is an alias — a callee reaching the same
+    /// location another way does not see the write until the call returns.
+    let mutable addrSeq = 0
+    let rec fixAddrs (e : Expr) : Expr =
+        match e with
+        | EApp (f, args) when
+                args |> List.exists (fun a ->
+                    match a with
+                    | EApp (EUnknown "$addr", [ _ ]) -> true
+                    // a .NET-style call passes a TUPLE, so the address sits
+                    // one level in
+                    | ETuple xs -> xs |> List.exists (fun x -> match x with EApp (EUnknown "$addr", [ _ ]) -> true | _ -> false)
+                    | _ -> false) ->
+            let f2 = fixAddrs f
+            let cells = vecNew<VarId * Expr> ()
+            let anon = mono (TCon ("?", []))
+            let takeAddr (a : Expr) : Expr =
+                match a with
+                | EApp (EUnknown "$addr", [ target ]) ->
+                    addrSeq <- addrSeq + 1
+                    let v = { Path = path; Offset = 91000000 + addrSeq; Name = "_addr" + string addrSeq }
+                    vecAdd cells (v, fixAddrs target)
+                    EVar (v, anon)
+                | other -> fixAddrs other
+            let args2 =
+                args
+                |> List.map (fun a ->
+                    match a with
+                    | ETuple xs -> ETuple (List.map takeAddr xs)
+                    | other -> takeAddr other)
+            addrSeq <- addrSeq + 1
+            let resV = { Path = path; Offset = 92000000 + addrSeq; Name = "_addrRes" + string addrSeq }
+            let writeBack =
+                vecToList cells
+                |> List.choose (fun (v, target) ->
+                    let read = EField (EVar (v, anon), "Contents", "ByRefCell")
+                    match target with
+                    | EVar (tv, _) -> Some (EAssign (tv, read))
+                    | EField (recv, fn, owner) -> Some (EFieldSet (recv, fn, owner, read))
+                    | _ -> None)
+            let body =
+                ELet (false, resV, anon, EApp (f2, args2),
+                      ESeq (writeBack @ [ EVar (resV, anon) ]))
+            vecToList cells
+            |> List.rev
+            |> List.fold
+                (fun acc (v, target) ->
+                    ELet (false, v, anon, ERecord ("ByRefCell", [ "Contents", target ]), acc))
+                body
+        | EApp (f, args) -> EApp (fixAddrs f, List.map fixAddrs args)
+        | ELam (ps, b) -> ELam (ps, fixAddrs b)
+        | ELet (r, v, sc, rhs, b) -> ELet (r, v, sc, fixAddrs rhs, fixAddrs b)
+        | EIf (a, b, c) -> EIf (fixAddrs a, fixAddrs b, fixAddrs c)
+        | ESeq xs -> ESeq (List.map fixAddrs xs)
+        | EMatch (sc, cs) -> EMatch (fixAddrs sc, cs |> List.map (fun (p, g, b) -> p, Option.map fixAddrs g, fixAddrs b))
+        | EWhile (c, b) -> EWhile (fixAddrs c, fixAddrs b)
+        | EPrim (op, xs) -> EPrim (op, List.map fixAddrs xs)
+        | ETuple xs -> ETuple (List.map fixAddrs xs)
+        | other -> other
+
     let rec lowerDecl (g : Green) : unit =
         match g with
         | GToken _ -> ()
@@ -2596,5 +2667,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     for c in root.Children do lowerDecl c
 
-    { Decls = vecToList decls
+    // `&location` becomes copy-in/copy-out, in EVERY binding — members and
+    // lifted lambdas reach `decls` by their own routes, so the pass runs
+    // here rather than at any one of them
+    { Decls =
+        vecToList decls
+        |> List.map (fun d ->
+            match d with
+            | DLet (r, v, sch, body) -> DLet (r, v, sch, fixAddrs body)
+            | other -> other)
       Notes = vecToList notes }

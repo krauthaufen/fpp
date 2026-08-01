@@ -607,16 +607,21 @@ let parse (src : string) : ParseResult =
             && (let n = s.Peek 1 in
                 n.Offset = s.Cur.Offset + 1
                 && (n.Kind = IntLit || n.Kind = FloatLit || n.Kind = Ident || n.Kind = LParen))
+        // `f &x` — an ADDRESS as a curried argument, by the same adjacency
+        // rule as the negation above
+        let isAddrArg () =
+            s.IsOp "&" && (let n = s.Peek 1 in
+                           List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen))
         let parseArg () =
-            if isNegArg () then
+            if isNegArg () || isAddrArg () then
                 let op = s.Bump ()
                 Green.node PrefixExpr [ op; parsePostfix ctx ]
             else parsePostfix ctx
         let head = parsePostfix ctx
-        if (canStartAtom () || isNegArg ()) && (s.SameLine || s.CurCol > ctx) then
+        if (canStartAtom () || isNegArg () || isAddrArg ()) && (s.SameLine || s.CurCol > ctx) then
             let acc = vecNew<Green> ()
             vecAdd acc head
-            while (canStartAtom () || isNegArg ()) && (s.SameLine || s.CurCol > ctx) do
+            while (canStartAtom () || isNegArg () || isAddrArg ()) && (s.SameLine || s.CurCol > ctx) do
                 vecAdd acc (parseArg ())
             Green.node AppExpr (vecToList acc)
         else head
