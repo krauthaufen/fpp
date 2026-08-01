@@ -46,15 +46,16 @@ was not a language feature at all: SIX files were stopped by `#nowarn
 four more files parse clean on the spot.
 
 That is the shape of this work. The remaining constructs are ordinary F#
-that any project would use — type extensions on DOTTED names
-(`type System.Threading.Interlocked with`), computation expressions,
-`use`/`IDisposable` — not exotica. Nothing so far has needed a
+that any project would use — flexible types in a member's parameters
+(`aval<#seq<'T1>>`), `do base.M()` in a class body — not exotica. Type
+extensions on dotted names, computation expressions and `use`/`IDisposable`
+were all on this list, and all three are done. Nothing so far has needed a
 FSharp.Data.Adaptive-specific hack, and every fix has been small and
 general.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **8027 of 22,635** — through
+The port parses and type-checks from line 1 to **8156 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
 `HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, all 3,908 lines
 of `MapExt.fs`, and into `IndexList.fs`. Everything past the frontier is unknown, not known-bad: the
@@ -152,8 +153,11 @@ is actually coming:
 | ~~`ConditionalWeakTable`~~ | 3 | **done.** An identity-keyed table in the prelude. The library's use is a per-object callback cache with an explicit `Remove`, so the behaviour is the same until something dies with callbacks attached |
 | ~~byref `TryGetValue`~~ | — | **done.** F# hands the out-parameter over as a tuple, which IS expressible |
 | reflection outside ShallowEquality (`typeof<>` in AdaptiveValue, HashSet, HashMap, IndexList, History, Cache) | ~30 | read each: most are `typeof<'a>` used as a cache key or a null test, which a typeclass or a constrained function answers |
-| `IDisposable` / `use` | 25 | `use` is scoped disposal; F++ has neither yet |
-| computation expressions (`ComputationExpressions.fs`, `seq { }`) | 2 files | builders |
+| ~~`IDisposable` / `use`~~ | 25 | **done.** Disposal at the end of the scope, on the normal path and the raising one, over a real `try`/`finally`. `IEnumerator<'a>` inherits `Dispose` the way .NET's does, which is what `use e = xs.GetEnumerator()` needs |
+| ~~computation expressions~~ | 2 files | **done.** `builder { ... }` is rewritten into builder-method calls between parsing and resolution, so resolve, infer and lower share ONE tree. What running that early cannot do is ask whether the builder defines `Run` or `Delay`, so those are emitted structurally — DIVERGENCES.md has the rule. `ComputationExpressions.fs` itself is still stopped by flexible types |
+| flexible types in a member's parameters | — | `member x.For(elements : aval<#seq<'T1>>, ...)`. `#T` parses elsewhere and not here |
+| `do base.M()` in a class body | 4 files | AdaptiveObject, Core, Transaction, Callbacks |
+| the harness mangles a tupled member | 2 files | `port_closures` rewrites `member x.Invoke(a : T, b : U)` into `member (x (a : T) (b : U))` and loses the name — the DRIVER's bug, not the compiler's |
 | `inherit` (119) | — | already works |
 
 ## The two harnesses, and which one to reach for

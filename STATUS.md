@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-578 tests
-corpus fixpoint    48098 bytes, byte-identical
-self-host fixpoint 1516855 bytes, byte-identical
+589 tests
+corpus fixpoint    53463 bytes, byte-identical
+self-host fixpoint 1555145 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -66,6 +66,8 @@ real ones: most were 10–60 lines.
 | compiler directives | `#nowarn` and friends |
 | qualification | a dotted head is named by its LAST segment — constructors, static members, base classes, and cases through their type |
 | `System.Threading` | `lock`, `Monitor`, `Interlocked` — real, on one thread |
+| `use` and `try`/`finally` | disposal at end of scope, on the normal path and the raising one; `IDisposable` in the prelude and on `IEnumerator<'a>`, as .NET has it |
+| computation expressions | `seq { }` and any builder — rewritten into method calls BEFORE resolution, so one tree serves resolve, infer and lower |
 
 ## Known problematic
 
@@ -115,13 +117,26 @@ mean the first.
 Expression and pattern position resolve SEPARATELY — the case-through-type
 fix needed both — which is worth remembering for anything else qualified.
 
-* **computation expressions** — `ComputationExpressions.fs` and `seq { }`.
-  The only remaining item that is a real feature rather than a small gap.
-* **`use` / `IDisposable`** — 25 uses.
+~~computation expressions~~ and ~~`use` / `IDisposable`~~ are done. What the
+40-file standalone parse still stops on, measured rather than guessed —
+**27 of 40 parse clean**, unchanged by the CE work because the blockers were
+never CEs:
+
+* **flexible types in a member's parameters** — `member x.For(elements :
+  aval<#seq<'T1>>, ...)`. `#T` parses in some positions and not this one,
+  and it stops `ComputationExpressions.fs` itself.
+* **`do base.M()` in a class body** — `AdaptiveObject.fs`, `Core.fs`,
+  `Transaction.fs`, `Callbacks.fs`.
+* **`member x.Invoke(a : T, b : U, ...)` mangled by the port harness** into
+  `member (x (a : T) (b : U)) =`. That one is the DRIVER's bug, not the
+  compiler's — `port_closures` rewrites a tupled member and loses the name.
 * **reflection outside ShallowEquality** — ~30 `typeof<>` sites in
   AdaptiveValue, HashSet, HashMap, IndexList, History, Cache. Read each:
   most are a cache key or a null test, which a class or a constrained
   function answers.
+
+The type-checked frontier moved from line 8027 to **8156 of 22,635**, and
+what it stops on now is `IndexList`/`MapExt` typing, not syntax.
 
 ### Reproducible defects, with diagnoses
 
