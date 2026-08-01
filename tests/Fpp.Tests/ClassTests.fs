@@ -1163,3 +1163,66 @@ let indexerTests =
             Expect.equal out "2\n9\n13\n" "ResizeArray<int> holds a packed array"
         }
     ]
+
+[<Tests>]
+let mutableHashSetTests =
+    testList "MutableHashSet" [
+        // the oracle cannot arbitrate this one: the type is called HashSet
+        // in .NET, and that name is taken here (see DIVERGENCES.md), so the
+        // expected output is written out
+        test "Add answers whether the element was new, and Remove whether it was there" {
+            let out =
+                run [ "let s = MutableHashSet<string>()"
+                      "let a = print (if s.Add \"x\" then 1 else 0)"
+                      "let b = print (if s.Add \"x\" then 1 else 0)"
+                      "let c = print s.Count"
+                      "let d ="
+                      "    s.UnionWith [ \"y\"; \"z\"; \"x\" ]"
+                      "    print s.Count"
+                      "let e = print (if s.Contains \"y\" then 1 else 0)"
+                      "let f = print (if s.Remove \"y\" then 1 else 0)"
+                      "let g = print (if s.Remove \"y\" then 1 else 0)"
+                      "let h = print s.Count" ]
+            Expect.equal out "1\n0\n1\n3\n1\n1\n0\n2\n" ".NET's answers exactly"
+        }
+        test "int elements go in a packed array, and the table rehashes" {
+            let out =
+                run [ "let seen = MutableHashSet<int>()"
+                      "let a ="
+                      "    for i in 1 .. 200 do"
+                      "        seen.Add (i % 37) |> ignore"
+                      "    print seen.Count"
+                      "let b = print (Array.sum (seen.ToArray ()))"
+                      "let c ="
+                      "    let mutable n = 0"
+                      "    for v in seen do"
+                      "        n <- n + 1"
+                      "    print n" ]
+            Expect.equal out "37\n666\n37\n" "37 residues, summing to 0+1+...+36"
+        }
+        test "elements stay insertion-ordered across a removal" {
+            let out =
+                run [ "let s = MutableHashSet<int>()"
+                      "let a ="
+                      "    s.Add 5 |> ignore"
+                      "    s.Add 3 |> ignore"
+                      "    s.Add 9 |> ignore"
+                      "    s.Remove 3 |> ignore"
+                      "    s.Add 1 |> ignore"
+                      "    for v in s do print v" ]
+            Expect.equal out "5\n9\n1\n" "the survivors shift down"
+        }
+        test "ExceptWith, IsSubsetOf and Overlaps" {
+            let out =
+                run [ "let s = MutableHashSet<int>()"
+                      "let a ="
+                      "    s.UnionWith [ 1; 2; 3; 4 ]"
+                      "    s.ExceptWith [ 2; 4; 99 ]"
+                      "    print s.Count"
+                      "let b = print (if s.IsSubsetOf [ 1; 2; 3 ] then 1 else 0)"
+                      "let c = print (if s.IsSubsetOf [ 1 ] then 1 else 0)"
+                      "let d = print (if s.Overlaps [ 3; 7 ] then 1 else 0)"
+                      "let e = print (if s.Overlaps [ 7; 8 ] then 1 else 0)" ]
+            Expect.equal out "2\n1\n0\n1\n0\n" "the set-relation surface"
+        }
+    ]

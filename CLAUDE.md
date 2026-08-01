@@ -12,14 +12,14 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 542 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 546 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 542 tests missed — a `List.init` that counted down, an equality that
+bugs the 546 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
@@ -141,8 +141,8 @@ body contains zero `array.len`. That one was checked, not assumed.
 
 ## The .NET collections, and the two rules that shaped them
 
-`ResizeArray`, `Dictionary` and `StringBuilder` live in the prelude and are
-gated by `stdlib/dotnet.fpp`, which runs under F++ AND under `dotnet fsi`
+`ResizeArray`, `Dictionary`, `MutableHashSet` and `StringBuilder` live in
+the prelude and are gated by `stdlib/dotnet.fpp`, which runs under F++ AND under `dotnet fsi`
 and must print the same 93 values. Two limits decided their shape, and both
 will bite anyone extending them:
 
@@ -153,7 +153,8 @@ will bite anyone extending them:
   `GetEnumerator` (which is what `for x in xs` looks for) over an array
   snapshot. Repro in `tests/known-issues/`.
 * **A user type whose name matches a prelude type MERGES with it.** That is
-  why there is no mutable `HashSet`: the acceptance corpus ports one.
+  why the mutable set is `MutableHashSet`: the acceptance corpus ports a
+  `HashSet` of its own.
 
 Extra members exist that .NET does not have (`Reserve`, `SlotOf`, `Rehash`,
 `KeyArray`) because there is no working `member private` convention here.

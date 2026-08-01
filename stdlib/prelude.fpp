@@ -4913,13 +4913,110 @@ type Dictionary<'k, 'v>() =
     member x.GetEnumerator () : IEnumerator<KeyValuePair<'k, 'v>> =
         (Array.init dcount (fun i -> KeyValuePair<'k, 'v>(dkeys.[i], dvals.[i])) :> seq<KeyValuePair<'k, 'v>>).GetEnumerator ()
 
-// There is deliberately NO mutable `HashSet` here. The name is taken twice
-// over — by this prelude's own immutable `HashSet` module and by
-// FSharp.Data.Adaptive's HashSet, which the acceptance corpus ports — and a
-// user type whose name matches a prelude type does not shadow it, it MERGES
-// with it (see DIVERGENCES.md). Until that is fixed, adding the .NET one
-// would break every program that declares its own. `Dictionary<'k, bool>`
-// is the substitute.
+/// System.Collections.Generic.HashSet — the same table without the values,
+/// under a DIFFERENT NAME. `HashSet` is taken twice over: by this prelude's
+/// own immutable one and by FSharp.Data.Adaptive's, which the acceptance
+/// corpus ports. A user type whose name matches a prelude type merges with
+/// it rather than shadowing it (see DIVERGENCES.md), so claiming the .NET
+/// name would break every program that declares its own. The members are
+/// .NET's exactly; only the type's name differs.
+type MutableHashSet<'a>() =
+    let mutable skeys : 'a[] = Array.zeroCreate 8
+    let mutable shashes : int[] = Array.zeroCreate 8
+    let mutable sslots : int[] = Array.zeroCreate 16
+    let mutable scount = 0
+    member x.SlotOfHash (k : 'a, h : int) : int =
+        let mask = sslots.Length - 1
+        let mutable i = h &&& mask
+        let mutable found = 0 - 1
+        while found < 0 do
+            let e = sslots.[i]
+            if e = 0 then found <- i
+            elif shashes.[e - 1] = h && skeys.[e - 1] = k then found <- i
+            else i <- (i + 1) &&& mask
+        found
+    member x.SlotOf (k : 'a) : int = x.SlotOfHash (k, hash k &&& 1073741823)
+    member x.Rehash () : unit =
+        let slots : int[] = Array.zeroCreate (sslots.Length * 2)
+        let mask = slots.Length - 1
+        let mutable e = 0
+        while e < scount do
+            let mutable i = shashes.[e] &&& mask
+            while slots.[i] <> 0 do
+                i <- (i + 1) &&& mask
+            slots.[i] <- e + 1
+            e <- e + 1
+        sslots <- slots
+    member x.Count = scount
+    member x.Contains (v : 'a) : bool = sslots.[x.SlotOf v] > 0
+    /// .NET answers whether the element was NEW
+    member x.Add (v : 'a) : bool =
+        let h = hash v &&& 1073741823
+        let s = x.SlotOfHash (v, h)
+        if sslots.[s] > 0 then false
+        else
+            if scount >= skeys.Length then
+                let keys : 'a[] = Array.zeroCreate (skeys.Length * 2)
+                let hs : int[] = Array.zeroCreate (skeys.Length * 2)
+                Array.blit skeys 0 keys 0 scount
+                Array.blit shashes 0 hs 0 scount
+                skeys <- keys
+                shashes <- hs
+            skeys.[scount] <- v
+            shashes.[scount] <- h
+            scount <- scount + 1
+            if scount * 2 >= sslots.Length then x.Rehash ()
+            else sslots.[s] <- scount
+            true
+    /// The survivors SHIFT DOWN and the index is rebuilt, so elements stay
+    /// insertion-ordered — the same trade the Dictionary makes.
+    member x.Remove (v : 'a) : bool =
+        let e = sslots.[x.SlotOf v]
+        if e = 0 then false
+        else
+            let mutable i = e - 1
+            while i < scount - 1 do
+                skeys.[i] <- skeys.[i + 1]
+                shashes.[i] <- shashes.[i + 1]
+                i <- i + 1
+            scount <- scount - 1
+            let slots : int[] = Array.zeroCreate sslots.Length
+            let mask = slots.Length - 1
+            let mutable j = 0
+            while j < scount do
+                let mutable p = shashes.[j] &&& mask
+                while slots.[p] <> 0 do
+                    p <- (p + 1) &&& mask
+                slots.[p] <- j + 1
+                j <- j + 1
+            sslots <- slots
+            true
+    member x.Clear () : unit =
+        scount <- 0
+        sslots <- Array.zeroCreate sslots.Length
+    member x.UnionWith (xs : seq<'a>) : unit =
+        for v in xs do x.Add v |> ignore
+    member x.ExceptWith (xs : seq<'a>) : unit =
+        for v in xs do x.Remove v |> ignore
+    member x.IsSubsetOf (xs : seq<'a>) : bool =
+        let other = MutableHashSet<'a>()
+        other.UnionWith xs
+        let mutable ok = true
+        let mutable i = 0
+        while i < scount do
+            if not (other.Contains skeys.[i]) then ok <- false
+            i <- i + 1
+        ok
+    member x.Overlaps (xs : seq<'a>) : bool =
+        let mutable any = false
+        for v in xs do
+            if x.Contains v then any <- true
+        any
+    /// ours, not .NET's — the seam to the Array and Seq modules, which a
+    /// class holding a PACKED array cannot offer through IEnumerable
+    member x.ToArray () : 'a[] = Array.init scount (fun i -> skeys.[i])
+    member x.GetEnumerator () : IEnumerator<'a> =
+        (x.ToArray () :> seq<'a>).GetEnumerator ()
 
 /// System.Text.StringBuilder. Appending is O(1) — the chunks are joined once,
 /// by the pairwise merge in String.concat, when the text is asked for. A left

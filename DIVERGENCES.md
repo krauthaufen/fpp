@@ -232,9 +232,9 @@ reference element type (`Arr<string>`) even the interface call is fine. It
 is the combination — an interface method reading a field whose layout
 depends on a type parameter — that has no correct answer today.
 
-**Why the prelude's own collections dodge it.** `ResizeArray` and
-`Dictionary` hold their elements in a packed `'a[]`, so neither implements
-`IEnumerable<'a>`. They carry a plain `GetEnumerator` member
+**Why the prelude's own collections dodge it.** `ResizeArray`, `Dictionary`
+and `MutableHashSet` hold their elements in a packed `'a[]`, so none of them
+implements `IEnumerable<'a>`. They carry a plain `GetEnumerator` member
 instead, which is what `for x in xs` looks for (the loop is structural, as
 in F#), and hand back the BUILT-IN array iterator over a snapshot. So
 `for x in ra` works at every element type, and `Seq.map f ra` does not
@@ -259,14 +259,14 @@ are not there, so write `sb.Append (string x)`.
 Equality and hashing are always the structural `=` and `hash`, never an
 `IEqualityComparer`.
 
-There is no mutable `HashSet`. The name is taken twice over — by the
-prelude's own immutable `HashSet` module and by FSharp.Data.Adaptive's
-`HashSet`, which the acceptance corpus ports — and a user type whose name
-matches a prelude type MERGES with it rather than shadowing it (below), so
-adding the .NET one would break every program that declares its own.
-`Dictionary<'k, bool>` is the substitute. This is the clearest argument yet
-for fixing prelude-type shadowing: it is not a corner, it costs real
-surface.
+The mutable set is called `MutableHashSet`, not `HashSet`. Its MEMBERS are
+.NET's exactly — `Add` answers whether the element was new, `Remove` whether
+it was there, plus `Contains`/`Count`/`Clear`/`UnionWith`/`ExceptWith`/
+`IsSubsetOf`/`Overlaps` — only the type's name differs. `HashSet` is taken
+twice over: by this prelude's own immutable one and by
+FSharp.Data.Adaptive's, which the acceptance corpus ports. A user type whose
+name matches a prelude type MERGES with it rather than shadowing it (below),
+so claiming the .NET name would break every program that declares its own.
 
 **Where they agree exactly.** Enumeration is INSERTION-ORDERED, like .NET's
 in practice; `Add` on a duplicate key throws where `d.[k] <- v` overwrites;
