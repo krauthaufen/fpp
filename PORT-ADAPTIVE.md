@@ -1,5 +1,8 @@
 # Porting FSharp.Data.Adaptive, whole
 
+> `STATUS.md` is the wider picture — gate state, everything closed so far,
+> and every known defect. This file is the port's own detail.
+
 The quest: `FSharp.Data.Adaptive` compiles as F++ — all 41 files, 24,792
 lines of it — with **the heart untouched**. The algorithms, the data
 structures and the adaptive machinery are the library's; what may be

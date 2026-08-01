@@ -5,6 +5,7 @@ and higher-kinded types, compiled ahead of time to wasm-GC — no JIT, no CLR,
 no runtime to install alongside the program.
 
 - **DESIGN.md** — the language, and why each decision went the way it did
+- **STATUS.md** — where things stand, what is being worked towards, what is known broken
 - **PLAN.md** — what is built, what is not, in the order it is being built
 - **DIVERGENCES.md** — every deliberate departure from F#, with its reason
 - **REPRESENTATION.md** — how values are laid out at run time
