@@ -13,6 +13,7 @@
     <Compile Include="Syntax/Lexer.fs" />
     <Compile Include="Syntax/Tree.fs" />
     <Compile Include="Syntax/Parser.fs" />
+    <Compile Include="Syntax/Desugar.fs" />
     <Compile Include="Analysis/Resolve.fs" />
     <Compile Include="Analysis/Types.fs" />
     <Compile Include="Analysis/Format.fs" />

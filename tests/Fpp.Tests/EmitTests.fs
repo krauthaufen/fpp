@@ -996,3 +996,119 @@ let disposalTests =
             Expect.isNonEmpty ds "a type that declares no Dispose cannot be used with `use`"
         }
     ]
+
+[<Tests>]
+let computationExpressionTests =
+    let optBuilder =
+        // Bind/Return/ReturnFrom and NOTHING else — the shape of
+        // FSharp.Data.Adaptive's AValBuilder, and the reason the rewrite
+        // never emits a method the construct did not ask for
+        [ "type OptionBuilder() ="
+          "    member _.Bind (v : option<'a>, f : 'a -> option<'b>) : option<'b> ="
+          "        match v with"
+          "        | Some x -> f x"
+          "        | None -> None"
+          "    member _.Return (v : 'a) : option<'a> = Some v"
+          "    member _.ReturnFrom (v : option<'a>) : option<'a> = v"
+          "let opt = OptionBuilder()" ]
+    testList "computation expressions" [
+        test "yield, yield! and an implicit yield build a sequence" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let a = seq { 1; 2 }"
+                    "let b ="
+                    "    seq {"
+                    "        yield 10"
+                    "        yield! a"
+                    "    }"
+                    "let go = for x in b do printfn \"%d\" x"
+                    "" ])
+            Expect.equal out "10\n1\n2\n" "Combine and Delay compose the parts"
+        }
+        test "for and while are the builder's, not the language's" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let b ="
+                    "    seq {"
+                    "        for i in 0 .. 2 do"
+                    "            yield i * 100"
+                    "        let mutable k = 0"
+                    "        while k < 2 do"
+                    "            yield k"
+                    "            k <- k + 1"
+                    "    }"
+                    "let go = for x in b do printfn \"%d\" x"
+                    "" ])
+            Expect.equal out "0\n100\n200\n0\n1\n" "For collects and While repeats a delayed body"
+        }
+        test "a builder with only Bind and Return needs no other method" {
+            // the rewrite emits Delay, Combine and Zero only where the
+            // CONSTRUCT requires them, so a bind/return chain asks for
+            // nothing else
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ optBuilder @
+                    [ "let add (a : option<int>) (b : option<int>) ="
+                      "    opt {"
+                      "        let! x = a"
+                      "        let! y = b"
+                      "        return x + y"
+                      "    }"
+                      "let out (v : option<int>) = printfn \"%d\" (match v with Some n -> n | None -> -1)"
+                      "let go ="
+                      "    out (add (Some 2) (Some 3))"
+                      "    out (add (Some 2) None)"
+                      "    out (opt { return! Some 9 })"
+                      "" ]))
+            Expect.equal out "5\n-1\n9\n" "Bind chains and short-circuits"
+        }
+        test "an if with no else is where Zero comes from" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let b (n : int) ="
+                    "    seq {"
+                    "        if n > 0 then yield \"pos\" else yield \"neg\""
+                    "        if n = 0 then yield \"zero\""
+                    "    }"
+                    "let go ="
+                    "    for s in b 0 do printfn \"%s\" s"
+                    "    for s in b 5 do printfn \"%s\" s"
+                    "" ])
+            Expect.equal out "neg\nzero\npos\n" "the missing branch is Zero, not a hole"
+        }
+        test "the body is lazy: nothing runs until it is enumerated" {
+            // Delay under Combine is what buys this. A statement AHEAD of
+            // the first yield is not covered — see DIVERGENCES.md
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let noisy ="
+                    "    seq {"
+                    "        yield 1"
+                    "        printfn \"side effect\""
+                    "        yield 2"
+                    "    }"
+                    "let go ="
+                    "    printfn \"built\""
+                    "    for x in noisy do printfn \"%d\" x"
+                    "" ])
+            Expect.equal out "built\n1\nside effect\n2\n" "the tail runs during enumeration"
+        }
+        test "a brace after something that is not a name stays an argument" {
+            // `test \"name\" { ... }` is a computation expression in F#, but
+            // guessing that here would newly EXPOSE every construct in a
+            // body the parser used to keep as token soup. The builder has
+            // to be a name.
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module M"
+                "type P = { X : int }"
+                "let f (r : P) = r.X"
+                "let go = printfn \"%d\" (f { X = 3 })"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "prog.fpp") "a record argument is still a record argument"
+        }
+    ]

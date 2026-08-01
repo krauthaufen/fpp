@@ -310,8 +310,18 @@ type Workspace() =
     member _.FileText (path : string) : string =
         unbox<string> (db.GetInput "text" path)
 
-    member this.ParseFile (path : string) : Parser.ParseResult =
+    /// The parse EXACTLY as written — the tree the round-trip gate and the
+    /// editor's view of the text are about.
+    member this.ParseRaw (path : string) : Parser.ParseResult =
         db.MemoT "parse" path (fun () -> Parser.parse (this.FileText path))
+
+    /// The tree everything semantic runs on: computation expressions are
+    /// rewritten into ordinary syntax first, so resolution, inference and
+    /// lowering all see ONE shape and cannot disagree about it.
+    member this.ParseFile (path : string) : Parser.ParseResult =
+        db.MemoT "desugar" path (fun () ->
+            let p = this.ParseRaw path
+            { p with Root = Desugar.desugar p.Root })
 
     /// Whole-project resolution + inference in compile order. Exports and
     /// generalized schemes of earlier files flow into later ones.

@@ -54,6 +54,9 @@ type NodeKind =
     | DotExpr
     | CastExpr
     | ObjExpr
+    /// `builder { ... }` — a computation expression. The first child is the
+    /// builder, the second the braced body.
+    | CompExpr
     | ForExpr
     | WhileExpr
     | TryExpr

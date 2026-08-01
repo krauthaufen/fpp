@@ -178,6 +178,14 @@ let parse (src : string) : ParseResult =
                              List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen)))
         // quotations and splices come through canStartAtom
 
+    /// Anything that can open a statement BLOCK. `yield` and `return` mean
+    /// something only inside a computation expression, but a block body is
+    /// exactly where they appear, and the shapes that reject them here are
+    /// the ones that used to swallow `while c do yield x`.
+    let canStartBlock () =
+        canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
+        || s.IsKw "yield" || s.IsKw "return"
+
     let isDirectiveHere () =
         s.IsOp "#" && (s.Peek 1).Kind = Ident
         && List.contains (s.Peek 1).Text
@@ -650,8 +658,36 @@ let parse (src : string) : ParseResult =
                 // `C(1).Get()` chains the dot onto the call — without this
                 // the postfix loop never saw past the constructor
                 e <- Green.node AppExpr [ e; parseAtom ctx ]
+            elif s.Is LBrace && s.SameLine && isNameExpr e
+                 && not ((s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "new")
+                 && not (looksLikeRecordExpr ()) then
+                // `builder { ... }`. A record or object expression in the
+                // same position is an ARGUMENT, so both are excluded first.
+                // The builder has to be a NAME: F# allows any expression,
+                // but a brace after an arbitrary atom is far more often an
+                // argument — `test "name" { ... }` reads as a computation
+                // expression only because Expecto says so, and guessing
+                // wrong turns a body the parser cannot see into one it can,
+                // with every construct inside newly exposed.
+                e <- Green.node CompExpr [ e; parseCeBody ctx ]
             else go <- false
         e
+
+    /// A plain name — `seq`, `Foo.bar`, `x.builder` — and nothing else.
+    and isNameExpr (e : Green) : bool =
+        match e with
+        | GNode n -> n.NodeKind = IdentExpr || n.NodeKind = DotExpr
+        | GToken _ -> false
+
+    /// The braced body of a computation expression: an ordinary statement
+    /// block — the bang forms are `let`/`do` with a `!` glued on — closed by
+    /// `}`. Indentation governs it exactly as it governs any other block.
+    and parseCeBody (ctx : int) : Green =
+        let acc = vecNew<Green> ()
+        vecAdd acc (s.Bump ())   // {
+        if canStartBlock () then vecAdd acc (parseBlock ctx)
+        if s.Is RBrace then vecAdd acc (s.Bump ()) else s.Diag "expected '}'"
+        Green.node BraceExpr (vecToList acc)
 
     /// The `<` begins immediately after the expression (F#'s disambiguator
     /// between generic application and comparison).
@@ -743,7 +779,7 @@ let parse (src : string) : ParseResult =
             else
                 let acc = vecNew<Green> ()
                 vecAdd acc lp
-                if canStartExpr () || s.IsKw "let" then vecAdd acc (inBrackets (fun () -> parseBlock ctx))
+                if canStartBlock () then vecAdd acc (inBrackets (fun () -> parseBlock ctx))
                 elif s.Is Operator then vecAdd acc (s.Bump ())   // section like (+) with odd op
                 if s.IsOp ":" then
                     vecAdd acc (s.Bump ())
@@ -774,7 +810,7 @@ let parse (src : string) : ParseResult =
                 let mark = s.Mark
                 if s.Is Semicolon then vecAdd acc (s.Bump ())
                 elif s.IsOp "|" then vecAdd acc (s.Bump ())
-                elif canStartExpr () || s.IsKw "for" || s.IsKw "yield" || s.IsKw "let" then vecAdd acc (parseBlock ctx)
+                elif canStartBlock () then vecAdd acc (parseBlock ctx)
                 else vecAdd acc (s.Bump ())
                 if s.Mark = mark then go <- false
             if s.Is RBracket then vecAdd acc (s.Bump ()) else s.Diag "expected ']'"
@@ -844,13 +880,13 @@ let parse (src : string) : ParseResult =
             // `do body` or comprehension arrow `-> expr`
             if s.IsKw "do" || s.IsOp "->" then vecAdd acc (s.Bump ())
             else s.Diag "expected 'do'"
-            if canStartExpr () || s.IsKw "let" || s.IsKw "yield" then vecAdd acc (parseBlock fcol)
+            if canStartBlock () then vecAdd acc (parseBlock fcol)
             Green.node ForExpr (vecToList acc)
         elif s.IsKw "try" then
             let acc = vecNew<Green> ()
             let tcol = s.CurCol
             vecAdd acc (s.Bump ())
-            if canStartExpr () || s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseBlock tcol)
+            if canStartBlock () then vecAdd acc (parseBlock tcol)
             if s.IsKw "with" then
                 vecAdd acc (s.Bump ())
                 parseClauses acc tcol
@@ -859,7 +895,7 @@ let parse (src : string) : ParseResult =
                 // list, and the `finally` keyword in the node is what tells
                 // the two shapes apart downstream
                 vecAdd acc (s.Bump ())
-                if canStartExpr () || s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseBlock tcol)
+                if canStartBlock () then vecAdd acc (parseBlock tcol)
             else s.Diag "expected 'with' or 'finally' in try"
             Green.node TryExpr (vecToList acc)
         elif s.IsKw "while" then
@@ -868,7 +904,7 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
             vecAdd acc (parseExpr wcol)
             if s.IsKw "do" then vecAdd acc (s.Bump ()) else s.Diag "expected 'do'"
-            if canStartExpr () || s.IsKw "let" then vecAdd acc (parseBlock wcol)
+            if canStartBlock () then vecAdd acc (parseBlock wcol)
             Green.node WhileExpr (vecToList acc)
         elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
             // type variable in expression position (e.g. `unbox<'a>` soup)
@@ -1061,9 +1097,11 @@ let parse (src : string) : ParseResult =
             let mark = s.Mark
             if s.IsKw "let" || s.IsKw "use" || s.IsKw "and" then vecAdd acc (parseLet blockCol)
             elif s.IsKw "do" then
-                let d = s.Bump ()
-                let body = if canStartExpr () then parseBlock blockCol else Green.node ErrorNode []
-                vecAdd acc (Green.node BlockExpr [ d; body ])
+                let kids = vecNew<Green> ()
+                vecAdd kids (s.Bump ())
+                if s.IsOp "!" && s.SameLine then vecAdd kids (s.Bump ())
+                vecAdd kids (if canStartExpr () then parseBlock blockCol else Green.node ErrorNode [])
+                vecAdd acc (Green.node BlockExpr (vecToList kids))
             elif s.IsKw "yield" || s.IsKw "return" then
                 let kids = vecNew<Green> ()
                 vecAdd kids (s.Bump ())
@@ -1093,6 +1131,9 @@ let parse (src : string) : ParseResult =
         let letCol = s.CurCol
         if s.IsKw "static" then vecAdd acc (s.Bump ())
         vecAdd acc (s.Bump ())   // let / use / and
+        // `let!`, `use!`, `and!` — the bang is a separate token, and only a
+        // computation expression gives it meaning
+        if s.IsOp "!" && s.SameLine then vecAdd acc (s.Bump ())
         while s.IsKw "rec" || s.IsKw "inline" || s.IsKw "mutable" || s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" do
             vecAdd acc (s.Bump ())
         // binding name / pattern. `let (|Add|Rem|) x = ...` binds a name the

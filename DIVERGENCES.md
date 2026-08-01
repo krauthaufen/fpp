@@ -356,3 +356,67 @@ removes the first occurrence and answers whether it found one;
 by `stdlib/dotnet.fpp`, which runs under both compilers and must print the
 same 111 values — the seq usage included, so `Seq.map f (ra :> seq<int>)`
 means in F++ exactly what it means in F#.
+
+## Computation expressions omit `Run` and the top-level `Delay`
+
+`builder { ... }` is rewritten into builder-method calls between parsing and
+resolution — before anything knows a type. F# does the same rewrite DURING
+type checking, which lets it ask whether the builder actually defines `Run`,
+`Delay`, `Zero` or `Combine` and leave out the ones it does not.
+
+Running earlier buys one tree for resolution, inference and lowering to
+share — a desugaring done once cannot be done two different ways — and costs
+that question. So the rule here is structural: a method is emitted only
+where the CONSTRUCT requires it.
+
+| | |
+| --- | --- |
+| `Delay` | the second argument of `Combine`, the body of `While`, the bodies of `TryWith` and `TryFinally` — where evaluating eagerly would be wrong. **Not at the top level.** |
+| `Zero` | an empty body, an `if` with no `else`, the tail after a trailing `do!` |
+| `Run` | never |
+
+**The visible consequence.** Statements AHEAD of the first yield run when the
+expression is built, not when it is consumed:
+
+```fsharp
+let s = seq { printfn "hi"; yield 1 }   // F# prints on enumeration; F++ prints here
+```
+
+Everything after the first yield is delayed as usual, because that is
+`Combine`'s second argument. In exchange, a builder that defines only `Bind`
+and `Return` — FSharp.Data.Adaptive's `AValBuilder` is exactly that — works
+without defining methods it has no use for.
+
+**`and!` chains instead of merging.** F# binds an `and!` group in parallel
+through `MergeSources`; here each one becomes another `Bind`. The value is
+the same; the dependency graph an adaptive builder ends up with is not.
+
+**The builder must be a NAME.** `seq { }`, `aval { }`, `Foo.builder { }`,
+`x.b { }` — but not an application. F# allows any expression, and Expecto's
+`test "name" { ... }` is the shape that wants one. A brace after an
+arbitrary atom is far more often an ARGUMENT, and guessing wrong newly
+exposes every construct in a body the parser had been keeping as token
+soup — which is how this restriction was arrived at rather than assumed.
+
+**`seq { }` has no `Using`, `TryWith` or `TryFinally`.** Scoping a resource
+or a handler ACROSS a suspension needs the enumerator to own it, and the
+prelude's sequences are built from combinators, not from a state machine.
+The rewrite still emits the calls, so `use` or `try` inside a `seq { }` is an
+error naming the missing member rather than a wrong answer.
+
+## `use` disposes, and nothing else does
+
+wasm-GC has no finalizers. `use` and an explicit `Dispose` are the only ways
+anything is ever released — there is no collector to fall back on, and a
+handle nobody disposes stays undisposed. That is why `IEnumerator<'a>`
+carries `Dispose` here exactly as .NET's does: a library walking a sequence
+it did not build has no other way to hand it back.
+
+**`for x in xs` does NOT dispose its enumerator.** F# wraps the loop in a
+try/finally; F++ does not. Every enumerator the prelude builds releases
+nothing, so the difference is invisible today — but a user enumerator that
+holds something will not be told the loop ended.
+
+**byref is not an alias, and `try`/`finally` emits its finalizer twice.**
+Only one copy ever runs; a closure to share it would cost an allocation per
+entry for code that is typically one call.

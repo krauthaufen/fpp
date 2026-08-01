@@ -300,6 +300,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       ESeq [ fin; EApp (EUnknown "raise", [ EVar (exV, exSch) ]) ] ]),
               ESeq [ fin; EVar (resV, anon) ])
 
+    /// `a .. b` as a VALUE — the list from a to b. Built DOWNWARDS so the
+    /// conses come out in order and nothing has to be reversed; both ends
+    /// are bound first, so each is evaluated once.
+    let rangeList (off : int) (lo : Expr) (hi : Expr) : Expr =
+        let ish = mono (TCon ("int", []))
+        let anonScheme = mono (TCon ("?", []))
+        let loV = { Path = path; Offset = off + 16000000; Name = "_rlo" }
+        let iV = { Path = path; Offset = off + 17000000; Name = "_ri" }
+        let outV = { Path = path; Offset = off + 18000000; Name = "_rout" }
+        ELet (false, loV, ish, lo,
+          ELet (false, iV, ish, hi,
+            ELet (false, outV, anonScheme, EListLit [],
+              ESeq [ EWhile (EPrim (">=", [ EVar (iV, ish); EVar (loV, ish) ]),
+                       ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anonScheme) ]))
+                              EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ])) ])
+                     EVar (outV, anonScheme) ])))
+
     // ---- patterns ---------------------------------------------------------
 
     /// The identifier a pattern is NAMED by. A qualified case
@@ -1386,20 +1403,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | [ EPrim ("..", [ lo; hi ]) ] -> Some (lo, hi)
                     | _ -> None
                 match rangeItems with
-                | Some (lo, hi) ->
-                    let off = offsetOf n
-                    let ish = mono (TCon ("int", []))
-                    let anon = anonScheme
-                    let loV = { Path = path; Offset = off + 16000000; Name = "_rlo" }
-                    let iV = { Path = path; Offset = off + 17000000; Name = "_ri" }
-                    let outV = { Path = path; Offset = off + 18000000; Name = "_rout" }
-                    ELet (false, loV, ish, lo,
-                      ELet (false, iV, ish, hi,
-                        ELet (false, outV, anon, EListLit [],
-                          ESeq [ EWhile (EPrim (">=", [ EVar (iV, ish); EVar (loV, ish) ]),
-                                   ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anon) ]))
-                                          EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ])) ])
-                                 EVar (outV, anon) ])))
+                | Some (lo, hi) -> rangeList (offsetOf n) lo hi
                 | None ->
                 match arrowFor with
                 | Some f ->
@@ -2703,6 +2707,47 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | ETuple xs -> ETuple (List.map fixAddrs xs)
         | other -> other
 
+    /// A range that reached emission is one nobody consumed: `[ a .. b ]`
+    /// and `for i in a .. b` each take theirs apart, and what is left is a
+    /// range used as a VALUE — `f (0 .. n)`, or the source of a computation
+    /// expression's `For`. It becomes the list it denotes.
+    let mutable rangeSeq = 0
+    let rec fixRanges (e : Expr) : Expr =
+        let r = fixRanges
+        match e with
+        | EPrim ("..", [ lo; hi ]) ->
+            rangeSeq <- rangeSeq + 1
+            rangeList (200000000 + rangeSeq * 100) (r lo) (r hi)
+        | ELam (ps, b) -> ELam (ps, r b)
+        | EApp (f, args) -> EApp (r f, List.map r args)
+        | ELet (rc, v, sc, rhs, b) -> ELet (rc, v, sc, r rhs, r b)
+        | EIf (a, b, c) -> EIf (r a, r b, r c)
+        | EMatch (sc, cs) -> EMatch (r sc, cs |> List.map (fun (p, g, b) -> p, Option.map r g, r b))
+        | ETuple xs -> ETuple (List.map r xs)
+        | EListLit xs -> EListLit (List.map r xs)
+        | ECtor (n, sc, xs) -> ECtor (n, sc, List.map r xs)
+        | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, r v))
+        | ERecordExt (n, b, fs) -> ERecordExt (n, r b, fs |> List.map (fun (k, v) -> k, r v))
+        | EField (recv, f, o) -> EField (r recv, f, o)
+        | EFieldSet (recv, f, o, v) -> EFieldSet (r recv, f, o, r v)
+        | EPrim (op, xs) -> EPrim (op, List.map r xs)
+        | ESeq xs -> ESeq (List.map r xs)
+        | EWhile (c, b) -> EWhile (r c, r b)
+        | EAssign (v, x) -> EAssign (v, r x)
+        | ETry (b, cs) -> ETry (r b, cs |> List.map (fun (p, g, x) -> p, Option.map r g, r x))
+        | EArray (k, xs) -> EArray (k, List.map r xs)
+        | EIndex (k, a, i) -> EIndex (k, r a, r i)
+        | EIndexSet (k, a, i, v) -> EIndexSet (k, r a, r i, r v)
+        | EArrayLen (k, a) -> EArrayLen (k, r a)
+        | EArrayCreate (k, a, b) -> EArrayCreate (k, r a, r b)
+        | EArrayPin (k, a) -> EArrayPin (k, r a)
+        | EArrayUnpin (k, a) -> EArrayUnpin (k, r a)
+        | EArrayBytes (k, a) -> EArrayBytes (k, r a)
+        | EIfaceCall (i, m, recv, args) -> EIfaceCall (i, m, r recv, List.map r args)
+        | ECast (t, x, d) -> ECast (t, r x, d)
+        | ETypeTest (t, x) -> ETypeTest (t, r x)
+        | other -> other
+
     let rec lowerDecl (g : Green) : unit =
         match g with
         | GToken _ -> ()
@@ -2753,6 +2798,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         vecToList decls
         |> List.map (fun d ->
             match d with
-            | DLet (r, v, sch, body) -> DLet (r, v, sch, fixAddrs body)
+            | DLet (r, v, sch, body) -> DLet (r, v, sch, fixRanges (fixAddrs body))
             | other -> other)
       Notes = vecToList notes }

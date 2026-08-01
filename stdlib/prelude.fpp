@@ -3089,7 +3089,12 @@ module Seq =
         List.toSeq (List.zip (toList a) (toList b))
     let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)
     let readonly (xs : seq<'a>) : seq<'a> = xs
-    let delay (f : unit -> seq<'a>) : seq<'a> = f ()
+    /// Really delayed: the thunk runs once per enumeration, not once when
+    /// the sequence is built. `seq { }` leans on this — it is where the
+    /// laziness of a computation expression comes from.
+    let delay (f : unit -> seq<'a>) : seq<'a> =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () = (f ()).GetEnumerator () }
 
     // ---- the rest of the F# Seq surface. Most are the List version over a
     // materialised copy: a seq here is an IEnumerable, and every one of
@@ -3140,6 +3145,71 @@ module Seq =
         List.toSeq (List.updateAt i v (toList xs))
     let compareWith (cmp : 'a -> 'a -> int) (a : seq<'a>) (b : seq<'a>) : int =
         List.compareWith cmp (toList a) (toList b)
+/// Lists and arrays compare LEXICOGRAPHICALLY — element by element, and a
+/// prefix comes before what extends it. That is F#'s ordering for both, and
+/// without it `List.sort` on a list of lists has no instance to reach for.
+instance Ordered<list<'a>> when Ordered<'a>
+    static compare (a : list<'a>) (b : list<'a>) : int =
+        let mutable x = a
+        let mutable y = b
+        let mutable r = 0
+        while r = 0 && not (List.isEmpty x) && not (List.isEmpty y) do
+            r <- compare (List.head x) (List.head y)
+            x <- List.tail x
+            y <- List.tail y
+        if r <> 0 then r
+        elif List.isEmpty x then (if List.isEmpty y then 0 else -1)
+        else 1
+instance Ordered<'a[]> when Ordered<'a>
+    static compare (a : 'a[]) (b : 'a[]) : int = Array.compareWith compare a b
+
+/// The builder behind `seq { }`. Every method returns a sequence that is
+/// still lazy, so the computation expression is too: `Combine` appends
+/// without walking, `Delay` defers to enumeration time, and `For` collects.
+///
+/// `Using`, `TryWith` and `TryFinally` are absent. Scoping a resource or a
+/// handler ACROSS a suspension needs the enumerator to own it, which this
+/// representation — a sequence built from combinators — cannot express. The
+/// desugaring emits them, so `use` or `try` inside a `seq { }` is an error
+/// naming the missing member rather than a wrong answer.
+type SeqBuilder() =
+    member _.Zero () : seq<'a> = Seq.empty
+    member _.Yield (v : 'a) : seq<'a> = Seq.singleton v
+    member _.YieldFrom (vs : seq<'a>) : seq<'a> = vs
+    member _.Combine (a : seq<'a>, b : seq<'a>) : seq<'a> = Seq.append a b
+    member _.Delay (f : unit -> seq<'a>) : seq<'a> = Seq.delay f
+    member _.For (xs : seq<'a>, f : 'a -> seq<'b>) : seq<'b> = Seq.collect f xs
+    /// The body is a DELAYED sequence, so enumerating it again re-runs it —
+    /// which is what makes an iteration of the loop repeatable.
+    member _.While (cond : unit -> bool, body : seq<'a>) : seq<'a> =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () =
+                let mutable cur : IEnumerator<'a> option = None
+                { new IEnumerator<'a> with
+                    member _.MoveNext () =
+                        let mutable answer = false
+                        let mutable searching = true
+                        while searching do
+                            match cur with
+                            | Some e ->
+                                if e.MoveNext () then
+                                    answer <- true
+                                    searching <- false
+                                else cur <- None
+                            | None ->
+                                if cond () then cur <- Some (body.GetEnumerator ())
+                                else searching <- false
+                        answer
+                    member _.Current =
+                        match cur with
+                        | Some e -> e.Current
+                        | None -> failwith "the sequence is exhausted"
+                    member _.Dispose () =
+                        match cur with
+                        | Some e -> e.Dispose ()
+                        | None -> () } }
+let seq = SeqBuilder()
+
 /// The delta vocabulary MapExt/HashMap deltas are expressed in. Named
 /// SetOp/RemoveOp because `Set` is already a type here (FSharp.Data.Adaptive
 /// spells the cases `Set` and `Remove`).
