@@ -621,6 +621,19 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     | GToken _ -> ()
                     | other -> walkExpr inner other |> ignore
                 env
+            | CompExpr ->
+                // Only the PROBE sees one of these: by the time the rewrite
+                // has run there is no CompExpr left. Binding its body anyway
+                // is what lets the probe TYPE the body, which is how the
+                // implicit-yield question — is the trailing expression a
+                // value or a statement? — gets a real answer.
+                for c in n.Children do
+                    match c with
+                    | GNode br when br.NodeKind = BraceExpr ->
+                        let mutable e = env
+                        for x in br.Children do e <- walkExpr e x
+                    | other -> walkExpr env other |> ignore
+                env
             | BraceExpr -> env
             | BlockExpr ->
                 // a local `let rec f ... and g ...`: register the group's

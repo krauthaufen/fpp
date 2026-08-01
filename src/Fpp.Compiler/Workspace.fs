@@ -132,6 +132,9 @@ type ProjectResults =
       Members : Fpp.Prelude.Dict<string, Analysis.Resolve.Definition>
       /// classes and their instances, project-wide
       Classes : Analysis.Classes.Tables
+      /// the REWRITTEN tree per file: computation expressions are gone from
+      /// it, and it is the one resolution, inference and lowering all saw
+      Trees : Fpp.Prelude.Dict<string, Parser.ParseResult>
       /// the prelude's own inference result — it is source like any other
       /// file, and its bodies use the classes it declares
       BuiltinInfer : Analysis.Infer.InferResult }
@@ -318,10 +321,22 @@ type Workspace() =
     /// The tree everything semantic runs on: computation expressions are
     /// rewritten into ordinary syntax first, so resolution, inference and
     /// lowering all see ONE shape and cannot disagree about it.
+    /// The tree everything semantic runs on: computation expressions have
+    /// been rewritten into ordinary syntax, so resolution, inference and
+    /// lowering all see ONE shape and cannot disagree about it. Inside a
+    /// project that rewrite is type-directed and ProjectCheck did it; a lone
+    /// file has no builder types to go on and gets the conservative form.
     member this.ParseFile (path : string) : Parser.ParseResult =
+        if List.contains path this.ProjectFiles then
+            match dictTryFind (this.ProjectCheck ()).Trees path with
+            | Some t -> t
+            | None -> this.ParseStandalone path
+        else this.ParseStandalone path
+
+    member private this.ParseStandalone (path : string) : Parser.ParseResult =
         db.MemoT "desugar" path (fun () ->
             let p = this.ParseRaw path
-            { p with Root = Desugar.desugar p.Root })
+            if Desugar.hasComp (GNode p.Root) then { p with Root = Desugar.desugar p.Root } else p)
 
     /// Whole-project resolution + inference in compile order. Exports and
     /// generalized schemes of earlier files flow into later ones.
@@ -351,8 +366,51 @@ type Workspace() =
                 let exps, schs, _ = Fpp.Core.Serialize.decodeLib text
                 for full, d in exps do dictSet imports full d
                 for k, sch in schs do dictSet schemes k sch
+            let trees = dictNew<string, Parser.ParseResult> ()
             for path in this.ProjectFiles do
-                let p = this.ParseFile path
+                let raw = this.ParseRaw path
+                // The PROBE. A computation expression's shape depends on what
+                // its builder declares — `Run` and `Delay` are there only if
+                // the builder has them — so the file is resolved and inferred
+                // once BEFORE the rewrite, with every computation expression
+                // left alone but its builder typed. Everything the probe
+                // touches is a COPY: inference registers instances and
+                // schemes as it goes, and doing that twice is not free of
+                // consequence. Its diagnostics are dropped — they would be
+                // about a body that is one pass away from not existing.
+                let p =
+                    if not (Desugar.hasComp (GNode raw.Root)) then raw
+                    else
+                        let b0 = Analysis.Resolve.resolve path imports raw.Root
+                        let members0 = BuiltinCache.copyDict members
+                        for k, d in b0.Members do dictSet members0 k d
+                        let inf0 =
+                            Analysis.Infer.infer path raw.Root b0
+                                (BuiltinCache.copyDict schemes) (BuiltinCache.copyDict aliases)
+                                (BuiltinCache.copyDict fields) (BuiltinCache.copyDict ifaces)
+                                (BuiltinCache.copyDict bases) (BuiltinCache.copyDict impls)
+                                (BuiltinCache.copyDict structTypes) (BuiltinCache.copyDict ctors)
+                                (BuiltinCache.copyTables classes)
+                        let builders = dictNew<int, Desugar.CeBuilder> ()
+                        for off, tyName in inf0.CompBuilders do
+                            let has (m : string) = (dictTryFind members0 (tyName + "." + m)).IsSome
+                            dictSet builders off
+                                { Name = tyName
+                                  HasRun = has "Run"
+                                  HasDelay = has "Delay"
+                                  HasReturn = has "Return"
+                                  HasBindReturn = has "BindReturn"
+                                  HasMergeSources = has "MergeSources"
+                                  HasMergeSources3 = has "MergeSources3" }
+                        let lookup (off : int) =
+                            match dictTryFind builders off with
+                            | Some b -> b
+                            | None -> Desugar.unknownBuilder "?"
+                        let stmts = dictNew<int, bool> ()
+                        for off in inf0.CompStatements do dictSet stmts off true
+                        let isStatement (off : int) = (dictTryFind stmts off).IsSome
+                        { raw with Root = Desugar.desugarWithStatements lookup isStatement raw.Root }
+                dictSet trees path p
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
                 for k, d in b.Members do dictSet members k d
@@ -371,7 +429,7 @@ type Workspace() =
                         dictSet impls n (cimpls |> List.map fst)
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
-              Members = members; Classes = classes; BuiltinInfer = binf })
+              Members = members; Classes = classes; Trees = trees; BuiltinInfer = binf })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with

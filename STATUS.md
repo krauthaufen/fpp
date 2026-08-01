@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-589 tests
+609 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1555145 bytes, byte-identical
+self-host fixpoint 1574145 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -67,7 +67,7 @@ real ones: most were 10–60 lines.
 | qualification | a dotted head is named by its LAST segment — constructors, static members, base classes, and cases through their type |
 | `System.Threading` | `lock`, `Monitor`, `Interlocked` — real, on one thread |
 | `use` and `try`/`finally` | disposal at end of scope, on the normal path and the raising one; `IDisposable` in the prelude and on `IEnumerator<'a>`, as .NET has it |
-| computation expressions | `seq { }` and any builder — rewritten into method calls BEFORE resolution, so one tree serves resolve, infer and lower |
+| computation expressions | `seq { }` and any builder. The rewrite is F#'s, read off the F# compiler by quoting and printing the desugared AST, and gated by an oracle suite that diffs the CALL TRACE. `Run` and `Delay` appear exactly when the builder declares them, which needs the builder's type — so a probe pass types it first |
 
 ## Known problematic
 

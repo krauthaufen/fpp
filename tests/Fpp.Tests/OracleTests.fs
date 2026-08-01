@@ -71,6 +71,288 @@ let private oracle (name : string) (srcLines : string list) =
         Expect.equal actual expected "F++ output must match F# (the oracle)"
     }
 
+/// A builder whose every method PRINTS. The oracle then diffs the call
+/// TRACE, not just the answer — which is the only way to check that a
+/// computation expression was rewritten into the same calls F# rewrites it
+/// into, in the same order.
+let private tracing (extra : string list) : string list =
+    [ "type M<'a> = M of 'a"
+      "type B() ="
+      "    member _.Bind (v : M<'a>, f : 'a -> M<'b>) : M<'b> ="
+      "        printfn \"Bind\""
+      "        match v with M x -> f x"
+      "    member _.Return (v : 'a) : M<'a> ="
+      "        printfn \"Return\""
+      "        M v"
+      "    member _.ReturnFrom (v : M<'a>) : M<'a> ="
+      "        printfn \"ReturnFrom\""
+      "        v"
+      "    member _.Yield (v : 'a) : M<list<'a>> ="
+      "        printfn \"Yield\""
+      "        M [ v ]"
+      "    member _.YieldFrom (v : M<list<'a>>) : M<list<'a>> ="
+      "        printfn \"YieldFrom\""
+      "        v"
+      "    member _.Zero () : M<list<'a>> ="
+      "        printfn \"Zero\""
+      "        M []"
+      "    member _.Combine (a : M<list<'a>>, b : M<list<'a>>) : M<list<'a>> ="
+      "        printfn \"Combine\""
+      "        match a, b with M x, M y -> M (x @ y)"
+      "    member _.Delay (f : unit -> M<'a>) : M<'a> ="
+      "        printfn \"Delay\""
+      "        f ()"
+      "    member _.For (xs : list<'a>, f : 'a -> M<list<'b>>) : M<list<'b>> ="
+      "        printfn \"For\""
+      "        M (List.collect (fun x -> match f x with M y -> y) xs)"
+      "    member _.While (c : unit -> bool, b : M<list<'a>>) : M<list<'a>> ="
+      "        printfn \"While\""
+      "        match b with M y -> M y"
+      "let b = B()" ] @ extra
+
+[<Tests>]
+let computationExpressionOracle =
+    testList "oracle: computation expressions" [
+        // Every one of these was READ OFF the F# compiler first, by quoting
+        // the expression and printing the desugared quotation. The oracle
+        // then holds us to it: the builder prints on every call, so a
+        // rewrite that emits a different shape shows up as a different
+        // trace, not merely as a different answer.
+        oracle "return goes through Run, Delay and Return" (tracing [
+            "let r = b { return 1 }"
+            "let out = print (match r with M v -> v)"
+        ])
+        oracle "let! chains Bind and ends in Return" (tracing [
+            "let r ="
+            "    b {"
+            "        let! x = M 2"
+            "        let! y = M 3"
+            "        return x + y"
+            "    }"
+            "let out = print (match r with M v -> v)"
+        ])
+        oracle "return! is ReturnFrom" (tracing [
+            "let r = b { return! M 9 }"
+            "let out = print (match r with M v -> v)"
+        ])
+        oracle "two yields Combine with a delayed tail" (tracing [
+            "let r ="
+            "    b {"
+            "        yield 1"
+            "        yield 2"
+            "    }"
+            "let out = print (match r with M v -> List.sum v)"
+        ])
+        oracle "three yields nest to the right" (tracing [
+            "let r ="
+            "    b {"
+            "        yield 1"
+            "        yield 2"
+            "        yield 3"
+            "    }"
+            "let out = print (match r with M v -> List.sum v)"
+        ])
+        oracle "yield! is YieldFrom" (tracing [
+            "let r ="
+            "    b {"
+            "        yield 1"
+            "        yield! M [ 5; 6 ]"
+            "    }"
+            "let out = print (match r with M v -> List.sum v)"
+        ])
+        oracle "for is the builder's For" (tracing [
+            "let r = b { for i in [ 1; 2; 3 ] do yield i * 10 }"
+            "let out = print (match r with M v -> List.sum v)"
+        ])
+        oracle "an if with no else is Zero" (tracing [
+            "let pick (c : bool) ="
+            "    b {"
+            "        if c then yield 1"
+            "    }"
+            "let o1 = print (match pick true with M v -> List.length v)"
+            "let o2 = print (match pick false with M v -> List.length v)"
+        ])
+        oracle "a statement sequences, it does not Combine" (tracing [
+            "let r ="
+            "    b {"
+            "        printfn \"effect\""
+            "        yield 1"
+            "    }"
+            "let out = print (match r with M v -> List.sum v)"
+        ])
+        oracle "a plain let inside the body is a plain let" (tracing [
+            "let r ="
+            "    b {"
+            "        let k = 4"
+            "        return k + 1"
+            "    }"
+            "let out = print (match r with M v -> v)"
+        ])
+        oracle "a trailing statement leaves Zero" (tracing [
+            "let r : M<list<int>> ="
+            "    b {"
+            "        printfn \"only an effect\""
+            "    }"
+            "let out = print (match r with M v -> List.length v)"
+        ])
+        oracle "match branches are computations" (tracing [
+            "let pick (n : int) ="
+            "    b {"
+            "        match n with"
+            "        | 0 -> yield 100"
+            "        | _ -> yield 200"
+            "    }"
+            "let o1 = print (match pick 0 with M v -> List.sum v)"
+            "let o2 = print (match pick 1 with M v -> List.sum v)"
+        ])
+        // Run and Delay are the two the BUILDER decides, and each is
+        // independent of the other. A builder with neither must see neither
+        // call — that is what lets AValBuilder, which declares only Bind and
+        // Return, work at all.
+        oracle "a builder with no Run and no Delay gets neither" [
+            "type M<'a> = M of 'a"
+            "type Min() ="
+            "    member _.Bind (v : M<'a>, f : 'a -> M<'b>) : M<'b> ="
+            "        printfn \"Bind\""
+            "        match v with M x -> f x"
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "let mn = Min()"
+            "let r ="
+            "    mn {"
+            "        let! x = M 2"
+            "        return x + 1"
+            "    }"
+            "let out = print (match r with M v -> v)"
+        ]
+        oracle "a builder with Delay but no Run gets only Delay" [
+            "type M<'a> = M of 'a"
+            "type WD() ="
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "    member _.Delay (f : unit -> M<'a>) : M<'a> ="
+            "        printfn \"Delay\""
+            "        f ()"
+            "let wd = WD()"
+            "let r = wd { return 7 }"
+            "let out = print (match r with M v -> v)"
+        ]
+        oracle "a builder with Run but no Delay gets only Run" [
+            "type M<'a> = M of 'a"
+            "type WR() ="
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "    member _.Run (v : M<'a>) : M<'a> ="
+            "        printfn \"Run\""
+            "        v"
+            "let wr = WR()"
+            "let r = wr { return 7 }"
+            "let out = print (match r with M v -> v)"
+        ]
+        // `let! p = e` whose continuation ENDS in `return` fuses into
+        // BindReturn when the builder has one. Not an optimisation it can be
+        // denied: AValBuilder.BindReturn is AVal.map where Bind is AVal.bind.
+        oracle "let! ending in return fuses into BindReturn" [
+            "type M<'a> = M of 'a"
+            "type BR() ="
+            "    member _.Bind (v : M<'a>, f : 'a -> M<'b>) : M<'b> ="
+            "        printfn \"Bind\""
+            "        match v with M x -> f x"
+            "    member _.BindReturn (v : M<'a>, f : 'a -> 'b) : M<'b> ="
+            "        printfn \"BindReturn\""
+            "        match v with M x -> M (f x)"
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "    member _.ReturnFrom (v : M<'a>) : M<'a> ="
+            "        printfn \"ReturnFrom\""
+            "        v"
+            "let br = BR()"
+            "let one = br { let! x = M 2"
+            "               return x + 1 }"
+            "let two = br { let! x = M 2"
+            "               let! y = M 3"
+            "               return x + y }"
+            "let three = br { let! x = M 2"
+            "                 return! M (x + 5) }"
+            "let o1 = print (match one with M v -> v)"
+            "let o2 = print (match two with M v -> v)"
+            "let o3 = print (match three with M v -> v)"
+        ]
+        oracle "while delays its body and re-runs it" (tracing [
+            "let r ="
+            "    b {"
+            "        let mutable k = 0"
+            "        while k < 3 do"
+            "            yield k"
+            "            k <- k + 1"
+            "    }"
+            "let out = print (match r with M v -> List.length v)"
+        ])
+        oracle "an and! group merges its sources" [
+            "type M<'a> = M of 'a"
+            "type MS() ="
+            "    member _.Bind (v : M<'a>, f : 'a -> M<'b>) : M<'b> ="
+            "        printfn \"Bind\""
+            "        match v with M x -> f x"
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "    member _.MergeSources (a : M<'a>, c : M<'b>) : M<'a * 'b> ="
+            "        printfn \"MergeSources\""
+            "        match a, c with M p, M q -> M (p, q)"
+            "let ms = MS()"
+            "let r ="
+            "    ms {"
+            "        let! x = M 2"
+            "        and! y = M 3"
+            "        return x + y"
+            "    }"
+            "let out = print (match r with M v -> v)"
+        ]
+        oracle "try/with and try/finally delay their bodies" [
+            "type M<'a> = M of 'a"
+            "type T() ="
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "    member _.Delay (f : unit -> M<'a>) : M<'a> ="
+            "        printfn \"Delay\""
+            "        f ()"
+            "    member _.TryWith (v : M<'a>, h : exn -> M<'a>) : M<'a> ="
+            "        printfn \"TryWith\""
+            "        v"
+            "    member _.TryFinally (v : M<'a>, f : unit -> unit) : M<'a> ="
+            "        printfn \"TryFinally\""
+            "        f ()"
+            "        v"
+            "let t = T()"
+            "let a = t { try return 1 with e -> return 2 }"
+            "let c = t { try return 3 finally printfn \"cleanup\" }"
+            "let o1 = print (match a with M v -> v)"
+            "let o2 = print (match c with M v -> v)"
+        ]
+        // `do!` is `let! () = e`. With nothing after it the continuation is
+        // the unit VALUE when the builder can return one, and Zero when it
+        // cannot.
+        oracle "a trailing do! returns unit when the builder can" [
+            "type M<'a> = M of 'a"
+            "type D() ="
+            "    member _.Bind (v : M<'a>, f : 'a -> M<'b>) : M<'b> ="
+            "        printfn \"Bind\""
+            "        match v with M x -> f x"
+            "    member _.Return (v : 'a) : M<'a> ="
+            "        printfn \"Return\""
+            "        M v"
+            "let d = D()"
+            "let r : M<unit> = d { do! M () }"
+            "let out = print \"done\""
+        ]
+    ]
+
 [<Tests>]
 let oracleTests =
     testList "oracle: F# vs F++" [

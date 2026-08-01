@@ -56,7 +56,16 @@ type InferResult =
       /// offset -> the OWNER type at its instantiation (`Pair$int$int`), for
       /// record construction and field access. Distinct from MemberSites,
       /// which names the declaring type for member dispatch.
-      FieldOwners : (int * string) list }
+      FieldOwners : (int * string) list
+      /// computation-expression offset -> the BUILDER's type name. F# picks
+      /// a computation expression's shape from what the builder declares —
+      /// `Run` and `Delay` appear only if it has them — so the rewrite needs
+      /// this before it can run, which is why it runs after a probe pass.
+      CompBuilders : (int * string) list
+      /// offsets of computation-expression body items that have no value:
+      /// statements, where anything else in the same position would be an
+      /// implicit `yield`
+      CompStatements : int list }
 
 type FieldInfo =
     { TypeName : string
@@ -287,6 +296,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
     let pendingDots = vecNew<int * Type * Type * string> ()
+    /// computation-expression offset -> the builder expression's type. Only
+    /// the PROBE pass fills this: by the time the rewrite has run there is
+    /// no CompExpr left to see.
+    let compBuildersRaw = vecNew<int * Type> ()
+    /// offsets of bare body expressions that turned out to have NO value —
+    /// statements, not implicit yields
+    let compStmtsRaw = vecNew<int> ()
+
+    /// A body item with no computation keyword of its own: the only kind
+    /// whose reading depends on its type.
+    let isBareCompItem (m : GreenNode) : bool =
+        let kws =
+            m.Children
+            |> List.choose (fun c -> match c with GToken t when t.Kind = Keyword -> Some t.Text | _ -> None)
+        not (List.contains "let" kws) && not (List.contains "use" kws)
+        && not (List.contains "do" kws) && not (List.contains "and" kws)
+        && not (List.contains "yield" kws) && not (List.contains "return" kws)
+        && m.NodeKind <> ForExpr && m.NodeKind <> WhileExpr
+        && m.NodeKind <> IfExpr && m.NodeKind <> MatchExpr && m.NodeKind <> TryExpr
     /// `downcast`/`upcast` sites: the target type is only known once the
     /// surrounding expression has been solved
     let pendingCasts = vecNew<int * Type> ()
@@ -2402,6 +2430,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     elif isPatKind m.NodeKind then patType fvars m |> ignore
                     elif isExprish m.NodeKind then exprType (GNode m) |> ignore
                 tUnit
+            | CompExpr ->
+                // The PROBE. Type the BUILDER — that is what decides the
+                // shape the rewrite emits — and then, separately, type the
+                // bare expressions in the body. A bare expression is an
+                // implicit `yield` unless it is a STATEMENT, and in F# the
+                // only thing that tells those apart is whether it has a
+                // value. Nothing else in the body is typed here: it is still
+                // written in `let!` and `yield`, which mean nothing until the
+                // rewrite has turned them into calls.
+                (match nodesOf n |> List.tryHead with
+                 | Some b ->
+                     let bt = exprType (GNode b)
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t -> vecAdd compBuildersRaw (t.Offset, bt)
+                      | None -> ())
+                 | None -> ())
+                (match nodesOf n |> List.filter (fun m -> m.NodeKind = BraceExpr) |> List.tryHead with
+                 | Some brace ->
+                     let items =
+                         match nodesOf brace with
+                         | [ one ] when one.NodeKind = BlockExpr -> nodesOf one
+                         | ms -> ms
+                     for it in items do
+                         if isBareCompItem it then
+                             let t = exprType (GNode it)
+                             (match Green.tokens (GNode it) |> List.tryHead with
+                              | Some tok ->
+                                  (match prune t with
+                                   | TCon ("unit", []) -> vecAdd compStmtsRaw tok.Offset
+                                   | _ -> ())
+                              | None -> ())
+                 | None -> ())
+                st.Fresh ()
             | RecordExpr ->
                 let fieldNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = RecordExprField)
                 let baseExpr = nodesOf n |> List.tryFind (fun m -> m.NodeKind <> RecordExprField && isExprish m.NodeKind)
@@ -3441,6 +3502,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | _ -> ""))
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
+      CompStatements = vecToList compStmtsRaw
+      CompBuilders =
+        vecToList compBuildersRaw
+        |> List.map (fun (off, ty) ->
+            off,
+            match prune ty with
+            | TCon (n, _) -> n
+            | _ -> "")
+        |> List.filter (fun (_, n) -> n <> "")
       CtorSites = vecToList ctorSitesRaw
       ClassUses = vecToList classUsesRaw
       ClassPending = vecToList classPendingRaw

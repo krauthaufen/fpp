@@ -3,38 +3,52 @@ module Fpp.Syntax.Desugar
 open Fpp.Prelude
 open Fpp.Syntax
 
-// Computation expressions, rewritten into ordinary syntax before anything
-// semantic runs.
+// Computation expressions, rewritten into the calls F# rewrites them into.
 //
-// The rewrite happens HERE, between parsing and resolution, and that
-// placement is the whole design. Resolution walks the rewritten tree, so the
-// names the rewrite introduces bind like any others and the lambdas it
-// builds scope their patterns correctly — none of it needs a second
-// mechanism. Inference and lowering then see one tree, which is what keeps
-// them from disagreeing: a desugaring done twice, once per pass, is the
-// shape that has cost this compiler the most (a construct type-checks under
-// one reading and traps under the other).
+// The shape is not a matter of taste: it was READ OFF the F# compiler, by
+// quoting `builder { ... }` for a battery of builders and printing the
+// desugared quotation. Everything below is what came back, and the tests in
+// EmitTests mirror those cases.
 //
-// The price of running before inference is that we cannot ask what members
-// the builder HAS. F# can, and uses it to omit `Run`, `Delay`, `Zero` and
-// friends when a builder does not define them. So the rule here is
-// structural instead: a method is emitted only where the CONSTRUCT requires
-// it, and never speculatively.
+//   b { return e }              b.Run(b.Delay(fun () -> b.Return(e)))
+//   b { let! p = e; REST }      b.Bind(e, fun p -> REST)
+//   b { let! p = e; return v }  b.BindReturn(e, fun p -> v)      [if present]
+//   b { let! p = e; and! q = f
+//       return v }              b.BindReturn(b.MergeSources(e, f), fun (p, q) -> v)
+//   b { do! e }                 b.Bind(e, fun () -> b.Return(()))  [b.Zero() if no Return]
+//   b { do! e; REST }           b.Bind(e, fun () -> REST)
+//   b { use p = e; REST }       b.Using(e, fun p -> REST)
+//   b { use! p = e; REST }      b.Bind(e, fun p -> b.Using(p, fun _ -> REST))
+//   b { yield e; REST }         b.Combine(b.Yield(e), b.Delay(fun () -> REST))
+//   b { for p in e do BODY }    b.For(e, fun p -> BODY)
+//   b { while c do BODY }       b.While((fun () -> c), b.Delay(fun () -> BODY))
+//   b { if c then BODY }        if c then BODY else b.Zero()
+//   b { try BODY with CS }      b.TryWith(b.Delay(fun () -> BODY), fun e -> match e with CS)
+//   b { try BODY finally F }    b.TryFinally(b.Delay(fun () -> BODY), fun () -> F)
+//   b { stmt; REST }            stmt; REST          — a plain sequential
+//   b { stmt }                  stmt; b.Zero()
 //
-//   Delay   the second argument of Combine, the body of While, the body of
-//           TryWith and TryFinally — the places where evaluating eagerly
-//           would be wrong. NOT at the top level.
-//   Zero    an empty body, an `if` with no `else`, the tail after a `do!`.
-//   Run     never.
+// **`Run` and `Delay` wrap the whole body if and only if the builder
+// declares them**, independently of each other, and that is the one decision
+// the shape of the source cannot make. It needs the builder's TYPE, so this
+// pass runs after a probe: the file is resolved and inferred once with every
+// computation expression left alone but its BUILDER typed, and what comes
+// back tells this pass which methods exist. Files with no computation
+// expression skip the probe and cost nothing.
 //
-// The top-level Delay is the visible consequence: statements ahead of the
-// first yield run when the expression is BUILT, not when it is consumed.
-// F# defers them. In exchange, a builder that defines only Bind and Return —
-// which is most of FSharp.Data.Adaptive's — works without defining methods
-// it has no use for.
+// Inside `Combine`, `While`, `TryWith` and `TryFinally` the `Delay` is NOT
+// optional — F# rejects those constructs outright on a builder without one —
+// so those are emitted unconditionally.
+//
+// Running before RESOLUTION is what keeps the rest honest: resolution walks
+// the rewritten tree, so the names this pass introduces bind like any others
+// and the lambdas it builds scope their patterns correctly. Inference and
+// lowering then see one tree, and cannot disagree about it — a desugaring
+// done twice, once per pass, is the shape that has cost this compiler the
+// most.
 //
 // The original tree is untouched: this returns a new one, and the lossless
-// parse the editor and the round-trip gate see is the parser's.
+// parse the editor and the round-trip gate see is still the parser's.
 
 /// Synthesized tokens need offsets no real token can own: every table
 /// downstream — definitions, member sites, instantiations — is keyed by
@@ -75,14 +89,38 @@ let private tuple (items : Green list) : Green =
         vecAdd acc i
     Green.node TupleExpr (vecToList acc)
 
+/// What the builder DECLARES. F# picks a computation expression's shape from
+/// this, so the rewrite cannot run until a probe pass has typed the builder
+/// and this has been read off its type.
+type CeBuilder =
+    { Name : string
+      HasRun : bool
+      HasDelay : bool
+      HasReturn : bool
+      HasBindReturn : bool
+      HasMergeSources : bool
+      HasMergeSources3 : bool }
+
+/// What to assume when the probe could not type the builder — a builder in a
+/// file that does not type check, or a lone file with no project around it.
+/// Omitting `Run` and `Delay` is the choice that still compiles against the
+/// SMALLEST builder, so an unknown one degrades to the minimum rather than to
+/// a call that cannot resolve.
+let unknownBuilder (name : string) : CeBuilder =
+    { Name = name; HasRun = false; HasDelay = false; HasReturn = true
+      HasBindReturn = false; HasMergeSources = false; HasMergeSources3 = false }
+
 /// `recv.Name(args)` — the tuple form, which is how a builder's methods are
 /// declared and how F# calls them.
-let private call (recv : string) (name : string) (args : Green list) : Green =
+let private callOn (recv : string) (name : string) (args : Green list) : Green =
     let target = Green.node DotExpr [ ident recv; tk Operator "."; tk Ident name ]
     match args with
     | [] -> Green.node AppExpr [ target; unitExpr () ]
     | [ a ] -> Green.node AppExpr [ target; paren a ]
     | many -> Green.node AppExpr [ target; paren (tuple many) ]
+
+let private call (b : CeBuilder) (name : string) (args : Green list) : Green =
+    callOn b.Name name args
 
 let private lambda (pats : Green list) (body : Green) : Green =
     Green.node LambdaExpr ((tk Keyword "fun" :: pats) @ [ tk Operator "->"; body ])
@@ -94,6 +132,11 @@ let private thunk (body : Green) : Green = lambda [ unitPat () ] body
 
 let private nodesOf (n : GreenNode) : GreenNode list =
     n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+
+let private offsetOf (n : GreenNode) : int =
+    match Green.tokens (GNode n) |> List.tryHead with
+    | Some t -> t.Offset
+    | None -> 0
 
 let private tokensOf (n : GreenNode) : Token list =
     n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
@@ -136,6 +179,15 @@ let private patName (n : GreenNode) : string option =
 
 // ---- the rewrite ----------------------------------------------------------
 
+/// How the probe answered for the computation expression at an offset.
+let mutable private builderAt : int -> CeBuilder = fun _ -> unknownBuilder "?"
+
+/// Body items the probe typed as having NO value. F# reads a bare expression
+/// as an implicit `yield` unless it is a statement, and its type is the only
+/// thing that tells those apart — `seq { 1 }` yields, `seq { printfn "x" }`
+/// does not.
+let mutable private statementAt : int -> bool = fun _ -> false
+
 let rec private walk (g : Green) : Green =
     match g with
     | GToken _ -> g
@@ -143,18 +195,27 @@ let rec private walk (g : Green) : Green =
         if n.NodeKind = CompExpr then comp n
         else Green.node n.NodeKind (List.map walk n.Children)
 
-/// `builder { body }`. The builder is evaluated ONCE, into a binding the
-/// rewrite then names: duplicating its expression would duplicate every
-/// token offset in it, and the tables downstream are keyed by offset.
+/// `builder { body }`, which F# renders as
+/// `let b = <builder> in b.Run(b.Delay(fun () -> BODY))` — with `Run` and
+/// `Delay` each there only if the builder declares it. The builder is
+/// evaluated ONCE into a binding: duplicating its expression would duplicate
+/// every token offset in it, and the tables downstream are keyed by offset.
 and private comp (n : GreenNode) : Green =
     let kids = nodesOf n
-    let b = "_ce" + string (freshOffset ())
+    let at = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
+    let probed = builderAt at
+    let b = { probed with Name = "_ce" + string (freshOffset ()) }
     match kids with
     | [ builder; body ] when body.NodeKind = BraceExpr ->
         let bind =
             Green.node LetDecl
-                [ tk Keyword "let"; identPat b; tk Operator "="; walk (GNode builder) ]
-        Green.node BlockExpr [ bind; block b (bodyItems body) ]
+                [ tk Keyword "let"; identPat b.Name; tk Operator "="; walk (GNode builder) ]
+        let core = block b (bodyItems body)
+        // Delay first, then Run around it — the order F# emits, and the one
+        // a builder whose Delay changes the type (`unit -> M<'a>`) needs
+        let delayed = if b.HasDelay then call b "Delay" [ thunk core ] else core
+        let ran = if b.HasRun then call b "Run" [ delayed ] else delayed
+        Green.node BlockExpr [ bind; ran ]
     | _ -> Green.node n.NodeKind (List.map walk n.Children)
 
 /// The statements of a braced body. `parseBlock` hands back a lone item
@@ -176,16 +237,16 @@ and private namesAValue (items : GreenNode list) : bool =
         else nodesOf n |> List.exists scan
     items |> List.exists scan
 
-and private block (b : string) (items : GreenNode list) : Green =
+and private block (b : CeBuilder) (items : GreenNode list) : Green =
     blockYielding b (namesAValue items) items
 
-and private blockYielding (b : string) (explicit : bool) (items : GreenNode list) : Green =
+and private blockYielding (b : CeBuilder) (explicit : bool) (items : GreenNode list) : Green =
     match items with
     | [] -> call b "Zero" []
     | item :: rest -> item1 b explicit item rest
 
 /// One statement and everything after it.
-and private item1 (b : string) (explicit : bool) (item : GreenNode) (rest : GreenNode list) : Green =
+and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : GreenNode list) : Green =
     let tail () = blockYielding b explicit rest
     let combine (value : Green) : Green =
         if List.isEmpty rest then value
@@ -194,30 +255,23 @@ and private item1 (b : string) (explicit : bool) (item : GreenNode) (rest : Gree
     let sequential () =
         Green.node BlockExpr [ walk (GNode item); tail () ]
     match item.NodeKind with
-    | LetDecl when hasBang item ->
-        // `let! p = e` and `and! p = e`. F# binds an `and!` group in
-        // PARALLEL through MergeSources; here it chains, which computes the
-        // same value over a slightly different graph.
-        (match bangBinder item with
-         | Some (pat, rhs) when hasKw item "use" ->
-             (match patName pat with
-              | Some nm ->
-                  call b "Bind"
-                      [ rhs
-                        lambda [ GNode pat ]
-                            (call b "Using" [ ident nm; lambda [ Green.node WildcardPat [ tk Ident "_" ] ] (tail ()) ]) ]
-              | None -> call b "Bind" [ rhs; lambda [ GNode pat ] (tail ()) ])
-         | Some (pat, rhs) -> call b "Bind" [ rhs; lambda [ GNode pat ] (tail ()) ]
-         | None -> sequential ())
+    | LetDecl when hasBang item -> bangLet b explicit item rest
+
     | LetDecl when hasKw item "use" ->
         (match bangBinder item with
          | Some (pat, rhs) -> call b "Using" [ rhs; lambda [ GNode pat ] (tail ()) ]
          | None -> sequential ())
     | LetDecl -> Green.node BlockExpr [ walk (GNode item); tail () ]
     | BlockExpr when isDoStmt item && hasBang item ->
+        // `do! e` is `let! () = e`. With nothing after it the continuation is
+        // the unit VALUE when the builder can return one, and Zero when it
+        // cannot — which is what F# emits for each.
         (match nodesOf item |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast with
          | Some e ->
-             let k = if List.isEmpty rest then call b "Zero" [] else tail ()
+             let k =
+                 if not (List.isEmpty rest) then tail ()
+                 elif b.HasReturn then call b "Return" [ unitExpr () ]
+                 else call b "Zero" []
              call b "Bind" [ walk (GNode e); thunk k ]
          | None -> sequential ())
     | PrefixExpr when hasKw item "yield" || hasKw item "return" ->
@@ -245,11 +299,108 @@ and private item1 (b : string) (explicit : bool) (item : GreenNode) (rest : Gree
     | MatchExpr -> combine (clauses b explicit item)
     | TryExpr -> combine (tryExpr b explicit item)
     // A bare expression. With no `yield` or `return` anywhere in the body it
-    // is an implicit yield; otherwise it is a statement, and a statement in
-    // final position leaves the computation with nothing to be.
-    | _ when not explicit -> combine (call b "Yield" [ walk (GNode item) ])
+    // is an implicit yield — unless the probe found it has no value, which
+    // is exactly what makes it a statement instead.
+    | _ when not explicit && not (statementAt (offsetOf item)) ->
+        combine (call b "Yield" [ walk (GNode item) ])
     | _ when List.isEmpty rest -> Green.node BlockExpr [ walk (GNode item); call b "Zero" [] ]
     | _ -> sequential ()
+
+/// `let!` — and the `and!` group that may follow it, which F# binds in
+/// PARALLEL through `MergeSources` rather than in sequence. Two special
+/// shapes ride on this one:
+///
+///   * `use! p = e` is a `Bind` whose continuation is a `Using` on what was
+///     bound — F# writes it as two nested lambdas over the same name;
+///   * a continuation that ENDS in `return e` fuses into `BindReturn`, when
+///     the builder has one. It is not an optimisation the builder can be
+///     denied: `AValBuilder.BindReturn` is `AVal.map` where `Bind` is
+///     `AVal.bind`, and the adaptive graph that comes out is a different
+///     one.
+and private bangLet (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : GreenNode list) : Green =
+    let rec peel (acc : (GreenNode * Green) list) (rs : GreenNode list) =
+        match rs with
+        | r :: more when r.NodeKind = LetDecl && hasBang r && hasKw r "and" ->
+            (match bangBinder r with
+             | Some pr -> peel (acc @ [ pr ]) more
+             | None -> acc, rs)
+        | _ -> acc, rs
+    match bangBinder item with
+    | None -> Green.node BlockExpr [ walk (GNode item); blockYielding b explicit rest ]
+    | Some (pat, rhs) ->
+        let ands, after = peel [] rest
+        let tail () = blockYielding b explicit after
+        // `use!` binds, then scopes what it bound
+        let body () =
+            if hasKw item "use" && List.isEmpty ands then
+                match patName pat with
+                | Some nm ->
+                    call b "Using" [ ident nm
+                                     lambda [ Green.node WildcardPat [ tk Ident "_" ] ] (tail ()) ]
+                | None -> tail ()
+            else tail ()
+        let source, binder =
+            if List.isEmpty ands then rhs, GNode pat
+            elif b.HasMergeSources3 && List.length ands = 2 then
+                match ands with
+                | [ (p2, r2); (p3, r3) ] ->
+                    call b "MergeSources3" [ rhs; r2; r3 ],
+                    Green.node ParenPat
+                        [ tk LParen "("; GNode pat; tk Comma ","; GNode p2; tk Comma ","; GNode p3; tk RParen ")" ]
+                | _ -> rhs, GNode pat
+            elif b.HasMergeSources then
+                // more than three sources nest to the LEFT, and the binder
+                // nests with them
+                List.fold
+                    (fun (src, bnd) (p, r) ->
+                        call b "MergeSources" [ src; r ],
+                        Green.node ParenPat [ tk LParen "("; bnd; tk Comma ","; GNode p; tk RParen ")" ])
+                    (rhs, GNode pat) ands
+            else
+                // no MergeSources: the group has to bind in sequence, which
+                // computes the same value over a different graph
+                rhs, GNode pat
+        let sequentialAnds (inner : Green) : Green =
+            if List.isEmpty ands || b.HasMergeSources then inner
+            else
+                List.foldBack
+                    (fun (p, r) acc -> call b "Bind" [ r; lambda [ GNode p ] acc ])
+                    ands inner
+        let k = sequentialAnds (body ())
+        match (if b.HasBindReturn && not (hasKw item "use") then stripReturn b k else None) with
+        | Some inner -> call b "BindReturn" [ source; lambda [ binder ] inner ]
+        | None -> call b "Bind" [ source; lambda [ binder ] k ]
+
+/// Is this exactly `b.Return(e)`, possibly after some statements? F# fuses
+/// `let! p = e` with a continuation of that shape into `BindReturn`, and the
+/// statements ride along inside the lambda.
+and private stripReturn (b : CeBuilder) (g : Green) : Green option =
+    match g with
+    | GNode n when n.NodeKind = AppExpr ->
+        (match n.Children with
+         | [ GNode d; GNode a ] when d.NodeKind = DotExpr && a.NodeKind = ParenExpr ->
+             let names = d.Children |> List.choose (fun c -> match c with GToken t -> Some t.Text | _ -> None)
+             let recv =
+                 match d.Children |> List.tryHead with
+                 | Some (GNode r) when r.NodeKind = IdentExpr ->
+                     (match r.Children |> List.tryHead with
+                      | Some (GToken t) -> t.Text
+                      | _ -> "")
+                 | _ -> ""
+             if recv = b.Name && List.contains "Return" names then
+                 match a.Children |> List.tryPick (fun c -> match c with GNode e -> Some (GNode e) | _ -> None) with
+                 | Some e -> Some e
+                 | None -> None
+             else None
+         | _ -> None)
+    | GNode n when n.NodeKind = BlockExpr ->
+        (match List.rev n.Children with
+         | last :: before ->
+             (match stripReturn b last with
+              | Some inner -> Some (Green.node BlockExpr (List.rev (inner :: before)))
+              | None -> None)
+         | [] -> None)
+    | _ -> None
 
 /// The pattern and the right-hand side of a `let!`/`use!`/`use` binder.
 and private bangBinder (item : GreenNode) : (GreenNode * Green) option =
@@ -260,13 +411,13 @@ and private bangBinder (item : GreenNode) : (GreenNode * Green) option =
     | _ -> None
 
 /// A nested body — a loop's, a branch's — is a computation of its own.
-and private nested (b : string) (explicit : bool) (body : GreenNode) : Green =
+and private nested (b : CeBuilder) (explicit : bool) (body : GreenNode) : Green =
     if body.NodeKind = BlockExpr && not (isDoStmt body) then blockYielding b explicit (nodesOf body)
     else blockYielding b explicit [ body ]
 
 /// `if`/`elif`/`else`, where the BRANCHES are computations and the
 /// conditions are not. A missing `else` is where Zero comes from.
-and private ifExpr (b : string) (explicit : bool) (item : GreenNode) : Green =
+and private ifExpr (b : CeBuilder) (explicit : bool) (item : GreenNode) : Green =
     let acc = vecNew<Green> ()
     let mutable branchNext = false
     let mutable sawElse = false
@@ -292,7 +443,7 @@ and private ifExpr (b : string) (explicit : bool) (item : GreenNode) : Green =
 
 /// Every clause body of a `match` is a computation; the scrutinee, the
 /// patterns and the guards are not.
-and private clauses (b : string) (explicit : bool) (item : GreenNode) : Green =
+and private clauses (b : CeBuilder) (explicit : bool) (item : GreenNode) : Green =
     let rewrite (c : Green) : Green =
         match c with
         | GNode cl when cl.NodeKind = MatchClause ->
@@ -312,7 +463,7 @@ and private clauses (b : string) (explicit : bool) (item : GreenNode) : Green =
 /// `try`/`with` and `try`/`finally`. Both bodies must be delayed: the
 /// builder decides when to run them, and running one to build the handler
 /// would defeat the point.
-and private tryExpr (b : string) (explicit : bool) (item : GreenNode) : Green =
+and private tryExpr (b : CeBuilder) (explicit : bool) (item : GreenNode) : Green =
     let body = nodesOf item |> List.tryFind (fun m -> m.NodeKind <> MatchClause && isExprish m.NodeKind)
     match body with
     | None -> walk (GNode item)
@@ -348,11 +499,51 @@ and private tryExpr (b : string) (explicit : bool) (item : GreenNode) : Green =
                 | _ -> ()
             call b "TryWith" [ delayed; lambda [ identPat e ] (Green.node MatchExpr (vecToList acc)) ]
 
-/// Rewrite every computation expression in a file. Files are independent, so
-/// the counter restarts: the same text desugars to the same tree, which is
-/// what lets the result be cached like any other parse.
-let desugar (root : GreenNode) : GreenNode =
+/// Rewrite every computation expression in a file, given what the probe pass
+/// learned about each one's builder. Files are independent, so the counter
+/// restarts: the same text and the same answers desugar to the same tree,
+/// which is what lets the result be cached like any other parse.
+/// Any allocation will do as the lock's identity; a Vec is one this compiler
+/// can also compile ITSELF, which `obj ()` is not.
+let private rewriteLock = vecNew<int> ()
+
+/// Not to be called except through the lock below. The module state it sets
+/// is read by every constructor above, and the assignments live in a plain
+/// function rather than in the lock's lambda because assigning to a
+/// module-level mutable from inside a closure is not something this compiler
+/// can compile itself.
+let private rewriteUnlocked (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
     counter <- synthBase
-    match walk (GNode root) with
-    | GNode n -> n
-    | _ -> root
+    builderAt <- lookup
+    statementAt <- isStatement
+    let r =
+        match walk (GNode root) with
+        | GNode n -> n
+        | _ -> root
+    builderAt <- (fun _ -> unknownBuilder "?")
+    statementAt <- (fun _ -> false)
+    r
+
+let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool) (root : GreenNode) : GreenNode =
+    // The offset counter and the probe's answers are module state — every
+    // constructor above reads them, and threading them through forty call
+    // sites would say nothing this does not. It has to BE a lock: two
+    // workspaces rewriting at once corrupted each other's answers, and the
+    // symptom was a `BindReturn` that fused in one run and not the next.
+    lock rewriteLock (fun () -> rewriteUnlocked lookup isStatement root)
+
+/// Is there anything here for the rewrite to do? Files without a computation
+/// expression — which is nearly all of them, the compiler's own sources and
+/// the prelude included — skip the probe pass entirely.
+let rec hasComp (g : Green) : bool =
+    match g with
+    | GToken _ -> false
+    | GNode n -> n.NodeKind = CompExpr || List.exists hasComp n.Children
+
+let desugarWith (lookup : int -> CeBuilder) (root : GreenNode) : GreenNode =
+    desugarWithStatements lookup (fun _ -> false) root
+
+/// The rewrite with no probe behind it: a lone file, or one whose builder
+/// could not be typed.
+let desugar (root : GreenNode) : GreenNode =
+    desugarWithStatements (fun _ -> unknownBuilder "?") (fun _ -> false) root

@@ -357,51 +357,48 @@ by `stdlib/dotnet.fpp`, which runs under both compilers and must print the
 same 111 values — the seq usage included, so `Seq.map f (ra :> seq<int>)`
 means in F++ exactly what it means in F#.
 
-## Computation expressions omit `Run` and the top-level `Delay`
+## Computation expressions: what still differs
 
-`builder { ... }` is rewritten into builder-method calls between parsing and
-resolution — before anything knows a type. F# does the same rewrite DURING
-type checking, which lets it ask whether the builder actually defines `Run`,
-`Delay`, `Zero` or `Combine` and leave out the ones it does not.
+The rewrite is F#'s, read off the F# compiler rather than reconstructed —
+each shape was obtained by quoting `builder { ... }` and printing the
+desugared quotation, and the oracle suite holds us to it: the builders in
+those tests print on every call, so the two compilers are diffed on the call
+TRACE, not merely on the answer.
 
-Running earlier buys one tree for resolution, inference and lowering to
-share — a desugaring done once cannot be done two different ways — and costs
-that question. So the rule here is structural: a method is emitted only
-where the CONSTRUCT requires it.
+`Run` and `Delay` appear exactly when the builder declares them, each
+independently, which needs the builder's TYPE. It comes from a probe: a file
+containing a computation expression is resolved and inferred once with every
+one of them left alone but its builder typed, and the rewrite runs on the
+answers. Files without one skip the probe. The same probe answers the other
+type-directed question — whether a bare expression in the body is a value to
+`Yield` or a statement, which in F# only its type can say.
 
-| | |
-| --- | --- |
-| `Delay` | the second argument of `Combine`, the body of `While`, the bodies of `TryWith` and `TryFinally` — where evaluating eagerly would be wrong. **Not at the top level.** |
-| `Zero` | an empty body, an `if` with no `else`, the tail after a trailing `do!` |
-| `Run` | never |
+What is left:
 
-**The visible consequence.** Statements AHEAD of the first yield run when the
-expression is built, not when it is consumed:
-
-```fsharp
-let s = seq { printfn "hi"; yield 1 }   // F# prints on enumeration; F++ prints here
-```
-
-Everything after the first yield is delayed as usual, because that is
-`Combine`'s second argument. In exchange, a builder that defines only `Bind`
-and `Return` — FSharp.Data.Adaptive's `AValBuilder` is exactly that — works
-without defining methods it has no use for.
-
-**`and!` chains instead of merging.** F# binds an `and!` group in parallel
-through `MergeSources`; here each one becomes another `Bind`. The value is
-the same; the dependency graph an adaptive builder ends up with is not.
+**`and!` merges, but never through `Bind2`/`Bind3`.** F# prefers
+`Bind2Return`/`Bind3Return` over `BindReturn` composed with `MergeSources`,
+when the builder has them. Here an `and!` group always goes through
+`MergeSources`/`MergeSources3` — and, on a builder with neither, falls back
+to binding in sequence. The value is the same in all three; for an adaptive
+builder the dependency graph is not.
 
 **The builder must be a NAME.** `seq { }`, `aval { }`, `Foo.builder { }`,
 `x.b { }` — but not an application. F# allows any expression, and Expecto's
-`test "name" { ... }` is the shape that wants one. A brace after an
-arbitrary atom is far more often an ARGUMENT, and guessing wrong newly
-exposes every construct in a body the parser had been keeping as token
-soup — which is how this restriction was arrived at rather than assumed.
+`test "name" { ... }` is the shape that wants one. A brace after an arbitrary
+atom is far more often an ARGUMENT, and guessing wrong newly exposes every
+construct in a body the parser had been keeping as token soup — which is how
+this restriction was arrived at rather than assumed.
+
+**A builder the probe could not type gets no `Run` and no `Delay`.** That is
+the reading that still compiles against the SMALLEST builder, so an unknown
+one degrades to the minimum rather than to a call that cannot resolve. It
+happens when the file does not type check, or when there is no project
+around it.
 
 **`seq { }` has no `Using`, `TryWith` or `TryFinally`.** Scoping a resource
 or a handler ACROSS a suspension needs the enumerator to own it, and the
-prelude's sequences are built from combinators, not from a state machine.
-The rewrite still emits the calls, so `use` or `try` inside a `seq { }` is an
+prelude's sequences are built from combinators, not from a state machine. The
+rewrite still emits the calls, so `use` or `try` inside a `seq { }` is an
 error naming the missing member rather than a wrong answer.
 
 ## `use` disposes, and nothing else does
