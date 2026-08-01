@@ -2170,16 +2170,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let staticOwner =
                     // the head may be a bare type name or a generic
                     // application: `Comparer.Instance` or `Comparer<int>.Instance`
-                    let headIdent (h : GreenNode) =
+                    let rec headIdent (h : GreenNode) =
                         if h.NodeKind = IdentExpr then tokensOf h |> List.tryFind (fun t -> t.Kind = Ident)
+                        // QUALIFIED: `Inner.Box.Make` names the type by its
+                        // path, and the type is the LAST segment of the head
+                        elif h.NodeKind = DotExpr then
+                            Green.tokens (GNode h) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
                         elif h.NodeKind = AppExpr
-                             && (nodesOf h |> List.forall (fun m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams)) then
+                             && (nodesOf h |> List.forall (fun m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams || m.NodeKind = DotExpr)) then
                             // only a PURE type application: `C(args).M` is an
                             // instance access, and seeing through the call
                             // typed it as a static
                             match nodesOf h |> List.tryHead with
-                            | Some inner when inner.NodeKind = IdentExpr ->
-                                tokensOf inner |> List.tryFind (fun t -> t.Kind = Ident)
+                            | Some inner when inner.NodeKind = IdentExpr || inner.NodeKind = DotExpr ->
+                                headIdent inner
                             | _ -> None
                         else None
                     match nodesOf n |> List.tryHead |> Option.bind headIdent with

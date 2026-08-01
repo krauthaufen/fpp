@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing (all green, `main` at `53703ff`):
 
 ```
-571 tests
+573 tests
 corpus fixpoint    46699 bytes, byte-identical
-self-host fixpoint 1513464 bytes, byte-identical
+self-host fixpoint 1513728 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -64,34 +64,36 @@ real ones: most were 10–60 lines.
 | type-level constraints | they BIND — `Box<Opaque>` is rejected — and F#'s spellings map onto classes |
 | weak references | strong, honestly documented |
 | compiler directives | `#nowarn` and friends |
-| qualified construction | a dotted head is named by its LAST segment |
+| qualification | a dotted head is named by its LAST segment — constructors and static members both |
 
 ## Known problematic
 
-### Qualification is not uniformly sound
+### Qualification
 
-**This is the live one.** `Impl.Node(k, v)` used to take the primary
-constructor whatever its arity, because overload selection searched the head
-for the FIRST identifier — which on a dotted name is the module. Fixed for
-constructors, and `CLAUDE.md` carries the rule: a dotted head is named by
-its LAST segment, and Infer and Lower must agree on which token they key by,
-or inference chooses one thing and emission calls another.
+Two holes were found by writing ONE program that qualifies everything, and
+both are fixed:
 
-What is still broken, found by qualifying everything in one program:
+* a qualified CONSTRUCTOR took the primary overload whatever its arity
+* a STATIC member through a qualified type did not resolve at all
+  (`Inner.Box.Make`)
 
-```fsharp
-let d = Inner.Box.Make 3        // "unknown field Make"
-```
+Both were the same mistake in two places: searching a head for its FIRST
+identifier, which on a dotted name is the module. The rule, now in
+`CLAUDE.md`: **a dotted head is named by its LAST segment**, and Infer and
+Lower must agree on which token they key by — the static-member fix needed
+BOTH sides, because inference bound the member while emission still built a
+closure over it.
 
-A STATIC member reached through a qualified type. Everything else in that
-program works — qualified functions, values, constructors, union cases in
-expressions AND patterns, record-literal field labels, type annotations,
-generic type applications.
+Verified working: qualified functions, values, constructors (with and
+without explicit type arguments), static members, union cases in expressions
+AND in patterns, record-literal field labels, type annotations, generic type
+applications.
 
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in
-`Infer.fs` and `Lower.fs`. Each is the same question — first segment or
-last — and each is right only if its head cannot be qualified. They want
-reading one at a time, not a blind sweep: some genuinely mean the first.
+`Infer.fs` and `Lower.fs`. Each is the same question, and each is right only
+if its head cannot be qualified. The two that mattered are done; the rest
+want reading one at a time rather than a blind sweep, since some genuinely
+mean the first.
 
 ### Still missing for the port
 

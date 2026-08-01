@@ -12,14 +12,14 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 571 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 573 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 571 tests missed — a `List.init` that counted down, an equality that
+bugs the 573 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
@@ -175,9 +175,14 @@ The rule: a dotted head is named by its LAST segment. Infer and Lower must
 agree on which token they key by, or inference chooses one constructor and
 emission calls another.
 
-There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in
-Infer and Lower. Each one is this question — first or last — and each is
-right only if its head cannot be qualified. Worth auditing as a group.
+The same mistake hid in two places, and the second needed BOTH sides fixed:
+a static member through a qualified type (`Inner.Box.Make`) bound in
+inference but emission still built a closure over it, so it type-checked and
+trapped. If you change one side, change the other.
+
+There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
+and Lower. Each one is this question — first or last — and each is right
+only if its head cannot be qualified. Worth auditing as a group.
 
 ## Pattern identifiers
 

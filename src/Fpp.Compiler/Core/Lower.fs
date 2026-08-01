@@ -162,11 +162,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let rec headIdent (h : GreenNode) =
             if h.NodeKind = IdentExpr then
                 h.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
+            // QUALIFIED: `Inner.Box.Make` names its type by the LAST segment
+            // of the head, exactly as inference does — the two must agree, or
+            // inference binds a static member and emission builds a closure
+            elif h.NodeKind = DotExpr then
+                Green.tokens (GNode h) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
             elif h.NodeKind = AppExpr
                  && (h.Children
                      |> List.forall (fun c ->
                          match c with
-                         | GNode m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams
+                         | GNode m -> m.NodeKind = IdentExpr || m.NodeKind = TyParams || m.NodeKind = DotExpr
                          | GToken _ -> true)) then
                 match h.Children |> List.tryPick (fun c -> match c with GNode m -> Some m | _ -> None) with
                 | Some inner -> headIdent inner

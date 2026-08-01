@@ -1604,4 +1604,42 @@ let qualifiedCtorTests =
                       "let q = print (int b.Height)" ]
             Expect.equal out "3\n1\n" "the qualified call takes the two-argument one"
         }
+        test "a static member resolves through a QUALIFIED type" {
+            // `Inner.Box.Make` is module, type, member — and the type is the
+            // LAST segment of the head. Infer and Lower have to agree on
+            // that, or inference binds the static member and emission builds
+            // a closure over it instead of calling it.
+            let out =
+                run [ "module Inner ="
+                      "    type Box<'a>(v : 'a) ="
+                      "        member x.V = v"
+                      "        static member Make (n : int) = Box<int>(n)"
+                      "let ok = Inner.Box<int>(7)"
+                      "let made = Inner.Box.Make 3"
+                      "let a = print ok.V"
+                      "let b = print made.V" ]
+            Expect.equal out "7\n3\n" "constructor and static member both qualify"
+        }
+        test "everything else qualifies too" {
+            let out =
+                run [ "module Inner ="
+                      "    type Colour ="
+                      "        | Red"
+                      "        | Green of int"
+                      "    type Rec = { Width : int; Tag : string }"
+                      "    let double (n : int) = n * 2"
+                      "    let answer = 42"
+                      "let a = print (Inner.double 21)"
+                      "let b = print Inner.answer"
+                      "let e = Inner.Green 5"
+                      "let g = { Inner.Width = 4; Inner.Tag = \"t\" }"
+                      "let c = print g.Width"
+                      "let d ="
+                      "    print (match e with"
+                      "           | Inner.Green n -> n"
+                      "           | Inner.Red -> 0)"
+                      "let f (x : Inner.Colour) = match x with Inner.Green n -> n | _ -> 0"
+                      "let h = print (f e)" ]
+            Expect.equal out "42\n42\n4\n5\n5\n" "values, cases, patterns, record labels, annotations"
+        }
     ]
