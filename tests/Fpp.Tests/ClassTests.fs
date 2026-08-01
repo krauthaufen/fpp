@@ -1696,3 +1696,44 @@ let qualifiedCtorTests =
             Expect.equal out "42\n42\n4\n5\n5\n" "values, cases, patterns, record labels, annotations"
         }
     ]
+
+[<Tests>]
+let threadingTests =
+    testList "System.Threading, single-threaded" [
+        test "Interlocked returns what .NET returns" {
+            // Increment the NEW value, Exchange and CompareExchange the OLD
+            // one — and the compare-exchange declines when the comparand
+            // does not match
+            let out =
+                run [ "type Counter() ="
+                      "    let mutable current = 0"
+                      "    member x.Next () = Interlocked.Increment (&current)"
+                      "    member x.Back () = Interlocked.Decrement (&current)"
+                      "    member x.Swap (v : int) = Interlocked.Exchange (&current, v)"
+                      "    member x.Cas (v : int, c : int) = Interlocked.CompareExchange (&current, v, c)"
+                      "    member x.Value = current"
+                      "let c = Counter()"
+                      "let a = print (c.Next ())"
+                      "let b = print (c.Next ())"
+                      "let d = print (c.Back ())"
+                      "let e = print (c.Swap 10)"
+                      "let f = print c.Value"
+                      "let g = print (c.Cas (99, 10))"
+                      "let h = print c.Value"
+                      "let i = print (c.Cas (5, 0))"
+                      "let j = print c.Value" ]
+            Expect.equal out "1\n2\n1\n1\n10\n10\n99\n99\n99\n" "the .NET answers"
+        }
+        test "lock runs the body, and Monitor is entered" {
+            let out =
+                run [ "type Gate() ="
+                      "    member x.Id = 1"
+                      "let gate = Gate()"
+                      "let a = print (lock gate (fun () -> 7))"
+                      "let b ="
+                      "    Monitor.Enter gate"
+                      "    print (if Monitor.IsEntered gate then 1 else 0)"
+                      "    Monitor.Exit gate" ]
+            Expect.equal out "7\n1\n" "one thread enters every lock it asks for"
+        }
+    ]

@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-576 tests
-corpus fixpoint    46699 bytes, byte-identical
-self-host fixpoint 1515440 bytes, byte-identical
+578 tests
+corpus fixpoint    48098 bytes, byte-identical
+self-host fixpoint 1516855 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -64,7 +64,8 @@ real ones: most were 10–60 lines.
 | type-level constraints | they BIND — `Box<Opaque>` is rejected — and F#'s spellings map onto classes |
 | weak references | strong, honestly documented |
 | compiler directives | `#nowarn` and friends |
-| qualification | a dotted head is named by its LAST segment — constructors and static members both |
+| qualification | a dotted head is named by its LAST segment — constructors, static members, base classes, and cases through their type |
+| `System.Threading` | `lock`, `Monitor`, `Interlocked` — real, on one thread |
 
 ## Known problematic
 
@@ -117,9 +118,6 @@ fix needed both — which is worth remembering for anything else qualified.
 * **computation expressions** — `ComputationExpressions.fs` and `seq { }`.
   The only remaining item that is a real feature rather than a small gap.
 * **`use` / `IDisposable`** — 25 uses.
-* **`lock` / `Monitor` (90) and `Interlocked` (13)** — real types in the
-  prelude. A single-threaded runtime genuinely enters and exits every lock;
-  that is an implementation, not a stub.
 * **reflection outside ShallowEquality** — ~30 `typeof<>` sites in
   AdaptiveValue, HashSet, HashMap, IndexList, History, Cache. Read each:
   most are a cache key or a null test, which a class or a constrained
@@ -141,6 +139,12 @@ In `tests/known-issues/`, one file each, smallest program that shows it:
   called `MutableHashSet`.
 
 ### Deliberate divergences that will surprise someone
+
+* **`Monitor` never blocks.** A single-threaded runtime genuinely enters and
+  exits every lock and an increment genuinely is atomic, so `lock`,
+  `Monitor` and `Interlocked` do exactly what .NET's do under the assumption
+  the platform enforces. What is absent is any way to WAIT: `Monitor.Enter`
+  on a lock someone else holds cannot happen.
 
 All in `DIVERGENCES.md`; these are the ones with teeth.
 

@@ -146,8 +146,8 @@ is actually coming:
 | what | hits | the answer |
 | --- | --- | --- |
 | ~~`uint64`, `int16`, `uint16`~~ | — | **done.** New primitive types, and the missing halves of `byte`/`sbyte`'s tower with them. uint64 is unsigned on the i64 rail (`div_u`, `lt_u`, `shr_u`); int16/uint16 are int-shaped like byte/sbyte, narrowed by the conversion. Pinned against .NET in `stdlib/dotnet.fpp` |
-| `lock` / `Monitor` (58 + 32) | 90 | real types in the prelude; a single-threaded runtime enters and exits every lock, which is the honest implementation, not a stub |
-| `Interlocked` | 13 | same — the increment is atomic when there is one thread |
+| ~~`lock` / `Monitor`~~ | 90 | **done.** Real types in the prelude; one thread enters and exits every lock, which is the honest implementation, not a stub |
+| ~~`Interlocked`~~ | 13 | **done.** Increment/Decrement/Exchange/CompareExchange, each taking its location by reference and returning what .NET returns |
 | ~~`WeakReference`~~ | 34 | **done.** A strong `WeakReference<'a>` in the prelude: reading through one is identical, and what changes — a graph that relied on weakness to drop its dead half keeps it — is written down in DIVERGENCES.md |
 | ~~`ConditionalWeakTable`~~ | 3 | **done.** An identity-keyed table in the prelude. The library's use is a per-object callback cache with an explicit `Remove`, so the behaviour is the same until something dies with callbacks attached |
 | ~~byref `TryGetValue`~~ | — | **done.** F# hands the out-parameter over as a tuple, which IS expressible |

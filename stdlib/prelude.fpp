@@ -5213,6 +5213,42 @@ type MutableHashSet<'a>() =
     interface IEnumerable<'a> with
         member x.GetEnumerator () = (x.ToArray () :> seq<'a>).GetEnumerator ()
 
+/// System.Threading, on a runtime with ONE thread.
+///
+/// These are not stubs. A single-threaded runtime genuinely enters and
+/// exits every lock, and an increment genuinely is atomic when nothing else
+/// can run between the read and the write — so each of these does exactly
+/// what .NET's does, under the assumption the platform enforces. What is
+/// absent is any way to BLOCK: `Monitor.Enter` on a lock someone else holds
+/// cannot happen, so there is nothing to wait for.
+type Monitor =
+    static member Enter (o : obj) : unit = ()
+    static member Exit (o : obj) : unit = ()
+    static member IsEntered (o : obj) : bool = true
+    static member TryEnter (o : obj) : bool = true
+
+/// F#'s `lock`: run the body, which is the whole of it here.
+let lock (o : 'a) (f : unit -> 'b) : 'b = f ()
+
+/// System.Threading.Interlocked. Every one takes the location by REFERENCE,
+/// as .NET's does, and returns what .NET returns — `Increment` the NEW
+/// value, `Exchange` and `CompareExchange` the OLD one.
+type Interlocked =
+    static member Increment (location : byref<int>) : int =
+        location <- location.Contents + 1
+        location.Contents
+    static member Decrement (location : byref<int>) : int =
+        location <- location.Contents - 1
+        location.Contents
+    static member Exchange (location : byref<int>, value : int) : int =
+        let old = location.Contents
+        location <- value
+        old
+    static member CompareExchange (location : byref<int>, value : int, comparand : int) : int =
+        let old = location.Contents
+        if old = comparand then location <- value
+        old
+
 /// System.WeakReference — a STRONG reference.
 ///
 /// wasm-GC has no weak references and no finalizers: there is no way to
