@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-575 tests
+576 tests
 corpus fixpoint    46699 bytes, byte-identical
-self-host fixpoint 1514339 bytes, byte-identical
+self-host fixpoint 1515440 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -70,13 +70,17 @@ real ones: most were 10–60 lines.
 
 ### Qualification
 
-Three holes were found by writing programs that qualify everything, and all
-three are fixed:
+Four holes were found by writing programs that qualify everything, and all
+four are fixed:
 
 * a qualified CONSTRUCTOR took the primary overload whatever its arity
 * a STATIC member through a qualified type did not resolve at all
   (`Inner.Box.Make`)
 * a qualified BASE class did not parse (`inherit Inner.Base(s)`)
+* a union case named through its module AND its type
+  (`Inner.Colour.Green`) resolved in neither expression nor pattern
+  position — no value carries that whole path, so the lookup has to go
+  through the TYPE, which is the second-to-last segment
 
 Both were the same mistake in two places: searching a head for its FIRST
 identifier, which on a dotted name is the module. The rule, now in
@@ -96,7 +100,8 @@ Verified working: qualified functions, values, constructors (with and
 without explicit type arguments), static members, base classes (generic
 ones too), interface implementations, union cases in expressions AND in
 patterns, record-literal field labels, type annotations, generic type
-applications, and modules nested two deep.
+applications, union cases through module AND type in expressions and
+patterns, and modules nested two deep.
 
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in
 `Infer.fs` and `Lower.fs`. Each is the same question, and each is right only
@@ -106,14 +111,8 @@ mean the first.
 
 ### Still missing for the port
 
-One hole is left, found the same way and not yet fixed:
-
-```fsharp
-let i = Inner.Colour.Green 7    // "unknown field Green"
-```
-
-a union case named through its TYPE as well as its module. `Inner.Green 7`
-works; it is the three-segment form that does not.
+Expression and pattern position resolve SEPARATELY — the case-through-type
+fix needed both — which is worth remembering for anything else qualified.
 
 * **computation expressions** — `ComputationExpressions.fs` and `seq { }`.
   The only remaining item that is a real feature rather than a small gap.

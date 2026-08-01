@@ -367,9 +367,20 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             tryRecord env first
             if idents.Length > 1 then
                 let full = idents |> List.map (fun t -> t.Text) |> String.concat "."
+                let last = List.last idents
                 match lookupValue env full with
-                | Some d -> record (List.last idents) d
-                | None -> ()
+                | Some d -> record last d
+                | None ->
+                    // `Inner.Colour.Green` in PATTERN position: the case is
+                    // named through its TYPE as well as its module, and no
+                    // value carries that whole path. The type is the
+                    // second-to-last segment, and `typeCases` is keyed by the
+                    // type's own name whatever holds it.
+                    if idents.Length > 2 then
+                        let ty = idents |> List.item (idents.Length - 2)
+                        (match dictTryFind typeCases (ty.Text + "." + last.Text) with
+                         | Some cd -> record last cd
+                         | None -> ())
 
     /// `inCase` marks a pattern in MATCH position, where a bare uppercase
     /// identifier is a union case and never a binder. A parameter or a `let`
@@ -544,6 +555,27 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      (match dictTryFind typeCases (headDef.Name + "." + last.Text) with
                       | Some cd -> record last cd
                       | None -> record last (Map.find last.Text env))
+                 // `Inner.Colour.Green`: a case named through its type AND
+                 // the module that holds it. The TYPE is the second-to-last
+                 // segment and the case the last; `typeCases` is keyed by the
+                 // type's own name, so the module spine in front of it does
+                 // not change the lookup.
+                 | Some spine when
+                        List.length spine >= 3
+                        && (let last = List.last spine
+                            let ty = spine |> List.item (List.length spine - 2)
+                            (dictTryFind typeCases (ty.Text + "." + last.Text)).IsSome) ->
+                     let last = List.last spine
+                     let ty = spine |> List.item (List.length spine - 2)
+                     (match Map.tryFind (List.head spine).Text env with
+                      | Some hd -> record (List.head spine) hd
+                      | None -> ())
+                     (match Map.tryFind ty.Text env with
+                      | Some td -> record ty td
+                      | None -> ())
+                     (match dictTryFind typeCases (ty.Text + "." + last.Text) with
+                      | Some cd -> record last cd
+                      | None -> ())
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])

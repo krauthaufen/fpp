@@ -1655,6 +1655,24 @@ let qualifiedCtorTests =
                       "let b = print (Inner.Sub<int>(9)).V" ]
             Expect.equal out "16\n9\n" "generic qualified base, qualified interface"
         }
+        test "a union case named through its module AND its type" {
+            // `Inner.Colour.Green` — three segments, and no value carries
+            // that whole path. The TYPE is the second-to-last segment, and
+            // the case table is keyed by the type's own name whatever module
+            // holds it. Expression and PATTERN position resolve separately.
+            let out =
+                run [ "module Inner ="
+                      "    type Colour ="
+                      "        | Red"
+                      "        | Green of int"
+                      "let a = Inner.Colour.Green 7"
+                      "let b = Inner.Colour.Red"
+                      "let c = match a with Inner.Colour.Green n -> n | _ -> 0"
+                      "let d = match b with Inner.Colour.Red -> 1 | _ -> 0"
+                      "let p = print c"
+                      "let q = print d" ]
+            Expect.equal out "7\n1\n" "built and matched through the full path"
+        }
         test "everything else qualifies too" {
             let out =
                 run [ "module Inner ="
