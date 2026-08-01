@@ -241,17 +241,26 @@ generic in, so the demand carries a variable the substitution does not know.
 Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
 snapshot into an array and hand back the built-in array iterator.
 
-## A class constraint on a TYPE declaration is not enforced
+## F#'s constraint spellings ARE typeclasses
 
-`type Box<'a> when Ordered<'a> = ...` parses, and so does F#'s own
-`type Box<'a when 'a : comparison>`. Neither BINDS: nothing pushes the
-constraint into the members as a given, and nothing checks it at an
-instantiation, so `Box<Opaque>` is accepted where `Opaque` has no instance.
-What does work is inference — a member whose body calls `compare` gets
-`Ordered` from that — which is why the declaration looks like it works
-until you write a type that does not satisfy it.
+`type Box<'a> when Ordered<'a> = ...` and F#'s own
+`type Box<'a when 'a : comparison>` mean the same thing and are both
+enforced: the constraint travels on the type's CONSTRUCTOR, so building a
+`Box<Opaque>` wants `Ordered<Opaque>` the way any other call would and is
+rejected by name.
 
-Constraints on a `let` or a member signature ARE enforced.
+| F# | the class |
+| --- | --- |
+| `'a : comparison` | `Ordered<'a>` |
+| `'a : unmanaged` | `Unmanaged<'a>` |
+| `'a : equality` | nothing to ask for — structural `=` is builtin |
+| `'a : struct`, `not struct`, `null`, `(new : unit -> 'a)` | no counterpart; they describe a CLR representation |
+
+`Unmanaged<'a>` is the blittable property: no references, a fixed size, C's
+layout. It is what the compiler already decides when it lays out a POD array
+or matches emscripten's padding, and its instance carries `byteSize`, which
+is the fact a caller actually wants. Instances exist for every primitive;
+a struct needs its own, which is the piece a deriving plugin should fill.
 
 ## The integer types, and which are int-shaped
 

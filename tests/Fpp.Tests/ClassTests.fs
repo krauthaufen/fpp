@@ -1342,6 +1342,53 @@ let typeExtensionTests =
                       "let b = print c.Twice" ]
             Expect.equal out "21\n42\n" "the namespace spine is not the name"
         }
+        test "a type-level constraint is ENFORCED at construction" {
+            let ds =
+                diagnostics [ "type Opaque(n : int) ="
+                              "    member x.N = n"
+                              "type Box<'a>(x : 'a) when Ordered<'a> ="
+                              "    member p.X = x"
+                              "let bad = Box<Opaque>(Opaque 1)" ]
+            Expect.isTrue
+                (ds |> List.exists (fun d -> d.Contains "Ordered<Opaque>"))
+                "the constraint travels on the constructor"
+        }
+        test "F#'s own constraint spellings are the same classes" {
+            // `'a : comparison` IS `Ordered<'a>`, and `'a : unmanaged` is the
+            // blittable property the layout machinery already computes
+            let cmp =
+                diagnostics [ "type Opaque(n : int) ="
+                              "    member x.N = n"
+                              "type Sorted<'a when 'a : comparison>(x : 'a) ="
+                              "    member p.X = x"
+                              "let bad = Sorted<Opaque>(Opaque 1)" ]
+            Expect.isTrue
+                (cmp |> List.exists (fun d -> d.Contains "Ordered<Opaque>"))
+                "comparison is Ordered"
+            let unm =
+                diagnostics [ "type Opaque(n : int) ="
+                              "    member x.N = n"
+                              "type Blit<'a when 'a : unmanaged>(x : 'a) ="
+                              "    member p.X = x"
+                              "let bad = Blit<Opaque>(Opaque 1)" ]
+            Expect.isTrue
+                (unm |> List.exists (fun d -> d.Contains "Unmanaged<Opaque>"))
+                "unmanaged is Unmanaged"
+        }
+        test "a satisfied constraint compiles and runs" {
+            let out =
+                run [ "type Sorted<'a when 'a : comparison>(x : 'a) ="
+                      "    member p.X = x"
+                      "    member p.Bigger (o : 'a) = if compare x o > 0 then x else o"
+                      "type Blit<'a when 'a : unmanaged>(x : 'a) ="
+                      "    member p.X = x"
+                      "let s = Sorted<int>(3)"
+                      "let b = Blit<int>(5)"
+                      "let a = print s.X"
+                      "let c = print (s.Bigger 7)"
+                      "let d = print b.X" ]
+            Expect.equal out "3\n7\n5\n" "int satisfies both"
+        }
         test "a type declaration carries class constraints" {
             let out =
                 run [ "type Box<'a>(x : 'a) when Ordered<'a> ="

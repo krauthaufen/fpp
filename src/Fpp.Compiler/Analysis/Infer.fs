@@ -963,7 +963,53 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// `when C<'a> with Result = 'a` (and the `= 'a` shorthand, which names
     /// the class' only associated type).
+    /// F#'s own constraint spellings, as the classes that mean the same
+    /// thing. `equality` and the rest are not omissions: structural `=` is
+    /// builtin, so an equality constraint asks for nothing, and `struct` /
+    /// `not struct` / `null` / `new` say things about a CLR representation
+    /// that has no counterpart here.
+    let fsharpConstraintClass (name : string) : string option =
+        match name with
+        | "comparison" -> Some "Ordered"
+        | "unmanaged" -> Some "Unmanaged"
+        | _ -> None
+
+    /// `when 'a : comparison` — F#'s INLINE form, which spells the same
+    /// thing as `when Ordered<'a>` and reads through the same function.
+    let fsharpInlineConstraint (vars : Dict<string, Type>) (n : GreenNode) : Constraint option =
+        let idents = tokensOf n |> List.filter (fun t -> t.Kind = Ident)
+        let hasColon = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":")
+        if not hasColon then None
+        else
+            match idents |> List.tryLast with
+            | Some last ->
+                (match fsharpConstraintClass last.Text with
+                 | Some cls ->
+                     // the constrained variable, read from the TOKENS: the
+                     // inline form is absorbed verbatim (that is what keeps
+                     // the parse lossless), so there is no type node to read
+                     let rec varAfterTick (ts : Token list) =
+                         match ts with
+                         | a :: b :: rest ->
+                             if a.Kind = Operator && a.Text = "'" && b.Kind = Ident then Some b.Text
+                             else varAfterTick (b :: rest)
+                         | _ -> None
+                     (match varAfterTick (tokensOf n) |> Option.bind (dictTryFind vars) with
+                      | Some argTy -> Some { Class = cls; Args = [ argTy ]; Assoc = [] }
+                      | None ->
+                          match n.Children |> List.tryPick (fun c ->
+                                    match c with
+                                    | GNode ty when isTypeKind ty.NodeKind -> Some (typeFromNode vars ty)
+                                    | _ -> None) with
+                          | Some argTy -> Some { Class = cls; Args = [ argTy ]; Assoc = [] }
+                          | None -> None)
+                 | None -> None)
+            | None -> None
+
     let constraintOf (vars : Dict<string, Type>) (n : GreenNode) : Constraint option =
+        match fsharpInlineConstraint vars n with
+        | Some c -> Some c
+        | None ->
         classHead vars n
         |> Option.map (fun (cls, args) ->
             let assocName =
@@ -2616,6 +2662,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let paramVarList () =
             vecToList tyParams
             |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
+        // `type Box<'a> when Ordered<'a> = ...` — the type's own context. It
+        // travels on the CONSTRUCTOR's scheme, so building a Box<Opaque>
+        // wants Ordered<Opaque> the way any other call would, and F#'s
+        // inline spelling (`<'a when 'a : comparison>`) lands in the same
+        // place: `constraintOf` reads both.
+        let declaredTypeCons =
+            nodesOf n
+            |> List.filter (fun m -> m.NodeKind = WhenDecl)
+            |> List.choose (constraintOf vars)
+        let inlineTypeCons =
+            nodesOf n
+            |> List.filter (fun m -> m.NodeKind = TyParams)
+            |> List.collect (fun m ->
+                    m.Children
+                    |> List.choose (fun c ->
+                        match c with
+                        | GNode w when w.NodeKind = WhenDecl -> constraintOf vars w
+                        | _ -> None))
+        let typeCons = declaredTypeCons @ inlineTypeCons
         // union cases become constructor schemes
         for m in nodesOf n do
             match m.NodeKind with
@@ -2685,7 +2750,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for b in nodesOf m do
                     if isExprish b.NodeKind then exprType (GNode b) |> ignore
                 let ctorTy = TFun (argTy, selfTy)
-                let csch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = ctorTy }
+                let csch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = typeCons; Body = ctorTy }
                 // With no primary constructor the FIRST `new` is what the
                 // type name denotes; any others live at their own keyword.
                 let prior = match dictTryFind ctors name with Some l -> l | None -> []
@@ -2729,7 +2794,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                  | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
                      let ctorTy = TFun (ctorArgTy, selfTy)
-                     let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = ctorTy }
+                     let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = typeCons; Body = ctorTy }
                      setScheme nameTok.Offset sch
                      let prior = match dictTryFind ctors name with Some l -> l | None -> []
                      dictSet ctors name (prior @ [ nameTok.Offset, sch ])

@@ -26,6 +26,17 @@ class Integral<'a>
     when Num<'a>
     when Div<'a, 'a> = 'a
     when Rem<'a, 'a> = 'a
+/// F#'s `unmanaged` constraint: the type is BLITTABLE — no references, a
+/// fixed size, and a layout that matches C's. It is what the compiler
+/// already decides when it lays out a POD array or matches emscripten's
+/// struct padding; as a class, user code can demand it too, which is what a
+/// zero-copy buffer needs.
+///
+/// A marker: the instance carries the size, because that is the fact a
+/// caller actually wants and the one the layout already knows.
+class Unmanaged<'a>
+    static byteSize : int
+
 class Ordered<'a>
     static compare : 'a -> 'a -> int
 class Neg<'a>
@@ -226,6 +237,33 @@ instance Num<byte>
     static Zero = 0uy
     static One = 1uy
 instance Integral<byte>
+instance Unmanaged<int>
+    static byteSize = 4
+instance Unmanaged<uint32>
+    static byteSize = 4
+instance Unmanaged<int64>
+    static byteSize = 8
+instance Unmanaged<uint64>
+    static byteSize = 8
+instance Unmanaged<float>
+    static byteSize = 8
+instance Unmanaged<float32>
+    static byteSize = 4
+instance Unmanaged<float16>
+    static byteSize = 2
+instance Unmanaged<byte>
+    static byteSize = 1
+instance Unmanaged<sbyte>
+    static byteSize = 1
+instance Unmanaged<int16>
+    static byteSize = 2
+instance Unmanaged<uint16>
+    static byteSize = 2
+instance Unmanaged<char>
+    static byteSize = 2
+instance Unmanaged<bool>
+    static byteSize = 1
+
 instance Ordered<byte>
 instance MinMax<byte>
     static min a b = if a < b then a else b
