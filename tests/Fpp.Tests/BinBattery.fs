@@ -219,6 +219,14 @@ let binBattery =
               "    if a = a then print 1 else print 0" ]
             "1\n0\n1\n"
 
+        expects "an inline let-in with a tuple pattern runs"
+            [ "let pair () = (3, 4)"
+              "let triple () = (1, 2, 3)"
+              "let go ="
+              "    print (let (x, y) = pair () in x + y)"
+              "    print (let (n, _, _) = triple () in n)" ]
+            "7\n1\n"
+
         expects "print of Int32.MinValue is not a wrapped negation"
             // `0 - min` wraps back to min, so a SIGNED remainder produced a
             // negative digit and printed "-(" — the magnitude is the same

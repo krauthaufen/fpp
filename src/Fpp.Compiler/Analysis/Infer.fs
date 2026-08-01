@@ -2483,16 +2483,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
             else tUnit
         | _ ->
-            // destructuring: bind all pattern names, unify with the body
+            // destructuring: bind all pattern names, unify with the body.
+            // With `in` the FIRST after-expr is the value and the last is the
+            // continuation — unifying the pattern with the continuation
+            // instead is how `let (x, y) = pair () in x + y` reported
+            // "int * int vs int", and made the whole let type as unit
+            let hasIn =
+                tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "in")
             st.EnterLevel ()
             let patTys = pats |> List.map (patType vars)
             let bodyTys = vecToList after |> List.map exprType
             st.ExitLevel ()
-            (match patTys, List.tryLast bodyTys with
+            let valueTy =
+                match bodyTys, hasIn with
+                | v :: _, true -> Some v
+                | _, _ -> List.tryLast bodyTys
+            (match patTys, valueTy with
              | [ single ], Some b -> unify single b |> ignore
              | many, Some b -> unify (TTuple many) b |> ignore
              | _ -> ())
-            tUnit
+            if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
+            else tUnit
 
     and inferTypeDecl (n : GreenNode) : unit =
         if pendingStructAttr then

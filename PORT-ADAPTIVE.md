@@ -28,20 +28,16 @@ library itself says is the library, in the order the library says.
 
 ## Where it stands
 
-The port parses and type-checks from line 1 to **6233 of 22,635** — through
+The port parses and type-checks from line 1 to **7451 of 22,635** — through
 `ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
-`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, and well into
+`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, and most of
 `MapExt.fs`. Everything past the frontier is unknown, not known-bad: the
 errors after the first are a cascade until the first is fixed.
 
-The frontier is an inline `let … in` with a TUPLE pattern:
-
-```fsharp
-else let (n,_,_) = withMinExclusiveN cmp minKey node.Left in n
-```
-
-which types as `unit`. PLAN.md already parks this one ("inline `let ... in`
-destructure"), so it is a known gap rather than a new discovery.
+The frontier is `byref`. MapExt declares four (`TryRemove`,
+`TryGetValue`), and the call sites pass `&x` on mutable FIELDS —
+`Interlocked.Increment(&currentId)`, `weak.TryGetTarget(&old)` — so both
+halves are needed, not just the declaration.
 
 ## What is replaced, and what it became
 

@@ -179,6 +179,23 @@ let inferSelfTests =
             Expect.equal diags 0 "zero type diagnostics on own sources"
         }
 
+        test "an inline `let (a, b) = e in body` types as the body" {
+            // the destructuring branch unified the pattern with the LAST
+            // after-expression, which under `in` is the continuation — so
+            // the binding's value and the body's result were unified with
+            // each other, and the whole let typed as unit
+            let src =
+                String.concat "\n"
+                    [ "module R"
+                      "let pair () = (3, 4)"
+                      "let a () ="
+                      "    let (x, y) = pair () in x + y"
+                      "let b () ="
+                      "    let (n, _, _) = (1, 2, 3) in n"
+                      "" ]
+            Expect.isEmpty (inferSrc src).Diagnostics "no mismatch"
+        }
+
         test "an uppercase identifier in a case pattern is a CASE, not a binder" {
             // F# reads a pattern identifier starting uppercase as a union
             // case. Binding it instead shadowed the case for the rest of the
