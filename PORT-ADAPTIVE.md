@@ -26,6 +26,29 @@ dotnet run -c Release --project src/Fpp.Cli -- check /tmp/adaptive.fpp
 The driver reads the compile order from the `.fsproj`, so it ports what the
 library itself says is the library, in the order the library says.
 
+## How much is actually left — measured, not guessed
+
+The first-error frontier is pessimistic: it stops at the first problem and
+says nothing about the 14,000 lines behind it. Parsing each of the 40 files
+ON ITS OWN answers the real question, because a parse error is a missing
+SYNTAX feature while a type error mostly needs cross-file context:
+
+    27 of 40 files parse clean
+    13 have a parse error, and the error counts are cascades —
+       one construct produces hundreds of "unexpected token"
+
+The distinct blockers behind those 13 are a short list, and the biggest one
+was not a language feature at all: SIX files were stopped by `#nowarn
+"7331"`, a compiler directive. Skipping directives took ten lines and made
+four more files parse clean on the spot.
+
+That is the shape of this work. The remaining constructs are ordinary F#
+that any project would use — type extensions on DOTTED names
+(`type System.Threading.Interlocked with`), computation expressions,
+`use`/`IDisposable` — not exotica. Nothing so far has needed a
+FSharp.Data.Adaptive-specific hack, and every fix has been small and
+general.
+
 ## Where it stands
 
 The port parses and type-checks from line 1 to **8027 of 22,635** — through

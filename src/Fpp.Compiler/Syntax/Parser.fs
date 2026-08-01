@@ -178,8 +178,14 @@ let parse (src : string) : ParseResult =
                              List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen)))
         // quotations and splices come through canStartAtom
 
+    let isDirectiveHere () =
+        s.IsOp "#" && (s.Peek 1).Kind = Ident
+        && List.contains (s.Peek 1).Text
+            [ "nowarn"; "light"; "line"; "load"; "r"; "I"; "time"; "help"; "quit" ]
+
     let canStartDecl () =
-        s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
+        isDirectiveHere ()
+        || s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
         || s.IsKw "namespace" || s.IsKw "and" || s.IsKw "do" || s.IsKw "exception"
         || s.IsKw "extern" || s.IsKw "instance"
         // `class` also opens an F#-style `type X = class ... end`, which F++
@@ -1513,6 +1519,15 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (s.Bump ())
                 vecAdd acc (parseType ctx)
             Green.node TypeDecl (vecToList acc)
+        elif isDirectiveHere () then
+            // a COMPILER DIRECTIVE: `#nowarn "7331"`, `#light`. It addresses
+            // the compiler, not the program, and every one of them is either
+            // about warnings F++ does not raise or about a script host it
+            // does not have. Consumed to the end of its line.
+            let acc = vecNew<Green> ()
+            vecAdd acc (s.Bump ())
+            while not s.AtEof && s.SameLine do vecAdd acc (s.Bump ())
+            Green.node BlockExpr (vecToList acc)
         elif s.Is LBracket then parseAttributeList ()
         elif s.IsKw "do" then
             let d = s.Bump ()
