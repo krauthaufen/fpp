@@ -37,11 +37,12 @@ errors after the first are a cascade until the first is fixed.
 The frontier is inside `IndexList.fs`. Two things are known to be waiting
 there and beyond:
 
-* **`&x` at a call site.** The byref DECLARATION works — a byref is a
-  one-field cell and `value <- v` writes through it — but taking the address
-  of a mutable field (`Interlocked.Increment(&currentId)`,
-  `weak.TryGetTarget(&old)`) is not built. The plan is copy-in/copy-out
-  around the call, which is what a byref means single-threaded.
+* **`&x` on a mutable LOCATION.** `&x` parses and types, and FORWARDING a
+  byref parameter to another (`x.TryGetValue(key, &value)`) hands the same
+  cell on, which is the whole of what MapExt needs. Taking the address of a
+  mutable field or local (`Interlocked.Increment(&currentId)`,
+  `weak.TryGetTarget(&old)`) still needs copy-in/copy-out around the call,
+  or promotion of that storage to a cell.
 * **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
   parses and is kept in the tree, and no longer counts as a type parameter
   — but it is inert. Each of F#'s constraints has a meaning F++ can express

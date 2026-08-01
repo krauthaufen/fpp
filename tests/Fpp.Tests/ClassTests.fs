@@ -1443,6 +1443,23 @@ let byrefTests =
                       "let c = print (if s.TryGet (1, cell) then 1 else 0)" ]
             Expect.equal out "1\n42\n0\n" "the write lands in the cell"
         }
+        test "&x forwards a byref parameter to another byref parameter" {
+            let out =
+                run [ "type Store(n : int) ="
+                      "    let mutable v = n"
+                      "    member x.TryGet (key : int, value : byref<int>) : bool ="
+                      "        if key = 0 then"
+                      "            value <- v"
+                      "            true"
+                      "        else false"
+                      "    member x.Forward (key : int, value : byref<int>) : bool ="
+                      "        x.TryGet (key, &value)"
+                      "let s = Store 42"
+                      "let cell = { Contents = 0 }"
+                      "let a = print (if s.Forward (0, cell) then 1 else 0)"
+                      "let b = print cell.Contents" ]
+            Expect.equal out "1\n42\n" "the same cell is handed on"
+        }
         test "an inline type-parameter constraint is not a type parameter" {
             // `type MapExt<'Key, 'Value when 'Key : comparison>` — every
             // identifier in the constraint used to count as another

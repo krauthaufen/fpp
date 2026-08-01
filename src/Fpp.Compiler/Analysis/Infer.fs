@@ -1694,6 +1694,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | [ i ] -> unifyAt t.Offset i tBool
                       | _ -> ())
                      tBool
+                 | Some t when t.Text = "&" ->
+                     // `&x` for a byref argument. Forwarding a byref
+                     // parameter (`f (key, &value)` where value is already
+                     // one) hands the SAME cell on; anything else is a
+                     // location whose cell the call site makes.
+                     (match inner with
+                      | [ i ] ->
+                          (match prune i with
+                           | TCon ("ByRefCell", _) -> i
+                           | other -> TCon ("ByRefCell", [ other ]))
+                      | _ -> st.Fresh ())
                  | Some t when t.Text = "~~~" ->
                      // bitwise complement keeps its operand's integer type
                      (match inner with

@@ -173,6 +173,9 @@ let parse (src : string) : ParseResult =
         || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
+        // `&x` — an address, for a byref argument
+        || (s.IsText "&" && (let n = s.Peek 1 in
+                             List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen)))
         // quotations and splices come through canStartAtom
 
     let canStartDecl () =
@@ -697,6 +700,13 @@ let parse (src : string) : ParseResult =
             if s.Is Operator && s.Cur.Text = "@>" then vecAdd acc (s.Bump ())
             else s.Diag "expected '@>' to close the quotation"
             Green.node QuoteExpr (vecToList acc)
+        elif s.IsOp "&" && (let n = s.Peek 1 in
+                            List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen)) then
+            // `&x` — the ADDRESS of a mutable location, for a byref
+            // parameter. Adjacency is what distinguishes it from the
+            // bitwise operators, which are `&&&` and `&&`.
+            let amp = s.Bump ()
+            Green.node PrefixExpr [ amp; parsePostfix ctx ]
         elif isSpliceHere () then
             // a splice: `%x` names code to drop in here
             let pct = s.Bump ()
