@@ -1583,3 +1583,25 @@ let byrefTests =
             Expect.equal out "3\na\n" "two parameters, not four"
         }
     ]
+
+[<Tests>]
+let qualifiedCtorTests =
+    testList "qualified construction" [
+        test "a QUALIFIED constructor call picks the same overload as a bare one" {
+            // `Impl.Node(k, v)` never reached overload selection: the search
+            // took the FIRST identifier of the head, which for a dotted name
+            // is the module. It took the primary constructor whatever its
+            // arity, and the mismatch surfaced far from the call.
+            let out =
+                run [ "module Impl ="
+                      "    type Node<'K, 'V>(key : 'K, value : 'V, height : byte) ="
+                      "        member x.Key = key"
+                      "        member x.Height = height"
+                      "        new(k, v) = Node<'K, 'V>(k, v, 1uy)"
+                      "let a = Impl.Node<int, string>(1, \"x\", 3uy)"
+                      "let b = Impl.Node<int, string>(2, \"y\")"
+                      "let p = print (int a.Height)"
+                      "let q = print (int b.Height)" ]
+            Expect.equal out "3\n1\n" "the qualified call takes the two-argument one"
+        }
+    ]

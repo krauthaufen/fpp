@@ -671,14 +671,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let overloaded =
                          let ctorHead =
                              if head.NodeKind = IdentExpr then Some head
+                             // qualified — `Impl.Node(k, v)`; the overload set
+                             // belongs to the LAST segment, and inference
+                             // keyed its choice there
+                             elif head.NodeKind = DotExpr then Some head
                              elif head.NodeKind = AppExpr
                                   && (nodesOf head |> List.exists (fun x -> x.NodeKind = TyParams)) then
-                                 nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr)
+                                 (match nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr) with
+                                  | Some h -> Some h
+                                  | None -> nodesOf head |> List.tryFind (fun x -> x.NodeKind = DotExpr))
                              else None
                          match ctorHead with
                          | None -> None
                          | Some head ->
-                             match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
+                             match tokensOf head |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                              | Some ht ->
                                  (match dictTryFind ctorSites ht.Offset with
                                   | Some coff -> dictTryFind defsAt coff

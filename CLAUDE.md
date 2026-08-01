@@ -12,14 +12,14 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 570 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 571 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 570 tests missed — a `List.init` that counted down, an equality that
+bugs the 571 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
@@ -162,6 +162,22 @@ will bite anyone extending them:
 Extra members exist that .NET does not have (`Reserve`, `SlotOf`, `Rehash`,
 `KeyArray`) because there is no working `member private` convention here.
 They are implementation, not surface.
+
+## Qualification, and the first-identifier trap
+
+`Impl.Node(k, v)` must mean what `Node(k, v)` means. It did not: constructor
+overload selection searched the head for the FIRST identifier, which on a
+dotted name is the MODULE, so a qualified call never reached selection and
+took the primary constructor whatever its arity — and the mismatch surfaced
+far from the call.
+
+The rule: a dotted head is named by its LAST segment. Infer and Lower must
+agree on which token they key by, or inference chooses one constructor and
+emission calls another.
+
+There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in
+Infer and Lower. Each one is this question — first or last — and each is
+right only if its head cannot be qualified. Worth auditing as a group.
 
 ## Pattern identifiers
 

@@ -1425,14 +1425,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // `HashSet<'K>(comparer, root)`
                          let ctorHead =
                              if head.NodeKind = IdentExpr then Some head
+                             // QUALIFIED: `Impl.Node(k, v)` names the type by
+                             // its path, and the overload set belongs to the
+                             // last segment. Without this the qualified call
+                             // never reached selection and took the primary
+                             // constructor whatever its arity.
+                             elif head.NodeKind = DotExpr then Some head
                              elif head.NodeKind = AppExpr
                                   && (nodesOf head |> List.exists (fun x -> x.NodeKind = TyParams)) then
-                                 nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr)
+                                 (match nodesOf head |> List.tryFind (fun x -> x.NodeKind = IdentExpr) with
+                                  | Some h -> Some h
+                                  | None -> nodesOf head |> List.tryFind (fun x -> x.NodeKind = DotExpr))
                              else None
                          match ctorHead with
                          | None -> None
                          | Some head ->
-                             match tokensOf head |> List.tryFind (fun t -> t.Kind = Ident) with
+                             match tokensOf head |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                              | Some ht ->
                                  (match dictTryFind useDefs ht.Offset with
                                   | Some d when d.Kind = Resolve.DefType ->
