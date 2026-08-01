@@ -6,11 +6,10 @@ module Stdlib
 // what pins the semantics — insertion order, what Add refuses, which way
 // Round breaks a tie, what Length counts.
 //
-// Three things are deliberately not here, because F++ does not have them:
-// TryGetValue and every other byref out-parameter; using a ResizeArray
-// directly as a seq (it carries GetEnumerator, so `for` works, but no
-// IEnumerable implementation); and a mutable HashSet, whose name collides
-// with the prelude's immutable one. All three are in DIVERGENCES.md.
+// Two things are deliberately not here, because F++ does not have them:
+// TryGetValue and every other byref out-parameter, and a mutable HashSet
+// under that name — ours is `MutableHashSet`, because `HashSet` belongs to
+// the prelude's immutable one. Both are in DIVERGENCES.md.
 
 open System
 open System.Collections.Generic
@@ -75,6 +74,13 @@ let r21 =
         s <- s + v
     print s
 
+// the collections ARE seqs: the whole Seq module applies to them
+let q0 = print (Seq.sum (big :> seq<int>))
+let q1 = print (Seq.length (names :> seq<string>))
+let q2 = print (String.concat "," (List.ofSeq (names :> seq<string>)))
+let q3 = print (Seq.sum (Seq.map (fun (x : int) -> x * 2) (big :> seq<int>)))
+let q4 = print (Seq.length (Seq.filter (fun (x : int) -> x % 2 = 0) (big :> seq<int>)))
+
 // ---- Dictionary ---------------------------------------------------------
 
 let d = Dictionary<string, int>()
@@ -117,6 +123,35 @@ let d17 =
     print removed
 let d18 = print counts.Count
 let d19 = print counts.[26]
+
+// ---- MutableHashSet -----------------------------------------------------
+//
+// .NET's HashSet, under a name that is free here. The F# run gets the
+// alias from the oracle harness' preamble, so this is one source again.
+
+let hs = MutableHashSet<string>()
+let h0 = print (if hs.Add "x" then 1 else 0)
+let h1 = print (if hs.Add "x" then 1 else 0)
+let h2 = print hs.Count
+let h3 =
+    hs.UnionWith [ "y"; "z"; "x" ]
+    print hs.Count
+let h4 = print (if hs.Contains "y" then 1 else 0)
+let h5 = print (if hs.Remove "y" then 1 else 0)
+let h6 = print (if hs.Remove "y" then 1 else 0)
+let h7 = print (String.concat "," (List.sort (List.ofSeq (hs :> seq<string>))))
+let h8 =
+    hs.ExceptWith [ "x" ]
+    print hs.Count
+let h9 = print (if hs.IsSubsetOf [ "z"; "q" ] then 1 else 0)
+let h10 = print (if hs.Overlaps [ "z"; "q" ] then 1 else 0)
+
+let seen = MutableHashSet<int>()
+let h11 =
+    for i in 1 .. 200 do
+        seen.Add (i % 37) |> ignore
+    print seen.Count
+let h12 = print (Seq.sum (seen :> seq<int>))
 
 // ---- StringBuilder ------------------------------------------------------
 

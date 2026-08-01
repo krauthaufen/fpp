@@ -3745,7 +3745,13 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             if fn <> "__desc" && fn <> "__idhash" then dictSet st.RecFieldTy (rn, fn) ty
         names |> List.iteri (fun i fn ->
             dictSet st.FieldIdx (rn, fn) i
-            if fn <> "__desc" && fn <> "__idhash" then dictSet st.FieldOwner fn rn)
+            // An INSTANTIATED subclass (`C$<int>`, one per element type, for
+            // the vtable) redeclares its base's field names and nothing of
+            // its own. Letting it claim ownership would point every
+            // unqualified read of those fields at the instantiation, and
+            // canonical code holding a plain C would fail the cast.
+            if fn <> "__desc" && fn <> "__idhash" && not (rn.Contains "$<") then
+                dictSet st.FieldOwner fn rn)
         if not stf && isObjRecord rn then
             // a FIELDLESS abstract base (all it declares is abstract members)
             // is lowered without a record of its own, so there is no $r_ type

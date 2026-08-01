@@ -38,6 +38,11 @@ let private oracleFile (relPath : string) (stripPrefix : string) =
         + "    | :? string as s -> printfn \"%s\" s\n"
         + "    | :? int as i -> printfn \"%d\" i\n"
         + "    | other -> printfn \"%O\" other\n"
+        // F#-side only: the mutable set is `MutableHashSet` in the prelude,
+        // because `HashSet` is taken by the immutable one. Declaring the
+        // alias in the shared source would collide with the prelude type on
+        // the F++ side, so it lives here, where only F# sees it.
+        + "type MutableHashSet<'a> = System.Collections.Generic.HashSet<'a>\n"
     let fsx = System.IO.Path.GetTempFileName() + ".fsx"
     System.IO.File.WriteAllText(fsx, prelude + body)
     let expected = run "dotnet" ("fsi " + fsx)

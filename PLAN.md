@@ -679,7 +679,25 @@ reduceBack/findBack/findIndexBack/transpose/permute/insertAt/removeAt/
 updateAt`).
 
 Gated by `stdlib/dotnet.fpp`, which runs under F++ AND under `dotnet fsi`
-and must print the same 93 values.
+and must print the same 111 values.
+
+### DONE: generic classes that implement interfaces are monomorphized
+A member reached through a vtable keeps the canonical all-anyref signature,
+so it is never specialized — and it read a `'a[]` field at the uniform
+representation while a `C<int>` held a packed array. The cast failed at run
+time, at packed element types only, with no diagnostic anywhere. Each
+instantiation is now a SUBCLASS of its class, allocated by the stamped
+constructor and carrying a vtable whose slots name the members stamped at
+that element type; fields, order and `:? C` are inherited unchanged. A class
+whose vtable members are layout-dependent drags its constructor into
+stamping with them — the constructor is what allocates, and allocating picks
+the vtable.
+
+That is what lets `ResizeArray`, `Dictionary` and `MutableHashSet` be real
+`seq`s while keeping their elements in a packed array. Still open: a generic
+class constructed inside another generic class' member (the .NET
+`Enumerator<'a>` shape) canonicalizes the inner instantiation —
+`tests/known-issues/`.
 
 Three compiler holes had to close first, all found by writing the library:
 

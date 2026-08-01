@@ -1226,3 +1226,62 @@ let mutableHashSetTests =
             Expect.equal out "2\n1\n0\n1\n0\n" "the set-relation surface"
         }
     ]
+
+[<Tests>]
+let perInstantiationVtableTests =
+    testList "per-instantiation vtables" [
+        test "an interface method reads a PACKED field through the vtable" {
+            // the member keeps the canonical all-anyref signature, so it used
+            // to read `items` at the uniform representation and fail the cast
+            // — but only at packed element types, and with no diagnostic
+            let out =
+                run [ "type Arr<'a>(items : 'a[]) ="
+                      "    member x.First = items.[0]"
+                      "    interface IEnumerator<'a> with"
+                      "        member _.MoveNext () = false"
+                      "        member _.Current = items.[0]"
+                      "let a = Arr<int>([| 5; 6 |])"
+                      "let d = print a.First"
+                      "let e = a :> IEnumerator<int>"
+                      "let f = print e.Current" ]
+            Expect.equal out "5\n5\n" "direct and vtable agree"
+        }
+        test "two instantiations get two vtables" {
+            let out =
+                run [ "type Cell<'a>(v : 'a[]) ="
+                      "    interface IEnumerator<'a> with"
+                      "        member _.MoveNext () = false"
+                      "        member _.Current = v.[0]"
+                      "let i = (Cell<int>([| 7 |]) :> IEnumerator<int>)"
+                      "let s = (Cell<string>([| \"q\" |]) :> IEnumerator<string>)"
+                      "let a = print i.Current"
+                      "let b = print s.Current" ]
+            Expect.equal out "7\nq\n" "int and string dispatch to their own stamps"
+        }
+        test "the instantiation is still the class for a type test" {
+            let out =
+                run [ "type Holder<'a>(v : 'a[]) ="
+                      "    member x.Head = v.[0]"
+                      "    interface IEnumerator<'a> with"
+                      "        member _.MoveNext () = false"
+                      "        member _.Current = v.[0]"
+                      "let h = Holder<int>([| 3 |])"
+                      "let o : obj = box h"
+                      "let a = print (match o with :? Holder<int> as k -> k.Head | _ -> 0 - 1)" ]
+            Expect.equal out "3\n" "the subclass answers to its base"
+        }
+        test "the prelude collections are seqs" {
+            let out =
+                run [ "let ra = ResizeArray<int>()"
+                      "let a ="
+                      "    ra.Add 3"
+                      "    ra.Add 4"
+                      "    print (Seq.sum (ra :> seq<int>))"
+                      "let b = print (List.length (List.ofSeq (ra :> seq<int>)))"
+                      "let hs = MutableHashSet<int>()"
+                      "let c ="
+                      "    hs.UnionWith [ 5; 6 ]"
+                      "    print (Seq.sum (hs :> seq<int>))" ]
+            Expect.equal out "7\n2\n11\n" "packed elements, and still a seq"
+        }
+    ]

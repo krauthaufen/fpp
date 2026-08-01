@@ -210,40 +210,36 @@ compilation has seen the members of, which is what keeps the dogfooding gate
 (every source typed with NOTHING resolved) from calling `JsonNode.[…]` an
 error.
 
-## A generic class reached through an INTERFACE cannot depend on its layout
+## A generic class implementing an interface is monomorphized
 
-A member reachable through a vtable keeps the canonical all-anyref
-signature — that is the dispatch contract — so it is never specialized. A
-member called directly IS specialized. When the two disagree, the interface
-one loses:
+A member reached through a vtable keeps the canonical all-anyref signature —
+that IS the dispatch contract — so it is never specialized, and it would read
+a `'a[]` field at the uniform representation while a `C<int>` holds a PACKED
+array. One class, one descriptor, one vtable, shared by every instantiation:
+the cast failed at run time, at packed element types only, with no
+diagnostic.
 
-```fsharp
-type Arr<'a>(items : 'a[]) =
-    interface IEnumerator<'a> with
-        member _.Current = items.[0]     // reads `items` at the UNIFORM
-                                          // representation
-let e = Arr<int>([| 5; 6 |]) :> IEnumerator<int>
-e.Current                                 // traps: the field holds a PACKED
-                                          // int array
-```
+So each instantiation of a class that implements an interface becomes a
+SUBCLASS of it. The stamped constructor allocates `C$<int>`, whose vtable
+slots name the members stamped at `int`; the fields, their order and every
+read that casts to `C` are inherited unchanged, and `:? C` still answers true
+because the chain says so. A class whose vtable members depend on the layout
+drags its constructor into stamping with them, however plain the constructor
+looks — the constructor is what allocates, and allocating is what picks the
+vtable.
 
-Constructing it is fine, calling the member directly is fine, and at a
-reference element type (`Arr<string>`) even the interface call is fine. It
-is the combination — an interface method reading a field whose layout
-depends on a type parameter — that has no correct answer today.
+**The cost.** One extra descriptor and one wasm struct type per (class,
+element type) that is actually constructed, and the interface members are
+stamped rather than shared. Classes that implement no interface are
+untouched.
 
-**Why the prelude's own collections dodge it.** `ResizeArray`, `Dictionary`
-and `MutableHashSet` hold their elements in a packed `'a[]`, so none of them
-implements `IEnumerable<'a>`. They carry a plain `GetEnumerator` member
-instead, which is what `for x in xs` looks for (the loop is structural, as
-in F#), and hand back the BUILT-IN array iterator over a snapshot. So
-`for x in ra` works at every element type, and `Seq.map f ra` does not
-compile — go through `ra.ToArray ()`. A compile error is the honest failure
-here; the alternative was a runtime trap that only appeared at packed
-element types.
-
-Lifting this means monomorphizing the CLASS, not just its members: a
-per-instantiation descriptor whose vtable names the stamped bodies.
+**What is still not covered.** A generic class constructed INSIDE another
+generic class' member — the .NET shape where a collection hands out its own
+`Enumerator<'a>` — canonicalizes the inner instantiation and traps the same
+way. The member's own quantified variable is not the one the class is
+generic in, so the demand carries a variable the substitution does not know.
+Repro in `tests/known-issues/`. The prelude's collections do not hit it: they
+snapshot into an array and hand back the built-in array iterator.
 
 ## The .NET collections carry no byref members
 
@@ -274,4 +270,5 @@ in practice; `Add` on a duplicate key throws where `d.[k] <- v` overwrites;
 removes the first occurrence and answers whether it found one;
 `StringBuilder.Length` counts characters, not chunks. All of that is pinned
 by `stdlib/dotnet.fpp`, which runs under both compilers and must print the
-same 93 values.
+same 111 values — the seq usage included, so `Seq.map f (ra :> seq<int>)`
+means in F++ exactly what it means in F#.

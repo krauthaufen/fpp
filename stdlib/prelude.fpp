@@ -4716,6 +4716,13 @@ module Worker =
 // What is deliberately absent: `TryGetValue`, and every other method whose
 // .NET signature needs a byref out-parameter. There is no byref here, and a
 // `TryFind` returning an option would be a name F# does not have.
+//
+// All three implement `IEnumerable`, so the Seq module applies to them, and
+// they hold their elements in a PACKED array — no boxing for an int. Those
+// two used to be mutually exclusive: a vtable member is not specialized, so
+// it read the packed array as uniform and the cast failed. Each
+// instantiation of a class that implements an interface now carries its own
+// vtable (DIVERGENCES.md), which is what buys both at once.
 
 /// System.Collections.Generic.List<'a> — F# calls it ResizeArray, and so do
 /// we. Backed by one array that doubles; `Item` is the .NET indexer, so
@@ -4787,15 +4794,14 @@ type ResizeArray<'a>() =
             items.[count - 1 - i] <- t
             i <- i + 1
     /// `for x in xs` is STRUCTURAL — it looks for a GetEnumerator on the type
-    /// in front of it, and finds this one. There is deliberately no
-    /// `IEnumerable<'a>` implementation: an interface method keeps the
-    /// canonical all-anyref signature, so it would read `items` at the
-    /// uniform representation while a ResizeArray<int> holds a PACKED array,
-    /// and the cast would fail at run time. Snapshotting into an array and
-    /// handing back the built-in array iterator keeps the loop honest at
-    /// every element type; `xs.ToArray ()` is the seam to the Seq module.
+    /// in front of it, and finds this one. The interface implementation
+    /// below is what makes `xs :> seq<'a>` and the whole Seq module work;
+    /// it dispatches to the copy of this member stamped at THIS element
+    /// type, which is what per-instantiation vtables buy.
     member x.GetEnumerator () : IEnumerator<'a> =
         (x.ToArray () :> seq<'a>).GetEnumerator ()
+    interface IEnumerable<'a> with
+        member x.GetEnumerator () = (x.ToArray () :> seq<'a>).GetEnumerator ()
 
 /// System.Collections.Generic.Dictionary. Open-addressed over
 /// INSERTION-ORDERED entries: the slot table holds one-based indices into
@@ -4912,6 +4918,9 @@ type Dictionary<'k, 'v>() =
     member x.Values : seq<'v> = x.ValueArray () :> seq<'v>
     member x.GetEnumerator () : IEnumerator<KeyValuePair<'k, 'v>> =
         (Array.init dcount (fun i -> KeyValuePair<'k, 'v>(dkeys.[i], dvals.[i])) :> seq<KeyValuePair<'k, 'v>>).GetEnumerator ()
+    interface IEnumerable<KeyValuePair<'k, 'v>> with
+        member x.GetEnumerator () =
+            (Array.init dcount (fun i -> KeyValuePair<'k, 'v>(dkeys.[i], dvals.[i])) :> seq<KeyValuePair<'k, 'v>>).GetEnumerator ()
 
 /// System.Collections.Generic.HashSet — the same table without the values,
 /// under a DIFFERENT NAME. `HashSet` is taken twice over: by this prelude's
@@ -5017,6 +5026,8 @@ type MutableHashSet<'a>() =
     member x.ToArray () : 'a[] = Array.init scount (fun i -> skeys.[i])
     member x.GetEnumerator () : IEnumerator<'a> =
         (x.ToArray () :> seq<'a>).GetEnumerator ()
+    interface IEnumerable<'a> with
+        member x.GetEnumerator () = (x.ToArray () :> seq<'a>).GetEnumerator ()
 
 /// System.Text.StringBuilder. Appending is O(1) — the chunks are joined once,
 /// by the pairwise merge in String.concat, when the text is asked for. A left

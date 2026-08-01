@@ -380,6 +380,34 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                     dictSet layoutDependent (v.Path, v.Offset) true
                     changed <- true
             | _ -> ()
+    // A class whose VTABLE members depend on the layout drags its
+    // constructor in with them, however plain the constructor looks. The
+    // constructor is what allocates, and allocating is what picks the
+    // vtable: without a stamp per instantiation there is nowhere to hang
+    // one, and the interface call lands in the canonical member that reads
+    // a packed array as uniform.
+    let vtableLayoutDep = dictNew<string, bool> ()
+    for d in decls do
+        match d with
+        | DClass (n, _, own, impls) ->
+            let ms =
+                (own |> List.map snd)
+                @ (impls |> List.collect (fun (_, mems) -> mems |> List.map snd))
+            if ms |> List.exists (fun mv -> (dictTryFind layoutDependent (mv.Path, mv.Offset)) = Some true) then
+                dictSet vtableLayoutDep n true
+        | _ -> ()
+    /// constructors forced into stamping by their class' vtable, NOT by
+    /// anything in their own body
+    let vtableCtor = dictNew<string * int, bool> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, sch, ELam _) when
+                (dictTryFind vtableLayoutDep v.Name) = Some true
+                && not (List.isEmpty sch.Quantified) ->
+            if (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true then
+                dictSet vtableCtor (v.Path, v.Offset) true
+            dictSet layoutDependent (v.Path, v.Offset) true
+        | _ -> ()
 
     let stamped = dictNew<string, Decl> ()      // mangled name -> clone
     let queue = vecNew<(string * int) * string list> ()
@@ -685,6 +713,39 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | other -> vecAdd out other
 
     // transitive closure: stamping a clone may demand further stamps
+    // ---- per-instantiation vtables ----------------------------------------
+    //
+    // A member reached through a vtable keeps the canonical all-anyref
+    // signature — that IS the dispatch contract — so it is never specialized,
+    // and it would read a `'a[]` field at the uniform representation while a
+    // C<int> holds a PACKED array. One class, one descriptor, one vtable,
+    // shared by every instantiation: the cast fails.
+    //
+    // So each instantiation of a class that implements an interface becomes a
+    // SUBCLASS of it. The stamped constructor allocates C$<int>, whose vtable
+    // slots name the members stamped at int; everything else — the fields,
+    // their order, the field reads that cast to C — is inherited and
+    // unchanged, and `:? C` still answers true because the chain says so.
+    let classImplsOf = dictNew<string, (string * (string * VarId) list) list> ()
+    let classOwnOf = dictNew<string, (string * VarId) list> ()
+    for d in decls do
+        match d with
+        | DClass (n, _, own, impls) when not (List.isEmpty impls) ->
+            dictSet classImplsOf n impls
+            dictSet classOwnOf n own
+        | _ -> ()
+    /// the class a constructor builds — a class' ctor is the top-level
+    /// function that carries its name
+    let classOfCtor = dictNew<string * int, string> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam _) when (dictTryFind classImplsOf v.Name).IsSome ->
+            dictSet classOfCtor (v.Path, v.Offset) v.Name
+        | _ -> ()
+    /// the instantiated subclasses to declare, in discovery order
+    let instClasses = vecNew<string * string * (string * (string * VarId) list) list * (string * VarId) list> ()
+    let instClassSeen = dictNew<string, bool> ()
+
     let mutable i = 0
     while i < vecLen queue do
         let key, inst = vecGet queue i
@@ -710,10 +771,83 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                          | EVar (w, s2) when (w.Path, w.Offset) = selfKey -> EVar (nv, s2)
                          | other -> other)
                      x
+             // this instantiation's own subclass, if the class has a vtable
+             let instClass =
+                 match dictTryFind classOfCtor key with
+                 | Some cn ->
+                     let sub = mangleInst cn inst
+                     // one member stamp per interface method — the SAME
+                     // instantiation the constructor got, so the member's
+                     // quantified variables have to line up with it
+                     // A member's quantified list is not the class' — it may
+                     // carry variables of its own (an interface method's
+                     // result type brings one). The class' parameters are
+                     // found POSITIONALLY, through the receiver: whatever
+                     // `self` is generic in gets this instantiation, and a
+                     // variable the class does not name is unconstrained
+                     // here, which is what canonical means.
+                     let memberInst (msch : Scheme) : string list option =
+                         match prune msch.Body with
+                         | TFun (self, _) ->
+                             (match prune self with
+                              | TCon (n, args) when n = cn && args.Length = inst.Length ->
+                                  let m = dictNew<int, string> ()
+                                  List.zip args inst
+                                  |> List.iter (fun (a, t) ->
+                                        match prune a with
+                                        | TVar v -> dictSet m v.Id t
+                                        | _ -> ())
+                                  Some (msch.Quantified
+                                        |> List.map (fun q ->
+                                              match dictTryFind m (prunedId q) with
+                                              | Some t -> t
+                                              | None -> "obj"))
+                              | _ -> None)
+                         | _ -> None
+                     let stampMember (mv : VarId) : VarId =
+                         match dictTryFind bodies (mv.Path, mv.Offset) with
+                         | Some (_, _, msch, _) when not (List.isEmpty msch.Quantified) ->
+                             (match memberInst msch with
+                              | Some minst ->
+                                  let mm = mangleFor mv minst
+                                  if not (dictTryFind seen mm).IsSome then
+                                      dictSet seen mm true
+                                      vecAdd queue ((mv.Path, mv.Offset), minst)
+                                  { Path = mv.Path
+                                    Offset = mv.Offset + 7000000 + (abs (strHash mm) % 1000000)
+                                    Name = mm }
+                              | None -> mv)
+                         | _ -> mv
+                     if not (dictTryFind instClassSeen sub).IsSome then
+                         dictSet instClassSeen sub true
+                         let impls =
+                             match dictTryFind classImplsOf cn with
+                             | Some xs -> xs |> List.map (fun (ifn, ms) -> ifn, ms |> List.map (fun (mn, mv) -> mn, stampMember mv))
+                             | None -> []
+                         let own =
+                             match dictTryFind classOwnOf cn with
+                             | Some xs -> xs |> List.map (fun (mn, mv) -> mn, stampMember mv)
+                             | None -> []
+                         vecAdd instClasses (sub, cn, impls, own)
+                     Some sub
+                 | None -> None
+             // allocate the subclass instead of the class itself
+             let allocFix (x : Expr) =
+                 match instClass with
+                 | None -> x
+                 | Some sub ->
+                     let cn = (dictTryFind classOfCtor key) |> Option.defaultValue ""
+                     mapExpr
+                         (fun y ->
+                             match y with
+                             | ERecord (n, fs) when n = cn -> ERecord (sub, fs)
+                             | ERecordExt (n, b, fs) when n = cn -> ERecordExt (sub, b, fs)
+                             | other -> other)
+                         x
              let clone =
                  DLet (rc, nv, substScheme inst sch,
                        alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10)
-                           (selfFix (rewrite mangled selfKey subst false e)))
+                           (allocFix (selfFix (rewrite mangled selfKey subst false e))))
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1
@@ -749,8 +883,22 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             | DLet (_, v, sch, ELam _) ->
                 (dictTryFind layoutDependent (v.Path, v.Offset)) <> Some true
                 || List.isEmpty sch.Quantified
+                // A constructor forced into stamping by its class' vtable is
+                // not a template: its own body is layout-free, and the call
+                // sites that carry no instantiation — every construction at a
+                // reference element type, where the canonical vtable is
+                // already right — still name it. Dropping it made every such
+                // call an "unbound variable HashSet".
+                || (dictTryFind vtableCtor (v.Path, v.Offset)) = Some true
             | _ -> true)
-    emitted @ (dictPairs stamped |> List.map snd), vecToList errors
+    // the instantiated subclasses: no fields of their own, so they inherit
+    // the class' layout exactly; only the vtable differs
+    let instDecls =
+        vecToList instClasses
+        |> List.collect (fun (sub, cn, impls, own) ->
+            [ DRecord (sub, [], [], false)
+              DClass (sub, Some cn, own, impls) ])
+    emitted @ (dictPairs stamped |> List.map snd) @ instDecls, vecToList errors
 
 // The link step, v0: demand-closure over symbols. Roots are the program's
 // top-level value initializers; only reachable functions survive. Tier-1
