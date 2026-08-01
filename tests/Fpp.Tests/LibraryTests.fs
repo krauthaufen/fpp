@@ -62,6 +62,9 @@ let stdlibTests =
         test "HashMap + HashSet (patricia trie, 44 assertions incl. randomised model diff) match F#" {
             oracleFile "stdlib/hashmap.fpp" "module Stdlib"
         }
+        test "the .NET surface (ResizeArray, Dictionary, HashSet, StringBuilder, Math) matches F#" {
+            oracleFile "stdlib/dotnet.fpp" "module Stdlib"
+        }
     ]
 
 [<Tests>]

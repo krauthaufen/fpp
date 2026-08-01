@@ -711,11 +711,111 @@ module Double =
             e <- e / 2.0
         e
 
+/// Parsing, shared by every integral Parse below. .NET accepts leading and
+/// trailing whitespace and an optional sign, and REFUSES everything else —
+/// including an empty string and a lone sign.
+let private parseDigits (s : string) : int64 =
+    let mutable i = 0
+    let mutable j = s.Length
+    while i < j && (s.[i] = ' ' || s.[i] = '\t' || s.[i] = '\n' || s.[i] = '\r') do i <- i + 1
+    while j > i && (s.[j - 1] = ' ' || s.[j - 1] = '\t' || s.[j - 1] = '\n' || s.[j - 1] = '\r') do j <- j - 1
+    let neg = i < j && s.[i] = '-'
+    if i < j && (s.[i] = '-' || s.[i] = '+') then i <- i + 1
+    if i >= j then failwith ("The input string '" + s + "' was not in a correct format.")
+    let mutable acc = 0L
+    while i < j do
+        let c = s.[i]
+        if c < '0' || c > '9' then failwith ("The input string '" + s + "' was not in a correct format.")
+        acc <- acc * 10L + int64 (int c - int '0')
+        i <- i + 1
+    if neg then 0L - acc else acc
+
 module Int32 =
     let MaxValue : int = 2147483647
     // written as an expression: `-2147483648` lexes as unary minus applied
     // to 2147483648, which does not fit in an int
     let MinValue : int = 0 - 2147483647 - 1
+    let Parse (s : string) : int = int (parseDigits s)
+
+/// F#'s `sign`, which is Math.Sign: -1, 0 or 1, at any ordered number.
+let sign (x : 'a) : int when Num<'a> when Ordered<'a> =
+    if x < Zero then 0 - 1
+    elif x > Zero then 1
+    else 0
+
+/// System.Math. Everything here is a .NET STATIC, so it is called in tuple
+/// form where it takes more than one argument (`Math.Max (a, b)`) — the same
+/// source has to compile under F#. The single-argument ones are the class
+/// operations under their .NET names, so `Math.Abs -3` is an int exactly as
+/// it is in .NET, not a float.
+module Math =
+    let PI : float = 3.141592653589793
+    let E : float = 2.718281828459045
+    let Abs (x : 'a) : 'a when Abs<'a> = abs x
+    let Sign (x : 'a) : int when Num<'a> when Ordered<'a> = sign x
+    let Max (a : 'a, b : 'a) : 'a when MinMax<'a> = max a b
+    let Min (a : 'a, b : 'a) : 'a when MinMax<'a> = min a b
+    let Sqrt (x : float) : float = sqrt x
+    let Pow (a : float, b : float) : float = pow a b
+    let Exp (x : float) : float = exp x
+    let Log (x : float) : float = log x
+    let Log10 (x : float) : float = log10 x
+    let Floor (x : float) : float = floor x
+    /// .NET spells it Ceiling; F#'s operator is `ceil`
+    let Ceiling (x : float) : float = ceil x
+    /// HALF-TO-EVEN, like Math.Round and F#'s `round`
+    let Round (x : float) : float = round x
+    let Truncate (x : float) : float = truncate x
+    let Sin (x : float) : float = sin x
+    let Cos (x : float) : float = cos x
+    let Tan (x : float) : float = tan x
+    let Asin (x : float) : float = asin x
+    let Acos (x : float) : float = acos x
+    let Atan (x : float) : float = atan x
+    let Atan2 (y : float, x : float) : float = atan2 y x
+    let Sinh (x : float) : float = sinh x
+    let Cosh (x : float) : float = cosh x
+    let Tanh (x : float) : float = tanh x
+
+/// The remaining numeric statics, spelled as .NET spells them. Written as
+/// expressions rather than literals wherever the literal would not lex: a
+/// minimum is one past the negated maximum, and `-2147483648` is unary minus
+/// applied to a number that does not fit.
+module Int64 =
+    let MaxValue : int64 = 9223372036854775807L
+    let MinValue : int64 = 0L - 9223372036854775807L - 1L
+    let Parse (s : string) : int64 = parseDigits s
+
+module UInt32 =
+    let MaxValue : uint32 = 4294967295u
+    let MinValue : uint32 = 0u
+
+module Boolean =
+    /// .NET compares case-insensitively and trims, and accepts nothing else
+    let Parse (s : string) : bool =
+        let t = s.Trim ()
+        if t = "true" || t = "True" || t = "TRUE" then true
+        elif t = "false" || t = "False" || t = "FALSE" then false
+        else failwith "String was not recognized as a valid Boolean."
+
+module Byte =
+    let MaxValue : byte = 255uy
+    let MinValue : byte = 0uy
+
+module SByte =
+    let MaxValue : sbyte = 127y
+    let MinValue : sbyte = 0y - 127y - 1y
+
+module Single =
+    let MaxValue : float32 = 3.4028234663852886e38f
+    let MinValue : float32 = 0.0f - 3.4028234663852886e38f
+    let Epsilon : float32 = 1.401298464324817e-45f
+    let IsNaN (x : float32) : bool = x <> x
+    let IsInfinity (x : float32) : bool =
+        x = 1.0f / 0.0f || x = 0.0f - 1.0f / 0.0f
+    let IsPositiveInfinity (x : float32) : bool = x = 1.0f / 0.0f
+    let IsNegativeInfinity (x : float32) : bool = x = 0.0f - 1.0f / 0.0f
+    let IsFinite (x : float32) : bool = not (IsNaN x) && not (IsInfinity x)
 
 module Option =
     let isSome (o : 'a option) : bool = match o with Some _ -> true | None -> false
@@ -1600,6 +1700,19 @@ module Array =
         match tryFindIndexBack p xs with
         | Some i -> i
         | None -> failwith "An index satisfying the predicate was not found in the collection."
+    /// LEXICOGRAPHIC: the first non-zero comparison decides, and a prefix
+    /// comes before the array it is a prefix of
+    let compareWith (cmp : 'a -> 'a -> int) (a : 'a[]) (b : 'a[]) : int =
+        let n = if length a < length b then length a else length b
+        let mutable r = 0
+        let mutable i = 0
+        while r = 0 && i < n do
+            r <- cmp a.[i] b.[i]
+            i <- i + 1
+        if r <> 0 then r
+        elif length a < length b then 0 - 1
+        elif length a > length b then 1
+        else 0
 module List =
     let length (xs : 'a list) =
         let mutable n = 0
@@ -2261,6 +2374,15 @@ module List =
     let averageBy (f : 'a -> float) (xs : 'a list) : float =
         if isEmpty xs then failwith "The input list was empty"
         else sumBy f xs / float (length xs)
+    /// lexicographic, like Array.compareWith
+    let rec compareWith (cmp : 'a -> 'a -> int) (a : 'a list) (b : 'a list) : int =
+        match a, b with
+        | [], [] -> 0
+        | [], _ -> 0 - 1
+        | _, [] -> 1
+        | x :: xs, y :: ys ->
+            let r = cmp x y
+            if r <> 0 then r else compareWith cmp xs ys
 // String sits AFTER Array and List: toArray/toList/mapi are written in
 // terms of Array.init, Array.length and List.init, and a module only sees
 // what precedes it.
@@ -2769,6 +2891,55 @@ module Seq =
     let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)
     let readonly (xs : seq<'a>) : seq<'a> = xs
     let delay (f : unit -> seq<'a>) : seq<'a> = f ()
+
+    // ---- the rest of the F# Seq surface. Most are the List version over a
+    // materialised copy: a seq here is an IEnumerable, and every one of
+    // these has to walk it anyway.
+    /// The one that must NOT materialise: it has no end.
+    let initInfinite (f : int -> 'a) : seq<'a> =
+        { new IEnumerable<'a> with
+            member _.GetEnumerator () =
+                let mutable i = 0 - 1
+                { new IEnumerator<'a> with
+                    member _.MoveNext () =
+                        i <- i + 1
+                        true
+                    member _.Current = f i } }
+    let tail (xs : seq<'a>) : seq<'a> = List.toSeq (List.tail (toList xs))
+    let mapi2 (f : int -> 'a -> 'b -> 'c) (a : seq<'a>) (b : seq<'b>) : seq<'c> =
+        List.toSeq (List.mapi2 f (toList a) (toList b))
+    let iteri2 (f : int -> 'a -> 'b -> unit) (a : seq<'a>) (b : seq<'b>) : unit =
+        List.iteri2 f (toList a) (toList b)
+    let foldBack2 (f : 'a -> 'b -> 's -> 's) (a : seq<'a>) (b : seq<'b>) (s : 's) : 's =
+        List.foldBack2 f (toList a) (toList b) s
+    let scanBack (f : 'a -> 's -> 's) (xs : seq<'a>) (s : 's) : seq<'s> =
+        List.toSeq (List.scanBack f (toList xs) s)
+    let reduceBack (f : 'a -> 'a -> 'a) (xs : seq<'a>) : 'a =
+        List.reduceBack f (toList xs)
+    let tryFindBack (p : 'a -> bool) (xs : seq<'a>) : 'a option =
+        List.tryFindBack p (toList xs)
+    let findBack (p : 'a -> bool) (xs : seq<'a>) : 'a =
+        List.findBack p (toList xs)
+    let tryFindIndexBack (p : 'a -> bool) (xs : seq<'a>) : int option =
+        List.tryFindIndexBack p (toList xs)
+    let findIndexBack (p : 'a -> bool) (xs : seq<'a>) : int =
+        List.findIndexBack p (toList xs)
+    let transpose (xss : seq<seq<'a>>) : seq<seq<'a>> =
+        List.toSeq (List.map List.toSeq (List.transpose (List.map toList (toList xss))))
+    let permute (f : int -> int) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.permute f (toList xs))
+    let insertAt (i : int) (v : 'a) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.insertAt i v (toList xs))
+    let insertManyAt (i : int) (vs : seq<'a>) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.insertManyAt i (toList vs) (toList xs))
+    let removeAt (i : int) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.removeAt i (toList xs))
+    let removeManyAt (i : int) (n : int) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.removeManyAt i n (toList xs))
+    let updateAt (i : int) (v : 'a) (xs : seq<'a>) : seq<'a> =
+        List.toSeq (List.updateAt i v (toList xs))
+    let compareWith (cmp : 'a -> 'a -> int) (a : seq<'a>) (b : seq<'a>) : int =
+        List.compareWith cmp (toList a) (toList b)
 /// The delta vocabulary MapExt/HashMap deltas are expressed in. Named
 /// SetOp/RemoveOp because `Set` is already a type here (FSharp.Data.Adaptive
 /// spells the cases `Set` and `Remove`).
@@ -4533,3 +4704,241 @@ module Worker =
 
     /// How many bytes the message at `p` occupies, header included.
     let messageLength (p : int) : int = Memory.loadInt p + 4
+
+// ==== System.Collections.Generic and System.Text ==========================
+//
+// The mutable collections, spelled the way .NET spells them, because the
+// same source has to compile under F#. Two conventions follow from that and
+// are not negotiable: a .NET method with several arguments takes a TUPLE
+// (`d.Add (k, v)`), and a property with a setter is a real property, not a
+// pair of functions.
+//
+// What is deliberately absent: `TryGetValue`, and every other method whose
+// .NET signature needs a byref out-parameter. There is no byref here, and a
+// `TryFind` returning an option would be a name F# does not have.
+
+/// System.Collections.Generic.List<'a> — F# calls it ResizeArray, and so do
+/// we. Backed by one array that doubles; `Item` is the .NET indexer, so
+/// `xs.[i]` and `xs.[i] <- v` mean what they mean in F#.
+type ResizeArray<'a>() =
+    let mutable items : 'a[] = Array.zeroCreate 4
+    let mutable count = 0
+    /// room for `n` more elements, doubling so that n appends cost O(n)
+    member x.Reserve (n : int) : unit =
+        if count + n > items.Length then
+            let mutable cap = items.Length * 2
+            while cap < count + n do
+                cap <- cap * 2
+            let next : 'a[] = Array.zeroCreate cap
+            Array.blit items 0 next 0 count
+            items <- next
+    member x.Count = count
+    member x.Item
+        with get (i : int) : 'a =
+            if i < 0 || i >= count then failwith "Index was out of range."
+            items.[i]
+        and set (i : int) (v : 'a) =
+            if i < 0 || i >= count then failwith "Index was out of range."
+            items.[i] <- v
+    member x.Add (v : 'a) : unit =
+        x.Reserve 1
+        items.[count] <- v
+        count <- count + 1
+    member x.AddRange (xs : seq<'a>) : unit =
+        for v in xs do x.Add v
+    member x.Insert (i : int, v : 'a) : unit =
+        if i < 0 || i > count then failwith "Index was out of range."
+        x.Reserve 1
+        let mutable k = count
+        while k > i do
+            items.[k] <- items.[k - 1]
+            k <- k - 1
+        items.[i] <- v
+        count <- count + 1
+    member x.RemoveAt (i : int) : unit =
+        if i < 0 || i >= count then failwith "Index was out of range."
+        let mutable k = i
+        while k < count - 1 do
+            items.[k] <- items.[k + 1]
+            k <- k + 1
+        count <- count - 1
+    member x.IndexOf (v : 'a) : int =
+        let mutable found = -1
+        let mutable i = 0
+        while i < count do
+            if found < 0 && items.[i] = v then found <- i
+            i <- i + 1
+        found
+    member x.Contains (v : 'a) : bool = x.IndexOf v >= 0
+    /// .NET removes the FIRST occurrence and answers whether it found one
+    member x.Remove (v : 'a) : bool =
+        let i = x.IndexOf v
+        if i < 0 then false
+        else
+            x.RemoveAt i
+            true
+    member x.Clear () : unit = count <- 0
+    member x.ToArray () : 'a[] = Array.init count (fun i -> items.[i])
+    member x.Reverse () : unit =
+        let mutable i = 0
+        while i < count / 2 do
+            let t = items.[i]
+            items.[i] <- items.[count - 1 - i]
+            items.[count - 1 - i] <- t
+            i <- i + 1
+    /// `for x in xs` is STRUCTURAL — it looks for a GetEnumerator on the type
+    /// in front of it, and finds this one. There is deliberately no
+    /// `IEnumerable<'a>` implementation: an interface method keeps the
+    /// canonical all-anyref signature, so it would read `items` at the
+    /// uniform representation while a ResizeArray<int> holds a PACKED array,
+    /// and the cast would fail at run time. Snapshotting into an array and
+    /// handing back the built-in array iterator keeps the loop honest at
+    /// every element type; `xs.ToArray ()` is the seam to the Seq module.
+    member x.GetEnumerator () : IEnumerator<'a> =
+        (x.ToArray () :> seq<'a>).GetEnumerator ()
+
+/// System.Collections.Generic.Dictionary. Open-addressed over
+/// INSERTION-ORDERED entries: the slot table holds one-based indices into
+/// three parallel arrays, so enumeration is deterministic and the keys stay
+/// in a packed array — no boxing for an `int` key. Each entry's hash is kept
+/// beside it, so a probe that lands on the wrong entry is rejected on one
+/// int compare instead of a structural one.
+type Dictionary<'k, 'v>() =
+    let mutable dkeys : 'k[] = Array.zeroCreate 8
+    let mutable dvals : 'v[] = Array.zeroCreate 8
+    let mutable dhashes : int[] = Array.zeroCreate 8
+    let mutable dslots : int[] = Array.zeroCreate 16
+    let mutable dcount = 0
+    /// the slot `k` belongs in: either its entry's, or the first free one.
+    /// The table is never more than half full, so this terminates.
+    member x.SlotOfHash (k : 'k, h : int) : int =
+        let mask = dslots.Length - 1
+        let mutable i = h &&& mask
+        let mutable found = -1
+        while found < 0 do
+            let e = dslots.[i]
+            if e = 0 then found <- i
+            elif dhashes.[e - 1] = h && dkeys.[e - 1] = k then found <- i
+            else i <- (i + 1) &&& mask
+        found
+    member x.SlotOf (k : 'k) : int = x.SlotOfHash (k, hash k &&& 1073741823)
+    member x.Rehash () : unit =
+        let slots : int[] = Array.zeroCreate (dslots.Length * 2)
+        let mask = slots.Length - 1
+        let mutable e = 0
+        while e < dcount do
+            // the STORED hash: rehashing must not recompute what it has
+            let mutable i = dhashes.[e] &&& mask
+            while slots.[i] <> 0 do
+                i <- (i + 1) &&& mask
+            slots.[i] <- e + 1
+            e <- e + 1
+        dslots <- slots
+    member x.Count = dcount
+    member x.ContainsKey (k : 'k) : bool = dslots.[x.SlotOf k] > 0
+    member x.Item
+        with get (k : 'k) : 'v =
+            let e = dslots.[x.SlotOf k]
+            if e = 0 then failwith "The given key was not present in the dictionary."
+            dvals.[e - 1]
+        and set (k : 'k) (v : 'v) =
+            let h = hash k &&& 1073741823
+            let s = x.SlotOfHash (k, h)
+            let e = dslots.[s]
+            if e > 0 then dvals.[e - 1] <- v
+            else
+                if dcount >= dkeys.Length then
+                    let keys : 'k[] = Array.zeroCreate (dkeys.Length * 2)
+                    let vals : 'v[] = Array.zeroCreate (dvals.Length * 2)
+                    let hs : int[] = Array.zeroCreate (dkeys.Length * 2)
+                    Array.blit dkeys 0 keys 0 dcount
+                    Array.blit dvals 0 vals 0 dcount
+                    Array.blit dhashes 0 hs 0 dcount
+                    dkeys <- keys
+                    dvals <- vals
+                    dhashes <- hs
+                dkeys.[dcount] <- k
+                dvals.[dcount] <- v
+                dhashes.[dcount] <- h
+                dcount <- dcount + 1
+                // under half full: probes stay short, and the "never full"
+                // invariant the probe relies on holds
+                if dcount * 2 >= dslots.Length then x.Rehash ()
+                else dslots.[s] <- dcount
+    /// .NET REFUSES a duplicate here — `d.[k] <- v` is the overwriting form
+    member x.Add (k : 'k, v : 'v) : unit =
+        if x.ContainsKey k then failwith "An item with the same key has already been added."
+        x.[k] <- v
+    member x.ContainsValue (v : 'v) : bool =
+        let mutable found = false
+        let mutable i = 0
+        while i < dcount do
+            if dvals.[i] = v then found <- true
+            i <- i + 1
+        found
+    /// The survivors SHIFT DOWN and the index is rebuilt, so entries stay
+    /// insertion-ordered. A tombstone would be cheaper, but the probe walks
+    /// until it finds an empty slot, and enumeration order is worth more.
+    member x.Remove (k : 'k) : bool =
+        let e = dslots.[x.SlotOf k]
+        if e = 0 then false
+        else
+            let mutable i = e - 1
+            while i < dcount - 1 do
+                dkeys.[i] <- dkeys.[i + 1]
+                dvals.[i] <- dvals.[i + 1]
+                dhashes.[i] <- dhashes.[i + 1]
+                i <- i + 1
+            dcount <- dcount - 1
+            let slots : int[] = Array.zeroCreate dslots.Length
+            let mask = slots.Length - 1
+            let mutable j = 0
+            while j < dcount do
+                let mutable p = dhashes.[j] &&& mask
+                while slots.[p] <> 0 do
+                    p <- (p + 1) &&& mask
+                slots.[p] <- j + 1
+                j <- j + 1
+            dslots <- slots
+            true
+    member x.Clear () : unit =
+        dcount <- 0
+        dslots <- Array.zeroCreate dslots.Length
+    member x.KeyArray () : 'k[] = Array.init dcount (fun i -> dkeys.[i])
+    member x.ValueArray () : 'v[] = Array.init dcount (fun i -> dvals.[i])
+    /// .NET hands back a KeyCollection; what every caller does with it is
+    /// enumerate, so a seq is the same thing minus the wrapper
+    member x.Keys : seq<'k> = x.KeyArray () :> seq<'k>
+    member x.Values : seq<'v> = x.ValueArray () :> seq<'v>
+    member x.GetEnumerator () : IEnumerator<KeyValuePair<'k, 'v>> =
+        (Array.init dcount (fun i -> KeyValuePair<'k, 'v>(dkeys.[i], dvals.[i])) :> seq<KeyValuePair<'k, 'v>>).GetEnumerator ()
+
+// There is deliberately NO mutable `HashSet` here. The name is taken twice
+// over — by this prelude's own immutable `HashSet` module and by
+// FSharp.Data.Adaptive's HashSet, which the acceptance corpus ports — and a
+// user type whose name matches a prelude type does not shadow it, it MERGES
+// with it (see DIVERGENCES.md). Until that is fixed, adding the .NET one
+// would break every program that declares its own. `Dictionary<'k, bool>`
+// is the substitute.
+
+/// System.Text.StringBuilder. Appending is O(1) — the chunks are joined once,
+/// by the pairwise merge in String.concat, when the text is asked for. A left
+/// fold over `+` would copy the whole accumulator at every step.
+type StringBuilder() =
+    let chunks = ResizeArray<string>()
+    let mutable total = 0
+    member x.Length = total
+    /// .NET returns the builder, so appends chain
+    member x.Append (s : string) : StringBuilder =
+        chunks.Add s
+        total <- total + s.Length
+        x
+    /// .NET overloads Append for every primitive; the char one is what
+    /// character-at-a-time code (a framing reader, a lexer) actually calls
+    member x.Append (c : char) : StringBuilder = x.Append (string c)
+    member x.AppendLine (s : string) : StringBuilder = x.Append (s + "\n")
+    member x.Clear () : StringBuilder =
+        chunks.Clear ()
+        total <- 0
+        x
+    override x.ToString () : string = String.concat "" (chunks.ToArray () :> seq<string>)

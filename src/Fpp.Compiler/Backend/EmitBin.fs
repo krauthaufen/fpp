@@ -788,13 +788,17 @@ let rtCore (m : Mod) : unit =
     ins f "i32.sub"
     ls f "$n"
     endB f
+    // UNSIGNED from here on. `0 - min` wraps back to min, which is still
+    // negative, so a signed remainder gave -8 and printed "-(" for
+    // Int32.MinValue; unsigned, the same bit pattern IS the magnitude, and
+    // for every other value the two agree.
     lg f "$n"
     ic f 10
-    ins f "i32.div_s"
+    ins f "i32.div_u"
     ls f "$m"
     lg f "$m"
     ic f 0
-    ins f "i32.gt_s"
+    ins f "i32.gt_u"
     ifE f
     lg f "$m"
     callf f "$printi"
@@ -802,7 +806,7 @@ let rtCore (m : Mod) : unit =
     ic f 48
     lg f "$n"
     ic f 10
-    ins f "i32.rem_s"
+    ins f "i32.rem_u"
     ins f "i32.add"
     callf f "$putc"
     endFn f

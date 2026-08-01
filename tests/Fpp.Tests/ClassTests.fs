@@ -1094,3 +1094,72 @@ let preludeFamilyTests =
             Expect.equal out "2\n2\n2\n2\n2\n" "nested arrays are reference elements"
         }
     ]
+
+[<Tests>]
+let indexerTests =
+    testList "the Item indexer" [
+        test "a type declaring Item is indexed with .[ ], read and write" {
+            let out =
+                run [ "type Box(cap : int) ="
+                      "    let mutable items : int[] = Array.zeroCreate cap"
+                      "    member x.Item"
+                      "        with get (i : int) = items.[i]"
+                      "        and set (i : int) (v : int) = items.[i] <- v"
+                      "let b = Box(8)"
+                      "let a ="
+                      "    b.[2] <- 41"
+                      "    print b.[2]"
+                      "let c = print b.[0]" ]
+            Expect.equal out "41\n0\n" "get and set go through the members"
+        }
+        test "the indexer of a GENERIC class is stamped per element type" {
+            // the setter is a separate function, named by the `set` keyword;
+            // it has to carry the same specialization demand the getter does,
+            // or the call names a template the stamper removed
+            let out =
+                run [ "type Box<'a>(cap : int) ="
+                      "    let mutable items : 'a[] = Array.zeroCreate cap"
+                      "    member x.Item"
+                      "        with get (i : int) = items.[i]"
+                      "        and set (i : int) (v : 'a) = items.[i] <- v"
+                      "let bi = Box<int>(4)"
+                      "let bs = Box<string>(4)"
+                      "let a ="
+                      "    bi.[1] <- 7"
+                      "    bs.[1] <- \"x\""
+                      "    print bi.[1]"
+                      "let c = print bs.[1]" ]
+            Expect.equal out "7\nx\n" "int and string instantiations coexist"
+        }
+        test "indexing a type without an Item member is an ERROR, not a trap" {
+            // it used to compile to an unnamed array read and fail the cast
+            // at run time, with no diagnostic anywhere
+            let ds =
+                diagnostics [ "type Box(n : int) ="
+                              "    member x.N = n"
+                              "let b = Box(3)"
+                              "let a = print b.[0]" ]
+            Expect.isNonEmpty ds "the index is rejected"
+            Expect.isTrue
+                (ds |> List.exists (fun d -> d.Contains "cannot be indexed"))
+                "and says why"
+        }
+        test "a member of another file's generic class is stamped too" {
+            // the prelude's own ResizeArray is reached this way: the demand
+            // used to be recorded for same-file members only
+            let out =
+                run [ "let xs = ResizeArray<int>()"
+                      "let a ="
+                      "    xs.Add 3"
+                      "    xs.Add 4"
+                      "    xs.[0] <- 9"
+                      "    print xs.Count"
+                      "let b = print xs.[0]"
+                      "let c ="
+                      "    let mutable s = 0"
+                      "    for v in xs do"
+                      "        s <- s + v"
+                      "    print s" ]
+            Expect.equal out "2\n9\n13\n" "ResizeArray<int> holds a packed array"
+        }
+    ]

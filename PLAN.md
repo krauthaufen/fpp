@@ -663,6 +663,46 @@ mapi/skip/init/singleton/replicate/sortWith/rev/toArray + eager folds).
 Operator sections `(+)` parse, type with the operator's class constraints,
 and lower to a lambda over the same resolution an infix use gets.
 
+### DONE: the .NET surface (ResizeArray, Dictionary, HashSet, StringBuilder)
+`System.Collections.Generic` and `System.Text`, spelled the way .NET spells
+them so the same source compiles under F#: `ResizeArray` (Count, the `Item`
+indexer, Add/AddRange/Insert/RemoveAt/Remove/Contains/IndexOf/ToArray/
+Reverse/Clear), `Dictionary` (open-addressed over insertion-ordered entries,
+hashes kept beside the keys, keys in a PACKED array), `HashSet` (the same
+table without values) and `StringBuilder` (chunks joined once, by the
+pairwise merge). Plus `System.Math` under its .NET names — generic where
+.NET is overloaded, so `Math.Abs -3` is an int — the numeric statics
+(Int64/UInt32/Byte/SByte/Single/Boolean, MinValue/MaxValue/Parse), `sign`,
+and the F# collection functions that were still missing (`compareWith` on
+all three, `Seq.initInfinite/tail/mapi2/iteri2/foldBack2/scanBack/
+reduceBack/findBack/findIndexBack/transpose/permute/insertAt/removeAt/
+updateAt`).
+
+Gated by `stdlib/dotnet.fpp`, which runs under F++ AND under `dotnet fsi`
+and must print the same 93 values.
+
+Three compiler holes had to close first, all found by writing the library:
+
+- **`.[ ]` bound nothing but arrays.** An `Item` member now binds at a
+  synthetic offset off the bracket (there is no `Item` token to key on), the
+  way the for-in protocol binds GetEnumerator; `set_Item` gets the same
+  treatment for the store. Indexing a type that has no indexer is a compile
+  error now instead of a cast that fails at run time.
+- **Another file's generic class member carried no specialization demand.**
+  `tracked` required the member's definition to be in the file being typed,
+  so the prelude's own `ResizeArray<int>.Add` named a layout-dependent
+  template the stamper had already removed — "unbound variable Add".
+- **The for-in protocol and the indexer's setter called templates.** Both
+  lowered to a bare `EVar`; both go through `memberFn` now, which carries
+  the instantiation. The setter also needed registering in `topLevelDefs`:
+  it is named by the `set` keyword, which is not a direct token child of the
+  member.
+
+And one runtime bug the conformance diff caught: `print (Int32.MinValue)`
+produced `-(`. `0 - min` wraps back to min, so the signed remainder gave a
+negative digit; `$printi` reads the magnitude unsigned now, like `$lput`
+already did.
+
 ### Next: the collections must WORK, not just run
 A smoke test appending real HashSet/HashMap usage compiles clean but traps
 at runtime: `IsLeaf` (a bit-packed base-class member) cast-fails when

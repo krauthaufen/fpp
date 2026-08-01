@@ -194,3 +194,84 @@ against ordered reference models, and are fixed:
   F# resolves the builtin there (the binding is not recursive). The prelude now
   routes those conversions through `genShowInt`/`genCharOf`/... — but the
   underlying resolution difference is unfixed, and it is silent.
+
+## `.[ ]` needs an `Item` member, and there are no other indexers
+
+`recv.[i]` binds a member named `Item` on the receiver's type, and
+`recv.[i] <- v` binds `set_Item` — the .NET indexer, spelled the way F#
+spells it (`member x.Item with get i = ... and set i v = ...`). That is the
+whole of it: a two-dimensional index (`m.[i, j]`), a slice (`xs.[1..3]`) and
+F#'s `GetSlice` do not resolve.
+
+**Where it used to go wrong.** An index on a type that had no indexer was
+lowered as an unnamed ARRAY read, which compiles to a cast that fails at run
+time. That is now a compile error naming the type — but only for a type this
+compilation has seen the members of, which is what keeps the dogfooding gate
+(every source typed with NOTHING resolved) from calling `JsonNode.[…]` an
+error.
+
+## A generic class reached through an INTERFACE cannot depend on its layout
+
+A member reachable through a vtable keeps the canonical all-anyref
+signature — that is the dispatch contract — so it is never specialized. A
+member called directly IS specialized. When the two disagree, the interface
+one loses:
+
+```fsharp
+type Arr<'a>(items : 'a[]) =
+    interface IEnumerator<'a> with
+        member _.Current = items.[0]     // reads `items` at the UNIFORM
+                                          // representation
+let e = Arr<int>([| 5; 6 |]) :> IEnumerator<int>
+e.Current                                 // traps: the field holds a PACKED
+                                          // int array
+```
+
+Constructing it is fine, calling the member directly is fine, and at a
+reference element type (`Arr<string>`) even the interface call is fine. It
+is the combination — an interface method reading a field whose layout
+depends on a type parameter — that has no correct answer today.
+
+**Why the prelude's own collections dodge it.** `ResizeArray` and
+`Dictionary` hold their elements in a packed `'a[]`, so neither implements
+`IEnumerable<'a>`. They carry a plain `GetEnumerator` member
+instead, which is what `for x in xs` looks for (the loop is structural, as
+in F#), and hand back the BUILT-IN array iterator over a snapshot. So
+`for x in ra` works at every element type, and `Seq.map f ra` does not
+compile — go through `ra.ToArray ()`. A compile error is the honest failure
+here; the alternative was a runtime trap that only appeared at packed
+element types.
+
+Lifting this means monomorphizing the CLASS, not just its members: a
+per-instantiation descriptor whose vtable names the stamped bodies.
+
+## The .NET collections carry no byref members
+
+`TryGetValue`, `TryPop`, `Remove(item, out removed)` and every other method
+whose .NET signature needs a byref out-parameter are absent — F++ has no
+byref. Use `ContainsKey` and the indexer.
+
+`StringBuilder.Append` takes a string or a char; .NET's numeric overloads
+are not there, so write `sb.Append (string x)`.
+
+`ResizeArray` and `Dictionary` construct with no arguments only:
+`Dictionary()`, not `Dictionary(capacity)` or `Dictionary(comparer)`.
+Equality and hashing are always the structural `=` and `hash`, never an
+`IEqualityComparer`.
+
+There is no mutable `HashSet`. The name is taken twice over — by the
+prelude's own immutable `HashSet` module and by FSharp.Data.Adaptive's
+`HashSet`, which the acceptance corpus ports — and a user type whose name
+matches a prelude type MERGES with it rather than shadowing it (below), so
+adding the .NET one would break every program that declares its own.
+`Dictionary<'k, bool>` is the substitute. This is the clearest argument yet
+for fixing prelude-type shadowing: it is not a corner, it costs real
+surface.
+
+**Where they agree exactly.** Enumeration is INSERTION-ORDERED, like .NET's
+in practice; `Add` on a duplicate key throws where `d.[k] <- v` overwrites;
+`HashSet.Add` answers whether the element was new; `ResizeArray.Remove`
+removes the first occurrence and answers whether it found one;
+`StringBuilder.Length` counts characters, not chunks. All of that is pinned
+by `stdlib/dotnet.fpp`, which runs under both compilers and must print the
+same 93 values.

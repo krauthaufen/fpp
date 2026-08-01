@@ -99,6 +99,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // index expressions whose RECEIVER is an array: `a.[i] <- v` may tie the
     // value to the element type, which a member setter's shape may not
     let arrIndexTargets = dictNew<int, bool> ()
+    // index sites that bound a user-defined `Item` member instead: the store
+    // goes through `set_Item`, whose value parameter has the getter's type,
+    // so the same tie is sound there
+    let indexerTargets = dictNew<int, bool> ()
+    /// Types this compilation has actually SEEN the members of. "T has no
+    /// indexer" is only sayable about those: the dogfooding gate types each
+    /// source with nothing resolved, where every .NET type is a bare name.
+    let knownTypes = dictNew<string, bool> ()
     let defSchemes = dictNew<int, Scheme> ()
     let defTypes = vecNew<int * int * Type> ()
 
@@ -285,13 +293,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `a.[i]` whose receiver was still a variable when the walk reached it —
     /// which is every index into the result of a PARKED dot access, e.g.
     /// `(s.Split ':').[0]`. Retried once the dot fixpoint has run.
-    let pendingIndex = vecNew<int * Type * Type> ()
+    // head offset, receiver, result, bracket offset, index type — the last two
+    // are what a user-defined `Item` needs to bind once the receiver settles
+    let pendingIndex = vecNew<int * Type * Type * int * Type> ()
 
     /// Register a member's FieldInfo. A second declaration under the same
     /// name is an OVERLOAD: it keeps its own entry under an ordinal suffix
     /// ("HashMap.CopyTo#2"), assigned in declaration order — the same order
     /// the resolver assigns, so the two suffixes name the same definition.
     let registerField (key : string) (fi : FieldInfo) : unit =
+        dictSet knownTypes fi.TypeName true
         if (dictTryFind fields key).IsNone then dictSet fields key fi
         else
             let mutable k = 2
@@ -449,10 +460,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // notion of. Type arguments are unified, never the nominal head.
         let tracked (ownerTag : string) (tn : string) (args : Type list) (fi : FieldInfo) : bool =
             match fi.DefKey with
-            | Some (dp, doff) when dp = path && not fi.IsStatic && fi.TypeName = tn ->
-                (match dictTryFind defSchemes doff with
+            | Some (dp, doff) when not fi.IsStatic && fi.TypeName = tn ->
+                // ANOTHER FILE's member is a specialization demand just like
+                // this file's — the prelude's own generic classes are reached
+                // that way, and without the demand the linker dropped their
+                // layout-dependent templates and the call named nothing
+                // ("unbound variable Add" on a ResizeArray<int>)
+                (match (if dp = path then dictTryFind defSchemes doff
+                        else dictTryFind shared (dp + ":" + string doff)) with
                  | Some sch ->
-                     (match instantiateTracked sch with
+                     (match (if dp = path then instantiateTracked sch else instantiateImported sch) with
                       | TFun (selfT, memT), fresh, _ ->
                           (match prune selfT with
                            | TCon (sn, sargs) when sn = tn && sargs.Length = args.Length ->
@@ -562,6 +579,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // here silently unbound `for e in x` over self. Stay parked;
                  // the forced pass concedes.
                  force)
+        | _ -> false
+
+    /// `recv.[i]` where the receiver declares `member x.Item` — a .NET
+    /// indexer. There is no `Item` TOKEN in the source to key the binding on,
+    /// so the access is bound at a synthetic offset derived from the bracket,
+    /// exactly the way the `for … in` protocol binds GetEnumerator. The
+    /// setter is bound too whenever the type declares one; `b.[i] <- v` needs
+    /// it, and a get-only indexer simply leaves it unbound.
+    let tryResolveIndexer (recvTy : Type) (br : int) (idxTy : Type) (result : Type) : bool =
+        match prune recvTy with
+        | TCon (tn, _) when tn <> "array" && tn <> "string" ->
+            if tryResolveDot false (60000000 + br) recvTy (TFun (idxTy, result)) "Item" then
+                tryResolveDot false (70000000 + br) recvTy (TFun (idxTy, TFun (result, tUnit))) "set_Item"
+                |> ignore
+                true
+            else false
         | _ -> false
 
     let nodesOf (n : GreenNode) : GreenNode list =
@@ -1610,7 +1643,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               && (match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                                   | Some t -> (dictTryFind recordFieldTargets t.Offset).IsSome
                                   | None -> false)
-                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex || isRecordField) then
+                          // an INDEXER target ties the same way: `set_Item`'s
+                          // value parameter is the getter's result type
+                          let isIndexer =
+                              l.NodeKind = DotExpr
+                              && (nodesOf l |> List.exists (fun m -> m.NodeKind = ListExpr))
+                              && (match Green.tokens (GNode l) |> List.tryHead with
+                                  | Some t -> (dictTryFind indexerTargets t.Offset).IsSome
+                                  | None -> false)
+                          if op.Text = "<-" && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
                               unifyArg op.Offset lt rt
                           tUnit
                       | _ -> st.Fresh ())
@@ -1930,8 +1971,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     nodesOf n
                     |> List.tryFind (fun m -> m.NodeKind <> ListExpr && isExprish m.NodeKind)
                     |> Option.map (fun m -> exprType (GNode m))
+                // the bracket group parses as a LIST, so the index's own type
+                // is that list's element — taken from the same typing the
+                // array path already ran, because typing the index expression
+                // a second time would duplicate its effects
+                let mutable idxTy = st.Fresh ()
                 for m in nodesOf n do
-                    if m.NodeKind = ListExpr then exprType (GNode m) |> ignore
+                    if m.NodeKind = ListExpr then
+                        match prune (exprType (GNode m)) with
+                        | TCon ("list", [ e ]) -> idxTy <- e
+                        | _ -> ()
                 (match lhsTy |> Option.map prune with
                  | Some (TCon ("array", [ e ])) ->
                      // keyed by THIS index's bracket: `a.[i].[j]` has two
@@ -1973,9 +2022,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // than leaving it nameless, which reaches emission as
                      // "array read needs a statically known element type"
                      let result = st.Fresh ()
-                     (match lhsTy, Green.tokens (GNode n) |> List.tryHead with
-                      | Some recv, Some t -> vecAdd pendingIndex (t.Offset, recv, result)
-                      | _ -> ())
+                     let br =
+                         nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
+                         |> Option.bind (fun ix -> Green.tokens (GNode ix) |> List.tryHead)
+                         |> Option.map (fun t -> t.Offset)
+                     let head = Green.tokens (GNode n) |> List.tryHead
+                     let bound =
+                         match lhsTy, br with
+                         | Some recv, Some b -> tryResolveIndexer recv b idxTy result
+                         | _ -> false
+                     if bound then
+                         (match head with
+                          | Some t -> dictSet indexerTargets t.Offset true
+                          | None -> ())
+                     else
+                         (match lhsTy, head, br with
+                          | Some recv, Some t, Some b -> vecAdd pendingIndex (t.Offset, recv, result, b, idxTy)
+                          | Some recv, Some t, None -> vecAdd pendingIndex (t.Offset, recv, result, 0, idxTy)
+                          | _ -> ())
                      result)
             | DotExpr ->
                 let lastIdent =
@@ -3108,7 +3172,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         tryResolveDot true offset recvTy result name |> ignore
     // index sites whose receiver only took shape through a parked dot: the
     // element type is known now, so name the read and tie the result to it
-    for offset, recvTy, result in vecToList pendingIndex do
+    for offset, recvTy, result, br, idxTy in vecToList pendingIndex do
         match prune recvTy with
         | TCon ("array", [ e ]) ->
             unifyAt offset result e
@@ -3117,7 +3181,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon ("string", []) ->
             unifyAt offset result tChar
             vecAdd arrKindsRaw (offset, TCon ("$str", []))
-        | _ -> ()
+        | _ ->
+            // a receiver that only took shape through a parked dot may still
+            // be a type with an indexer
+            if br > 0 && tryResolveIndexer recvTy br idxTy result then
+                dictSet indexerTargets offset true
+            else
+                // Nothing can index this. Say so HERE: the read used to reach
+                // emission as an unnamed array access, which compiles to a
+                // cast that fails at run time — a wrong program with no
+                // diagnostic anywhere.
+                match prune recvTy with
+                | TCon (tn, _) when (dictTryFind knownTypes tn).IsSome ->
+                    vecAdd diags (offset, tn + " cannot be indexed: it is not an array and declares no Item member")
+                | _ -> ()
 
     // record literals: name the instantiation once everything is solved
     for offset, ty in vecToList pendingRecords do

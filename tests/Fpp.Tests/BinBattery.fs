@@ -219,6 +219,17 @@ let binBattery =
               "    if a = a then print 1 else print 0" ]
             "1\n0\n1\n"
 
+        expects "print of Int32.MinValue is not a wrapped negation"
+            // `0 - min` wraps back to min, so a SIGNED remainder produced a
+            // negative digit and printed "-(" — the magnitude is the same
+            // bit pattern read unsigned
+            [ "let go ="
+              "    print (0 - 2147483647 - 1)"
+              "    print Int32.MinValue"
+              "    print (0 - 1)"
+              "    print 0" ]
+            "-2147483648\n-2147483648\n-1\n0\n"
+
         expects "interface dispatch through the vtable"
             [ "type IShape ="
               "    abstract member Area : unit -> int"

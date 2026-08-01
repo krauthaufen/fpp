@@ -81,9 +81,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> ())
                 let rec collectMembers (m : GreenNode) =
                     if m.NodeKind = MemberDecl then
-                        match m.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
-                        | [ _; nm ] | [ nm ] -> dictSet topLevelDefs nm.Offset true
-                        | _ -> ()
+                        (match m.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
+                         | [ _; nm ] | [ nm ] -> dictSet topLevelDefs nm.Offset true
+                         | _ -> ())
+                        // `member x.P with get … and set …` declares the
+                        // writer as a SEPARATE function, named by the `set`
+                        // keyword. Without it here, a use site could not
+                        // carry a specialization demand, and a setter whose
+                        // body depends on the layout (`items.[i] <- v`) was
+                        // called through the template the stamper had already
+                        // removed — "unbound variable set_Item".
+                        for c in m.Children do
+                            match c with
+                            | GNode a when a.NodeKind = AccessorDecl ->
+                                (match Green.tokens (GNode a) |> List.tryFind (fun t -> t.Kind = Ident) with
+                                 | Some t -> dictSet topLevelDefs t.Offset true
+                                 | None -> ())
+                            | _ -> ()
                     elif m.NodeKind = InterfaceImpl then
                         m.Children |> List.iter (fun c -> match c with GNode x -> collectMembers x | _ -> ())
                     elif m.NodeKind = LetDecl
@@ -231,6 +245,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let varIdOf (d : Resolve.Definition) : VarId =
         { Path = d.Path; Offset = d.Offset; Name = d.Name }
+
+    /// The callee for a member bound at `t`: a member of a generic class is a
+    /// generic function, so the instantiation recorded at the use site has to
+    /// travel with it for the linker to stamp.
+    let memberFn (t : Token) (d : Resolve.Definition) : Expr =
+        match dictTryFind instSites t.Offset with
+        | Some inst when
+             not (List.isEmpty inst)
+             && (if d.Path = path then (dictTryFind topLevelDefs d.Offset).IsSome else true) ->
+            EVarI (varIdOf d, schemeOf d, inst)
+        | _ -> EVar (varIdOf d, schemeOf d)
+
+    /// `recv.[i]` on a type that declares `Item`. Inference bound the access
+    /// at a synthetic offset off the bracket token — there is no `Item` token
+    /// to key on — the way the for-in protocol binds its three members.
+    let indexerTok (base_ : int) (name : string) (br : Token) : Token =
+        { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + br.Offset }
 
     // ---- patterns ---------------------------------------------------------
 
@@ -773,9 +804,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | [ l; r ], [ op ] ->
                      (match op.Text with
                       | "<-" ->
+                          // `recv.[i] <- v` calls the indexer's setter, bound
+                          // at the bracket's synthetic offset. Decided FIRST:
+                          // the property path keys on the last identifier in
+                          // the target, which for an index target is part of
+                          // the index expression
+                          let indexSetter =
+                              match nodesOf l with
+                              | [ recv; ix ] when l.NodeKind = DotExpr && ix.NodeKind = ListExpr ->
+                                  (match Green.tokens (GNode ix) |> List.tryHead with
+                                   | Some br ->
+                                       let t = indexerTok 70000000 "set_Item" br
+                                       (match memberAt t, nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind) with
+                                        | Some (_, d), [ i ] ->
+                                            Some (memberFn t d, lowerExpr (GNode recv), lowerExpr (GNode i))
+                                        | _ -> None)
+                                   | None -> None)
+                              | _ -> None
                           // `recv.P <- v` calls the property's setter
                           let propSetter =
-                              if l.NodeKind <> DotExpr then None
+                              if l.NodeKind <> DotExpr || indexSetter.IsSome then None
                               else
                                   match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                                   | Some t ->
@@ -789,7 +837,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             | None -> None)
                                        | None -> None)
                                   | None -> None
-                          (match propSetter with
+                          (match indexSetter with
+                           | Some (fn, recv, i) -> EApp (fn, [ recv; i; lowerExpr (GNode r) ])
+                           | None ->
+                          match propSetter with
                            | Some (sd, recv) ->
                                EApp (EVar (varIdOf sd, schemeOf sd), [ recv; lowerExpr (GNode r) ])
                            | None ->
@@ -1500,8 +1551,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  match atBracket with
                                  | Some v -> v
                                  | None -> (match atNode with Some v -> v | None -> "")
-                     (match idx with
-                      | [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
+                     // a user-defined indexer takes precedence over the array
+                     // read: inference only binds one when the receiver is
+                     // NOT an array
+                     let indexer =
+                         match Green.tokens (GNode ix) |> List.tryHead with
+                         | Some br ->
+                             let t = indexerTok 60000000 "Item" br
+                             (match memberAt t with
+                              | Some (_, d) -> Some (memberFn t d)
+                              | None -> None)
+                         | None -> None
+                     (match indexer, idx with
+                      | Some fn, [ i ] -> EApp (fn, [ lowerExpr (GNode lhs); i ])
+                      | _, [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")
                  | _ -> note (offsetOf n) "index shape")
             | DotExpr when
@@ -1815,7 +1878,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   match dictTryFind ifaces owner with
                                   | Some ms when ms |> List.exists (fun (m, _) -> m = t.Text) ->
                                       Some (EIfaceCall (owner, t.Text, recv, args))
-                                  | _ -> Some (EApp (EVar (varIdOf d, schemeOf d), recv :: args))
+                                  // a concrete member of a GENERIC class is
+                                  // stamped per instantiation like any other
+                                  // generic function; the protocol's call has
+                                  // to name the stamp
+                                  | _ -> Some (EApp (memberFn t d, recv :: args))
                           let anon = mono (TCon ("?", []))
                           let enV = { Path = path; Offset = fo + 4000000; Name = "_en" }
                           (match call (synth "GetEnumerator" 30000000) (lowerExpr (GNode range)) true,
