@@ -12,6 +12,7 @@ no runtime to install alongside the program.
 - **editors/README.md** — VS Code, Rider, Visual Studio
 - **tests/tooling/README.md** — the harnesses that measure rather than assume
 - **tests/known-issues/** — the smallest program that shows each open bug
+- **PORT-ADAPTIVE.md** — porting FSharp.Data.Adaptive whole, and what it needs
 
 ## Getting started
 

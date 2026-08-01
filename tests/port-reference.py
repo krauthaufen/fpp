@@ -85,13 +85,16 @@ def strip_attrs(src):
     # a line that held nothing but attributes disappears
     return "\n".join(l for l in src.split("\n") if l.strip() or not l)
 
-def pick_branch(src):
+def pick_branch(src, defined=()):
     out, stack = [], []   # stack of "are we emitting here?"
     for line in src.split("\n"):
         t = line.strip()
         if t.startswith("#if "):
             sym = t[4:].strip()
-            stack.append(sym.startswith("!"))   # no symbols are defined
+            if sym.startswith("!"):
+                stack.append(sym[1:].strip() not in defined)
+            else:
+                stack.append(sym in defined)
             continue
         if t == "#else":
             if stack: stack[-1] = not stack[-1]
