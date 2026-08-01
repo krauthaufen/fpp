@@ -1329,6 +1329,30 @@ let typeExtensionTests =
                       "let c = print o.Inverse.Count" ]
             Expect.equal out "5\n1\n-1\n" "static and instance, at int"
         }
+        test "a DOTTED name extends the type its last segment names" {
+            // `type System.Threading.Interlocked with ...` — the spine is
+            // namespaces, the last segment is the type
+            let out =
+                run [ "type Counter(n : int) ="
+                      "    member x.N = n"
+                      "type Some.Deep.Counter with"
+                      "    member x.Twice = x.N * 2"
+                      "let c = Counter 21"
+                      "let a = print c.N"
+                      "let b = print c.Twice" ]
+            Expect.equal out "21\n42\n" "the namespace spine is not the name"
+        }
+        test "a type declaration carries class constraints" {
+            let out =
+                run [ "type Box<'a>(x : 'a) when Ordered<'a> ="
+                      "    member p.X = x"
+                      "    member p.Bigger (other : 'a) ="
+                      "        if compare x other > 0 then x else other"
+                      "let b = Box<int>(3)"
+                      "let a = print b.X"
+                      "let c = print (b.Bigger 7)" ]
+            Expect.equal out "3\n7\n" "the constraint is available to the members"
+        }
         test "an INTERFACE gains members, dispatched statically" {
             // the shape FSharp.Data.Adaptive uses most: an interface with a
             // fluent API hung off it. An extension is not a vtable slot —

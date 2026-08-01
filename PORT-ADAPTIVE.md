@@ -67,13 +67,21 @@ there and beyond:
   `weak.TryGetTarget(&old)`) still needs copy-in/copy-out around the call,
   or promotion of that storage to a cell.
 * **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
-  parses and is kept in the tree, and no longer counts as a type parameter
-  — but it is inert. Each of F#'s constraints has a meaning F++ can express
-  as a class: `comparison` is `Ordered<'a>`, `equality` is structural `=`,
-  and `unmanaged` is the important one — it is exactly the POD/blittable
-  property the layout machinery already computes. Wiring them needs
-  type-level constraints (`type X<'a> when C<'a>`), which a type
-  declaration does not accept yet; a `let` signature does.
+  parses, stays in the tree and no longer counts as a type parameter — but
+  it is still inert. The PREREQUISITE is now in place: a type declaration
+  carries class constraints (`type Box<'a> when Ordered<'a> = ...`), so the
+  translation is a rewrite from the F# spelling to the F++ one:
+
+  | F# | F++ |
+  | --- | --- |
+  | `'a : comparison` | `Ordered<'a>` |
+  | `'a : equality` | structural `=`, which is builtin — nothing to add |
+  | `'a : unmanaged` | the one worth most: exactly the POD/blittable
+    property the layout machinery already computes for struct arrays and
+    C-compatible layout. As a class it would let USER code demand it, which
+    is what a zero-copy `Buffer<'t>` needs |
+  | `'a : struct` / `not struct` | the value-vs-reference split
+    `ShallowEquality` wants too |
 
 ## What is replaced, and what it became
 

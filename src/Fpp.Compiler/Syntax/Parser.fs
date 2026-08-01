@@ -1138,7 +1138,24 @@ let parse (src : string) : ParseResult =
             vecAdd acc (parseAttributeList ())
             while s.IsKw "private" || s.IsKw "internal" || s.IsKw "public" || s.IsKw "rec" do
                 vecAdd acc (s.Bump ())
-        if s.Is Ident then vecAdd acc (s.Bump ()) else s.Diag "expected a type name"
+        if s.Is Ident then
+            vecAdd acc (s.Bump ())
+            // a DOTTED name: `type System.Threading.Interlocked with ...`
+            // extends a type named by its full path. The last segment IS the
+            // type — the spine is namespaces — so the earlier segments are
+            // consumed and the name that remains is the one members hang on.
+            while s.IsOp "." && s.SameLine && (s.Peek 1).Kind = Ident do
+                s.Bump () |> ignore
+                let seg = s.Bump ()
+                // replace the accumulated name with the deeper segment
+                let rest = vecToList acc |> List.filter (fun g ->
+                                match g with
+                                | GToken t -> t.Kind <> Ident
+                                | _ -> true)
+                vecClear acc
+                for g in rest do vecAdd acc g
+                vecAdd acc seg
+        else s.Diag "expected a type name"
         if s.IsOp "<" && s.SameLine then
             vecAdd acc (Green.node TyParams (parseAngleArgs typeCol))
         // primary-constructor parameters: `type State(src : string) =`,
@@ -1148,6 +1165,10 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
         if s.Is LParen && s.SameLine then
             vecAdd acc (parseAtomPat typeCol)
+        // declared class constraints: `type Box<'a> when Ordered<'a> = ...`,
+        // the same `when C<'a>` a let signature carries
+        while s.IsKw "when" && (s.SameLine || s.CurCol > typeCol) do
+            vecAdd acc (parseWhen false typeCol)
         // `type X with member ... ` — an INTRINSIC TYPE EXTENSION: members
         // for a type declared elsewhere, and no representation of its own.
         // The `with` in place of `=` is what says so, and it is the whole
