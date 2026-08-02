@@ -535,25 +535,48 @@ call, so the rest of the pipeline sees ordinary shapes.
 
 ## Where it stops now
 
-Measured per FILE — one unparsed file poisons every file after it:
+The whole 39-file port — all 21,872 lines — now INFERS in under seven
+seconds, with 297 diagnostics:
 
-    clean through Traceable/Instances.fs            13,767 of 22,332 lines
-    History.fs .. ComputationExpressions.fs            278 real diagnostics
-    AdaptifyHelpers.fs                               inference does not finish
+     72  AdaptiveHashMap/AdaptiveHashMap.fs
+     69  AdaptiveIndexList/AdaptiveIndexList.fs
+     65  AdaptiveHashSet/AdaptiveHashSet.fs
+     28  CollectionExtensions.fs
+     18  Traceable/CountingHashSet.fs
+     14  AdaptifyHelpers.fs
+     28  spread over five more
 
-`AdaptiveTools/AdaptiveFileSystem.fs` is now skipped outright — see
-DIVERGENCES.md. It is a leaf nothing depends on, and it is a directory
-watcher, not adaptive machinery.
+    265  type mismatch
+     17  the type HashSet<'a> would contain itself
+      7  no constructor accepts these arguments
+      8  missing instances (Add, Mul, MinMax, Ordered)
+
+Three of the eight files hold 206 of the 297, and they are the three big
+adaptive collections — one shared cause is likely.
+
+## The one thing that does not finish
+
+`module private Test` in `ComputationExpressions.fs` — 79 lines whose whole
+purpose is to check that the computation expressions compile. One `aset { }`
+with eight `yield!`s, four `for`s and a `let!` does not finish inferring.
+Remove that module and everything else, that file and the two after it
+included, infers in 6.7 s.
+
+So it is the CE itself: desugaring nests `Combine` calls, and every `yield!`
+chooses among the builder's overloads inside that nest. Cost compounds with
+depth. This was twice attributed to `AdaptifyHelpers.fs`, which is innocent —
+the walk that measured it labels each prefix with the file that comes AFTER
+it, and reading that label as the culprit is wrong.
 
 ## Compiling is not the same as running
 
 The port has only ever been INFERRED. Lowering and emission are a separate
 pass with their own failure class, and there is one known instance: a generic
 class implementing a non-generic interface type-checks and then traps
-(`unbound variable Accept`). How big that stage is has NOT been measured, and
-guessing at it would be worthless. The cheap measurement is a twenty-line
-smoke test — build a cval, map it, transact, read it back — which exercises
-the machinery end to end without needing the 6,667-line test suite.
+(`unbound variable Accept`). How big that stage is has NOT been measured.
+The cheap measurement is a twenty-line smoke test — build a cval, map it,
+transact, read it back — which exercises the machinery end to end without
+needing the 6,667-line test suite.
 
 That suite needs NUnit, FsUnit and FsCheck. FsCheck's generators are
 reflection-driven, so it is a hand-written harness or nothing; there is
