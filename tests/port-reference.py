@@ -60,8 +60,13 @@ def port_closures(src):
     src = "".join(out)
     def inv(m):
         return "(" + m.group(1) + " " + " ".join("(" + a + ")" for a in split_top(m.group(2), ",")) + ")"
+    # a CALL to .Invoke, never a DECLARATION of one: `member x.Invoke(a, b)`
+    # matched too, and came out as `member (x (a) (b))` — a member with no
+    # name, which is what stopped two files of the whole-library port
     for _ in range(4):
-        src = re.sub(r"([A-Za-z_][A-Za-z0-9_.]*)\.Invoke\(([^()]*(?:\([^()]*\)[^()]*)*)\)", inv, src)
+        src = re.sub(
+            r"(?<!member )(?<!override )(?<!abstract )(?<!default )"
+            r"([A-Za-z_][A-Za-z0-9_.]*)\.Invoke\(([^()]*(?:\([^()]*\)[^()]*)*)\)", inv, src)
     return src
 
 def strip_attrs(src):

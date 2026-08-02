@@ -55,7 +55,6 @@ module Keywords =
             "default"; "delegate"; "do"; "done"; "downcast"; "downto"; "elif"
             "else"; "end"; "exception"; "extern"; "false"; "finally"; "fixed"
             "for"; "fun"; "function"; "global"; "if"; "in"; "inherit"; "inline"
-            "instance"
             "interface"; "internal"; "lazy"; "let"; "match"; "member"; "module"
             "mutable"; "namespace"; "new"; "not"; "null"; "of"; "open"; "or"
             "override"; "private"; "public"; "rec"; "return"; "static"

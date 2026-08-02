@@ -1038,6 +1038,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match dictTryFind fieldOwners op.Offset with
                       | Some "ByRefCell" -> lowered
                       | _ -> EApp (EUnknown "$addr", [ lowered ]))
+                 | Some op, [] when op.Text = "not" ->
+                     // the function, not the operation: `f >> not`
+                     let bsch = mono (TCon ("bool", []))
+                     let v = { Path = path; Offset = 96000000 + op.Offset; Name = "_notArg" }
+                     ELam ([ v, bsch ], EPrim ("unot", [ EVar (v, bsch) ]))
+                 | Some op, [ a ] when op.Text = "assert" ->
+                     EIf (lowerExpr (GNode a), ELit LUnit,
+                          EApp (EUnknown "failwith", [ ELit (LString "\"assertion failed\"") ]))
                  | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
                      let suffix =
                          match dictTryFind opKinds op.Offset with

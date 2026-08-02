@@ -170,6 +170,7 @@ let parse (src : string) : ParseResult =
         canStartAtom () || s.IsKw "fun" || s.IsKw "if" || s.IsKw "match"
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
         || s.IsKw "function" || s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new"
+        || s.IsKw "assert"
         || s.IsKw "downcast" || s.IsKw "upcast"
         || s.IsKw "for" || s.IsKw "while" || s.IsKw "try"
         || (s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~"))
@@ -186,6 +187,15 @@ let parse (src : string) : ParseResult =
         canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
         || s.IsKw "yield" || s.IsKw "return"
 
+    /// `instance` is CONTEXTUAL. F# does not reserve it and real code binds
+    /// it — `static let instance = ...` is how a type holds a singleton of
+    /// itself, and FSharp.Data.Adaptive writes exactly that. So it is an
+    /// ordinary identifier everywhere except at declaration position with a
+    /// class name after it, which is the only place the declaration can
+    /// appear.
+    let atInstanceDecl () =
+        s.Is Ident && s.IsText "instance" && (s.Peek 1).Kind = Ident
+
     let isDirectiveHere () =
         s.IsOp "#" && (s.Peek 1).Kind = Ident
         && List.contains (s.Peek 1).Text
@@ -195,7 +205,7 @@ let parse (src : string) : ParseResult =
         isDirectiveHere ()
         || s.IsKw "let" || s.IsKw "type" || s.IsKw "open" || s.IsKw "module"
         || s.IsKw "namespace" || s.IsKw "and" || s.IsKw "do" || s.IsKw "exception"
-        || s.IsKw "extern" || s.IsKw "instance"
+        || s.IsKw "extern" || atInstanceDecl ()
         // `class` also opens an F#-style `type X = class ... end`, which F++
         // does not have, so at declaration position it is always a typeclass
         || s.IsKw "class"
@@ -400,7 +410,7 @@ let parse (src : string) : ParseResult =
         vecToList acc
 
     and canStartTypeAtom () =
-        s.Is Ident || s.IsOp "'" || s.Is LParen || s.IsOp "#"
+        s.Is Ident || s.IsOp "'" || s.IsOp "^" || s.Is LParen || s.IsOp "#"
         // `: %t` — a spliced TYPE, inside a quotation only
         || isSpliceHere ()
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
@@ -423,7 +433,11 @@ let parse (src : string) : ParseResult =
             // `struct('K * 'V)` names the generic struct StructTuple2<'K,'V>
             let kw = s.Bump ()
             Green.node StructTupleType [ kw; parseAtomType ctx ]
-        elif s.IsOp "'" then
+        elif s.IsOp "'" || s.IsOp "^" then
+            // `^T` is F#'s STATICALLY RESOLVED type parameter. Here it is an
+            // ordinary one: what F# resolves by member constraint, F++
+            // resolves by typeclass, so the two spellings mean the same
+            // thing and the caret is only a different sigil.
             let q = s.Bump ()
             if s.Is Ident then Green.node VarType [ q; s.Bump () ]
             else Green.node VarType [ q ]
@@ -718,7 +732,7 @@ let parse (src : string) : ParseResult =
                         if closed < 0 then false
                         elif closed = 0 then true
                         else scan (k + 1) closed
-                    elif t.Text = "'" || t.Text = "." || t.Text = "*" || t.Text = "->" then scan (k + 1) depth
+                    elif t.Text = "'" || t.Text = "^" || t.Text = "." || t.Text = "*" || t.Text = "->" then scan (k + 1) depth
                     else false
                 | Ident -> scan (k + 1) depth
                 // `zeroCreate<struct('K * 'V)>` — a struct-tuple type
@@ -919,6 +933,21 @@ let parse (src : string) : ParseResult =
             let kw = s.Bump ()
             let arg = parseApp ctx
             Green.node CastExpr [ kw; arg ]
+        elif s.IsKw "assert" then
+            // `assert e`. F# elides it outside DEBUG; here it is a real
+            // check, because a wasm module has no debugger attached to
+            // notice the difference and a silent assertion is worth nothing.
+            // the operand is a whole EXPRESSION, not an application:
+            // `assert n > 0` asserts the comparison, as F# reads it
+            let kw = s.Bump ()
+            Green.node PrefixExpr [ kw; parseExpr ctx ]
+        elif s.IsKw "not" && (let k = (s.Peek 1).Kind in
+                              k = RParen || k = RBracket || k = RBrace
+                              || k = Comma || k = Semicolon || k = Eof) then
+            // `f >> not` — `not` as a VALUE. It is a keyword here and a
+            // function in F#, so with nothing to apply it to the node keeps
+            // only the keyword, and lowering makes the function out of it.
+            Green.node PrefixExpr [ s.Bump () ]
         elif s.IsKw "not" || s.IsKw "lazy" || s.IsKw "new" then
             let kw = s.Bump ()
             let arg = parseApp ctx
@@ -1259,7 +1288,10 @@ let parse (src : string) : ParseResult =
         Green.node TypeDecl (vecToList acc)
 
     and isMemberStart () =
-        s.IsKw "member" || s.IsKw "static" || s.IsKw "abstract" || s.IsKw "override"
+        // `static let` is a BINDING, not a member — one shared cell, which is
+        // exactly how a type holds a singleton of itself
+        (s.IsKw "static" && not ((s.Peek 1).Kind = Keyword && ((s.Peek 1).Text = "let" || (s.Peek 1).Text = "do")))
+        || s.IsKw "member" || s.IsKw "abstract" || s.IsKw "override"
         || s.IsKw "default" || s.IsKw "interface" || s.IsKw "inherit" || s.IsKw "val"
         || s.IsKw "new"
         // an access modifier may lead: `internal new(...)`, `private val ...`
@@ -1271,7 +1303,7 @@ let parse (src : string) : ParseResult =
                     || k.Text = "new" || k.Text = "inline" || k.Text = "mutable")))
 
     and isTypeBodyStart () =
-        isMemberStart () || s.IsKw "let" || s.IsKw "do" || s.IsKw "use"
+        isMemberStart () || s.IsKw "let" || s.IsKw "do" || s.IsKw "use" || s.IsKw "static"
         // a member may carry attributes: `[<MethodImpl(...)>] member ...`
         || (s.Is LBracket && (s.Peek 1).Kind = Operator && (s.Peek 1).Text = "<")
 
@@ -1285,7 +1317,9 @@ let parse (src : string) : ParseResult =
             elif s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let" then
                 // `static let`: a binding on the type, not on an instance
                 vecAdd acc (parseLet typeCol)
-            elif s.IsKw "let" || s.IsKw "use" then vecAdd acc (parseLet typeCol)
+            elif s.IsKw "let" || s.IsKw "use"
+                 || (s.IsKw "static" && (s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "let") then
+                vecAdd acc (parseLet typeCol)
             elif s.IsKw "do" then
                 let d = s.Bump ()
                 let body = if canStartExpr () then parseBlock typeCol else Green.node ErrorNode []
@@ -1596,7 +1630,7 @@ let parse (src : string) : ParseResult =
             if lastMajor = "type" then parseTypeDecl ctx else parseLet ctx
         elif s.IsKw "type" then parseTypeDecl ctx
         elif s.IsKw "class" then parseClassLike ClassDecl
-        elif s.IsKw "instance" then parseClassLike InstanceDecl
+        elif atInstanceDecl () then parseClassLike InstanceDecl
         elif s.IsKw "exception" then
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())

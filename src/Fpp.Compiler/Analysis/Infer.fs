@@ -1773,9 +1773,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match tokensOf n |> List.tryHead with
                  | Some t when t.Text = "not" ->
                      (match inner with
+                      | [ i ] ->
+                          unifyAt t.Offset i tBool
+                          tBool
+                      // `not` with nothing to negate is the FUNCTION
+                      | _ -> TFun (tBool, tBool))
+                 | Some t when t.Text = "assert" ->
+                     (match inner with
                       | [ i ] -> unifyAt t.Offset i tBool
                       | _ -> ())
-                     tBool
+                     tUnit
                  | Some t when t.Text = "&" ->
                      // record which kind this is: forwarding an existing
                      // cell, or taking the address of a LOCATION, which the

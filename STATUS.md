@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-610 tests
+615 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1579856 bytes, byte-identical
+self-host fixpoint 1581577 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -117,19 +117,27 @@ mean the first.
 Expression and pattern position resolve SEPARATELY — the case-through-type
 fix needed both — which is worth remembering for anything else qualified.
 
-~~computation expressions~~ and ~~`use` / `IDisposable`~~ are done. What the
-40-file standalone parse still stops on, measured rather than guessed —
-**27 of 40 parse clean**, unchanged by the CE work because the blockers were
-never CEs:
+~~computation expressions~~ and ~~`use` / `IDisposable`~~ are done, and so
+are five of the syntax blockers the 40-file standalone parse was stuck on:
+flexible types (`#seq<'T>`) and statically-resolved ones (`^T`) inside a
+generic argument list — both were LEXED into the angle bracket, so the
+argument list was never entered; `assert`; `not` as a value; and `instance`,
+which F++ had reserved and F# had not. That is **31 of 40 parsing clean**,
+up from 27.
 
-* **flexible types in a member's parameters** — `member x.For(elements :
-  aval<#seq<'T1>>, ...)`. `#T` parses in some positions and not this one,
-  and it stops `ComputationExpressions.fs` itself.
+What is left, measured:
+
 * **`do base.M()` in a class body** — `AdaptiveObject.fs`, `Core.fs`,
-  `Transaction.fs`, `Callbacks.fs`.
-* **`member x.Invoke(a : T, b : U, ...)` mangled by the port harness** into
-  `member (x (a : T) (b : U)) =`. That one is the DRIVER's bug, not the
-  compiler's — `port_closures` rewrites a tupled member and loses the name.
+  `Transaction.fs`, `Callbacks.fs`. `base` is not a token this compiler knows
+  anywhere. A non-virtual call to the base's own implementation is what it
+  means, which the lifted-member machinery can already express.
+* **optional parameters** — `static member F(path : string, ?retries : int)`
+  in `AdaptiveFileSystem.fs`.
+* **the offside rule inside brackets** — `store.AlterV(value, function` with
+  the clauses undented on the lines below. F# allows a bracketed group to
+  undent; F++ ends the block. This one has bitten twice now, and both
+  attempts to relax it swallowed the next statement — it wants the enclosing
+  BLOCK columns, not just the bracket depth.
 * **reflection outside ShallowEquality** — ~30 `typeof<>` sites in
   AdaptiveValue, HashSet, HashMap, IndexList, History, Cache. Read each:
   most are a cache key or a null test, which a class or a constrained

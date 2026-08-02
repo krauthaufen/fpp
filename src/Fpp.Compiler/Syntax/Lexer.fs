@@ -156,6 +156,14 @@ let tokenize (src : string) : Token list =
         while not stop && i < n && isSymbolic (peek i) do
             // a comment start terminates a symbolic run: `1 +// rest`
             if (peek i = '/' && peek (i + 1) = '/') || (peek i = '(' && peek (i + 1) = '*') then stop <- true
+            // `#` stands ALONE. It opens a compiler directive and a FLEXIBLE
+            // type, and neither is an operator — gluing it to the run made
+            // `aval<#seq<'a>>` lex its `<#` as one token, so the generic
+            // argument list was never entered and the type would not parse.
+            // No operator in this language contains one.
+            elif peek i = '#' then
+                if i = pos then i <- i + 1
+                stop <- true
             else i <- i + 1
         i
 

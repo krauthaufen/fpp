@@ -1112,3 +1112,83 @@ let computationExpressionTests =
             Expect.isEmpty (ws.Diagnostics "prog.fpp") "a record argument is still a record argument"
         }
     ]
+
+[<Tests>]
+let inheritedSyntaxTests =
+    testList "F# syntax the library writes" [
+        test "assert checks, and says so when it fails" {
+            // F# elides `assert` outside DEBUG. A wasm module has no
+            // debugger attached to notice the difference, so a silent
+            // assertion would be worth nothing — here it is a real check.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let f (n : int) ="
+                    "    assert (n > 0)"
+                    "    n * 2"
+                    "let g (n : int) ="
+                    "    assert n > 0"
+                    "    n * 3"
+                    "let go ="
+                    "    printfn \"%d\" (f 3)"
+                    "    printfn \"%d\" (g 4)"
+                    "    try printfn \"%d\" (f -1) with Failure m -> printfn \"caught %s\" m"
+                    "" ])
+            Expect.equal out "6\n12\ncaught assertion failed\n"
+                            "the operand is a whole expression, not an application"
+        }
+        test "`not` with nothing to negate is the function" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let isOdd (n : int) = n % 2 = 1"
+                    "let evens = List.filter (isOdd >> not) [ 1; 2; 3; 4 ]"
+                    "let go = printfn \"%d\" (List.length evens)"
+                    "" ])
+            Expect.equal out "2\n" "`f >> not` composes with it as a value"
+        }
+        test "`instance` is a name as well as a declaration" {
+            // F# does not reserve it, and real code binds it: `static let
+            // instance = ...` is how a type holds a singleton of itself.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "class Sized<'a>"
+                    "    static size : 'a -> int"
+                    "instance Sized<int>"
+                    "    static size _ = 4"
+                    "let instance = 7"
+                    "let go = printfn \"%d %d\" instance (size 1)"
+                    "" ])
+            Expect.equal out "7 4\n" "the keyword is contextual, the identifier is not"
+        }
+        test "a flexible type inside a generic argument" {
+            // `aval<#seq<'T1>>` — the caret and the hash both used to glue
+            // onto the angle bracket, so the argument list was never entered
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module M"
+                "type Box<'a> = B of 'a"
+                "let f (x : Box<#seq<int>>) = 1"
+                "let inline g (a : ^T, b : ^T) : ^T = a"
+                "let go = printfn \"%d\" (f (B ([ 1 ] :> seq<int>)))"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "prog.fpp") "flexible and statically-resolved parameters parse"
+        }
+        test "static let holds a value on the type" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Counter<'a>() ="
+                    "    static let mutable made = 0"
+                    "    member x.Bump () ="
+                    "        made <- made + 1"
+                    "        made"
+                    "let c = Counter<int>()"
+                    "let go ="
+                    "    printfn \"%d\" (c.Bump ())"
+                    "    printfn \"%d\" (c.Bump ())"
+                    "" ])
+            Expect.equal out "1\n2\n" "one cell, shared by every instance"
+        }
+    ]
