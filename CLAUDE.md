@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 619 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 621 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -183,6 +183,15 @@ trapped. If you change one side, change the other.
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
 and Lower. Each one is this question — first or last — and each is right
 only if its head cannot be qualified. Worth auditing as a group.
+
+The same mistake had a second form, in MEMBERS rather than constructors: a
+member declared `M(a, b, c)` takes a parameter of TUPLE type, and only a call
+written with three arguments reaches it. `shapeFits` treats an unresolved
+argument type as a wildcard, so the three-tuple parameter fit a one-argument
+call and the overload declared FIRST won. Arity is checked before shape now.
+When you add an overload rule, check it against a call whose argument types
+are still VARIABLES — that is the case where every candidate looks equally
+good.
 
 ## Pattern identifiers
 

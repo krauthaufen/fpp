@@ -1282,3 +1282,48 @@ let undentedClauseTests =
             Expect.equal out "1 2 3\n" "the outer clause still owns `| C`"
         }
     ]
+
+[<Tests>]
+let memberOverloadArityTests =
+    let map2 =
+        [ "type Map2<'K, 'V>(k : 'K, v : 'V) ="
+          "    member x.Key = k"
+          // the THREE-argument overload is declared FIRST, which is what
+          // made the one-argument call take it
+          "    member x.TryRemove (key : 'K, result : byref<Map2<'K, 'V>>, removed : byref<'V>) ="
+          "        result <- x"
+          "        removed <- v"
+          "        true"
+          "    member x.TryRemove (key : 'K) = Some v" ]
+    testList "member overloads are selected by arity" [
+        test "a one-argument call cannot reach a tupled member" {
+            // A member declared `M(a, b, c)` takes a parameter of TUPLE
+            // type, and only a call written with three arguments reaches it.
+            // Inference used to treat an unresolved argument type as a
+            // wildcard, so the three-tuple parameter "fit" one argument
+            // whose type was still a variable — and the overload declared
+            // first won.
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ map2 @
+                    [ "module M2 ="
+                      "    let tryRemove (key : 'K) (map : Map2<'K, 'V>) = map.TryRemove(key)"
+                      "let go ="
+                      "    let m = Map2<int, string>(1, \"one\")"
+                      "    printfn \"%s\" (match M2.tryRemove 1 m with Some v -> v | None -> \"?\")"
+                      "" ]))
+            Expect.equal out "one\n" "the generic receiver picks the one-argument overload"
+        }
+        test "and the tupled call still reaches the tupled member" {
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ map2 @
+                    [ "let go ="
+                      "    let m = Map2<int, string>(1, \"one\")"
+                      "    let mutable r = m"
+                      "    let mutable s = \"\""
+                      "    printfn \"%b %s\" (m.TryRemove(1, &r, &s)) s"
+                      "" ]))
+            Expect.equal out "true one\n" "three written arguments select the three-parameter member"
+        }
+    ]

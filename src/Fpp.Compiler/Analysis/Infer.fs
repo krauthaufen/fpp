@@ -549,10 +549,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | TVar _ -> false
                      | _ -> true
                  if List.length cands > 1 && not informative && not force then false else
+                 // ARITY first. A member declared `M(a, b, c)` takes a
+                 // parameter of TUPLE type, and only a call written with
+                 // three arguments can reach it — F# selects on the number
+                 // written, never on what the single argument's type might
+                 // turn out to be. `shapeFits` cannot see that: it treats an
+                 // unresolved argument type as a wildcard, so a three-tuple
+                 // parameter "fits" one argument whose type is still a
+                 // variable, and the overload declared FIRST won.
+                 // `MapExt.TryRemove(key)` reached `TryRemove(key, &result,
+                 // &removed)` this way, and the mismatch surfaced a line off
+                 // from the call.
+                 let paramOf (t : Type) =
+                     match prune t with
+                     | TFun (a, _) -> Some (prune a)
+                     | _ -> None
+                 let arityOk (c : Type) =
+                     match paramOf c with
+                     | Some (TTuple xs) ->
+                         (match paramOf result with
+                          | Some (TTuple ys) -> xs.Length = ys.Length
+                          // a written tuple is the only thing that reaches a
+                          // tupled member, whatever the actual turns out to be
+                          | Some _ -> false
+                          | None -> true)
+                     | _ -> true
                  let ord, fi =
                      match cands with
                      | [ one ] -> one
-                     | many ->
+                     | all ->
+                         let many =
+                             match all |> List.filter (fun (_, c) -> arityOk c.FieldType) with
+                             | [] -> all
+                             | kept -> kept
                          (match many |> List.filter (fun (_, c) -> shapeFits true c.FieldType result) with
                           | picked :: _ -> picked
                           | [] ->

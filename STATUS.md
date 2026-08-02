@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-619 tests
+621 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1587489 bytes, byte-identical
+self-host fixpoint 1588217 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -136,25 +136,21 @@ is **39 of 40 parsing clean**, up from 27:
 | a clause list undented inside brackets | `f (x, function` puts its clauses left of the keyword — the bracket delimits the group, so the offside line is the enclosing statement's. What it may not undent past is a clause list or block that ENCLOSES it |
 | `function` | parsed all along and never lowered. It is the lambda whose body matches on its own argument, and nothing else |
 
-**The frontier is no longer syntax.** With 39 of 40 files parsing, the
-sequential type-check frontier has barely moved — line 8155 of 22,635, still
-inside `MapExt` — because what stops it is one bug, not one construct:
+**The frontier is no longer syntax**, and the bug that was holding it is
+fixed. A member declared `M(a, b, c)` takes a parameter of TUPLE type, and
+only a call written with three arguments can reach it — but `shapeFits`
+treats an unresolved argument type as a WILDCARD, so a three-tuple parameter
+fit a one-argument call whose type was still a variable, and the overload
+declared first won. `MapExt.TryRemove(key)` reached `TryRemove(key, &result,
+&removed)` that way, and the mismatch surfaced a line off from the call,
+which is why it took a bisect to find. Arity is checked before shape now.
 
-> **A member's overloads are not selected by arity.** `MapExt.TryRemove` is
-> declared twice, first as `TryRemove(key, result : byref<_>, removedValue :
-> byref<_>)` and then as `TryRemove(key)`. The one-argument call takes the
-> THREE-argument overload, because it is declared first — and the mismatch
-> surfaces on the line above it, which is why this took a bisect to find.
->
-> This is the same mistake that was fixed for CONSTRUCTORS
-> ("a qualified constructor took the primary overload whatever its arity")
-> and never fixed for members. Resolve already records the overloads as
-> `Type.Member`, `Type.Member#1`, `Type.Member#2`; nothing picks among them
-> by the shape of the call.
-
-Fix that and the frontier moves for the first time in a while: the twelve
-files unblocked above all sit BEYOND it, and none of them has been type
-checked yet.
+With that, the frontier moved for the first time in a while — **8155 to
+8396** — and `MapExt.fs`, all 3,908 lines of it, type checks whole for the
+first time. The next stop is inside `IndexList.fs`, at
+`MapExt.slice min max content`: three symptoms (`int vs Index`, `IComparer<'a>
+vs Index`, and an occurs-check on `Node<Index, 'a>`) that look like one wrong
+instantiation rather than three problems.
 
 Then, still measured:
 
