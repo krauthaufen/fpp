@@ -533,51 +533,45 @@ this written element, take it wrapped, or pass None.
 `?x` rides in the tree as its own token, both in the parameter list and at the
 call, so the rest of the pipeline sees ordinary shapes.
 
+## `[<AutoOpen>]`
+
+An auto-opened module's contents are in scope for everything after it. The
+adaptive library leans on this: `HashSet.computeDelta` and `applyDelta` live
+in an auto-opened `DifferentiationExtensions.HashSet`, three thousand lines
+away from the `HashSet` module that holds `empty`. Without it those names
+resolved to the PRELUDE's set operators, which are backed by `HashNode` — so
+`Traceable`'s `'State` was bound to a `HashNode` before its first field was
+even read, and every field after it looked wrong.
+
+The port script was stripping the attribute; it keeps it now.
+
 ## Where it stops now
 
-The whole 39-file port — all 21,873 lines, the computation-expression test
-module included — INFERS in 6.4 seconds, with 269 diagnostics. Nothing in it
-is superlinear any more; see CLAUDE.md for the cause, which was one argument
-being typed twice per application.
+The whole 39-file port — 21,873 lines — infers in about seven seconds, with
+259 diagnostics. Every `HashNode` mismatch is gone.
 
-    265  type mismatch
-     17  the type HashSet<'a> would contain itself
-      7  no constructor accepts these arguments
-      8  missing instances (Add, Mul, MinMax, Ordered)
-
-The three big adaptive collections — AdaptiveHashMap, AdaptiveIndexList,
-AdaptiveHashSet — hold about three quarters of them, which suggests one or
-two shared causes rather than 200 separate ones.
-
-Grouped by shape, one pattern dominates: a type and its DELTA unified with
-each other, in every collection.
-
-     29  IOpReader<HashMap<IndexList<IndexListDelta<'a>...
-     26  IOpReader<CountingHashSet<HashSetDelta<'a>>, ...
-     16  HashNode<'a, int> vs HashSet<'a>
-     14  IndexList<'a> vs IndexListDelta<'a>
-     12  HashMap<'a, HashSet<'b>> vs HashMapDelta<'a, ...
+     35  IOpReader<HashMap<IndexList<IndexListDelta<'a>...
+     32  IOpReader<CountingHashSet<HashSetDelta<'a>>, ...
+     25  IndexList<'a> vs IndexListDelta<'a>
+     23  the type HashSet<'a> would contain itself
      11  CountingHashSet<'a> vs HashSetDelta<'a>
 
-### Two hypotheses, both TESTED and both WRONG
+Still one shape: a collection unified with its own DELTA. `IOpReader<'a>`
+takes the delta, `Traceable`/`History` carry the pair, and something is
+tying the two parameters together.
+
+### Hypotheses tested and REJECTED
 
 Recorded so nobody spends the afternoon on them again.
 
-* **A name collision on `Traceable`.** `Traceable/Instances.fs` declares a
-  private per-module cache class `Traceable<'T>` while the library's own
-  record is `Traceable<'State, 'Delta>`, and types here are keyed by bare
-  name. Renaming the cache classes in the port changed the diagnostic count
-  by ZERO — same 269, same distribution.
-* **The prelude's `module HashSet` shadowing the port's.** The prelude has a
-  `HashSet` module whose `empty` is a `HashNode<'k, int>`, which is exactly
-  the type in the error. But a user module DOES shadow a prelude module of
-  the same name — verified in isolation, it resolves to the user's. So the
-  collision is real and the shadowing is not broken; something else about
-  the port's shape is.
-
-`HashNode` appears in these errors at all only because it is the prelude's
-representation, so whatever goes wrong reaches for the prelude's `HashSet`
-rather than the library's. That is the thread to pull next.
+* **A name collision on `Traceable`.** Renaming the private per-module cache
+  classes in the port changed the count by ZERO.
+* **The prelude's `module HashSet` shadowing the port's.** A user module DOES
+  shadow a prelude module of the same name — verified in isolation. What was
+  actually happening is the AutoOpen above, and `DefinitionAt`/`HoverAt` on
+  the failing tokens is what settled it: `empty` bound to the library,
+  `computeDelta` to the prelude. Ask the compiler where a name went before
+  theorising about why.
 
 ## Compiling is not the same as running
 

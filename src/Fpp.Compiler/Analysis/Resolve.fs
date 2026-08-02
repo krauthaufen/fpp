@@ -62,6 +62,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let exports = vecNew<string * Definition> ()
     let ownExports = dictNew<string, Definition> ()
     let opens = vecNew<string> ()
+    /// set by an `[<AutoOpen>]` attribute, consumed by the module it precedes
+    let mutable pendingAutoOpen = false
     // "TypeName.MemberName" -> def, and bare name -> every def with that
     // name (a use is disambiguated by the receiver type during inference)
     let memberDefs = dictNew<string, Definition> ()
@@ -1040,7 +1042,10 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      if atExportLevel then exportDef d
                  | [] -> ())
                 let saved = modulePath
+                let auto = pendingAutoOpen
+                pendingAutoOpen <- false
                 modulePath <- (if modulePath = "" then segment else modulePath + "." + segment)
+                let full = modulePath
                 let mutable inner = outer
                 let groups = andGroupBindings n.Children
                 let mutable idx = 0
@@ -1051,7 +1056,19 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      | GToken _ -> ())
                     idx <- idx + 1
                 modulePath <- saved
-                outer
+                if auto then
+                    vecAdd opens full
+                    // and into scope unqualified, the way `open` does
+                    let prefix = full + "."
+                    let injectAuto (e : Env) (tbl : Dict<string, Definition>) : Env =
+                        let mutable acc = e
+                        for k, d in dictPairs tbl do
+                            if k.StartsWith prefix then
+                                let rest = substr k (strLen prefix) (strLen k - strLen prefix)
+                                if not (rest.Contains ".") then acc <- Map.add rest d acc
+                        acc
+                    injectAuto (injectAuto outer imports) ownExports
+                else outer
             | ModuleHeader ->
                 let nameToks =
                     n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
@@ -1082,7 +1099,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                                     acc <- Map.add rest d acc
                         acc
                     inject (inject env imports) ownExports
-            | AttributeList | TyParams -> env
+            | AttributeList ->
+                // `[<AutoOpen>] module M` puts M's contents in scope for
+                // everything after it, without an `open`. The adaptive library
+                // leans on it — `HashSet.computeDelta` lives in an auto-opened
+                // `DifferentiationExtensions.HashSet`, and without this the
+                // name falls through to whatever else answers to it.
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "AutoOpen") then
+                    pendingAutoOpen <- true
+                env
+            | TyParams -> env
             | _ -> local (fun () -> walkExpr env g) |> ignore; env
 
     let mutable env : Env = Map.empty

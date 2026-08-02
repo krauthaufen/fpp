@@ -17,7 +17,10 @@ changes"). Nothing here works around a compiler limitation.
 """
 import re, sys
 
-KEEP = {"Struct", "AllowNullLiteral", "AbstractClass", "Sealed"}
+# AutoOpen is KEPT: the library leans on it — `HashSet.computeDelta` lives in
+# an auto-opened `DifferentiationExtensions.HashSet`, and stripping it left
+# every such name resolving to whatever else answered to it.
+KEEP = {"Struct", "AllowNullLiteral", "AbstractClass", "Sealed", "AutoOpen"}
 
 def split_top(s, sep):
     out, depth, cur = [], 0, ""

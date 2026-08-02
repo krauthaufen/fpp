@@ -2025,3 +2025,29 @@ let namedArgumentTests =
             Expect.equal out "true\np\n" "the name is a parameter of nothing here"
         }
     ]
+
+[<Tests>]
+let autoOpenTests =
+    testList "AutoOpen" [
+        test "an auto-opened module is in scope without an open" {
+            // `[<AutoOpen>] module M` puts M's contents in scope for what
+            // follows. The adaptive library leans on it — HashSet.computeDelta
+            // lives in an auto-opened DifferentiationExtensions.HashSet — and
+            // without it the name resolved to whatever else answered to it.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module Root"
+                    "type Thing<'T>(tag : int) ="
+                    "    member x.Tag = tag"
+                    "module Thing ="
+                    "    let make<'T> = Thing<'T>(1)"
+                    "[<AutoOpen>]"
+                    "module Extensions ="
+                    "    module Thing ="
+                    "        let better<'T> = Thing<'T>(99)"
+                    "let go ="
+                    "    printfn \"%d %d\" (Thing.make<int>).Tag (Thing.better<int>).Tag"
+                    "" ])
+            Expect.equal out "1 99\n" "the auto-opened module answers too"
+        }
+    ]
