@@ -5363,7 +5363,13 @@ type Interlocked =
 /// This is a divergence with teeth, and it is written down in
 /// DIVERGENCES.md rather than hidden here.
 type WeakReference<'a>(value : 'a) =
+    /// .NET declares `TryGetTarget(out T)`. F# offers BOTH spellings — the
+    /// out-parameter one and the tuple it becomes when you leave it off —
+    /// and real code uses each, so both are here.
     member x.TryGetTarget () : bool * 'a = (true, value)
+    member x.TryGetTarget (target : byref<'a>) : bool =
+        target <- value
+        true
     member x.Target = value
     member x.IsAlive = true
 

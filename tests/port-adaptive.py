@@ -92,6 +92,37 @@ def strip_namespace_headers(src, first):
     return "\n".join(out)
 
 
+def dotnet_hashset(src):
+    """`HashSet<T>` is System.Collections.Generic's when the file's HEADER
+    opens that namespace last. F# is last-open-wins — measured, not assumed —
+    so a header open applies to the whole file and decides every bare use in
+    it.
+
+    HEADER opens only. `Deltas.fs` opens the namespace INSIDE a module, which
+    binds only there, and reading the whole file for the last occurrence
+    rewrote uses that mean the library's own type — it moved the frontier
+    backwards by 1,400 lines.
+
+    This is the harness's mess to clean up rather than a change to what the
+    library means: flattening every namespace into one module is what
+    destroys the shadowing, and F++ identifies a type by its bare NAME, so
+    two called `HashSet` merge (DIVERGENCES.md — it is also why the prelude's
+    mutable set is `MutableHashSet`). Until a type can be told apart by more
+    than its name, the resolution F# performed has to be replayed here.
+    """
+    header = src.split("\nmodule ")[0].split("\ntype ")[0].split("\n[<")[0]
+    generic = header.rfind("open System.Collections.Generic")
+    if generic < 0:
+        return src
+    if header.rfind("open FSharp.Data.Adaptive") > generic:
+        return src
+    # not in the file that DECLARES it: inside `HashCollections.fs` every
+    # `HashSet<'T>` is the one being defined, all 77 of them
+    if re.search(r"^\s*(type|and)\s+HashSet\b", src, re.M):
+        return src
+    return re.sub(r"\bHashSet\s*<", "MutableHashSet<", src)
+
+
 def port(path, first):
     src = open(path, encoding="utf-8-sig").read()
     # The .NET branch, not the Fable one: Fable's WeakReference never dies,
@@ -105,6 +136,7 @@ def port(path, first):
     src = drop_fsharp_core_set_bridges(src)
     src = rewrite_shallow_calls(src)
     src = drop_dotnet_interop_interfaces(src)
+    src = dotnet_hashset(src)
     src = strip_namespace_headers(src, first)
     return src
 

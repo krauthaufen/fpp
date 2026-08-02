@@ -1805,3 +1805,28 @@ let objectInitializerTests =
             Expect.equal out "true\n" "the case takes the comparison's value"
         }
     ]
+
+[<Tests>]
+let outParameterOverloadTests =
+    testList "an out parameter has two spellings" [
+        test "TryGetTarget, both ways" {
+            // .NET declares `TryGetTarget(out T)`. F# offers the
+            // out-parameter form AND the tuple it becomes when you leave it
+            // off, and real code uses each — FSharp.Data.Adaptive passes a
+            // cell, `stdlib/dotnet.fpp` matches the tuple.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Cell(n : int) ="
+                    "    member x.N = n"
+                    "let go ="
+                    "    let w = WeakReference<Cell>(Cell 7)"
+                    "    (match w.TryGetTarget () with"
+                    "     | (true, t) -> printfn \"tuple %d\" t.N"
+                    "     | _ -> printfn \"none\")"
+                    "    let mutable got = Cell 0"
+                    "    if w.TryGetTarget(&got) then printfn \"outparam %d\" got.N"
+                    "" ])
+            Expect.equal out "tuple 7\noutparam 7\n" "arity picks between them"
+        }
+    ]

@@ -7,7 +7,7 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-642 tests
+643 tests
 corpus fixpoint    53463 bytes, byte-identical
 self-host fixpoint 1612326 bytes, byte-identical
 ```
@@ -421,35 +421,44 @@ first one.
 
 The frontier is **11741** — everything through `Core/Core.fs`.
 
-## Where it stops now, and why it is a different KIND of blocker
+## `HashSet` means two types, and the harness replays which
 
-`Core/Core.fs` line 289 writes
+`Core/Core.fs` writes `HashSet<WeakReference<IAdaptiveObject>>()` and
+mutates it: that is `System.Collections.Generic`'s, because the file's
+HEADER opens that namespace last. F# is last-open-wins — measured against
+the real compiler, not assumed — and F++ identifies a type by its bare NAME,
+so two called `HashSet` merge and the port's flattening destroys the
+namespaces that told them apart.
 
-```fsharp
-let set = HashSet<WeakReference<IAdaptiveObject>>()
-set.Add r |> ignore
-```
+Until a type can be told apart by more than its name, the harness replays
+the resolution F# performed: in a file whose HEADER opens
+`System.Collections.Generic` last, and which does not itself DECLARE the
+name, `HashSet<` is the mutable one.
 
-and that is `System.Collections.Generic.HashSet` — the file opens that
-namespace LAST, so F#'s temporal shadowing puts the .NET type over the
-library's own. F++ calls the mutable one `MutableHashSet` precisely because
-it cannot have two types of one name (DIVERGENCES.md), and the port's
-concatenation destroys the namespaces that would have told them apart.
+Both qualifications are load-bearing and both were found by getting it
+wrong. Reading the WHOLE file for the last open catches one nested inside a
+module — `Deltas.fs` has exactly that, and rewriting its uses moved the
+frontier backwards by 1,400 lines. And `HashCollections.fs` opens the
+namespace in its header while declaring `HashSet` itself, all 77 uses its
+own.
 
-**This was attempted and reverted.** A harness rule rewriting `HashSet<` to
-`MutableHashSet<` in files whose last relevant open is the .NET one needs
-two exceptions immediately — a file that opens `FSharp.Data.Adaptive`
-afterwards, and one that DECLARES the name (`HashCollections.fs`, 77 uses,
-all its own) — and even then it moved the frontier BACKWARDS, from 11741 to
-10364, by breaking `Deltas.fs`. Each exception is a guess about which
-`HashSet` a file means, which is exactly the question real name resolution
-answers.
+**This is still a workaround for a missing mechanism**, and the mechanism is
+named: types identified by more than their bare name, which reaches the
+backend, where every type is a string. `MutableHashSet` exists for the same
+reason, and so does "a user type whose name matches a prelude type MERGES
+with it".
 
-So this one is not a naming patch. It wants **types identified by more than
-their bare name** — the same root as the `MutableHashSet` divergence and as
-"a user type whose name matches a prelude type MERGES with it". Two types
-called `Thing` in one file merge today; that is what has to change, and it
-reaches the backend, which names every type by a string.
+## An out parameter has two spellings
 
-Everything before it is clean: the frontier is **11741 of 22,635**, every
-file through `Core/Core.fs`.
+.NET declares `TryGetTarget(out T)`; F# offers that AND the tuple it becomes
+when you leave the parameter off. The library passes a cell,
+`stdlib/dotnet.fpp` matches the tuple, and the prelude now has both — arity
+picks between them, which it can since overload resolution became real.
+
+The frontier is **12092 of 22,635** — everything through
+`Core/Transaction.fs`.
+
+## Where it stops now
+
+`Core/AdaptiveToken.fs`, line 12198: `type mismatch: int vs list<unit ->
+unit>`.
