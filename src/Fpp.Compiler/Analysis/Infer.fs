@@ -960,6 +960,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if head.NodeKind <> DotExpr then None
         else Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
 
+    /// What the pattern about to be typed must BE. Consumed by whoever
+    /// reads it, so a nested pattern never inherits its parent's answer by
+    /// accident — the parent passes it down deliberately or not at all.
+    ///
+    /// Only one question needs it: whether a parenthesised comma pattern
+    /// destructures a REFERENCE tuple or a STRUCT one. Nothing in the
+    /// pattern says, and F# reads it from the scrutinee — allowing
+    /// `ValueSome (a, b)` over a struct-tuple payload while rejecting the
+    /// same pattern in a `let`.
+    let mutable patExpect : Type option = None
+
     let mutable letDepth = 0
 
     /// The enclosing binding's named type variables ('K of the member or
@@ -1222,8 +1233,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | AppPat ->
             (match nodesOf n with
              | head :: args ->
+                 let want = patExpect
+                 patExpect <- None
                  let ctorTy = patType pvars head
-                 let argTys = args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map (patType pvars)
+                 // Tie the case's RESULT to what this pattern must be FIRST:
+                 // that is what makes the payload's type known, and the
+                 // payload pattern is about to be typed against it.
+                 (match want, prune ctorTy with
+                  | Some w, TFun (_, res) -> unify res w |> ignore
+                  | _ -> ())
+                 let payloadWant =
+                     match prune ctorTy with
+                     | TFun (dom, _) -> Some dom
+                     | _ -> None
+                 let argTys =
+                     args
+                     |> List.filter (fun m -> isPatKind m.NodeKind)
+                     |> List.map (fun m ->
+                         patExpect <- payloadWant
+                         let t = patType pvars m
+                         patExpect <- None
+                         t)
                  (match argTys with
                   | [] -> ctorTy
                   | [ argTy ] ->
@@ -1240,7 +1270,32 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some tn -> typeFromNode pvars tn
              | None -> st.Fresh ())
         | TuplePat ->
-            TTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map (patType pvars))
+            let want = patExpect
+            patExpect <- None
+            let elems = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
+            let asStruct =
+                match want with
+                | Some w ->
+                    (match prune w with
+                     | TCon (sn, args) when
+                            sn.StartsWith "StructTuple" && List.length args = List.length elems ->
+                         Some (sn, args)
+                     | _ -> None)
+                | None -> None
+            (match asStruct with
+             | Some (sn, args) ->
+                 // A struct tuple destructured by a plain comma pattern.
+                 // Marked at the pattern's offset, because lowering reads
+                 // the node KIND and this node lies about it.
+                 let tys = elems |> List.map (patType pvars)
+                 List.iter2 (fun t a -> unify t a |> ignore) tys args
+                 // recorded in the OWNER channel, which is where lowering
+                 // already looks for a struct pattern's instantiated name
+                 (match Green.tokens (GNode n) |> List.tryHead with
+                  | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                  | None -> ())
+                 TCon (sn, args)
+             | None -> TTuple (elems |> List.map (patType pvars)))
         | StructTuplePat ->
             // the same generic struct the `struct(a, b)` expression builds
             let rec unwrap (m : GreenNode) =
@@ -1282,6 +1337,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | _ -> st.Fresh ())
         | ParenPat ->
             // sequence of patterns, each optionally ascribed, comma-separated
+            let want = patExpect
+            patExpect <- None
             let items = vecNew<Type> ()
             let kids = n.Children
             let rec walk (ks : Green list) =
@@ -1313,7 +1370,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match vecToList items with
             | [] -> tUnit
             | [ one ] -> one
-            | many -> TTuple many
+            | many ->
+                // A comma pattern says nothing about which KIND of tuple it
+                // takes apart, and F# reads that from what it is matched
+                // against: `ValueSome (a, b)` over a struct-tuple payload is
+                // allowed, the same pattern in a `let` is not. Marked at the
+                // pattern's offset in the owner channel, which is where
+                // lowering already looks for a struct pattern's name.
+                match want with
+                | Some w ->
+                    (match prune w with
+                     | TCon (sn, args) when
+                            sn.StartsWith "StructTuple" && List.length args = List.length many ->
+                         List.iter2 (fun t a -> unify t a |> ignore) many args
+                         (match Green.tokens (GNode n) |> List.tryHead with
+                          | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                          | None -> ())
+                         TCon (sn, args)
+                     | _ -> TTuple many)
+                | None -> TTuple many
         | _ -> st.Fresh ()
 
     // ---- expressions ------------------------------------------------------
@@ -2138,7 +2213,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 // one we have a declaration for. Typing its
                                 // binder is enough.
                                 if isTypeTest m then patType cvars m |> ignore
-                                else unifyArg barOff scrut (patType cvars m)
+                                else
+                                    // the scrutinee is what this pattern must
+                                    // be, and a comma pattern needs to know
+                                    patExpect <- Some scrut
+                                    let pt = patType cvars m
+                                    patExpect <- None
+                                    unifyArg barOff scrut pt
                         // body: expr children; when-guard is bool but we keep it loose
                         let bodies = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
                         (match List.tryLast bodies with
@@ -2813,9 +2894,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match bodyTys, hasIn with
                 | v :: _, true -> Some v
                 | _, _ -> List.tryLast bodyTys
+            // REPORTED, not discarded. `let (p, q) = struct(1, "x")` is an
+            // error in F# — one tuple is a struct, the other is not — and
+            // swallowing it here let the binding compile and then trap,
+            // which is the worst of the three outcomes available.
+            let at =
+                match pats |> List.tryHead |> Option.bind (fun p -> Green.tokens (GNode p) |> List.tryHead) with
+                | Some t -> t.Offset
+                | None -> 0
             (match patTys, valueTy with
-             | [ single ], Some b -> unify single b |> ignore
-             | many, Some b -> unify (TTuple many) b |> ignore
+             | [ single ], Some b -> unifyAt at single b
+             | many, Some b -> unifyAt at (TTuple many) b
              | _ -> ())
             if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
             else tUnit

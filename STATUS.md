@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-625 tests
+627 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1593266 bytes, byte-identical
+self-host fixpoint 1596666 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -189,19 +189,22 @@ lowering to wrap the result — `a < b` is `compare a b < 0` only for a member
 by that name, and without it the raw int stood in for the boolean and both
 directions came out true.
 
-The frontier has moved **8155 → 8454**. `MapExt.fs` and `IndexList.fs` up to
+**A comma pattern takes apart whichever tuple it is matched against.** It
+says nothing about which kind it is, and F# reads that from the scrutinee:
+`ValueSome (a, b)` over a struct-tuple payload is allowed, the same pattern
+in a `let` is not. Both were measured before either was implemented.
+
+Typing a pattern is bidirectional now — the scrutinee flows in, a union case
+ties its RESULT to it before its payload pattern is typed, and a comma
+pattern that finds a struct tuple waiting marks itself in the owner channel
+so lowering binds the payload whole and reads the fields out. The `let` form
+stays an error, and it is one for the first time: the mismatch was being
+computed and then DISCARDED, so the binding compiled and trapped, which is
+the worst of the three outcomes available.
+
+The frontier has moved **8155 → 8766**. `MapExt.fs` and `IndexList.fs` up to
 that line type check whole, and IndexList's diagnostics are down from 60 to
-34.
-
-What heads the remaining 34 is now one thing, not several:
-
-* **`StructTuple2<Index, 'a> vs 'a * 'b`**. `ValueSome (id, _)` destructuring
-  a struct-tuple payload. Measured against F#: it ALLOWS a plain tuple
-  pattern inside a union case's payload and REJECTS it in a `let`
-  ("One tuple type is a struct tuple, the other is a reference tuple"), so
-  the fix is exactly that narrow. It needs the scrutinee's type when the
-  pattern is typed, which is the same bidirectional plumbing the member
-  demand already uses.
+14.
 
 Then, still measured:
 

@@ -1444,3 +1444,40 @@ let derivedOrderingTests =
             Expect.equal out "9\n" "what the program declares beats what it implies"
         }
     ]
+
+[<Tests>]
+let structTuplePayloadTests =
+    testList "a comma pattern over a struct-tuple payload" [
+        test "a union case destructures a struct tuple" {
+            // A comma pattern says nothing about WHICH kind of tuple it takes
+            // apart. F# reads that from what it is matched against, and this
+            // was measured against it: `ValueSome (a, b)` over a struct-tuple
+            // payload is allowed, and the same pattern in a `let` is not.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let pick (v : voption<struct(int * string)>) ="
+                    "    match v with"
+                    "    | ValueSome (a, b) -> b + string a"
+                    "    | ValueNone -> \"none\""
+                    "let go ="
+                    "    printfn \"%s\" (pick (ValueSome (struct(7, \"x\"))))"
+                    "    printfn \"%s\" (pick ValueNone)"
+                    "" ])
+            Expect.equal out "x7\nnone\n" "the payload is bound whole and read out"
+        }
+        test "but a let still refuses it, as F# does" {
+            // "One tuple type is a struct tuple, the other is a reference
+            // tuple". The mismatch used to be computed and DISCARDED, so the
+            // binding compiled and trapped — the worst of the three outcomes.
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module M"
+                "let g () = struct(2, \"y\")"
+                "let go ="
+                "    let (p, q) = g ()"
+                "    printfn \"%d %s\" p q"
+                "" ])
+            Expect.isNonEmpty (ws.Diagnostics "prog.fpp") "a reference-tuple pattern does not take a struct apart"
+        }
+    ]

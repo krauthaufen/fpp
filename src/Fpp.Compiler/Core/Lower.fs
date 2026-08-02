@@ -503,6 +503,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `Some binder` for a named element, `None` for a wildcard or literal.
     /// The POSITION is what names the field, so a dropped element still
     /// takes its slot.
+    /// `Case (a, b)` whose payload inference marked as a STRUCT tuple —
+    /// a plain comma pattern that takes apart a struct, which is what F#
+    /// allows inside a union case and nowhere else.
+    let structPayloadOf (p : GreenNode) : GreenNode option =
+        if p.NodeKind <> AppPat then None
+        else
+            match nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) with
+            | _ :: rest ->
+                rest
+                |> List.tryPick (fun a ->
+                    if a.NodeKind <> ParenPat && a.NodeKind <> TuplePat then None
+                    else
+                        match dictTryFind fieldOwners (offsetOf a) with
+                        | Some o when o.StartsWith "StructTuple" -> Some a
+                        | _ -> None)
+            | [] -> None
+
     let structSlots (p : GreenNode) : (VarId * Scheme) option list =
         let rec unwrap (m : GreenNode) =
             if m.NodeKind = ParenPat || m.NodeKind = TuplePat then
@@ -1585,6 +1602,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  | None -> None, ELit LUnit)
                         let pat, body =
                             match pats with
+                            // `| Case (a, b) ->` where the payload is a
+                            // STRUCT tuple. The pattern says nothing about
+                            // which kind it is — inference read that from the
+                            // scrutinee and marked it — so the case binds the
+                            // payload whole and its fields are read out into
+                            // the binders, the way `struct(a, b)` is.
+                            | [ p ] when (structPayloadOf p).IsSome ->
+                                let inner = (structPayloadOf p).Value
+                                let tn =
+                                    match dictTryFind fieldOwners (offsetOf inner) with
+                                    | Some o -> o
+                                    | None -> "StructTuple" + string (List.length (structSlots inner))
+                                let binders = structSlots inner
+                                let tmp = { Path = path; Offset = offsetOf inner + 4200000; Name = "_cp" }
+                                let sch = mono (TCon (tn, []))
+                                let ctorName, ctorSch =
+                                    match nodesOf p |> List.tryHead |> Option.bind patHeadToken
+                                          |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                                    | Some d -> d.Name, schemeOf d
+                                    | None -> "?", mono (TCon ("?", []))
+                                PCtor (ctorName, ctorSch, [ PVar (tmp, sch) ]),
+                                structLetExpr binders tn (EVar (tmp, sch)) body
                             | [ p ] when p.NodeKind = StructTuplePat ->
                                 // `| struct(a, b) ->`: bind the whole value,
                                 // then read its fields into the binders
