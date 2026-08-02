@@ -1327,3 +1327,40 @@ let memberOverloadArityTests =
             Expect.equal out "true one\n" "three written arguments select the three-parameter member"
         }
     ]
+
+[<Tests>]
+let constructorSpecificityTests =
+    let map3 =
+        [ "type Cmp<'a>() ="
+          "    member x.Tag = \"cmp\""
+          "type Node<'k, 'v>(tag : string) ="
+          "    member x.Tag = tag"
+          // two constructors of the SAME arity: arity cannot separate them
+          "type Map3<'K, 'V>(comparer : Cmp<'K>, root : Node<'K, 'V>) ="
+          "    member x.Which = root.Tag"
+          "    new(key : 'K, value : 'V) ="
+          "        Map3<'K, 'V>(Cmp<'K>(), Node<'K, 'V>(\"from-kv\"))" ]
+    testList "constructor overloads are selected by specificity" [
+        test "an argument whose type is still a variable does not fit a concrete parameter" {
+            // `MapExt(comparer, root)` and `MapExt(key, value)` both take
+            // two arguments, and inside `let singleton (key : 'K) (value :
+            // 'V)` both of the actuals are VARIABLES — so every position of
+            // the first fit a wildcard and the first declared won, passing a
+            // key where a comparer was wanted. A candidate that demands
+            // something concrete of a variable is guessing; one that demands
+            // nothing is not.
+            let out =
+                runProgram (String.concat "\n" (
+                    [ "module M" ] @ map3 @
+                    [ "module Map3 ="
+                      "    let singleton (key : 'K) (value : 'V) = Map3<'K, 'V>(key, value)"
+                      "    let raw (c : Cmp<'K>) (r : Node<'K, 'V>) = Map3<'K, 'V>(c, r)"
+                      "let go ="
+                      "    printfn \"%s\" (Map3.singleton 1 \"one\").Which"
+                      "    printfn \"%s\" (Map3.raw (Cmp<int>()) (Node<int, string>(\"from-raw\"))).Which"
+                      "    printfn \"%s\" (Map3<int, string>(3, \"three\")).Which"
+                      "" ]))
+            Expect.equal out "from-kv\nfrom-raw\nfrom-kv\n"
+                            "generic actuals take the generic constructor, concrete ones the concrete"
+        }
+    ]

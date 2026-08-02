@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 621 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 622 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -191,7 +191,10 @@ argument type as a wildcard, so the three-tuple parameter fit a one-argument
 call and the overload declared FIRST won. Arity is checked before shape now.
 When you add an overload rule, check it against a call whose argument types
 are still VARIABLES — that is the case where every candidate looks equally
-good.
+good. Its twin is in CONSTRUCTORS, where two overloads may share an arity
+and counting settles nothing: selection scores them instead, and a candidate
+that demands something concrete of a variable scores WORSE than one that
+demands nothing, because it is guessing what the variable will become.
 
 ## Pattern identifiers
 

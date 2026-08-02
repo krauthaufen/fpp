@@ -1541,13 +1541,50 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | TTuple xs, TTuple ys ->
                                  xs.Length = ys.Length && List.forall2 couldAccept xs ys
                              | _ -> false
+                         // Fitting is not enough when two overloads have the
+                         // same ARITY: `MapExt(comparer, root)` and
+                         // `MapExt(key, value)` both take two, and with the
+                         // arguments' types still VARIABLES — which is what
+                         // they are inside `let singleton (key : 'Key) (value
+                         // : 'Value)` — every position of the first fits a
+                         // wildcard, so the first declared won and a key was
+                         // passed where a comparer was wanted.
+                         //
+                         // So score them. A position where both sides are
+                         // concrete and AGREE is evidence for a candidate; a
+                         // position where the candidate demands something
+                         // concrete of a variable is evidence against, since
+                         // it is a guess about what that variable will turn
+                         // out to be. A candidate that demands nothing scores
+                         // zero and wins by default over one that guesses.
+                         let rec specificity (dom : Type) (arg : Type) : int =
+                             match prune dom, prune arg with
+                             | TVar _, _ -> 0
+                             | _, TVar _ -> -1
+                             | TCon (d, da), TCon (a, aa) ->
+                                 let here = if d = a then 1 else 0
+                                 if da.Length = aa.Length then
+                                     here + List.fold2 (fun acc x y -> acc + specificity x y) 0 da aa
+                                 else here
+                             | TFun (a1, b1), TFun (a2, b2) -> specificity a1 a2 + specificity b1 b2
+                             | TTuple xs, TTuple ys when xs.Length = ys.Length ->
+                                 List.fold2 (fun acc x y -> acc + specificity x y) 0 xs ys
+                             | _ -> 0
                          let fits (sch : Scheme) =
                              match prune (st.Instantiate sch) with
                              | TFun (dom, res) ->
-                                 if couldAccept dom argTy then Some res else None
+                                 if couldAccept dom argTy then Some (specificity dom argTy) else None
                              | _ -> None
                          let chosen =
-                             cs |> List.tryPick (fun (o, sch) -> fits sch |> Option.map (fun _ -> o, sch))
+                             let scored =
+                                 cs |> List.choose (fun (o, sch) -> fits sch |> Option.map (fun sc -> sc, o, sch))
+                             match scored with
+                             | [] -> None
+                             | _ ->
+                                 // declaration order breaks ties, as before
+                                 let best = scored |> List.map (fun (sc, _, _) -> sc) |> List.max
+                                 scored
+                                 |> List.tryPick (fun (sc, o, sch) -> if sc = best then Some (o, sch) else None)
                          (match chosen with
                           | Some (o, sch) ->
                               vecAdd ctorSitesRaw (ht.Offset, o)

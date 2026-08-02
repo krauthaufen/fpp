@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-621 tests
+622 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1588217 bytes, byte-identical
+self-host fixpoint 1589905 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -145,12 +145,29 @@ declared first won. `MapExt.TryRemove(key)` reached `TryRemove(key, &result,
 &removed)` that way, and the mismatch surfaced a line off from the call,
 which is why it took a bisect to find. Arity is checked before shape now.
 
-With that, the frontier moved for the first time in a while — **8155 to
-8396** — and `MapExt.fs`, all 3,908 lines of it, type checks whole for the
-first time. The next stop is inside `IndexList.fs`, at
-`MapExt.slice min max content`: three symptoms (`int vs Index`, `IComparer<'a>
-vs Index`, and an occurs-check on `Node<Index, 'a>`) that look like one wrong
-instantiation rather than three problems.
+That bug had a twin, and the twin needed a different answer. Two
+constructors of the SAME arity — `MapExt(comparer, root)` and `MapExt(key,
+value)` — cannot be told apart by counting, and inside `let singleton (key :
+'Key) (value : 'Value)` both actuals are still VARIABLES, so every position
+of the first fits a wildcard and the first declared won. Selection now
+SCORES: a position where both sides are concrete and agree is evidence for a
+candidate, a position where the candidate demands something concrete of a
+variable is evidence against — it is a guess about what that variable will
+turn out to be — and a candidate that demands nothing wins by default over
+one that guesses. Declaration order still breaks genuine ties.
+
+With both, the frontier moved for the first time in a while — **8155 to
+8396** — `MapExt.fs`, all 3,908 lines of it, type checks whole for the first
+time, and `IndexList.fs` went from 60 diagnostics to 38.
+
+The two that head the remaining 38:
+
+* **`MapExt.slice min max content`** at 8396, `int vs Index`. The definition
+  it calls is clean and both `Slice` overloads differ in arity, so this is
+  not the bug above wearing a hat — it wants its own look.
+* **`no instance Ordered<Index>`** at 8439. `Index` carries a custom
+  comparison in F#, and `'Key : comparison` maps onto `Ordered<'a>` here, so
+  the port owes an instance. That one is shim work, not compiler work.
 
 Then, still measured:
 
