@@ -136,12 +136,36 @@ is **39 of 40 parsing clean**, up from 27:
 | a clause list undented inside brackets | `f (x, function` puts its clauses left of the keyword — the bracket delimits the group, so the offside line is the enclosing statement's. What it may not undent past is a clause list or block that ENCLOSES it |
 | `function` | parsed all along and never lowered. It is the lambda whose body matches on its own argument, and nothing else |
 
-What is left, measured:
+**The frontier is no longer syntax.** With 39 of 40 files parsing, the
+sequential type-check frontier has barely moved — line 8155 of 22,635, still
+inside `MapExt` — because what stops it is one bug, not one construct:
+
+> **A member's overloads are not selected by arity.** `MapExt.TryRemove` is
+> declared twice, first as `TryRemove(key, result : byref<_>, removedValue :
+> byref<_>)` and then as `TryRemove(key)`. The one-argument call takes the
+> THREE-argument overload, because it is declared first — and the mismatch
+> surfaces on the line above it, which is why this took a bisect to find.
+>
+> This is the same mistake that was fixed for CONSTRUCTORS
+> ("a qualified constructor took the primary overload whatever its arity")
+> and never fixed for members. Resolve already records the overloads as
+> `Type.Member`, `Type.Member#1`, `Type.Member#2`; nothing picks among them
+> by the shape of the call.
+
+Fix that and the frontier moves for the first time in a while: the twelve
+files unblocked above all sit BEYOND it, and none of them has been type
+checked yet.
+
+Then, still measured:
 
 * **optional parameters** — `static member F(path : string, ?retries : int)`,
   the last file that does not parse (`AdaptiveFileSystem.fs`). Parsing them
   is small; what is not is that a caller may OMIT one, which changes how a
-  call's arity is resolved.
+  call's arity is resolved — the same machinery the overload bug above wants.
+* **a 22k-line file with parse errors in it makes inference crawl.** The
+  whole-library `check` ran past ten minutes; parsing the same text takes
+  200ms. Error-recovery nodes are the difference, and nothing bounds what
+  inference does with them.
 * **a class-body `do` has no `this`** — the constructor runs its `do` blocks
   BEFORE it allocates, so `do base.M()` and `do this.M()` have no receiver.
   Reordering is what F# does, and it would change where a `do` block's writes
