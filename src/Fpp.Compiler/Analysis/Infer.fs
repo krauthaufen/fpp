@@ -1021,6 +1021,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// pattern says, and F# reads it from the scrutinee — allowing
     /// `ValueSome (a, b)` over a struct-tuple payload while rejecting the
     /// same pattern in a `let`.
+    /// Uses of parameters DECLARED `byref`/`outref`. F# dereferences a byref
+    /// on read — but only a byref: a `ref` CELL is the same representation
+    /// here and must not be touched, or `r.Contents` reads through the cell
+    /// twice. So the declaration decides, not the type.
+    let byrefParams = dictNew<int, bool> ()
+
     /// Suppresses the automatic dereference of a byref. A byref READ in F#
     /// means the value — `let x = location` copies what the cell holds — but
     /// two positions want the CELL: the operand of `&`, which forwards it,
@@ -1451,6 +1457,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     patExpect <- None
                     (match rest with
                      | GToken c :: GNode a :: rest2 when c.Text = ":" && isTypeKind a.NodeKind ->
+                         // `(location : byref<int>)` — the DECLARATION is
+                         // what makes a read dereference, not the type: a
+                         // `ref` cell is the same representation and must be
+                         // read as itself
+                         (match Green.tokens (GNode a) |> List.filter (fun x -> x.Kind = Ident) |> List.tryHead with
+                          | Some ht when ht.Text = "byref" || ht.Text = "outref" ->
+                              (match Green.tokens (GNode p) |> List.tryFind (fun x -> x.Kind = Ident) with
+                               | Some bt -> dictSet byrefParams bt.Offset true
+                               | None -> ())
+                          | _ -> ())
                          unify ty (typeFromNode pvars a) |> ignore
                          vecAdd items ty
                          walk rest2
@@ -1589,7 +1605,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // want the cell and say so — `&x` and the
                                    // left of an assignment.
                                    (match prune ty with
-                                    | TCon ("ByRefCell", [ inner ]) when not noDeref ->
+                                    | TCon ("ByRefCell", [ inner ]) when
+                                           not noDeref && (dictTryFind byrefParams d.Offset).IsSome ->
                                         vecAdd fieldOwnersRaw (t.Offset, "$deref")
                                         inner
                                     | _ -> ty)

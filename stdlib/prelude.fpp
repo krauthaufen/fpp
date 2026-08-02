@@ -770,9 +770,16 @@ type Result<'t, 'e> =
 /// `x`, calls, and writes the cell back into `x`. Single-threaded, that is
 /// exactly what a real byref does; what it is not is an alias, so two
 /// byrefs to the same variable do not see each other's writes mid-call.
-type ByRefCell<'a> = { mutable Contents : 'a }
+/// One cell, two jobs. F# has `byref<'T>` for a location a callee may write
+/// and `Ref<'T>` for one a program passes around; wasm-GC has no address of
+/// a local, so both are this. What tells them apart is the DECLARATION: a
+/// parameter written `byref` reads as its value, and a `ref` cell reads as
+/// itself, which is exactly how the two behave in F#.
+type ByRefCell<'a> = { mutable Value : 'a }
 type byref<'a> = ByRefCell<'a>
 type outref<'a> = ByRefCell<'a>
+type Ref<'a> = ByRefCell<'a>
+let ref (value : 'a) : Ref<'a> = { Value = value }
 
 
 type ActiveChoice2<'a, 'b> =

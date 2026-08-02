@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-645 tests
+646 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1616276 bytes, byte-identical
+self-host fixpoint 1616872 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -473,20 +473,23 @@ worth remembering for anything else that adapts a member's type.
 `int` alone made that a type error; `Exchange` and `CompareExchange` are
 generic now, and `AdaptiveToken.fs` types past them.
 
+## `ref` cells, and what makes a read dereference
+
+F# has `byref<'T>` for a location a callee may write and `Ref<'T>` for one a
+program passes around. wasm-GC has no address of a local, so both are one
+cell here — and what tells them apart is the **declaration**, not the type.
+
+The automatic dereference was keyed on the TYPE, which meant every cell
+dereferenced: `r.Value` read through it twice and trapped. It is keyed on the
+parameter being written `byref`/`outref` now, which is exactly F#'s rule, and
+`ref` is one line of prelude on top of it.
+
+Worth recording how that was nearly mis-filed. The trap was banked as a
+known issue marked PRE-EXISTING, on the evidence that it failed before the
+change — but the change was already COMMITTED, so "before" included it. The
+right check is to disable the suspect and re-run, which took one build and
+found the cause immediately.
+
 ## Where it stops now
 
-`Core/AdaptiveToken.fs` line 12328, `type mismatch: Transaction vs obj` —
-and the cause is two lines earlier: `let outputs = ref (Array.zeroCreate 8)`.
-
-**`ref` does not exist in F++**, and adding it is one line — F#'s ref cell is
-exactly `ByRefCell`, the same shape the compiler already synthesizes for
-`&x`. But a `ByRefCell` written by HAND traps: see
-`tests/known-issues/byref-cell-by-hand.fpp`, which also records that this is
-PRE-EXISTING — it fails identically before today's byref work. Until a cell
-can be built in user code, `ref` inherits the bug, `outputs` stays untyped,
-and every member access through it parks and then binds to whatever declares
-that name first. `Transaction vs obj` is the shadow of that, three levels
-down.
-
-So the next move is that known issue, not the diagnostic the frontier
-reports.
+Re-measuring after `ref` landed.

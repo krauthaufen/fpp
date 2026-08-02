@@ -568,7 +568,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | None -> false) ->
                 (match tokensOf n |> List.tryHead |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                  | Some d ->
-                     EField (EVar (varIdOf d, schemeOf d), "Contents", "ByRefCell")
+                     EField (EVar (varIdOf d, schemeOf d), "Value", "ByRefCell")
                  | None -> note (offsetOf n) "byref read")
             | IdentExpr when
                     tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "base") ->
@@ -662,10 +662,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match written with
                     | [] -> EVar (cell, anon)
                     | many -> ETuple (many @ [ EVar (cell, anon) ])
-                ELet (false, cell, anon, ERecord ("ByRefCell", [ "Contents", zeroFor outTy ]),
+                ELet (false, cell, anon, ERecord ("ByRefCell", [ "Value", zeroFor outTy ]),
                       ELet (false, res, anon, EApp (lowerExpr (GNode head), [ callArg ]),
                             ETuple [ EVar (res, anon)
-                                     EField (EVar (cell, anon), "Contents", "ByRefCell") ]))
+                                     EField (EVar (cell, anon), "Value", "ByRefCell") ]))
             // `new T(Prop = v, ...)` — an object INITIALIZER: build it, then
             // write each named field into what was built
             | AppExpr when
@@ -1094,7 +1094,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | _ -> None)
                                   | _ -> None
                           (match byrefTarget with
-                           | Some cell -> EFieldSet (cell, "Contents", "ByRefCell", lowerExpr (GNode r))
+                           | Some cell -> EFieldSet (cell, "Value", "ByRefCell", lowerExpr (GNode r))
                            | None ->
                           match indexSetter with
                            | Some (fn, recv, i) -> EApp (fn, [ recv; i; lowerExpr (GNode r) ])
@@ -2964,7 +2964,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let writeBack =
                 vecToList cells
                 |> List.choose (fun (v, target) ->
-                    let read = EField (EVar (v, anon), "Contents", "ByRefCell")
+                    let read = EField (EVar (v, anon), "Value", "ByRefCell")
                     match target with
                     | EVar (tv, _) -> Some (EAssign (tv, read))
                     | EField (recv, fn, owner) -> Some (EFieldSet (recv, fn, owner, read))
@@ -2976,7 +2976,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.rev
             |> List.fold
                 (fun acc (v, target) ->
-                    ELet (false, v, anon, ERecord ("ByRefCell", [ "Contents", target ]), acc))
+                    ELet (false, v, anon, ERecord ("ByRefCell", [ "Value", target ]), acc))
                 body
         | EApp (f, args) -> EApp (fixAddrs f, List.map fixAddrs args)
         | ELam (ps, b) -> ELam (ps, fixAddrs b)

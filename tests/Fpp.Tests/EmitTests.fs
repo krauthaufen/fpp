@@ -1878,3 +1878,35 @@ let outViewTests =
             Expect.equal out "a=1\nfalse\n" "one declaration serves both"
         }
     ]
+
+[<Tests>]
+let refCellTests =
+    testList "ref cells, and what makes a read dereference" [
+        test "a ref cell reads as itself, a byref parameter as its value" {
+            // F# has `byref<'T>` for a location a callee may write and
+            // `Ref<'T>` for one a program passes around. wasm-GC has no
+            // address of a local, so both are one cell here — and what tells
+            // them apart is the DECLARATION, not the type. Keying the
+            // automatic dereference on the type instead made `r.Value` read
+            // through the cell twice.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let fill (target : byref<int>) = target <- 42"
+                    "let bump (location : byref<int>) = location <- location + 1"
+                    "let go ="
+                    "    let r = ref 5"
+                    "    r.Value <- r.Value + 1"
+                    "    printfn \"%d\" r.Value"
+                    "    let cells = ref (Array.zeroCreate 3)"
+                    "    cells.Value.[0] <- 7"
+                    "    printfn \"%d\" cells.Value.[0]"
+                    "    fill &r.Value"
+                    "    printfn \"%d\" r.Value"
+                    "    let mutable n = 5"
+                    "    bump &n"
+                    "    printfn \"%d\" n"
+                    "" ])
+            Expect.equal out "6\n7\n42\n6\n" "the cell keeps its identity, the parameter reads through"
+        }
+    ]
