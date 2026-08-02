@@ -468,6 +468,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// refuse it.
     let mutable dotDemand : (int * Type) option = None
 
+    /// The TUPLE VIEW of a member whose last parameter is an out. F#
+    /// synthesizes one for every such method — `d.TryGetValue k` returns
+    /// `(found, value)` — so a library writes the .NET signature and calls it
+    /// either way. Returns the view and the out parameter's type name, which
+    /// is what lowering needs to make the cell.
+    let outView (t : Type) : (Type * string) option =
+        let nameOf (o : Type) =
+            match prune o with
+            | TCon (n, _) -> n
+            | _ -> "?"
+        match prune t with
+        | TFun (dom, res) ->
+            (match prune dom with
+             | TTuple ps when List.length ps >= 2 ->
+                 (match prune (List.item (List.length ps - 1) ps) with
+                  | TCon ("ByRefCell", [ o ]) ->
+                      let rest = ps |> List.take (List.length ps - 1)
+                      let d2 = match rest with [ one ] -> one | many -> TTuple many
+                      Some (TFun (d2, TTuple [ res; o ]), nameOf o)
+                  | _ -> None)
+             | TCon ("ByRefCell", [ o ]) -> Some (TFun (tUnit, TTuple [ res; o ]), nameOf o)
+             | _ -> None)
+        | _ -> None
+
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
     let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
@@ -513,6 +537,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match prune selfT with
                            | TCon (sn, sargs) when sn = tn && sargs.Length = args.Length ->
                                List.iter2 (unifyAt offset) sargs args
+                               // the same out-parameter view the general path
+                               // takes; a member of THIS file arrives here
+                               let demanded =
+                                   match dotDemand with
+                                   | Some (off, want) when off = offset -> want
+                                   | _ -> result
+                               let memT =
+                                   if (Types.unifyTrial false memT demanded).IsNone then memT
+                                   else
+                                       match outView memT with
+                                       | Some (v, outName) when (Types.unifyTrial false v demanded).IsNone ->
+                                           vecAdd fieldOwnersRaw (offset, "$out:" + outName)
+                                           v
+                                       | _ -> memT
                                unifyAt offset result memT
                                if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
                                vecAdd memberSitesRaw (offset, ownerTag)
@@ -614,7 +652,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let subst = dictNew<int, Type> ()
                      List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst (prunedId pv) a)
                      for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
-                     unifyAt offset result (substVars subst fi.FieldType)
+                     // F# synthesizes a TUPLE VIEW for a trailing out
+                     // parameter: `d.TryGetValue k` is `(found, value)` where
+                     // the declaration says `TryGetValue(k, value : byref<_>)`.
+                     // The declaration stays .NET's; the view is the
+                     // compiler's, as it is in F#.
+                     let declared = substVars subst fi.FieldType
+                     let chosen =
+                         if (Types.unifyTrial false declared demanded).IsNone then declared
+                         else
+                             match outView declared with
+                             | Some (v, outName) when (Types.unifyTrial false v demanded).IsNone ->
+                                 vecAdd fieldOwnersRaw (offset, "$out:" + outName)
+                                 v
+                             | _ -> declared
+                     unifyAt offset result chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then
                          vecAdd fieldOwnersRaw (offset, instName recvTy)

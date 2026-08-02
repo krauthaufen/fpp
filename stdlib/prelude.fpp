@@ -5187,15 +5187,18 @@ type Dictionary<'k, 'v>() =
     member x.Clear () : unit =
         dcount <- 0
         dslots <- Array.zeroCreate dslots.Length
-    /// .NET's byref out-parameter, which F# sees as a TUPLE — so
-    /// `match d.TryGetValue k with | (true, v) -> ...` is one source for
-    /// both languages. The miss returns whatever the value array holds at
-    /// zero, exactly as .NET returns `default`, and the flag is what says
-    /// which happened.
-    member x.TryGetValue (k : 'k) : bool * 'v =
+    /// .NET's signature, with the out parameter written. The compiler
+    /// synthesizes the TUPLE VIEW, as F# does, so
+    /// `match d.TryGetValue k with | (true, v) -> ...` and
+    /// `d.TryGetValue(k, &v)` are both this one declaration.
+    member x.TryGetValue (k : 'k, value : byref<'v>) : bool =
         let e = dslots.[x.SlotOf k]
-        if e = 0 then (false, dvals.[0])
-        else (true, dvals.[e - 1])
+        if e = 0 then
+            value <- dvals.[0]
+            false
+        else
+            value <- dvals.[e - 1]
+            true
     member x.KeyArray () : 'k[] = Array.init dcount (fun i -> dkeys.[i])
     member x.ValueArray () : 'v[] = Array.init dcount (fun i -> dvals.[i])
     /// .NET hands back a KeyCollection; what every caller does with it is
@@ -5363,10 +5366,8 @@ type Interlocked =
 /// This is a divergence with teeth, and it is written down in
 /// DIVERGENCES.md rather than hidden here.
 type WeakReference<'a>(value : 'a) =
-    /// .NET declares `TryGetTarget(out T)`. F# offers BOTH spellings — the
-    /// out-parameter one and the tuple it becomes when you leave it off —
-    /// and real code uses each, so both are here.
-    member x.TryGetTarget () : bool * 'a = (true, value)
+    /// .NET's signature. The tuple view — `match w.TryGetTarget () with |
+    /// (true, t) -> ...` — is the compiler's, as it is in F#.
     member x.TryGetTarget (target : byref<'a>) : bool =
         target <- value
         true
@@ -5391,10 +5392,14 @@ type ConditionalWeakTable<'k, 'v>() =
             if found < 0 && System.Object.ReferenceEquals (ckeys.[i], k) then found <- i
             i <- i + 1
         found
-    member x.TryGetValue (k : 'k) : bool * 'v =
+    member x.TryGetValue (k : 'k, value : byref<'v>) : bool =
         let i = x.IndexOf k
-        if i < 0 then (false, cvals.[0])
-        else (true, cvals.[i])
+        if i < 0 then
+            value <- cvals.[0]
+            false
+        else
+            value <- cvals.[i]
+            true
     member x.Add (k : 'k, v : 'v) : unit =
         if ccount >= ckeys.Length then
             let nk : 'k[] = Array.zeroCreate (ckeys.Length * 2)

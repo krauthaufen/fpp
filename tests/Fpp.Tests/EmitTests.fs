@@ -1810,10 +1810,10 @@ let objectInitializerTests =
 let outParameterOverloadTests =
     testList "an out parameter has two spellings" [
         test "TryGetTarget, both ways" {
-            // .NET declares `TryGetTarget(out T)`. F# offers the
-            // out-parameter form AND the tuple it becomes when you leave it
-            // off, and real code uses each — FSharp.Data.Adaptive passes a
-            // cell, `stdlib/dotnet.fpp` matches the tuple.
+            // .NET declares `TryGetTarget(out T)` and F# SYNTHESIZES the
+            // tuple view — the prelude writes one signature, not two, and
+            // both spellings come from it. FSharp.Data.Adaptive passes a
+            // cell; `stdlib/dotnet.fpp` matches the tuple.
             let out =
                 runProgram (String.concat "\n" [
                     "module M"
@@ -1828,5 +1828,53 @@ let outParameterOverloadTests =
                     "    if w.TryGetTarget(&got) then printfn \"outparam %d\" got.N"
                     "" ])
             Expect.equal out "tuple 7\noutparam 7\n" "arity picks between them"
+        }
+    ]
+
+[<Tests>]
+let outViewTests =
+    testList "the tuple view of an out parameter is synthesized" [
+        test "one declaration, both spellings" {
+            // F# creates the view for every method with a trailing out
+            // parameter. Declaring it twice in the prelude was doing the
+            // compiler's job by hand — the library declares .NET signatures
+            // and calls them either way.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Store() ="
+                    "    let mutable v = 42"
+                    "    member x.TryGet (key : int, value : byref<int>) : bool ="
+                    "        if key = 0 then"
+                    "            value <- v"
+                    "            true"
+                    "        else false"
+                    "let go ="
+                    "    let s = Store()"
+                    "    (match s.TryGet 0 with"
+                    "     | (true, n) -> printfn \"found %d\" n"
+                    "     | (false, n) -> printfn \"missing %d\" n)"
+                    "    (match s.TryGet 1 with"
+                    "     | (true, n) -> printfn \"found %d\" n"
+                    "     | (false, n) -> printfn \"missing %d\" n)"
+                    "    let mutable got = 0"
+                    "    printfn \"%b %d\" (s.TryGet (0, &got)) got"
+                    "" ])
+            Expect.equal out "found 42\nmissing 0\ntrue 42\n" "the view and the out-parameter call agree"
+        }
+        test "the prelude's Dictionary reads the same way" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    let d = Dictionary<string, int>()"
+                    "    d.Add (\"a\", 1)"
+                    "    (match d.TryGetValue \"a\" with"
+                    "     | (true, v) -> printfn \"a=%d\" v"
+                    "     | _ -> printfn \"missing\")"
+                    "    let mutable v = 0"
+                    "    printfn \"%b\" (d.TryGetValue (\"b\", &v))"
+                    "" ])
+            Expect.equal out "a=1\nfalse\n" "one declaration serves both"
         }
     ]

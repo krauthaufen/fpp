@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-643 tests
+645 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1612326 bytes, byte-identical
+self-host fixpoint 1616276 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -448,15 +448,24 @@ backend, where every type is a string. `MutableHashSet` exists for the same
 reason, and so does "a user type whose name matches a prelude type MERGES
 with it".
 
-## An out parameter has two spellings
+## The tuple view of an out parameter is SYNTHESIZED
 
-.NET declares `TryGetTarget(out T)`; F# offers that AND the tuple it becomes
-when you leave the parameter off. The library passes a cell,
-`stdlib/dotnet.fpp` matches the tuple, and the prelude now has both — arity
-picks between them, which it can since overload resolution became real.
+F# creates it for every method with a trailing out parameter:
+`d.TryGetValue k` is `(found, value)` where the declaration says
+`TryGetValue(k, value : byref<_>)`. The prelude had been writing both by
+hand, which is the compiler's job — a library declares .NET signatures and
+calls them either way, and the port cannot be asked to spell them
+differently.
 
-The frontier is **12092 of 22,635** — everything through
-`Core/Transaction.fs`.
+Inference picks the view when the declared shape does not fit what the call
+asks for and the view does; lowering makes the cell, passes it, and reads it
+back beside the result. `Dictionary.TryGetValue`, `WeakReference` and the
+weak table now carry one declaration each instead of two.
+
+It had to go in TWICE — a member of the file being compiled binds through
+`tracked`, a separate path from the general one, and putting the view only
+in the general path left every same-file `TryGet` unchanged. That split is
+worth remembering for anything else that adapts a member's type.
 
 ## Where it stops now
 

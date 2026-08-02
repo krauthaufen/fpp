@@ -617,6 +617,55 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None -> EUnknown t.Text)
                  | None -> note (offsetOf n) "type-variable expression")
             // a numeric conversion carries the source kind inference found
+            // The TUPLE VIEW of a trailing out parameter: `d.TryGetValue k`
+            // where the declaration is `TryGetValue(k, value : byref<_>)`.
+            // Inference chose the view; here the cell is made, passed, and
+            // read back beside the result.
+            | AppExpr when
+                    (match nodesOf n |> List.tryHead with
+                     | Some h when h.NodeKind = DotExpr ->
+                         (match Green.tokens (GNode h) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          | Some mt ->
+                              (match dictTryFind fieldOwners mt.Offset with
+                               | Some o -> o.StartsWith "$out:"
+                               | None -> false)
+                          | None -> false)
+                     | _ -> false) ->
+                let head = (nodesOf n |> List.tryHead).Value
+                let outTy =
+                    match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                          |> Option.bind (fun mt -> dictTryFind fieldOwners mt.Offset) with
+                    | Some o -> o.Substring 5
+                    | None -> "?"
+                let zeroFor (tn : string) : Expr =
+                    match tn with
+                    | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" | "uint32" -> ELit (LInt "0")
+                    | "int64" | "uint64" -> ELit (LInt "0L")
+                    | "float" | "float32" | "float16" -> ELit (LFloat "0.0")
+                    | _ -> ELit LNull
+                let anon = mono (TCon ("?", []))
+                let cell = { Path = path; Offset = offsetOf n + 4500000; Name = "_out" }
+                let res = { Path = path; Offset = offsetOf n + 4600000; Name = "_outRes" }
+                // the arguments as WRITTEN, with the cell appended
+                let written =
+                    nodesOf n
+                    |> List.filter (fun m -> isExprish m.NodeKind && not (System.Object.ReferenceEquals (m, head)))
+                    |> List.collect (fun a ->
+                        if a.NodeKind = ParenExpr then
+                            match nodesOf a |> List.filter (fun m -> isExprish m.NodeKind) with
+                            | [ t ] when t.NodeKind = TupleExpr ->
+                                nodesOf t |> List.filter (fun m -> isExprish m.NodeKind)
+                            | ms -> ms
+                        else [ a ])
+                    |> List.map (fun a -> lowerExpr (GNode a))
+                let callArg =
+                    match written with
+                    | [] -> EVar (cell, anon)
+                    | many -> ETuple (many @ [ EVar (cell, anon) ])
+                ELet (false, cell, anon, ERecord ("ByRefCell", [ "Contents", zeroFor outTy ]),
+                      ELet (false, res, anon, EApp (lowerExpr (GNode head), [ callArg ]),
+                            ETuple [ EVar (res, anon)
+                                     EField (EVar (cell, anon), "Contents", "ByRefCell") ]))
             // `new T(Prop = v, ...)` — an object INITIALIZER: build it, then
             // write each named field into what was built
             | AppExpr when
