@@ -2026,6 +2026,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     |> Option.map (fun m -> exprType (GNode m))
                 let scrut = match scrutTy with Some t -> t | None -> st.Fresh ()
                 let result = st.Fresh ()
+                // `function` has no scrutinee written: it IS the function
+                let isFunctionForm = scrutTy.IsNone
                 for cl in nodesOf n do
                     if cl.NodeKind = MatchClause then
                         let barOff = match tokensOf cl |> List.tryHead with Some t -> t.Offset | None -> 0
@@ -2052,7 +2054,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                      exprType (GNode extra) |> ignore
                              unifyAt barOff (exprType (GNode b)) result
                          | None -> ())
-                result
+                if isFunctionForm then TFun (scrut, result) else result
             | BlockExpr ->
                 let mutable last = tUnit
                 for m in nodesOf n do

@@ -1240,3 +1240,45 @@ let assignmentBlockTests =
             Expect.equal out "12\n" "the right-hand side is a whole block"
         }
     ]
+
+[<Tests>]
+let undentedClauseTests =
+    testList "a clause list may undent inside brackets" [
+        test "`f (x, function` puts its clauses left of the keyword" {
+            // The bracket delimits the group, so the offside line is the
+            // enclosing statement's and not the keyword's. This shape is
+            // everywhere in real F#.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Store() ="
+                    "    member x.AlterV (k : int, f : int -> int) = f k"
+                    "let store = Store()"
+                    "let add (value : int) ="
+                    "    store.AlterV(value, function"
+                    "        | 0 -> 1"
+                    "        | o -> o + 1"
+                    "    )"
+                    "let go = printfn \"%d %d\" (add 0) (add 5)"
+                    "" ])
+            Expect.equal out "1 6\n" "the clauses belong to the `function`"
+        }
+        test "but not past a clause list that encloses it" {
+            // Without a bound, the inner `match` takes the outer's last
+            // clause and the outer loses it.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type T = A | C"
+                    "type U = B | D"
+                    "let f (x : T) (y : U) ="
+                    "    (match x with"
+                    "     | A -> match y with"
+                    "            | B -> 1"
+                    "            | D -> 2"
+                    "     | C -> 3)"
+                    "let go = printfn \"%d %d %d\" (f A B) (f A D) (f C B)"
+                    "" ])
+            Expect.equal out "1 2 3\n" "the outer clause still owns `| C`"
+        }
+    ]

@@ -313,9 +313,38 @@ let parse (src : string) : ParseResult =
     // Inside brackets the offside rule is suspended: the closing bracket
     // delimits the group, so a continuation line may sit at any column.
     let mutable bracketDepth = 0
+    /// The columns an UNDENTED clause list must still stay right of,
+    /// innermost first. F# lets `f (x, function` put its clauses left of the
+    /// `function` keyword — the bracket delimits the group, so the offside
+    /// line is the enclosing statement's, not the keyword's. What it may NOT
+    /// undent past is a clause list or a block that encloses it, or
+    ///
+    ///     (match x with
+    ///      | A -> match y with
+    ///             | B -> 1
+    ///      | C -> 2)
+    ///
+    /// would give the inner `match` the outer's last clause.
+    ///
+    /// A -1 is the bracket's own immediate content, which constrains
+    /// nothing: `parseBlock` on the inside of a paren starts at whatever
+    /// column the first argument happens to sit at, and that column is an
+    /// artifact of the layout rather than a bound anyone wrote.
+    let mutable guardCols : int list = []
+    let mutable pendingBracketBlock = false
+    let undentGuard () =
+        let rec first (cs : int list) =
+            match cs with
+            | c :: rest -> if c >= 0 then c else first rest
+            | [] -> -1
+        first guardCols
+
     let inBrackets (f : unit -> Green) : Green =
         bracketDepth <- bracketDepth + 1
+        let saved = pendingBracketBlock
+        pendingBracketBlock <- true
         let r = f ()
+        pendingBracketBlock <- saved
         bracketDepth <- bracketDepth - 1
         r
     let offside (col : int) = bracketDepth = 0 && not s.SameLine && s.CurCol <= col
@@ -1115,15 +1144,22 @@ let parse (src : string) : ParseResult =
                 vecAdd c (s.Bump ())
                 vecAdd c (parseExpr barCol)
             if s.IsOp "->" then vecAdd c (s.Bump ()) else s.Diag "expected '->' in match clause"
+            // the clause's own bar column guards anything nested in its body
+            guardCols <- barCol :: guardCols
             if canStartExpr () || s.IsKw "let" || s.IsKw "yield" || s.IsKw "return" then
                 vecAdd c (parseBlock barCol)
+            guardCols <- List.tail guardCols
             vecAdd acc (Green.node MatchClause (vecToList c))
         // first clause may omit the bar: `match x with null -> ...`
         if not (s.IsOp "|") && canStartAtomPat () && s.SameLine then
             let c = vecNew<Green> ()
             finishClause c s.CurCol
+        let barHere () =
+            s.IsOp "|"
+            && (s.SameLine || s.CurCol >= col
+                || (bracketDepth > 0 && s.CurCol > undentGuard ()))
         let mutable go = true
-        while go && s.IsOp "|" && (s.SameLine || s.CurCol >= col) do
+        while go && barHere () do
             let mark = s.Mark
             let barCol = s.CurCol
             let c = vecNew<Green> ()
@@ -1135,6 +1171,15 @@ let parse (src : string) : ParseResult =
     /// unmodified; wraps multiple items in BlockExpr.
     and parseBlock (outerCtx : int) : Green =
         let blockCol = s.CurCol
+        let isBracketContent = pendingBracketBlock
+        pendingBracketBlock <- false
+        guardCols <- (if isBracketContent then -1 else blockCol) :: guardCols
+        let r = parseBlockInner outerCtx blockCol
+        guardCols <- List.tail guardCols
+        pendingBracketBlock <- isBracketContent
+        r
+
+    and parseBlockInner (outerCtx : int) (blockCol : int) : Green =
         let acc = vecNew<Green> ()
         let canStartItem () =
             canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"

@@ -1602,7 +1602,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         pat, guard, body)
                 (match scrut with
                  | Some s -> EMatch (lowerExpr (GNode s), cases)
-                 | None -> note (offsetOf n) "match without scrutinee")
+                 // `function | A -> .. | B -> ..` is the lambda whose body
+                 // matches on its own argument, and nothing else
+                 | None ->
+                     let v = { Path = path; Offset = 97000000 + offsetOf n; Name = "_fnArg" }
+                     let anon = mono (TCon ("?", []))
+                     ELam ([ v, anon ], EMatch (EVar (v, anon), cases)))
             | BlockExpr ->
                 lowerBlock (nodesOf n)
             | LetDecl ->

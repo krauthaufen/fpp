@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-617 tests
+619 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1584120 bytes, byte-identical
+self-host fixpoint 1587489 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -118,8 +118,8 @@ Expression and pattern position resolve SEPARATELY — the case-through-type
 fix needed both — which is worth remembering for anything else qualified.
 
 ~~computation expressions~~ and ~~`use` / `IDisposable`~~ are done, and so
-are ten syntax blockers the 40-file standalone parse was stuck on. That is
-**38 of 40 parsing clean**, up from 27:
+are twelve syntax blockers the 40-file standalone parse was stuck on. That
+is **39 of 40 parsing clean**, up from 27:
 
 | | |
 | --- | --- |
@@ -133,16 +133,15 @@ are ten syntax blockers the 40-file standalone parse was stuck on. That is
 | `type C(args) as this` | parsed; what the name MEANS is still open |
 | `x <- <block>` | an assignment may take a whole block, and only an assignment may |
 | `{ new Base(args) with ... }` | an object expression over a class passes base constructor arguments |
+| a clause list undented inside brackets | `f (x, function` puts its clauses left of the keyword — the bracket delimits the group, so the offside line is the enclosing statement's. What it may not undent past is a clause list or block that ENCLOSES it |
+| `function` | parsed all along and never lowered. It is the lambda whose body matches on its own argument, and nothing else |
 
 What is left, measured:
 
-* **the offside rule inside brackets** — `store.AlterV(value, function` with
-  the clauses undented on the lines below. F# lets a bracketed group undent;
-  F++ ends the block. This one has bitten twice, and both attempts to relax
-  it swallowed the next statement instead — it wants the enclosing BLOCK
-  columns, not just the bracket depth. One file (`CountingHashSet.fs`).
 * **optional parameters** — `static member F(path : string, ?retries : int)`,
-  one file (`AdaptiveFileSystem.fs`).
+  the last file that does not parse (`AdaptiveFileSystem.fs`). Parsing them
+  is small; what is not is that a caller may OMIT one, which changes how a
+  call's arity is resolved.
 * **a class-body `do` has no `this`** — the constructor runs its `do` blocks
   BEFORE it allocates, so `do base.M()` and `do this.M()` have no receiver.
   Reordering is what F# does, and it would change where a `do` block's writes
