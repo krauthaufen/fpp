@@ -16,3 +16,7 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 * `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
   isolation; the note records exactly what was ruled out.
+
+* `byref-cell-by-hand.fpp` — a `ByRefCell` written by hand traps, while
+  every compiler-synthesized one works. It is what blocks `ref`, which the
+  library uses.

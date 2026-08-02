@@ -467,7 +467,26 @@ It had to go in TWICE — a member of the file being compiled binds through
 in the general path left every same-file `TryGet` unchanged. That split is
 worth remembering for anything else that adapts a member's type.
 
+## Interlocked is generic, as .NET's is
+
+`Interlocked.Exchange(&finalizers, [])` swaps a LIST. Declaring these at
+`int` alone made that a type error; `Exchange` and `CompareExchange` are
+generic now, and `AdaptiveToken.fs` types past them.
+
 ## Where it stops now
 
-`Core/AdaptiveToken.fs`, line 12198: `type mismatch: int vs list<unit ->
-unit>`.
+`Core/AdaptiveToken.fs` line 12328, `type mismatch: Transaction vs obj` —
+and the cause is two lines earlier: `let outputs = ref (Array.zeroCreate 8)`.
+
+**`ref` does not exist in F++**, and adding it is one line — F#'s ref cell is
+exactly `ByRefCell`, the same shape the compiler already synthesizes for
+`&x`. But a `ByRefCell` written by HAND traps: see
+`tests/known-issues/byref-cell-by-hand.fpp`, which also records that this is
+PRE-EXISTING — it fails identically before today's byref work. Until a cell
+can be built in user code, `ref` inherits the bug, `outputs` stays untyped,
+and every member access through it parks and then binds to whatever declares
+that name first. `Transaction vs obj` is the shadow of that, three levels
+down.
+
+So the next move is that known issue, not the diagnostic the frontier
+reports.

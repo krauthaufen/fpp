@@ -774,6 +774,7 @@ type ByRefCell<'a> = { mutable Contents : 'a }
 type byref<'a> = ByRefCell<'a>
 type outref<'a> = ByRefCell<'a>
 
+
 type ActiveChoice2<'a, 'b> =
     | Choice2Of1 of 'a
     | Choice2Of2 of 'b
@@ -5345,11 +5346,14 @@ type Interlocked =
     static member Decrement (location : byref<int>) : int =
         location <- location - 1
         location
-    static member Exchange (location : byref<int>, value : int) : int =
+    /// GENERIC, as .NET's are: a list, a reference, an int — anything a
+    /// location can hold. `Interlocked.Exchange(&finalizers, [])` swaps a
+    /// list, and declaring these at `int` alone made that a type error.
+    static member Exchange (location : byref<'a>, value : 'a) : 'a =
         let old = location
         location <- value
         old
-    static member CompareExchange (location : byref<int>, value : int, comparand : int) : int =
+    static member CompareExchange (location : byref<'a>, value : 'a, comparand : 'a) : 'a =
         let old = location
         if old = comparand then location <- value
         old
