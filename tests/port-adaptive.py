@@ -146,6 +146,14 @@ def main():
     proj = os.path.join(root, "FSharp.Data.Adaptive.fsproj")
     files = re.findall(r'Include="([^"]*\.fs)"', open(proj, encoding="utf-8-sig").read())
     files = [f.replace("\\", "/") for f in files if not f.startswith("AssemblyInfo")]
+    # AdaptiveFileSystem.fs is SKIPPED, and it is the only file that is.
+    # It is a leaf — nothing else in the library refers to anything it
+    # defines — and it is not adaptive machinery at all: it is a tool that
+    # watches a directory. What it needs is a FileSystemWatcher, a
+    # BlockingCollection and a Thread, none of which exist here and none of
+    # which say anything about whether this compiler can build the library.
+    # See DIVERGENCES.md.
+    files = [f for f in files if not f.endswith("AdaptiveFileSystem.fs")]
     chunks = ["module Adaptive"]
     shims = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive-shims")
     for i, f in enumerate(files):

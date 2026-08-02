@@ -417,3 +417,24 @@ holds something will not be told the loop ended.
 **byref is not an alias, and `try`/`finally` emits its finalizer twice.**
 Only one copy ever runs; a closure to share it would cost an allocation per
 entry for code that is typically one call.
+
+## The FSharp.Data.Adaptive port skips AdaptiveFileSystem.fs
+
+One file of the forty, and it is the only one skipped.
+
+`AdaptiveTools/AdaptiveFileSystem.fs` is not adaptive machinery — it is a
+tool built ON the machinery that watches a directory and reads files. It
+needs a `FileSystemWatcher`, a `BlockingCollection`, a `Thread` and a
+`static do`, and none of those exist here. Nothing else in the library refers
+to anything it defines, so skipping it removes no dependency of the heart.
+
+It also uses NAMED optional arguments — `GetFiles(path, ?regex = rx,
+recursive = true)` — which this compiler does not have. Optional parameters
+themselves work: a caller may leave a trailing `?x` off, and it may pass the
+value rather than the option. What is missing is naming an argument at the
+call, and every site that needs it is in this file.
+
+The reason to say so plainly rather than leave the file in and failing: in
+ONE concatenated pass, a file that does not parse hides every file after it.
+Left in, this one peripheral tool reported 1,655 diagnostics that belonged to
+nothing, and made the eight files behind it look broken when they were not.

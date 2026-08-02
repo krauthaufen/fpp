@@ -180,6 +180,8 @@ let parse (src : string) : ParseResult =
         // `&x` — an address, for a byref argument
         || (s.IsText "&" && (let n = s.Peek 1 in
                              List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen)))
+        // `?pattern = p` — naming an optional parameter at a call
+        || (s.IsText "?" && (s.Peek 1).Kind = Ident && (s.Peek 2).Text = "=")
         // quotations and splices come through canStartAtom
 
     /// Anything that can open a statement BLOCK. `yield` and `return` mean
@@ -581,8 +583,14 @@ let parse (src : string) : ParseResult =
             else
                 // comma-separated patterns, each optionally ascribed:
                 // (x), (x : int), (a, b), (src : string, toks : Vec<Token>)
-                let mutable go = canStartAtomPat ()
+                // `?retires : int` — an OPTIONAL parameter. The `?` rides in
+                // the tree as its own token so inference can see which
+                // parameter it belongs to and give that one an option type.
+                let optHere () =
+                    s.IsOp "?" && (s.Peek 1).Kind = Ident && s.SameLine
+                let mutable go = canStartAtomPat () || optHere ()
                 while go do
+                    if optHere () then vecAdd acc (s.Bump ())
                     vecAdd acc (parseAsSuffix (parseConsPat ctx))
                     // parenthesized or-pattern: ("&&" | "||")
                     while s.IsOp "|" && not s.AtEof do
@@ -593,7 +601,7 @@ let parse (src : string) : ParseResult =
                         vecAdd acc (parseType ctx)
                     if s.Is Comma then
                         vecAdd acc (s.Bump ())
-                        go <- canStartAtomPat ()
+                        go <- canStartAtomPat () || optHere ()
                     else go <- false
             if s.Is RParen then vecAdd acc (s.Bump ()) else s.Diag "expected ')' in pattern"
             Green.node ParenPat (vecToList acc)
@@ -982,6 +990,12 @@ let parse (src : string) : ParseResult =
             // an ordinary receiver as far as the tree is concerned; what the
             // keyword changes is which type its members are looked up on
             Green.node IdentExpr [ s.Bump () ]
+        elif s.IsOp "?" && (s.Peek 1).Kind = Ident && (s.Peek 2).Text = "=" then
+            // `?pattern = p` at a CALL: the argument names an optional
+            // parameter and passes the option itself, not a value to wrap.
+            // The `?` rides inside the name so the `= p` still reads as the
+            // ordinary named-argument shape.
+            Green.node IdentExpr [ s.Bump (); s.Bump () ]
         elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
             // type variable in expression position (e.g. `unbox<'a>` soup)
             Green.node IdentExpr [ s.Bump (); s.Bump () ]

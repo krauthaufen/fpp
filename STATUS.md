@@ -7,7 +7,7 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-650 tests
+653 tests
 corpus fixpoint    53463 bytes, byte-identical
 self-host fixpoint 1622242 bytes, byte-identical
 ```
@@ -515,33 +515,46 @@ seen to finish; it now takes eight seconds. The cause was a base-chain cycle,
 not volume — see CLAUDE.md. That changes how the work is done: the whole
 remaining error set is visible at once instead of one error per run.
 
+## Optional and named arguments
+
+Both, and every call form F# allows:
+
+    Dir.Get "root"                                        omitted -> None
+    Dir.Get("root", recursive = true)                     named, skipping one
+    Dir.Get("root", "*.fs", true)                         positional, wrapped in Some
+    Dir.Get(path = "x", recursive = true, pattern = "p")  all named, out of order
+    Dir.Get("root", ?pattern = p)                         the option passed through
+
+A name is an argument name only when the CALLEE declares it — everywhere else
+`x = v` is still an equality test, and a test says so. Inference puts the
+arguments in declaration order and leaves Lower a per-slot instruction: take
+this written element, take it wrapped, or pass None.
+
+`?x` rides in the tree as its own token, both in the parameter list and at the
+call, so the rest of the pipeline sees ordinary shapes.
+
 ## Where it stops now
 
-Measured per FILE, which is the only honest way to read it — one unparsed
-file poisons every file after it in one concatenated pass:
+Measured per FILE — one unparsed file poisons every file after it:
 
     clean through Traceable/Instances.fs            13,767 of 22,332 lines
     History.fs .. ComputationExpressions.fs            278 real diagnostics
-    AdaptiveTools/AdaptiveFileSystem.fs              does not parse
     AdaptifyHelpers.fs                               inference does not finish
 
-The raw count on the whole file is 1,904, and 1,655 of those are one parse
-error cascading. Parsed on its own, 39 of the 40 ported files are clean.
+`AdaptiveTools/AdaptiveFileSystem.fs` is now skipped outright — see
+DIVERGENCES.md. It is a leaf nothing depends on, and it is a directory
+watcher, not adaptive machinery.
 
-Three pieces of work remain, in the order they are worth doing:
+## Compiling is not the same as running
 
-* **Optional parameters.** `?retires : int` in the declaration, `defaultArg`
-  in the body, and at the call all three F# forms — omitted entirely
-  (`File.ReadAllTextSafe file`), passed through as an option
-  (`?regex = regex`), and named by value (`recursive = true`). Six
-  declaration sites, but it is what unparses a whole file, and named
-  arguments are not supported anywhere yet: `recursive = true` currently
-  reads as an equality test.
-* **278 type mismatches**, spread over eight files and not yet triaged.
-* **A second superlinear path** in `AdaptifyHelpers.fs`. It is NOT the parked
-  dot retry (measured: two passes) — the time is inside `unifyTrial` under
-  `tryResolveDot`.
+The port has only ever been INFERRED. Lowering and emission are a separate
+pass with their own failure class, and there is one known instance: a generic
+class implementing a non-generic interface type-checks and then traps
+(`unbound variable Accept`). How big that stage is has NOT been measured, and
+guessing at it would be worthless. The cheap measurement is a twenty-line
+smoke test — build a cval, map it, transact, read it back — which exercises
+the machinery end to end without needing the 6,667-line test suite.
 
-Known and open: a nested private `Traceable<'T>` merges with the global
-`Traceable<'S,'D>` because types are keyed by bare name; generic values are
-evaluated once per instantiation rather than per use.
+That suite needs NUnit, FsUnit and FsCheck. FsCheck's generators are
+reflection-driven, so it is a hand-written harness or nothing; there is
+precedent in this repo for exactly that.

@@ -956,7 +956,67 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              (nodesOf head |> List.filter (fun x -> isExprish x.NodeKind)).Head
                          else head
                      let f = lowerExpr (GNode head)
-                     let loweredArgs = args |> List.map (fun a -> lowerExpr (GNode a))
+                     let loweredArgs =
+                         let given = args |> List.map (fun a -> lowerExpr (GNode a))
+                         // the call left optional parameters off; inference
+                         // counted them, and each one is None
+                         match dictTryFind fieldOwners (offsetOf n) with
+                         | Some m when m.StartsWith "$call:" ->
+                             // inference put the arguments in DECLARATION
+                             // order and said, per slot, which written element
+                             // fills it: p/s take it as-is or wrapped in Some,
+                             // capitalised means the element is `name = value`
+                             // and it is the VALUE that is the argument, n is
+                             // an optional the call left off
+                             let written =
+                                 match nodesOf n |> List.filter (fun x -> isExprish x.NodeKind) with
+                                 | _ :: rest ->
+                                     (match rest with
+                                      | [ one ] when one.NodeKind = ParenExpr ->
+                                          (match nodesOf one |> List.filter (fun x -> isExprish x.NodeKind) with
+                                           | [ t ] when t.NodeKind = TupleExpr ->
+                                               nodesOf t |> List.filter (fun x -> isExprish x.NodeKind)
+                                           | xs -> xs)
+                                      | xs -> xs)
+                                 | [] -> []
+                             let rhsOf (a : GreenNode) =
+                                 match nodesOf a |> List.filter (fun x -> isExprish x.NodeKind) with
+                                 | [ _; r ] -> r
+                                 | _ -> a
+                             let optTy = mono (TCon ("Option", [ TCon ("?", []) ]))
+                             let slots =
+                                 (m.Substring 6).Split ','
+                                 |> Array.toList
+                                 |> List.map (fun sp ->
+                                     if sp = "n" then ECtor ("None", optTy, [])
+                                     else
+                                         let tag = sp.[0]
+                                         let k = int (sp.Substring 1)
+                                         let node = List.item k written
+                                         let node = if tag = 'P' || tag = 'S' then rhsOf node else node
+                                         let e = lowerExpr (GNode node)
+                                         if tag = 's' || tag = 'S' then ECtor ("Some", optTy, [ e ]) else e)
+                             [ ETuple slots ]
+                         | Some m when m.StartsWith "$optargs:" ->
+                             let parts = (m.Substring 9).Split ':'
+                             let k = int parts.[0]
+                             let wraps =
+                                 if parts.[1] = "" then []
+                                 else parts.[1].Split ',' |> Array.toList |> List.map (fun x -> int x)
+                             let optTy = mono (TCon ("Option", [ TCon ("?", []) ]))
+                             let none = ECtor ("None", optTy, [])
+                             // the parameters are a TUPLE, so the Nones join
+                             // the tuple — they are not further arguments
+                             let nones = List.replicate k none
+                             let xs =
+                                 match given with
+                                 | [ ETuple ys ] -> ys
+                                 | other -> other
+                             let xs =
+                                 xs |> List.mapi (fun i x ->
+                                     if List.contains i wraps then ECtor ("Some", optTy, [ x ]) else x)
+                             [ ETuple (xs @ nones) ]
+                         | _ -> given
                      // a type with several constructors: inference chose one
                      let overloaded =
                          let ctorHead =

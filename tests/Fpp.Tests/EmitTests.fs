@@ -1959,3 +1959,69 @@ let castPrecedenceTests =
             Expect.equal out "box\n" "the pipe runs first, the cast wraps it"
         }
     ]
+
+[<Tests>]
+let optionalParameterTests =
+    testList "optional parameters" [
+        test "omitted, and given by value" {
+            // `?retries : int` declares an `int option`. A caller may leave it
+            // off — that argument is None — or pass the VALUE, which F# wraps
+            // in Some. Both join the parameter TUPLE; they are not extra
+            // positional arguments.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Reader ="
+                    "    static member Read (path : string, ?retries : int) ="
+                    "        let n = defaultArg retries 5"
+                    "        printfn \"%s %d\" path n"
+                    "let go ="
+                    "    Reader.Read \"a\""
+                    "    Reader.Read(\"b\", 3)"
+                    "" ])
+            Expect.equal out "a 5\nb 3\n" "the default, then the given value"
+        }
+    ]
+
+[<Tests>]
+let namedArgumentTests =
+    testList "named arguments" [
+        test "named, reordered, and mixed with optionals" {
+            // A name is only an argument name when the CALLEE declares it —
+            // everywhere else `x = v` is still an equality test. Named
+            // arguments take their declared slot, positional ones fill what
+            // is left in order, an omitted optional is None, and a value
+            // given for an optional is wrapped in Some. `?x = e` passes the
+            // option itself and is not wrapped.
+            let src ends = String.concat "\n" ([
+                "module M"
+                "type Dir ="
+                "    static member Get (path : string, ?pattern : string, ?recursive : bool) ="
+                "        printfn \"%s %s %b\" path (defaultArg pattern \"*\") (defaultArg recursive false)"
+                "let go =" ] @ ends @ [ "" ])
+            let out =
+                runProgram (src [
+                    "    Dir.Get \"root\""
+                    "    Dir.Get(\"root\", recursive = true)"
+                    "    Dir.Get(\"root\", \"*.fs\", true)"
+                    "    Dir.Get(path = \"x\", recursive = true, pattern = \"p\")"
+                    "    let p = Some \"y.fs\""
+                    "    Dir.Get(\"root\", ?pattern = p)" ])
+            Expect.equal out
+                "root * false\nroot * true\nroot *.fs true\nx p true\nroot y.fs false\n"
+                "each call form lands in declaration order"
+        }
+        test "an equality test beside a call is still an equality test" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Dir ="
+                    "    static member Get (path : string) = printfn \"%s\" path"
+                    "let go ="
+                    "    let path = 1"
+                    "    printfn \"%b\" (path = 1)"
+                    "    Dir.Get \"p\""
+                    "" ])
+            Expect.equal out "true\np\n" "the name is a parameter of nothing here"
+        }
+    ]

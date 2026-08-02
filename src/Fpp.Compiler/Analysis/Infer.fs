@@ -78,7 +78,13 @@ type FieldInfo =
       /// use site can instantiate THAT scheme and record the specialization
       /// demand. None for plain record fields.
       DefKey : (string * int) option
-      IsStatic : bool }
+      IsStatic : bool
+      /// how many TRAILING parameters were declared `?x` — a caller may
+      /// leave that many off the end, and each one it leaves off is None
+      Optionals : int
+      /// the parameters' names in declaration order, "" where the parameter
+      /// is not a plain identifier. What lets a CALL name its arguments.
+      ParamNames : string list }
 
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
@@ -329,8 +335,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// name is an OVERLOAD: it keeps its own entry under an ordinal suffix
     /// ("HashMap.CopyTo#2"), assigned in declaration order — the same order
     /// the resolver assigns, so the two suffixes name the same definition.
+    /// use-site offset -> how many trailing arguments that use may omit
+    let optionalsAt = dictNew<int, int> ()
+
     let registerField (key : string) (fi : FieldInfo) : unit =
         dictSet knownTypes fi.TypeName true
+        // A second entry keyed by the DEFINITION, so a use site that resolved
+        // to the definition (a static member through its type, say) can ask
+        // how many arguments it may leave off without knowing the receiver.
+        // `fields` is the project-wide table, so this crosses files.
+        (match fi.DefKey with
+         | Some (dp, doff) when fi.Optionals > 0 || not (List.isEmpty fi.ParamNames) ->
+             dictSet fields ("$sig:" + dp + ":" + string doff) fi
+         | _ -> ())
         if (dictTryFind fields key).IsNone then dictSet fields key fi
         else
             let mutable k = 2
@@ -352,7 +369,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if (dictTryFind fields "string.Substring").IsNone then
             let m (ty : Type) =
                 { TypeName = "string"; Params = []; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
             let strArr = TCon ("array", [ tString ])
             let charArr = TCon ("array", [ tChar ])
             // the 1-arg form first: ordinal order IS declaration order
@@ -401,7 +418,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "Option"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
             registerField "Option.IsSome" (m tBool)
             registerField "Option.IsNone" (m tBool)
             registerField "Option.Value" (m (TVar elem))
@@ -416,7 +433,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "list"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
             registerField "list.IsEmpty" (m tBool)
             registerField "list.Length" (m tInt)
             registerField "list.Head" (m (TVar elem))
@@ -729,8 +746,44 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let nodesOf (n : GreenNode) : GreenNode list =
         n.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
 
+    /// how many of this member's parameters were written `?x`. F# requires
+    /// them last, so the count IS how many a caller may leave off.
+    let optionalArity (m : GreenNode) : int =
+        nodesOf m
+        |> List.filter (fun p -> p.NodeKind = ParenPat)
+        |> List.sumBy (fun p ->
+            p.Children
+            |> List.sumBy (fun c ->
+                match c with
+                | GToken q when q.Kind = Operator && q.Text = "?" -> 1
+                | _ -> 0))
+
     let tokensOf (n : GreenNode) : Token list =
         n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+
+    /// the member's parameter names, in order. "" for a parameter that is
+    /// not a plain identifier — it can never be named at a call.
+    let paramNames (m : GreenNode) : string list =
+        match nodesOf m |> List.filter (fun p -> p.NodeKind = ParenPat) with
+        | pp :: _ ->
+            nodesOf pp
+            // the OTHER children are the ascriptions' type nodes
+            |> List.filter (fun p ->
+                match p.NodeKind with
+                | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
+                | ConsPat | AppPat | ParenPat | ListPat | AsPat | TypeTestPat -> true
+                | _ -> false)
+            |> List.map (fun p ->
+                // the match comes LAST: a `match` with an `else` after it
+                // swallows the else, and this has to compile under itself
+                let ids = tokensOf p |> List.filter (fun t -> t.Kind = Ident)
+                if p.NodeKind <> IdentPat then ""
+                else
+                    match ids with
+                    | [ nt ] -> nt.Text
+                    | _ -> "")
+        | [] -> []
+
 
     /// The label of a record-literal field. It may be qualified with the
     /// owning type or module (`{ Classes.MPath = p; ... }`), in which case
@@ -1455,9 +1508,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | _ -> [])
                 | None -> []
             let mutable elemIx = 0
+            // `?retries : int` declares an `int option`. The `?` is its own
+            // token in the tree, so it is seen just before the pattern it
+            // belongs to.
+            let mutable optNext = false
             let rec walk (ks : Green list) =
                 match ks with
+                | GToken q :: rest when q.Kind = Operator && q.Text = "?" ->
+                    optNext <- true
+                    walk rest
                 | GNode p :: rest when isPatKind p.NodeKind ->
+                    let isOpt = optNext
+                    optNext <- false
                     (if elemIx < List.length elemWant then
                         patExpect <- Some (List.item elemIx elemWant))
                     elemIx <- elemIx + 1
@@ -1475,7 +1537,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                | Some bt -> dictSet byrefParams bt.Offset true
                                | None -> ())
                           | _ -> ())
-                         unify ty (typeFromNode pvars a) |> ignore
+                         let declared = typeFromNode pvars a
+                         unify ty (if isOpt then TCon ("Option", [ declared ]) else declared) |> ignore
                          vecAdd items ty
                          walk rest2
                      | GToken b :: _ when b.Kind = Operator && b.Text = "|" ->
@@ -2011,9 +2074,132 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 | _ -> ())
                            | None -> ())
                       | None -> ())
+                     // how many trailing arguments this callee lets the call
+                     // leave off — each one it leaves off is None
+                     let calleeSig =
+                         match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                         | Some ht ->
+                             (match dictTryFind useDefs ht.Offset with
+                              | Some d -> dictTryFind fields ("$sig:" + d.Path + ":" + string d.Offset)
+                              | None -> None)
+                         | None -> None
+                     let omittable = match calleeSig with Some fi -> fi.Optionals | None -> 0
+                     // The elements a call actually wrote, whether or not
+                     // they came wrapped in a paren and a tuple.
+                     let suppliedNodes =
+                         match args |> List.filter (fun a -> isExprish a.NodeKind) with
+                         | [ one ] when one.NodeKind = ParenExpr ->
+                             (match nodesOf one |> List.filter (fun m -> isExprish m.NodeKind) with
+                              | [ t ] when t.NodeKind = TupleExpr ->
+                                  nodesOf t |> List.filter (fun m -> isExprish m.NodeKind)
+                              | xs -> xs)
+                         | xs -> xs
+                     /// `name = value`, but ONLY for a name the callee declares
+                     /// — anywhere else `x = v` is an equality test and stays one
+                     let namedArg (known : string list) (a : GreenNode) =
+                         let parts = nodesOf a |> List.filter (fun m -> isExprish m.NodeKind)
+                         let ops = tokensOf a
+                         if a.NodeKind <> BinaryExpr then None
+                         else
+                             // the match comes LAST, so nothing follows it
+                             match parts, ops with
+                             | [ l; r ], [ op ] when op.Text = "=" && l.NodeKind = IdentExpr ->
+                                 let ids = tokensOf l |> List.filter (fun t -> t.Kind = Ident)
+                                 // `?x = e` passes the OPTION; `x = e` a value
+                                 let through =
+                                     tokensOf l |> List.exists (fun t -> t.Kind = Operator && t.Text = "?")
+                                 (match ids with
+                                  | [ nt ] when List.contains nt.Text known -> Some (nt.Text, r, through)
+                                  | _ -> None)
+                             | _ -> None
+                     let names =
+                         match calleeSig with Some fi -> fi.ParamNames | None -> []
+                     let anyNamed =
+                         not (List.isEmpty names)
+                         && suppliedNodes |> List.exists (fun a -> (namedArg names a).IsSome)
+                     let mutable handled = false
+                     (if anyNamed then
+                        match prune funTy with
+                        | TFun (pt, rt) ->
+                            (match prune pt with
+                             | TTuple ps when List.length ps = List.length names ->
+                                 // each written element takes the slot its name
+                                 // gives it; the rest fill the slots left over,
+                                 // in order, as F# reads them
+                                 let slotOf = dictNew<int, GreenNode> ()
+                                 let fromSlot = dictNew<int, int> ()
+                                 let namedSlot = dictNew<int, bool> ()
+                                 let passThrough = dictNew<int, bool> ()
+                                 suppliedNodes |> List.iteri (fun k a ->
+                                     match namedArg names a with
+                                     | Some (nm, v, through) ->
+                                         let i = List.findIndex (fun x -> x = nm) names
+                                         dictSet slotOf i v
+                                         dictSet fromSlot i k
+                                         dictSet namedSlot i true
+                                         if through then dictSet passThrough i true
+                                     | None -> ())
+                                 let mutable pos = 0
+                                 suppliedNodes |> List.iteri (fun k a ->
+                                     match namedArg names a with
+                                     | Some _ -> ()
+                                     | None ->
+                                         while (dictTryFind slotOf pos).IsSome do pos <- pos + 1
+                                         dictSet slotOf pos a
+                                         dictSet fromSlot pos k
+                                         pos <- pos + 1)
+                                 let firstOpt = List.length ps - (match calleeSig with Some fi -> fi.Optionals | None -> 0)
+                                 let spec = vecNew<string> ()
+                                 let built = vecNew<Type> ()
+                                 let mutable ok = true
+                                 ps |> List.iteri (fun i pty ->
+                                     match dictTryFind slotOf i with
+                                     | Some v ->
+                                         exprExpect <-
+                                             (match prune pty with
+                                              | TCon ("Option", [ inner ]) when
+                                                     i >= firstOpt && (dictTryFind passThrough i) <> Some true -> Some inner
+                                              | other -> Some other)
+                                         let vt = exprType (GNode v)
+                                         exprExpect <- None
+                                         let k = match dictTryFind fromSlot i with Some k -> k | None -> 0
+                                         let isNamed = (dictTryFind namedSlot i) = Some true
+                                         // an optional parameter given its VALUE
+                                         // is wrapped, the way F# wraps it
+                                         let wrap =
+                                             i >= firstOpt
+                                             && (dictTryFind passThrough i) <> Some true
+                                             && (match prune pty with
+                                                 | TCon ("Option", [ inner ]) ->
+                                                     (Types.unifyTrial false pty vt).IsSome
+                                                     && (Types.unifyTrial false inner vt).IsNone
+                                                 | _ -> false)
+                                         (if wrap then
+                                            (match prune pty with
+                                             | TCon ("Option", [ inner ]) -> unifyArg off inner vt
+                                             | _ -> ())
+                                            vecAdd built pty
+                                          else
+                                            vecAdd built vt)
+                                         vecAdd spec
+                                             ((if wrap then (if isNamed then "S" else "s")
+                                               else (if isNamed then "P" else "p")) + string k)
+                                     | None ->
+                                         if i >= firstOpt then
+                                             vecAdd built pty
+                                             vecAdd spec "n"
+                                         else ok <- false)
+                                 if ok then
+                                     unifyArg off pt (TTuple (vecToList built))
+                                     vecAdd fieldOwnersRaw
+                                         (off, "$call:" + String.concat "," (vecToList spec))
+                                     funTy <- rt
+                                     handled <- true
+                             | _ -> ())
+                        | _ -> ())
                      let mutable firstArg = true
                      let mutable firstArgTy = None
-                     for a in args do
+                     for a in (if handled then [] else args) do
                          if isExprish a.NodeKind then
                              (match prune funTy with
                               | TFun (pt, _) -> exprExpect <- Some pt
@@ -2027,7 +2213,52 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              // decompose first so a subclass argument can widen
                              (match prune funTy with
                               | TFun (pt, rt) ->
-                                  unifyArg off pt argTy
+                                  // `File.ReadAllTextSafe file` against
+                                  // `(string * int option)`: the parameters
+                                  // the call left off take their declared
+                                  // types, and Lower passes None for each
+                                  let supplied =
+                                      match prune argTy with
+                                      | TTuple ys -> ys
+                                      | one -> [ one ]
+                                  (match prune pt with
+                                   | TTuple ps when
+                                          omittable > 0
+                                          && List.length supplied <= List.length ps
+                                          && List.length ps - List.length supplied <= omittable ->
+                                       let have = List.length supplied
+                                       let need = List.length ps
+                                       let firstOpt = need - omittable
+                                       // an optional parameter may be given
+                                       // its VALUE rather than an option, and
+                                       // F# wraps it — but `?x = e` passes the
+                                       // option straight through, so only wrap
+                                       // where the option itself does not fit
+                                       let wraps =
+                                           supplied
+                                           |> List.mapi (fun i x -> i, x)
+                                           |> List.filter (fun (i, x) ->
+                                               i >= firstOpt
+                                               && (match prune (List.item i ps) with
+                                                   | TCon ("Option", [ inner ]) ->
+                                                       (Types.unifyTrial false (List.item i ps) x).IsSome
+                                                       && (Types.unifyTrial false inner x).IsNone
+                                                   | _ -> false))
+                                           |> List.map fst
+                                       let filled =
+                                           supplied
+                                           |> List.mapi (fun i x ->
+                                               if List.contains i wraps then List.item i ps else x)
+                                       vecAdd fieldOwnersRaw
+                                           (off, "$optargs:" + string (need - have) + ":"
+                                                 + String.concat "," (List.map (fun i -> string i) wraps))
+                                       unifyArg off pt (TTuple (filled @ List.skip have ps))
+                                       for i in wraps do
+                                           (match prune (List.item i ps) with
+                                            | TCon ("Option", [ inner ]) ->
+                                                unifyArg off inner (List.item i supplied)
+                                            | _ -> ())
+                                   | _ -> unifyArg off pt argTy)
                                   unifyAt off res rt
                               | _ -> unifyAt off funTy (TFun (argTy, res)))
                              funTy <- res
@@ -3446,7 +3677,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              recordDef t ft
                              let info =
                                  { TypeName = name; Params = paramVarList (); Quantified = []
-                                   FieldType = ft; DefKey = None; IsStatic = false }
+                                   FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
                              // bare name: last declaration wins (F# shadowing);
                              // qualified key: dot-access on a known record type
                              dictSet fields t.Text info
@@ -3486,7 +3717,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      recordDef nameTok ft
                      let info =
                          { TypeName = name; Params = paramVarList (); Quantified = []
-                           FieldType = ft; DefKey = None; IsStatic = false }
+                           FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
                      dictSet fields nameTok.Text info
                      dictSet fields (name + "." + nameTok.Text) info
                  | _ -> ())
@@ -3682,7 +3913,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                { TypeName = tyName; Params = classParams
                                  Quantified = []
                                  FieldType = setTy
-                                 DefKey = Some (path, kt.Offset); IsStatic = false }
+                                 DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = [] }
                        | None -> ())
                   | _ -> ())
              | None -> ())
@@ -3701,7 +3932,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            |> List.filter (fun v -> not (Set.contains v.Id classIds))
                        FieldType = propTy
                        DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
-                       IsStatic = false }
+                       IsStatic = false; Optionals = 0; ParamNames = [] }
              | None -> ())
         else
 
@@ -3745,7 +3976,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 { TypeName = tyName; Params = classParams; Quantified = quantified
                   FieldType = memberTy
                   DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
-                  IsStatic = isStatic }
+                  IsStatic = isStatic; Optionals = optionalArity n; ParamNames = paramNames n }
         | None -> ()
 
     /// An instance member is an ordinary function; the only extra work is

@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 650 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 653 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -243,6 +243,18 @@ The strict rule applies only in match/try clauses. A `let`, a parameter or a
 shared tail code into one branch — once skipping a type conversion, once
 failing to advance a loop and hanging the compiler. Parenthesise a `match`
 whose arms are statements and whose result continues below.
+
+`if c then match ... with ... else e` is the same trap wearing a hat: the
+`else` lands inside the last arm. The .NET build accepts it and the SELF-HOST
+traps, which is a long way to travel for a missing bracket. Write the match
+LAST — `if not c then e else match ...` — rather than parenthesising it.
+
+**A builtin conversion is not a first-class function.** `List.map string xs`
+and `List.map int xs` compile under .NET and lower to nothing: the backend
+stubs them (`not ported: EUnknown string`) and the stub traps when reached.
+`string` and `int` are emitted at their APPLICATION, so they have to be
+applied — `List.map (fun x -> string x) xs`. Grep for `map string`/`map int`
+before wondering why a green build dies at the fixpoint.
 
 ## Conventions
 
