@@ -3977,6 +3977,49 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
     root.Children |> List.iter preScan
 
+    // Type abbreviations, all of them, before any signature is read. In an
+    // `and` group the abbreviation can come AFTER the interface that uses it
+    // — `IVisitor` takes an `aval<'T>` three lines above `and aval<'T> =
+    // IAdaptiveValue<'T>` — and registering them in declaration order left
+    // that parameter as an opaque `aval`, so no argument ever widened into
+    // it. The main pass registers them again; this only makes them early.
+    let rec preScanAliases (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            if n.NodeKind = TypeDecl then
+                let hasStructure =
+                    nodesOf n
+                    |> List.exists (fun m ->
+                        m.NodeKind = UnionCase || m.NodeKind = RecordRepr
+                        || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
+                if not hasStructure then
+                    match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident),
+                          nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                    | Some nameTok, Some repr ->
+                        let vars = dictNew<string, Type> ()
+                        let ps = vecNew<Var> ()
+                        for m in nodesOf n do
+                            if m.NodeKind = TyParams then
+                                let paramToks =
+                                    m.Children
+                                    |> List.collect (fun c ->
+                                        match c with
+                                        | GNode w when w.NodeKind = WhenDecl -> []
+                                        | other -> Green.tokens other)
+                                for t in paramToks do
+                                    if t.Kind = Ident && t.Text <> "_"
+                                       && not (dictTryFind vars t.Text).IsSome then
+                                        let v = st.Fresh ()
+                                        dictSet vars t.Text v
+                                        match prune v with
+                                        | TVar vr -> vecAdd ps vr
+                                        | _ -> ()
+                        dictSet aliases nameTok.Text (vecToList ps, typeFromNode vars repr)
+                    | _ -> ()
+            elif n.NodeKind = ModuleDef then n.Children |> List.iter preScanAliases
+    root.Children |> List.iter preScanAliases
+
     // classes before instances, both before any body: the `= 'a` shorthand
     // in a superclass constraint names the class' only associated type, so
     // the class it mentions has to be on the table already

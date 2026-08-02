@@ -254,3 +254,26 @@ let instantiationTests =
             Expect.isEmpty (ws.TypeCheck "t.fpp").InstSites "no demands for monomorphic code"
         }
     ]
+
+[<Tests>]
+let aliasInAndGroupTests =
+    testList "abbreviation in an and-group" [
+        test "an abbreviation used above its own declaration still widens" {
+            // `IVisitor` takes a `foo<'T>` three lines ABOVE `and foo<'T> =
+            // IFoo<'T>`. Registering abbreviations in declaration order left
+            // that parameter opaque, so no argument ever widened into it.
+            let src = String.concat "\n" [
+                "module M"
+                "type IFoo<'T> ="
+                "    abstract member Get : unit -> 'T"
+                "and IVisitor<'R> ="
+                "    abstract member Visit<'T> : foo<'T> -> 'R"
+                "and foo<'T> = IFoo<'T>"
+                "type Box<'T>(v : 'T) ="
+                "    interface IFoo<'T> with"
+                "        member x.Get () = v"
+                "let use2 (vis : IVisitor<'R>) (b : Box<int>) = vis.Visit b"
+                "" ]
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+        }
+    ]

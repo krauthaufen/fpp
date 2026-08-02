@@ -7,7 +7,7 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-647 tests
+648 tests
 corpus fixpoint    53463 bytes, byte-identical
 self-host fixpoint 1622242 bytes, byte-identical
 ```
@@ -500,6 +500,22 @@ does not move the frontier so much as reveal the next thing.
 The write has to be recognised BEFORE its target is lowered. Lowering the
 target reads the slice, and a read is not a place to write to.
 
+## Type abbreviations are registered before any signature is read
+
+In an `and` group the abbreviation can come after the interface that uses it:
+`IAdaptiveValueVisitor` takes an `aval<'T>` three lines above `and aval<'T> =
+IAdaptiveValue<'T>`. Registering abbreviations in declaration order left that
+parameter opaque, so no argument ever widened into it and every `v.Visit x`
+in the library failed. A pre-pass registers them all first.
+
 ## Where it stops now
 
-Re-measuring after slices landed.
+Everything through `AdaptiveValue/AdaptiveValue.fs` type-checks — 13,510 of
+22,332 lines, up from 12,092. Two things are known and open:
+
+* Inferring the whole file is superlinear somewhere after line 13,130 and has
+  not been made to finish. The clean prefixes up to 13,130 take ~2 s.
+* A generic class implementing a NON-generic interface emits an unbound
+  member: `Box<'T>` with `interface IFoo with member x.Accept ...` type-checks
+  and then traps. It reproduces with no abbreviation involved, so it is the
+  monomorphization path, not this fix.
