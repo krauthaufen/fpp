@@ -632,8 +632,16 @@ let parse (src : string) : ParseResult =
         while go do
             // operators may sit at exactly the block column on a fresh line
             let allowed = s.SameLine || s.CurCol >= ctx || bracketDepth > 0
-            if (s.IsOp ":>" || s.IsOp ":?>" || s.IsOp ":?") && allowed then
-                // a cast or type test takes a TYPE on the right, not an expression
+            // A CAST binds looser than `|>`: F# reads `x |> f :> obj` as
+            // `(x |> f) :> obj`, and taking the cast unconditionally made it
+            // `x |> (f :> obj)` — a function upcast to obj. Level 4 is the
+            // band `|>` and `=` share, and left association puts the cast
+            // outside them, which is what the spec's ordering amounts to.
+            if (s.IsOp ":>" || s.IsOp ":?>") && allowed && minPrec <= 4 then
+                let op = s.Bump ()
+                lhs <- Green.node CastExpr [ lhs; op; parseType ctx ]
+            elif s.IsOp ":?" && allowed then
+                // a type TEST still binds tightly, as in F#
                 let op = s.Bump ()
                 lhs <- Green.node CastExpr [ lhs; op; parseType ctx ]
             elif s.Is Operator && allowed && not (s.IsOp "|") && not (s.IsOp "->") then

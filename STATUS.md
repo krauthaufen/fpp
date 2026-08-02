@@ -7,7 +7,7 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-648 tests
+650 tests
 corpus fixpoint    53463 bytes, byte-identical
 self-host fixpoint 1622242 bytes, byte-identical
 ```
@@ -508,14 +508,28 @@ IAdaptiveValue<'T>`. Registering abbreviations in declaration order left that
 parameter opaque, so no argument ever widened into it and every `v.Visit x`
 in the library failed. A pre-pass registers them all first.
 
+## Measuring the port stopped being the slow part
+
+Inferring all 22,332 ported lines took longer than ten minutes and was never
+seen to finish; it now takes eight seconds. The cause was a base-chain cycle,
+not volume — see CLAUDE.md. That changes how the work is done: the whole
+remaining error set is visible at once instead of one error per run.
+
 ## Where it stops now
 
-Everything through `AdaptiveValue/AdaptiveValue.fs` type-checks — 13,510 of
-22,332 lines, up from 12,092. Two things are known and open:
+The first diagnostic is at line 13,821, up from 12,092. But the count is the
+more useful number, and it decomposes:
 
-* Inferring the whole file is superlinear somewhere after line 13,130 and has
-  not been made to finish. The clean prefixes up to 13,130 take ~2 s.
-* A generic class implementing a NON-generic interface emits an unbound
-  member: `Box<'T>` with `interface IFoo with member x.Accept ...` type-checks
-  and then traps. It reproduces with no abbreviation involved, so it is the
-  monomorphization path, not this fix.
+    1655  parse errors, ALL cascading from ONE unparsed file
+     225  type mismatches
+      24  missing instances, constructors, occurs failures
+
+Parsed on its own, 39 of the 40 ported files are clean. The fortieth,
+`AdaptiveTools/AdaptiveFileSystem.fs`, uses OPTIONAL PARAMETERS — `?retires :
+int`, `?regex = regex` at the call, `defaultArg` in the body — which this
+compiler does not have, and every file after it in compile order inherits the
+cascade. That feature is the next piece of work, and it is worth more than
+its six declaration sites suggest.
+
+Removing that file to see what is behind it makes inference hang again, so
+there is a second superlinear path still to find.

@@ -277,3 +277,24 @@ let aliasInAndGroupTests =
             Expect.isEmpty (inferSrc src).Diagnostics "clean"
         }
     ]
+
+[<Tests>]
+let sameNameBaseTests =
+    testList "a type is never its own base" [
+        test "generic and non-generic of one name do not make a cycle" {
+            // Types are keyed by BARE NAME, so `IVal` and `IVal<'T>` share an
+            // entry and `and IVal<'T> = inherit IVal` recorded IVal as its own
+            // base. The member walk then never ended — a shallow stack at
+            // 100% CPU, because the recursion is a tail call.
+            let src = String.concat "\n" [
+                "module M"
+                "type IVal ="
+                "    abstract member OutOfDate : bool"
+                "and IVal<'T> ="
+                "    inherit IVal"
+                "    abstract member Get : unit -> 'T"
+                "let read (v : IVal<int>) = v.OutOfDate"
+                "" ]
+            Expect.isEmpty (inferSrc src).Diagnostics "clean"
+        }
+    ]

@@ -1935,3 +1935,27 @@ let arraySliceTests =
             Expect.equal out "3 20 40\n0 20 40 0\nab\n" "packed and reference elements alike"
         }
     ]
+
+[<Tests>]
+let castPrecedenceTests =
+    testList "cast precedence" [
+        test "a cast binds looser than a pipe" {
+            // F# reads `x |> f :> obj` as `(x |> f) :> obj`. Taking the cast
+            // unconditionally made it `x |> (f :> obj)` — piping into a
+            // function that had been upcast, so the call typed against obj.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type IThing ="
+                    "    abstract member Say : unit -> string"
+                    "type Box(n : int) ="
+                    "    interface IThing with"
+                    "        member x.Say () = \"box\""
+                    "let mk (n : int) = Box n"
+                    "let go ="
+                    "    let t = 1 |> mk :> IThing"
+                    "    printfn \"%s\" (t.Say ())"
+                    "" ])
+            Expect.equal out "box\n" "the pipe runs first, the cast wraps it"
+        }
+    ]

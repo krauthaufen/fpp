@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 648 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 650 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -188,6 +188,13 @@ The same mistake hid in two places, and the second needed BOTH sides fixed:
 a static member through a qualified type (`Inner.Box.Make`) bound in
 inference but emission still built a closure over it, so it type-checked and
 trapped. If you change one side, change the other.
+
+**Types are keyed by BARE NAME**, so `IVal` and `IVal<'T>` share one entry.
+`and IVal<'T> = inherit IVal` therefore recorded a type as its own base, and
+the member walk never ended — a SHALLOW stack at 100% CPU, because the
+recursion is a tail call. Both the record and the walk now refuse a cycle.
+The same conflation still merges a nested private `Traceable<'T>` with a
+global `Traceable<'S,'D>`; keying by name AND arity is the real fix.
 
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
 and Lower. Each one is this question — first or last — and each is right

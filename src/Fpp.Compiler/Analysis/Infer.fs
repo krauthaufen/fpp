@@ -500,7 +500,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // Walk to the type that declares this member, carrying the receiver's
         // type arguments up through each `inherit` so a generic base is
         // instantiated the way the derived class instantiated it.
+        // Types are keyed by BARE NAME, so `IAdaptiveValue` and
+        // `IAdaptiveValue<'T>` share one entry and the generic one's
+        // `inherit IAdaptiveValue` can make a type its own base. The record
+        // below refuses the self-edge; this refuses every longer cycle, and
+        // costs one set on a walk that is a handful of links deep.
+        let seenOwners = dictNew<string, bool> ()
         let rec declaringOwner (tn : string) (args : Type list) : ((int * FieldInfo) list * string * Type list) option =
+            if (dictTryFind seenOwners tn).IsSome then None else
+            dictSet seenOwners tn true
             match fieldCandidates (tn + "." + name) with
             | (_ :: _) as cs -> Some (cs, tn, args)
             | [] ->
@@ -1876,9 +1884,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  | TTuple xs, TTuple ys when List.length xs = List.length ys ->
                                      List.forall2 couldAccept xs ys
                                  | _ -> false)
+                         // `LazyOrValue<'T> create` WRITES its type argument,
+                         // and that is what tells the two constructors apart:
+                         // against `new(value : 'T)` the argument would have
+                         // to make 'T contain itself. Ignoring the written
+                         // arguments left both candidates fitting, and the
+                         // first declared won — F# picks the other.
+                         let writtenArgs =
+                             match nodesOf head |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                             | Some tp ->
+                                 nodesOf tp
+                                 |> List.filter (fun x -> isTypeKind x.NodeKind)
+                                 |> List.map (typeFromNode tyScope)
+                             | None -> []
+                         // pins a FRESH instantiation, so there is nothing to undo
+                         let pin (res : Type) =
+                             match writtenArgs, prune res with
+                             | (_ :: _), TCon (_, ras) when writtenArgs.Length = ras.Length ->
+                                 List.iter2 (fun w r -> Types.unify w r |> ignore) writtenArgs ras
+                             | _ -> ()
                          let fits (sch : Scheme) =
                              match prune (st.Instantiate sch) with
-                             | TFun (dom, res) -> couldAccept dom argTy
+                             | TFun (dom, res) ->
+                                 pin res
+                                 couldAccept dom argTy
                              | _ -> false
                          let chosen =
                              // one fit is the answer; several is an ambiguity
@@ -1891,6 +1920,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               vecAdd ctorSitesRaw (ht.Offset, o)
                               (match prune (st.Instantiate sch) with
                                | TFun (dom, res) ->
+                                   pin res
                                    // widen per argument, not on the tuple
                                    (match prune dom, prune argTy with
                                     | TTuple ds, TTuple has when ds.Length = has.Length ->
@@ -3334,7 +3364,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   let ownParams =
                       vecToList tyParams
                       |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
-                  dictSet bases name (ownParams, typeFromNode vars tn)
+                  let baseTy = typeFromNode vars tn
+                  // `and IAdaptiveValue<'T> = inherit IAdaptiveValue` names
+                  // the SAME key as the type being declared, because a type
+                  // is keyed by its bare name. Recording it would make the
+                  // type its own base and the member walk would never end.
+                  match prune baseTy with
+                  | TCon (b, _) when b = name -> ()
+                  | _ -> dictSet bases name (ownParams, baseTy)
               | None -> ())
          | None -> ())
         currentBase <-
@@ -3949,34 +3986,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         if not (inst.Members |> List.exists (fun (mn, _) -> mn = m)) then
                             vecAdd diags (offset, "instance " + name + " must implement " + m)
 
-    // Which interfaces each type implements has to be known BEFORE any
-    // body is checked: a type's own members may narrow to it (`:? HashSet`
-    // from a `seq`), and that test needs the subtype relation already.
-    let rec preScan (g : Green) : unit =
-        match g with
-        | GToken _ -> ()
-        | GNode n ->
-            if n.NodeKind = TypeDecl then
-                match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
-                | Some nameTok ->
-                    let rec ifaceOf (ty : GreenNode) : string option =
-                        match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
-                        | Some hd when ty.NodeKind = AppType -> ifaceOf hd
-                        | _ ->
-                            Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
-                            |> Option.map (fun t -> t.Text)
-                    let names =
-                        nodesOf n
-                        |> List.filter (fun m -> m.NodeKind = InterfaceImpl)
-                        |> List.choose (fun m ->
-                            nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) |> Option.bind ifaceOf)
-                    if not (List.isEmpty names) then
-                        let prior = match dictTryFind impls nameTok.Text with Some l -> l | None -> []
-                        dictSet impls nameTok.Text (prior @ names)
-                | None -> ()
-            elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
-    root.Children |> List.iter preScan
-
     // Type abbreviations, all of them, before any signature is read. In an
     // `and` group the abbreviation can come AFTER the interface that uses it
     // — `IVisitor` takes an `aval<'T>` three lines above `and aval<'T> =
@@ -4019,6 +4028,43 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | _ -> ()
             elif n.NodeKind = ModuleDef then n.Children |> List.iter preScanAliases
     root.Children |> List.iter preScanAliases
+
+    // Which interfaces each type implements has to be known BEFORE any
+    // body is checked: a type's own members may narrow to it (`:? HashSet`
+    // from a `seq`), and that test needs the subtype relation already.
+    let rec preScan (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            if n.NodeKind = TypeDecl then
+                match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some nameTok ->
+                    let rec ifaceOf (ty : GreenNode) : string option =
+                        match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                        | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                        | _ ->
+                            Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                            |> Option.map (fun t -> t.Text)
+                    let names =
+                        nodesOf n
+                        |> List.filter (fun m -> m.NodeKind = InterfaceImpl)
+                        |> List.choose (fun m ->
+                            nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) |> Option.bind ifaceOf)
+                    // `interface aval<'b> with` implements IAdaptiveValue.
+                    // Recorded under the abbreviation's own name, no argument
+                    // would ever widen into the interface it stands for.
+                    let names =
+                        names |> List.map (fun nm ->
+                            match dictTryFind aliases nm with
+                            | Some (_, body) ->
+                                (match prune body with TCon (t, _) -> t | _ -> nm)
+                            | None -> nm)
+                    if not (List.isEmpty names) then
+                        let prior = match dictTryFind impls nameTok.Text with Some l -> l | None -> []
+                        dictSet impls nameTok.Text (prior @ names)
+                | None -> ()
+            elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
+    root.Children |> List.iter preScan
 
     // classes before instances, both before any body: the `= 'a` shorthand
     // in a superclass constraint names the class' only associated type, so

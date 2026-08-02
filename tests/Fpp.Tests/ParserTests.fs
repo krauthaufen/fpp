@@ -279,3 +279,4 @@ let parserSelfTests =
                 Expect.isEmpty r.Diagnostics (sprintf "diagnostics in %s" f)
         }
     ]
+
