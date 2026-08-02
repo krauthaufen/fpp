@@ -1481,3 +1481,47 @@ let structTuplePayloadTests =
             Expect.isNonEmpty (ws.Diagnostics "prog.fpp") "a reference-tuple pattern does not take a struct apart"
         }
     ]
+
+[<Tests>]
+let genericValueTests =
+    testList "an explicitly generic value is generic" [
+        test "two instantiations of one value binding" {
+            // The value restriction exists to withhold generality from a
+            // binding that made no promise. `let empty<'k, 'v> : Mp<'k, 'v>`
+            // makes exactly that promise, so it keeps it — F# reads it the
+            // same way and calls the result a generic value.
+            //
+            // Without this every use shared ONE type, which is how a map
+            // bound empty before a loop became tied to the map the loop read
+            // from: storing a pair into it asked `'T` to become `'T * 'T`,
+            // and that surfaced as an occurs check on the TUPLE, a long way
+            // from the binding responsible.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Mp<'k, 'v>(n : int) ="
+                    "    member x.N = n"
+                    "    static member Empty : Mp<'k, 'v> = Mp<'k, 'v>(0)"
+                    "module Mp ="
+                    "    let empty<'k, 'v> : Mp<'k, 'v> = Mp<'k, 'v>.Empty"
+                    "let a : Mp<int, string> = Mp.empty"
+                    "let b : Mp<bool, int> = Mp.empty"
+                    "let go = printfn \"%d %d\" a.N b.N"
+                    "" ])
+            Expect.equal out "0 0\n" "the two uses do not share a type"
+        }
+        test "a binding with no declared parameters still does not generalize" {
+            // the restriction still applies where nothing was promised:
+            // `let cell = ResizeArray<int>()` is one array, not one per use
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let cell = ResizeArray<int>()"
+                    "let go ="
+                    "    cell.Add 1"
+                    "    cell.Add 2"
+                    "    printfn \"%d\" cell.Count"
+                    "" ])
+            Expect.equal out "2\n" "one cell, shared"
+        }
+    ]

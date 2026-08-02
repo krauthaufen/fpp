@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-627 tests
+629 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1596666 bytes, byte-identical
+self-host fixpoint 1596822 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -202,17 +202,24 @@ stays an error, and it is one for the first time: the mismatch was being
 computed and then DISCARDED, so the binding compiled and trapped, which is
 the worst of the three outcomes available.
 
-The frontier has moved **8155 → 8766**. `MapExt.fs` and `IndexList.fs` up to
+The frontier has moved **8155 → 8840**. `MapExt.fs` and `IndexList.fs` up to
 that line type check whole, and IndexList's diagnostics are down from 60 to
 14.
 
-What stops it there is an occurs check — `the type 'a * 'a would contain
-itself` on a tuple of two pattern binders inside a loop, in `Pairwise` and
-`PairwiseV`. It is banked as `tests/known-issues/tuple-value-occurs-check.fpp`
-with what has been ruled out. It is the only open bug in that directory that
-resists reduction: dropping the loop, the outer match or the `let mutable x =
-x` shadowing makes it disappear or turn into an honest mismatch, so the
-trigger needs the whole shape and the file is the size it is on purpose.
+**An explicitly generic value is generic.** The value restriction exists to
+withhold generality from a binding that made no promise; `let empty<'k, 'v> :
+MapExt<'k, 'v> = ...` makes exactly that promise, and F# reads it the same
+way. Without the exemption every use of `MapExt.empty` shared ONE type, so a
+map bound empty before a loop was tied to the map the loop read from, and
+storing a pair into it asked `'T` to become `'T * 'T`.
+
+That is worth remembering for its SHAPE: it surfaced as an occurs check on a
+tuple expression, in a member, several lines from the binding responsible —
+and reducing it made it vanish, because every ingredient except the shared
+`empty` was incidental. The cause was two files away, in a `let` with no
+loop, no tuple and no pattern in it.
+
+With it, `IndexList.fs` goes from 14 diagnostics to **2**, both on one line.
 
 Then, still measured:
 
@@ -293,3 +300,22 @@ intuitions that earned it. Two things worth repeating:
 Throughput, measured over this session: a feature plus its gate run is about
 twelve minutes, so four or five an hour, and that is the ceiling worth
 planning around.
+
+## The last two diagnostics in IndexList
+
+Both are on `res <- MapExt.add i0 (v0, initial) res` in `PairwiseCyclicV`,
+which stores `struct(v0, v1)` in its loop and `(v0, initial)` after it, into
+the same map. That is verbatim library code and F# accepts it: a
+parenthesised tuple BUILDS a struct tuple when a struct tuple is what the
+context asks for — the mirror of the pattern rule, measured the same way.
+
+It does not fall out of the plumbing the pattern rule uses, and it is worth
+knowing why before anyone tries. The expectation has to reach the tuple from
+a LATER argument: in `add i0 (v0, initial) res` the parameter's type is still
+a variable when the tuple is typed, and only the third argument says it is a
+struct. By then the tuple has committed to being a reference tuple, and the
+mismatch is reported against it.
+
+So this one wants the application checked against an expected result type,
+or the tuple's shape parked until the call is solved. Both are real changes
+to how applications are typed; neither is a marker channel.

@@ -971,6 +971,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// same pattern in a `let`.
     let mutable patExpect : Type option = None
 
+
     let mutable letDepth = 0
 
     /// The enclosing binding's named type variables ('K of the member or
@@ -2861,8 +2862,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | ListExpr | ArrayExpr | TupleExpr | StructTupleExpr | ParenExpr ->
                         m.Children |> List.forall nonExpansive
                     | _ -> false
+            // EXPLICIT type parameters exempt a binding from the value
+            // restriction. `let empty<'k, 'v> : Mp<'k, 'v> = ...` names what
+            // it is generic in, which is exactly the promise the restriction
+            // exists to withhold from a binding that made no such promise —
+            // F# reads it the same way and calls the result a generic value.
+            //
+            // Without this every use of `MapExt.empty` shared ONE type, so a
+            // map bound empty before a loop was tied to the map the loop read
+            // from, and storing a pair into it asked `'T` to become `'T * 'T`.
+            // That surfaced as an occurs check on the tuple, a long way from
+            // the binding that caused it.
+            let declaresTyParams =
+                vecToList before
+                |> List.exists (fun c ->
+                    match c with
+                    | GNode t -> t.NodeKind = TyParams
+                    | _ -> false)
             let expansiveValue =
                 paramPats.IsEmpty
+                && not declaresTyParams
                 && (let body =
                         match vecToList after, hasIn with
                         | b :: _, true -> Some b
