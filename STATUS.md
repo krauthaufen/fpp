@@ -568,6 +568,21 @@ gates:
      4  Index vs int
     ...
 
+### The next cause, diagnosed but not fixed
+
+The occurs-check family traces to STATIC members of generic classes sharing
+the class's type-parameter objects. `ToASetReader<'Key, 'Value>` has a
+`static member DeltaMapping`; its lambda's `oldState : HashMap<'Key, 'Value>`
+hovers as `HashMap<'a, HashSet<'b>>` — some OTHER site's use of a static on
+this class unified the class-level 'Value with its own HashSet, permanently,
+and every later use at a different element type hits the occurs check. The
+same signature shows in `CountingHashSet.trace` hovering as
+`Traceable<CountingHashSet<'a>, HashSetDelta<'b>>` — 'a and 'b UNRELATED
+where the declaration ties them. A static has no receiver to supply the
+class parameters, so whether its scheme quantifies them decides everything;
+the paths disagree. Diagnose with hovers before touching: the pin that
+looks wrong may be three uses away.
+
 ## Compiling is not the same as running
 
 The port has only ever been INFERRED. Lowering and emission are a separate
