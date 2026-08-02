@@ -1312,7 +1312,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
                   | None -> ())
                  TCon (sn, args)
-             | None -> TTuple (elems |> List.map (patType pvars)))
+             | None ->
+                 // a tuple matched against a TUPLE passes each element's
+                 // expected type down: `| ValueSome(_, l), ValueNone ->`
+                 // needs the left element to know its payload is a struct
+                 let elemWant =
+                     match want with
+                     | Some w ->
+                         (match prune w with
+                          | TTuple ts when List.length ts = List.length elems -> ts
+                          | _ -> [])
+                     | None -> []
+                 if List.isEmpty elemWant then
+                     TTuple (elems |> List.map (patType pvars))
+                 else
+                     TTuple (List.map2
+                                 (fun (e : GreenNode) (w : Type) ->
+                                     patExpect <- Some w
+                                     let t = patType pvars e
+                                     patExpect <- None
+                                     t)
+                                 elems elemWant))
         | StructTuplePat ->
             // the same generic struct the `struct(a, b)` expression builds
             let rec unwrap (m : GreenNode) =
@@ -1358,10 +1378,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             patExpect <- None
             let items = vecNew<Type> ()
             let kids = n.Children
+            // a tuple matched against a TUPLE passes each element's expected
+            // type down: `| ValueSome(_, l), ValueNone ->` needs the left
+            // element to know its payload is a struct tuple
+            let elemWant =
+                match want with
+                | Some w ->
+                    (match prune w with
+                     | TTuple ts -> ts
+                     | _ -> [])
+                | None -> []
+            let mutable elemIx = 0
             let rec walk (ks : Green list) =
                 match ks with
                 | GNode p :: rest when isPatKind p.NodeKind ->
+                    (if elemIx < List.length elemWant then
+                        patExpect <- Some (List.item elemIx elemWant))
+                    elemIx <- elemIx + 1
                     let ty = patType pvars p
+                    patExpect <- None
                     (match rest with
                      | GToken c :: GNode a :: rest2 when c.Text = ":" && isTypeKind a.NodeKind ->
                          unify ty (typeFromNode pvars a) |> ignore

@@ -1686,3 +1686,29 @@ let byrefReadTests =
             Expect.equal out "6\n6\n" "a byref forwarded into a byref member"
         }
     ]
+
+[<Tests>]
+let nestedStructPayloadTests =
+    testList "a struct payload inside a tuple pattern" [
+        test "a clause matching a tuple of cases" {
+            // The scrutinee is a tuple, so the expectation has to reach the
+            // ELEMENTS of the clause's pattern before each case can know its
+            // payload is a struct. Lowering then binds each payload whole
+            // and reads its fields out, at whatever depth the case sits.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let pick (l : voption<struct(int * string)>) (r : voption<struct(int * string)>) ="
+                    "    match l, r with"
+                    "    | ValueNone, ValueNone -> \"none\""
+                    "    | ValueSome (_, a), ValueNone -> \"left \" + a"
+                    "    | ValueNone, ValueSome (_, b) -> \"right \" + b"
+                    "    | ValueSome (_, a), ValueSome (_, b) -> a + b"
+                    "let go ="
+                    "    printfn \"%s\" (pick ValueNone ValueNone)"
+                    "    printfn \"%s\" (pick (ValueSome (struct(1, \"x\"))) ValueNone)"
+                    "    printfn \"%s\" (pick (ValueSome (struct(1, \"x\"))) (ValueSome (struct(2, \"y\"))))"
+                    "" ])
+            Expect.equal out "none\nleft x\nxy\n" "each element destructures its own payload"
+        }
+    ]

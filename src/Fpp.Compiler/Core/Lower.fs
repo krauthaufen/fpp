@@ -520,6 +520,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> None)
             | [] -> None
 
+    /// Does this pattern destructure a struct-tuple payload, at the top or
+    /// inside a tuple of cases? Its own recursive binding rather than a
+    /// `let rec ... and` group with `structPayloadOf`: putting the two in
+    /// one group broke the SELF-HOST while leaving the .NET build and every
+    /// test green, and the nested path was never even reached.
+    let rec hasStructPayload (p : GreenNode) : bool =
+        (structPayloadOf p).IsSome
+        || (p.NodeKind = TuplePat
+            && (nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) |> List.exists hasStructPayload))
+
     let structSlots (p : GreenNode) : (VarId * Scheme) option list =
         let rec unwrap (m : GreenNode) =
             if m.NodeKind = ParenPat || m.NodeKind = TuplePat then
@@ -1632,8 +1642,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             // scrutinee and marked it — so the case binds the
                             // payload whole and its fields are read out into
                             // the binders, the way `struct(a, b)` is.
-                            | [ p ] when (structPayloadOf p).IsSome ->
-                                let inner = (structPayloadOf p).Value
+                            | [ p ] when hasStructPayload p ->
+                                let inner =
+                                    match structPayloadOf p with
+                                    | Some i -> i
+                                    | None -> p
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf inner) with
                                     | Some o -> o
@@ -1646,8 +1659,44 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                           |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                                     | Some d -> d.Name, schemeOf d
                                     | None -> "?", mono (TCon ("?", []))
-                                PCtor (ctorName, ctorSch, [ PVar (tmp, sch) ]),
-                                structLetExpr binders tn (EVar (tmp, sch)) body
+                                if (structPayloadOf p).IsSome then
+                                    PCtor (ctorName, ctorSch, [ PVar (tmp, sch) ]),
+                                    structLetExpr binders tn (EVar (tmp, sch)) body
+                                else
+                                    // the case sits inside a TUPLE pattern —
+                                    // a clause may match a tuple of them —
+                                    // so each marked payload binds whole and
+                                    // its fields are read out in turn
+                                    let wraps = vecNew<GreenNode * VarId * Scheme * string> ()
+                                    let rec fix (q : GreenNode) : Pat =
+                                        match structPayloadOf q with
+                                        | Some inr ->
+                                            let tn2 =
+                                                match dictTryFind fieldOwners (offsetOf inr) with
+                                                | Some o -> o
+                                                | None -> "StructTuple" + string (List.length (structSlots inr))
+                                            let tmp2 = { Path = path; Offset = offsetOf inr + 4200000; Name = "_cp" }
+                                            let sch2 = mono (TCon (tn2, []))
+                                            vecAdd wraps (inr, tmp2, sch2, tn2)
+                                            let cn, cs =
+                                                match nodesOf q |> List.tryHead |> Option.bind patHeadToken
+                                                      |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                                                | Some d -> d.Name, schemeOf d
+                                                | None -> "?", mono (TCon ("?", []))
+                                            PCtor (cn, cs, [ PVar (tmp2, sch2) ])
+                                        | None ->
+                                            if q.NodeKind = TuplePat then
+                                                PTuple (nodesOf q |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map fix)
+                                            else lowerPat q
+                                    let pat2 = fix p
+                                    let body2 =
+                                        vecToList wraps
+                                        |> List.rev
+                                        |> List.fold
+                                            (fun acc (inr, tmp2, sch2, tn2) ->
+                                                structLetExpr (structSlots inr) tn2 (EVar (tmp2, sch2)) acc)
+                                            body
+                                    pat2, body2
                             | [ p ] when p.NodeKind = StructTuplePat ->
                                 // `| struct(a, b) ->`: bind the whole value,
                                 // then read its fields into the binders

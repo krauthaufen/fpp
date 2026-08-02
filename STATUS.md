@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-636 tests
+637 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1603142 bytes, byte-identical
+self-host fixpoint 1605612 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -365,6 +365,30 @@ They passed a hand-built `{ Contents = 0 }` as a byref argument and read
 only be made with `&`. They now say `let mutable cell = 0`, `&cell` and
 `cell`.
 
+## A struct payload inside a tuple pattern
+
+`| ValueSome(_, l), ValueNone ->` matches a TUPLE, so the expectation has to
+reach the ELEMENTS of the clause's pattern before either case can know its
+payload is a struct. Lowering then binds each payload whole and reads its
+fields out, at whatever depth the case sits.
+
+**And a self-host trap that cost an hour.** The lowering half was written as
+a `let rec hasStructPayload ... and structPayloadOf ...` group. Every test
+passed, the .NET build was clean, and the CORPUS gate died with an
+`unreachable` deep inside an unrelated lambda. Bisecting showed the nested
+branch was never reached during the failing compile — it was the SHAPE, not
+the logic. Splitting the group into two ordinary bindings fixed it with no
+other change. Banked as
+`tests/known-issues/let-rec-and-group-self-host.fpp`, which is honest that
+it does not reproduce in isolation.
+
+That is the gate earning its keep again: 637 tests and a clean .NET build
+said yes, and the compiler could not compile itself.
+
 ## Where it stops now
 
-Line 11023, one diagnostic: `StructTuple2<'a, 'b> vs 'a * Index`.
+Line 11023, one diagnostic: `StructTuple2<'a, 'b> vs 'a * Index`, on the
+call to `MapExt.changeWithNeighboursV` whose lambda takes three
+`voption<struct('Key * 'Value)>` parameters. The clause patterns inside it
+are handled now; what is left is the lambda's own parameter types against
+the function's declared ones.
