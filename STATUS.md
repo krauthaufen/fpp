@@ -421,7 +421,35 @@ first one.
 
 The frontier is **11741** — everything through `Core/Core.fs`.
 
-## Where it stops now
+## Where it stops now, and why it is a different KIND of blocker
 
-`Core/Transaction.fs`, one diagnostic: `no constructor of HashSet accepts
-these arguments` at line 11898.
+`Core/Core.fs` line 289 writes
+
+```fsharp
+let set = HashSet<WeakReference<IAdaptiveObject>>()
+set.Add r |> ignore
+```
+
+and that is `System.Collections.Generic.HashSet` — the file opens that
+namespace LAST, so F#'s temporal shadowing puts the .NET type over the
+library's own. F++ calls the mutable one `MutableHashSet` precisely because
+it cannot have two types of one name (DIVERGENCES.md), and the port's
+concatenation destroys the namespaces that would have told them apart.
+
+**This was attempted and reverted.** A harness rule rewriting `HashSet<` to
+`MutableHashSet<` in files whose last relevant open is the .NET one needs
+two exceptions immediately — a file that opens `FSharp.Data.Adaptive`
+afterwards, and one that DECLARES the name (`HashCollections.fs`, 77 uses,
+all its own) — and even then it moved the frontier BACKWARDS, from 11741 to
+10364, by breaking `Deltas.fs`. Each exception is a guess about which
+`HashSet` a file means, which is exactly the question real name resolution
+answers.
+
+So this one is not a naming patch. It wants **types identified by more than
+their bare name** — the same root as the `MutableHashSet` divergence and as
+"a user type whose name matches a prelude type MERGES with it". Two types
+called `Thing` in one file merge today; that is what has to change, and it
+reaches the backend, which names every type by a string.
+
+Everything before it is clean: the frontier is **11741 of 22,635**, every
+file through `Core/Core.fs`.
