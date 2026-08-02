@@ -3042,6 +3042,56 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      dictSet ctors name (prior @ [ nameTok.Offset, sch ])
                  | _ -> ())
             | _ -> ()
+        // A type that declares `CompareTo` IS ordered, and knows it as soon
+        // as the declaration is finished — a body typed later asks for the
+        // instance, and asking is the only chance it gets.
+        //
+        // F#'s `'a : comparison` is satisfied by IComparable, and
+        // `Ordered<'a>` is how that constraint is spelled here, so a library
+        // implementing comparison the .NET way must not also have to declare
+        // an instance it never wrote. The member lifts to a function of the
+        // receiver and the argument, which is exactly `compare`'s shape, so
+        // the instance points straight at it and no code is synthesized.
+        deriveOrdered name
+
+    and deriveOrdered (tn : string) : unit =
+        match dictTryFind fields (tn + ".CompareTo") with
+        | Some fi when fi.DefKey.IsSome && not fi.IsStatic ->
+            let already =
+                Classes.instancesOf classes "Ordered"
+                |> List.exists (fun i ->
+                    match i.Head with
+                    | [ h ] -> (match prune h with TCon (n, _) -> n = tn | _ -> false)
+                    | _ -> false)
+            // one argument of the type itself, answering an int: anything
+            // else is some other CompareTo and none of our business
+            let shapeOk =
+                match prune fi.FieldType with
+                | TFun (a, r) ->
+                    (match prune r with TCon ("int", []) -> true | _ -> false)
+                    && (match prune a with TCon (n, _) -> n = tn | _ -> false)
+                | _ -> false
+            if not already && shapeOk then
+                let path, off = fi.DefKey.Value
+                Classes.addInstance classes
+                    { Class = "Ordered"
+                      Params = fi.Params
+                      Head = [ TCon (tn, fi.Params |> List.map TVar) ]
+                      Assoc = []
+                      Context = []
+                      Members =
+                        [ "compare",
+                          // named for the CLASS member, not the type's: a
+                          // VarId is identified by path and offset, and the
+                          // name is what tells lowering this is a comparison
+                          // — `a < b` becomes `compare a b < 0` only for a
+                          // member called `compare`
+                          { MPath = path; MOffset = off; MName = "compare"
+                            MTakesUnit = false; MInst = [] } ]
+                      Builtin = false
+                      Path = path
+                      Offset = off }
+        | _ -> ()
 
     and inferMember (tyName : string) (tyVars : Dict<string, Type>) (classParams : Var list) (selfTy : Type) (n : GreenNode) : unit =
         // member scope: the class type variables plus the member's own
@@ -3469,6 +3519,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     predeclareAndGroups root.Children
     for c in root.Children do inferDecl c
+
     solveWanted ()
 
     // Numeric defaulting, as F# does it: a constraint nothing in the program

@@ -1394,3 +1394,53 @@ let overloadTrialTests =
             Expect.equal out "7 7\n" "both overloads reachable from one body"
         }
     ]
+
+[<Tests>]
+let derivedOrderingTests =
+    testList "a type that declares CompareTo is ordered" [
+        test "comparison, sorting and the operators all reach it" {
+            // F#'s `'a : comparison` is satisfied by IComparable, and
+            // `Ordered<'a>` is how that constraint is spelled here — so a
+            // library implementing comparison the .NET way must not also
+            // have to declare an instance it never wrote. The member lifts
+            // to a function of the receiver and the argument, which is
+            // exactly `compare`'s shape, so nothing is synthesized.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Version(major : int, minor : int) ="
+                    "    member x.Major = major"
+                    "    member x.Minor = minor"
+                    "    member x.CompareTo (o : Version) ="
+                    "        if major <> o.Major then compare major o.Major"
+                    "        else compare minor o.Minor"
+                    "    interface IComparable<Version> with"
+                    "        member x.CompareTo (o : Version) = x.CompareTo o"
+                    "let go ="
+                    "    let a = Version(1, 2)"
+                    "    let b = Version(1, 9)"
+                    "    printfn \"%b %b\" (a < b) (b < a)"
+                    "    printfn \"%d\" (compare a b)"
+                    "    printfn \"%d\" (List.head (List.sort [ b; a ])).Minor"
+                    "" ])
+            // `a < b` is `compare a b < 0`, which only happens for a member
+            // the instance calls `compare` — naming it after the TYPE's
+            // member left the raw int standing in for the boolean, and both
+            // comparisons came out true
+            Expect.equal out "true false\n-1\n2\n" "the operators wrap the comparison"
+        }
+        test "an explicit instance still wins over the derived one" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type V(n : int) ="
+                    "    member x.N = n"
+                    "    member x.CompareTo (o : V) = compare n o.N"
+                    // reversed on purpose: if this is ignored, the sort flips
+                    "instance Ordered<V>"
+                    "    static compare (a : V) (b : V) = compare b.N a.N"
+                    "let go = printfn \"%d\" (List.head (List.sort [ V 1; V 9 ])).N"
+                    "" ])
+            Expect.equal out "9\n" "what the program declares beats what it implies"
+        }
+    ]

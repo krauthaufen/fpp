@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-623 tests
+625 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1591622 bytes, byte-identical
+self-host fixpoint 1593266 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -171,19 +171,37 @@ Two rules survive as second and third word, and both are F#'s: widening gets
 a second chance when nothing fits exactly (`Equals : obj -> bool` takes
 anything once obj widens), and declaration order breaks a genuine ambiguity.
 
-The frontier has moved **8155 → 8439**. `MapExt.fs` and `IndexList.fs` up to
-that line type check whole for the first time, and IndexList's diagnostics
-are down from 60 to 37.
+**A type that declares `CompareTo` is ordered**, decided by the compiler
+rather than by a shim. F#'s `'a : comparison` is satisfied by IComparable and
+`Ordered<'a>` is how that constraint is spelled here, so a library
+implementing comparison the .NET way must not also have to declare an
+instance it never wrote — the goal is the library compiling with its
+REFLECTION replaced and nothing else. The member lifts to a function of the
+receiver and the argument, which is exactly `compare`'s shape, so the
+instance points straight at it and no code is synthesized. An explicit
+instance still wins.
 
-The two that head the remaining 37:
+Two things that cost a debug cycle each and are worth knowing: the instance
+has to exist by the time the DECLARATION finishes, because a body typed
+later asks for it and asking is the only chance it gets; and its member must
+be named `compare`, not `CompareTo`, because that name is also what tells
+lowering to wrap the result — `a < b` is `compare a b < 0` only for a member
+by that name, and without it the raw int stood in for the boolean and both
+directions came out true.
 
-* **`no instance Ordered<Index>`** at 8439. `Index` carries a custom
-  comparison in F#, and `'Key : comparison` maps onto `Ordered<'a>` here, so
-  the port owes an instance. Shim work, not compiler work.
-* **`StructTuple2<Index, 'a> vs 'a * 'b`** at 8454. `ValueSome (id, _)`
-  destructuring a struct-tuple payload — and F# ALLOWS a plain tuple pattern
-  there while rejecting it in a `let`, which was measured, so the fix is that
-  narrow.
+The frontier has moved **8155 → 8454**. `MapExt.fs` and `IndexList.fs` up to
+that line type check whole, and IndexList's diagnostics are down from 60 to
+34.
+
+What heads the remaining 34 is now one thing, not several:
+
+* **`StructTuple2<Index, 'a> vs 'a * 'b`**. `ValueSome (id, _)` destructuring
+  a struct-tuple payload. Measured against F#: it ALLOWS a plain tuple
+  pattern inside a union case's payload and REJECTS it in a `let`
+  ("One tuple type is a struct tuple, the other is a reference tuple"), so
+  the fix is exactly that narrow. It needs the scrutinee's type when the
+  pattern is typed, which is the same bidirectional plumbing the member
+  demand already uses.
 
 Then, still measured:
 
