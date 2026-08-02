@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-637 tests
+638 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1605612 bytes, byte-identical
+self-host fixpoint 1606039 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -385,10 +385,27 @@ it does not reproduce in isolation.
 That is the gate earning its keep again: 637 tests and a clean .NET build
 said yes, and the compiler could not compile itself.
 
+## A lambda's parameters are tied before its body
+
+The last of the struct-tuple chain. A lambda's parameters were fresh
+variables while its body was typed, so `(fun left self right -> match left,
+right with | ValueSome(_, l), ...)` had nothing to read the struct-ness
+from. The expected type reaches the parameters first now, and
+`PriorityQueue.fs` is clean.
+
+The frontier is **11177** — every file through `Utilities/PriorityQueue.fs`
+type checks whole.
+
 ## Where it stops now
 
-Line 11023, one diagnostic: `StructTuple2<'a, 'b> vs 'a * Index`, on the
-call to `MapExt.changeWithNeighboursV` whose lambda takes three
-`voption<struct('Key * 'Value)>` parameters. The clause patterns inside it
-are handled now; what is left is the lambda's own parameter types against
-the function's declared ones.
+`Utilities/Cache.fs`, two diagnostics, and both are new KINDS of gap rather
+than more of the same:
+
+* **block comments inside an array literal.** `[| (* prime no. *) 7 ... |]`
+  reports `int vs int -> 'a`, which is what `(*)` applied to `7` would say —
+  so the comment is being read as a multiplication section somewhere the
+  lexer's block-comment rule does not reach.
+* **object initializers.** `new TransactQueueEntry<_>(Hash = h, Slot = s,
+  ...)` sets properties in a constructor call; the `Prop = v` pairs are being
+  read as equality comparisons, which is why the type comes out as a tuple of
+  bools.

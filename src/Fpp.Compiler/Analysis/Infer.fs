@@ -2296,6 +2296,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let pats = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
                 let lvars = dictNew<string, Type> ()
                 let paramTys = pats |> List.map (patType lvars)
+                // Tie the parameters to what the context asks for BEFORE the
+                // body is typed. Otherwise they are still variables while it
+                // runs, and a pattern inside it cannot tell a struct tuple
+                // from a reference one — which is what `(fun left self right
+                // -> match left, right with | ValueSome(_, l), ...)` needs.
+                (match expected with
+                 | Some w ->
+                     let rec tie (ps : Type list) (t : Type) =
+                         match ps, prune t with
+                         | p :: rest, TFun (dom, res) ->
+                             unify p dom |> ignore
+                             tie rest res
+                         | _ -> ()
+                     tie paramTys w
+                 | None -> ())
                 let body =
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
                     |> List.map (fun m -> exprType (GNode m))

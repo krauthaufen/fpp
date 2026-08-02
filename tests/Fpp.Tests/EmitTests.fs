@@ -1712,3 +1712,30 @@ let nestedStructPayloadTests =
             Expect.equal out "none\nleft x\nxy\n" "each element destructures its own payload"
         }
     ]
+
+[<Tests>]
+let lambdaParameterTests =
+    testList "a lambda's parameters are tied before its body" [
+        test "a pattern inside the body can tell a struct tuple apart" {
+            // Otherwise the parameters are still variables while the body is
+            // typed, and `match left, right with | ValueSome(_, l), ...` has
+            // nothing to read the struct-ness from.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let apply (f : voption<struct(int * string)> -> voption<struct(int * string)> -> string)"
+                    "          (l : voption<struct(int * string)>) (r : voption<struct(int * string)>) = f l r"
+                    "let go ="
+                    "    let describe ="
+                    "        apply (fun left right ->"
+                    "            match left, right with"
+                    "            | ValueNone, ValueNone -> \"none\""
+                    "            | ValueSome (_, a), ValueNone -> \"left \" + a"
+                    "            | ValueNone, ValueSome (_, b) -> \"right \" + b"
+                    "            | ValueSome (_, a), ValueSome (_, b) -> a + b)"
+                    "    printfn \"%s\" (describe (ValueSome (struct(1, \"x\"))) ValueNone)"
+                    "    printfn \"%s\" (describe ValueNone ValueNone)"
+                    "" ])
+            Expect.equal out "left x\nnone\n" "the expected type reaches the parameters first"
+        }
+    ]
