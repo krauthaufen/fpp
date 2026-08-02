@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 653 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 654 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -46,6 +46,21 @@ Three details that will bite:
   F++-inferable with NOTHING resolved — no prelude, no union cases. That is
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
+
+## An application types its argument ONCE
+
+The member path takes a `dotDemand` before typing the head, and that needs the
+argument's type. It used to type the argument again in the argument loop, so
+every member application did the work twice. A computation expression nests
+once per `yield` and each level's argument IS the whole remaining tail, so it
+doubled per level: eight yields took 8 s, and the adaptive port's own CE test
+module never finished inferring. The demand's result is kept and reused —
+eight yields now take 34 ms, thirty-two take 180 ms.
+
+Do not "fix" this by taking the demand only for overloaded members. That was
+tried: it scales the same and breaks the OUT-PARAMETER view, which is built
+from the demand too (`real.TryGetTarget()` stops typing). The duplication was
+the bug, not the demand.
 
 ## Measure, do not reason
 

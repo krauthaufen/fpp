@@ -2004,10 +2004,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // after the fact is too late — the binding has been
                      // generalized by then, and the member's result comes out
                      // quantified and empty.
+                     // Its result is KEPT. Typing the argument here and again
+                     // in the loop below doubles the work per nesting level,
+                     // and a computation expression nests once per `yield`:
+                     // eight yields took 8 s, thirty-two now take 0.2 s.
+                     // The demand is still taken for EVERY member — it is not
+                     // only about choosing an overload, the out-parameter view
+                     // is built from it too.
+                     let mutable demandArg : (int * Type) option = None
                      (match memberDemandTok head, args |> List.filter (fun a -> isExprish a.NodeKind) with
-                      | Some mt, ([ _ ] as argNodes) ->
+                      | Some mt, ([ only ] as argNodes) ->
                           let argTys = argNodes |> List.map (fun a -> exprType (GNode a))
                           let argTy = match argTys with [ one ] -> one | many -> TTuple many
+                          (match Green.tokens (GNode only) |> List.tryHead with
+                           | Some t -> demandArg <- Some (t.Offset, argTy)
+                           | None -> ())
                           dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()))
                       | _ -> ())
                      let want = expected
@@ -2204,7 +2215,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              (match prune funTy with
                               | TFun (pt, _) -> exprExpect <- Some pt
                               | _ -> exprExpect <- None)
-                             let argTy = exprType (GNode a)
+                             let already =
+                                 match demandArg, Green.tokens (GNode a) |> List.tryHead with
+                                 | Some (o, t), Some at when o = at.Offset -> Some t
+                                 | _ -> None
+                             let argTy =
+                                 match already with
+                                 | Some t -> t
+                                 | None -> exprType (GNode a)
                              exprExpect <- None
                              if firstArg then
                                  firstArgTy <- Some argTy

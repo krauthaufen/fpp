@@ -535,38 +535,19 @@ call, so the rest of the pipeline sees ordinary shapes.
 
 ## Where it stops now
 
-The whole 39-file port — all 21,872 lines — now INFERS in under seven
-seconds, with 297 diagnostics:
-
-     72  AdaptiveHashMap/AdaptiveHashMap.fs
-     69  AdaptiveIndexList/AdaptiveIndexList.fs
-     65  AdaptiveHashSet/AdaptiveHashSet.fs
-     28  CollectionExtensions.fs
-     18  Traceable/CountingHashSet.fs
-     14  AdaptifyHelpers.fs
-     28  spread over five more
+The whole 39-file port — all 21,873 lines, the computation-expression test
+module included — INFERS in 6.4 seconds, with 269 diagnostics. Nothing in it
+is superlinear any more; see CLAUDE.md for the cause, which was one argument
+being typed twice per application.
 
     265  type mismatch
      17  the type HashSet<'a> would contain itself
       7  no constructor accepts these arguments
       8  missing instances (Add, Mul, MinMax, Ordered)
 
-Three of the eight files hold 206 of the 297, and they are the three big
-adaptive collections — one shared cause is likely.
-
-## The one thing that does not finish
-
-`module private Test` in `ComputationExpressions.fs` — 79 lines whose whole
-purpose is to check that the computation expressions compile. One `aset { }`
-with eight `yield!`s, four `for`s and a `let!` does not finish inferring.
-Remove that module and everything else, that file and the two after it
-included, infers in 6.7 s.
-
-So it is the CE itself: desugaring nests `Combine` calls, and every `yield!`
-chooses among the builder's overloads inside that nest. Cost compounds with
-depth. This was twice attributed to `AdaptifyHelpers.fs`, which is innocent —
-the walk that measured it labels each prefix with the file that comes AFTER
-it, and reading that label as the culprit is wrong.
+The three big adaptive collections — AdaptiveHashMap, AdaptiveIndexList,
+AdaptiveHashSet — hold about three quarters of them, which suggests one or
+two shared causes rather than 200 separate ones.
 
 ## Compiling is not the same as running
 

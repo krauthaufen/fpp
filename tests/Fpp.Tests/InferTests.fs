@@ -298,3 +298,43 @@ let sameNameBaseTests =
             Expect.isEmpty (inferSrc src).Diagnostics "clean"
         }
     ]
+
+[<Tests>]
+let ceScalingTests =
+    testList "computation expressions do not blow up" [
+        test "cost is linear in the number of yields, not exponential" {
+            // A CE nests once per `yield`, and the member application used to
+            // type its argument TWICE — once to hand the member a demand,
+            // once in the argument loop. That doubles per level: eight yields
+            // took 8 s and the library's own CE test module never finished.
+            // The demand's result is now kept and reused.
+            let src (n : int) =
+                String.concat "\n" ([
+                    "module M"
+                    "type B() ="
+                    "    member _.Yield (x : int) = [ x ]"
+                    "    member _.YieldFrom (xs : list<int>) = xs"
+                    "    member _.YieldFrom (xs : int[]) = List.ofArray xs"
+                    "    member _.Combine (a : list<int>, b : list<int>) = a @ b"
+                    "    member _.Delay (f : unit -> list<int>) = f ()"
+                    "    member _.Zero () = ([] : list<int>)"
+                    "let b = B()"
+                    "let go ="
+                    "    let r ="
+                    "        b {" ]
+                    @ [ for i in 1 .. n -> "            yield! ([ " + string i + " ] : list<int>)" ]
+                    @ [ "        }"; "    printfn \"%d\" r.Length"; "" ])
+            let time (n : int) =
+                let sw = System.Diagnostics.Stopwatch.StartNew()
+                let r = inferSrc (src n)
+                Expect.isEmpty r.Diagnostics "clean"
+                sw.ElapsedMilliseconds
+            time 4 |> ignore                       // warm
+            let small = max 1L (time 8)
+            let big = time 24
+            // exponential would be ~2^16 times slower; anything near linear
+            // stays far inside this
+            Expect.isTrue (big < small * 40L)
+                (sprintf "8 yields %dms, 24 yields %dms — superlinear" small big)
+        }
+    ]
