@@ -1525,3 +1525,52 @@ let genericValueTests =
             Expect.equal out "2\n" "one cell, shared"
         }
     ]
+
+[<Tests>]
+let structTupleExpressionTests =
+    testList "a paren tuple builds the struct it is asked for" [
+        test "both spellings store into one map" {
+            // The mirror of the pattern rule, measured the same way: F#
+            // builds a STRUCT tuple from `(a, b)` when a struct tuple is
+            // what the context asks for. FSharp.Data.Adaptive relies on it —
+            // `PairwiseCyclicV` writes `struct(v0, v1)` in its loop and
+            // `(v0, initial)` after it, into the same map.
+            //
+            // The expectation has to reach the tuple from a LATER argument:
+            // in `add k (a, b) m` the parameter is still a variable when the
+            // tuple is typed, and only `m` says it is a struct. So the
+            // application ties its RESULT to the context first — but only
+            // when an argument is a tuple literal, and only if the tie
+            // cannot itself fail.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Mp<'k, 'v>(n : int) ="
+                    "    member x.N = n"
+                    "module Mp ="
+                    "    let empty<'k, 'v> : Mp<'k, 'v> = Mp<'k, 'v>(0)"
+                    "    let add (k : 'k) (v : 'v) (m : Mp<'k, 'v>) : Mp<'k, 'v> = Mp<'k, 'v>(m.N + 1)"
+                    "let go ="
+                    "    let mutable m : Mp<int, struct(int * int)> = Mp.empty"
+                    "    m <- Mp.add 1 struct(2, 3) m"
+                    "    m <- Mp.add 2 (4, 5) m"
+                    "    printfn \"%d\" m.N"
+                    "" ])
+            Expect.equal out "2\n" "the paren form reached the same map"
+        }
+        test "an expectation does not leak into a nested expression" {
+            // it reached a constructor inside `ValueSome struct(v, C(...))`
+            // and tied its result to the tuple. Consumed once, by whichever
+            // node is being typed.
+            let ws = Workspace()
+            ws.SetFileText "prog.fpp" (String.concat "\n" [
+                "module M"
+                "type C<'k, 'v>(n : int) ="
+                "    member x.N = n"
+                "let wrap (v : 'k) (n : int) : voption<struct('k * C<'k, 'v>)> ="
+                "    ValueSome struct(v, C<'k, 'v>(n))"
+                "let go = printfn \"%d\" (match wrap 1 5 with ValueSome (_, c) -> c.N | ValueNone -> 0)"
+                "" ])
+            Expect.isEmpty (ws.Diagnostics "prog.fpp") "the constructor keeps its own result type"
+        }
+    ]

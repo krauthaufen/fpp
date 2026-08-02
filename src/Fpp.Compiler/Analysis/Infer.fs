@@ -971,6 +971,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// same pattern in a `let`.
     let mutable patExpect : Type option = None
 
+    /// What the expression about to be typed is expected to BE. Consumed by
+    /// whoever reads it, so nothing inherits it by accident.
+    ///
+    /// One question needs it, and it is the mirror of the pattern one:
+    /// `(a, b)` builds a REFERENCE tuple unless a struct tuple is what the
+    /// context asks for. F# reads it the same way, and the library relies on
+    /// it — `PairwiseCyclicV` stores `struct(v0, v1)` in its loop and
+    /// `(v0, initial)` after it, into the same map.
+    let mutable exprExpect : Type option = None
+
 
     let mutable letDepth = 0
 
@@ -1424,6 +1434,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         t
 
     and exprTypeOf (g : Green) : Type =
+        // Consumed HERE, once, by whichever node is about to be typed. An
+        // expectation left standing leaks into a NESTED expression — it
+        // reached a constructor inside `ValueSome struct(v, HashMap(...))`
+        // and tied its result to the tuple. Only the nodes that deliberately
+        // pass it on set it again.
+        let expected = exprExpect
+        exprExpect <- None
+        ignore expected
         match g with
         | GToken _ -> st.Fresh ()
         | GNode n ->
@@ -1704,8 +1722,43 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let argTy = match argTys with [ one ] -> one | many -> TTuple many
                           dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()))
                       | _ -> ())
+                     let want = expected
                      let mutable funTy = exprType (GNode head)
                      dotDemand <- None
+                     // Tie the application's RESULT to what it must be before
+                     // the arguments are typed. Otherwise a parameter whose
+                     // type only a LATER argument settles is still a variable
+                     // when an earlier one is checked against it — which is
+                     // how `add i0 (v0, initial) res` typed its tuple as a
+                     // reference tuple and only then learned the map wanted a
+                     // struct.
+                     // ONLY when an argument is a tuple LITERAL, and only if
+                     // the tie cannot itself fail. Tying the result of every
+                     // application to its context is a much bigger change
+                     // than this question needs — it takes the result away
+                     // from the widening the argument path does — and the
+                     // only thing that cannot be settled later is whether a
+                     // written `(a, b)` is a struct.
+                     let hasTupleLiteral =
+                         let rec tupleish (m : GreenNode) =
+                             if m.NodeKind = TupleExpr then true
+                             elif m.NodeKind = ParenExpr then nodesOf m |> List.exists tupleish
+                             else false
+                         args |> List.exists (fun a -> isExprish a.NodeKind && tupleish a)
+                     (match want with
+                      | Some w when hasTupleLiteral ->
+                          let argCount = args |> List.filter (fun a -> isExprish a.NodeKind) |> List.length
+                          let rec tail (k : int) (t : Type) =
+                              if k = 0 then Some t
+                              else
+                                  match prune t with
+                                  | TFun (_, r) -> tail (k - 1) r
+                                  | _ -> None
+                          (match tail argCount funTy with
+                           | Some r ->
+                               if (Types.unifyTrial false r w).IsNone then unify r w |> ignore
+                           | None -> ())
+                      | _ -> ())
                      let off =
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some t -> t.Offset
@@ -1737,7 +1790,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let mutable firstArgTy = None
                      for a in args do
                          if isExprish a.NodeKind then
+                             (match prune funTy with
+                              | TFun (pt, _) -> exprExpect <- Some pt
+                              | _ -> exprExpect <- None)
                              let argTy = exprType (GNode a)
+                             exprExpect <- None
                              if firstArg then
                                  firstArgTy <- Some argTy
                                  firstArg <- false
@@ -1761,7 +1818,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n, tokensOf n with
                  | [ l; r ], [ op ] ->
                      let lt = exprType (GNode l)
+                     // an assignment says what its right-hand side must be,
+                     // and a call on that side needs to hear it BEFORE its
+                     // arguments are typed
+                     if opClass op.Text = "assign" then exprExpect <- Some lt
                      let rt = exprType (GNode r)
+                     exprExpect <- None
                      (match opClass op.Text with
                       | "arith" | "cmp" | "bits" -> vecAdd opKindsRaw (op.Offset, lt)
                       | _ -> ())
@@ -2041,7 +2103,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let inner =
                     n.Children
                     |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
-                    |> List.map exprType
+                    // parentheses pass the expectation through: `(a, b)` as
+                    // an argument is a ParenExpr wrapping the tuple
+                    |> List.map (fun m ->
+                        exprExpect <- expected
+                        let t = exprType m
+                        exprExpect <- None
+                        t)
                 let ascribed =
                     nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
                     |> Option.map (typeFromNode vars)
@@ -2107,9 +2175,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | [ t ], None -> t
                 | many, _ -> List.last many
             | TupleExpr ->
-                TTuple (n.Children
-                        |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
-                        |> List.map exprType)
+                let want = expected
+                let elems =
+                    n.Children
+                    |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
+                    |> List.map exprType
+                (match want with
+                 | Some w ->
+                     (match prune w with
+                      | TCon (sn, args) when
+                             sn.StartsWith "StructTuple" && List.length args = List.length elems ->
+                          // marked in the owner channel, where lowering reads
+                          // a struct tuple's instantiated name
+                          List.iter2 (fun a e -> unify a e |> ignore) args elems
+                          (match Green.tokens (GNode n) |> List.tryHead with
+                           | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                           | None -> ())
+                          TCon (sn, args)
+                      | _ -> TTuple elems)
+                 | None -> TTuple elems)
             | ListExpr ->
                 let elem = st.Fresh ()
                 let rec addItems (m : GreenNode) =

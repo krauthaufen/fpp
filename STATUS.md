@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-629 tests
+631 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1596822 bytes, byte-identical
+self-host fixpoint 1598782 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -202,7 +202,7 @@ stays an error, and it is one for the first time: the mismatch was being
 computed and then DISCARDED, so the binding compiled and trapped, which is
 the worst of the three outcomes available.
 
-The frontier has moved **8155 → 8840**. `MapExt.fs` and `IndexList.fs` up to
+The frontier has moved **8155 → 10857**. `MapExt.fs` and `IndexList.fs` up to
 that line type check whole, and IndexList's diagnostics are down from 60 to
 14.
 
@@ -301,21 +301,33 @@ Throughput, measured over this session: a feature plus its gate run is about
 twelve minutes, so four or five an hour, and that is the ceiling worth
 planning around.
 
-## The last two diagnostics in IndexList
+## A paren tuple builds the struct it is asked for
 
-Both are on `res <- MapExt.add i0 (v0, initial) res` in `PairwiseCyclicV`,
-which stores `struct(v0, v1)` in its loop and `(v0, initial)` after it, into
-the same map. That is verbatim library code and F# accepts it: a
-parenthesised tuple BUILDS a struct tuple when a struct tuple is what the
-context asks for — the mirror of the pattern rule, measured the same way.
+The mirror of the pattern rule, measured the same way: F# builds a STRUCT
+tuple from `(a, b)` when a struct tuple is what the context asks for.
+`PairwiseCyclicV` writes `struct(v0, v1)` in its loop and `(v0, initial)`
+after it, into the same map, and that is verbatim library code.
 
-It does not fall out of the plumbing the pattern rule uses, and it is worth
-knowing why before anyone tries. The expectation has to reach the tuple from
-a LATER argument: in `add i0 (v0, initial) res` the parameter's type is still
-a variable when the tuple is typed, and only the third argument says it is a
-struct. By then the tuple has committed to being a reference tuple, and the
-mismatch is reported against it.
+The expectation has to reach the tuple from a LATER argument — in
+`add k (a, b) m` the parameter is still a variable when the tuple is typed,
+and only `m` says it is a struct — so an application ties its RESULT to its
+context before typing arguments. Tying EVERY application that way is a much
+bigger change than this question needs (it takes the result away from the
+widening the argument path does, and it turned 45 tests red), so the tie is
+made only when an argument is a tuple literal, and only when a trial says it
+cannot fail.
 
-So this one wants the application checked against an expected result type,
-or the tuple's shape parked until the call is solved. Both are real changes
-to how applications are typed; neither is a marker channel.
+The expectation is consumed once, at the top of `exprTypeOf`, by whichever
+node is being typed. Left standing it leaks into a NESTED expression: it
+reached a constructor inside `ValueSome struct(v, HashMap(...))` and tied its
+result to the tuple. Parentheses pass it through deliberately, because
+`(a, b)` as an argument is a ParenExpr wrapping the tuple.
+
+With that, `IndexList.fs` is clean, and so are `HashSetDelta.fs`,
+`Deltas.fs`, `MultiSetMap.fs` and `Utilities.fs` behind it.
+
+## Where it stops now
+
+Line 10869, in `PriorityQueue.fs`: `List cannot be indexed: it is not an
+array and declares no Item member`. A different kind of gap from everything
+above — it is about what the PORT means by `List<'T>`, not about inference.
