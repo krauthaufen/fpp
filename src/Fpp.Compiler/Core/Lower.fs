@@ -268,6 +268,41 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let indexerTok (base_ : int) (name : string) (br : Token) : Token =
         { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + br.Offset }
 
+    /// Is this dot-access written on `base`? Then the member it names is the
+    /// BASE's own, called directly however virtual it is.
+    let isBaseReceiver (n : GreenNode) : bool =
+        match n.Children |> List.tryHead with
+        | Some (GNode r) when r.NodeKind = IdentExpr ->
+            r.Children
+            |> List.exists (fun c ->
+                match c with
+                | GToken t -> t.Kind = Keyword && t.Text = "base"
+                | _ -> false)
+        | _ -> false
+
+    /// The member `base.M()` means. An `abstract` declaration and the
+    /// `default` that implements it are BOTH recorded under the type, the
+    /// abstract one first and the implementation as the next overload — so
+    /// the plain key names a slot with no body, and the last one names the
+    /// code. Reading the plain key is what made `base.Speak()` call an
+    /// unbound function.
+    let baseMemberAt (t : Token) : (string * Resolve.Definition) option =
+        match dictTryFind memberSites t.Offset with
+        | None -> None
+        | Some owner ->
+            let hash = owner.IndexOf "#"
+            let plainOwner = if hash < 0 then owner else owner.Substring (0, hash)
+            // the overload ordinals are not dense — scan a range and keep
+            // the LAST one that exists, which is the implementation
+            let mutable best = memberAt t
+            let mutable k = 1
+            while k < 8 do
+                (match dictTryFind memberIndex (plainOwner + "." + t.Text + "#" + string k) with
+                 | Some d -> best <- Some (plainOwner, d)
+                 | None -> ())
+                k <- k + 1
+            best
+
     /// A member call the source has no token for — the enumerator protocol,
     /// an indexer, `use`'s Dispose. Inference parked the access at a
     /// synthetic offset derived from the construct's first token; this reads
@@ -498,6 +533,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match tokensOf n |> List.tryHead with
                      | Some t when t.Text = "null" -> ELit LNull
                      | _ -> note (offsetOf n) "literal")
+            | IdentExpr when
+                    tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "base") ->
+                // `base` IS the receiver — one object, not two. What the
+                // keyword changes is which type the member was looked up on,
+                // and inference recorded that at the member's own token: the
+                // call that comes out names the BASE's implementation
+                // directly, which is what makes it non-virtual.
+                (match currentSelf with
+                 | Some (sv, ssch) -> EVar (sv, ssch)
+                 | None -> note (offsetOf n) "base outside a member")
             | IdentExpr ->
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                  | Some t ->
@@ -1748,17 +1793,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some o, Some tn -> ECast (tn, lowerExpr (GNode o), isDown)
                  | _ -> note (offsetOf n) "cast shape")
             // dispatch through an interface: the receiver's concrete type is
-            // unknown here, so the call goes through its vtable
+            // unknown here, so the call goes through its vtable. NOT through
+            // `base` — naming the base is precisely a request for the
+            // implementation the vtable would have overridden, and routing it
+            // back through the vtable makes `base.M()` call the override that
+            // called it.
             | DotExpr when
-                (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
-                 | Some t ->
-                     (match dictTryFind memberSites t.Offset with
-                      | Some owner ->
-                          (match dictTryFind ifaces owner with
-                           | Some ms -> ms |> List.exists (fun (m, _) -> m = t.Text)
-                           | None -> false)
-                      | None -> false)
-                 | None -> false) ->
+                not (isBaseReceiver n)
+                && (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                    | Some t ->
+                        (match dictTryFind memberSites t.Offset with
+                         | Some owner ->
+                             (match dictTryFind ifaces owner with
+                              | Some ms -> ms |> List.exists (fun (m, _) -> m = t.Text)
+                              | None -> false)
+                         | None -> false)
+                    | None -> false) ->
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 let iface = (dictTryFind memberSites t.Offset).Value
                 (match nodesOf n |> List.tryHead with
@@ -1785,7 +1835,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // member access: inference bound it to one type's member, and
                 // that member is a top-level function taking the receiver
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
-                let _, d = (memberAt t).Value
+                let _, d = (if isBaseReceiver n then baseMemberAt t else memberAt t).Value
                 // a member of a generic class is a generic function: carry
                 // the instantiation so the linker can stamp it
                 let fn =

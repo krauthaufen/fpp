@@ -1192,3 +1192,51 @@ let inheritedSyntaxTests =
             Expect.equal out "1\n2\n" "one cell, shared by every instance"
         }
     ]
+
+[<Tests>]
+let baseCallTests =
+    testList "base member calls" [
+        test "base.M() calls the base's own implementation" {
+            // `base` IS the receiver — one object, not two. What the keyword
+            // changes is which type the member was looked up on, so the call
+            // names the base's implementation directly and never goes
+            // through the vtable.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Animal(name : string) ="
+                    "    member x.Name = name"
+                    "    abstract member Speak : unit -> string"
+                    "    default x.Speak () = \"...\""
+                    "type Dog(name : string) ="
+                    "    inherit Animal(name)"
+                    "    override x.Speak () = \"woof\""
+                    "    member x.Both () = base.Speak () + \"/\" + x.Speak ()"
+                    "let go ="
+                    "    let d = Dog \"rex\""
+                    "    printfn \"%s\" (d.Speak ())"
+                    "    printfn \"%s\" (d.Both ())"
+                    "" ])
+            Expect.equal out "woof\n.../woof\n" "the override is virtual, base is not"
+        }
+    ]
+
+[<Tests>]
+let assignmentBlockTests =
+    testList "an assignment may take a block" [
+        test "x <- let ... in ..." {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let f (xs : int list) ="
+                    "    let mutable result = 0"
+                    "    for v in xs do"
+                    "        result <-"
+                    "            let k = v * 2"
+                    "            result + k"
+                    "    result"
+                    "let go = printfn \"%d\" (f [ 1; 2; 3 ])"
+                    "" ])
+            Expect.equal out "12\n" "the right-hand side is a whole block"
+        }
+    ]

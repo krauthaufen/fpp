@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-615 tests
+617 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1581577 bytes, byte-identical
+self-host fixpoint 1584120 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -118,26 +118,35 @@ Expression and pattern position resolve SEPARATELY — the case-through-type
 fix needed both — which is worth remembering for anything else qualified.
 
 ~~computation expressions~~ and ~~`use` / `IDisposable`~~ are done, and so
-are five of the syntax blockers the 40-file standalone parse was stuck on:
-flexible types (`#seq<'T>`) and statically-resolved ones (`^T`) inside a
-generic argument list — both were LEXED into the angle bracket, so the
-argument list was never entered; `assert`; `not` as a value; and `instance`,
-which F++ had reserved and F# had not. That is **31 of 40 parsing clean**,
-up from 27.
+are ten syntax blockers the 40-file standalone parse was stuck on. That is
+**38 of 40 parsing clean**, up from 27:
+
+| | |
+| --- | --- |
+| `#seq<'T>` and `^T` inside a generic argument | both were LEXED into the angle bracket — `<#` and `<^` came out as ONE operator, so the argument list was never entered |
+| `assert` | a real check, not F#'s elided one: a wasm module has no debugger to notice the difference |
+| `not` as a value | `f >> not`, where the keyword has nothing to negate |
+| `instance` | F++ had reserved it and F# had not, and `static let instance = ...` is how a type holds a singleton of itself. Contextual now |
+| `base.M()` | the base's OWN implementation, called directly however virtual it is. An `abstract` slot and the `default` that fills it are both recorded under the type, and reading the first was calling a function with no body |
+| `abstract member P : t with get, set` | the accessors are named, never bodied |
+| `exception E of label : int` | a labelled payload |
+| `type C(args) as this` | parsed; what the name MEANS is still open |
+| `x <- <block>` | an assignment may take a whole block, and only an assignment may |
+| `{ new Base(args) with ... }` | an object expression over a class passes base constructor arguments |
 
 What is left, measured:
 
-* **`do base.M()` in a class body** — `AdaptiveObject.fs`, `Core.fs`,
-  `Transaction.fs`, `Callbacks.fs`. `base` is not a token this compiler knows
-  anywhere. A non-virtual call to the base's own implementation is what it
-  means, which the lifted-member machinery can already express.
-* **optional parameters** — `static member F(path : string, ?retries : int)`
-  in `AdaptiveFileSystem.fs`.
 * **the offside rule inside brackets** — `store.AlterV(value, function` with
-  the clauses undented on the lines below. F# allows a bracketed group to
-  undent; F++ ends the block. This one has bitten twice now, and both
-  attempts to relax it swallowed the next statement — it wants the enclosing
-  BLOCK columns, not just the bracket depth.
+  the clauses undented on the lines below. F# lets a bracketed group undent;
+  F++ ends the block. This one has bitten twice, and both attempts to relax
+  it swallowed the next statement instead — it wants the enclosing BLOCK
+  columns, not just the bracket depth. One file (`CountingHashSet.fs`).
+* **optional parameters** — `static member F(path : string, ?retries : int)`,
+  one file (`AdaptiveFileSystem.fs`).
+* **a class-body `do` has no `this`** — the constructor runs its `do` blocks
+  BEFORE it allocates, so `do base.M()` and `do this.M()` have no receiver.
+  Reordering is what F# does, and it would change where a `do` block's writes
+  to a class `let` land.
 * **reflection outside ShallowEquality** — ~30 `typeof<>` sites in
   AdaptiveValue, HashSet, HashMap, IndexList, History, Cache. Read each:
   most are a cache key or a null test, which a class or a constrained

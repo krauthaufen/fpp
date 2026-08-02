@@ -894,6 +894,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// declared with `when` is kept whether or not the body needed it.
     /// > 0 while typing a nested let — those must neither solve nor move
     /// the wanted pool, which belongs to the enclosing top-level binding
+    /// The type `base` denotes inside the type declaration being inferred.
+    /// Set for the whole declaration, so members and `do` bindings alike see
+    /// it.
+    let mutable currentBase : Type option = None
     let mutable letDepth = 0
 
     /// The enclosing binding's named type variables ('K of the member or
@@ -1289,6 +1293,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | LiteralExpr ->
                 (match tokensOf n |> List.tryHead with
                  | Some t -> literalType t
+                 | None -> st.Fresh ())
+            | IdentExpr when
+                    tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "base") ->
+                (match currentBase with
+                 | Some t -> t
                  | None -> st.Fresh ())
             | IdentExpr ->
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
@@ -2747,6 +2756,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   dictSet bases name (ownParams, typeFromNode vars tn)
               | None -> ())
          | None -> ())
+        currentBase <-
+            match dictTryFind bases name with
+            | Some (_, bt) -> Some bt
+            | None -> None
         // Any abstract member declares a dispatch slot — on a pure interface
         // (all members abstract) or on a base class with overridable methods.
         let memberDecls = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)

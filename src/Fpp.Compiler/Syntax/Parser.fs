@@ -164,6 +164,9 @@ let parse (src : string) : ParseResult =
         || (s.IsOp "'" && (s.Peek 1).Kind = Ident)
         // a struct tuple can be an application argument: `f struct(a, b)`
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen)
+        // `base.M()` — the receiver is the same object, the member is the
+        // one the BASE declares
+        || s.IsKw "base"
 
     /// Can the current token start an expression at statement position?
     let canStartExpr () =
@@ -612,7 +615,14 @@ let parse (src : string) : ParseResult =
                     let opText = s.Cur.Text
                     let op = s.Bump ()
                     let nextMin = if rightAssoc opText then prec else prec + 1
-                    let rhs = parseBinary ctx nextMin
+                    let rhs =
+                        // `x <- \n  let k = ... \n  k + 1` — an assignment
+                        // may take a whole BLOCK, and only an assignment
+                        // does: everywhere else a `let` on the right of an
+                        // operator is a syntax error in F# too
+                        if (opText = "<-" || opText = ":=")
+                           && canStartBlock () && not (canStartExpr ()) then parseBlock ctx
+                        else parseBinary ctx nextMin
                     lhs <- Green.node BinaryExpr [ lhs; op; rhs ]
                 else go <- false
             else go <- false
@@ -837,6 +847,10 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (s.Bump ())   // {
                 if s.IsKw "new" then vecAdd acc (s.Bump ())
                 vecAdd acc (parseType ctx)
+                // `{ new Base(args) with ... }` — an object expression over a
+                // CLASS passes its base constructor arguments here, where an
+                // interface has none to pass
+                if s.Is LParen && s.SameLine then vecAdd acc (parseAtom ctx)
                 if s.IsKw "with" then vecAdd acc (s.Bump ())
                 bracketDepth <- bracketDepth + 1
                 let mutable go = true
@@ -920,6 +934,10 @@ let parse (src : string) : ParseResult =
             if s.IsKw "do" then vecAdd acc (s.Bump ()) else s.Diag "expected 'do'"
             if canStartBlock () then vecAdd acc (parseBlock wcol)
             Green.node WhileExpr (vecToList acc)
+        elif s.IsKw "base" then
+            // an ordinary receiver as far as the tree is concerned; what the
+            // keyword changes is which type its members are looked up on
+            Green.node IdentExpr [ s.Bump () ]
         elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
             // type variable in expression position (e.g. `unbox<'a>` soup)
             Green.node IdentExpr [ s.Bump (); s.Bump () ]
@@ -1247,6 +1265,12 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
         if s.Is LParen && s.SameLine then
             vecAdd acc (parseAtomPat typeCol)
+        // `type C(args) as this =` — a name for the object under
+        // construction. The tokens are kept so the parse stays lossless;
+        // what the name MEANS is the same question `base` asks.
+        if s.IsKw "as" && s.SameLine then
+            vecAdd acc (s.Bump ())
+            if s.Is Ident then vecAdd acc (s.Bump ())
         // declared class constraints: `type Box<'a> when Ordered<'a> = ...`,
         // the same `when C<'a>` a let signature carries
         while s.IsKw "when" && (s.SameLine || s.CurCol > typeCol) do
@@ -1442,7 +1466,13 @@ let parse (src : string) : ParseResult =
                             if not (s.AtEof || (not s.SameLine && s.CurCol <= mcol)) then
                                 vecAdd a2 (parseBlock mcol)
                         vecAdd acc (Green.node AccessorDecl (vecToList a2))
-                        if s.IsKw "and" then vecAdd acc (s.Bump ()) else more <- false
+                        // `and` between WRITTEN accessors, a comma between
+                        // DECLARED ones: `abstract member Tag : obj with
+                        // get, set` names the two slots and gives neither a
+                        // body
+                        if s.IsKw "and" then vecAdd acc (s.Bump ())
+                        elif s.Is Comma then vecAdd acc (s.Bump ())
+                        else more <- false
                     else
                         for g in vecToList a2 do vecAdd acc g
                         more <- false
@@ -1637,7 +1667,16 @@ let parse (src : string) : ParseResult =
             if s.Is Ident then vecAdd acc (s.Bump ())
             if s.IsKw "of" then
                 vecAdd acc (s.Bump ())
-                vecAdd acc (parseType ctx)
+                // the payload may be LABELLED — `exception E of level : int`
+                // — and the label is documentation, not part of the type
+                let mutable go = true
+                while go do
+                    if s.Is Ident && (s.Peek 1).Kind = Operator && (s.Peek 1).Text = ":" then
+                        s.Bump () |> ignore
+                        s.Bump () |> ignore
+                    vecAdd acc (parseType ctx)
+                    if s.Is Comma || (s.IsOp "*" && s.SameLine) then s.Bump () |> ignore
+                    else go <- false
             Green.node TypeDecl (vecToList acc)
         elif isDirectiveHere () then
             // a COMPILER DIRECTIVE: `#nowarn "7331"`, `#light`. It addresses
