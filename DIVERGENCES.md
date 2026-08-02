@@ -438,3 +438,28 @@ The reason to say so plainly rather than leave the file in and failing: in
 ONE concatenated pass, a file that does not parse hides every file after it.
 Left in, this one peripheral tool reported 1,655 diagnostics that belonged to
 nothing, and made the eight files behind it look broken when they were not.
+
+## The port renames PRIVATE types that collide across modules
+
+F++ keys types by BARE NAME, so two types of one name declared in different
+modules become one type. The adaptive library does this often: a private
+`Traceable` sits in three modules, `Monoid` in four. Merged, `IndexList.trace`
+answered with the HashSet one, and `Traceable`'s `'State` came out as a set.
+
+F# tells them apart by their enclosing module, and so does IL — this is the
+same distinction `[<CompilationRepresentation(ModuleSuffix)>]` exists to make
+where a module's name collides with a type's. The port does it textually: a
+`private` type whose name is already taken is renamed `<Module>_<Name>` inside
+its module.
+
+Only `private` ones, and that limit is measured, not assumed:
+
+    rename nothing                        259 diagnostics
+    rename every colliding type           263   (worse)
+    rename the private ones only          246
+
+A public type is referenced from OUTSIDE its module, and renaming it within
+the module alone breaks those references — which is why the greedy rule loses.
+
+This is a porting transformation and not a fix. The compiler should key types
+by their declaration, not their spelling; STATUS.md scopes what that takes.

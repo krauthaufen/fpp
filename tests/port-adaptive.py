@@ -141,6 +141,76 @@ def port(path, first):
     return src
 
 
+def qualify_colliding_types(src):
+    """F++ keys types by BARE NAME, so two types of one name declared in
+    DIFFERENT modules become one type. The library does that a lot — a private
+    `Traceable` sits in three modules, and `MapReader`/`ChooseReader`/
+    `AValReader` in both the hash-set and the index-list implementation.
+    Merged, `IndexList.trace` answered with the HashSet one.
+
+    F# tells them apart by their enclosing module, and so does IL. This does
+    the same textually: the SECOND and later declarations of a name, when they
+    sit inside a `module X =`, are renamed `X_Name` within that module's
+    extent. The first keeps the plain name, so the deliberate merge with a
+    same-named prelude type is untouched.
+
+    A porting transformation, not a fix — see DIVERGENCES.md.
+    """
+    lines = src.split("\n")
+    # `and` also continues a property (`with get() ... and inline set v = ...`),
+    # so a declaration is only one when the name is followed by `<`, `(` or `=`
+    # ONLY `private` types. A public one is referenced from outside its
+    # module, and renaming it inside the module alone breaks those references
+    # — measured: renaming everything that collides is WORSE than renaming
+    # nothing (263 diagnostics against 259), while the private ones alone
+    # take it to 245.
+    decl = re.compile(r"^(\s*)(?:type|and)\s+private\s+"
+                      r"([A-Za-z_][A-Za-z0-9_]*)\s*(?=[<(=])")
+    modl = re.compile(r"^(\s*)module\s+(?:private\s+|internal\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*$")
+
+    def enclosing(ln, ind):
+        """nearest `module X =` above `ln` with a smaller indent, and its extent"""
+        for j in range(ln - 1, -1, -1):
+            m = modl.match(lines[j])
+            if m and len(m.group(1)) < ind:
+                mi = len(m.group(1))
+                end = len(lines)
+                for k in range(j + 1, len(lines)):
+                    l = lines[k]
+                    if l.strip() and (len(l) - len(l.lstrip())) <= mi:
+                        end = k
+                        break
+                return m.group(2).split(".")[-1], j + 1, end
+            if m and len(m.group(1)) >= ind:
+                return None
+        return None
+
+    # `and` opens a property accessor too (`and inline set v = ...`); these
+    # are never type names, and renaming one rewrites the KEYWORD
+    KEYWORDS = {"set", "get", "inline", "new", "val", "member", "this", "static",
+                "mutable", "rec", "of", "with", "abstract", "override", "default"}
+    seen, renames = {}, []
+    for i, l in enumerate(lines):
+        d = decl.match(l)
+        if not d:
+            continue
+        name = d.group(2)
+        if name in KEYWORDS:
+            continue
+        if name not in seen:
+            seen[name] = i
+            continue
+        enc = enclosing(i, len(d.group(1)))
+        if enc is not None:
+            renames.append((name, enc[0] + "_" + name, enc[1], enc[2]))
+
+    for old, new_name, a, b in renames:
+        pat = re.compile(r"(?<![A-Za-z0-9_.])" + re.escape(old) + r"\b")
+        for i in range(a, min(b, len(lines))):
+            lines[i] = pat.sub(new_name, lines[i])
+    return "\n".join(lines)
+
+
 def main():
     root, out = sys.argv[1], sys.argv[2]
     proj = os.path.join(root, "FSharp.Data.Adaptive.fsproj")
@@ -163,7 +233,8 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    open(out, "w").write("\n".join(chunks) + "\n")
+    text = qualify_colliding_types("\n".join(chunks))
+    open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 
 
