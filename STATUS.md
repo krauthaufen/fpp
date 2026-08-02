@@ -549,6 +549,36 @@ The three big adaptive collections — AdaptiveHashMap, AdaptiveIndexList,
 AdaptiveHashSet — hold about three quarters of them, which suggests one or
 two shared causes rather than 200 separate ones.
 
+Grouped by shape, one pattern dominates: a type and its DELTA unified with
+each other, in every collection.
+
+     29  IOpReader<HashMap<IndexList<IndexListDelta<'a>...
+     26  IOpReader<CountingHashSet<HashSetDelta<'a>>, ...
+     16  HashNode<'a, int> vs HashSet<'a>
+     14  IndexList<'a> vs IndexListDelta<'a>
+     12  HashMap<'a, HashSet<'b>> vs HashMapDelta<'a, ...
+     11  CountingHashSet<'a> vs HashSetDelta<'a>
+
+### Two hypotheses, both TESTED and both WRONG
+
+Recorded so nobody spends the afternoon on them again.
+
+* **A name collision on `Traceable`.** `Traceable/Instances.fs` declares a
+  private per-module cache class `Traceable<'T>` while the library's own
+  record is `Traceable<'State, 'Delta>`, and types here are keyed by bare
+  name. Renaming the cache classes in the port changed the diagnostic count
+  by ZERO — same 269, same distribution.
+* **The prelude's `module HashSet` shadowing the port's.** The prelude has a
+  `HashSet` module whose `empty` is a `HashNode<'k, int>`, which is exactly
+  the type in the error. But a user module DOES shadow a prelude module of
+  the same name — verified in isolation, it resolves to the user's. So the
+  collision is real and the shadowing is not broken; something else about
+  the port's shape is.
+
+`HashNode` appears in these errors at all only because it is the prelude's
+representation, so whatever goes wrong reaches for the prelude's `HashSet`
+rather than the library's. That is the thread to pull next.
+
 ## Compiling is not the same as running
 
 The port has only ever been INFERRED. Lowering and emission are a separate
