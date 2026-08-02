@@ -548,12 +548,12 @@ The port script was stripping the attribute; it keeps it now.
 ## Where it stops now
 
 The whole 39-file port — 21,873 lines — infers in about seven seconds, with
-259 diagnostics. Every `HashNode` mismatch is gone.
+246 diagnostics. Every `HashNode` mismatch is gone.
 
      35  IOpReader<HashMap<IndexList<IndexListDelta<'a>...
      32  IOpReader<CountingHashSet<HashSetDelta<'a>>, ...
-     25  IndexList<'a> vs IndexListDelta<'a>
      23  the type HashSet<'a> would contain itself
+     15  IndexList<'a> vs IndexListDelta<'a>
      11  CountingHashSet<'a> vs HashSetDelta<'a>
 
 Still one shape: a collection unified with its own DELTA. `IOpReader<'a>`
@@ -562,31 +562,32 @@ tying the two parameters together.
 
 ### The next fix, scoped and measured
 
-The remaining shape is one bug: **types are keyed by BARE NAME, so a name
-declared at two different arities becomes one type.** The port has exactly
-three such names, all in the reader hierarchy:
+The remaining shape is one bug: **types are keyed by BARE NAME, so two types
+of one name declared in DIFFERENT modules become one type.** Not arity — that
+was the first reading, and it is only a special case. The library has ~25 such
+names: `MapReader`, `ChooseReader` and `AValReader` in both the hash-set and
+the index-list implementation, a private `Traceable` in three modules,
+`Monoid` in four, `IOpReader` at two arities.
 
-    IOpReader        <'D>        and <'S,'D>
-    AbstractReader   <'D>        and <'S,'D>
-    HistoryReader    <'S,'D>     and <'S,'D,'VS,'VD>
+It is not only an inference problem — the merged types share a LAYOUT, so a
+five-line repro type-checks and then dies with `missing field p in Reader`.
 
-`IOpReader` alone accounts for about 72 of the 259 diagnostics. It is not
-only an inference problem — the two types share a LAYOUT, so a five-line
-repro type-checks and then dies with `missing field p in Reader`:
+The resolver ALREADY knows which declaration a use means, so the shape of the
+fix is small: key a type by its declaration rather than its spelling, first
+declaration keeping the plain name so nothing that does not collide is
+renamed. Two attempts were made and BOTH REVERTED, because the name is also
+the key for `ctors` (two registration sites plus `predeclareCtor`), for
+`preScan`'s `impls`, and for the layout Lower and Link emit:
 
-    type Reader<'S, 'D>(h : int) = member x.Tag = "two"
-    and Reader<'S, 'D, 'VS, 'VD>(h, mapping, seed) = member x.Tag = "four"
+    decorate by arity only              repro went from 1 error to 3
+    key by resolved declaration         port went from 259 to 271
 
-The fix is F#'s own convention — a name redeclared at a different arity
-becomes `Name`N`, the first arity seen keeping the plain name so that
-non-colliding types, and the DELIBERATE merge with a prelude type of the same
-arity, are untouched. This was attempted and REVERTED: decorating the
-declaration and `typeFromNode` is about twenty lines, but the name is also the
-key for `ctors` (two registration sites plus `predeclareCtor`), for `preScan`'s
-`impls`, and for the layout Lower and Link emit. Half of that coordination
-lands you in a worse place than not starting — the repro above regressed from
-one error to three. It wants doing in one deliberate pass, with the three
-gates between each step.
+Half the coordination is worse than none. It wants one deliberate pass with
+the three gates between steps.
+
+Meanwhile the PORT does the rename for `private` types, which is safe because
+they are not referenced outside their module — 259 to 246. See DIVERGENCES.md
+for why the greedy version is worse than doing nothing.
 
 ### Hypotheses tested and REJECTED
 
