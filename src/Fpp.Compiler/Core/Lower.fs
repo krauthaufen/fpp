@@ -550,6 +550,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match tokensOf n |> List.tryHead with
                      | Some t when t.Text = "null" -> ELit LNull
                      | _ -> note (offsetOf n) "literal")
+            // a byref READ: inference marked it, and the value is what the
+            // cell holds
+            | IdentExpr when
+                    (match tokensOf n |> List.tryHead with
+                     | Some t -> (dictTryFind fieldOwners t.Offset) = Some "$deref"
+                     | None -> false) ->
+                (match tokensOf n |> List.tryHead |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                 | Some d ->
+                     EField (EVar (varIdOf d, schemeOf d), "Contents", "ByRefCell")
+                 | None -> note (offsetOf n) "byref read")
             | IdentExpr when
                     tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "base") ->
                 // `base` IS the receiver — one object, not two. What the

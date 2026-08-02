@@ -969,6 +969,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// pattern says, and F# reads it from the scrutinee — allowing
     /// `ValueSome (a, b)` over a struct-tuple payload while rejecting the
     /// same pattern in a `let`.
+    /// Suppresses the automatic dereference of a byref. A byref READ in F#
+    /// means the value — `let x = location` copies what the cell holds — but
+    /// two positions want the CELL: the operand of `&`, which forwards it,
+    /// and the left of an assignment, which writes through it.
+    let mutable noDeref = false
+
     let mutable patExpect : Type option = None
 
     /// What the expression about to be typed is expected to BE. Consumed by
@@ -1485,7 +1491,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                ty
                            | _ ->
                                match instantiateFor d with
-                               | Some (ty, cs) -> owe cs; ty
+                               | Some (ty, cs) ->
+                                   owe cs
+                                   // A byref READ means the value. F#
+                                   // dereferences it silently and the
+                                   // library writes `let mutable initial =
+                                   // location`; without this the CELL came
+                                   // out, and `f initial` asked `'T` to
+                                   // become `ByRefCell<'T>`. Two positions
+                                   // want the cell and say so — `&x` and the
+                                   // left of an assignment.
+                                   (match prune ty with
+                                    | TCon ("ByRefCell", [ inner ]) when not noDeref ->
+                                        vecAdd fieldOwnersRaw (t.Offset, "$deref")
+                                        inner
+                                    | _ -> ty)
                                | None -> st.Fresh ())
                       | None -> st.Fresh ())
                  | _ -> st.Fresh ())   // quote-ident type variable
@@ -1835,7 +1855,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      unifyAt op.Offset fnTy (TFun (lt, TFun (rt, res)))
                      res
                  | [ l; r ], [ op ] ->
+                     // the target of an assignment is the CELL, not what it
+                     // holds: `location <- v` writes through the byref
+                     if opClass op.Text = "assign" then noDeref <- true
                      let lt = exprType (GNode l)
+                     noDeref <- false
                      // an assignment says what its right-hand side must be,
                      // and a call on that side needs to hear it BEFORE its
                      // arguments are typed
@@ -2026,9 +2050,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      for m in nodesOf n do exprType (GNode m) |> ignore
                      st.Fresh ())
             | PrefixExpr ->
+                // `&x` forwards the CELL; everything else reads through it
+                let isAddr =
+                    match tokensOf n |> List.tryHead with
+                    | Some t -> t.Text = "&"
+                    | None -> false
                 let inner =
                     nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
-                    |> List.map (fun m -> exprType (GNode m))
+                    |> List.map (fun m ->
+                        if isAddr then noDeref <- true
+                        let t = exprType (GNode m)
+                        noDeref <- false
+                        t)
                 (match tokensOf n |> List.tryHead with
                  | Some t when t.Text = "not" ->
                      (match inner with

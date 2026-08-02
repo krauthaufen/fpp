@@ -1636,3 +1636,53 @@ let dotnetNameAndOperatorTests =
             Expect.equal out "12\n3\ntrue false\n" "both kinds of operator keep working"
         }
     ]
+
+[<Tests>]
+let byrefReadTests =
+    testList "reading a byref is reading what it holds" [
+        test "a byref parameter reads as its value" {
+            // F# dereferences a byref read silently, and the library writes
+            // `let mutable initial = location`. Two positions want the CELL
+            // and say so: the operand of `&`, which forwards it, and the left
+            // of an assignment, which writes through it.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let bump (location : byref<int>) ="
+                    "    let mutable initial = location"
+                    "    initial <- initial + 1"
+                    "    location <- initial"
+                    "let inner (loc : byref<int>) = loc <- loc + 10"
+                    "let outer (loc : byref<int>) ="
+                    "    let seen = loc"
+                    "    inner &loc"
+                    "    seen"
+                    "let go ="
+                    "    let mutable n = 5"
+                    "    bump &n"
+                    "    printfn \"%d\" n"
+                    "    let mutable m = 5"
+                    "    printfn \"%d\" (outer &m)"
+                    "    printfn \"%d\" m"
+                    "" ])
+            Expect.equal out "6\n5\n15\n" "read dereferences, & forwards, assignment writes through"
+        }
+        test "Interlocked.Change, as the library writes it" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let change (location : byref<int>, f : int -> int) ="
+                    "    let mutable initial = location"
+                    "    let mutable computed = f initial"
+                    "    while Interlocked.CompareExchange(&location, computed, initial) <> initial do"
+                    "        initial <- location"
+                    "        computed <- f initial"
+                    "    computed"
+                    "let go ="
+                    "    let mutable m = 3"
+                    "    printfn \"%d\" (change (&m, fun v -> v * 2))"
+                    "    printfn \"%d\" m"
+                    "" ])
+            Expect.equal out "6\n6\n" "a byref forwarded into a byref member"
+        }
+    ]

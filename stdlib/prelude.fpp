@@ -5337,17 +5337,17 @@ let lock (o : 'a) (f : unit -> 'b) : 'b = f ()
 /// value, `Exchange` and `CompareExchange` the OLD one.
 type Interlocked =
     static member Increment (location : byref<int>) : int =
-        location <- location.Contents + 1
-        location.Contents
+        location <- location + 1
+        location
     static member Decrement (location : byref<int>) : int =
-        location <- location.Contents - 1
-        location.Contents
+        location <- location - 1
+        location
     static member Exchange (location : byref<int>, value : int) : int =
-        let old = location.Contents
+        let old = location
         location <- value
         old
     static member CompareExchange (location : byref<int>, value : int, comparand : int) : int =
-        let old = location.Contents
+        let old = location
         if old = comparand then location <- value
         old
 

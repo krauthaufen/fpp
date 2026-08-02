@@ -1508,10 +1508,10 @@ let byrefTests =
                       "            true"
                       "        else false"
                       "let s = Store 42"
-                      "let cell = { Contents = 0 }"
-                      "let a = print (if s.TryGet (0, cell) then 1 else 0)"
-                      "let b = print cell.Contents"
-                      "let c = print (if s.TryGet (1, cell) then 1 else 0)" ]
+                      "let mutable cell = 0"
+                      "let a = print (if s.TryGet (0, &cell) then 1 else 0)"
+                      "let b = print cell"
+                      "let c = print (if s.TryGet (1, &cell) then 1 else 0)" ]
             Expect.equal out "1\n42\n0\n" "the write lands in the cell"
         }
         test "&x forwards a byref parameter to another byref parameter" {
@@ -1526,9 +1526,9 @@ let byrefTests =
                       "    member x.Forward (key : int, value : byref<int>) : bool ="
                       "        x.TryGet (key, &value)"
                       "let s = Store 42"
-                      "let cell = { Contents = 0 }"
-                      "let a = print (if s.Forward (0, cell) then 1 else 0)"
-                      "let b = print cell.Contents" ]
+                      "let mutable cell = 0"
+                      "let a = print (if s.Forward (0, &cell) then 1 else 0)"
+                      "let b = print cell" ]
             Expect.equal out "1\n42\n" "the same cell is handed on"
         }
         test "&x on a mutable LOCAL copies in and out around the call" {
@@ -1556,8 +1556,9 @@ let byrefTests =
             // `Interlocked.Increment(&currentId)` is this shape
             let out =
                 run [ "let bump (cell : byref<int>) : int ="
-                      "    cell <- cell.Contents + 1"
-                      "    cell.Contents"
+                      // reading a byref IS reading what it holds, as in F#
+                      "    cell <- cell + 1"
+                      "    cell"
                       "type Counter() ="
                       "    let mutable current = 0"
                       "    member x.Next () = bump &current"

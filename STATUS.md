@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-634 tests
+636 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1602052 bytes, byte-identical
+self-host fixpoint 1603142 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -348,9 +348,23 @@ it exactly as a binding does — so filtering on "is it let-bound" was not
 enough, and the prelude's own arithmetic started calling declarations with no
 body. The filter is the class layer's own operator set.
 
+## Reading a byref is reading what it holds
+
+F# dereferences a byref read silently — `let mutable initial = location`
+copies the value — and F++ required `location.Contents`, which no F# code
+writes. Reads dereference now. Two positions want the CELL and say so: the
+operand of `&`, which forwards it, and the left of an assignment, which
+writes through it.
+
+The prelude's `Interlocked` was written in the explicit idiom and is now
+written the way F# writes it, which is the point: `location <- location + 1`.
+
+Three tests changed with it, and that is a contract change worth naming.
+They passed a hand-built `{ Contents = 0 }` as a byref argument and read
+`cell.Contents` back — neither is expressible in F#, where a byref value can
+only be made with `&`. They now say `let mutable cell = 0`, `&cell` and
+`cell`.
+
 ## Where it stops now
 
-Line 10960, in `InterlockedExtensions`: `the type ByRefCell<'a> would contain
-itself`, on `let mutable initial = location` where `location : byref<'T>`.
-Reading a byref parameter into a mutable local — the byref machinery, which
-is the one part of this file that is genuinely about `Interlocked`.
+Line 11023, one diagnostic: `StructTuple2<'a, 'b> vs 'a * Index`.
