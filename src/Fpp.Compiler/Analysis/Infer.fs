@@ -1816,6 +1816,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | [] -> st.Fresh ())
             | BinaryExpr ->
                 (match nodesOf n, tokensOf n with
+                 // `a +++ b` where `+++` is a BINDING: resolution recorded
+                 // the operator like any other use, so it is an application
+                 // and not a primitive
+                 | [ l; r ], [ op ] when
+                        (dictTryFind useDefs op.Offset).IsSome
+                        // a symbol the CLASS layer owns keeps its dispatch:
+                        // `/` is `Div.(/)`, chosen by the operand type, and a
+                        // class declares it exactly as a binding would
+                        && (Classes.operatorClass op.Text).IsNone ->
+                     let fnTy =
+                         match dictTryFind useDefs op.Offset with
+                         | Some d -> (match instantiateFor d with Some (t, _) -> t | None -> st.Fresh ())
+                         | None -> st.Fresh ()
+                     let lt = exprType (GNode l)
+                     let rt = exprType (GNode r)
+                     let res = st.Fresh ()
+                     unifyAt op.Offset fnTy (TFun (lt, TFun (rt, res)))
+                     res
                  | [ l; r ], [ op ] ->
                      let lt = exprType (GNode l)
                      // an assignment says what its right-hand side must be,
@@ -3038,10 +3056,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let v = st.Fresh ()
                         dictSet vars t.Text v
                         vecAdd tyParams v
-        let name =
+        let written =
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
             | Some t -> t.Text
             | None -> "?"
+        // An extension on an ALIAS extends what the alias NAMES. `type
+        // List<'T> with` adds members to ResizeArray, because that is what
+        // `List` is — F# reads it the same way, and attaching them to the
+        // alias instead left the members on a type nothing has.
+        let name =
+            match dictTryFind aliases written with
+            | Some (_, body) ->
+                (match prune body with
+                 | TCon (target, _) -> target
+                 | _ -> written)
+            | None -> written
         let selfTy = TCon (name, vecToList tyParams)
         // `inherit Base(...)`: remember the base so member lookup and layout
         // can walk the chain

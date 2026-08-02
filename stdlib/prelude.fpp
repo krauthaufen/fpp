@@ -5073,6 +5073,13 @@ type ResizeArray<'a>() =
     interface IEnumerable<'a> with
         member x.GetEnumerator () = (x.ToArray () :> seq<'a>).GetEnumerator ()
 
+/// `ResizeArray<'a>` is F#'s abbreviation for this; `List<'a>` is what .NET
+/// calls it, and what F# code means once `System.Collections.Generic` is
+/// open. The `List` MODULE is a different thing under the same name, exactly
+/// as in F# — one is a type, the other is a namespace of functions over the
+/// immutable `list`.
+type List<'a> = ResizeArray<'a>
+
 /// System.Collections.Generic.Dictionary. Open-addressed over
 /// INSERTION-ORDERED entries: the slot table holds one-based indices into
 /// three parallel arrays, so enumeration is deterministic and the keys stay

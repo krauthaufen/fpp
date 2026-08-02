@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-631 tests
+634 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1598782 bytes, byte-identical
+self-host fixpoint 1602052 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -326,8 +326,31 @@ result to the tuple. Parentheses pass it through deliberately, because
 With that, `IndexList.fs` is clean, and so are `HashSetDelta.fs`,
 `Deltas.fs`, `MultiSetMap.fs` and `Utilities.fs` behind it.
 
+## Three more, from PriorityQueue and Utilities
+
+**`List<'a>` is what .NET calls `ResizeArray`**, and F# code means it once
+`System.Collections.Generic` is open. The `List` MODULE is a different thing
+under the same name, exactly as in F#.
+
+**An extension on an abbreviation extends what it abbreviates.** `type
+List<'T> with` adds members to ResizeArray. Resolution is per file and cannot
+know that — the abbreviation is usually in another one — so the member key is
+aligned in the workspace, where the project's aliases are known.
+
+**A let-bound operator is a call.** `let (+++) a b = ...` binds a name that
+FUSES, the way `(+)` does everywhere else; parsed as a pattern it came out as
+a parenthesised section and the binding had no name at all. Its uses resolve
+like any other name and lower to calls.
+
+The line that took two attempts: a symbol the CLASS layer owns keeps its
+dispatch. `/` is `Div.(/)`, chosen by the operand type, and a class declares
+it exactly as a binding does — so filtering on "is it let-bound" was not
+enough, and the prelude's own arithmetic started calling declarations with no
+body. The filter is the class layer's own operator set.
+
 ## Where it stops now
 
-Line 10869, in `PriorityQueue.fs`: `List cannot be indexed: it is not an
-array and declares no Item member`. A different kind of gap from everything
-above — it is about what the PORT means by `List<'T>`, not about inference.
+Line 10960, in `InterlockedExtensions`: `the type ByRefCell<'a> would contain
+itself`, on `let mutable initial = location` where `location : byref<'T>`.
+Reading a byref parameter into a mutable local — the byref machinery, which
+is the one part of this file that is genuinely about `Interlocked`.

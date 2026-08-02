@@ -417,7 +417,24 @@ type Workspace() =
                 dictSet trees path p
                 let b = Analysis.Resolve.resolve path imports p.Root
                 for full, d in b.Exports do dictSet imports full d
-                for k, d in b.Members do dictSet members k d
+                // An extension on an ABBREVIATION belongs to what the
+                // abbreviation names: `type List<'T> with` adds members to
+                // ResizeArray, because that is what `List` IS. Resolution is
+                // per file and cannot know that — the abbreviation is
+                // usually in another one — so the key is aligned here, where
+                // the project's aliases are known.
+                for k, d in b.Members do
+                    dictSet members k d
+                    let dot = k.IndexOf "."
+                    if dot > 0 then
+                        let owner = k.Substring (0, dot)
+                        match dictTryFind aliases owner with
+                        | Some (_, body) ->
+                            (match body with
+                             | Analysis.Types.TCon (target, _) when target <> owner ->
+                                 dictSet members (target + k.Substring dot) d
+                             | _ -> ())
+                        | None -> ()
                 let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls structTypes ctors classes
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core

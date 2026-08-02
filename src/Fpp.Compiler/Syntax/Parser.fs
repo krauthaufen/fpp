@@ -1235,6 +1235,12 @@ let parse (src : string) : ParseResult =
         if atActivePatternName () then
             isActivePattern <- true
             vecAdd acc (Green.node IdentPat [ bumpActivePatternName () ])
+        // `let (+++) a b = ...` — an OPERATOR defined as an ordinary
+        // binding. The name fuses into one identifier, as it does everywhere
+        // else; parsed as a pattern it came out as a parenthesised operator
+        // section and the binding had no name at all.
+        elif atOperatorName () then
+            vecAdd acc (Green.node IdentPat [ bumpOperatorName () ])
         else
             vecAdd acc (parseAtomPat letCol)
         if s.Is Comma then

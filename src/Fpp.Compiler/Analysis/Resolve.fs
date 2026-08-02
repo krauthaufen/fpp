@@ -162,6 +162,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | Some d when d.Kind = DefType -> Some d
             | _ -> findQualifiedType name
 
+    /// Record a use under a name that is not the token's own text — an
+    /// operator's definition is written `(+++)` and used as `+++`.
+    let tryRecordAs (env : Env) (name : string) (t : Token) : unit =
+        match Map.tryFind name env with
+        | Some d -> record t d
+        | None -> ()
+
     let tryRecord (env : Env) (t : Token) : unit =
         // A bare name in expression position is a value or a constructor,
         // never a module: if a module shadows a type of the same name, the
@@ -478,6 +485,25 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 (match n.Children with
                  | [ GToken t ] when t.Kind = Ident -> tryRecord env t
                  | _ -> ())
+                env
+            | BinaryExpr ->
+                // `a +++ b` where `+++` is a binding rather than a builtin.
+                // The name is the FUSED one a definition writes, `(+++)`, so
+                // an operator that resolves is recorded like any other use
+                // and the later passes see a call instead of a primitive.
+                (match n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None) with
+                 | [ op ] when op.Kind = Operator ->
+                     // ONLY a let-bound one. A CLASS declares its operators
+                     // too (`static (/) : 'a -> 'a -> 'a`), and those are
+                     // dispatched through the instance the operand type
+                     // selects — binding a use to the declaration would call
+                     // a member that has no body.
+                     (match Map.tryFind ("(" + op.Text + ")") env with
+                      | Some d when d.Kind = DefLet -> tryRecordAs env ("(" + op.Text + ")") op
+                      | _ -> ())
+                 | _ -> ())
+                let mutable e = env
+                for c in n.Children do e <- walkExpr e c
                 env
             | ObjExpr ->
                 // an anonymous class: its members are keyed by a synthetic

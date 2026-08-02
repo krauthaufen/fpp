@@ -1574,3 +1574,65 @@ let structTupleExpressionTests =
             Expect.isEmpty (ws.Diagnostics "prog.fpp") "the constructor keeps its own result type"
         }
     ]
+
+[<Tests>]
+let dotnetNameAndOperatorTests =
+    testList "the .NET name, and let-bound operators" [
+        test "List<'a> is what .NET calls ResizeArray" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let swap (h : List<int>) ="
+                    "    let t = h.[0]"
+                    "    h.[0] <- h.[1]"
+                    "    h.[1] <- t"
+                    "    h.[0]"
+                    "let go ="
+                    "    let r = ResizeArray<int>()"
+                    "    r.Add 5"
+                    "    r.Add 9"
+                    "    printfn \"%d\" (swap r)"
+                    "" ])
+            Expect.equal out "9\n" "one type under two names"
+        }
+        test "an extension on an abbreviation extends what it abbreviates" {
+            // `type List<'T> with` adds members to ResizeArray, because that
+            // is what `List` IS. Resolution is per file and cannot know —
+            // the abbreviation is in another one — so the member key is
+            // aligned where the project's aliases are known.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type List<'T> with"
+                    "    member x.Second : 'T = x.[1]"
+                    "let go ="
+                    "    let r = ResizeArray<int>()"
+                    "    r.Add 5"
+                    "    r.Add 9"
+                    "    printfn \"%d\" r.Second"
+                    "" ])
+            Expect.equal out "9\n" "the member is on ResizeArray"
+        }
+        test "a let-bound operator is a call, a class operator still dispatches" {
+            // `let (+++) a b = ...` is an ordinary binding whose NAME is
+            // fused, and its uses are calls. A symbol the class layer owns —
+            // `/` is `Div.(/)` — keeps its dispatch, or the prelude's own
+            // arithmetic starts calling declarations with no body.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let (+++) (a : int) (b : int) = a * 10 + b"
+                    "let inline refequal (l : 'T) (r : 'T) ="
+                    "    System.Object.ReferenceEquals(l :> obj, r :> obj)"
+                    "let inline (==) (l : 'T) (r : 'T) = refequal l r"
+                    "type Box(n : int) ="
+                    "    member x.N = n"
+                    "let go ="
+                    "    printfn \"%d\" (1 +++ 2)"
+                    "    printfn \"%d\" (7 / 2)"
+                    "    let a = Box 1"
+                    "    printfn \"%b %b\" (a == a) (a == Box 1)"
+                    "" ])
+            Expect.equal out "12\n3\ntrue false\n" "both kinds of operator keep working"
+        }
+    ]

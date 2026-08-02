@@ -921,6 +921,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | ECtor (cn, cs, []), _ when not (List.isEmpty loweredArgs) -> ECtor (cn, cs, loweredArgs)
                       | _ -> EApp (f, loweredArgs))
                  | [] -> note (offsetOf n) "empty application")
+            // `a +++ b` where `+++` is a BINDING, not a builtin: resolution
+            // bound the operator token, so this is an ordinary call
+            | BinaryExpr when
+                    (match tokensOf n with
+                     | [ op ] ->
+                         (dictTryFind useDefs op.Offset).IsSome
+                         && (Fpp.Analysis.Classes.operatorClass op.Text).IsNone
+                     | _ -> false) ->
+                (match nodesOf n, tokensOf n with
+                 | [ l; r ], [ op ] ->
+                     (match dictTryFind useDefs op.Offset with
+                      | Some d -> EApp (memberFn op d, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                      | None -> note (offsetOf n) "operator")
+                 | _ -> note (offsetOf n) "operator shape")
             | BinaryExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind), tokensOf n with
                  | [ l; r ], [ op ] ->
