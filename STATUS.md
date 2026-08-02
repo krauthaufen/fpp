@@ -206,6 +206,14 @@ The frontier has moved **8155 → 8766**. `MapExt.fs` and `IndexList.fs` up to
 that line type check whole, and IndexList's diagnostics are down from 60 to
 14.
 
+What stops it there is an occurs check — `the type 'a * 'a would contain
+itself` on a tuple of two pattern binders inside a loop, in `Pairwise` and
+`PairwiseV`. It is banked as `tests/known-issues/tuple-value-occurs-check.fpp`
+with what has been ruled out. It is the only open bug in that directory that
+resists reduction: dropping the loop, the outer match or the `let mutable x =
+x` shadowing makes it disappear or turn into an honest mismatch, so the
+trigger needs the whole shape and the file is the size it is on purpose.
+
 Then, still measured:
 
 * **optional parameters** — `static member F(path : string, ?retries : int)`,
