@@ -98,6 +98,10 @@ type CeBuilder =
       HasDelay : bool
       HasReturn : bool
       HasBindReturn : bool
+      HasBind2 : bool
+      HasBind3 : bool
+      HasBind2Return : bool
+      HasBind3Return : bool
       HasMergeSources : bool
       HasMergeSources3 : bool }
 
@@ -108,7 +112,9 @@ type CeBuilder =
 /// a call that cannot resolve.
 let unknownBuilder (name : string) : CeBuilder =
     { Name = name; HasRun = false; HasDelay = false; HasReturn = true
-      HasBindReturn = false; HasMergeSources = false; HasMergeSources3 = false }
+      HasBindReturn = false; HasBind2 = false; HasBind3 = false
+      HasBind2Return = false; HasBind3Return = false
+      HasMergeSources = false; HasMergeSources3 = false }
 
 /// `recv.Name(args)` — the tuple form, which is how a builder's methods are
 /// declared and how F# calls them.
@@ -339,37 +345,67 @@ and private bangLet (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest :
                                      lambda [ Green.node WildcardPat [ tk Ident "_" ] ] (tail ()) ]
                 | None -> tail ()
             else tail ()
-        let source, binder =
-            if List.isEmpty ands then rhs, GNode pat
-            elif b.HasMergeSources3 && List.length ands = 2 then
-                match ands with
-                | [ (p2, r2); (p3, r3) ] ->
-                    call b "MergeSources3" [ rhs; r2; r3 ],
-                    Green.node ParenPat
-                        [ tk LParen "("; GNode pat; tk Comma ","; GNode p2; tk Comma ","; GNode p3; tk RParen ")" ]
-                | _ -> rhs, GNode pat
-            elif b.HasMergeSources then
-                // more than three sources nest to the LEFT, and the binder
-                // nests with them
-                List.fold
-                    (fun (src, bnd) (p, r) ->
-                        call b "MergeSources" [ src; r ],
-                        Green.node ParenPat [ tk LParen "("; bnd; tk Comma ","; GNode p; tk RParen ")" ])
-                    (rhs, GNode pat) ands
-            else
-                // no MergeSources: the group has to bind in sequence, which
-                // computes the same value over a different graph
-                rhs, GNode pat
-        let sequentialAnds (inner : Green) : Green =
-            if List.isEmpty ands || b.HasMergeSources then inner
-            else
-                List.foldBack
-                    (fun (p, r) acc -> call b "Bind" [ r; lambda [ GNode p ] acc ])
-                    ands inner
-        let k = sequentialAnds (body ())
-        match (if b.HasBindReturn && not (hasKw item "use") then stripReturn b k else None) with
-        | Some inner -> call b "BindReturn" [ source; lambda [ binder ] inner ]
-        | None -> call b "Bind" [ source; lambda [ binder ] k ]
+        let sources = (GNode pat, rhs) :: (ands |> List.map (fun (p, r) -> GNode p, r))
+        let n = List.length sources
+        let canMerge = b.HasMergeSources || b.HasMergeSources3
+        let k =
+            if canMerge || List.isEmpty ands then body ()
+            else sequentialAnds b (ands |> List.map (fun (p, r) -> GNode p, r)) (body ())
+        let returned = if b.HasBindReturn && not (hasKw item "use") then stripReturn b k else None
+        let arity (want : int) (hasIt : bool) = n = want && hasIt
+        if arity 2 b.HasBind2Return && returned.IsSome then
+            match sources, returned with
+            | [ (p1, r1); (p2, r2) ], Some inner ->
+                call b "Bind2Return" [ r1; r2; lambda [ tuplePat [ p1; p2 ] ] inner ]
+            | _ -> call b "Bind" [ rhs; lambda [ GNode pat ] k ]
+        elif arity 3 b.HasBind3Return && returned.IsSome then
+            match sources, returned with
+            | [ (p1, r1); (p2, r2); (p3, r3) ], Some inner ->
+                call b "Bind3Return" [ r1; r2; r3; lambda [ tuplePat [ p1; p2; p3 ] ] inner ]
+            | _ -> call b "Bind" [ rhs; lambda [ GNode pat ] k ]
+        elif arity 2 b.HasBind2 then
+            match sources with
+            | [ (p1, r1); (p2, r2) ] -> call b "Bind2" [ r1; r2; lambda [ tuplePat [ p1; p2 ] ] k ]
+            | _ -> call b "Bind" [ rhs; lambda [ GNode pat ] k ]
+        elif arity 3 b.HasBind3 then
+            match sources with
+            | [ (p1, r1); (p2, r2); (p3, r3) ] ->
+                call b "Bind3" [ r1; r2; r3; lambda [ tuplePat [ p1; p2; p3 ] ] k ]
+            | _ -> call b "Bind" [ rhs; lambda [ GNode pat ] k ]
+        else
+            let source, binder =
+                if List.isEmpty ands || not canMerge then rhs, GNode pat
+                else merge b sources
+            match returned with
+            | Some inner -> call b "BindReturn" [ source; lambda [ binder ] inner ]
+            | None -> call b "Bind" [ source; lambda [ binder ] k ]
+
+/// The sources of an `and!` group, merged the way F# merges them: the first
+/// two stay where they are and everything after them folds into a THIRD,
+/// recursively. Four sources come out as
+/// `MergeSources3(a, b, MergeSources(c, d))` and five as
+/// `MergeSources3(a, b, MergeSources3(c, d, e))` — measured, not guessed.
+/// The binder mirrors the nesting.
+and private merge (b : CeBuilder) (sources : (Green * Green) list) : Green * Green =
+    match sources with
+    | [] -> unitExpr (), unitPat ()
+    | [ (p, r) ] -> r, p
+    | [ (p1, r1); (p2, r2) ] when b.HasMergeSources ->
+        call b "MergeSources" [ r1; r2 ], tuplePat [ p1; p2 ]
+    | [ (p1, r1); (p2, r2); (p3, r3) ] when b.HasMergeSources3 ->
+        call b "MergeSources3" [ r1; r2; r3 ], tuplePat [ p1; p2; p3 ]
+    | (p1, r1) :: (p2, r2) :: more when b.HasMergeSources3 ->
+        let rr, rp = merge b more
+        call b "MergeSources3" [ r1; r2; rr ], tuplePat [ p1; p2; rp ]
+    | (p1, r1) :: more ->
+        let rr, rp = merge b more
+        call b "MergeSources" [ r1; rr ], tuplePat [ p1; rp ]
+
+/// A group the builder cannot merge binds in SEQUENCE instead. The value is
+/// the same; for an adaptive builder the graph is not, which is why this is
+/// the last resort rather than the shape.
+and private sequentialAnds (b : CeBuilder) (ands : (Green * Green) list) (inner : Green) : Green =
+    List.foldBack (fun (p, r) acc -> call b "Bind" [ r; lambda [ p ] acc ]) ands inner
 
 /// Is this exactly `b.Return(e)`, possibly after some statements? F# fuses
 /// `let! p = e` with a continuation of that shape into `BindReturn`, and the
@@ -409,6 +445,19 @@ and private bangBinder (item : GreenNode) : (GreenNode * Green) option =
     match pat, rhs with
     | Some p, Some r -> Some (p, walk (GNode r))
     | _ -> None
+
+/// `(a, b, c)` as a binder — the parenthesised, comma-separated form a
+/// lambda takes.
+and private tuplePat (ps : Green list) : Green =
+    let acc = vecNew<Green> ()
+    vecAdd acc (tk LParen "(")
+    let mutable first = true
+    for p in ps do
+        if not first then vecAdd acc (tk Comma ",")
+        first <- false
+        vecAdd acc p
+    vecAdd acc (tk RParen ")")
+    Green.node ParenPat (vecToList acc)
 
 /// A nested body — a loop's, a branch's — is a computation of its own.
 and private nested (b : CeBuilder) (explicit : bool) (body : GreenNode) : Green =

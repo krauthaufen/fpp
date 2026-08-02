@@ -373,14 +373,14 @@ answers. Files without one skip the probe. The same probe answers the other
 type-directed question — whether a bare expression in the body is a value to
 `Yield` or a statement, which in F# only its type can say.
 
-What is left:
+`and!` follows the same measured rules: `Bind2Return`/`Bind3Return` when the
+builder has them and the continuation ends in `return`, then `Bind2`/`Bind3`,
+then `BindReturn`/`Bind` over a merge — and the merge nests the way F#'s
+does, the first two sources staying put while the rest fold into a third. A
+builder with no merge at all binds the group in SEQUENCE, which computes the
+same value over a different graph; that is the only fallback left in it.
 
-**`and!` merges, but never through `Bind2`/`Bind3`.** F# prefers
-`Bind2Return`/`Bind3Return` over `BindReturn` composed with `MergeSources`,
-when the builder has them. Here an `and!` group always goes through
-`MergeSources`/`MergeSources3` — and, on a builder with neither, falls back
-to binding in sequence. The value is the same in all three; for an adaptive
-builder the dependency graph is not.
+What is left:
 
 **The builder must be a NAME.** `seq { }`, `aval { }`, `Foo.builder { }`,
 `x.b { }` — but not an application. F# allows any expression, and Expecto's

@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-609 tests
+610 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1574145 bytes, byte-identical
+self-host fixpoint 1579856 bytes, byte-identical
 ```
 
 ## What we are working towards
