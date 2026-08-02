@@ -517,19 +517,31 @@ remaining error set is visible at once instead of one error per run.
 
 ## Where it stops now
 
-The first diagnostic is at line 13,821, up from 12,092. But the count is the
-more useful number, and it decomposes:
+Measured per FILE, which is the only honest way to read it — one unparsed
+file poisons every file after it in one concatenated pass:
 
-    1655  parse errors, ALL cascading from ONE unparsed file
-     225  type mismatches
-      24  missing instances, constructors, occurs failures
+    clean through Traceable/Instances.fs            13,767 of 22,332 lines
+    History.fs .. ComputationExpressions.fs            278 real diagnostics
+    AdaptiveTools/AdaptiveFileSystem.fs              does not parse
+    AdaptifyHelpers.fs                               inference does not finish
 
-Parsed on its own, 39 of the 40 ported files are clean. The fortieth,
-`AdaptiveTools/AdaptiveFileSystem.fs`, uses OPTIONAL PARAMETERS — `?retires :
-int`, `?regex = regex` at the call, `defaultArg` in the body — which this
-compiler does not have, and every file after it in compile order inherits the
-cascade. That feature is the next piece of work, and it is worth more than
-its six declaration sites suggest.
+The raw count on the whole file is 1,904, and 1,655 of those are one parse
+error cascading. Parsed on its own, 39 of the 40 ported files are clean.
 
-Removing that file to see what is behind it makes inference hang again, so
-there is a second superlinear path still to find.
+Three pieces of work remain, in the order they are worth doing:
+
+* **Optional parameters.** `?retires : int` in the declaration, `defaultArg`
+  in the body, and at the call all three F# forms — omitted entirely
+  (`File.ReadAllTextSafe file`), passed through as an option
+  (`?regex = regex`), and named by value (`recursive = true`). Six
+  declaration sites, but it is what unparses a whole file, and named
+  arguments are not supported anywhere yet: `recursive = true` currently
+  reads as an equality test.
+* **278 type mismatches**, spread over eight files and not yet triaged.
+* **A second superlinear path** in `AdaptifyHelpers.fs`. It is NOT the parked
+  dot retry (measured: two passes) — the time is inside `unifyTrial` under
+  `tryResolveDot`.
+
+Known and open: a nested private `Traceable<'T>` merges with the global
+`Traceable<'S,'D>` because types are keyed by bare name; generic values are
+evaluated once per instantiation rather than per use.
