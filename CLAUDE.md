@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 636 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 637 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -22,6 +22,15 @@ and stage-1's output must equal stage-0's **byte for byte**. It has caught
 bugs the 578 tests missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
+
+**A `let rec ... and` group inside `lower` miscompiled under SELF-HOST**
+while the .NET build and all 637 tests passed. The symptom was an
+`unreachable` deep inside an unrelated lambda, and the branch the group
+existed for was never even reached during the failing compile. Two ordinary
+bindings in place of the group fixed it with no other change. If something is
+green everywhere and the fixpoint dies, suspect the SHAPE of what you wrote
+rather than its logic — `tests/known-issues/let-rec-and-group-self-host.fpp`
+records what was ruled out.
 
 Three details that will bite:
 
