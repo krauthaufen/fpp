@@ -617,6 +617,45 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None -> EUnknown t.Text)
                  | None -> note (offsetOf n) "type-variable expression")
             // a numeric conversion carries the source kind inference found
+            // `new T(Prop = v, ...)` — an object INITIALIZER: build it, then
+            // write each named field into what was built
+            | AppExpr when
+                    (match Green.tokens (GNode n) |> List.tryHead with
+                     | Some t ->
+                         (match dictTryFind fieldOwners t.Offset with
+                          | Some o -> o.StartsWith "$init:"
+                          | None -> false)
+                     | None -> false) ->
+                let tn =
+                    match Green.tokens (GNode n) |> List.tryHead |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset) with
+                    | Some o -> o.Substring 6
+                    | None -> "?"
+                let sch = mono (TCon (tn, []))
+                let tmp = { Path = path; Offset = offsetOf n + 4300000; Name = "_init" }
+                let pairs =
+                    nodesOf n
+                    |> List.filter (fun m -> m.NodeKind = ParenExpr)
+                    |> List.collect (fun pe ->
+                        match nodesOf pe |> List.filter (fun m -> isExprish m.NodeKind) with
+                        | [ t ] when t.NodeKind = TupleExpr ->
+                            nodesOf t |> List.filter (fun m -> isExprish m.NodeKind)
+                        | ms -> ms)
+                    |> List.choose (fun m ->
+                        match nodesOf m, tokensOf m with
+                        | [ l; r ], [ op ] when op.Text = "=" ->
+                            (match tokensOf l |> List.tryHead with
+                             | Some nt -> Some (nt.Text, lowerExpr (GNode r))
+                             | None -> None)
+                        | _ -> None)
+                // a class is built by CALLING its constructor, the way `E()`
+                // is — `ECtor` builds a union case, which this is not
+                let built =
+                    match Green.tokens (GNode n) |> List.tryHead |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                    | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ ELit LUnit ])
+                    | None -> ECtor (tn, sch, [])
+                ELet (false, tmp, sch, built,
+                      ESeq ((pairs |> List.map (fun (f, v) -> EFieldSet (EVar (tmp, sch), f, tn, v)))
+                            @ [ EVar (tmp, sch) ]))
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
@@ -2732,6 +2771,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, valFields, pendingStruct))
             emitExplicitCtors ()
+            // `type E() = val mutable X : int` — a PRIMARY constructor on a
+            // type whose storage is declared. F# gives it one that
+            // zero-initializes every field; without it `E()` named a
+            // constructor nothing emitted, and the type could only be built
+            // by an explicit `new`.
+            (match ctorPat, tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+             | Some cp, Some tyDef when List.isEmpty newCtorNodes ->
+                 let zeroFor (tn : string) : Expr =
+                     match tn with
+                     | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" -> ELit (LInt "0")
+                     | "uint32" -> ELit (LInt "0")
+                     | "int64" | "uint64" -> ELit (LInt "0L")
+                     | "float" | "float32" | "float16" -> ELit (LFloat "0.0")
+                     | _ -> ELit LNull
+                 let build = ERecord (name, valFields |> List.map (fun (f, tn) -> f, zeroFor tn))
+                 let anon = mono (TCon ("?", []))
+                 let arg = { Path = path; Offset = offsetOf cp + 4400000; Name = "_unit" }
+                 vecAdd decls (DLet (false, varIdOf tyDef, schemeOf tyDef, ELam ([ arg, anon ], build)))
+             | _ -> ())
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)
             vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))

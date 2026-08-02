@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-638 tests
+642 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1606039 bytes, byte-identical
+self-host fixpoint 1612326 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -396,16 +396,32 @@ from. The expected type reaches the parameters first now, and
 The frontier is **11177** — every file through `Utilities/PriorityQueue.fs`
 type checks whole.
 
+## Cache.fs: three, and each one under the last
+
+* **Array elements are ELEMENTS.** `[| 7 \n 13 |]` parsed each element
+  against the enclosing context, so the next line became an ARGUMENT of the
+  one before. It had been invisible because elements usually sit left of the
+  outer column; a leading block comment moves them right, and
+  `(* prime no. *) 7` is what exposed it. Each element parses at its own
+  column now.
+* **A type whose storage is DECLARED gets a primary constructor.**
+  `type E() = val mutable X : int` had none — `E()` named a constructor
+  nothing emitted, and the type could only be built by an explicit `new`.
+  F# zero-initializes; so does this.
+* **Object initializers.** `new T<_>(Hash = h, Slot = s)` sets fields on what
+  the constructor made. Read as an application, each pair is an equality test
+  and the call comes out as a tuple of bools.
+
+Two things the initializer needed that are worth knowing. The head must name
+a TYPE: `LBool (b = "1")` applies a union CASE to a comparison and is
+otherwise identical — that one was caught by the dogfooding gate, in the
+compiler's own `Serialize.fs`. And with `new T<_>(...)` the head is an
+application whose LAST identifier is a type ARGUMENT, so the name is the
+first one.
+
+The frontier is **11741** — everything through `Core/Core.fs`.
+
 ## Where it stops now
 
-`Utilities/Cache.fs`, two diagnostics, and both are new KINDS of gap rather
-than more of the same:
-
-* **block comments inside an array literal.** `[| (* prime no. *) 7 ... |]`
-  reports `int vs int -> 'a`, which is what `(*)` applied to `7` would say —
-  so the comment is being read as a multiplication section somewhere the
-  lexer's block-comment rule does not reach.
-* **object initializers.** `new TransactQueueEntry<_>(Hash = h, Slot = s,
-  ...)` sets properties in a constructor call; the `Prop = v` pairs are being
-  read as equality comparisons, which is why the type comes out as a tuple of
-  bools.
+`Core/Transaction.fs`, one diagnostic: `no constructor of HashSet accepts
+these arguments` at line 11898.

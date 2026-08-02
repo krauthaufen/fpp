@@ -1739,3 +1739,69 @@ let lambdaParameterTests =
             Expect.equal out "left x\nnone\n" "the expected type reaches the parameters first"
         }
     ]
+
+[<Tests>]
+let objectInitializerTests =
+    testList "array elements, val storage and object initializers" [
+        test "array elements are elements, not an application" {
+            // Each element parses at its OWN column, so a sibling on the
+            // next line is a new element. Against the enclosing context the
+            // next line became an ARGUMENT of the one before — a leading
+            // block comment exposed it by moving the elements right.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let sizes ="
+                    "    [|"
+                    "        (*  a comment  *) 7"
+                    "        (*  another    *) 13"
+                    "        31"
+                    "    |]"
+                    "let flat = [| 1; 2; 3 |]"
+                    "let go = printfn \"%d %d %d\" (Array.length sizes) sizes.[1] (Array.length flat)"
+                    "" ])
+            Expect.equal out "3 13 3\n" "three elements, and the flat form still works"
+        }
+        test "a type whose storage is declared gets a primary constructor" {
+            // `type E() = val mutable X : int` — F# gives it one that
+            // zero-initializes; without it `E()` named a constructor nothing
+            // emitted, and the type could only be built by an explicit `new`
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type E() ="
+                    "    val mutable public Hash : int"
+                    "let go ="
+                    "    let e = E()"
+                    "    e.Hash <- 5"
+                    "    printfn \"%d\" e.Hash"
+                    "" ])
+            Expect.equal out "5\n" "built, then written"
+        }
+        test "new T(Prop = v, ...) sets the fields" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type E<'V>() ="
+                    "    val mutable public Hash : int"
+                    "    val mutable public Value : 'V"
+                    "    static member New(h, v) = new E<_>(Hash = h, Value = v)"
+                    "let go ="
+                    "    let e = E<string>.New(3, \"x\")"
+                    "    printfn \"%d %s\" e.Hash e.Value"
+                    "" ])
+            Expect.equal out "3 x\n" "the named pairs are field writes, not comparisons"
+        }
+        test "a union case applied to a comparison is still that" {
+            // `LBool (b = \"1\")` looks identical to an initializer, and the
+            // head is what tells them apart: a TYPE, not a case
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Lit = LBool of bool | LInt of int"
+                    "let parse (b : string) = LBool (b = \"1\")"
+                    "let go = printfn \"%b\" (match parse \"1\" with LBool v -> v | _ -> false)"
+                    "" ])
+            Expect.equal out "true\n" "the case takes the comparison's value"
+        }
+    ]

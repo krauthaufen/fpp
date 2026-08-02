@@ -1697,6 +1697,77 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | _ -> None)
                                   | _ -> None)
                              | None -> None
+                     // `new T(Prop = v, ...)` — an object INITIALIZER. The
+                     // constructor takes nothing and the named pairs set
+                     // fields on what it made; read as an application, each
+                     // pair is an equality test and the call comes out as a
+                     // tuple of bools.
+                     // the head must name a TYPE. `LBool (b = "1")` applies a
+                     // union CASE to a comparison and looks identical
+                     let headIsType =
+                         // `new T<_>(...)` writes its type arguments, so the
+                         // head is an application and its LAST identifier is
+                         // a type ARGUMENT — the name is the first one
+                         let headTok =
+                             if head.NodeKind = AppExpr then
+                                 nodesOf head
+                                 |> List.tryFind (fun x -> x.NodeKind = IdentExpr)
+                                 |> Option.bind (fun x -> Green.tokens (GNode x) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast)
+                             else Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                         match headTok with
+                         | Some ht ->
+                             (match dictTryFind useDefs ht.Offset with
+                              | Some d -> d.Kind = Resolve.DefType
+                              | None -> false)
+                         | None -> false
+                     let initPairs =
+                         match args |> List.filter (fun a -> isExprish a.NodeKind) with
+                         | [ one ] when headIsType && one.NodeKind = ParenExpr ->
+                             let items =
+                                 match nodesOf one |> List.filter (fun m -> isExprish m.NodeKind) with
+                                 | [ t ] when t.NodeKind = TupleExpr ->
+                                     nodesOf t |> List.filter (fun m -> isExprish m.NodeKind)
+                                 | ms -> ms
+                             let asPair (m : GreenNode) =
+                                 if m.NodeKind <> BinaryExpr then None
+                                 else
+                                     match nodesOf m, tokensOf m with
+                                     | [ l; r ], [ op ] when op.Text = "=" && l.NodeKind = IdentExpr ->
+                                         (match tokensOf l |> List.tryHead with
+                                          | Some nt when nt.Kind = Ident -> Some (nt, r)
+                                          | _ -> None)
+                                     | _ -> None
+                             let pairs = items |> List.map asPair
+                             if not (List.isEmpty pairs) && pairs |> List.forall (fun p -> p.IsSome)
+                             then Some (pairs |> List.map (fun p -> p.Value))
+                             else None
+                         | _ -> None
+                     match initPairs with
+                     | Some pairs ->
+                         let selfTy =
+                             match prune (exprType (GNode head)) with
+                             | TFun (_, res) -> res
+                             | other -> other
+                         (match prune selfTy with
+                          | TCon (tn, _) ->
+                              for nameTok, valueNode in pairs do
+                                  let vt = exprType (GNode valueNode)
+                                  (match dictTryFind fields (tn + "." + nameTok.Text) with
+                                   | Some fi ->
+                                       let subst = dictNew<int, Type> ()
+                                       for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                                       for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                                       unifyAt nameTok.Offset (substVars subst fi.FieldType) vt
+                                       vecAdd memberSitesRaw (nameTok.Offset, tn)
+                                   | None ->
+                                       vecAdd diags (nameTok.Offset, tn + " has no field " + nameTok.Text))
+                              (match Green.tokens (GNode n) |> List.tryHead with
+                               | Some t -> vecAdd fieldOwnersRaw (t.Offset, "$init:" + tn)
+                               | None -> ())
+                          | _ ->
+                              for _, valueNode in pairs do exprType (GNode valueNode) |> ignore)
+                         selfTy
+                     | None ->
                      match ctorChoice with
                      | Some (ht, cs) ->
                          let argTys =

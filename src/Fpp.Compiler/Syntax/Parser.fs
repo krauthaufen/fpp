@@ -848,7 +848,14 @@ let parse (src : string) : ParseResult =
             while go && not s.AtEof && not (s.Is RBracket) && not (s.IsOp "|") do
                 let mark = s.Mark
                 if s.Is Semicolon then vecAdd acc (s.Bump ())
-                elif canStartExpr () then vecAdd acc (parseExpr ctx)
+                // Each ELEMENT is parsed at its OWN column, so a sibling on
+                // the next line is a new element and only a deeper
+                // continuation belongs to this one. Against the enclosing
+                // context the next line became an ARGUMENT of the one
+                // before — a leading block comment is what exposed it, by
+                // moving the elements right, past the outer column, so
+                // `[| 7 \n 13 |]` read as `7 13`.
+                elif canStartExpr () then vecAdd acc (parseExpr s.CurCol)
                 else vecAdd acc (s.Bump ())
                 if s.Mark = mark then go <- false
             if s.IsOp "|" then vecAdd acc (s.Bump ())
