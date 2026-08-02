@@ -560,6 +560,34 @@ Still one shape: a collection unified with its own DELTA. `IOpReader<'a>`
 takes the delta, `Traceable`/`History` carry the pair, and something is
 tying the two parameters together.
 
+### The next fix, scoped and measured
+
+The remaining shape is one bug: **types are keyed by BARE NAME, so a name
+declared at two different arities becomes one type.** The port has exactly
+three such names, all in the reader hierarchy:
+
+    IOpReader        <'D>        and <'S,'D>
+    AbstractReader   <'D>        and <'S,'D>
+    HistoryReader    <'S,'D>     and <'S,'D,'VS,'VD>
+
+`IOpReader` alone accounts for about 72 of the 259 diagnostics. It is not
+only an inference problem — the two types share a LAYOUT, so a five-line
+repro type-checks and then dies with `missing field p in Reader`:
+
+    type Reader<'S, 'D>(h : int) = member x.Tag = "two"
+    and Reader<'S, 'D, 'VS, 'VD>(h, mapping, seed) = member x.Tag = "four"
+
+The fix is F#'s own convention — a name redeclared at a different arity
+becomes `Name`N`, the first arity seen keeping the plain name so that
+non-colliding types, and the DELIBERATE merge with a prelude type of the same
+arity, are untouched. This was attempted and REVERTED: decorating the
+declaration and `typeFromNode` is about twenty lines, but the name is also the
+key for `ctors` (two registration sites plus `predeclareCtor`), for `preScan`'s
+`impls`, and for the layout Lower and Link emit. Half of that coordination
+lands you in a worse place than not starting — the repro above regressed from
+one error to three. It wants doing in one deliberate pass, with the three
+gates between each step.
+
 ### Hypotheses tested and REJECTED
 
 Recorded so nobody spends the afternoon on them again.
