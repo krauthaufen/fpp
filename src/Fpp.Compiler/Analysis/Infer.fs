@@ -457,6 +457,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TTuple xs, TTuple ys -> xs.Length = ys.Length && List.forall2 (shapeFits strict) xs ys
         | _ -> false
 
+    /// The type an overloaded member access is being asked for, keyed by its
+    /// name token. Set by the application that surrounds it, for the length
+    /// of typing that head and no longer.
+    ///
+    /// It informs the CHOICE and nothing else. The chosen member is still
+    /// unified with the access's own result the way it always was, because
+    /// that unification widens arguments — `hs.UnionWith [ 5; 6 ]` passes a
+    /// list where a seq is declared — and a demand unified directly would
+    /// refuse it.
+    let mutable dotDemand : (int * Type) option = None
+
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
     let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
@@ -544,51 +555,52 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // uninformative overload set stays parked; the retry runs
                  // after the whole file is typed, and a final FORCED pass
                  // breaks genuine ties in declaration order.
+                 let demanded =
+                     match dotDemand with
+                     | Some (off, want) when off = offset -> want
+                     | _ -> result
                  let informative =
-                     match prune result with
+                     match prune demanded with
                      | TVar _ -> false
                      | _ -> true
                  if List.length cands > 1 && not informative && not force then false else
-                 // ARITY first. A member declared `M(a, b, c)` takes a
-                 // parameter of TUPLE type, and only a call written with
-                 // three arguments can reach it — F# selects on the number
-                 // written, never on what the single argument's type might
-                 // turn out to be. `shapeFits` cannot see that: it treats an
-                 // unresolved argument type as a wildcard, so a three-tuple
-                 // parameter "fits" one argument whose type is still a
-                 // variable, and the overload declared FIRST won.
-                 // `MapExt.TryRemove(key)` reached `TryRemove(key, &result,
-                 // &removed)` this way, and the mismatch surfaced a line off
-                 // from the call.
-                 let paramOf (t : Type) =
-                     match prune t with
-                     | TFun (a, _) -> Some (prune a)
-                     | _ -> None
-                 let arityOk (c : Type) =
-                     match paramOf c with
-                     | Some (TTuple xs) ->
-                         (match paramOf result with
-                          | Some (TTuple ys) -> xs.Length = ys.Length
-                          // a written tuple is the only thing that reaches a
-                          // tupled member, whatever the actual turns out to be
-                          | Some _ -> false
-                          | None -> true)
-                     | _ -> true
+                 // Selection is a real unification, tried and then undone.
+                 // What this replaced was a structural stand-in that called
+                 // every unresolved type a wildcard — so a three-parameter
+                 // member "fit" a one-argument call, and the overload
+                 // declared FIRST won. `MapExt.TryRemove(key)` reached
+                 // `TryRemove(key, &result, &removed)` that way, and the
+                 // mismatch surfaced a line off from the call.
+                 //
+                 // Under `unifyTrial true` the caller's own type parameters
+                 // are RIGID: the body has to work for every instantiation,
+                 // so a candidate may not choose them to make itself fit.
+                 // That is the question F# asks, and asking it properly is
+                 // what makes arity fall out rather than be special-cased.
                  let ord, fi =
                      match cands with
                      | [ one ] -> one
-                     | all ->
-                         let many =
-                             match all |> List.filter (fun (_, c) -> arityOk c.FieldType) with
-                             | [] -> all
-                             | kept -> kept
-                         (match many |> List.filter (fun (_, c) -> shapeFits true c.FieldType result) with
+                     | many ->
+                         let accepts (c : FieldInfo) =
+                             let subst = dictNew<int, Type> ()
+                             for pv in c.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                             for qv in c.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                             (Types.unifyTrial true (substVars subst c.FieldType) demanded).IsNone
+                         (match many |> List.filter (fun (_, c) -> accepts c) with
+                          // one fit is the answer; several is an ambiguity F#
+                          // breaks in declaration order
                           | picked :: _ -> picked
                           | [] ->
-                              match many |> List.filter (fun (_, c) -> shapeFits false c.FieldType result) with
+                              // Nothing fits EXACTLY. Widening is the one
+                              // rule plain unification does not model —
+                              // `Equals : obj -> bool` takes anything once
+                              // obj widens — so the structural test gets the
+                              // second word, and only then declaration order.
+                              match many |> List.filter (fun (_, c) -> shapeFits false c.FieldType demanded) with
                               | picked :: _ -> picked
-                              // none fit: bind the first so the mismatch
-                              // surfaces at THIS use with both types named
+                              // none at all: the use is wrong, and binding
+                              // the first puts the mismatch at THIS use with
+                              // both types named
                               | [] -> List.head many)
                  let ownerTag =
                      if ord = 0 then fi.TypeName else fi.TypeName + "#" + string ord
@@ -927,6 +939,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Set for the whole declaration, so members and `do` bindings alike see
     /// it.
     let mutable currentBase : Type option = None
+    /// Mark (or unmark) every type parameter a signature wrote. Rigidity is
+    /// a property of the BODY being typed, not of the variable forever.
+    let setRigid (vars : Dict<string, Type>) (on : bool) : Var list =
+        let touched = vecNew<Var> ()
+        for _, t in dictPairs vars do
+            match prune t with
+            | TVar v ->
+                // only ones this call actually changes come back, so an
+                // enclosing binding's rigidity survives a nested one
+                if v.Rigid <> on then
+                    v.Rigid <- on
+                    vecAdd touched v
+            | _ -> ()
+        vecToList touched
+
+    /// The member-name token of a head that IS a member access, and nothing
+    /// else — a qualified value or a constructor is somebody else's job.
+    let memberDemandTok (head : GreenNode) : Token option =
+        if head.NodeKind <> DotExpr then None
+        else Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+
     let mutable letDepth = 0
 
     /// The enclosing binding's named type variables ('K of the member or
@@ -1525,66 +1558,45 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | [] -> tUnit
                              | [ one ] -> one
                              | many -> TTuple many
-                         // A trial must not commit — plain unify links type
-                         // variables it touches, corrupting the later trials
-                         // — and it must allow a SUBCLASS where the parameter
-                         // declares a base, since F# widens ctor arguments
-                         // like any others. So selection is a pure structural
-                         // test, and only the chosen overload unifies.
-                         let rec couldAccept (dom : Type) (arg : Type) : bool =
-                             match prune dom, prune arg with
-                             | TVar _, _ | _, TVar _ -> true
-                             | TCon (d, da), TCon (a, aa) ->
-                                 (d = a || isSupertypeOf d a)
-                                 && (da.Length <> aa.Length || List.forall2 couldAccept da aa)
-                             | TFun (a1, b1), TFun (a2, b2) -> couldAccept a1 a2 && couldAccept b1 b2
-                             | TTuple xs, TTuple ys ->
-                                 xs.Length = ys.Length && List.forall2 couldAccept xs ys
-                             | _ -> false
-                         // Fitting is not enough when two overloads have the
-                         // same ARITY: `MapExt(comparer, root)` and
-                         // `MapExt(key, value)` both take two, and with the
-                         // arguments' types still VARIABLES — which is what
-                         // they are inside `let singleton (key : 'Key) (value
-                         // : 'Value)` — every position of the first fits a
-                         // wildcard, so the first declared won and a key was
-                         // passed where a comparer was wanted.
+                         // A trial unifies for REAL and is then undone, so
+                         // one candidate's attempt cannot corrupt the next —
+                         // which is what a structural stand-in was there to
+                         // avoid, at the cost of calling every unresolved
+                         // type a wildcard. That cost was the bug: two
+                         // constructors of the same arity both "fit" a call
+                         // whose arguments are the caller's own type
+                         // parameters, and the first declared won.
                          //
-                         // So score them. A position where both sides are
-                         // concrete and AGREE is evidence for a candidate; a
-                         // position where the candidate demands something
-                         // concrete of a variable is evidence against, since
-                         // it is a guess about what that variable will turn
-                         // out to be. A candidate that demands nothing scores
-                         // zero and wins by default over one that guesses.
-                         let rec specificity (dom : Type) (arg : Type) : int =
-                             match prune dom, prune arg with
-                             | TVar _, _ -> 0
-                             | _, TVar _ -> -1
-                             | TCon (d, da), TCon (a, aa) ->
-                                 let here = if d = a then 1 else 0
-                                 if da.Length = aa.Length then
-                                     here + List.fold2 (fun acc x y -> acc + specificity x y) 0 da aa
-                                 else here
-                             | TFun (a1, b1), TFun (a2, b2) -> specificity a1 a2 + specificity b1 b2
-                             | TTuple xs, TTuple ys when xs.Length = ys.Length ->
-                                 List.fold2 (fun acc x y -> acc + specificity x y) 0 xs ys
-                             | _ -> 0
+                         // Under `unifyTrial true` those parameters are
+                         // RIGID — the body has to work for every
+                         // instantiation, so a candidate may not choose them
+                         // — and `MapExt(comparer, root)` fails against
+                         // `(key, value)` for the same reason F# fails it.
+                         //
+                         // Subtyping is the one thing unification does not
+                         // know: F# widens a constructor argument like any
+                         // other, so a parameter declaring a BASE gets a
+                         // second chance against the argument's own type
+                         // arguments under that base's name.
+                         let rec couldAccept (dom : Type) (arg : Type) : bool =
+                             (Types.unifyTrial true dom arg).IsNone
+                             || (match prune dom, prune arg with
+                                 | TCon (d, da), TCon (a, aa) when
+                                        d <> a && isSupertypeOf d a && List.length da = List.length aa ->
+                                     (Types.unifyTrial true (TCon (d, da)) (TCon (d, aa))).IsNone
+                                 | TTuple xs, TTuple ys when List.length xs = List.length ys ->
+                                     List.forall2 couldAccept xs ys
+                                 | _ -> false)
                          let fits (sch : Scheme) =
                              match prune (st.Instantiate sch) with
-                             | TFun (dom, res) ->
-                                 if couldAccept dom argTy then Some (specificity dom argTy) else None
-                             | _ -> None
+                             | TFun (dom, res) -> couldAccept dom argTy
+                             | _ -> false
                          let chosen =
-                             let scored =
-                                 cs |> List.choose (fun (o, sch) -> fits sch |> Option.map (fun sc -> sc, o, sch))
-                             match scored with
+                             // one fit is the answer; several is an ambiguity
+                             // F# breaks in declaration order, and so do we
+                             match cs |> List.filter (fun (_, sch) -> fits sch) with
+                             | picked :: _ -> Some picked
                              | [] -> None
-                             | _ ->
-                                 // declaration order breaks ties, as before
-                                 let best = scored |> List.map (fun (sc, _, _) -> sc) |> List.max
-                                 scored
-                                 |> List.tryPick (fun (sc, o, sch) -> if sc = best then Some (o, sch) else None)
                          (match chosen with
                           | Some (o, sch) ->
                               vecAdd ctorSitesRaw (ht.Offset, o)
@@ -1601,7 +1613,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               vecAdd diags (ht.Offset, "no constructor of " + ht.Text + " accepts these arguments")
                               st.Fresh ())
                      | None ->
+                     // An overloaded MEMBER is chosen the same way a
+                     // constructor is: by what the call passes. So when the
+                     // head is a member access, the arguments are typed
+                     // FIRST and the demand handed down, which is the only
+                     // moment the caller's type parameters are still rigid.
+                     // Waiting for the application to constrain the result
+                     // after the fact is too late — the binding has been
+                     // generalized by then, and the member's result comes out
+                     // quantified and empty.
+                     (match memberDemandTok head, args |> List.filter (fun a -> isExprish a.NodeKind) with
+                      | Some mt, ([ _ ] as argNodes) ->
+                          let argTys = argNodes |> List.map (fun a -> exprType (GNode a))
+                          let argTy = match argTys with [ one ] -> one | many -> TTuple many
+                          dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()))
+                      | _ -> ())
                      let mutable funTy = exprType (GNode head)
+                     dotDemand <- None
                      let off =
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some t -> t.Offset
@@ -2680,7 +2708,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | _ -> None)
             let savedGivens = givens
             givens <- givens @ declared
-            let bodyTys = vecToList after |> List.map exprType
+            // The type parameters this binding WROTE are rigid while its body
+            // is typed: the body has to work for every instantiation, so an
+            // overload may not choose them. Only overload trials consult the
+            // flag — ordinary unification is unchanged, and the flag is
+            // cleared before generalization.
+            let rigidHere = setRigid vars true
+            let bodyTys =
+                try vecToList after |> List.map exprType
+                finally
+                    // cleared HERE, not at the end of the branch: a rigid
+                    // variable that outlives its binding poisons every later
+                    // overload trial, and the branches out of this function
+                    // are many
+                    for v in rigidHere do v.Rigid <- false
             givens <- savedGivens
             // with `in`, the last after-expr is the continuation, the first
             // is the binding body

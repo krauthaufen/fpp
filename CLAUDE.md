@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 622 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 623 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -184,17 +184,31 @@ There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
 and Lower. Each one is this question — first or last — and each is right
 only if its head cannot be qualified. Worth auditing as a group.
 
-The same mistake had a second form, in MEMBERS rather than constructors: a
-member declared `M(a, b, c)` takes a parameter of TUPLE type, and only a call
-written with three arguments reaches it. `shapeFits` treats an unresolved
-argument type as a wildcard, so the three-tuple parameter fit a one-argument
-call and the overload declared FIRST won. Arity is checked before shape now.
-When you add an overload rule, check it against a call whose argument types
-are still VARIABLES — that is the case where every candidate looks equally
-good. Its twin is in CONSTRUCTORS, where two overloads may share an arity
-and counting settles nothing: selection scores them instead, and a candidate
-that demands something concrete of a variable scores WORSE than one that
-demands nothing, because it is guessing what the variable will become.
+## Overload resolution, and why it cannot be approximated
+
+Selection unifies each candidate against what the call asks for and UNDOES
+the attempt (`Types.unifyTrial`). Two things make that answer correctly, and
+both were missing while two rounds of heuristics were tried in their place:
+
+* the undo log is **threaded through the unifier**, never module state. Two
+  workspaces type check at once under Expecto, and a trial that recorded —
+  then undid — another thread's ordinary unifications corrupted both. It
+  presented as five unrelated tests failing differently on every run, and as
+  passing when reproduced alone.
+* a type parameter a binding WRITES is **rigid** inside its body. The body
+  must work for every instantiation, so a candidate may not decide that `'K`
+  is `Cmp<'K>` to make itself fit. The flag is consulted only inside a trial.
+
+An overloaded MEMBER is chosen at the application, with the arguments typed
+first: that is the only moment the caller's parameters are still rigid, and
+by the time an application has constrained the result the binding has been
+generalized. The demand informs the CHOICE only — the chosen member is still
+unified through the path that widens arguments, or `hs.UnionWith [ 5; 6 ]`
+stops accepting a list where a seq is declared.
+
+If you are tempted to approximate this again: the test is a call whose
+argument types are still VARIABLES. Every candidate looks equally good there,
+and that is the whole problem.
 
 ## Pattern identifiers
 

@@ -1295,14 +1295,16 @@ let memberOverloadArityTests =
           "        removed <- v"
           "        true"
           "    member x.TryRemove (key : 'K) = Some v" ]
-    testList "member overloads are selected by arity" [
+    testList "member overloads are selected by unification" [
         test "a one-argument call cannot reach a tupled member" {
-            // A member declared `M(a, b, c)` takes a parameter of TUPLE
-            // type, and only a call written with three arguments reaches it.
-            // Inference used to treat an unresolved argument type as a
-            // wildcard, so the three-tuple parameter "fit" one argument
-            // whose type was still a variable — and the overload declared
-            // first won.
+            // Selection unifies each candidate against what the call asks
+            // for, and undoes the attempt. What makes the answer come out
+            // right here is RIGIDITY: inside `tryRemove (key : 'K) (map :
+            // Map2<'K, 'V>)` the caller's own type parameters are not the
+            // candidate's to choose, so a three-parameter member cannot make
+            // itself fit by deciding `'K` is a tuple. The earlier structural
+            // stand-in called every unresolved type a wildcard, so it fit,
+            // and the overload declared first won.
             let out =
                 runProgram (String.concat "\n" (
                     [ "module M" ] @ map2 @
@@ -1340,15 +1342,15 @@ let constructorSpecificityTests =
           "    member x.Which = root.Tag"
           "    new(key : 'K, value : 'V) ="
           "        Map3<'K, 'V>(Cmp<'K>(), Node<'K, 'V>(\"from-kv\"))" ]
-    testList "constructor overloads are selected by specificity" [
+    testList "constructor overloads are selected by unification" [
         test "an argument whose type is still a variable does not fit a concrete parameter" {
-            // `MapExt(comparer, root)` and `MapExt(key, value)` both take
-            // two arguments, and inside `let singleton (key : 'K) (value :
-            // 'V)` both of the actuals are VARIABLES — so every position of
-            // the first fit a wildcard and the first declared won, passing a
-            // key where a comparer was wanted. A candidate that demands
-            // something concrete of a variable is guessing; one that demands
-            // nothing is not.
+            // Two constructors of the SAME arity, so counting settles
+            // nothing. What settles it is that inside `let singleton (key :
+            // 'K) (value : 'V)` the caller's type parameters are RIGID: the
+            // body has to work for every instantiation, so `Cmp<'K>` cannot
+            // accept `'K` however much the candidate would like it to. F#
+            // rejects it for exactly this reason, which is why the two
+            // compilers agree.
             let out =
                 runProgram (String.concat "\n" (
                     [ "module M" ] @ map3 @
@@ -1362,5 +1364,33 @@ let constructorSpecificityTests =
                       "" ]))
             Expect.equal out "from-kv\nfrom-raw\nfrom-kv\n"
                             "generic actuals take the generic constructor, concrete ones the concrete"
+        }
+    ]
+
+[<Tests>]
+let overloadTrialTests =
+    testList "overload trials leave no trace" [
+        test "a candidate that fails does not bind what it touched" {
+            // A trial unifies for REAL, so it must be undone completely —
+            // including the levels it adjusted. If the losing candidate left
+            // anything bound, the winner would be chosen against a type that
+            // had already been narrowed by a hypothesis nobody accepted.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Box<'a>(v : 'a) ="
+                    "    member x.Value = v"
+                    // the first candidate is the one that must NOT stick
+                    "    member x.Pick (a : Box<'a>, b : Box<'a>) = a.Value"
+                    "    member x.Pick (a : 'a) = a"
+                    "let outer (z : 'z) (bx : Box<'z>) ="
+                    "    let one = bx.Pick z"
+                    "    let two = bx.Pick (Box<'z>(z), Box<'z>(z))"
+                    "    (one, two)"
+                    "let go ="
+                    "    let p = outer 7 (Box<int>(7))"
+                    "    printfn \"%d %d\" (fst p) (snd p)"
+                    "" ])
+            Expect.equal out "7 7\n" "both overloads reachable from one body"
         }
     ]

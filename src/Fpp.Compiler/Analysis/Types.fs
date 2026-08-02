@@ -11,7 +11,17 @@ open Fpp.Prelude
 type Var =
     { Id : int
       mutable Level : int
-      mutable Link : Type option }
+      mutable Link : Type option
+      /// A type parameter WRITTEN in the enclosing binding's signature. Its
+      /// body must work for every instantiation, so inside that body the
+      /// variable stands for one it cannot choose — `'K` is not free to
+      /// become `Cmp<'K>` just because an overload would like it to.
+      ///
+      /// Ordinary unification ignores this: the flag exists for overload
+      /// resolution, which is the one place that asks a hypothetical
+      /// question ("would this candidate fit?") and must not answer it by
+      /// helping itself to the caller's type parameters.
+      mutable Rigid : bool }
 
 and Type =
     | TVar of Var
@@ -47,6 +57,20 @@ let tBool = TCon ("bool", [])
 let tUnit = TCon ("unit", [])
 let tList (t : Type) = TCon ("list", [ t ])
 
+/// What a SPECULATIVE unification has changed, so it can be put back.
+/// Threaded explicitly rather than kept in module state: two workspaces
+/// type-check at once in the test harness, and a trial that recorded — and
+/// then undid — another thread's ordinary unifications corrupted both.
+type Trial =
+    { Undo : Vec<Var * Type option * int>
+      /// do rigid variables refuse to be bound? Only ever inside a trial
+      Rigid : bool }
+
+let private noteVar (trial : Trial option) (v : Var) : unit =
+    match trial with
+    | Some t -> vecAdd t.Undo (v, v.Link, v.Level)
+    | None -> ()
+
 /// Follow links to the representative.
 let rec prune (t : Type) : Type =
     match t with
@@ -54,6 +78,9 @@ let rec prune (t : Type) : Type =
         match v.Link with
         | Some inner ->
             let r = prune inner
+            // path compression is not recorded: it re-points a variable at
+            // the SAME representative it already had, so undoing a trial
+            // leaves it pointing where it should either way
             v.Link <- Some r
             r
         | None -> t
@@ -127,13 +154,16 @@ let private occurs (v : Var) (t : Type) : bool =
 
 /// Clamp levels of all vars in t to at most `level` (link-time invariant
 /// that keeps generalization sound).
-let private adjustLevels (level : int) (t : Type) : unit =
+let private adjustLevels (trial : Trial option) (level : int) (t : Type) : unit =
     let seen = refSetNew<Type> shallowHash
     let rec go (t : Type) : unit =
         let p = prune t
         if refSetAdd seen p then
             match p with
-            | TVar w -> if w.Level > level then w.Level <- level
+            | TVar w ->
+                if w.Level > level then
+                    noteVar trial w
+                    w.Level <- level
             | TCon (_, args) -> List.iter go args
             | TFun (a, b) -> go a; go b
             | TTuple ts -> List.iter go ts
@@ -219,8 +249,9 @@ let prunedId (v : Var) : int =
     | TVar w -> w.Id
     | _ -> v.Id
 
-let rec private unifySeen (seen : RefPairSet<Type>) (t1 : Type) (t2 : Type) : string option =
-    let unify a b = unifySeen seen a b
+let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 : Type) (t2 : Type) : string option =
+    let unify a b = unifySeen seen trial a b
+    let rigid (v : Var) = v.Rigid && (match trial with Some t -> t.Rigid | None -> false)
     let a = prune t1
     let b = prune t2
     if System.Object.ReferenceEquals (a, b) then None
@@ -230,23 +261,35 @@ let rec private unifySeen (seen : RefPairSet<Type>) (t1 : Type) (t2 : Type) : st
     else
     match a, b with
     | TVar v, TVar w when System.Object.ReferenceEquals (v, w) -> None
+    | TVar v, TVar w when rigid v && rigid w ->
+        // two DIFFERENT parameters of the caller's signature: a candidate
+        // that needs them equal needs something the caller never promised
+        Some ("type mismatch: " + typeString a + " vs " + typeString b)
     | TVar v, TVar w ->
         // union by LEVEL: the SHALLOWER variable stays the representative.
         // Schemes quantify representatives — re-pointing a class-level
         // variable at a member-level one would make every scheme that
         // quantifies it miss its substitution at instantiation, and the
         // first concrete use would then ground the raw variable for ALL
-        if v.Level < w.Level then
+        // a rigid variable stays the representative: binding it away is
+        // what the flag exists to prevent
+        if rigid v || (not (rigid w) && v.Level < w.Level) then
+            noteVar trial w
             w.Link <- Some (TVar v)
         else
-            adjustLevels w.Level (TVar v)
+            adjustLevels trial w.Level (TVar v)
+            noteVar trial v
             v.Link <- Some (TVar w)
         None
     | TVar v, other | other, TVar v ->
-        if occurs v other then
+        if rigid v then
+            // the caller's type parameter is not ours to choose
+            Some ("type mismatch: " + typeString (TVar v) + " vs " + typeString other)
+        elif occurs v other then
             Some ("the type " + typeString other + " would contain itself")
         else
-            adjustLevels v.Level other
+            adjustLevels trial v.Level other
+            noteVar trial v
             v.Link <- Some other
             None
     | TCon (n1, a1), TCon (n2, a2) ->
@@ -267,7 +310,20 @@ let rec private unifySeen (seen : RefPairSet<Type>) (t1 : Type) (t2 : Type) : st
         Some ("type mismatch: " + typeString a + " vs " + typeString b)
 
 let unify (t1 : Type) (t2 : Type) : string option =
-    unifySeen (refPairSetNew<Type> shallowHash) t1 t2
+    unifySeen (refPairSetNew<Type> shallowHash) None t1 t2
+
+/// Would these unify? Ask, then put everything back exactly as it was.
+/// `rigid` makes the caller's own type parameters unbindable for the
+/// duration, which is what turns "could this candidate be made to fit" into
+/// "does this candidate fit" — the question overload resolution means.
+let unifyTrial (rigid : bool) (t1 : Type) (t2 : Type) : string option =
+    let trial = { Undo = vecNew<Var * Type option * int> (); Rigid = rigid }
+    let r = unifySeen (refPairSetNew<Type> shallowHash) (Some trial) t1 t2
+    // newest first, which is the order they have to be undone in
+    for v, link, lvl in List.rev (vecToList trial.Undo) do
+        v.Link <- link
+        v.Level <- lvl
+    r
 
 /// Variable supply and level tracking for one inference run.
 type TypeState() =
@@ -283,7 +339,7 @@ type TypeState() =
 
     member _.Fresh () : Type =
         nextId <- nextId + 1
-        TVar { Id = nextId; Level = level; Link = None }
+        TVar { Id = nextId; Level = level; Link = None; Rigid = false }
 
     /// Quantify variables deeper than the current level. A constraint is
     /// carried into the scheme when it mentions a quantified variable — the

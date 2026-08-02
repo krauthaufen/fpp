@@ -212,7 +212,7 @@ let private varById (id : string) : Var =
     match dictTryFind freshVars id with
     | Some v -> v
     | None ->
-        let v : Var = { Id = 1000000 + vecLen (vecOfList (dictPairs freshVars)); Level = 0; Link = None }
+        let v : Var = { Id = 1000000 + vecLen (vecOfList (dictPairs freshVars)); Level = 0; Link = None; Rigid = false }
         dictSet freshVars id v
         v
 

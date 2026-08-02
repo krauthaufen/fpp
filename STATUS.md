@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-622 tests
+623 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1589905 bytes, byte-identical
+self-host fixpoint 1591622 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -136,38 +136,54 @@ is **39 of 40 parsing clean**, up from 27:
 | a clause list undented inside brackets | `f (x, function` puts its clauses left of the keyword — the bracket delimits the group, so the offside line is the enclosing statement's. What it may not undent past is a clause list or block that ENCLOSES it |
 | `function` | parsed all along and never lowered. It is the lambda whose body matches on its own argument, and nothing else |
 
-**The frontier is no longer syntax**, and the bug that was holding it is
-fixed. A member declared `M(a, b, c)` takes a parameter of TUPLE type, and
-only a call written with three arguments can reach it — but `shapeFits`
-treats an unresolved argument type as a WILDCARD, so a three-tuple parameter
-fit a one-argument call whose type was still a variable, and the overload
-declared first won. `MapExt.TryRemove(key)` reached `TryRemove(key, &result,
-&removed)` that way, and the mismatch surfaced a line off from the call,
-which is why it took a bisect to find. Arity is checked before shape now.
+**Overload resolution is real now**, and the two heuristics that stood in
+for it are gone. What was there tested candidates STRUCTURALLY — deliberately,
+to avoid a trial unification corrupting the losers — and a structural test
+has to call every unresolved type a wildcard. So a three-parameter member fit
+a one-argument call, and two constructors of the same arity both fit
+everything, and in each case the overload declared FIRST won. Two rounds of
+patching that (arity first, then a specificity score) fixed the symptoms in
+front of me and would have gone on doing so.
 
-That bug had a twin, and the twin needed a different answer. Two
-constructors of the SAME arity — `MapExt(comparer, root)` and `MapExt(key,
-value)` — cannot be told apart by counting, and inside `let singleton (key :
-'Key) (value : 'Value)` both actuals are still VARIABLES, so every position
-of the first fits a wildcard and the first declared won. Selection now
-SCORES: a position where both sides are concrete and agree is evidence for a
-candidate, a position where the candidate demands something concrete of a
-variable is evidence against — it is a guess about what that variable will
-turn out to be — and a candidate that demands nothing wins by default over
-one that guesses. Declaration order still breaks genuine ties.
+What it takes to ask the question properly is two mechanisms:
 
-With both, the frontier moved for the first time in a while — **8155 to
-8396** — `MapExt.fs`, all 3,908 lines of it, type checks whole for the first
-time, and `IndexList.fs` went from 60 diagnostics to 38.
+* **A trial that can be undone.** `unifyTrial` unifies for real and puts back
+  every link and level it changed, so one candidate's attempt cannot narrow
+  the types the next one is judged against. The undo log is threaded through
+  the unifier rather than kept in module state — two workspaces type check at
+  once in the test harness, and a trial that recorded, then undid, another
+  thread's ordinary unifications corrupted both. That failure was flaky and
+  looked nothing like its cause.
+* **Rigid type variables.** A type parameter a binding WRITES is not the
+  candidate's to choose: inside `let singleton (key : 'K) (value : 'V)` the
+  body must work for every instantiation, so `Cmp<'K>` does not accept `'K`.
+  This is why F# rejects the constructor F++ was picking, and the flag is
+  consulted ONLY inside a trial — ordinary unification is untouched.
 
-The two that head the remaining 38:
+And one ordering fix: an overloaded member is now chosen at the APPLICATION,
+with the arguments typed first, because that is the only moment the caller's
+parameters are still rigid. Waiting for the application to constrain the
+result afterwards was too late — the binding had been generalized by then,
+and the member's result came out quantified and empty, which is why
+`MapExt.slice` used to return something with no members.
 
-* **`MapExt.slice min max content`** at 8396, `int vs Index`. The definition
-  it calls is clean and both `Slice` overloads differ in arity, so this is
-  not the bug above wearing a hat — it wants its own look.
+Two rules survive as second and third word, and both are F#'s: widening gets
+a second chance when nothing fits exactly (`Equals : obj -> bool` takes
+anything once obj widens), and declaration order breaks a genuine ambiguity.
+
+The frontier has moved **8155 → 8439**. `MapExt.fs` and `IndexList.fs` up to
+that line type check whole for the first time, and IndexList's diagnostics
+are down from 60 to 37.
+
+The two that head the remaining 37:
+
 * **`no instance Ordered<Index>`** at 8439. `Index` carries a custom
   comparison in F#, and `'Key : comparison` maps onto `Ordered<'a>` here, so
-  the port owes an instance. That one is shim work, not compiler work.
+  the port owes an instance. Shim work, not compiler work.
+* **`StructTuple2<Index, 'a> vs 'a * 'b`** at 8454. `ValueSome (id, _)`
+  destructuring a struct-tuple payload — and F# ALLOWS a plain tuple pattern
+  there while rejecting it in a `let`, which was measured, so the fix is that
+  narrow.
 
 Then, still measured:
 
