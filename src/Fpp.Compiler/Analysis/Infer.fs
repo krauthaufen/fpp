@@ -268,6 +268,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `(IEqualityComparer * SetNode)` must accept a MapLeaf second
         | TTuple ps, TTuple has when ps.Length = has.Length ->
             List.iter2 (unifyArg offset) ps has
+        // a function RESULT is read-only, so it widens covariantly — which
+        // is also all that `#IOpReader<...>` in a declared callback result
+        // needs, since the flexible marker itself is dropped at parse
+        | TFun (p1, r1), TFun (p2, r2) ->
+            unifyAt offset p1 p2
+            unifyArg offset r1 r2
         | _ -> unifyAt offset paramTy argTy
 
     /// The name of a type at its instantiation. A name still mentioning a
@@ -814,6 +820,60 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Convert a type node. `vars` maps type-variable names to Types and is
     /// per-declaration so repeated 'a in one signature mean the same thing.
+    // ---- multi-arity type names -------------------------------------------
+    // .NET keys a type as Name`N — the arity is part of the name, which is
+    // how `IOpReader<'D>` and `IOpReader<'S,'D>` coexist in one namespace.
+    // Types here were keyed by BARE name, so the two merged: they shared a
+    // layout, and a five-line repro died with `missing field`. The same
+    // decoration is adopted: the FIRST arity seen keeps the plain name (so
+    // nothing that does not collide is renamed, and the deliberate merge
+    // with a same-named prelude type still happens), each further arity is
+    // `Name`N`. The table rides in `aliases`, which is already project-wide.
+    let arityDeclared (name : string) (n : int) : unit =
+        match dictTryFind aliases ("$arity:" + name) with
+        | None ->
+            let vs =
+                List.init n (fun _ -> st.Fresh ())
+                |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
+            dictSet aliases ("$arity:" + name) (vs, TCon (name, []))
+        | Some (ps, _) ->
+            if ps.Length <> n then
+                dictSet aliases ("$arity:" + name + ":" + string n) ([], TCon (name, []))
+    /// the KEY for this name at this arity — plain unless a colliding
+    /// variant was declared at exactly this arity
+    let arityName (name : string) (n : int) : string =
+        if (dictTryFind aliases ("$arity:" + name + ":" + string n)).IsSome
+        then name + "`" + string n
+        else name
+    /// the variant a resolved DEFINITION means — for a bare use, where no
+    /// written arguments say which type of this name is intended
+    let arityNameOfDef (d : Resolve.Definition) : string =
+        match dictTryFind aliases ("$adecl:" + d.Path + ":" + string d.Offset) with
+        | Some (ps, _) -> arityName d.Name ps.Length
+        | None -> d.Name
+
+    /// every declared variant of a name, for a use that does not write its
+    /// type arguments (a bare constructor call chooses by ARGUMENT fit)
+    let arityVariants (name : string) : string list =
+        name
+        :: (List.init 9 (fun i -> i)
+            |> List.filter (fun i -> (dictTryFind aliases ("$arity:" + name + ":" + string i)).IsSome)
+            |> List.map (fun i -> name + "`" + string i))
+
+    /// A constructor's quantified variables, DECLARED parameters first.
+    /// `H<'S, 'D>(x : voption<W<'D>>, ...)` writes 'D before 'S in its
+    /// parameters, so free-variable encounter order is ['D; 'S] — and the
+    /// explicit type application `H<'S, 'D>(...)` pins POSITIONALLY against
+    /// scheme order. Crossed pins unified 'S into 'D and every History
+    /// constructor collapsed to Traceable<'a, 'a>.
+    let ctorQuantified (declared : Type list) (ctorTy : Type) : Var list =
+        let declVars = declared |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
+        let declIds = declVars |> List.map (fun v -> v.Id) |> Set.ofList
+        declVars
+        @ (freeVars ctorTy
+           |> List.distinctBy (fun v -> v.Id)
+           |> List.filter (fun v -> not (Set.contains v.Id declIds)))
+
     let rec typeFromNode (vars : Dict<string, Type>) (n : GreenNode) : Type =
         let namedVar (name : string) : Type =
             match dictTryFind vars name with
@@ -863,7 +923,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | None -> "?"
                       (match expandAlias name args with
                        | Some t -> t
-                       | None -> TCon (name, args))
+                       | None -> TCon (arityName name args.Length, args))
                   | _ ->
                       match typeFromNode vars head with
                       | TCon (name, []) -> TCon (name, args)
@@ -878,7 +938,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  let arg = typeFromNode vars inner
                  (match expandAlias t.Text [ arg ] with
                   | Some ty -> ty
-                  | None -> TCon (t.Text, [ arg ]))
+                  | None -> TCon (arityName t.Text 1, [ arg ]))
              | [ inner ], _ -> TCon ("array", [ typeFromNode vars inner ])   // int[]
              | _ -> st.Fresh ())
         | FunType ->
@@ -1809,6 +1869,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // actually accepts them — F#'s overload resolution,
                      // restricted to constructors.
                      let ctorChoice =
+                         // the WRITTEN type-argument count, taken from the
+                         // outer head before ctorHead narrows to the bare
+                         // identifier — `Reader<int, string>(1)` says 2
+                         let writtenCount =
+                             match nodesOf head |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                             | Some tp ->
+                                 Some (nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.length)
+                             | None -> None
                          // the head may carry explicit type arguments:
                          // `HashSet<'K>(comparer, root)`
                          let ctorHead =
@@ -1832,8 +1900,33 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | Some ht ->
                                  (match dictTryFind useDefs ht.Offset with
                                   | Some d when d.Kind = Resolve.DefType ->
-                                      (match dictTryFind ctors d.Name with
-                                       | Some cs when cs.Length > 1 -> Some (ht, cs)
+                                      // the written type arguments pick the
+                                      // VARIANT; without them, every variant's
+                                      // constructors compete and the argument
+                                      // fit decides — the same trial that
+                                      // separates ordinary overloads
+                                      let written = writtenCount
+                                      let cands =
+                                          match written with
+                                          | Some k ->
+                                              (match dictTryFind ctors (arityName d.Name k) with
+                                               | Some cs -> cs
+                                               | None -> [])
+                                          | None ->
+                                              arityVariants d.Name
+                                              |> List.collect (fun v ->
+                                                  match dictTryFind ctors v with
+                                                  | Some cs -> cs
+                                                  | None -> [])
+                                      // ONE candidate is still the answer
+                                      // when the name has variants: the
+                                      // ordinary path resolves the name to
+                                      // its LAST declaration, which may be
+                                      // the wrong variant entirely
+                                      let hasVariants = (arityVariants d.Name).Length > 1
+                                      (match cands with
+                                       | cs when cs.Length > 1 -> Some (ht, cs)
+                                       | [ _ ] when hasVariants -> Some (ht, cands)
                                        | _ -> None)
                                   | _ -> None)
                              | None -> None
@@ -1946,6 +2039,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                      (Types.unifyTrial true (TCon (d, da)) (TCon (d, aa))).IsNone
                                  | TTuple xs, TTuple ys when List.length xs = List.length ys ->
                                      List.forall2 couldAccept xs ys
+                                 // a callback's RESULT widens, as at the call
+                                 | TFun (p1, r1), TFun (p2, r2) ->
+                                     (Types.unifyTrial true p1 p2).IsNone && couldAccept r1 r2
                                  | _ -> false)
                          // `LazyOrValue<'T> create` WRITES its type argument,
                          // and that is what tells the two constructors apart:
@@ -3060,7 +3156,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match nodesOf n |> List.tryHead |> Option.bind headIdent with
                     | Some t ->
                         (match dictTryFind useDefs t.Offset with
-                         | Some d when d.Kind = Resolve.DefType -> Some d.Name
+                         | Some d when d.Kind = Resolve.DefType -> Some (arityNameOfDef d)
                          | _ -> None)
                     | None -> None
                 match staticOwner, lastIdent with
@@ -3594,13 +3690,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // List<'T> with` adds members to ResizeArray, because that is what
         // `List` is — F# reads it the same way, and attaching them to the
         // alias instead left the members on a type nothing has.
-        let name =
+        let plain =
             match dictTryFind aliases written with
             | Some (_, body) ->
                 (match prune body with
                  | TCon (target, _) -> target
                  | _ -> written)
             | None -> written
+        // a name redeclared at a DIFFERENT arity is a DIFFERENT type — the
+        // pre-sweep recorded every arity, so the decoration is known here
+        let name = arityName plain (vecToList tyParams |> List.length)
+        if name <> plain then
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t -> vecAdd fieldOwnersRaw (t.Offset, "$tyname:" + name)
+             | None -> ())
         let selfTy = TCon (name, vecToList tyParams)
         // `inherit Base(...)`: remember the base so member lookup and layout
         // can walk the chain
@@ -3716,7 +3819,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | None -> selfTy
                 (match caseTok with
                  | Some t when (dictTryFind defsAt t.Offset).IsSome ->
-                     let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = ctorTy }
+                     let sch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = []; Body = ctorTy }
                      setScheme t.Offset sch
                      recordDef t ctorTy
                  | _ -> ())
@@ -3750,7 +3853,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for b in nodesOf m do
                     if isExprish b.NodeKind then exprType (GNode b) |> ignore
                 let ctorTy = TFun (argTy, selfTy)
-                let csch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = typeCons; Body = ctorTy }
+                let csch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = typeCons; Body = ctorTy }
                 // With no primary constructor the FIRST `new` is what the
                 // type name denotes; any others live at their own keyword.
                 let prior = match dictTryFind ctors name with Some l -> l | None -> []
@@ -3794,10 +3897,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                  | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
                      let ctorTy = TFun (ctorArgTy, selfTy)
-                     let sch = { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id); Constraints = typeCons; Body = ctorTy }
+                     let sch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = typeCons; Body = ctorTy }
                      setScheme nameTok.Offset sch
                      let prior = match dictTryFind ctors name with Some l -> l | None -> []
-                     dictSet ctors name (prior @ [ nameTok.Offset, sch ])
+                     if not (prior |> List.exists (fun (o, _) -> o = nameTok.Offset)) then
+                         dictSet ctors name (prior @ [ nameTok.Offset, sch ])
                  | _ -> ())
             | _ -> ()
         // A type that declares `CompareTo` IS ordered, and knows it as soon
@@ -4099,14 +4203,28 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         vecAdd tyParams v
         match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
         | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
-            let selfTy = TCon (nameTok.Text, vecToList tyParams)
+            // the same Name`N key the declaration itself will take
+            let selfTy = TCon (arityName nameTok.Text (vecToList tyParams |> List.length), vecToList tyParams)
             (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
              | Some p ->
                  let ctorArgTy = patType vars p
                  let ctorTy = TFun (ctorArgTy, selfTy)
-                 setScheme nameTok.Offset
-                     { Quantified = freeVars ctorTy |> List.distinctBy (fun v -> v.Id)
+                 let sch =
+                     { Quantified = ctorQuantified (vecToList tyParams) ctorTy
                        Constraints = []; Body = ctorTy }
+                 setScheme nameTok.Offset sch
+                 // into the overload table NOW: in an `and` group an earlier
+                 // member's body calls this constructor before the
+                 // declaration itself is inferred, and an empty candidate
+                 // set fell back to the resolver — which knows only the LAST
+                 // declaration of the name
+                 let key =
+                     match prune selfTy with
+                     | TCon (kn, _) -> kn
+                     | _ -> nameTok.Text
+                 let prior = match dictTryFind ctors key with Some l -> l | None -> []
+                 if not (prior |> List.exists (fun (o, _) -> o = nameTok.Offset)) then
+                     dictSet ctors key (prior @ [ nameTok.Offset, sch ])
              | None -> ())
         | _ -> ()
 
@@ -4276,6 +4394,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         dictSet aliases nameTok.Text (vecToList ps, typeFromNode vars repr)
                     | _ -> ()
             elif n.NodeKind = ModuleDef then n.Children |> List.iter preScanAliases
+    // every type name's arities, BEFORE anything reads a signature: the
+    // decoration has to be known at the first use, not the declaration
+    let tyParamCount (n : GreenNode) : int =
+        match nodesOf n |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+        | Some m ->
+            m.Children
+            |> List.collect (fun c ->
+                match c with
+                | GNode w when w.NodeKind = WhenDecl -> []
+                | other -> Green.tokens other)
+            |> List.filter (fun t -> t.Kind = Ident && t.Text <> "_")
+            |> List.distinctBy (fun t -> t.Text)
+            |> List.length
+        | None -> 0
+    let rec aritySweep (g : Green) : unit =
+        match g with
+        | GToken _ -> ()
+        | GNode n ->
+            if n.NodeKind = TypeDecl then
+                match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some t ->
+                    arityDeclared t.Text (tyParamCount n)
+                    // per-DECLARATION arity, so a BARE use — `Inner.GetCount`
+                    // has no written arguments — can still find the variant
+                    // its resolved definition means
+                    let seat = "$adecl:" + path + ":" + string t.Offset
+                    if (dictTryFind aliases seat).IsNone then
+                        let vs =
+                            List.init (tyParamCount n) (fun _ -> st.Fresh ())
+                            |> List.choose (fun x -> match prune x with TVar v -> Some v | _ -> None)
+                        dictSet aliases seat (vs, TCon (t.Text, []))
+                | None -> ()
+            elif n.NodeKind = ModuleDef then n.Children |> List.iter aritySweep
+    root.Children |> List.iter aritySweep
+
     root.Children |> List.iter preScanAliases
 
     // Which interfaces each type implements has to be known BEFORE any
@@ -4309,8 +4462,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 (match prune body with TCon (t, _) -> t | _ -> nm)
                             | None -> nm)
                     if not (List.isEmpty names) then
-                        let prior = match dictTryFind impls nameTok.Text with Some l -> l | None -> []
-                        dictSet impls nameTok.Text (prior @ names)
+                        let key = arityName nameTok.Text (tyParamCount n)
+                        let prior = match dictTryFind impls key with Some l -> l | None -> []
+                        dictSet impls key (prior @ names)
                 | None -> ()
             elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
     root.Children |> List.iter preScan

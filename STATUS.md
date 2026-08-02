@@ -547,60 +547,26 @@ The port script was stripping the attribute; it keeps it now.
 
 ## Where it stops now
 
-The whole 39-file port — 21,873 lines — infers in about seven seconds, with
-246 diagnostics. Every `HashNode` mismatch is gone.
+142 diagnostics over the 39 ported files, from 246 at the last commit and
+1,904 nominal at the start. What closed this stretch, each behind all three
+gates:
 
-     35  IOpReader<HashMap<IndexList<IndexListDelta<'a>...
-     32  IOpReader<CountingHashSet<HashSetDelta<'a>>, ...
-     23  the type HashSet<'a> would contain itself
-     15  IndexList<'a> vs IndexListDelta<'a>
-     11  CountingHashSet<'a> vs HashSetDelta<'a>
+* **Multi-arity type names** split as .NET splits them (`Name`N`) — layout
+  included, with constructors registered at predeclaration so an `and`
+  group's earlier members choose correctly, and Lower consulting inference's
+  member table (keyed by decorated receiver) before the resolver's.
+* **Function results widen covariantly** in argument positions — which is
+  also everything `#IOpReader<...>` in a declared callback result needs.
+* **Constructor schemes quantify declared parameters first** — the crossed
+  positional pin that collapsed History's 'State into 'Delta.
+* **`ignore` is a real prelude function** — passed as a value it lowered to
+  a stub that trapped.
 
-Still one shape: a collection unified with its own DELTA. `IOpReader<'a>`
-takes the delta, `Traceable`/`History` carry the pair, and something is
-tying the two parameters together.
-
-### The next fix, scoped and measured
-
-The remaining shape is one bug: **types are keyed by BARE NAME, so two types
-of one name declared in DIFFERENT modules become one type.** Not arity — that
-was the first reading, and it is only a special case. The library has ~25 such
-names: `MapReader`, `ChooseReader` and `AValReader` in both the hash-set and
-the index-list implementation, a private `Traceable` in three modules,
-`Monoid` in four, `IOpReader` at two arities.
-
-It is not only an inference problem — the merged types share a LAYOUT, so a
-five-line repro type-checks and then dies with `missing field p in Reader`.
-
-The resolver ALREADY knows which declaration a use means, so the shape of the
-fix is small: key a type by its declaration rather than its spelling, first
-declaration keeping the plain name so nothing that does not collide is
-renamed. Two attempts were made and BOTH REVERTED, because the name is also
-the key for `ctors` (two registration sites plus `predeclareCtor`), for
-`preScan`'s `impls`, and for the layout Lower and Link emit:
-
-    decorate by arity only              repro went from 1 error to 3
-    key by resolved declaration         port went from 259 to 271
-
-Half the coordination is worse than none. It wants one deliberate pass with
-the three gates between steps.
-
-Meanwhile the PORT does the rename for `private` types, which is safe because
-they are not referenced outside their module — 259 to 246. See DIVERGENCES.md
-for why the greedy version is worse than doing nothing.
-
-### Hypotheses tested and REJECTED
-
-Recorded so nobody spends the afternoon on them again.
-
-* **A name collision on `Traceable`.** Renaming the private per-module cache
-  classes in the port changed the count by ZERO.
-* **The prelude's `module HashSet` shadowing the port's.** A user module DOES
-  shadow a prelude module of the same name — verified in isolation. What was
-  actually happening is the AutoOpen above, and `DefinitionAt`/`HoverAt` on
-  the failing tokens is what settled it: `empty` bound to the library,
-  `computeDelta` to the prelude. Ask the compiler where a name went before
-  theorising about why.
+    29  the type HashSet<'a> would contain itself
+    16  HashSet<int> vs int
+     4  StructTuple2<Index, 'a> vs Index * 'a
+     4  Index vs int
+    ...
 
 ## Compiling is not the same as running
 

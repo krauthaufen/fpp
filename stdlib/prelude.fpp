@@ -825,6 +825,10 @@ type KeyValuePair<'K, 'V>(key : 'K, value : 'V) =
     member x.Value = value
 // ---- the identity function ----
 let id (x : 'a) : 'a = x
+/// first-class: `ignore` passed as a VALUE (a callback slot, a constructor
+/// argument) has to be a real function. Applied directly it still emits as
+/// the backend's drop.
+let ignore (_ : 'a) : unit = ()
 
 // Boxing is a TYPE-level operation here: every value is already a reference
 // at runtime, so both of these lower to their argument. `obj` is the top

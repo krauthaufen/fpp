@@ -130,6 +130,9 @@ type ProjectResults =
       Bases : Fpp.Prelude.Dict<string, Analysis.Types.Var list * Analysis.Types.Type>
       /// "TypeName.MemberName" -> definition, project-wide
       Members : Fpp.Prelude.Dict<string, Analysis.Resolve.Definition>
+      /// inference's member table, keyed by the receiver's DECORATED type
+      /// name (Name`N for a multi-arity name) — what Lower consults first
+      Fields : Fpp.Prelude.Dict<string, Analysis.Infer.FieldInfo>
       /// classes and their instances, project-wide
       Classes : Analysis.Classes.Tables
       /// the REWRITTEN tree per file: computation expressions are gone from
@@ -450,7 +453,7 @@ type Workspace() =
                         dictSet impls n (cimpls |> List.map fst)
                     | _ -> ()
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
-              Members = members; Classes = classes; Trees = trees; BuiltinInfer = binf })
+              Members = members; Fields = fields; Classes = classes; Trees = trees; BuiltinInfer = binf })
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with
@@ -788,7 +791,7 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (blameAt path off ("not lowerable: " + why))
@@ -823,7 +826,7 @@ type Workspace() =
         for k, v in bi.OpTypes do dictSet bot k v
         let blow =
             Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes bok bak bik bms bfo bcs
-                r.Members r.Interfaces bcu bcp bot
+                r.Members r.Fields r.Interfaces bcu bcp bot
         for d in blow.Decls do vecAdd allDecls d
         // one function per primitive instance member, so `Add.(+)` denotes
         // something callable even where `a + b` is a machine instruction
@@ -918,7 +921,7 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -951,7 +954,7 @@ type Workspace() =
             for off, t in inf.ClassPending do dictSet cp off t
             let ot = dictNew<int, string> ()
             for off, t in inf.OpTypes do dictSet ot off t
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Interfaces cu cp ot
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

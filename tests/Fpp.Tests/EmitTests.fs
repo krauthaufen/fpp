@@ -2051,3 +2051,50 @@ let autoOpenTests =
             Expect.equal out "1 99\n" "the auto-opened module answers too"
         }
     ]
+
+[<Tests>]
+let multiArityTests =
+    testList "multi-arity type names" [
+        test "two types of one name, told apart by arity" {
+            // .NET keys a type as Name`N; these were keyed by bare name and
+            // MERGED — shared layout, `missing field` at runtime. The first
+            // arity seen keeps the plain name; a call's written arguments
+            // pick the variant, and in an `and` group the constructor is
+            // registered at predeclaration so an earlier member's body can
+            // already choose correctly.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type Reader<'S, 'D>(h : int) ="
+                    "    member x.Tag = \"two\""
+                    "and Reader<'S, 'D, 'VS, 'VD>(h : int, mapping : 'S -> 'D -> 'VD, seed : 'VS) ="
+                    "    member x.Tag = \"four\""
+                    "let go ="
+                    "    let a = new Reader<int, string>(1)"
+                    "    let b = new Reader<int, string, bool, char>(1, (fun _ _ -> 'x'), true)"
+                    "    printfn \"%s %s\" a.Tag b.Tag"
+                    "" ])
+            Expect.equal out "two four\n" "each call reaches its own type"
+        }
+        test "constructor quantification follows the declared parameter order" {
+            // `H<'S, 'D>(x : voption<W<'D>>, ...)` writes 'D before 'S in its
+            // parameters, so free-variable ENCOUNTER order is ['D; 'S] — and
+            // the explicit application `H<'S, 'D>(...)` pins positionally
+            // against scheme order. Crossed pins collapsed 'S into 'D and
+            // every History constructor became Traceable<'a, 'a>.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "type W<'D> = { w : 'D }"
+                    "type Tr<'S, 'D> = { te : 'S; ts : 'D -> int }"
+                    "type H<'S, 'D> private(x : voption<W<'D>>, t : Tr<'S, 'D>, fin : 'D -> unit) ="
+                    "    member q.Trace = t"
+                    "    new (t : Tr<'S, 'D>) = H<'S, 'D>(ValueNone, t, ignore)"
+                    "let go ="
+                    "    let tr : Tr<string, bool> = { te = \"s\"; ts = fun _ -> 0 }"
+                    "    let h = H tr"
+                    "    printfn \"%s\" h.Trace.te"
+                    "" ])
+            Expect.equal out "s\n" "State and Delta stay distinct"
+        }
+    ]

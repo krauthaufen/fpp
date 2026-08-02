@@ -25,6 +25,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (memberSites : Dict<int, string>) (fieldOwners : Dict<int, string>)
           (ctorSites : Dict<int, int>)
           (projectMembers : Dict<string, Resolve.Definition>)
+          (fieldsTable : Dict<string, Fpp.Analysis.Infer.FieldInfo>)
           (ifaces : Dict<string, (string * int) list>)
           (classUses : Dict<int, Fpp.Analysis.Classes.InstMember>)
           (classPending : Dict<int, string>)
@@ -195,9 +196,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 if hash < 0 then owner + "." + t.Text
                 else owner.Substring (0, hash) + "." + t.Text + owner.Substring hash
             let plainOwner = if hash < 0 then owner else owner.Substring (0, hash)
-            (match dictTryFind memberIndex key with
-             | Some d -> Some (plainOwner, d)
-             | None -> None)
+            // Inference's own member table FIRST: it is keyed by the
+            // receiver's decorated type (Name`N for a multi-arity name),
+            // and it knows WHICH declaration the member belongs to. The
+            // resolver's index is keyed by plain spelling, where two types
+            // of one name collapse to whichever registered last.
+            (match dictTryFind fieldsTable key with
+             | Some fi when fi.DefKey.IsSome ->
+                 let dp, doff = fi.DefKey.Value
+                 Some (plainOwner,
+                       { Resolve.Definition.Name = t.Text
+                         Kind = Resolve.DefMember
+                         Path = dp; Offset = doff; Length = strLen t.Text })
+             | _ ->
+                 match dictTryFind memberIndex key with
+                 | Some d -> Some (plainOwner, d)
+                 | None -> None)
         | None -> None
 
     let schemeOf (d : Resolve.Definition) : Scheme =
@@ -2724,7 +2738,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let lowerTypeDecl (n : GreenNode) : unit =
         let name =
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
-            | Some t -> t.Text
+            | Some t ->
+                // a multi-arity name was decorated by inference (Name`N, the
+                // .NET spelling); the layout must carry the same key
+                (match dictTryFind fieldOwners t.Offset with
+                 | Some m when m.StartsWith "$tyname:" -> m.Substring 8
+                 | _ -> t.Text)
             | None -> "?"
         let tyParams =
             nodesOf n

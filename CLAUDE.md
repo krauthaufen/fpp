@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 655 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 657 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -203,6 +203,21 @@ The same mistake hid in two places, and the second needed BOTH sides fixed:
 a static member through a qualified type (`Inner.Box.Make`) bound in
 inference but emission still built a closure over it, so it type-checked and
 trapped. If you change one side, change the other.
+
+**A type name declared at several ARITIES is now split** the way .NET splits
+it: `IOpReader<'D>` and `IOpReader<'S,'D>` are `IOpReader` and `IOpReader`2`.
+The first arity seen keeps the plain name; a use's WRITTEN type arguments
+pick the variant, a bare constructor call chooses by argument fit across all
+variants, and Lower learns a decl's decorated name via a `$tyname:` marker.
+Same-name-same-arity across MODULES still merges — the port renames those
+when private (see DIVERGENCES.md).
+
+**A constructor scheme quantifies its DECLARED parameters first.** freeVars
+order is encounter order, and `H<'S, 'D>(x : voption<W<'D>>, ...)` meets 'D
+first — while the explicit application `H<'S, 'D>(...)` pins positionally
+against scheme order. Crossed pins collapsed 'S into 'D, every History
+constructor read Traceable<'a, 'a>, and NOTHING errored at the declaration —
+it surfaced as "no constructor accepts these arguments" at every call.
 
 **Types are keyed by BARE NAME**, so `IVal` and `IVal<'T>` share one entry.
 `and IVal<'T> = inherit IVal` therefore recorded a type as its own base, and
