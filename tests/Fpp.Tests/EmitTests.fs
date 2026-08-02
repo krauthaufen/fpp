@@ -1910,3 +1910,28 @@ let refCellTests =
             Expect.equal out "6\n7\n42\n6\n" "the cell keeps its identity, the parameter reads through"
         }
     ]
+
+[<Tests>]
+let arraySliceTests =
+    testList "array slices" [
+        test "read a range, and write one" {
+            // `a.[lo..hi]` and `dst.[lo..hi] <- src`. The write has to be
+            // recognised BEFORE the target is lowered: lowering it reads the
+            // slice, and a read is not a place to write to.
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let go ="
+                    "    let src = [| 10; 20; 30; 40; 50 |]"
+                    "    let part = src.[1..3]"
+                    "    printfn \"%d %d %d\" part.Length part.[0] part.[2]"
+                    "    let dst = Array.zeroCreate 5"
+                    "    dst.[1..3] <- part"
+                    "    printfn \"%d %d %d %d\" dst.[0] dst.[1] dst.[3] dst.[4]"
+                    "    let words = [| \"a\"; \"b\"; \"c\" |]"
+                    "    let w = words.[0..1]"
+                    "    printfn \"%s%s\" w.[0] w.[1]"
+                    "" ])
+            Expect.equal out "3 20 40\n0 20 40 0\nab\n" "packed and reference elements alike"
+        }
+    ]

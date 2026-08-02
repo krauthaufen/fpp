@@ -319,6 +319,72 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 Some (EIfaceCall (owner, name, recv, args))
             | _ -> Some (EApp (memberFn t d, recv :: args))
 
+    /// `dst.[lo..hi]` as an assignment TARGET: the array, the element kind
+    /// and the two ends, straight from the syntax.
+    let sliceTargetOf (l : GreenNode) : (string * GreenNode * GreenNode * GreenNode) option =
+        if l.NodeKind <> DotExpr then None
+        else
+            match nodesOf l |> List.tryFind (fun m -> m.NodeKind = ListExpr) with
+            | None -> None
+            | Some ix ->
+                match Green.tokens (GNode ix) |> List.tryHead with
+                | Some br when (dictTryFind fieldOwners br.Offset) = Some "$slice" ->
+                    (match nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind) with
+                     | [ rng ] ->
+                         (match nodesOf rng |> List.filter (fun m -> isExprish m.NodeKind),
+                                nodesOf l |> List.tryHead with
+                          | [ lo; hi ], Some arr ->
+                              let nm =
+                                  match dictTryFind arrKinds br.Offset with
+                                  | Some k -> k
+                                  | None -> ""
+                              Some (nm, arr, lo, hi)
+                          | _ -> None)
+                     | _ -> None)
+                | _ -> None
+
+    /// `a.[lo..hi]` — build an array of the range and copy into it. There is
+    /// no slice primitive; a counted loop is what one would be.
+    let sliceRead (off : int) (kind : string) (src : Expr) (lo : Expr) (hi : Expr) : Expr =
+        let ish = mono (TCon ("int", []))
+        let anon = mono (TCon ("?", []))
+        let loV = { Path = path; Offset = off + 19000000; Name = "_slo" }
+        let srcV = { Path = path; Offset = off + 19100000; Name = "_ssrc" }
+        let nV = { Path = path; Offset = off + 19200000; Name = "_sn" }
+        let dstV = { Path = path; Offset = off + 19300000; Name = "_sdst" }
+        let iV = { Path = path; Offset = off + 19400000; Name = "_si" }
+        ELet (false, srcV, anon, src,
+          ELet (false, loV, ish, lo,
+            ELet (false, nV, ish, EPrim ("+", [ EPrim ("-", [ hi; EVar (loV, ish) ]); ELit (LInt "1") ]),
+              ELet (false, dstV, anon, EArrayCreate (kind, EVar (nV, ish), EIndex (kind, EVar (srcV, anon), EVar (loV, ish))),
+                ELet (false, iV, ish, ELit (LInt "0"),
+                  ESeq [ EWhile (EPrim ("<", [ EVar (iV, ish); EVar (nV, ish) ]),
+                           ESeq [ EIndexSet (kind, EVar (dstV, anon), EVar (iV, ish),
+                                             EIndex (kind, EVar (srcV, anon),
+                                                     EPrim ("+", [ EVar (loV, ish); EVar (iV, ish) ])))
+                                  EAssign (iV, EPrim ("+", [ EVar (iV, ish); ELit (LInt "1") ])) ])
+                         EVar (dstV, anon) ])))))
+
+    /// `dst.[lo..hi] <- src` — the same loop, the other way round.
+    let sliceWrite (off : int) (kind : string) (dst : Expr) (lo : Expr) (hi : Expr) (src : Expr) : Expr =
+        let ish = mono (TCon ("int", []))
+        let anon = mono (TCon ("?", []))
+        let dstV = { Path = path; Offset = off + 19500000; Name = "_wdst" }
+        let srcV = { Path = path; Offset = off + 19600000; Name = "_wsrc" }
+        let loV = { Path = path; Offset = off + 19700000; Name = "_wlo" }
+        let nV = { Path = path; Offset = off + 19800000; Name = "_wn" }
+        let iV = { Path = path; Offset = off + 19900000; Name = "_wi" }
+        ELet (false, dstV, anon, dst,
+          ELet (false, srcV, anon, src,
+            ELet (false, loV, ish, lo,
+              ELet (false, nV, ish, EPrim ("+", [ EPrim ("-", [ hi; EVar (loV, ish) ]); ELit (LInt "1") ]),
+                ELet (false, iV, ish, ELit (LInt "0"),
+                  EWhile (EPrim ("<", [ EVar (iV, ish); EVar (nV, ish) ]),
+                    ESeq [ EIndexSet (kind, EVar (dstV, anon),
+                                      EPrim ("+", [ EVar (loV, ish); EVar (iV, ish) ]),
+                                      EIndex (kind, EVar (srcV, anon), EVar (iV, ish)))
+                           EAssign (iV, EPrim ("+", [ EVar (iV, ish); ELit (LInt "1") ])) ]))))))
+
     /// `try body finally fin` needs no node of its own: catching everything,
     /// running the finalizer and rethrowing IS the semantics, and the
     /// finalizer on the normal path completes it. It is emitted twice — only
@@ -1102,6 +1168,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           match propSetter with
                            | Some (sd, recv) ->
                                EApp (EVar (varIdOf sd, schemeOf sd), [ recv; lowerExpr (GNode r) ])
+                           | None ->
+                          // `dst.[lo..hi] <- src` has to be seen BEFORE the
+                          // target is lowered: lowering it reads the slice,
+                          // and a read is not a place to write to
+                          match sliceTargetOf l with
+                           | Some (nm, arrNode, lo, hi) ->
+                               sliceWrite (offsetOf n) nm (lowerExpr (GNode arrNode))
+                                          (lowerExpr (GNode lo)) (lowerExpr (GNode hi))
+                                          (lowerExpr (GNode r))
                            | None ->
                           match lowerExpr (GNode l) with
                            | EVar (v, _) -> EAssign (v, lowerExpr (GNode r))
@@ -1890,7 +1965,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some (_, d) -> Some (memberFn t d)
                               | None -> None)
                          | None -> None
+                     let isSlice =
+                         match Green.tokens (GNode ix) |> List.tryHead with
+                         | Some br -> (dictTryFind fieldOwners br.Offset) = Some "$slice"
+                         | None -> false
                      (match indexer, idx with
+                      | _, [ EPrim ("..", [ lo; hi ]) ] when isSlice ->
+                          // `a.[lo..hi]` — a fresh array of the range, copied
+                          sliceRead (offsetOf n) nm (lowerExpr (GNode lhs)) lo hi
                       | Some fn, [ i ] -> EApp (fn, [ lowerExpr (GNode lhs); i ])
                       | _, [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")

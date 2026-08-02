@@ -779,6 +779,9 @@ type ByRefCell<'a> = { mutable Value : 'a }
 type byref<'a> = ByRefCell<'a>
 type outref<'a> = ByRefCell<'a>
 type Ref<'a> = ByRefCell<'a>
+/// `ref` is a type AND a function, as it is in F#: `ref<int>` is the cell's
+/// type and `ref 5` makes one.
+type ref<'a> = ByRefCell<'a>
 let ref (value : 'a) : Ref<'a> = { Value = value }
 
 

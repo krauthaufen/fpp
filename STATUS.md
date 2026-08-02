@@ -7,9 +7,9 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-646 tests
+647 tests
 corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1616872 bytes, byte-identical
+self-host fixpoint 1622242 bytes, byte-identical
 ```
 
 ## What we are working towards
@@ -490,6 +490,16 @@ change — but the change was already COMMITTED, so "before" included it. The
 right check is to disable the suspect and re-run, which took one build and
 found the cause immediately.
 
+## Array slices
+
+`a.[lo..hi]` and `dst.[lo..hi] <- src`. Three uses in the whole library, and
+they only surfaced once `ref` typed — before that the enclosing function was
+untyped and the slice was never reached, which is the pattern all day: a fix
+does not move the frontier so much as reveal the next thing.
+
+The write has to be recognised BEFORE its target is lowered. Lowering the
+target reads the slice, and a read is not a place to write to.
+
 ## Where it stops now
 
-Re-measuring after `ref` landed.
+Re-measuring after slices landed.

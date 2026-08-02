@@ -2645,7 +2645,35 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match prune (exprType (GNode m)) with
                         | TCon ("list", [ e ]) -> idxTy <- e
                         | _ -> ()
+                // `a.[lo..hi]` is a SLICE: the bracket holds a range and the
+                // result is an array, not an element
+                let isSlice =
+                    nodesOf n
+                    |> List.filter (fun m -> m.NodeKind = ListExpr)
+                    |> List.exists (fun ix ->
+                        match nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind) with
+                        | [ one ] ->
+                            one.NodeKind = BinaryExpr
+                            && (one.Children |> List.exists (fun c ->
+                                    match c with
+                                    | GToken t -> t.Kind = Operator && t.Text = ".."
+                                    | _ -> false))
+                        | _ -> false)
                 (match lhsTy |> Option.map prune with
+                 | Some (TCon ("array", [ e ])) when isSlice ->
+                     (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
+                            |> Option.bind (fun ix -> Green.tokens (GNode ix) |> List.tryHead) with
+                      | Some br ->
+                          vecAdd arrKindsRaw (br.Offset, TCon ("array", [ e ]))
+                          dictSet arrIndexTargets br.Offset true
+                          vecAdd fieldOwnersRaw (br.Offset, "$slice")
+                      | None -> ())
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t ->
+                          vecAdd arrKindsRaw (t.Offset, TCon ("array", [ e ]))
+                          dictSet arrIndexTargets t.Offset true
+                      | None -> ())
+                     TCon ("array", [ e ])
                  | Some (TCon ("array", [ e ])) ->
                      // keyed by THIS index's bracket: `a.[i].[j]` has two
                      // index sites whose expressions start at the same token,
