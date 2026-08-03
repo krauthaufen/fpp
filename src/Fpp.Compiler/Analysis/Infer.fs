@@ -3690,13 +3690,28 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // List<'T> with` adds members to ResizeArray, because that is what
         // `List` is — F# reads it the same way, and attaching them to the
         // alias instead left the members on a type nothing has.
+        //
+        // But NOT for the abbreviation's OWN declaration. The pre-scan
+        // registers abbreviations before this runs, so `type MultiSetMap =
+        // HashMap<'k, HashSet<'v>>` found ITSELF here, took the name
+        // `HashMap`, and re-registered the alias under it — after which
+        // every `HashMap<K, V>` in the project expanded with a HashSet
+        // wrapped around its value type.
+        let isAbbreviation =
+            not (nodesOf n
+                 |> List.exists (fun m ->
+                     m.NodeKind = UnionCase || m.NodeKind = RecordRepr
+                     || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl))
+            && (nodesOf n |> List.exists (fun m -> isTypeKind m.NodeKind))
         let plain =
-            match dictTryFind aliases written with
-            | Some (_, body) ->
-                (match prune body with
-                 | TCon (target, _) -> target
-                 | _ -> written)
-            | None -> written
+            if isAbbreviation then written
+            else
+                match dictTryFind aliases written with
+                | Some (_, body) ->
+                    (match prune body with
+                     | TCon (target, _) -> target
+                     | _ -> written)
+                | None -> written
         // a name redeclared at a DIFFERENT arity is a DIFFERENT type — the
         // pre-sweep recorded every arity, so the decoration is known here
         let name = arityName plain (vecToList tyParams |> List.length)

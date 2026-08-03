@@ -547,41 +547,21 @@ The port script was stripping the attribute; it keeps it now.
 
 ## Where it stops now
 
-142 diagnostics over the 39 ported files, from 246 at the last commit and
-1,904 nominal at the start. What closed this stretch, each behind all three
-gates:
+77 diagnostics over the 39 ported files. The whole occurs-check family — 65
+errors — was ONE poisoned alias-table entry (see CLAUDE.md): the abbreviation
+`MultiSetMap = HashMap<'k, HashSet<'v>>` re-registered itself under
+`HashMap`, and every use of HashMap in the project expanded wrong. The
+"statics share the class's parameters" diagnosis recorded here earlier was
+WRONG — the untied hovers were this same poison viewed from another angle.
 
-* **Multi-arity type names** split as .NET splits them (`Name`N`) — layout
-  included, with constructors registered at predeclaration so an `and`
-  group's earlier members choose correctly, and Lower consulting inference's
-  member table (keyed by decorated receiver) before the resolver's.
-* **Function results widen covariantly** in argument positions — which is
-  also everything `#IOpReader<...>` in a declared callback result needs.
-* **Constructor schemes quantify declared parameters first** — the crossed
-  positional pin that collapsed History's 'State into 'Delta.
-* **`ignore` is a real prelude function** — passed as a value it lowered to
-  a stub that trapped.
+What remains is small and scattered:
 
-    29  the type HashSet<'a> would contain itself
-    16  HashSet<int> vs int
      4  StructTuple2<Index, 'a> vs Index * 'a
      4  Index vs int
+     3  ListTreeReader<'a> vs AdaptiveToken -> 'a     (ctor used as function)
+     3  SetTreeReader<'a> vs AdaptiveToken -> 'a
+    ~12 IAdaptiveValue`1 vs concrete impls           (interface widening)
     ...
-
-### The next cause, diagnosed but not fixed
-
-The occurs-check family traces to STATIC members of generic classes sharing
-the class's type-parameter objects. `ToASetReader<'Key, 'Value>` has a
-`static member DeltaMapping`; its lambda's `oldState : HashMap<'Key, 'Value>`
-hovers as `HashMap<'a, HashSet<'b>>` — some OTHER site's use of a static on
-this class unified the class-level 'Value with its own HashSet, permanently,
-and every later use at a different element type hits the occurs check. The
-same signature shows in `CountingHashSet.trace` hovering as
-`Traceable<CountingHashSet<'a>, HashSetDelta<'b>>` — 'a and 'b UNRELATED
-where the declaration ties them. A static has no receiver to supply the
-class parameters, so whether its scheme quantifies them decides everything;
-the paths disagree. Diagnose with hovers before touching: the pin that
-looks wrong may be three uses away.
 
 ## Compiling is not the same as running
 

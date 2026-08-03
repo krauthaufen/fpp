@@ -12,7 +12,7 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 657 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 658 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
 ```
@@ -225,6 +225,16 @@ the member walk never ended — a SHALLOW stack at 100% CPU, because the
 recursion is a tail call. Both the record and the walk now refuse a cycle.
 The same conflation still merges a nested private `Traceable<'T>` with a
 global `Traceable<'S,'D>`; keying by name AND arity is the real fix.
+
+**The extension-on-an-alias remap must not fire for the abbreviation's own
+declaration.** Abbreviations are pre-registered before declarations are
+walked, so `type MultiSetMap<'k,'v> = HashMap<'k, HashSet<'v>>` found ITSELF
+in the alias table, took the name `HashMap`, and re-registered the alias
+under it — after which every `HashMap<K, V>` in the project expanded with a
+HashSet around its value type. Sixty-five diagnostics from one poisoned
+entry, and none of them pointed anywhere near it. The tell was a HOVER on a
+parameter disagreeing with its own written annotation — when those disagree,
+suspect the alias table first.
 
 There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
 and Lower. Each one is this question — first or last — and each is right

@@ -330,11 +330,41 @@ let ceScalingTests =
                 Expect.isEmpty r.Diagnostics "clean"
                 sw.ElapsedMilliseconds
             time 4 |> ignore                       // warm
-            let small = max 1L (time 8)
+            // FLOORED at 20ms: on an otherwise-busy machine the small case
+            // measures ~1ms and any scheduling hiccup on the big one blows a
+            // ratio test. Exponential cost is ~2^16 here — a floor this size
+            // cannot mask it.
+            let small = max 20L (time 8)
             let big = time 24
-            // exponential would be ~2^16 times slower; anything near linear
-            // stays far inside this
             Expect.isTrue (big < small * 40L)
                 (sprintf "8 yields %dms, 24 yields %dms — superlinear" small big)
+        }
+    ]
+
+[<Tests>]
+let abbreviationSelfRemapTests =
+    testList "an abbreviation does not rename itself" [
+        test "the aliased type's own name stays clean" {
+            // `type MultiSetMap<'k, 'v> = HashMap<'k, Set<'v>>`: abbreviations
+            // are pre-registered, so the extension-on-an-alias remap found the
+            // abbreviation ITSELF, took the name `HashMap`, and re-registered
+            // the alias under it — after which every `HashMap<K, V>` in the
+            // project expanded with a Set wrapped around its value type.
+            let src = String.concat "\n" [
+                "module M"
+                "type HashMap<'k, 'v>(tag : int) ="
+                "    member x.Tag = tag"
+                "type Set<'v>(tag : int) ="
+                "    member x.Tag = tag"
+                "type MultiSetMap<'k, 'v> = HashMap<'k, Set<'v>>"
+                "let take (m : HashMap<int, string>) = m.Tag"
+                "" ]
+            let r = inferSrc src
+            Expect.isEmpty r.Diagnostics "clean"
+            let b = Fpp.Analysis.Resolve.resolve "test" (Fpp.Prelude.dictNew ()) (parse src).Root
+            let takeDef = b.Definitions |> List.find (fun d -> d.Name = "take")
+            let ts =
+                r.DefTypes |> List.tryPick (fun (off, _, t) -> if off = takeDef.Offset then Some t else None)
+            Expect.equal ts (Some "HashMap<int, string> -> int") "the parameter kept its written type"
         }
     ]
