@@ -463,3 +463,42 @@ the module alone breaks those references — which is why the greedy rule loses.
 
 This is a porting transformation and not a fix. The compiler should key types
 by their declaration, not their spelling; STATUS.md scopes what that takes.
+
+## LevelChangedException rides in a `Failure` message
+
+F++ has no user exception TYPES — `exn` is the prelude's closed DU. The
+library's one custom exception, `LevelChangedException of newLevel : int`,
+becomes `Failure ("!level:" + string n)`; two helpers (`isLevelMsg`,
+`levelOfMsg`) decode it at the catch sites. The helpers exist because a
+string METHOD on a catch-pattern binder (`msg.StartsWith`) does not resolve
+— an annotated top-level function does. `reraise()` becomes `raise e` with
+the exception bound by the handler.
+
+## `static val mutable` becomes `static let mutable`
+
+Same zero-initialized slot, a spelling the compiler lowers. A DU-typed one
+(`ValueOption<Transaction>`) initializes to its real empty case, because a
+NULL falls through an exhaustive `ValueSome/ValueNone` match; everything
+else takes `Unchecked.defaultof`. The private qualified self-references
+(`Transaction.RunningTransaction`) become bare reads — private means no
+reference outside the class exists.
+
+## Module-level generic VALUES are thunked
+
+`let empty<'T> = ...` compiles to one shared global initialized at program
+start at the UNIFORM representation — where a `'Key : comparison` body has
+no instance to call. The port writes `let empty<'T> () = ...` and turns
+every read into a call, which the monomorphizer stamps per instantiation —
+the same treatment the generic classes' `static let empty` got.
+
+## Identity hash is spelled `hash`
+
+`RuntimeHelpers.GetHashCode` is .NET's reference-identity hash; F++'s
+`hash` on a class that declares no `GetHashCode` override IS the identity
+hash. An override that only says so (`Real`'s) is dropped: it restates the
+default.
+
+## `List<T>` is spelled `ResizeArray<T>`
+
+One type, the prelude's name for it. The `type List<'T> with` heap-order
+extensions become `type ResizeArray<'T> with`.

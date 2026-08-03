@@ -247,6 +247,18 @@ let private charCode (raw : string) : int =
         let bs = unescape raw
         if bs.Length > 0 then int bs.[0] else 0
 
+/// "12" -> Some 12; anything with a non-digit (or empty) -> None. Spelled
+/// out because the compiler compiles ITSELF: System.Int32.TryParse is not in
+/// the subset, and a stubbed helper took the whole emitter down at startup.
+let private parseDigits (s : string) : int option =
+    if strLen s = 0 then None
+    else
+        let mutable ok = true
+        for i in 0 .. strLen s - 1 do
+            let c = charAt s i
+            if c < '0' || c > '9' then ok <- false
+        if ok then Some (int s) else None
+
 /// A local becomes a cell when it is let-bound, assigned somewhere, and
 /// mentioned inside a lambda. The test is per BINDING, so every read and
 /// write agrees on the representation. (Port of the text emitter's cellScan.)
@@ -264,6 +276,15 @@ let private cellScan (decls : Decl list) : Dict<string * int, bool> * Dict<strin
             dictSet assigned (v.Path, v.Offset) true
             if depth > 0 then dictSet inLambda (v.Path, v.Offset) true
             g x
+        | ELet (_, v, _, EApp (EUnknown "$forcecell", [ r ]), b) ->
+            // class-level `let mutable`: the instance field will hold the
+            // CELL, so this binding is a cell no matter what the capture
+            // analysis would say
+            dictSet letBound (v.Path, v.Offset) true
+            dictSet assigned (v.Path, v.Offset) true
+            dictSet inLambda (v.Path, v.Offset) true
+            g r
+            g b
         | ELet (_, v, _, r, b) ->
             dictSet letBound (v.Path, v.Offset) true
             g r
@@ -556,6 +577,7 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
         elif t.EndsWith "f" || t.EndsWith "F" then "s"
         else "f"
     | ELit (LInt t) -> if t.EndsWith "L" then "l" else "i"
+    | EUnknown n when n.StartsWith "$sizeof:" -> "i"
     | EPrim (op, _) when
         op.Length > 1 && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
         let k = op.Substring (op.Length - 1)
@@ -599,6 +621,17 @@ let private scanTupleArities (decls : Decl list) : int list =
     let rec scan (e : Expr) : unit =
         match e with
         | ETuple xs -> note (List.length xs); List.iter scan xs
+        // uniform-representation struct tuples emit as boxed tuples, so
+        // their arity needs a $tupN type too
+        | ERecord (tn, fs) when tn.StartsWith "StructTuple" ->
+            note (List.length fs)
+            for _, v in fs do scan v
+        | EField (r, fn2, owner) when owner.StartsWith "StructTuple" && fn2.StartsWith "Item" ->
+            let core = (if owner.Contains "$<" then owner.Substring (0, owner.IndexOf "$<") else owner).Substring 11
+            (match parseDigits core with
+             | Some v -> note v
+             | None -> ())
+            scan r
         | ELam (_, b) -> scan b
         | ELet (_, _, _, r, b) -> scan r; scan b
         | EMatch (sc, cs) ->
@@ -1180,6 +1213,22 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | ELit LUnit ->
         ic f 0
         refI31 f
+    | EUnknown n when n.StartsWith "$sizeof:" ->
+        // the byte size of the named type, from the SAME tables the layouts
+        // come from: primitives at C's widths, a POD struct at its computed
+        // layout size, any reference at pointer width
+        let tn = n.Substring 8
+        let size =
+            match tn with
+            | "byte" | "sbyte" | "bool" -> 1
+            | "char" | "int16" | "uint16" | "float16" -> 2
+            | "int" | "uint32" | "float32" -> 4
+            | "int64" | "uint64" | "float" -> 8
+            | _ ->
+                match dictTryFind st.Pod tn with
+                | Some (_, sz, _) -> sz
+                | None -> 8
+        emitNode st f lv (ELit (LInt (string size)))
     | ELit LNull -> refNull f "any"
     | ELit (LString raw) ->
         let bytes = unescape raw
@@ -1227,7 +1276,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              refNull f "any"
              gcT f "struct.new" "$clo"
          | _ ->
-             err st ("binary: unbound variable " + v.Name)
+             err st ("binary: unbound variable " + v.Name + " @" + v.Path + ":" + string v.Offset)
              refNull f "any")
     | ELet (_, _, _, _, _) ->
         // the let spine, iteratively, exactly like the text emitter
@@ -1446,11 +1495,24 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                      | None ->
                          match baseRn with
                          | Some bn when i < baseLen ->
+                             // cast to the TOPMOST ancestor declaring slot i:
+                             // an instantiation subclass's base value is the
+                             // ORIGINAL base class's instance, not the
+                             // template's — the shared prefix is what makes
+                             // the index valid, so name the type that owns it
+                             let rec ancestorFor (t : string) : string =
+                                 match dictTryFind st.BaseOf t with
+                                 | Some p ->
+                                     (match dictTryFind st.FieldsOf p with
+                                      | Some o when i < o.Length -> ancestorFor p
+                                      | _ -> t)
+                                 | None -> t
+                             let tn = ancestorFor bn
                              lg f bl
-                             gcT f "ref.cast" ("$r_" + bn)
-                             gcTF f "struct.get" ("$r_" + bn) i
+                             gcT f "ref.cast" ("$r_" + tn)
+                             gcTF f "struct.get" ("$r_" + tn) i
                          | Some _ ->
-                             err st ("binary: missing field " + fname + " in " + rn)
+                             err st ("binary: missing field " + fname + " in " + rn + " (have " + String.concat "," (fields |> List.map fst) + ")")
                              refNull f "any"
                          | None ->
                              lg f bl
@@ -1768,7 +1830,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv cs
         callf f "$strTrimEndChars"
     | EIfaceCall (iface, mname, recv, args) ->
-        (match dictTryFind st.SlotOf (iface, mname) with
+        (match dictTryFind st.SlotOf ((match iface.IndexOf '`' with | i when i > 0 -> iface.Substring (0, i) | _ -> iface), mname) with
          | Some slot ->
              let t = freshLocal f "$dv" "anyref"
              let ft = "$v" + string (1 + List.length args)
@@ -2057,6 +2119,32 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f (if pd.StartsWith "pad0#" then 48 else 32)
         ic f (if pd.StartsWith "padl#" then 1 else 0)
         callf f "$strPad"
+    | EApp (EUnknown "$forcecell", [ r ]) ->
+        // marker only: the ELet's own cell-wrapping does the rest
+        emitNode st f lv r
+    | EApp (EUnknown "$cellof", [ EVar (v, _) ]) ->
+        // the CELL itself, not its contents — what the instance field stores
+        (match dictTryFind lv (v.Path, v.Offset) with
+         | Some l when l.StartsWith "@env:" ->
+             lg f "$env"
+             gcT f "ref.cast" "$arr"
+             ic f (int (l.Substring 5))
+             gcT f "array.get" "$arr"
+         | Some l -> lg f l
+         | None ->
+             err st ("binary: $cellof outside the constructor: " + v.Name)
+             refNull f "any")
+    | EApp (EUnknown "$cellget", [ inner ]) ->
+        emitNode st f lv inner
+        gcT f "ref.cast" "$cell"
+        gcTF f "struct.get" "$cell" 0
+    | EApp (EUnknown "$cellset", [ target; value ]) ->
+        emitNode st f lv target
+        gcT f "ref.cast" "$cell"
+        emitNode st f lv value
+        gcTF f "struct.set" "$cell" 0
+        ic f 0
+        refI31 f
     | EApp (EUnknown "compare", [ a; b ]) ->
         emitNode st f lv a
         emitNode st f lv b
@@ -2619,6 +2707,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ins f "i64.lt_s"
         ins f "select"
         callf f "$ofl"
+    | ERecord (tyName, fields) when
+          tyName.StartsWith "StructTuple"
+          && not (dictTryFind st.FieldsOf tyName).IsSome
+          && fields |> List.forall (fun (fn, _) -> fn.StartsWith "Item") ->
+        // uniform-representation struct tuple: build the boxed tuple
+        let ordered = fields |> List.sortBy (fun (fn, _) -> int (fn.Substring 4))
+        for _, v in ordered do emitNode st f lv v
+        gcT f "struct.new" ("$tup" + string (List.length ordered))
     | ERecord (tyName, fields) ->
         let rn =
             if tyName <> "" && tyName <> "?" && (dictTryFind st.FieldsOf tyName).IsSome then tyName
@@ -2637,7 +2733,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                       ic f 0
                       refI31 f
                   | None ->
-                      err st ("binary: missing field " + fname + " in " + rn)
+                      err st ("binary: missing field " + fname + " in " + rn + " (have " + String.concat "," (fields |> List.map fst) + ")")
                       refNull f "any")
              gcT f "struct.new" ("$r_" + rn)
          | None ->
@@ -2677,6 +2773,22 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         // strings and every array representation
         emitNode st f lv r
         callf f "$lenv"
+    | EField (r, fname, owner) when
+          owner.StartsWith "StructTuple" && fname.StartsWith "Item"
+          && not (dictTryFind st.FieldIdx (owner, fname)).IsSome ->
+        // a struct tuple at the UNIFORM representation (an unstamped
+        // template, or a canonical all-reference instantiation): it is laid
+        // out as the boxed tuple, so read it as one. Falling through to the
+        // by-field-name owner guess picked WHATEVER record declares ItemN.
+        let arity =
+            let core = (if owner.Contains "$<" then owner.Substring (0, owner.IndexOf "$<") else owner).Substring 11
+            (match parseDigits core with
+             | Some v -> v
+             | None -> 2)
+        let idx = (int (fname.Substring 4)) - 1
+        emitNode st f lv r
+        gcT f "ref.cast" ("$tup" + string arity)
+        gcTF f "struct.get" ("$tup" + string arity) idx
     | EField (r, fname, owner) ->
         let rn =
             if owner <> "" && (dictTryFind st.FieldIdx (owner, fname)).IsSome then owner
@@ -3114,15 +3226,19 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         // numeric one — uniform boxing means a zero int is `ref.i31 0`, not
         // null. So the zero is spelled per element kind and filled by
         // array.new.
+        // NUMERIC kinds get their boxed zero; EVERYTHING else — a class, a
+        // record, a DU, a type variable — is a reference and its zero is
+        // NULL. (An i31 zero in a class-element array made `isNull` false
+        // and the first field read a cast failure.)
         (match nm with
          | "float" | "float32" | "double" | "single" ->
              fc f 0L
              gcT f "struct.new" "$boxf"
-         | "string" | "obj" | "" -> refNull f "any"
-         | _ when strLen nm > 0 && charAt nm 0 = '\'' -> refNull f "any"
-         | _ ->
+         | "int" | "uint32" | "int64" | "uint64" | "int16" | "uint16"
+         | "byte" | "sbyte" | "char" | "bool" ->
              ic f 0
-             refI31 f)
+             refI31 f
+         | _ -> refNull f "any")
         emitNode st f lv n
         callf f "$toi"
         gcT f "array.new" "$arr"
@@ -3504,8 +3620,105 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
 /// Emit, and report where each piece of code came from. `mapUrl` is written
 /// into a `sourceMappingURL` custom section when non-empty — a debugger reads
 /// it to find the map, and it changes the bytes, so it stays opt-in.
+/// One LAYOUT, one NAME. A record instantiation is named by its arguments,
+/// but every REFERENCE argument shares the uniform representation — so
+/// `StructTuple2$<int.IAdaptiveObject>` and the canonical template's
+/// `StructTuple2$<int.#34665>` are the same layout and must be the same
+/// wasm type. Reference and symbolic arguments canonicalize to `obj`;
+/// primitives and struct arguments (recursively canonicalized) keep their
+/// names, because those DO change the layout.
+let private canonRecordNames (decls : Decl list) : Decl list =
+    let prims =
+        [ "int"; "uint32"; "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
+          "char"; "bool"; "float"; "float32"; "float16"; "double"; "single"; "obj"; "$ref" ]
+    let structBases = dictNew<string, bool> ()
+    for d in decls do
+        match d with
+        | DRecord (n, _, _, true) ->
+            let b = match n.IndexOf "$<" with | i when i > 0 -> n.Substring (0, i) | _ -> n
+            dictSet structBases b true
+        | _ -> ()
+    let splitArgs (inner : string) : string list =
+        let args = vecNew<string> ()
+        let cur = vecNew<string> ()
+        let mutable depth = 0
+        for c in inner do
+            if c = '<' then depth <- depth + 1; vecAdd cur (string c)
+            elif c = '>' then depth <- depth - 1; vecAdd cur (string c)
+            elif c = '.' && depth = 0 then
+                vecAdd args (String.concat "" (vecToList cur))
+                vecClear cur
+            else vecAdd cur (string c)
+        if vecLen cur > 0 then vecAdd args (String.concat "" (vecToList cur))
+        vecToList args
+    let rec canonName (n : string) : string =
+        let i = n.IndexOf "$<"
+        if i < 0 || not (n.EndsWith ">") then n
+        else
+            let b = n.Substring (0, i)
+            let args = splitArgs (n.Substring (i + 2, n.Length - i - 3))
+            b + "$<" + String.concat "." (args |> List.map canonArg) + ">"
+    and canonArg (a : string) : string =
+        if List.contains a prims then a
+        elif a.StartsWith "#" then "obj"
+        else
+            let b = match a.IndexOf "$<" with | i when i > 0 -> a.Substring (0, i) | _ -> a
+            if (dictTryFind structBases b).IsSome then canonName a else "obj"
+    let cn (n : string) = if n.Contains "$<" then canonName n else n
+    let rec cx (e : Expr) : Expr =
+        match e with
+        | ERecord (n, fs) -> ERecord (cn n, fs |> List.map (fun (k, v) -> k, cx v))
+        | ERecordExt (n, b, fs) -> ERecordExt (cn n, cx b, fs |> List.map (fun (k, v) -> k, cx v))
+        | EField (r, f2, o) -> EField (cx r, f2, cn o)
+        | EFieldSet (r, f2, o, v) -> EFieldSet (cx r, f2, cn o, cx v)
+        | ECast (t, x, d) -> ECast (cn t, cx x, d)
+        | ETypeTest (t, x) -> ETypeTest (cn t, cx x)
+        | ELam (ps, b) -> ELam (ps, cx b)
+        | EApp (g, args) -> EApp (cx g, List.map cx args)
+        | ELet (rc, v, s2, r, b) -> ELet (rc, v, s2, cx r, cx b)
+        | EIf (a, b, c) -> EIf (cx a, cx b, cx c)
+        | EMatch (sc, cs) -> EMatch (cx sc, cs |> List.map (fun (p2, g, b) -> p2, Option.map cx g, cx b))
+        | ETry (b, cs) -> ETry (cx b, cs |> List.map (fun (p2, g, x) -> p2, Option.map cx g, cx x))
+        | ETuple xs -> ETuple (List.map cx xs)
+        | EListLit xs -> EListLit (List.map cx xs)
+        | ESeq xs -> ESeq (List.map cx xs)
+        | EPrim (op, xs) -> EPrim (op, List.map cx xs)
+        | ECtor (n2, s2, xs) -> ECtor (n2, s2, List.map cx xs)
+        | EWhile (c, b) -> EWhile (cx c, cx b)
+        | EAssign (v, x) -> EAssign (v, cx x)
+        | EArray (n2, xs) -> EArray (n2, List.map cx xs)
+        | EIndex (n2, a, i2) -> EIndex (n2, cx a, cx i2)
+        | EIndexSet (n2, a, i2, v) -> EIndexSet (n2, cx a, cx i2, cx v)
+        | EArrayLen (n2, a) -> EArrayLen (n2, cx a)
+        | EArrayCreate (n2, a, b) -> EArrayCreate (n2, cx a, cx b)
+        | EArrayPin (n2, a) -> EArrayPin (n2, cx a)
+        | EArrayUnpin (n2, a) -> EArrayUnpin (n2, cx a)
+        | EArrayBytes (n2, a) -> EArrayBytes (n2, cx a)
+        | EIfaceCall (i2, m2, r, args) -> EIfaceCall (i2, m2, cx r, List.map cx args)
+        | other -> other
+    let seenRec = dictNew<string, bool> ()
+    decls
+    |> List.choose (fun d ->
+        match d with
+        | DRecord (n, ps, fs, stf) ->
+            let n2 = cn n
+            if (dictTryFind seenRec n2).IsSome then None
+            else
+                dictSet seenRec n2 true
+                // field TYPE names: canonicalize only STRUCT-based ones —
+                // they name a layout; a reference-typed field is "r" either
+                // way and its name is never cast against
+                let cfs =
+                    fs |> List.map (fun (f2, t) ->
+                        let b = match t.IndexOf "$<" with | i when i > 0 -> t.Substring (0, i) | _ -> t
+                        if (dictTryFind structBases b).IsSome then f2, cn t else f2, t)
+                Some (DRecord (n2, ps, cfs, stf))
+        | DLet (rc, v, sch, e) -> Some (DLet (rc, v, sch, cx e))
+        | other -> Some other)
+
 let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         : byte[] * string list * string list * (int * string * int) list =
+    let decls = canonRecordNames decls
     // a DEBUG build carries the shadow stack that makes a guest-visible
     // stack trace possible; a plain one pays nothing for it
     let debugBuild = mapUrl <> ""
@@ -3536,6 +3749,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // ---- class machinery tables (pure, over the decls) ---------------------
     let classDecls = decls |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
     let classImpls = classDecls |> List.map (fun (n, _, _, impls) -> n, impls)
+
     let isClassName (n : string) = classDecls |> List.exists (fun (cn, _, _, _) -> cn = n)
     let baseOf (n : string) = classDecls |> List.tryPick (fun (cn, b, _, _) -> if cn = n then b else None)
     let ownMembersOf (n : string) = classDecls |> List.tryPick (fun (cn, _, own, _) -> if cn = n then Some own else None)
@@ -3548,9 +3762,17 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
         if List.isEmpty derived then [ n ] else derived
     let interfaceDecls = decls |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
+    // slot keys use the BARE interface name: an impl clause, a dispatch site
+    // and the declaration spell the arity differently (`aval`,
+    // `IAdaptiveValue<'T>`, IAdaptiveValue`1) and every spelling must land in
+    // one slot
+    let bareIface (n : string) =
+        match n.IndexOf '`' with
+        | i when i > 0 -> n.Substring (0, i)
+        | _ -> n
     let vtableSlots =
-        ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> i, mn)))
-         @ (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> i, mn)))))
+        ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
+         @ (classImpls |> List.collect (fun (_, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))))
         |> List.distinct
         |> List.sort
     let slotImpl (cn : string) (owner : string) (mn : string) : VarId option =
@@ -3560,7 +3782,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 classDecls
                 |> List.tryPick (fun (n2, _, _, impls) ->
                     if n2 <> c then None
-                    else impls |> List.tryPick (fun (i, ms) -> if i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+                    else impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
         match fromIface with
         | Some v -> Some v
         | None ->
@@ -3695,13 +3917,15 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         |> List.distinct
     for ifn in ifaceNames do
         dictSet st.IfaceName ifn true
+        dictSet st.IfaceName (bareIface ifn) true
         let impls =
             classImpls
-            |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> i = ifn))
+            |> List.filter (fun (_, impls) -> impls |> List.exists (fun (i, _) -> bareIface i = bareIface ifn))
             |> List.collect (fun (cn, _) -> subclassesOf cn)
             |> List.distinct
             |> List.filter isObjRecord
         dictSet st.ImplsOf ifn impls
+        dictSet st.ImplsOf (bareIface ifn) impls
     // functions reachable through a vtable keep the canonical all-anyref
     // signature — that IS the dispatch contract, so no specialization
     let ifaceImplKeys =
@@ -4090,6 +4314,15 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 match dictTryFind st.SigKinds (v.Path, v.Offset) with
                 | Some (p, r) -> p, r
                 | None -> (ps |> List.map (fun _ -> "u")), "u"
+            // a capped stamp's scheme can disagree with the lambda's own
+            // parameter list. Its CALLERS read SigKinds, so the header must
+            // keep them agreeing with itself is impossible — the whole
+            // function becomes an unreachable STUB instead: it only exists
+            // because a poisoned vtable materialized it, and no real path
+            // calls it.
+            let poisoned = List.length pks <> List.length ps
+            let pks = if poisoned then ps |> List.map (fun _ -> "u") else pks
+            let body = if poisoned then EUnknown "poisoned stamp" else body
             let paramKinds =
                 List.zip ps pks
                 |> List.choose (fun ((pv : VarId, _), k) ->

@@ -61,7 +61,7 @@ def drop_fable_interop(src):
 # Files with no port, only a REPLACEMENT: what they provide is a runtime
 # service F++ does not have, and the replacement provides it another way.
 # `tests/adaptive-shims/<name>.fpp` is the substitute.
-REPLACED = {"ShallowEquality.fs": "ShallowEquality.fpp"}
+REPLACED = {"ShallowEquality.fs": "ShallowEquality.fpp", "Equality.fs": "Equality.fpp"}
 
 
 def rewrite_shallow_calls(src):
@@ -89,7 +89,7 @@ def strip_namespace_headers(src, first):
         if t.startswith("module ") and t.endswith(" =") is False and " " in t and first:
             pass
         out.append(line)
-    return "\n".join(out)
+    return chr(10).join(out)
 
 
 def dotnet_hashset(src):
@@ -166,6 +166,12 @@ def qualify_colliding_types(src):
     # take it to 245.
     decl = re.compile(r"^(\s*)(?:type|and)\s+private\s+"
                       r"([A-Za-z_][A-Za-z0-9_]*)\s*(?=[<(=])")
+    # any declaration, for collision detection between a module-nested type
+    # and a later TOP-LEVEL one of the same name (AVal.AbstractVal vs the
+    # public AbstractVal): there the NESTED one is renamed — its references
+    # all sit inside its module extent, the top-level one is the public API
+    decl_any = re.compile(r"^(\s*)(?:type|and)\s+(?:private\s+|internal\s+)?"
+                          r"([A-Za-z_][A-Za-z0-9_]*)\s*(?=[<(=])")
     modl = re.compile(r"^(\s*)module\s+(?:private\s+|internal\s+)?([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*$")
 
     def enclosing(ln, ind):
@@ -204,6 +210,25 @@ def qualify_colliding_types(src):
         if enc is not None:
             n = 1 + lines[i][d.end():].split(">")[0].count(",") if "<" in lines[i][d.end():d.end()+2] else 0
             renames.append((name, enc[0] + "_" + name, enc[1], enc[2], n))
+    # module-nested vs later top-level: rename the NESTED declaration
+    seen_any = {}
+    for i, l in enumerate(lines):
+        d = decl_any.match(l)
+        if not d:
+            continue
+        name = d.group(2)
+        if name in KEYWORDS:
+            continue
+        if name not in seen_any:
+            seen_any[name] = (i, len(d.group(1)))
+            continue
+        pi, pind = seen_any[name]
+        if len(d.group(1)) == 0 and pind > 0 and not any(r[0] == name for r in renames):
+            enc = enclosing(pi, pind)
+            if enc is not None:
+                dp = decl_any.match(lines[pi])
+                n = 1 + lines[pi][dp.end():].split(">")[0].count(",") if "<" in lines[pi][dp.end():dp.end()+2] else 0
+                renames.append((name, enc[0] + "_" + name, enc[1], enc[2], n))
 
     def arity_at(line, k):
         depth, commas, j = 0, 0, k
@@ -277,7 +302,7 @@ def rewrite_keyvalue_binders(src):
                 out.append("%s    let struct (v, _) = %s.Value" % (ind, kv))
             else:
                 out.append("%s    let %s = %s.Value" % (ind, vp, kv))
-    return "\n".join(out)
+    return chr(10).join(out)
 
 
 EXCISED = ["AdaptiveSynchronizationContext"]
@@ -315,9 +340,152 @@ SPOT = [
      "Dictionary"),
     ("System.Collections.Generic.MutableHashSet",
      "MutableHashSet"),
+    # the .NET comparer factory, as the Ordered typeclass: same decision,
+    # made at compile time
+    # a generic class's static-let initializer runs ONCE at program start
+    # with the parameter unresolved (see DIVERGENCES.md on generic values),
+    # so the comparer becomes a FUNCTION and every read a call
+    ("static let defaultComparer = LanguagePrimitives.FastGenericComparer<'Key>",
+     "static let defaultComparer () = { new IComparer<'Key> with member __.Compare(a : 'Key, b : 'Key) = compare a b }"),
+    ("static let empty = MapExt<'Key, 'Value>(defaultComparer, null)",
+     "static let empty () = MapExt<'Key, 'Value>(defaultComparer (), null)"),
+    ("let cmp = defaultComparer\n",
+     "let cmp = defaultComparer ()\n"),
+    # only MapExt's Empty reads the THUNKED empty; the FromSeq neighbour
+    # makes the site unique
+    ("    static member Empty = empty\n    static member FromSeq",
+     "    static member Empty = empty ()\n    static member FromSeq"),
+    # the other in-class reads of MapExt's thunked statics
+    ("            empty, None, x",
+     "            empty (), None, x"),
+    ("            x, None, empty\n",
+     "            x, None, empty ()\n"),
+    ("    static let empty = IndexList<'T>(Index.zero, Index.zero, MapExt.empty)",
+     "    static let empty () = IndexList<'T>(Index.zero, Index.zero, MapExt.empty)"),
+    ("    static member Empty = empty\n\n    /// The smallest Index",
+     "    static member Empty = empty ()\n\n    /// The smallest Index"),
+    ("    static let empty = IndexListDelta<'T>(MapExt.empty)\n    static member Empty = empty",
+     "    static let empty () = IndexListDelta<'T>(MapExt.empty)\n    static member Empty = empty ()"),
+    # typeof<'T>.IsValueType picks the null test; here a value type is
+    # boxed the moment it is 'T1, and a boxed value is never null — the
+    # reference arm is right for both
+    ("""    static let isNull =
+        if typeof<'T1>.IsValueType then fun (_o : 'T1) -> false
+        else fun (o : 'T1) -> isNull (o :> obj)""",
+     """    static let isNull = fun (o : 'T1) -> isNull (o :> obj)"""),
+    # IsAssignableFrom is reflection; the identity cast stands in, and a
+    # genuinely wrong cast surfaces at the use instead of as None here
+    ("""        static let cast =
+            if typeof<'b>.IsAssignableFrom typeof<'a> then
+                Some (fun (a : 'a) -> unbox<'b> a)
+            else
+                None""",
+     """        static let cast =
+            Some (fun (a : 'a) -> unbox<'b> a)"""),
+    # the generic zero, as the prelude's own class member
+    ("LanguagePrimitives.GenericZero", "Zero"),
+    # `static val mutable` storage, as a static let: AdaptiveObject is not
+    # generic, so the once-per-program initializer is exactly right
+    ("    static val mutable private CurrentEvaluationDepth : int",
+     "    static let mutable CurrentEvaluationDepth = 0"),
+    ("LanguagePrimitives.FastGenericComparer<'Key>",
+     "{ new IComparer<'Key> with member __.Compare(a : 'Key, b : 'Key) = compare a b }"),
+    ("LanguagePrimitives.FastGenericComparer",
+     "{ new IComparer<_> with member __.Compare(a, b) = compare a b }"),
     ("MutableHashSet<'T>(ReferenceEqualityComparer<'T>.Instance)",
      "MutableHashSet<'T>()"),
 ]
+
+# F++ has no user exception TYPES (exn is the prelude's closed DU), so
+# LevelChangedException rides in a Failure with an encoded message. The level
+# survives as "!level:N"; the catch sites decode it. See DIVERGENCES.md.
+LEVEL_EXC = [
+    # the prelude Dictionary has no comparer-taking constructor (F++ has no
+    # secondary ctors) and hashes structurally anyway
+    ("Dictionary<'B, int>(DefaultEqualityComparer<'B>.Instance)",
+     "Dictionary<'B, int>()"),
+
+    # RuntimeHelpers.GetHashCode is the reference-identity hash; F++'s `hash`
+    # on a class with no GetHashCode override IS the identity hash
+    ("let hash = RuntimeHelpers.GetHashCode value |> uint32",
+     "let hash = hash value |> uint32"),
+    # ... so an override SAYING identity is the default spelled out: drop it
+    ("        override x.GetHashCode() = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(x)\n",
+     ""),
+    ("        System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode (obj :> obj)",
+     "        hash obj"),
+
+    # a static let is in scope BARE inside its own class; the qualified spelling
+    # (AdaptiveObject.CurrentEvaluationDepth) lowers to an unknown field
+    ("with get() = AdaptiveObject.CurrentEvaluationDepth",
+     "with get() = CurrentEvaluationDepth"),
+    ("and set v = AdaptiveObject.CurrentEvaluationDepth <- v",
+     "and set v = CurrentEvaluationDepth <- v"),
+    # F++ has no reraise(); the catch binds the exception and raises it back
+    ("""            with _ ->
+                AdaptiveObject.UnsafeEvaluationDepth <- depth
+                Monitor.Exit x
+                reraise()""",
+     """            with e ->
+                AdaptiveObject.UnsafeEvaluationDepth <- depth
+                Monitor.Exit x
+                raise e"""),
+
+    ("""exception LevelChangedException of 
+    /// The new level for the top-level object.
+    newLevel : int""",
+     """// exception LevelChangedException -> encoded as Failure "!level:N": F++
+// has no user exception types; raise/catch sites decode the level.
+let internal isLevelMsg (msg : string) = msg.StartsWith "!level:"
+let internal levelOfMsg (msg : string) = int (msg.Substring 7)"""),
+    ("raise <| LevelChangedException(x.Level + depth)",
+     'raise (Failure ("!level:" + string (x.Level + depth)))'),
+    ("""                            with LevelChangedException newLevel ->""",
+     """                            with Failure msg when isLevelMsg msg ->
+                                let newLevel = levelOfMsg msg"""),
+    ("""                with :? LevelChangedException ->""",
+     """                with Failure msg when isLevelMsg msg ->"""),
+]
+
+
+def rewrite_bare_list(src):
+    """`List<...>` (System.Collections.Generic.List) IS ResizeArray, which is
+    the name the prelude declares it under -- one spelling, everywhere."""
+    return re.sub(r"\bList<", "ResizeArray<", src)
+
+
+def rewrite_static_val_mutable(src):
+    """`static val mutable private X : T` has no F++ lowering; a
+    `static let mutable X = Unchecked.defaultof<T>` is the same zero-initialized
+    slot. The private qualified self-references (Owner.X) become bare reads --
+    private means no reference exists outside the class. See DIVERGENCES.md."""
+    lines = src.split(chr(10))
+    renames = []
+    cur_type = None
+    for i, l in enumerate(lines):
+        m = re.match(r"\s*type\s+(?:internal\s+|private\s+)?(\w+)", l)
+        if m:
+            cur_type = m.group(1)
+        m = re.match(r"(\s*)static val mutable private (\w+) : (.+?)\s*$", l)
+        if m and cur_type:
+            ind, name, ty = m.groups()
+            # a NULL default falls through an exhaustive ValueSome/ValueNone
+            # match -- a DU-typed slot needs its real empty case
+            init = "ValueNone" if ty.startswith("ValueOption") else "Unchecked.defaultof<" + ty + ">"
+            lines[i] = ind + "static let mutable " + name + " : " + ty + " = " + init
+            renames.append((cur_type, name))
+    src = chr(10).join(lines)
+    for owner, name in renames:
+        src = re.sub(r"\b" + owner + r"\." + name + r"\b", name, src)
+    return src
+
+
+def rewrite_level_exception(src):
+    for old, new in LEVEL_EXC:
+        assert old in src, "LEVEL_EXC pattern missing: " + old[:60]
+        src = src.replace(old, new)
+    return src
+
 
 def spot_rewrites(src):
     for old, new in SPOT:
@@ -349,7 +517,79 @@ def excise_types(src):
             continue
         out.append(l)
         i += 1
-    return "\n".join(out)
+    return chr(10).join(out)
+
+
+def call_thunked_statics(src):
+    """Inside a class whose `static let empty` became a THUNK (a generic
+    class's static initializer cannot run at program start — see
+    DIVERGENCES.md), every remaining bare read becomes a call. Scoped to the
+    class extent; dotted names (MapExt.empty) and members (.IsEmpty) are
+    other things and excluded by the boundaries."""
+    lines = src.split("\n")
+    out = []
+    in_extent = False
+    ind = 0
+    for l in lines:
+        if "static let empty () =" in l or "static let defaultComparer () =" in l:
+            in_extent = True
+            ind = len(l) - len(l.lstrip()) - 4
+            out.append(l)
+            continue
+        if in_extent and l.strip() and not l.lstrip().startswith("//"):
+            cur = len(l) - len(l.lstrip())
+            if cur <= ind and (l.lstrip().startswith("type ") or l.lstrip().startswith("and ") or l.lstrip().startswith("module ")):
+                in_extent = False
+        if in_extent:
+            l = re.sub(r"(?<![.\w'])empty(?![\w(\)])", "empty ()", l)
+            l = re.sub(r"(?<![.\w'])defaultComparer(?![\w(\)])", "defaultComparer ()", l)
+            l = l.replace("empty () ()", "empty ()")
+            l = l.replace("defaultComparer () ()", "defaultComparer ()")
+        out.append(l)
+    return chr(10).join(out)
+
+
+THUNKED_MODULE_VALUES = ["HashSet", "HashMap", "MapExt", "IndexList",
+                         "HashMapDelta", "IndexListDelta", "MultiSetMap"]
+
+
+def thunk_module_generic_values(src):
+    """A module-level GENERIC value (`let empty<'T> = ...`) compiles to ONE
+    shared global whose initializer runs at program start AT THE UNIFORM
+    REPRESENTATION -- where a `'Key : comparison` body has no instance to
+    call and traps. Thunk them (`let empty<'T> () = ...`) so every read is a
+    call the monomorphizer stamps at its own instantiation. See
+    DIVERGENCES.md."""
+    lines = src.split(chr(10))
+    out = []
+    in_module = None   # name of a THUNKED module whose extent we are in
+    for l in lines:
+        m = re.match(r"module (?:internal )?(\w+) =\s*$", l)
+        if m:
+            in_module = m.group(1) if m.group(1) in THUNKED_MODULE_VALUES else None
+        elif l and not l[0].isspace() and not l.startswith("//"):
+            in_module = None
+        thunked = False
+        if in_module:
+            m = re.match(r"(    let empty<[^=>]*>)( : [^=]*)?( =\s*)$|(    let empty<[^=>]*>)( : [^=]*)?( = .*)$", l)
+            if m:
+                g = m.groups()
+                head, ann, eq = (g[0], g[1], g[2]) if g[0] else (g[3], g[4], g[5])
+                l = head + " ()" + (ann or "") + eq
+                thunked = True
+        if in_module and not thunked:
+            # bare reads inside the module extent become calls
+            l2 = re.sub(r"(?<![.\w'])empty(?![\w(<])(?! \(\))", "(empty ())", l)
+            if l2 != l and "let empty" not in l:
+                l = l2
+        out.append(l)
+    # qualified reads, everywhere: Module.empty / Module.empty<args>
+    src = chr(10).join(out)
+    src = re.sub(r"\b(" + "|".join(THUNKED_MODULE_VALUES) + r")\.empty(<[^<>=]*>)?(?! ?\()",
+                 lambda m: "(" + m.group(1) + ".empty" + (m.group(2) or "") + " ())", src)
+    src = src.replace("empty () ()", "empty ()")
+    src = src.replace("(empty ()) ()", "(empty ())")
+    return src
 
 
 def main():
@@ -374,7 +614,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks)))))
+    text = thunk_module_generic_values(call_thunked_statics(rewrite_bare_list(rewrite_static_val_mutable(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))))))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

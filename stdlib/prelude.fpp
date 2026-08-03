@@ -811,6 +811,10 @@ type StructTuple2<'a, 'b> = { Item1 : 'a; Item2 : 'b }
 type StructTuple3<'a, 'b, 'c> = { Item1 : 'a; Item2 : 'b; Item3 : 'c }
 [<Struct>]
 type StructTuple4<'a, 'b, 'c, 'd> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd }
+/// .NET's ordering hook. `Compare(a, b)` is negative, zero or positive —
+/// the tupled member shape is what ported code calls.
+type IComparer<'a> =
+    abstract member Compare : 'a * 'a -> int
 type IEqualityComparer<'a> =
     abstract member Equals : 'a * 'a -> bool
     abstract member GetHashCode : 'a -> int
@@ -5202,12 +5206,6 @@ type Dictionary<'k, 'v>() =
     member x.Clear () : unit =
         dcount <- 0
         dslots <- Array.zeroCreate dslots.Length
-    /// .NET's signature, with the out parameter written. The compiler
-    /// synthesizes the TUPLE VIEW, as F# does, so
-    /// .NET's comparer-taking constructor. The comparer is NOT consulted:
-    /// this table hashes structurally, which is what DefaultEqualityComparer
-    /// asks for anyway — see DIVERGENCES.md before passing anything else.
-    new (_comparer : IEqualityComparer<'k>) = Dictionary<'k, 'v>()
     /// ConcurrentDictionary surface, minus the concurrency: wasm is
     /// single-threaded, so the atomicity these promise is free
     member x.TryAdd (k : 'k, v : 'v) : bool =

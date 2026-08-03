@@ -416,6 +416,50 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     let stamped = dictNew<string, Decl> ()      // mangled name -> clone
     let queue = vecNew<(string * int) * string list> ()
     let seen = dictNew<string, bool> ()
+    // A DIVERGENCE CAP. Poisoned member schemes (class vars mutated by a
+    // use — the shared-representative hazard) hand the vtable stamper
+    // instantiations that GROW each round: IndexList<T> begets
+    // IndexList<StructTuple2<T, T>> begets its double, and the queue never
+    // drains. An instantiation nested deeper than any real program writes
+    // degrades to the uniform representation — boxed, correct, and finite.
+    // A stamp's IDENTITY. It used to be offset + hash(mangled) mod 1e6 —
+    // and with a few thousand stamps two different clones COLLIDE, one
+    // reading the other's signature: a zip crash when the arities differ,
+    // invalid wasm when they happen to agree. The registry hands each
+    // mangled name one offset, first come first served, deterministically.
+    // The base sits far above every synthetic-offset family the lowerer
+    // mints (7e6 _fmt, 1.5e7/1.7e7, 7e7 set_Item, 9.5e7 Dispose, 9.7e7) —
+    // dense allocation from a shared base COLLIDED with 7e6+offset vars.
+    let stampOffsets = dictNew<string, int> ()
+    // stamp offset -> the TEMPLATE's offset. What lets a demand on a stamped
+    // constructor unpark the class members that parked on the template.
+    let stampOrigins = dictNew<int, int> ()
+    let mutable stampNext = 500000000
+    let stampOffsetOf (baseOffset : int) (mangled : string) : int =
+        match dictTryFind stampOffsets mangled with
+        | Some o -> o
+        | None ->
+            let o = stampNext
+            stampNext <- stampNext + 1
+            dictSet stampOffsets mangled o
+            dictSet stampOrigins o baseOffset
+            o
+    let mutable cappedWarned = false
+    let capInst (i : string list) : string list =
+        i |> List.map (fun t ->
+            let mutable depth = 0
+            let mutable worst = 0
+            for k in 0 .. strLen t - 1 do
+                if charAt t k = '<' then
+                    depth <- depth + 1
+                    if depth > worst then worst <- depth
+                elif charAt t k = '>' then depth <- depth - 1
+            if worst > 5 then
+                if not cappedWarned then
+                    cappedWarned <- true
+                    ewarn ("mono: instantiation depth capped (" + substr t 0 (min 60 (strLen t)) + "...) — a scheme is poisoned, see CLAUDE.md")
+                "$ref"
+            else t)
 
     // rewrite EVarI uses: struct instantiations point at the stamped clone,
     // reference instantiations keep the shared body
@@ -427,6 +471,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     /// PRODUCED during rewriting (rather than walked over) has to enqueue the
     /// work itself — `mapExpr` never revisits what its callback returns.
     let stampRef (v : VarId) (sch : Scheme) (i : string list) (fallback : Expr) : Expr =
+        let i = capInst i
         let key = (v.Path, v.Offset)
         match dictTryFind bodies key with
         | Some _ ->
@@ -434,7 +479,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             if not (dictTryFind seen mangled).IsSome then
                 dictSet seen mangled true
                 vecAdd queue (key, i)
-            EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000)
+            EVar ({ Path = v.Path; Offset = stampOffsetOf v.Offset mangled
                     Name = mangled }, substScheme i sch)
         | None -> fallback
 
@@ -496,7 +541,8 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                      if not isTemplate || nameless then
                          vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)
                      EVar (v, sch)
-                 | Stamp i ->
+                 | Stamp i0 ->
+                     let i = capInst i0
                      let mangled = mangleFor v i
                      let key = (v.Path, v.Offset)
                      (match dictTryFind bodies key with
@@ -504,7 +550,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                           if not (dictTryFind seen mangled).IsSome then
                               dictSet seen mangled true
                               vecAdd queue (key, i)
-                          EVar ({ Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000)
+                          EVar ({ Path = v.Path; Offset = stampOffsetOf v.Offset mangled
                                   Name = mangled }, substScheme i sch)
                       | None ->
                           // a struct instantiation whose body we cannot see
@@ -561,6 +607,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
+            | EUnknown n when n.StartsWith "$sizeof:" ->
+                // resolve the SYMBOLIC instantiation the way $class does:
+                // the size is only knowable once the stamp names the type
+                EUnknown ("$sizeof:" + substName subst (n.Substring 8))
             | EUnknown n when n.StartsWith "$class:" ->
                 // an ARRAY pattern would read better here, but F++ has no
                 // array patterns yet (see PLAN.md) — an array literal in
@@ -734,7 +784,11 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     let classOwnOf = dictNew<string, (string * VarId) list> ()
     for d in decls do
         match d with
-        | DClass (n, _, own, impls) when not (List.isEmpty impls) ->
+        // a class with OWN members and no direct impls still needs the
+        // treatment: an override (MapVal's Compute) fills a base-declared
+        // vtable slot, and only a stamped copy of it can run at this
+        // instantiation
+        | DClass (n, _, own, impls) when not (List.isEmpty impls) || not (List.isEmpty own) ->
             dictSet classImplsOf n impls
             dictSet classOwnOf n own
         | _ -> ()
@@ -756,7 +810,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         (match dictTryFind bodies key with
          | Some (rc, v, sch, e) ->
              let mangled = mangleFor v inst
-             let nv = { Path = v.Path; Offset = v.Offset + 7000000 + (abs (strHash mangled) % 1000000); Name = mangled }
+             let nv = { Path = v.Path; Offset = stampOffsetOf v.Offset mangled; Name = mangled }
              // map the callee's quantified vars to this instantiation so
              // demands nested in the body specialize too
              let subst = dictNew<string, string> ()
@@ -813,12 +867,13 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                          | Some (_, _, msch, _) when not (List.isEmpty msch.Quantified) ->
                              (match memberInst msch with
                               | Some minst ->
+                                  let minst = capInst minst
                                   let mm = mangleFor mv minst
                                   if not (dictTryFind seen mm).IsSome then
                                       dictSet seen mm true
                                       vecAdd queue ((mv.Path, mv.Offset), minst)
                                   { Path = mv.Path
-                                    Offset = mv.Offset + 7000000 + (abs (strHash mm) % 1000000)
+                                    Offset = stampOffsetOf mv.Offset mm
                                     Name = mm }
                               | None -> mv)
                          | _ -> mv
@@ -967,24 +1022,44 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
     //
     // A class whose constructor cannot be identified falls back to the
     // unconditional rule, which is never wrong, only bigger.
-    let ctorKey = dictNew<string, string * int> ()
-    for d in decls do
-        match d with
-        | DLet (_, v, _, ELam _) -> dictSet ctorKey v.Name (v.Path, v.Offset)
-        | _ -> ()
+    // a class's constructor and every STAMPED clone of it: members parked on
+    // the class must wake when ANY of them is demanded — a generic class is
+    // usually constructed only through its stamps
     let classNames = dictNew<string, bool> ()
     for d in decls do
         match d with
         | DClass (n, _, _, _) -> dictSet classNames n true
         | _ -> ()
+    let ctorKeys = dictNew<string, (string * int) list> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam _) ->
+            // a STAMP's mangled name is the template's name plus argument
+            // segments; strip from the right until a class name appears
+            let baseName =
+                if v.Offset >= 500000000 && not (dictTryFind classNames v.Name).IsSome then
+                    let mutable n = v.Name
+                    let mutable go = true
+                    while go do
+                        match n.LastIndexOf '_' with
+                        | i when i > 0 ->
+                            n <- n.Substring (0, i)
+                            if (dictTryFind classNames n).IsSome then go <- false
+                        | _ -> go <- false
+                    if (dictTryFind classNames n).IsSome then n else v.Name
+                else v.Name
+            let prev = match dictTryFind ctorKeys baseName with Some p -> p | None -> []
+            dictSet ctorKeys baseName ((v.Path, v.Offset) :: prev)
+        | _ -> ()
     /// members waiting for their class to be constructed somewhere
     let onCtor = dictNew<string * int, (string * int) list> ()
     /// did the members park on `cls`'s constructor?
     let parkOn (cls : string) (ms : (string * int) list) =
-        match dictTryFind ctorKey cls with
-        | Some k ->
-            let prev = match dictTryFind onCtor k with Some p -> p | None -> []
-            dictSet onCtor k (ms @ prev)
+        match dictTryFind ctorKeys cls with
+        | Some ks ->
+            for k in ks do
+                let prev = match dictTryFind onCtor k with Some p -> p | None -> []
+                dictSet onCtor k (ms @ prev)
             true
         | None -> false
     for d in decls do
@@ -1119,10 +1194,12 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
          | Some body -> scan body
          | None -> ())
         // this key is a constructor: everything reachable through the class's
-        // vtable becomes reachable with it
+        // vtable becomes reachable with it. A STAMPED constructor stands for
+        // its template — members parked there become reachable too.
         (match dictTryFind onCtor k with
          | Some ms -> for m in ms do demand m
          | None -> ())
+
         i <- i + 1
     decls
     |> List.filter (fun d ->

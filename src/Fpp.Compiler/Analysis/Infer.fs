@@ -548,7 +548,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     (match prune (substVars subst baseTy) with
                      | TCon (bn, bargs) -> declaringOwner bn bargs
                      | _ -> None)
-                | None -> None
+                | None ->
+                    // an EXTENSION member on an interface the receiver
+                    // implements (`type IAdaptiveObject with member
+                    // x.MarkOutdated ...`) declares through the interface;
+                    // without this hop the access fell to the by-name field
+                    // lookup, which types fine and records nothing — and
+                    // emission then read an unknown FIELD
+                    // NOT for the enumerator protocol: the for-in lowering
+                    // has its own resolution for those, and binding them here
+                    // broke `for e in x` over a class enumerated another way
+                    if name = "GetEnumerator" || name = "MoveNext" || name = "Current" || name = "Dispose" then None else
+                    match dictTryFind impls tn with
+                    | Some ifs ->
+                        ifs |> List.tryPick (fun i ->
+                            match fieldCandidates (i + "." + name) with
+                            | (_ :: _) as cs -> Some (cs, i, [])
+                            | [] -> None)
+                    | None -> None
         // Instantiating the member's own scheme (rather than substituting
         // into its type) is what turns the use into a specialization demand:
         // a generic class' members must be stamped per element type just
@@ -1849,6 +1866,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match formatFamily with
                      | Some t -> t
                      | None ->
+                     // `sizeof<'T>` — the compiler KNOWS every layout, so
+                     // this is a real constant, resolved per instantiation
+                     // at monomorphization. Typed int; the written
+                     // argument's INSTANTIATION NAME rides to lowering.
+                     let sizeofMark =
+                         match head.NodeKind with
+                         | IdentExpr when
+                               (tokensOf head |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "sizeof"
+                               && (tokensOf head |> List.tryHead |> Option.map (fun t -> (dictTryFind useDefs t.Offset).IsNone)) = Some true ->
+                             (match tokensOf head |> List.tryHead,
+                                    args |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                              | Some ht, Some tp ->
+                                  (match nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind) with
+                                   | [ ta ] ->
+                                       let ty = typeFromNode tyScope ta
+                                       vecAdd fieldOwnersRaw (ht.Offset, "$sizeof:" + instName ty)
+                                       true
+                                   | _ -> false)
+                              | _ -> false)
+                         | _ -> false
+                     if sizeofMark then tInt else
                      // numeric conversions are primitives, not functions
                      let conversion =
                          match head.NodeKind, args with
@@ -2121,7 +2159,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // template the stamper drops, leaving the
                                    // call to name nothing
                                    (match prune res with
-                                    | TCon (_, ras) when not (List.isEmpty ras) ->
+                                    | TCon (_, ras) when not (List.isEmpty ras) && false ->
                                         vecAdd instRaw (ht.Offset, ras)
                                     | _ -> ())
                                    // widen per argument, not on the tuple
@@ -3013,9 +3051,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TCon (nm, _) -> nm
                     | _ -> "?"
                 let selfTy = TCon (synth, [])
+                // members share the INTERFACE's type-variable scope: a
+                // `'a` in a member annotation is the interface's `'a`, which
+                // the context's unification links to the enclosing binding's
+                // — a fresh dict left it dangling, so `compare a b` in an
+                // object expression defaulted instead of going class-pending
                 for m in nodesOf n do
                     if m.NodeKind = MemberDecl then
-                        inferMember (synth + "." + ifaceName) (dictNew ()) [] selfTy m
+                        inferMember (synth + "." + ifaceName) ivars [] selfTy m
                 ifaceTy
             // `downcast e` / `upcast e`: the target is whatever the context
             // demands, so park the result and read it back once solved

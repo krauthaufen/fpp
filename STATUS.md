@@ -647,6 +647,116 @@ port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from
 adaptive.fpp by the recipe in the session notes; group.fsx/ms.fsx in the
 scratchpad are the measurement and hover probes.
 
+## THE SMOKE TEST RUNS: 2, then 42
+
+`let c = cval 1` / `AVal.map (fun v -> v * 2) c` / `force` prints 2;
+`transact (fun () -> c.Value <- 21)`; `force` prints 42. Construction,
+evaluation, caching, transactions, level-ordered invalidation, and
+recomputation of FSharp.Data.Adaptive all execute in F++-compiled wasm-GC.
+Every fix on the way was a REAL mechanism, in dependency order:
+
+* **Interface identity is ONE name.** `interface aval<'T> with`,
+  `interface IAdaptiveValue<'T> with` and the declaration IAdaptiveValue`1
+  spelled three vtable keys for one slot. ifaceNameOf resolves
+  abbreviations (aliases threaded into Lower), ifaceKeyOf appends the
+  arity, and the emitter's slot table strips it — every spelling, one slot.
+* **Interface property SETTERS exist.** Accessor lifting now surfaces
+  `set_P` beside `P`; `x.Level <- v` on an interface receiver dispatches
+  through the vtable like the read does.
+* **Static properties are reads, not closures.** `T.P` where P's scheme is
+  a value type applies the lifted accessor (fields table tells properties
+  from methods); `T.M args` no longer double-applies the synthesized unit.
+* **A stamped constructor stands for its class.** DCE parks class members
+  on the ctor and only the stamps were ever called — members park on every
+  stamped clone too. And a class whose only contribution is an OVERRIDE
+  (MapVal.Compute) now gets the instantiation-subclass treatment; the
+  base-field copy casts to the ancestor that declares the slot.
+* **Class `let mutable` is ONE storage.** The instance field held a
+  snapshot while the class body's closures mutated a cell — the TransactQueue
+  counted into the cell and Commit read the field, so the commit loop never
+  ran. The field now holds the CELL ($forcecell/$cellof/$cellget/$cellset)
+  and members read and write through it.
+* **One layout, one name.** The canonical template built
+  `StructTuple2$<int.#v>` as a boxed tuple while the concrete consumer cast
+  `StructTuple2$<int.IAdaptiveObject>` — canonRecordNames collapses every
+  reference argument to `obj` at emit entry, so both sides name one wasm
+  type. Uniform struct tuples emit as $tupN.
+* **Array.zeroCreate of a class element is NULL-filled** — the i31 zero
+  made `isNull` false and the first traversal a cast failure.
+* **Object expressions capture same-file locals only** (a prelude class
+  member "capture" smuggled an uncallable EVar into the env), their members
+  share the interface's type-variable scope (a dangling 'a defaulted to int
+  and bound `compare` to the wrong instance), and nested
+  `Case (struct (a, b)) when guard` binds its elements in the GUARD too.
+* **Dot-resolution hops through implemented interfaces** for extension
+  members (`x.MarkOutdated()` on a class whose extension sits on
+  IAdaptiveObject) — the silent by-name field fallback typed fine and
+  emitted an unknown field.
+* Port: LevelChangedException rides in `Failure "!level:N"` (helpers decode
+  it — string methods on a catch binder don't resolve), `static val
+  mutable` becomes `static let mutable` with ValueNone/defaultof inits and
+  bare self-references, module-level generic values are thunked like the
+  class statics, `List<...>` is spelled ResizeArray, RuntimeHelpers
+  identity-hash is `hash`, and a module-nested type colliding with a later
+  top-level one is renamed (two AbstractVals were one merged class).
+
+Next: the FULL adaptive.fpp (History/ASet/AMap...), then the actual test
+suite. The gates on this batch had one lesson mid-stream: the new stamp
+registry's dense offsets collided with the lowerer's synthetic-offset
+families (7e6 `_fmt`) — bases must be disjoint; it now sits at 5e8.
+
+## The smoke test REACHED THE ADAPTIVE MACHINERY
+
+`ChangeableValue 1 |> AVal.map |> force` now compiles clean, every library
+initializer runs, and execution reaches `AVal.force` — where it dies on a
+CAST FAILURE in the interface dispatch (`value.GetValue AdaptiveToken.Top`
+on an `IAdaptiveValue`1` receiver). That is the next session's single
+target, and it is the first REAL adaptive-machinery bug: everything before
+it is now infrastructure that works.
+
+What landed to get here (gates pending as this was written):
+
+* **`sizeof<'T>` is a real constant** — typed int in inference, carried as
+  `$sizeof:name` through lowering, substituted per stamp in Link (like
+  `$class:`), resolved in the emitter against the SAME tables layouts come
+  from. `sizeof<int>`=4, a two-field POD struct=16, and a generic
+  instantiation resolves right.
+* **A generic value has NO eager initializer.** `let empty<'K,'V> = ...` as
+  a startup init ran the template at UNRESOLVED arguments and trapped in
+  whatever class-constrained call it reached. Templates are skipped; stamps
+  carry their own bodies.
+* **Stamp identity is a REGISTRY, not a hash.** offset+hash(mangled)%1e6
+  collided at a few thousand stamps — one clone reading another's
+  signature: a zip crash where arities differed, INVALID WASM where they
+  agreed. First-come sequential offsets, deterministic.
+* **A divergence cap in the stamper**: poisoned schemes (the shared-var
+  hazard) hand the vtable machinery instantiations that DOUBLE each round
+  (IndexList<T> -> IndexList<StructTuple2<T,T>> -> ...); nesting deeper
+  than any real program writes degrades to the uniform representation with
+  one warning. The OOM this fixed burned 40 minutes before the stamp trace
+  named it.
+* **The out-parameter view chooses by WRITTEN argument count** (F#'s own
+  rule) — a still-variable argument fits the full byref signature in a
+  trial, and the full signature then swallowed the variable.
+* **`box`/`unbox` are identities BY NAME** wherever they resolved (the
+  prelude declares `extern let unbox`), including piped (`|> unbox<T>`).
+* **Port**: Equality.fs replaced by an honest shim (structural hash/=, the
+  provider indirection kept); thunked generic-class statics
+  (defaultComparer/empty families) with extent-scoped read rewriting;
+  IsValueType/IsAssignableFrom/GenericZero/static-val spot-fixes — each a
+  documented divergence.
+
+The debug-loop lesson worth keeping: the "self-host regression" that parked
+this branch was MY OWN `GetEnvironmentVariable` debug toggles — F++ cannot
+compile them, so the self-hosted compiler stubbed the whole `infer` function
+and trapped on entry. The stub warnings named it all along. STRIP
+INSTRUMENTATION BEFORE GATING.
+
+Known deliberate gaps, all banked: constructor-through-abbreviation
+(`cval 1` — the smoke writes ChangeableValue for now), `Item5`+ tuple
+fields, exceptions-as-types (NotSupportedException etc. stub), the
+poisoned-scheme root cause behind the divergence cap.
+
 ## Compiling is not the same as running
 
 The port has only ever been INFERRED. Lowering and emission are a separate
