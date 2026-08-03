@@ -11,6 +11,7 @@ let mutable passedCount = 0
 let mutable failedCount = 0
 
 let test (name : string) (f : unit -> unit) : unit =
+    printfn "RUN %s" name
     let mutable ok = true
     (try f () with Failure msg ->
         ok <- false
@@ -304,8 +305,8 @@ let go =
 
     // ---- ASet.fs -------------------------------------------------
     // DIV: single-threaded, so the disposable ref-count is a plain mutable
-    // TEMP-SKIP mapUse
-    let skipMapUse = fun () -> test "[ASet] mapUse" (fun () ->
+    // TEMP-SKIP: Cache refcount misread through struct(r,ref) in stamped Dictionary (task 16)
+    let skipMU = fun () -> test "[ASet] mapUse" (fun () ->
         let input = cset (HashSet.ofList [1; 2; 3; 4])
         let mutable refCount = 0
         let newDisposable () =
@@ -620,7 +621,7 @@ let go =
                             upper.Value <- u)
                         checkRange ())
 
-    // TEMP-SKIP: AbstractReader ctor cast failure in stamped BindReader
+    // TEMP-SKIP: BindReader obj-stamp writes cache as uniform $tup2, reads $r_StructTuple2 (task 16)
     let skipCB = fun () -> test "[ASet] content bind" (fun () ->
         let set = cset<int> (HashSet.empty ())
         let res = (set :> aset<int>).Content |> ASet.bind (fun x -> ASet.ofHashSet (x.Map(fun v -> v * 2)))
@@ -629,8 +630,7 @@ let go =
             let cnt = (res |> ASet.force).Count
             checkInt "counts agree" set.Count cnt)
 
-    // TEMP-SKIP: base-ctor of the two AbstractReaders resolves arity-blind
-    let skipU0 = fun () -> test "[ASet] union constant" (fun () ->
+    test "[ASet] union constant" (fun () ->
         let constSet = ASet.ofList [1; 2; 3]
         let changeSet = cset (HashSet.ofList [4; 5; 6])
         let union1 = ASet.union constSet changeSet
@@ -656,8 +656,9 @@ let go =
         checkSet "u11" [1; 2; 3; 4] (ASet.force union1)
         checkSet "u12" [1; 2; 3; 4] (ASet.force union2))
 
-    // TEMP-SKIP: base-ctor of the two AbstractReaders resolves arity-blind
-    let skipU1 = fun () -> test "[ASet] filterA" (fun () ->
+    // TEMP-SKIP: struct(v,p) stored via uniform $tup2 but read back as the
+    // specialized $r_StructTuple2$<obj.bool> record (state.[m] in FilterAReader)
+    let skipFA = fun () -> test "[ASet] filterA" (fun () ->
         let takeEven = AVal.init true
         let takeOdd = AVal.init true
         let set = ASet.ofArray (Array.init 5 (fun i -> i))

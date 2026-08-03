@@ -4037,7 +4037,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | [ nm ] -> Some nm
                          | _ -> None
                      nameTok |> Option.map (fun t ->
-                         t.Text, (nodesOf m |> List.filter (fun p -> isPatKind p.NodeKind) |> List.length))))
+                         // a TYPE-ONLY abstract (`abstract Apply : 'D -> 'D`)
+                         // declares its parameters as arrows, not patterns —
+                         // the count feeds eta-expansion of member VALUES,
+                         // so a method must not look like a getter
+                         let patCount = nodesOf m |> List.filter (fun p -> isPatKind p.NodeKind) |> List.length
+                         let arity =
+                             if patCount > 0 then patCount
+                             else
+                                 let rec arrows (g : GreenNode) =
+                                     if g.NodeKind = FunType then
+                                         match nodesOf g |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.rev with
+                                         | cod :: _ -> 1 + arrows cod
+                                         | [] -> 1
+                                     else 0
+                                 match nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+                                 | Some ty -> arrows ty
+                                 | None -> 0
+                         t.Text, arity)))
         // type abbreviation: register for same-file expansion
         let hasStructure =
             nodesOf n
@@ -4360,6 +4377,51 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         else
 
         let paramTys = vecToList pats |> List.map (patType mvars)
+        // an OVERRIDE's parameters take the ABSTRACT's declared types,
+        // exactly as F# types them: the body dispatches members on them
+        // (`o.Tag` on an IAdaptiveObject), and typing them fresh left the
+        // receiver unresolvable — the access fell to a by-name field guess
+        let isOverride =
+            tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "override" || t.Text = "default"))
+        (match nameTok with
+         | Some nm when isOverride && not (List.isEmpty paramTys) ->
+             // walk the base chain for the declaration, substituting each
+             // hop's own parameters by the instantiation the subclass wrote
+             let rec findDecl (cls : string) (args : Type list) (fuel : int) : Type option =
+                 if fuel <= 0 then None
+                 else
+                     match dictTryFind bases cls with
+                     | Some (bps, bty) when List.length bps = List.length args ->
+                         let subst = dictNew<int, Type> ()
+                         List.iter2 (fun (pv : Var) a -> dictSet subst (prunedId pv) a) bps args
+                         for fv in freeVars bty do
+                             if (dictTryFind subst (prunedId fv)).IsNone then
+                                 dictSet subst (prunedId fv) (st.Fresh ())
+                         (match prune (substVars subst bty) with
+                          | TCon (bn, bargs) ->
+                              (match dictTryFind fields (bn + "." + nm.Text) with
+                               | Some fi when List.length fi.Params = List.length bargs ->
+                                   let fs = dictNew<int, Type> ()
+                                   List.iter2 (fun (pv : Var) a -> dictSet fs (prunedId pv) a) fi.Params bargs
+                                   for qv in fi.Quantified do dictSet fs (prunedId qv) (st.Fresh ())
+                                   for fv in freeVars fi.FieldType do
+                                       if (dictTryFind fs (prunedId fv)).IsNone then
+                                           dictSet fs (prunedId fv) (st.Fresh ())
+                                   Some (substVars fs fi.FieldType)
+                               | _ -> findDecl bn bargs (fuel - 1))
+                          | _ -> None)
+                     | _ -> None
+             (match findDecl tyName (classParams |> List.map TVar) 8 with
+              | Some declared ->
+                  let rec pin (ps : Type list) (d : Type) =
+                      match ps, prune d with
+                      | p :: rest, TFun (dom, cod) ->
+                          unifyAt nm.Offset dom p
+                          pin rest cod
+                      | _ -> ()
+                  pin paramTys declared
+              | None -> ())
+         | _ -> ())
         // body typed only after parameters are bound
         let bodyTys = vecToList bodies |> List.map exprType
         let bodyTy =

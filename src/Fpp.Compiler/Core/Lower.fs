@@ -64,6 +64,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// type-declaration name tokens seen during the top-level collect; the
     /// definitions resolve AFTER the binder tables are built below
     let typeDeclNames = dictNew<int, string> ()
+    let typeDeclArity = dictNew<int, int> ()
     let rec collectTop (g : Green) : unit =
         match g with
         | GToken _ -> ()
@@ -85,6 +86,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some t ->
                      dictSet topLevelDefs t.Offset true
                      dictSet typeDeclNames t.Offset t.Text
+                     // the declared ARITY too: two classes may share the
+                     // bare name at different arities (the two
+                     // AbstractReaders), and a base-constructor call picks
+                     // its target by the WRITTEN argument count
+                     let arity =
+                         match n.Children |> List.tryPick (fun c -> match c with GNode m when m.NodeKind = TyParams -> Some m | _ -> None) with
+                         | Some tp -> Green.tokens (GNode tp) |> List.filter (fun x -> x.Kind = Ident) |> List.length
+                         | None -> 0
+                     dictSet typeDeclArity t.Offset arity
                  | None -> ())
                 let rec collectMembers (m : GreenNode) =
                     if m.NodeKind = MemberDecl then
@@ -143,7 +153,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let typeDeclDefs = dictNew<string, Resolve.Definition> ()
     for off, nm in dictPairs typeDeclNames do
         match dictTryFind defsAt off with
-        | Some d -> dictSet typeDeclDefs nm d
+        | Some d ->
+            dictSet typeDeclDefs nm d
+            // keyed by declared ARITY too, so a use that writes its type
+            // arguments can pick among same-named variants
+            (match dictTryFind typeDeclArity off with
+             | Some k -> dictSet typeDeclDefs (nm + "`" + string k) d
+             | None -> ())
         | None -> ()
     // "TypeName.MemberName" -> the member's definition; a use site picks the
     // entry named by the receiver's inferred type (Infer.MemberSites)
@@ -2394,7 +2410,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 let iface = (dictTryFind memberSites t.Offset).Value
                 (match nodesOf n |> List.tryHead with
-                 | Some lhs -> EIfaceCall (iface, t.Text, lowerExpr (GNode lhs), [])
+                 | Some lhs ->
+                     // a METHOD referenced as a VALUE (`|> x.Apply`) must
+                     // eta-expand: the vtable entry takes its arguments, and
+                     // a zero-argument dispatch would call it as a getter
+                     let arity =
+                         match dictTryFind ifaces iface with
+                         | Some ms ->
+                             (match ms |> List.tryFind (fun (m, _) -> m = t.Text) with
+                              | Some (_, k) -> k
+                              | None -> 0)
+                         | None -> 0
+                     if arity > 0 then
+                         let recv = lowerExpr (GNode lhs)
+                         let sch = mono (TCon ("?", []))
+                         let ps =
+                             List.init arity (fun k ->
+                                 { Path = path; Offset = t.Offset + 670000 + k; Name = "_eta" + string k })
+                         ELam (ps |> List.map (fun v -> v, sch),
+                               EIfaceCall (iface, t.Text, recv, ps |> List.map (fun v -> EVar (v, sch))))
+                     else EIfaceCall (iface, t.Text, lowerExpr (GNode lhs), [])
                  | None -> note (offsetOf n) "interface call without a receiver")
             | DotExpr when
                 (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -3123,12 +3158,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | Some inner -> baseNameTok inner
                 | None -> Green.tokens (GNode g) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
         let baseTok = inheritNode |> Option.bind baseNameTok
-        let baseName = baseTok |> Option.map (fun t -> t.Text)
+        // the WRITTEN argument count of the base type: `inherit Reader<'d>`
+        // must reach the one-parameter Reader even when a two-parameter
+        // class of the same name was declared later (and the resolver's
+        // bare-name binding therefore points at the wrong one — or at the
+        // inheriting class ITSELF, which then calls its own constructor)
+        let rec baseTypeNode (g : GreenNode) : GreenNode option =
+            if g.NodeKind = AppType || g.NodeKind = NamedType then Some g
+            else nodesOf g |> List.tryPick (fun m -> baseTypeNode m)
+        let baseWrittenArity =
+            match inheritNode |> Option.bind baseTypeNode with
+            | Some tn when tn.NodeKind = AppType ->
+                (nodesOf tn |> List.filter (fun m -> isTypeKind m.NodeKind) |> List.length) - 1
+            | _ -> 0
+        // the base's DECORATED name, by the same rule inference's arityName
+        // applies: the first-declared arity keeps the plain name, later
+        // ones carry a backtick suffix — and the emitted STRUCT types are
+        // named accordingly, so the field-copy cast must agree
+        let baseName =
+            baseTok |> Option.map (fun t ->
+                if baseWrittenArity > 0 && not (t.Text.Contains "`")
+                   && (dictTryFind tyAliases ("$arity:" + t.Text + ":" + string baseWrittenArity)).IsSome
+                then t.Text + "`" + string baseWrittenArity
+                else t.Text)
         let baseCtorCall =
             match inheritNode, baseName with
             | Some i, Some bn ->
                 let bt = match baseTok with Some t -> t | None -> Green.tokens (GNode i) |> List.filter (fun t -> t.Kind = Ident) |> List.head
-                let bdef = dictTryFind useDefs bt.Offset
+                let bareBn = if bn.Contains "`" then bn.Substring (0, bn.IndexOf "`") else bn
+                let bdef =
+                    match dictTryFind typeDeclDefs (bareBn + "`" + string baseWrittenArity) with
+                    | Some d -> Some d
+                    | None -> dictTryFind useDefs bt.Offset
                 let args =
                     nodesOf i
                     |> List.filter (fun m -> isExprish m.NodeKind)
