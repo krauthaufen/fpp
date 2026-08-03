@@ -448,6 +448,12 @@ SPOT = [
 # LevelChangedException rides in a Failure with an encoded message. The level
 # survives as "!level:N"; the catch sites decode it. See DIVERGENCES.md.
 LEVEL_EXC = [
+    # the Cache's dictionary stores STRUCT tuples; say so in the patterns —
+    # a plain comma pattern relies on a deferred struct mark that the parked
+    # TryGetValue view resolves too late inside a template
+    ("| (true, (r, ref)) ->", "| (true, struct (r, ref)) ->"),
+    ("cache.[v] <- (r, ref 1)", "cache.[v] <- struct (r, ref 1)"),
+
     # ctor property-initializer syntax with a POSITIONAL argument mixed in is
     # not lowered; say the writes out loud
     ("""            let res = IndexNode(x.Root, Prev = x, Next = next, Tag = key)""",
@@ -537,6 +543,27 @@ let internal levelOfMsg (msg : string) = int (msg.Substring 7)"""),
     ("""                with :? LevelChangedException ->""",
      """                with Failure msg when isLevelMsg msg ->"""),
 ]
+
+
+def rewrite_lazy_keyword(src):
+    """`lazy expr` is a keyword F++ does not lower; the prelude's Lazy class
+    says the same thing as a constructor call."""
+    out, i = [], 0
+    while True:
+        k = src.find("lazy (", i)
+        if k < 0:
+            out.append(src[i:])
+            break
+        if k > 0 and (src[k - 1].isalnum() or src[k - 1] == "_"):
+            out.append(src[i:k + 6])
+            i = k + 6
+            continue
+        j = _portref.matchto(src, k + 6, "(", ")")
+        inner = src[k + 6:j - 1]
+        out.append(src[i:k])
+        out.append("Lazy(fun () -> (" + inner + "))")
+        i = j
+    return "".join(out)
 
 
 def rewrite_bare_list(src):
@@ -749,7 +776,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = thunk_module_generic_values(call_thunked_statics(rewrite_bare_list(rewrite_static_val_mutable(rewrite_regex_spots(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks)))))))))))
+    text = thunk_module_generic_values(call_thunked_statics(rewrite_lazy_keyword(rewrite_bare_list(rewrite_static_val_mutable(rewrite_regex_spots(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))))))))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

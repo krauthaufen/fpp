@@ -647,6 +647,37 @@ port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from
 adaptive.fpp by the recipe in the session notes; group.fsx/ms.fsx in the
 scratchpad are the measurement and hover probes.
 
+## aval, aset AND amap RUN — alist is one dispatch away
+
+The collection smoke now prints: aval 2/42, aset add+remove propagation
+(`aset 2 true true` then `aset 1 true`), amap mapping (`amap 2 102`). The
+alist path does single operations (History integrate, applyDelta,
+Index allocation) and fails only at `cmp.Compare` inside the MapExt tree
+walk: the comparer is an OBJECT EXPRESSION inside the generic MapExt class,
+its template member body carries `$class:Ordered:compare:#K`, and the
+emitter has no uniform case for it — the vtable slot stays empty and the
+dispatch casts null. The principled fix is a COMPARE slot in the descriptor
+(next to eq/hash) so the runtime `$cmpv` dispatches per type — "make
+compare real" — queued as the next session's first task.
+
+What landed on the way:
+
+* **`Lazy` exists** (prelude class: memoized thunk; the `lazy expr` keyword
+  is port-rewritten to the constructor). The prelude is an EMBEDDED
+  RESOURCE — editing it does nothing until the compiler rebuilds.
+* **A `_` parameter is a parameter.** `let f _ o n` fell into the tupled
+  fallback and became a one-tuple lambda while every call stayed curried.
+* **Struct patterns bind at ANY depth** — `(true, struct (r, cnt))`, tuple
+  positions, constructor payloads — one recursive fixer replaces the
+  special-cased arms, wrapping BODY and GUARD with the element reads.
+* **canonRecordNames covers DClass names and bases** — the instantiation
+  subclass lost its base chain under the canonical spelling, inherited no
+  fields, and its constructor built a one-field husk.
+* **stillNamed guards the template drop** (History's secondary ctors).
+* Port: BCL exception ctors ride in Failure, the Cache says `struct` in its
+  patterns and stores (a plain tuple against a struct slot relies on
+  adaption inference only does for direct arguments — a real gap, noted).
+
 ## THE FULL LIBRARY COMPILES AND LOADS
 
 All 38 files (everything but AdaptiveFileSystem and the aset{}/alist{}

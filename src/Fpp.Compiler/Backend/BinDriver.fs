@@ -3714,6 +3714,12 @@ let private canonRecordNames (decls : Decl list) : Decl list =
                         if (dictTryFind structBases b).IsSome then f2, cn t else f2, t)
                 Some (DRecord (n2, ps, cfs, stf))
         | DLet (rc, v, sch, e) -> Some (DLet (rc, v, sch, cx e))
+        // class declarations carry record NAMES too — the instantiation
+        // subclass and its base; leaving them unnormalized broke the BaseOf
+        // chain, so the subclass record inherited NO fields and its
+        // constructor built a one-field husk
+        | DClass (n, b, own, impls) -> Some (DClass (cn n, Option.map cn b, own, impls))
+        | DMembers (n, own) -> Some (DMembers (cn n, own))
         | other -> Some other)
 
 let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)

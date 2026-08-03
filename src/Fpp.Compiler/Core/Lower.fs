@@ -594,6 +594,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match lowerPat p with
                 | PVar (v, s) -> Some (v, s), PVar (v, s)
                 | PLit LUnit -> Some ({ Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit), PLit LUnit
+                // `_` is a simple parameter with no name, not a structured
+                // one: falling to the tupled path collapsed `let f _ o n`
+                // into a one-tuple lambda while every call stayed curried
+                | PWild -> Some ({ Path = path; Offset = offsetOf p + 640000; Name = "_ignored" }, mono (TCon ("?", []))), PWild
                 | other -> None, other)
         if binds |> List.forall (fun (b, _) -> b.IsSome) then
             binds |> List.map (fun (b, _) -> b.Value), []
@@ -2065,6 +2069,65 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 PVar (tmp, sch),
                                 (guard |> Option.map (structLetExpr binders tn (EVar (tmp, sch)))),
                                 structLetExpr binders tn (EVar (tmp, sch)) body
+                            // a struct pattern at ANY nesting depth —
+                            // `(true, struct(r, cnt))`, a tuple position, a
+                            // constructor payload — binds its node whole and
+                            // reads the elements out in the BODY and GUARD
+                            | [ p ] when
+                                (let rec hasStruct (q : GreenNode) =
+                                    q.NodeKind = StructTuplePat
+                                    || ((q.NodeKind = ParenPat || q.NodeKind = TuplePat)
+                                        && (match dictTryFind fieldOwners (offsetOf q) with
+                                            | Some o -> o.StartsWith "StructTuple"
+                                            | None -> false))
+                                    || (nodesOf q |> List.filter (fun m -> isPatKind m.NodeKind) |> List.exists hasStruct)
+                                 hasStruct p) ->
+                                let wraps = vecNew<GreenNode * VarId * Scheme * string> ()
+                                let rec fixDeep (q : GreenNode) : Pat =
+                                    let structNode =
+                                        if q.NodeKind = StructTuplePat then Some q
+                                        elif (q.NodeKind = ParenPat || q.NodeKind = TuplePat)
+                                             && (match dictTryFind fieldOwners (offsetOf q) with
+                                                 | Some o -> o.StartsWith "StructTuple"
+                                                 | None -> false) then Some q
+                                        else None
+                                    match structNode with
+                                    | Some sq ->
+                                        let tn =
+                                            match dictTryFind fieldOwners (offsetOf sq) with
+                                            | Some o -> o
+                                            | None -> "StructTuple" + string (List.length (structSlots sq))
+                                        let tmp = { Path = path; Offset = offsetOf sq + 4200000; Name = "_sp" }
+                                        let sch = mono (TCon (tn, []))
+                                        vecAdd wraps (sq, tmp, sch, tn)
+                                        PVar (tmp, sch)
+                                    | None ->
+                                        match q.NodeKind with
+                                        | ParenPat ->
+                                            (match nodesOf q |> List.filter (fun m -> isPatKind m.NodeKind) with
+                                             | [ one ] -> fixDeep one
+                                             | many -> PTuple (List.map fixDeep many))
+                                        | TuplePat ->
+                                            PTuple (nodesOf q |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map fixDeep)
+                                        | AppPat ->
+                                            (match nodesOf q with
+                                             | head :: rest ->
+                                                 let cn, cs =
+                                                     match patHeadToken head |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
+                                                     | Some d -> d.Name, schemeOf d
+                                                     | None -> "?", mono (TCon ("?", []))
+                                                 PCtor (cn, cs, rest |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map fixDeep)
+                                             | [] -> PWild)
+                                        | _ -> lowerPat q
+                                let pat2 = fixDeep p
+                                let wrap (x : Expr) =
+                                    vecToList wraps
+                                    |> List.rev
+                                    |> List.fold
+                                        (fun acc (sq, tmp2, sch2, tn2) ->
+                                            structLetExpr (structSlots sq) tn2 (EVar (tmp2, sch2)) acc)
+                                        x
+                                pat2, Option.map wrap guard, wrap body
                             | [ p ] -> lowerPat p, guard, body
                             | [] -> PWild, guard, body
                             | ps -> POr (alignOrBinders (List.map lowerPat ps)), guard, body   // bar-separated alternatives

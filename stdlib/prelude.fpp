@@ -5398,6 +5398,18 @@ type Interlocked =
         if old = comparand then location <- value
         old
 
+/// System.Lazy — a memoized thunk.
+type Lazy<'a>(f : unit -> 'a) =
+    let mutable computed = false
+    let mutable stored : 'a = Unchecked.defaultof<'a>
+    member x.Value : 'a =
+        if not computed then
+            stored <- f ()
+            computed <- true
+        stored
+    member x.IsValueCreated = computed
+    member x.Force () : 'a = x.Value
+
 /// System.WeakReference — a STRONG reference.
 ///
 /// wasm-GC has no weak references and no finalizers: there is no way to

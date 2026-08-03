@@ -180,9 +180,17 @@ def drop_fsharp_core_set_bridges(src):
 def dotnet_exception_ctors(src):
     """.NET exception CLASSES construct with optional arguments; the port's
     exn is a union, so the no-argument form gets .NET's own message."""
-    return src.replace(
+    src = src.replace(
         "KeyNotFoundException()",
         'KeyNotFoundException("The given key was not present in the dictionary.")')
+    # exception TYPES the prelude's exn union does not carry ride in Failure
+    src = src.replace("raise <| System.IndexOutOfRangeException()",
+                      'raise (Failure "Index was outside the bounds of the array.")')
+    src = src.replace("raise <| IndexOutOfRangeException()",
+                      'raise (Failure "Index was outside the bounds of the array.")')
+    src = src.replace("raise <| System.NotSupportedException()",
+                      'raise (Failure "Specified method is not supported.")')
+    return src
 
 def drop_dotnet_interop_interfaces(src):
     """The non-generic System.Collections interfaces and the mutable
