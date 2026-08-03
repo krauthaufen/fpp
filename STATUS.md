@@ -859,8 +859,14 @@ compile them, so the self-hosted compiler stubbed the whole `infer` function
 and trapped on entry. The stub warnings named it all along. STRIP
 INSTRUMENTATION BEFORE GATING.
 
-Known deliberate gaps, all banked: constructor-through-abbreviation
-(`cval 1` — the smoke writes ChangeableValue for now), `Item5`+ tuple
+Constructor-through-abbreviation now WORKS (`cval 1` builds a
+ChangeableValue): Infer hops the ctor-candidate lookup through the alias
+body (tentatively — a hop commits only when a target constructor matches
+the written argument count, and a bare `Vec<'a>` head with no argument
+node is a type-applied VALUE, never a construction), and Lower redirects
+the alias's def to the target type's declaration for the ctor reference.
+
+Known deliberate gaps, all banked: `Item5`+ tuple
 fields, exceptions-as-types (NotSupportedException etc. stub), the
 poisoned-scheme root cause behind the divergence cap.
 
