@@ -2067,6 +2067,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | Some ht ->
                                  (match dictTryFind useDefs ht.Offset with
                                   | Some d when d.Kind = Resolve.DefType ->
+                                      // an ABBREVIATION constructs the type
+                                      // it names: `cval 1` builds a
+                                      // ChangeableValue, so the constructor
+                                      // set is the TARGET's
+                                      let ctorName =
+                                          match dictTryFind aliases d.Name with
+                                          | Some (_, body) ->
+                                              (match prune body with
+                                               | TCon (t, _) -> t
+                                               | _ -> d.Name)
+                                          | None -> d.Name
                                       // the written type arguments pick the
                                       // VARIANT; without them, every variant's
                                       // constructors compete and the argument
@@ -2076,11 +2087,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       let cands =
                                           match written with
                                           | Some k ->
-                                              (match dictTryFind ctors (arityName d.Name k) with
+                                              (match dictTryFind ctors (arityName ctorName k) with
                                                | Some cs -> cs
                                                | None -> [])
                                           | None ->
-                                              arityVariants d.Name
+                                              arityVariants ctorName
                                               |> List.collect (fun v ->
                                                   match dictTryFind ctors v with
                                                   | Some cs -> cs
@@ -2090,15 +2101,47 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       // ordinary path resolves the name to
                                       // its LAST declaration, which may be
                                       // the wrong variant entirely
-                                      let hasVariants = (arityVariants d.Name).Length > 1
+                                      let hasVariants = (arityVariants ctorName).Length > 1
+                                      // the hop through an ABBREVIATION is
+                                      // tentative: commit only when a target
+                                      // constructor matches the written
+                                      // argument count — the compiler's own
+                                      // BCL-shaped aliases (Vec, RefMap)
+                                      // construct with arguments the
+                                      // prelude's classes never declared,
+                                      // and those keep the lenient path
+                                      let hopOk () =
+                                          if ctorName = d.Name then true
+                                          else
+                                              // a bare `Vec<'a>` head carries NO
+                                              // argument node at all — that is a
+                                              // type-applied VALUE, not a
+                                              // construction; `Vec<'a>()` still
+                                              // counts as zero via its empty parens
+                                              let writtenArgs =
+                                                  match args |> List.filter (fun a -> isExprish a.NodeKind) with
+                                                  | [] -> -1
+                                                  | [ one ] when one.NodeKind = ParenExpr
+                                                                 && (nodesOf one |> List.filter (fun m -> isExprish m.NodeKind) |> List.isEmpty) -> 0
+                                                  | xs -> List.length xs
+                                              cands |> List.exists (fun (_, csch) ->
+                                                  match prune csch.Body with
+                                                  | TFun (dom, _) ->
+                                                      let n =
+                                                          match prune dom with
+                                                          | TCon ("unit", []) -> 0
+                                                          | TTuple ts -> List.length ts
+                                                          | _ -> 1
+                                                      n = writtenArgs
+                                                  | _ -> false)
                                       (match cands with
-                                       | cs when cs.Length > 1 -> Some (ht, cs)
+                                       | cs when cs.Length > 1 && hopOk () -> Some (ht, cs)
                                        // ONE candidate is still the answer
                                        // when the ordinary path has nothing:
                                        // a struct-block type's scheme lives
                                        // on its `new` members, and the TYPE
                                        // definition itself carries none
-                                       | [ _ ] when hasVariants || (schemeOfDef d).IsNone -> Some (ht, cands)
+                                       | [ _ ] when (hasVariants || (schemeOfDef d).IsNone) && hopOk () -> Some (ht, cands)
                                        | _ -> None)
                                   | _ -> None)
                              | None -> None

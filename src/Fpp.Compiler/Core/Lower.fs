@@ -61,6 +61,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // offsets of top-level `let` bindings in this file — the only symbols
     // Link can clone, hence the only uses that carry instantiations
     let topLevelDefs = dictNew<int, bool> ()
+    /// type-declaration name tokens seen during the top-level collect; the
+    /// definitions resolve AFTER the binder tables are built below
+    let typeDeclNames = dictNew<int, string> ()
     let rec collectTop (g : Green) : unit =
         match g with
         | GToken _ -> ()
@@ -79,7 +82,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // a class' constructor and members are top-level functions
                 // too, so their uses may carry specialization demands
                 (match n.Children |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
-                 | Some t -> dictSet topLevelDefs t.Offset true
+                 | Some t ->
+                     dictSet topLevelDefs t.Offset true
+                     dictSet typeDeclNames t.Offset t.Text
                  | None -> ())
                 let rec collectMembers (m : GreenNode) =
                     if m.NodeKind = MemberDecl then
@@ -133,6 +138,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
     let defsAt = dictNew<int, Resolve.Definition> ()
     for d in binder.Definitions do dictSet defsAt d.Offset d
+    /// type NAME -> the declaration's definition, for resolving an
+    /// ABBREVIATION used as a constructor (`cval 1`) to the class it names
+    let typeDeclDefs = dictNew<string, Resolve.Definition> ()
+    for off, nm in dictPairs typeDeclNames do
+        match dictTryFind defsAt off with
+        | Some d -> dictSet typeDeclDefs nm d
+        | None -> ()
     // "TypeName.MemberName" -> the member's definition; a use site picks the
     // entry named by the receiver's inferred type (Infer.MemberSites)
     let memberIndex = dictNew<string, Resolve.Definition> ()
@@ -747,6 +759,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EApp (EUnknown "$cellget", [ fld ])
                           else fld
                       | Some d ->
+                          // an ABBREVIATION in expression position IS the
+                          // constructor of the type it names: `cval 1`
+                          // constructs a ChangeableValue
+                          let d =
+                              match dictTryFind tyAliases d.Name with
+                              | Some (_, body) ->
+                                  (match prune body with
+                                   | TCon (target, _) ->
+                                       (match dictTryFind typeDeclDefs target with
+                                        | Some td -> td
+                                        | None -> d)
+                                   | _ -> d)
+                              | None -> d
                           (match dictTryFind instSites t.Offset with
                            | Some inst when
                                 not (List.isEmpty inst)
