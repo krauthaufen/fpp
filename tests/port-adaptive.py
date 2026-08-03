@@ -211,6 +211,69 @@ def qualify_colliding_types(src):
     return "\n".join(lines)
 
 
+def rewrite_keyvalue_binders(src):
+    """`for (KeyValue(k, v)) in d do` — the KeyValue view as a BINDER. F++
+    has no single-case active patterns, so the port binds the pair itself
+    and destructures in two lets, which is the same program."""
+    out = []
+    counter = [0]
+    pat = re.compile(r"^(\s*)for\s*\(KeyValue\s*\((.*)\)\)\s+in\s+(.*?)\s+do\s*(//.*)?$")
+    for line in src.split("\n"):
+        m = pat.match(line)
+        if not m:
+            out.append(line)
+            continue
+        ind, inner, source = m.group(1), m.group(2), m.group(3)
+        # split the pair pattern at the TOP-level comma
+        depth, cut = 0, -1
+        for i, c in enumerate(inner):
+            if c in "([<":
+                depth += 1
+            elif c in ")]>":
+                depth -= 1
+            elif c == "," and depth == 0:
+                cut = i
+                break
+        kp, vp = inner[:cut].strip(), inner[cut+1:].strip()
+        counter[0] += 1
+        kv = "kvp%d" % counter[0]
+        out.append("%sfor %s in %s do" % (ind, kv, source))
+        if kp != "_":
+            out.append("%s    let %s = %s.Key" % (ind, kp, kv))
+        if vp != "_":
+            out.append("%s    let %s = %s.Value" % (ind, vp, kv))
+    return "\n".join(out)
+
+
+EXCISED = ["AdaptiveSynchronizationContext"]
+
+def excise_types(src):
+    """Types that exist to interoperate with a .NET runtime service — an
+    AdaptiveSynchronizationContext IS a System.Threading
+    SynchronizationContext — have nothing to attach to here. Dropped whole,
+    with their doc comments; nothing else in the library refers to them
+    (Install() is a static on the type itself)."""
+    lines = src.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        l = lines[i]
+        m = re.match(r"^(\s*)type\s+(?:internal\s+|private\s+)*([A-Za-z_][A-Za-z0-9_]*)", l)
+        if m and m.group(2) in EXCISED:
+            ind = len(m.group(1))
+            while out and out[-1].lstrip().startswith("///"):
+                out.pop()
+            i += 1
+            while i < len(lines):
+                nxt = lines[i]
+                if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= ind:
+                    break
+                i += 1
+            continue
+        out.append(l)
+        i += 1
+    return "\n".join(out)
+
+
 def main():
     root, out = sys.argv[1], sys.argv[2]
     proj = os.path.join(root, "FSharp.Data.Adaptive.fsproj")
@@ -233,7 +296,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = qualify_colliding_types("\n".join(chunks))
+    text = excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

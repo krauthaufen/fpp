@@ -600,15 +600,29 @@ member index — keyed by plain spelling, while inference's fields table keys
 definition). propSetter now consults the fields table first, exactly as
 `memberAt` does.
 
-What remains of stage 2 on the clean prefix — NINE sites, two causes:
+Stage 2 on the clean prefix, updated:
 
-* **`for (KeyValue(k, v)) in dict`** (7): enumerating a Dictionary through
-  the KeyValue active pattern; the prelude Dictionary offers no
-  GetEnumerator the for-in lowering can find. Two of the seven iterate
-  `data.Array` / `data.Set` instead — check those separately.
-* **`AdaptiveSynchronizationContext`** (2): inherits
-  System.Threading.SynchronizationContext, a runtime service that will
-  never exist here — squarely the `#if FPP` category the user set.
+* **KeyValue binders**: the port now rewrites `for (KeyValue(k, v)) in d do`
+  into a plain binder plus two destructuring lets — F++ has no single-case
+  active patterns (the parser requires >= 2 cases; a prelude `(|KeyValue|)`
+  was tried and does not LOWER, so it came out again). Four sites rewrote.
+* **`AdaptiveSynchronizationContext`**: excised by the port (`EXCISED` list
+  in port-adaptive.py) — it IS a System.Threading.SynchronizationContext.
+* **OPEN — the List alias fails to expand, but only at scale.** In the smoke
+  prefix, `let inline private swap (heap: List<'T>) ...` (HeapExtensions)
+  hovers as `List<'a>` — the prelude's `type List<'a> = ResizeArray<'a>`
+  did not expand — and every `heap.[l]` then fails to lower ("List cannot
+  be indexed"), ~20 errors. A faithful small repro (module + inline private
+  + the `type List<'T> with` extension + AutoOpen) expands CORRECTLY, so
+  something earlier in the 13,816-line prefix breaks the entry. The
+  full-file measure (58) NEVER SEES these: they are lowering-side, and
+  group.fsx only reads Workspace.Diagnostics. Next move: binary-search the
+  prefix length for where the hover at the swap annotation flips from
+  ResizeArray to List — eight runs, mechanical. Suspect list: a probe-pass
+  unification mutating the SHARED alias param vars (BuiltinCache.copyDict
+  copies keys, not Var objects), or an overwrite of aliases["List"].
+* Also still open from before: `for n in all` and `for r in data.Array` —
+  two for-in sites that are not KeyValue-shaped.
 
 ## Compiling is not the same as running
 
