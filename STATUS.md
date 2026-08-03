@@ -877,7 +877,18 @@ harness is a hand-port of the plain [<Test>] cases; FsCheck properties need
 the reference implementation and are not started. Six ASet tests are parked
 as TEMP-SKIP with these open compiler bugs, in rough order of leverage:
 
-* **Base-ctor calls resolve arity-blind**: `AbstractReader<'S,'D>`'s own
+* DONE (faf9773): base-ctor arity resolution, method-value eta-expansion,
+  override params from the abstract's signature — union constant and
+  content-bind-adjacent machinery run.
+* **Struct-tuple representation splits through stamped Dictionary storage**:
+  `state.[m] <- struct(v, p)` writes the uniform boxed $tup2 while reads use
+  the specialized record ($r_StructTuple2$<obj.bool>), and Cache's
+  struct(r, ref) refcounts misread the same way. Blocks: mapUse (dispose
+  semantics), filterA, content bind, and is likely under reduceByA too.
+  The read site cannot decide (bare owners legitimately hold BOTH reps —
+  reverting to uniform broke three struct-tuple Expecto tests); the fix is
+  making the WRITE side name its instantiation (pendingRecords/instName).
+* **Base-ctor calls resolve arity-blind** (FIXED above, kept for context): `AbstractReader<'S,'D>`'s own
   `inherit AbstractReader<'D>(...)` calls ITSELF (b882_575193 recurses), and
   every stamped reader subclass (UnionConstantSingleReader, BindReader,
   MapUseReader) calls the arity-2 ctor which casts its argument to
