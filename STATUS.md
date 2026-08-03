@@ -593,12 +593,22 @@ inventory:
      7  not lowerable: for-in (no GetEnumerator on the source)
      2  base-related
 
-The 27 are `inner.Count <- e` — val-field assignment through a local — which
-WORKS in isolation (tested), so it is the DOT's lowering at these sites
-producing something other than EField (likely a member-getter EApp via a
-stale memberIndex entry), and the assignment branch then has nothing to
-write to. That is the first stage-2 investigation, `mh2.fpp`/`smoke.fpp` in
-the scratchpad are the repros.
+The 27 were FIXED in one stroke: they were properties with `inline get/set`
+accessors, and `propSetter` looked the setter up only in the RESOLVER's
+member index — keyed by plain spelling, while inference's fields table keys
+`Inner`2.set_Count` by the decorated owner (and already carries the
+definition). propSetter now consults the fields table first, exactly as
+`memberAt` does.
+
+What remains of stage 2 on the clean prefix — NINE sites, two causes:
+
+* **`for (KeyValue(k, v)) in dict`** (7): enumerating a Dictionary through
+  the KeyValue active pattern; the prelude Dictionary offers no
+  GetEnumerator the for-in lowering can find. Two of the seven iterate
+  `data.Array` / `data.Set` instead — check those separately.
+* **`AdaptiveSynchronizationContext`** (2): inherits
+  System.Threading.SynchronizationContext, a runtime service that will
+  never exist here — squarely the `#if FPP` category the user set.
 
 ## Compiling is not the same as running
 

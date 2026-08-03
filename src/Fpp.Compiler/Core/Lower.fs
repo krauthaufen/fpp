@@ -1213,7 +1213,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | Some t ->
                                       (match dictTryFind memberSites t.Offset with
                                        | Some owner ->
-                                           (match dictTryFind memberIndex (owner + ".set_" + t.Text) with
+                                           // inference's table first, as in memberAt:
+                                           // it is keyed by the DECORATED owner, and
+                                           // the resolver's index is not
+                                           let sd =
+                                               match dictTryFind fieldsTable (owner + ".set_" + t.Text) with
+                                               | Some fi when fi.DefKey.IsSome ->
+                                                   let dp, doff = fi.DefKey.Value
+                                                   Some ({ Name = "set_" + t.Text
+                                                           Kind = Resolve.DefMember
+                                                           Path = dp; Offset = doff
+                                                           Length = strLen t.Text } : Resolve.Definition)
+                                               | _ -> dictTryFind memberIndex (owner + ".set_" + t.Text)
+                                           (match sd with
                                             | Some sd ->
                                                 (match nodesOf l |> List.tryHead with
                                                  | Some recv -> Some (sd, lowerExpr (GNode recv))
