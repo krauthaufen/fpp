@@ -249,6 +249,14 @@ let prunedId (v : Var) : int =
     | TVar w -> w.Id
     | _ -> v.Id
 
+/// Installed by inference: nominal subsumption. Given (interface-side,
+/// class-side), answer the DECLARED interface instantiation to unify the
+/// interface side against — `HashSetDelta<'a>` widening into
+/// `IEnumerable<'x>` yields `IEnumerable<SetOperation<'a>>`, so `'x` binds
+/// to what the class actually enumerates. The caller performs the returned
+/// unification itself, so trials stay undoable.
+let mutable subsumeHook : (Type -> Type -> (Type * Type) option) option = None
+
 let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 : Type) (t2 : Type) : string option =
     let unify a b = unifySeen seen trial a b
     let rigid (v : Var) = v.Rigid && (match trial with Some t -> t.Rigid | None -> false)
@@ -293,10 +301,26 @@ let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 :
             v.Link <- Some other
             None
     | TCon (n1, a1), TCon (n2, a2) ->
-        if n1 <> n2 || List.length a1 <> List.length a2 then
-            Some ("type mismatch: " + typeString a + " vs " + typeString b)
-        else
+        if n1 = n2 && List.length a1 = List.length a2 then
             List.zip a1 a2 |> List.tryPick (fun (x, y) -> unify x y)
+        // widening is COMMITTING-only: during an overload TRIAL the
+        // question is "does this candidate fit as declared", and letting a
+        // seq subsume into a HashSet parameter made the wrong Overlaps
+        // overload fit — the runtime then read Root off a seq
+        elif n1 <> n2 && subsumeHook.IsSome && trial.IsNone then
+            // one side implements the other: the value widens, as it does
+            // in F#. The hook names the class's DECLARED instantiation of
+            // the interface; unifying against it is what pins the
+            // interface's arguments to what the class really provides.
+            let resolve = subsumeHook.Value
+            (match resolve a b with
+             | Some (da, db) -> unify da db
+             | None ->
+             match resolve b a with
+             | Some (da, db) -> unify da db
+             | None -> Some ("type mismatch: " + typeString a + " vs " + typeString b))
+        else
+            Some ("type mismatch: " + typeString a + " vs " + typeString b)
     | TFun (p1, r1), TFun (p2, r2) ->
         match unify p1 p2 with
         | Some e -> Some e
@@ -311,6 +335,22 @@ let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 :
 
 let unify (t1 : Type) (t2 : Type) : string option =
     unifySeen (refPairSetNew<Type> shallowHash) None t1 t2
+
+/// Like unifyTrial, but on success answer HOW MANY variables the fit had to
+/// bind. Overload selection uses it as an exactness measure: `IndexOf(Index)`
+/// fits an Index argument with 0 bindings where `IndexOf('T)` needs one, and
+/// F# picks the exact member — picking the generic one bound the class's own
+/// parameter and corrupted every later use of the type.
+let unifyTrialScore (rigid : bool) (t1 : Type) (t2 : Type) : int option =
+    let trial = { Undo = vecNew<Var * Type option * int> (); Rigid = rigid }
+    let r = unifySeen (refPairSetNew<Type> shallowHash) (Some trial) t1 t2
+    let n = vecLen trial.Undo
+    for v, link, lvl in List.rev (vecToList trial.Undo) do
+        v.Link <- link
+        v.Level <- lvl
+    match r with
+    | None -> Some n
+    | Some _ -> None
 
 /// Would these unify? Ask, then put everything back exactly as it was.
 /// `rigid` makes the caller's own type parameters unbindable for the

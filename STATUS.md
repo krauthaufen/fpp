@@ -647,6 +647,55 @@ port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from
 adaptive.fpp by the recipe in the session notes; group.fsx/ms.fsx in the
 scratchpad are the measurement and hover probes.
 
+## THE FULL LIBRARY COMPILES AND LOADS
+
+All 38 files (everything but AdaptiveFileSystem and the aset{}/alist{}
+builder sugar in ComputationExpressions.fs) compile with ZERO errors, every
+initializer runs, and the aval smoke stays green. The error count went
+68 -> 0 in one sitting; each fix was a mechanism:
+
+* **Nominal subsumption lives in the UNIFIER.** A subsumeHook installed by
+  inference answers TCon mismatches: it returns the class's DECLARED
+  interface instantiation (implTys, threaded through Workspace like bases)
+  substituted at the receiver's arguments, and unifySeen unifies the pair
+  itself so trials stay undoable. `HashSetDelta<'a>` widening into
+  `IEnumerable<'x>` binds 'x to SetOperation<'a> — what the class actually
+  enumerates — where a name-only rule bound it to 'a and manufactured
+  "SetOperation would contain itself". Arity-mismatched entries are OTHER
+  classes sharing a bare name and are skipped: substituting nothing and
+  unifying raw parameter variables corrupted every later use.
+* **Exact overloads outrank declaration order.** unifyTrialScore counts the
+  bindings a fit needs; a zero-binding parameter fit (IndexOf(Index) for an
+  Index argument) wins, anything less exact keeps the old first-fit rule.
+  Picking the generic member bound the receiver's class parameter GLOBALLY.
+* **Numeric defaulting never touches declaration-level variables.** A
+  leftover constraint whose argument is a level-0 var is some class's
+  parameter; defaulting it took MapExt's 'Key to int for the whole project.
+  The constraint drops instead — stamping resolves it per instantiation.
+* **Stored types freshen COMPLETELY at use.** Every site that unifies a
+  fields/bases/implTys tree now freshens all leftover free variables, not
+  just Params+Quantified — leaked foreign variables were landmines.
+* **Overloaded accessor properties register decorated** (registerField, not
+  a raw dictSet): the second `Item` overwrote the first and the wrong index
+  type always won.
+* **`stillNamed` finally guards the template drop** (the comment always
+  promised it): a secondary constructor names its primary symbolically from
+  inside a template, and dropping the primary unbound History.
+* Port: extent-scoped .Invoke rewriting (adapted closures only — `x.Invoke`
+  and `cache.Invoke` are real members; parameters typed FSharpFunc anchor
+  at their declaring line), file-scoped renames for non-private colliding
+  reader types, `type X with` augmentations excluded from renaming,
+  MutableHashSet grew a real enumerator, MapExt KeyValue enumerations go
+  through ToSeq, dotless indexers get their dot, `override
+  Compute(token, dirty)` states its dirty-set type, LevelChanged guards use
+  annotated helpers, and one ctor-with-property-initializers writes its
+  fields out loud.
+
+The remaining frontier is RUNTIME tails of the collection smoke (a $tup3
+cast in the alist applyDelta path) and the parked builder sugar. The
+`cval`/`cset`-style ABBREVIATION constructors still don't resolve
+(ctor-through-abbreviation); the smoke uses the class names.
+
 ## THE SMOKE TEST RUNS: 2, then 42
 
 `let c = cval 1` / `AVal.map (fun v -> v * 2) c` / `force` prints 2;

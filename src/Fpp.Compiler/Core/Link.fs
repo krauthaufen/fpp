@@ -949,6 +949,11 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                 // already right — still name it. Dropping it made every such
                 // call an "unbound variable HashSet".
                 || (dictTryFind vtableCtor (v.Path, v.Offset)) = Some true
+                // ... and the rule the comment above promises: drop a
+                // template only if NOTHING still names it. A secondary
+                // constructor's body names its primary SYMBOLICALLY inside a
+                // template, and dropping the primary unbound it (History).
+                || (dictTryFind stillNamed (v.Path, v.Offset)) = Some true
             | _ -> true)
     // the instantiated subclasses: no fields of their own, so they inherit
     // the class' layout exactly; only the vtable differs

@@ -162,6 +162,7 @@ module private BuiltinCache =
           Ifaces : Fpp.Prelude.Dict<string, (string * int) list>
           Bases : Fpp.Prelude.Dict<string, Analysis.Types.Var list * Analysis.Types.Type>
           Impls : Fpp.Prelude.Dict<string, string list>
+          ImplTys : Fpp.Prelude.Dict<string, (Analysis.Types.Var list * Analysis.Types.Type) list>
           StructTypes : Fpp.Prelude.Dict<string, bool>
           Ctors : Fpp.Prelude.Dict<string, (int * Analysis.Types.Scheme) list>
           Classes : Analysis.Classes.Tables
@@ -191,6 +192,7 @@ module private BuiltinCache =
             let ifaces = dictNew<string, (string * int) list> ()
             let bases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
             let impls = dictNew<string, string list> ()
+            let implTys = dictNew<string, (Analysis.Types.Var list * Analysis.Types.Type) list> ()
             let structTypes = dictNew<string, bool> ()
             let ctors = dictNew<string, (int * Analysis.Types.Scheme) list> ()
             let classes = Analysis.Classes.newTables ()
@@ -200,10 +202,10 @@ module private BuiltinCache =
             for full, d in bb.Exports do dictSet imports full d
             for k, d in bb.Members do dictSet members k d
             let binf =
-                Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls structTypes ctors classes
+                Analysis.Infer.infer Builtin.path bp.Root bb schemes aliases fields ifaces bases impls implTys structTypes ctors classes
             { Parse = bp; Bind = bb; Inferred = binf; Imports = imports
               Schemes = schemes; Aliases = aliases; Fields = fields
-              Ifaces = ifaces; Bases = bases; Impls = impls
+              Ifaces = ifaces; Bases = bases; Impls = impls; ImplTys = implTys
               StructTypes = structTypes; Ctors = ctors; Classes = classes
               Members = members }
     // Memoized by hand rather than with `lazy`: one cell, computed on first
@@ -358,6 +360,7 @@ type Workspace() =
             let ifaces = BuiltinCache.copyDict cached.Ifaces
             let bases = BuiltinCache.copyDict cached.Bases
             let impls = BuiltinCache.copyDict cached.Impls
+            let implTys = BuiltinCache.copyDict cached.ImplTys
             let structTypes = BuiltinCache.copyDict cached.StructTypes
             let ctors = BuiltinCache.copyDict cached.Ctors
             // classes and instances are project-wide: the prelude declares
@@ -396,6 +399,7 @@ type Workspace() =
                                 (BuiltinCache.copyDict schemes) (BuiltinCache.copyDict aliases)
                                 (BuiltinCache.copyDict fields) (BuiltinCache.copyDict ifaces)
                                 (BuiltinCache.copyDict bases) (BuiltinCache.copyDict impls)
+                                (BuiltinCache.copyDict implTys)
                                 (BuiltinCache.copyDict structTypes) (BuiltinCache.copyDict ctors)
                                 (BuiltinCache.copyTables classes)
                         let builders = dictNew<int, Desugar.CeBuilder> ()
@@ -442,7 +446,7 @@ type Workspace() =
                                  dictSet members (target + k.Substring dot) d
                              | _ -> ())
                         | None -> ()
-                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls structTypes ctors classes
+                let inf = Analysis.Infer.infer path p.Root b schemes aliases fields ifaces bases impls implTys structTypes ctors classes
                 dictSet results path (b, inf)
             // libraries declare their interfaces in their serialized core
             for _, text in this.Libraries do
@@ -465,7 +469,7 @@ type Workspace() =
         | Some (_, i) -> i
         | None ->
             Analysis.Infer.infer path (this.ParseFile path).Root (this.Resolve path)
-                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
+                (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ()) (dictNew ())
                 (Analysis.Classes.newTables ())
 
     member this.Diagnostics (path : string) : DiagnosticInfo list =

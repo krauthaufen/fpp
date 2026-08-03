@@ -97,6 +97,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (fields : Dict<string, FieldInfo>) (ifaces : Dict<string, (string * int) list>)
           (bases : Dict<string, Var list * Type>)
           (impls : Dict<string, string list>)
+          (implTys : Dict<string, (Var list * Type) list>)
           (structTypes : Dict<string, bool>)
           (ctors : Dict<string, (int * Scheme) list>)
           (classes : Classes.Tables) : InferResult =
@@ -257,6 +258,58 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | _ -> false)
             | None -> false)
 
+    // (iface-side, class-side) -> the DECLARED interface instantiation to
+    // unify against, or the identity pair when only the NAME relation is
+    // known (the arguments then stay open and later uses pin them)
+    do Types.subsumeHook <-
+        Some (fun ifaceTy clsTy ->
+            match prune ifaceTy, prune clsTy with
+            | TCon (iname, _), TCon (cname, cargs) when iname <> "obj" ->
+                let rec resolve (cname : string) (cargs : Type list) : (Type * Type) option =
+                    // an entry whose parameter count differs is ANOTHER
+                    // class sharing the bare name (two AbstractReaders):
+                    // substituting nothing and unifying its RAW parameter
+                    // variables bound them globally and corrupted every
+                    // later use of that class
+                    let viaDecl =
+                        match dictTryFind implTys cname with
+                        | Some entries ->
+                            entries |> List.tryPick (fun (ps, ity) ->
+                                match prune ity with
+                                | TCon (inm, _) when inm = iname && ps.Length = cargs.Length ->
+                                    let subst = dictNew<int, Type> ()
+                                    List.zip ps cargs
+                                    |> List.iter (fun (pv, ca) -> dictSet subst (prunedId pv) ca)
+                                    for fv in freeVars ity do
+                                        if (dictTryFind subst (prunedId fv)).IsNone then
+                                            dictSet subst (prunedId fv) (st.Fresh ())
+                                    Some (substVars subst ity, ifaceTy)
+                                | _ -> None)
+                        | None -> None
+                    match viaDecl with
+                    | Some r -> Some r
+                    | None ->
+                        match dictTryFind bases cname with
+                        | Some (ps, bt) when ps.Length = cargs.Length ->
+                            let subst = dictNew<int, Type> ()
+                            List.zip ps cargs
+                            |> List.iter (fun (pv, ca) -> dictSet subst (prunedId pv) ca)
+                            for fv in freeVars bt do
+                                if (dictTryFind subst (prunedId fv)).IsNone then
+                                    dictSet subst (prunedId fv) (st.Fresh ())
+                            (match prune (substVars subst bt) with
+                             | TCon (bn, bargs) -> resolve bn bargs
+                             | _ -> None)
+                        | _ -> None
+                (match resolve cname cargs with
+                 | Some r -> Some r
+                 | None ->
+                     // name-only knowledge: the value widens, the arguments
+                     // stay the interface's own business
+                     if isSupertypeOf iname cname then Some (ifaceTy, ifaceTy)
+                     else None)
+            | _ -> None)
+
     /// Unify an argument against a parameter, allowing the argument to be a
     /// subtype — F# inserts the upcast, and the representation is identical.
     let rec unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
@@ -276,6 +329,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             unifyAt offset p1 p2
             unifyArg offset r1 r2
         | _ -> unifyAt offset paramTy argTy
+
+    /// Unify a MEMBER's type against the type its use demands, letting each
+    /// argument position widen: `Outputs.Remove x` passes the class where the
+    /// declaration says the interface, exactly as F# inserts the upcast.
+    let rec unifyMemberAt (offset : int) (demanded : Type) (memT : Type) : unit =
+        match prune demanded, prune memT with
+        | TFun (dArg, dRes), TFun (mArg, mRes) ->
+            unifyArg offset mArg dArg
+            unifyMemberAt offset dRes mRes
+        | _ -> unifyAt offset demanded memT
 
     /// The name of a type at its instantiation. A name still mentioning a
     /// type variable (`Pair$<#7.int>`) marks code that is itself generic:
@@ -628,7 +691,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                            vecAdd fieldOwnersRaw (offset, "$out:" + outName)
                                            v
                                        | _ -> memT
-                               unifyAt offset result memT
+                               unifyMemberAt offset result memT
                                if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
                                vecAdd memberSitesRaw (offset, ownerTag)
                                true
@@ -696,15 +759,44 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match cands with
                      | [ one ] -> one
                      | many ->
-                         let accepts (c : FieldInfo) =
+                         // Fit first, exactness second. Exactness is measured
+                         // on the PARAMETER positions only: `IndexOf(Index)`
+                         // takes an Index argument with zero bindings where
+                         // `IndexOf('T)` must bind one — and picking the
+                         // generic member bound the receiver's own class
+                         // parameter, corrupting every later use of the type.
+                         // Result positions stay out of the count (they bind
+                         // the use's fresh result either way), and a still
+                         // unconstrained argument scores every candidate the
+                         // same, which leaves the tie to declaration order.
+                         let score (c : FieldInfo) : int option =
                              let subst = dictNew<int, Type> ()
                              for pv in c.Params do dictSet subst (prunedId pv) (st.Fresh ())
                              for qv in c.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
-                             (Types.unifyTrial true (substVars subst c.FieldType) demanded).IsNone
-                         (match many |> List.filter (fun (_, c) -> accepts c) with
-                          // one fit is the answer; several is an ambiguity F#
-                          // breaks in declaration order
-                          | picked :: _ -> picked
+                             for fv in freeVars c.FieldType do
+                                 if (dictTryFind subst (prunedId fv)).IsNone then
+                                     dictSet subst (prunedId fv) (st.Fresh ())
+                             let ft = substVars subst c.FieldType
+                             match Types.unifyTrialScore true ft demanded with
+                             | None -> None
+                             | Some _ ->
+                                 match prune ft, prune demanded with
+                                 | TFun (p1, _), TFun (p2, _) ->
+                                     (match Types.unifyTrialScore true p1 p2 with
+                                      | Some n -> Some n
+                                      | None -> Some 1000000)
+                                 | _ -> Some 0
+                         let scored =
+                             many |> List.choose (fun (o, c) -> score c |> Option.map (fun n -> n, (o, c)))
+                         (match scored with
+                          | _ :: _ ->
+                              // an EXACT fit (zero parameter bindings)
+                              // outranks declaration order; anything less
+                              // exact keeps the old first-fit rule, which
+                              // matters when arguments are still variables
+                              (match scored |> List.tryPick (fun (n, pc) -> if n = 0 then Some pc else None) with
+                               | Some pc -> pc
+                               | None -> snd (List.head scored))
                           | [] ->
                               // Nothing fits EXACTLY. Widening is the one
                               // rule plain unification does not model —
@@ -729,6 +821,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let subst = dictNew<int, Type> ()
                      List.zip fi.Params ownArgs |> List.iter (fun (pv, a) -> dictSet subst (prunedId pv) a)
                      for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                     // EVERY remaining free variable freshens too: the stored
+                     // type is shared project-wide, and unifying a var that
+                     // leaked into it from another declaration bound that
+                     // declaration's parameter FOR EVERYONE (MapExt's 'Key
+                     // went to int through one such use)
+                     for fv in freeVars fi.FieldType do
+                         if (dictTryFind subst (prunedId fv)).IsNone then
+                             dictSet subst (prunedId fv) (st.Fresh ())
                      // F# synthesizes a TUPLE VIEW for a trailing out
                      // parameter: `d.TryGetValue k` is `(found, value)` where
                      // the declaration says `TryGetValue(k, value : byref<_>)`.
@@ -743,7 +843,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  vecAdd fieldOwnersRaw (offset, "$out:" + outName)
                                  v
                              | _ -> declared
-                     unifyAt offset result chosen
+                     unifyMemberAt offset result chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then
                          vecAdd fieldOwnersRaw (offset, instName recvTy)
@@ -2062,6 +2162,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        let subst = dictNew<int, Type> ()
                                        for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
                                        for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                                       for fv in freeVars fi.FieldType do
+                                           if (dictTryFind subst (prunedId fv)).IsNone then
+                                               dictSet subst (prunedId fv) (st.Fresh ())
                                        unifyAt nameTok.Offset (substVars subst fi.FieldType) vt
                                        vecAdd memberSitesRaw (nameTok.Offset, tn)
                                    | None ->
@@ -4160,7 +4263,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       setScheme kt.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = defTy }
                       (match nameTok with
                        | Some pn ->
-                           dictSet fields (tyName + ".set_" + pn.Text)
+                           // registerField, not a raw set: an overloaded
+                           // indexer (`Item` by Index AND by int) needs the
+                           // second entry DECORATED, or it overwrites the
+                           // first and the wrong index type always wins
+                           registerField (tyName + ".set_" + pn.Text)
                                { TypeName = tyName; Params = classParams
                                  Quantified = []
                                  FieldType = setTy
@@ -4176,7 +4283,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  if (dictTryFind defsAt t.Offset).IsSome then
                      setScheme t.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = defTy }
                  let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
-                 dictSet fields (tyName + "." + t.Text)
+                 registerField (tyName + "." + t.Text)
                      { TypeName = tyName; Params = classParams
                        Quantified =
                            freeVars propTy |> List.distinctBy (fun v -> v.Id)
@@ -4617,6 +4724,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let key = arityName nameTok.Text (tyParamCount n)
                         let prior = match dictTryFind impls key with Some l -> l | None -> []
                         dictSet impls key (prior @ names)
+                        // the DECLARED instantiation, typed at the class's
+                        // own parameters: what subsumption unifies against
+                        let pvars = dictNew<string, Type> ()
+                        let pvarList =
+                            match nodesOf n |> List.tryFind (fun m -> m.NodeKind = TyParams) with
+                            | Some m ->
+                                m.Children
+                                |> List.collect (fun c ->
+                                    match c with
+                                    | GNode w when w.NodeKind = WhenDecl -> []
+                                    | other -> Green.tokens other)
+                                |> List.filter (fun t -> t.Kind = Ident && t.Text <> "_")
+                                |> List.distinctBy (fun t -> t.Text)
+                                |> List.map (fun t ->
+                                    let fv = st.Fresh ()
+                                    dictSet pvars t.Text fv
+                                    match prune fv with
+                                    | TVar v -> v
+                                    | _ -> { Id = 0; Level = 0; Link = None; Rigid = false })
+                            | None -> []
+                        let ityps =
+                            nodesOf n
+                            |> List.filter (fun m -> m.NodeKind = InterfaceImpl)
+                            |> List.choose (fun m -> nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind))
+                            |> List.map (typeFromNode pvars)
+                        if not (List.isEmpty ityps) then
+                            let prior2 = match dictTryFind implTys key with Some l -> l | None -> []
+                            dictSet implTys key (prior2 @ (ityps |> List.map (fun t -> pvarList, t)))
                 | None -> ()
             elif n.NodeKind = ModuleDef then n.Children |> List.iter preScan
     root.Children |> List.iter preScan
@@ -4644,6 +4779,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable defaulting = true
     while defaulting do
         defaulting <- false
+        // never default a DECLARATION-LEVEL variable (level 0): that is some
+        // class's or top-level binding's parameter, shared project-wide, and
+        // defaulting it bound the parameter for everyone — MapExt's 'Key went
+        // to int through one leftover constraint. Such a constraint resolves
+        // per instantiation when the use is stamped; drop it here.
+        let declLevel (c : Constraint) =
+            c.Args |> List.exists (fun a ->
+                match prune a with
+                | TVar v -> v.Level = 0
+                | _ -> false)
+        wanted <- wanted |> List.filter (fun (_, c) -> isGround c || not (declLevel c))
         match wanted |> List.tryFind (fun (_, c) -> not (isGround c)) with
         | Some (offset, c) ->
             (match Classes.select classes c.Class (c.Args |> List.map (fun _ -> tInt)) [] with

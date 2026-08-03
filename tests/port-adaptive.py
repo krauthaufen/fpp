@@ -138,6 +138,12 @@ def port(path, first):
     src = drop_dotnet_interop_interfaces(src)
     src = dotnet_hashset(src)
     src = strip_namespace_headers(src, first)
+    if path.endswith("AdaptiveIndexList.fs"):
+        # this file's Cache is keyed by a STRUCT tuple; the calls pass the
+        # elements bare and F++ does not adapt plain to struct tuples
+        src = src.replace("cache.TryRevoke(i, ov)", "cache.TryRevoke(struct (i, ov))")
+        src = src.replace("cache.TryRevoke(i, v)", "cache.TryRevoke(struct (i, v))")
+        src = src.replace("cache.Invoke(i,v)", "cache.Invoke(struct (i, v))")
     return src
 
 
@@ -196,6 +202,14 @@ def qualify_colliding_types(src):
     KEYWORDS = {"set", "get", "inline", "new", "val", "member", "this", "static",
                 "mutable", "rec", "of", "with", "abstract", "override", "default"}
     seen, renames = {}, []
+    # seed with EVERY declaration: a private type whose name collides with an
+    # EARLIER public one (module HashSet's `type private Traceable<'T>` vs the
+    # core Traceable record) must rename too — tracking only private decls let
+    # the first private collision through unrenamed
+    for i, l in enumerate(lines):
+        d = decl_any.match(l)
+        if d and d.group(2) not in KEYWORDS and d.group(2) not in seen:
+            seen[d.group(2)] = i
     for i, l in enumerate(lines):
         d = decl.match(l)
         if not d:
@@ -203,13 +217,43 @@ def qualify_colliding_types(src):
         name = d.group(2)
         if name in KEYWORDS:
             continue
-        if name not in seen:
-            seen[name] = i
+        if seen.get(name) == i:
             continue
         enc = enclosing(i, len(d.group(1)))
         if enc is not None:
             n = 1 + lines[i][d.end():].split(">")[0].count(",") if "<" in lines[i][d.end():d.end()+2] else 0
             renames.append((name, enc[0] + "_" + name, enc[1], enc[2], n))
+    # NON-private colliding types (three MapReaders, one per collection
+    # family): each family lives inside ONE source file, so the rename runs
+    # from the declaration to the file's end marker. Arity-guarded like the
+    # private pass, so a same-name type of a different arity is untouched.
+    file_marks = [i for i, l in enumerate(lines) if l.startswith("// ==== ")]
+    def file_end(ln):
+        for m in file_marks:
+            if m > ln:
+                return m
+        return len(lines)
+    decl_pub = re.compile(r"^(\s*)(?:type|and)\s+(?:internal\s+)?"
+                          r"([A-Za-z_][A-Za-z0-9_]*)\s*(?=[<(=])")
+    already = set(r[0] for r in renames)
+    for i, l in enumerate(lines):
+        d = decl_pub.match(l)
+        if not d:
+            continue
+        # `type X<'T> with` AUGMENTS the existing type; it declares nothing
+        if l.rstrip().endswith(" with"):
+            continue
+        name = d.group(2)
+        if name in KEYWORDS or name in already:
+            continue
+        if seen.get(name) is None or seen.get(name) >= i:
+            continue
+        enc = enclosing(i, len(d.group(1)))
+        if enc is None:
+            continue
+        n = 1 + lines[i][d.end():].split(">")[0].count(",") if "<" in lines[i][d.end():d.end()+2] else 0
+        renames.append((name, enc[0] + "_" + name, i, file_end(i), n))
+        already.add(name)
     # module-nested vs later top-level: rename the NESTED declaration
     seen_any = {}
     for i, l in enumerate(lines):
@@ -390,6 +434,10 @@ SPOT = [
      "    static let mutable CurrentEvaluationDepth = 0"),
     ("LanguagePrimitives.FastGenericComparer<'Key>",
      "{ new IComparer<'Key> with member __.Compare(a : 'Key, b : 'Key) = compare a b }"),
+    ("LanguagePrimitives.FastGenericComparer<Index>",
+     "{ new IComparer<Index> with member __.Compare(a : Index, b : Index) = compare a b }"),
+    ("LanguagePrimitives.FastGenericComparer<'T2>",
+     "{ new IComparer<'T2> with member __.Compare(a : 'T2, b : 'T2) = compare a b }"),
     ("LanguagePrimitives.FastGenericComparer",
      "{ new IComparer<_> with member __.Compare(a, b) = compare a b }"),
     ("MutableHashSet<'T>(ReferenceEqualityComparer<'T>.Instance)",
@@ -400,6 +448,49 @@ SPOT = [
 # LevelChangedException rides in a Failure with an encoded message. The level
 # survives as "!level:N"; the catch sites decode it. See DIVERGENCES.md.
 LEVEL_EXC = [
+    # ctor property-initializer syntax with a POSITIONAL argument mixed in is
+    # not lowered; say the writes out loud
+    ("""            let res = IndexNode(x.Root, Prev = x, Next = next, Tag = key)""",
+     """            let res = IndexNode(x.Root)
+            res.Prev <- x
+            res.Next <- next
+            res.Tag <- key"""),
+
+    # the flexible-return widening picks a wrong pairing for this one ctor;
+    # the explicit upcast says what F# would have inserted
+    ("ofReader (fun () -> SortWithReader(list, compare))",
+     "ofReader (fun () -> SortWithReader(list, compare) :> IOpReader<IndexListDelta<_>>)"),
+
+    # Index and the comparer wrappers need their class instances said in
+    # F++'s own words: MinMax has no derivation from Ordered, and
+    # ReversedCompare's ordering lives in interface impls the auto
+    # CompareTo->Ordered rule does not read
+    ("""/// internal type used for properly handling of decorator objects (as introduced in AVal.mapNonAdaptive)""",
+     """instance MinMax<Index>
+    static min (a : Index) (b : Index) = if compare a b < 0 then a else b
+    static max (a : Index) (b : Index) = if compare a b > 0 then a else b
+
+/// internal type used for properly handling of decorator objects (as introduced in AVal.mapNonAdaptive)"""),
+
+    # an override's parameter types are not yet taken from the base abstract
+    # signature; the dirty-set parameter needs its type said out loud
+    ("override x.Compute(token, dirty) =",
+     "override x.Compute(token, dirty : MutableHashSet<_>) ="),
+    ("override x.Compute(token,dirty) =",
+     "override x.Compute(token, dirty : MutableHashSet<_>) ="),
+
+    # the BCL HashSet IS the prelude's MutableHashSet; qualified spellings too
+    ("System.Collections.Generic.HashSet<", "MutableHashSet<"),
+    ("FSharp.Data.Traceable.", ""),
+    # F# 6 dotless indexers parse as application of a list
+    ("cache[struct(r, i)] <-", "cache.[struct(r, i)] <-"),
+    ("cache[n] <-", "cache.[n] <-"),
+    # range slices on keyed collections go through GetSlice explicitly
+    ("reader.State.[newMin .. newMax]",
+     "reader.State.GetSlice(Some newMin, Some newMax)"),
+    ("ops.Content.[sharedMin .. sharedMax]",
+     "ops.Content.GetSlice(Some sharedMin, Some sharedMax)"),
+
     # the prelude Dictionary has no comparer-taking constructor (F++ has no
     # secondary ctors) and hashes structurally anyway
     ("Dictionary<'B, int>(DefaultEqualityComparer<'B>.Instance)",
@@ -480,10 +571,50 @@ def rewrite_static_val_mutable(src):
     return src
 
 
+def inject_after_type(src, type_header, block):
+    """Insert `block` after the extent of the type declared by `type_header`
+    (the first following non-blank line at an indent <= the header's)."""
+    i = src.index(type_header)
+    lines = src[i:].split(chr(10))
+    ind = len(lines[0]) - len(lines[0].lstrip())
+    end = len(lines)
+    for j in range(1, len(lines)):
+        l = lines[j]
+        if l.strip() and (len(l) - len(l.lstrip())) <= ind and not l.lstrip().startswith("//"):
+            end = j
+            break
+    pos = i + sum(len(l) + 1 for l in lines[:end])
+    return src[:pos] + block + chr(10) + src[pos:]
+
+
+REGEX_SPOTS = [
+    # MapExt enumerated as KeyValuePairs: go through ToSeq and plain tuples
+    (r"GetChanges\(token\)\.Content\s*\n(\s*)\|> Seq\.collect \(fun \(KeyValue\((\w+), (\w+)\)\) ->",
+     r"GetChanges(token).Content.ToSeq()\n\1|> Seq.collect (fun (\2, \3) ->"),
+    # HashSetDelta enumerated by Seq.*: through toSeq (the port dropped the
+    # BCL enumerator interfaces)
+    (r"reader\.GetChanges token \|> Seq\.choose \(fun op ->",
+     r"reader.GetChanges token |> HashSetDelta.toSeq |> Seq.choose (fun op ->"),
+]
+
+
+def rewrite_regex_spots(src):
+    for pat, rep in REGEX_SPOTS:
+        src2 = re.sub(pat, rep, src)
+        assert src2 != src or re.search(pat, src) is None, "REGEX_SPOT missing: " + pat[:50]
+        src = src2
+    return src
+
+
 def rewrite_level_exception(src):
     for old, new in LEVEL_EXC:
         assert old in src, "LEVEL_EXC pattern missing: " + old[:60]
         src = src.replace(old, new)
+    src = inject_after_type(src,
+        "type internal ReversedCompare<'a when 'a : comparison>(value : 'a) =",
+        """instance Ordered<ReversedCompare<'a>> when Ordered<'a>
+    static compare (a : ReversedCompare<'a>) (b : ReversedCompare<'a>) = compare b.Value a.Value
+""")
     return src
 
 
@@ -579,13 +710,13 @@ def thunk_module_generic_values(src):
                 thunked = True
         if in_module and not thunked:
             # bare reads inside the module extent become calls
-            l2 = re.sub(r"(?<![.\w'])empty(?![\w(<])(?! \(\))", "(empty ())", l)
+            l2 = re.sub(r"(?<![.\w'])empty(?![\w(<])(?! ?\(\))", "(empty ())", l)
             if l2 != l and "let empty" not in l:
                 l = l2
         out.append(l)
     # qualified reads, everywhere: Module.empty / Module.empty<args>
     src = chr(10).join(out)
-    src = re.sub(r"\b(" + "|".join(THUNKED_MODULE_VALUES) + r")\.empty(<[^<>=]*>)?(?! ?\()",
+    src = re.sub(r"\b(" + "|".join(THUNKED_MODULE_VALUES) + r")\.empty(<[^<>=]*>)?(?! ?\(\))",
                  lambda m: "(" + m.group(1) + ".empty" + (m.group(2) or "") + " ())", src)
     src = src.replace("empty () ()", "empty ()")
     src = src.replace("(empty ()) ()", "(empty ())")
@@ -605,6 +736,10 @@ def main():
     # which say anything about whether this compiler can build the library.
     # See DIVERGENCES.md.
     files = [f for f in files if not f.endswith("AdaptiveFileSystem.fs")]
+    # ComputationExpressions.fs is the aset{}/alist{} builder SUGAR — heavy
+    # inline overload families, nothing the core machinery calls. Parked
+    # until the test suite demands it; see DIVERGENCES.md.
+    files = [f for f in files if not f.endswith("ComputationExpressions.fs")]
     chunks = ["module Adaptive"]
     shims = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive-shims")
     for i, f in enumerate(files):
@@ -614,7 +749,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = thunk_module_generic_values(call_thunked_statics(rewrite_bare_list(rewrite_static_val_mutable(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))))))))
+    text = thunk_module_generic_values(call_thunked_statics(rewrite_bare_list(rewrite_static_val_mutable(rewrite_regex_spots(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks)))))))))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

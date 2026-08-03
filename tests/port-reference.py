@@ -60,17 +60,59 @@ def port_closures(src):
                 out.append(mm.group(0)); i = after + mm.end()
         else:
             out.append("(" + " -> ".join(split_top(inner, ",")) + ")"); i = j
+    # `.Invoke` becomes plain application ONLY for bindings the Adapt
+    # conversion touched, and only within their scope. A global by-name rule
+    # rewrote `x.Invoke`/`cache.Invoke`/an IndexMapping's `mapping.Invoke` —
+    # all REAL members — into applying the object. The scope of an adapted
+    # binding runs to the first non-blank line at a smaller indent.
+    lines = src.split("\n")
+    adapted = []   # (name, first_line, end_line)
+    for i, l in enumerate(lines):
+        m = re.match(r"(\s*)let (?:mutable )?(\w+)\s*=\s*OptimizedClosures\.", l)
+        if m:
+            ind = len(m.group(1))
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                lj = lines[j]
+                if lj.strip() and (len(lj) - len(lj.lstrip())) < ind:
+                    end = j
+                    break
+            adapted.append((m.group(2), i, end))
+        # a PARAMETER typed as an adapted closure (`compare :
+        # OptimizedClosures.FSharpFunc<...>`) is applied through .Invoke too;
+        # its scope is the declaring type or function
+        for pm in re.finditer(r"([A-Za-z_]\w*)\s*:\s*OptimizedClosures\.FSharpFunc<", l):
+            # the parameter may sit on its own line of a MULTILINE signature;
+            # the scope is the DECLARING construct's, so anchor the indent at
+            # the nearest let/member/new/type line at or above
+            anchor = i
+            while anchor > 0 and not re.match(r"\s*(let|member|new|type|and|override|static)\b", lines[anchor]):
+                anchor -= 1
+            ind = len(lines[anchor]) - len(lines[anchor].lstrip())
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                lj = lines[j]
+                if lj.strip() and (len(lj) - len(lj.lstrip())) <= ind and j > anchor:
+                    if not re.match(r"\s*[\(\)a-zA-Z_']", lj) or re.match(r"\s*(let|member|new|type|and|override|static|module)\b", lj):
+                        end = j
+                        break
+            adapted.append((pm.group(1), i, end))
     src = "".join(out)
-    def inv(m):
-        return "(" + m.group(1) + " " + " ".join("(" + a + ")" for a in split_top(m.group(2), ",")) + ")"
-    # a CALL to .Invoke, never a DECLARATION of one: `member x.Invoke(a, b)`
-    # matched too, and came out as `member (x (a) (b))` — a member with no
-    # name, which is what stopped two files of the whole-library port
-    for _ in range(4):
-        src = re.sub(
-            r"(?<!member )(?<!override )(?<!abstract )(?<!default )"
-            r"([A-Za-z_][A-Za-z0-9_.]*)\.Invoke\(([^()]*(?:\([^()]*\)[^()]*)*)\)", inv, src)
-    return src
+    lines = src.split("\n")
+    def inv_for(name):
+        def inv(m):
+            return "(" + m.group(1) + " " + " ".join("(" + a + ")" for a in split_top(m.group(2), ",")) + ")"
+        return inv
+    for name, a, b in adapted:
+        pat = re.compile(
+            r"(?<![A-Za-z0-9_.])(" + re.escape(name) + r")\.Invoke\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
+        for i in range(a, min(b, len(lines))):
+            for _ in range(4):
+                new_l = pat.sub(inv_for(name), lines[i])
+                if new_l == lines[i]:
+                    break
+                lines[i] = new_l
+    return "\n".join(lines)
 
 def strip_attrs(src):
     out, i = [], 0

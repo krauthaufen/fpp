@@ -807,6 +807,10 @@ type ValueOption<'a> =
 type voption<'a> = ValueOption<'a>
 [<Struct>]
 type StructTuple2<'a, 'b> = { Item1 : 'a; Item2 : 'b }
+instance Ordered<StructTuple2<'a, 'b>> when Ordered<'a> when Ordered<'b>
+    static compare (x : StructTuple2<'a, 'b>) (y : StructTuple2<'a, 'b>) =
+        let c = compare x.Item1 y.Item1
+        if c <> 0 then c else compare x.Item2 y.Item2
 [<Struct>]
 type StructTuple3<'a, 'b, 'c> = { Item1 : 'a; Item2 : 'b; Item3 : 'c }
 [<Struct>]
@@ -5247,6 +5251,13 @@ type Dictionary<'k, 'v>() =
 /// it rather than shadowing it (see DIVERGENCES.md), so claiming the .NET
 /// name would break every program that declares its own. The members are
 /// .NET's exactly; only the type's name differs.
+/// walks a MutableHashSet's DENSE key array (0 .. count-1)
+type MutableHashSetEnumerator<'a>(keys : 'a[], count : int) =
+    let mutable i = 0 - 1
+    member x.MoveNext () : bool =
+        i <- i + 1
+        i < count
+    member x.Current : 'a = keys.[i]
 type MutableHashSet<'a>() =
     let mutable skeys : 'a[] = Array.zeroCreate 8
     let mutable shashes : int[] = Array.zeroCreate 8
@@ -5275,6 +5286,7 @@ type MutableHashSet<'a>() =
             e <- e + 1
         sslots <- slots
     member x.Count = scount
+    member x.GetEnumerator () = MutableHashSetEnumerator<'a>(skeys, scount)
     member x.Contains (v : 'a) : bool = sslots.[x.SlotOf v] > 0
     /// .NET answers whether the element was NEW
     member x.Add (v : 'a) : bool =
