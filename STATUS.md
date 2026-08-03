@@ -557,14 +557,48 @@ errors — was ONE poisoned alias-table entry (see CLAUDE.md): the abbreviation
 "statics share the class's parameters" diagnosis recorded here earlier was
 WRONG — the untied hovers were this same poison viewed from another angle.
 
-What remains is small and scattered:
+The remaining 58, clustered by cause (line numbers are DISPLACED — these
+errors are blamed at parked-dot retry time, so hover the actual expressions,
+do not trust the reported line):
 
-     4  StructTuple2<Index, 'a> vs Index * 'a
-     4  Index vs int
-     3  ListTreeReader<'a> vs AdaptiveToken -> 'a     (ctor used as function)
-     3  SetTreeReader<'a> vs AdaptiveToken -> 'a
-    ~12 IAdaptiveValue`1 vs concrete impls           (interface widening)
-    ...
+* **A reader class where a function is expected** (~14): `ListTreeReader<'a>
+  vs AdaptiveToken -> 'a`, `Cache<'a,'b> vs 'a -> 'b`, `IndexMapping<...> vs
+  Index -> 'a`. One shared shape — some application path unifies the CLASS
+  against a function type instead of calling a member or constructor.
+* **A concrete class vs IAdaptiveObject** (~8): widening into an interface
+  at a NON-argument position (`AdaptiveOr vs IAdaptiveObject`, the reduce
+  classes). unifyArg widens; plain unify does not.
+* **`IEnumerable<'a> vs HashSet<'a>`** (4, in the CE builders' YieldFrom):
+  NOT the isSeqName decoration — tested, count unchanged. Something else.
+* **StructTuple2 vs reference tuple** (4+), **Index vs int** (4, one
+  `inherit` line), **MinMax<Index>/Ordered<ReversedCompare>** instances (4),
+  slice on MapExt content (1), occurs in AdaptiveFileSystem-adjacent
+  Compute overrides (2).
+
+### The plan the user set: `#if FPP`
+
+The reflection/DynamicMethod zoo (ShallowEqualityComparer and friends)
+cannot ever compile here — it gets `#if !FPP` guards in the FDA sources
+instead of shims. `tests/port-reference.py` already has `pick_branch` with a
+defined-set for `#if FABLE_COMPILER`; add FPP to that machinery and guard
+the zoo at the source.
+
+### Stage 2 has been measured now
+
+Building the CLEAN PREFIX (13,767 lines through Traceable/Instances.fs, with
+a cval/AVal.map/transact smoke test appended) produces the first LOWERING
+inventory:
+
+    27  not lowerable: assignment target
+     7  not lowerable: for-in (no GetEnumerator on the source)
+     2  base-related
+
+The 27 are `inner.Count <- e` — val-field assignment through a local — which
+WORKS in isolation (tested), so it is the DOT's lowering at these sites
+producing something other than EField (likely a member-getter EApp via a
+stale memberIndex entry), and the assignment branch then has nothing to
+write to. That is the first stage-2 investigation, `mh2.fpp`/`smoke.fpp` in
+the scratchpad are the repros.
 
 ## Compiling is not the same as running
 
