@@ -547,7 +547,10 @@ The port script was stripping the attribute; it keeps it now.
 
 ## Where it stops now
 
-77 diagnostics over the 39 ported files. The whole occurs-check family — 65
+58 diagnostics over the 39 ported files. An implemented interface is now
+recorded under its DECORATED name (`interface IAdaptiveValue<'State> with`
+implements IAdaptiveValue`1), so concrete values widen into generic
+interfaces again — 77 to 58. The whole occurs-check family — 65
 errors — was ONE poisoned alias-table entry (see CLAUDE.md): the abbreviation
 `MultiSetMap = HashMap<'k, HashSet<'v>>` re-registered itself under
 `HashMap`, and every use of HashMap in the project expanded wrong. The

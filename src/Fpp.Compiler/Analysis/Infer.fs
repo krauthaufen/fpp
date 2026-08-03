@@ -3890,8 +3890,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // implementations live under "Class.Interface.Method": they
                 // are not accessible as members of the class itself
                 let rec ifaceOf (ty : GreenNode) : string option =
+                    // DECORATED: `interface IAdaptiveValue<'State> with`
+                    // implements IAdaptiveValue`1, and recording the bare
+                    // name meant nothing ever widened into the generic
+                    // interface
                     match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
-                    | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                    | Some hd when ty.NodeKind = AppType ->
+                        let n = nodesOf ty |> List.tail |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.length
+                        ifaceOf hd |> Option.map (fun nm -> arityName nm n)
                     | _ ->
                         Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
                         |> Option.map (fun t -> t.Text)
@@ -4457,8 +4463,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                 | Some nameTok ->
                     let rec ifaceOf (ty : GreenNode) : string option =
+                        // decorated, as in inferTypeDecl's copy above
                         match nodesOf ty |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
-                        | Some hd when ty.NodeKind = AppType -> ifaceOf hd
+                        | Some hd when ty.NodeKind = AppType ->
+                            let n = nodesOf ty |> List.tail |> List.filter (fun x -> isTypeKind x.NodeKind) |> List.length
+                            ifaceOf hd |> Option.map (fun nm -> arityName nm n)
                         | _ ->
                             Green.tokens (GNode ty) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
                             |> Option.map (fun t -> t.Text)
