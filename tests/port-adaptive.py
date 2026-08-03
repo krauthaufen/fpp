@@ -193,8 +193,8 @@ def qualify_colliding_types(src):
                         end = k
                         break
                 return m.group(2).split(".")[-1], j + 1, end
-            if m and len(m.group(1)) >= ind:
-                return None
+            # a module at the SAME (or deeper) indent is a closed SIBLING
+            # scope above us, not the enclosing one — walk past it
         return None
 
     # `and` opens a property accessor too (`and inline set v = ...`); these
@@ -235,7 +235,7 @@ def qualify_colliding_types(src):
         return len(lines)
     decl_pub = re.compile(r"^(\s*)(?:type|and)\s+(?:internal\s+)?"
                           r"([A-Za-z_][A-Za-z0-9_]*)\s*(?=[<(=])")
-    already = set(r[0] for r in renames)
+    already = set((r[0], r[2]) for r in renames)
     for i, l in enumerate(lines):
         d = decl_pub.match(l)
         if not d:
@@ -244,7 +244,9 @@ def qualify_colliding_types(src):
         if l.rstrip().endswith(" with"):
             continue
         name = d.group(2)
-        if name in KEYWORDS or name in already:
+        # `already` holds (name, extent-start): the same bare name may need
+        # renaming in SEVERAL disjoint module extents (three AValReaders)
+        if name in KEYWORDS or (name, i) in already:
             continue
         if seen.get(name) is None or seen.get(name) >= i:
             continue
@@ -253,7 +255,7 @@ def qualify_colliding_types(src):
             continue
         n = 1 + lines[i][d.end():].split(">")[0].count(",") if "<" in lines[i][d.end():d.end()+2] else 0
         renames.append((name, enc[0] + "_" + name, i, file_end(i), n))
-        already.add(name)
+        already.add((name, i))
     # module-nested vs later top-level: rename the NESTED declaration
     seen_any = {}
     for i, l in enumerate(lines):
@@ -428,6 +430,7 @@ SPOT = [
             Some (fun (a : 'a) -> unbox<'b> a)"""),
     # the generic zero, as the prelude's own class member
     ("LanguagePrimitives.GenericZero", "Zero"),
+    ("LanguagePrimitives.GenericOne", "One"),
     # `static val mutable` storage, as a static let: AdaptiveObject is not
     # generic, so the once-per-program initializer is exactly right
     ("    static val mutable private CurrentEvaluationDepth : int",
@@ -628,6 +631,17 @@ SPOT.append((
                 gc <- false"""))
 
 REGEX_SPOTS = [
+    # ValueOption's intrinsic .Value has no equivalent here (adding a Value
+    # member to the union stole every deferred `.Value` by-name pick)
+    (r"let t = Transaction\.Running\.Value",
+     'let t = (match Transaction.Running with ValueSome tt -> tt | ValueNone -> failwith "no running transaction")'),
+    # a bare obj() exists only to be a LOCK TOKEN; lock here is a no-op
+    # (single-threaded), any reference value serves
+    (r"= obj\(\)", r"= box 0"),
+    # HashMapEnumerator's Mapping field is a PLAIN curried function; F#
+    # tolerates .Invoke on it, this language applies it
+    (r"x\.Mapping\.Invoke\(([^,]+), ([^)]+)\)",
+     r"x.Mapping \1 \2"),
     # MapExt enumerated as KeyValuePairs: go through ToSeq and plain tuples
     (r"GetChanges\(token\)\.Content\s*\n(\s*)\|> Seq\.collect \(fun \(KeyValue\((\w+), (\w+)\)\) ->",
      r"GetChanges(token).Content.ToSeq()\n\1|> Seq.collect (fun (\2, \3) ->"),
@@ -721,7 +735,8 @@ def call_thunked_statics(src):
 
 
 THUNKED_MODULE_VALUES = ["HashSet", "HashMap", "MapExt", "IndexList",
-                         "HashMapDelta", "IndexListDelta", "MultiSetMap"]
+                         "HashMapDelta", "IndexListDelta", "MultiSetMap",
+                         "ASet", "AMap", "AList"]
 
 
 def thunk_module_generic_values(src):

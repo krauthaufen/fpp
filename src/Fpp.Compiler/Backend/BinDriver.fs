@@ -628,9 +628,16 @@ let private scanTupleArities (decls : Decl list) : int list =
             for _, v in fs do scan v
         | EField (r, fn2, owner) when owner.StartsWith "StructTuple" && fn2.StartsWith "Item" ->
             let core = (if owner.Contains "$<" then owner.Substring (0, owner.IndexOf "$<") else owner).Substring 11
+            // the read may demand a larger arity than the owner names (an
+            // inconsistent uniform template); the emitter casts to the
+            // demanded arity, so that type must exist too
+            let demanded =
+                match parseDigits (fn2.Substring 4) with
+                | Some k -> k
+                | None -> 0
             (match parseDigits core with
-             | Some v -> note v
-             | None -> ())
+             | Some v -> note (if demanded > v then demanded else v)
+             | None -> note demanded)
             scan r
         | ELam (_, b) -> scan b
         | ELet (_, _, _, r, b) -> scan r; scan b
@@ -2809,6 +2816,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              | Some v -> v
              | None -> 2)
         let idx = (int (fname.Substring 4)) - 1
+        // an owner that names a SMALLER arity than the field demands is an
+        // inconsistent template (uniform-representation dead code): cast to
+        // the arity the READ needs, so the module validates and the path
+        // traps at the cast if it is ever actually taken
+        let arity = if idx >= arity then idx + 1 else arity
         emitNode st f lv r
         gcT f "ref.cast" ("$tup" + string arity)
         gcTF f "struct.get" ("$tup" + string arity) idx

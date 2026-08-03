@@ -804,14 +804,6 @@ type exn =
 type ValueOption<'a> =
     | ValueNone
     | ValueSome of 'a
-
-    /// The F# intrinsic properties, as ported code writes them.
-    member x.Value : 'a =
-        match x with
-        | ValueSome v -> v
-        | ValueNone -> failwith "ValueOption.Value: no value"
-    member x.IsSome = match x with ValueSome _ -> true | ValueNone -> false
-    member x.IsNone = match x with ValueNone -> true | ValueSome _ -> false
 type voption<'a> = ValueOption<'a>
 [<Struct>]
 type StructTuple2<'a, 'b> = { Item1 : 'a; Item2 : 'b }

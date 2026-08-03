@@ -264,7 +264,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     do Types.subsumeHook <-
         Some (fun ifaceTy clsTy ->
             match prune ifaceTy, prune clsTy with
-            | TCon (iname, _), TCon (cname, cargs) when iname <> "obj" ->
+            | TCon (iname, iargs), TCon (cname, cargs) when iname <> "obj" ->
                 let rec resolve (cname : string) (cargs : Type list) : (Type * Type) option =
                     // an entry whose parameter count differs is ANOTHER
                     // class sharing the bare name (two AbstractReaders):
@@ -276,7 +276,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some entries ->
                             entries |> List.tryPick (fun (ps, ity) ->
                                 match prune ity with
-                                | TCon (inm, _) when inm = iname && ps.Length = cargs.Length ->
+                                // the ARITY must match too: IOpReader<'d>
+                                // and IOpReader<'s, 'd> share the bare name
+                                | TCon (inm, ia) when inm = iname
+                                                      && ia.Length = iargs.Length
+                                                      && ps.Length = cargs.Length ->
                                     let subst = dictNew<int, Type> ()
                                     List.zip ps cargs
                                     |> List.iter (fun (pv, ca) -> dictSet subst (prunedId pv) ca)
@@ -315,8 +319,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let rec unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
         match prune paramTy, prune argTy with
         | TCon (p, pa), TCon (a, aa) when p <> a && isSupertypeOf p a ->
-            // widening: only the type arguments they share need to agree
-            if pa.Length = aa.Length then List.iter2 (unifyAt offset) pa aa
+            // widening: the positional pairing is right whenever the
+            // subtype passes its parameters straight through (list -> seq),
+            // and it is TRIED first so those keep their exact old path. A
+            // reader's own parameter is the ELEMENT while IOpReader's is
+            // the DELTA — there the pairs cannot unify, and the class's
+            // DECLARED instantiation of the supertype carries the real
+            // argument mapping instead.
+            let resolved =
+                match Types.subsumeHook with
+                | Some hook -> hook (TCon (p, pa)) (TCon (a, aa))
+                | None -> None
+            (match resolved with
+             | Some (da, db) -> unifyAt offset da db
+             | None -> ())
+            // the positional pairing still applies wherever it fits — it is
+            // what a subtype passing its parameters straight through relies
+            // on; after the declared-instantiation unify it is a no-op there
+            if pa.Length = aa.Length
+               && List.forall2 (fun x y -> (Types.unifyTrial false x y).IsNone) pa aa then
+                List.iter2 (unifyAt offset) pa aa
         // a multi-argument member packs its arguments into a tuple, and each
         // POSITION widens independently — `M(cmp, leaf)` against
         // `(IEqualityComparer * SetNode)` must accept a MapLeaf second
