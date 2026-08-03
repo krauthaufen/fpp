@@ -614,6 +614,19 @@ def inject_after_type(src, type_header, block):
     return src[:pos] + block + chr(10) + src[pos:]
 
 
+# CallbackDisposable pins itself with a GCHandle so a weakly-referenced
+# subscription outlives collection. This runtime's WeakReference IS strong
+# (prelude), so there is nothing to pin — the handle becomes a flag.
+SPOT.append((
+    "    let mutable gc = if makeGCRoot then GCHandle.Alloc(this) else Unchecked.defaultof<GCHandle>",
+    "    let mutable gc = makeGCRoot"))
+SPOT.append((
+    """            if gc.IsAllocated then 
+                gc.Free()
+                gc <- Unchecked.defaultof<GCHandle>""",
+    """            if gc then
+                gc <- false"""))
+
 REGEX_SPOTS = [
     # MapExt enumerated as KeyValuePairs: go through ToSeq and plain tuples
     (r"GetChanges\(token\)\.Content\s*\n(\s*)\|> Seq\.collect \(fun \(KeyValue\((\w+), (\w+)\)\) ->",

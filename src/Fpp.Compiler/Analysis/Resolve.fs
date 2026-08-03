@@ -530,13 +530,29 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     | _ -> ()
                 env
             | DotExpr ->
+                // the spine may start with NAMESPACE segments this language
+                // does not have (`System.Threading.Interlocked.Exchange`):
+                // drop unbound heads until the remaining path names
+                // something real
+                let qualifiedSuffix (spine : Token list) : Token list option =
+                    let rec go (sp : Token list) =
+                        match sp with
+                        | [] | [ _ ] -> None
+                        | h :: rest ->
+                            let dotted = sp |> List.map (fun t -> t.Text) |> String.concat "."
+                            if (findQualified dotted).IsSome then Some sp
+                            elif (Map.tryFind h.Text env).IsNone then go rest
+                            else None
+                    go spine
                 (match flattenSpine g with
-                 | Some (head :: _ as spine) when
-                        (let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
-                         (findQualified dotted).IsSome
-                         && (Map.tryFind head.Text env |> Option.forall (fun d -> d.Kind <> DefLet && d.Kind <> DefParam))) ->
-                     // qualified access: the spine names something real, and
-                     // the head is not a local shadowing it
+                 | Some (head0 :: _ as spine0) when
+                        (qualifiedSuffix spine0).IsSome
+                        && (Map.tryFind head0.Text env |> Option.forall (fun d -> d.Kind <> DefLet && d.Kind <> DefParam)) ->
+                     // qualified access: the spine (with any namespace heads
+                     // dropped) names something real, and the head is not a
+                     // local shadowing it
+                     let spine = (qualifiedSuffix spine0).Value
+                     let head = List.head spine
                      let dotted = spine |> List.map (fun t -> t.Text) |> String.concat "."
                      let picked =
                          match findQualified dotted with
@@ -552,6 +568,29 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                           record (List.last spine) d
                           tryRecord env head
                       | None -> tryRecord env head)
+                 | Some spine0 when
+                        List.length spine0 >= 3
+                        && (spine0 |> List.take (List.length spine0 - 2)
+                            |> List.forall (fun t -> (Map.tryFind t.Text env).IsNone && (findQualified t.Text).IsNone))
+                        && (let tyTok = spine0 |> List.item (List.length spine0 - 2)
+                            match Map.tryFind tyTok.Text env with
+                            | Some d -> d.Kind = DefType
+                            | None ->
+                                (match findQualifiedType tyTok.Text with
+                                 | Some d -> d.Kind = DefType
+                                 | None -> false)) ->
+                     // NAMESPACE-QUALIFIED static access, e.g.
+                     // `System.Threading.Interlocked.Exchange`: every
+                     // segment before the TYPE names a namespace this
+                     // language does not have. Recording the type is enough
+                     // — inference rebinds the member by receiver type.
+                     let tyTok = spine0 |> List.item (List.length spine0 - 2)
+                     (match Map.tryFind tyTok.Text env with
+                      | Some d -> record tyTok d
+                      | None ->
+                          (match findQualifiedType tyTok.Text with
+                           | Some d -> record tyTok d
+                           | None -> ()))
                  | _ when (match n.Children |> List.rev |> List.tryPick (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None) with
                            | Some t -> (dictTryFind membersByName t.Text).IsSome
                            | None -> false) ->
@@ -881,10 +920,25 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | GNode u when u.NodeKind = UnionCase ->
                 (match firstIdentToken u.Children with
                  | Some t ->
-                     let d = define DefCase t
-                     outer <- Map.add t.Text d outer
+                     // an ENUM member (`| None = 0`) is only in scope
+                     // QUALIFIED, as in F# — binding it bare would shadow
+                     // union cases of the same name (Option's None). Its
+                     // definition carries the qualified name so every later
+                     // pass distinguishes it from a union case.
+                     let isEnumMember =
+                         u.Children |> List.exists (fun c ->
+                             match c with
+                             | GToken et -> et.Kind = Operator && et.Text = "="
+                             | _ -> false)
+                     let d =
+                         if isEnumMember then defineAs DefCase (typeName + "." + t.Text) t
+                         else define DefCase t
+                     if not isEnumMember then
+                         outer <- Map.add t.Text d outer
                      dictSet typeCases (typeName + "." + t.Text) d
-                     if exportHere then exportDef d
+                     if exportHere then
+                         if isEnumMember then exportUnder (typeName + "." + t.Text) d
+                         else exportDef d
                  | None -> ())
                 for x in u.Children do
                     match x with

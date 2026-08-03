@@ -3353,7 +3353,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if not (List.isEmpty (vecToList ownMembers)) then
                 vecAdd decls (DMembers (name, vecToList ownMembers))
 
-        if isEnum then vecAdd decls (DEnum (name, enumCases))
+        if isEnum then vecAdd decls (DEnum (name, enumCases |> List.map (fun (c, v) -> name + "." + c, v)))
         elif not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name

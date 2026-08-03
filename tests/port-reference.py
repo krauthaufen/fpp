@@ -105,7 +105,7 @@ def port_closures(src):
         return inv
     for name, a, b in adapted:
         pat = re.compile(
-            r"(?<![A-Za-z0-9_.])(" + re.escape(name) + r")\.Invoke\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
+            r"(?<![A-Za-z0-9_.])(" + re.escape(name) + r")\.Invoke\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)")
         for i in range(a, min(b, len(lines))):
             for _ in range(4):
                 new_l = pat.sub(inv_for(name), lines[i])
