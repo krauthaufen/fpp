@@ -5204,6 +5204,22 @@ type Dictionary<'k, 'v>() =
         dslots <- Array.zeroCreate dslots.Length
     /// .NET's signature, with the out parameter written. The compiler
     /// synthesizes the TUPLE VIEW, as F# does, so
+    /// .NET's comparer-taking constructor. The comparer is NOT consulted:
+    /// this table hashes structurally, which is what DefaultEqualityComparer
+    /// asks for anyway — see DIVERGENCES.md before passing anything else.
+    new (_comparer : IEqualityComparer<'k>) = Dictionary<'k, 'v>()
+    /// ConcurrentDictionary surface, minus the concurrency: wasm is
+    /// single-threaded, so the atomicity these promise is free
+    member x.TryAdd (k : 'k, v : 'v) : bool =
+        if x.ContainsKey k then false
+        else
+            x.Add (k, v)
+            true
+    member x.TryRemove (k : 'k, value : byref<'v>) : bool =
+        if x.TryGetValue (k, &value) then
+            x.Remove k |> ignore
+            true
+        else false
     /// `match d.TryGetValue k with | (true, v) -> ...` and
     /// `d.TryGetValue(k, &v)` are both this one declaration.
     member x.TryGetValue (k : 'k, value : byref<'v>) : bool =

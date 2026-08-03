@@ -109,7 +109,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // marker at the end, but only if it turned out to be a list or an
     // array: the enumerator protocol needs member accesses parked DURING
     // the walk, so promoting one here would emit an array walk over a class
-    let lateLoopSources = vecNew<int * Type> ()
+    /// (loop offset, collection-token offset, collection type, binder type)
+    let lateLoopSources = vecNew<int * int * Type * Type> ()
     let instRaw = vecNew<int * Type list> ()
     // index expressions whose RECEIVER is an array: `a.[i] <- v` may tie the
     // value to the element type, which a member setter's shape may not
@@ -1924,9 +1925,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       // its LAST declaration, which may be
                                       // the wrong variant entirely
                                       let hasVariants = (arityVariants d.Name).Length > 1
+                                      if (System.Environment.GetEnvironmentVariable "FPP_DBG_CTOR") = "1" && d.Name = "Dictionary" then
+                                          eprintfn "CTOR Dictionary written=%A cands=%d" written cands.Length
                                       (match cands with
                                        | cs when cs.Length > 1 -> Some (ht, cs)
-                                       | [ _ ] when hasVariants -> Some (ht, cands)
+                                       // ONE candidate is still the answer
+                                       // when the ordinary path has nothing:
+                                       // a struct-block type's scheme lives
+                                       // on its `new` members, and the TYPE
+                                       // definition itself carries none
+                                       | [ _ ] when hasVariants || (schemeOfDef d).IsNone -> Some (ht, cands)
                                        | _ -> None)
                                   | _ -> None)
                              | None -> None
@@ -2080,6 +2088,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               (match prune (st.Instantiate sch) with
                                | TFun (dom, res) ->
                                    pin res
+                                   // the SPECIALIZATION DEMAND: this arm
+                                   // returns without typing the head, so
+                                   // nothing else records the instantiation
+                                   // — and an undemanded generic class is a
+                                   // template the stamper drops, leaving the
+                                   // call to name nothing
+                                   (match prune res with
+                                    | TCon (_, ras) when not (List.isEmpty ras) ->
+                                        vecAdd instRaw (ht.Offset, ras)
+                                    | _ -> ())
                                    // widen per argument, not on the tuple
                                    (match prune dom, prune argTy with
                                     | TTuple ds, TTuple has when ds.Length = has.Length ->
@@ -3128,7 +3146,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 if isDefaultOf then
                     let result = st.Fresh ()
                     (match lastIdent with
-                     | Some t -> vecAdd pendingCasts (t.Offset, result)
+                     | Some t ->
+                         vecAdd pendingCasts (t.Offset, result)
+                         // `defaultof<VolatileSetData>` WRITES its type: the
+                         // enclosing application's written-argument pinning
+                         // reads instRaw at the head token, so registering
+                         // the result there is all it takes
+                         vecAdd instRaw (t.Offset, [ result ])
                      | None -> ())
                     result
                 else
@@ -3315,6 +3339,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // lowering derives the same three and reads what
                           // they bound to
                           ignore tn
+                          if (System.Environment.GetEnvironmentVariable "FPP_DBG_FOR") = "1" then
+                              eprintfn "FORIN tn=%s" tn
                           let fo =
                               match Green.tokens (GNode n) |> List.tryHead with
                               | Some t -> t.Offset
@@ -3338,14 +3364,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // the type is not known YET — a parked dot may
                           // still resolve it. Remember the source so the
                           // finalization can look again
-                          (match Green.tokens (GNode coll) |> List.tryHead with
-                           | Some t -> vecAdd lateLoopSources (t.Offset, ct)
-                           | None -> ())
-                          // neither array, list nor protocol: still bind the
-                          // pattern so the body sees its names
-                          (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
-                           | Some ip -> patType fvars ip |> ignore
-                           | None -> ()))
+                          // neither array, list nor protocol YET: bind the
+                          // pattern so the body sees its names, and remember
+                          // BOTH types so the finalization can wire the
+                          // protocol once the source's type has resolved
+                          let bt =
+                              match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                              | Some ip -> patType fvars ip
+                              | None -> st.Fresh ()
+                          (match Green.tokens (GNode n) |> List.tryHead,
+                                 Green.tokens (GNode coll) |> List.tryHead with
+                           | Some t, Some c -> vecAdd lateLoopSources (t.Offset, c.Offset, ct, bt)
+                           | _ -> ()))
                  | _ -> ())
                 for m in nodesOf n do
                     if List.exists (fun h -> System.Object.ReferenceEquals (h, m)) handled then ()
@@ -3882,6 +3912,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         |> Option.map (fun t -> t.Offset)
                 (match siteOffset with
                  | Some off ->
+                     if (System.Environment.GetEnvironmentVariable "FPP_DBG_CTOR") = "1" && name.StartsWith "Dictionary" then
+                         eprintfn "REG new under %s (prior %d)" name prior.Length
                      setScheme off csch
                      dictSet ctors name (prior @ [ off, csch ])
                  | None -> ())
@@ -4226,6 +4258,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
             // the same Name`N key the declaration itself will take
             let selfTy = TCon (arityName nameTok.Text (vecToList tyParams |> List.length), vecToList tyParams)
+            // a struct-block type's only constructors are `new(...)` MEMBERS
+            // — predeclare those too, or an earlier member of the and-group
+            // calling `new MapExtEnumerator<_,_>(root)` finds nothing and
+            // its result stays a variable forever
+            for m in nodesOf n do
+                if m.NodeKind = MemberDecl then
+                    match tokensOf m |> List.tryFind (fun t -> t.Kind = Keyword && t.Text = "new"),
+                          nodesOf m |> List.tryFind (fun p -> isPatKind p.NodeKind) with
+                    | Some nk, Some p ->
+                        let ctorArgTy = patType vars p
+                        let ctorTy = TFun (ctorArgTy, selfTy)
+                        let sch =
+                            { Quantified = ctorQuantified (vecToList tyParams) ctorTy
+                              Constraints = []; Body = ctorTy }
+                        setScheme nk.Offset sch
+                        let key = match prune selfTy with TCon (kn, _) -> kn | _ -> nameTok.Text
+                        let prior = match dictTryFind ctors key with Some l -> l | None -> []
+                        if not (prior |> List.exists (fun (o, _) -> o = nk.Offset)) then
+                            dictSet ctors key (prior @ [ nk.Offset, sch ])
+                    | _ -> ()
             (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
              | Some p ->
                  let ctorArgTy = patType vars p
@@ -4582,6 +4634,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // wait no longer: force the tie, which binds in declaration order
     for offset, recvTy, result, name in parked do
         tryResolveDot true offset recvTy result name |> ignore
+    // a loop whose source's type only settled during the fixpoint: wire the
+    // enumerator protocol NOW, at the same synthetic offsets the eager
+    // branch would have used — the lowering derives them from the loop and
+    // reads what they bound to. `for kv in dict` was silently unlowerable
+    // because the Dictionary ctor's result resolves late.
+    for fo, _, ct, bt in vecToList lateLoopSources do
+        match prune ct with
+        | TCon ("list", _) | TCon ("array", _) | TCon ("string", []) -> ()
+        | TCon (_, _) ->
+            let enTy = st.Fresh ()
+            let gTy = st.Fresh ()
+            if (System.Environment.GetEnvironmentVariable "FPP_DBG_FOR") = "1" then
+                eprintfn "LATELOOP fo=%d ct=%s" fo (Types.typeString ct)
+            if tryResolveDot false (30000000 + fo) ct gTy "GetEnumerator"
+               || tryResolveDot true (30000000 + fo) ct gTy "GetEnumerator" then
+                unify gTy (TFun (tUnit, enTy)) |> ignore
+                let mTy = st.Fresh ()
+                (if not (tryResolveDot false (40000000 + fo) enTy mTy "MoveNext") then
+                    tryResolveDot true (40000000 + fo) enTy mTy "MoveNext" |> ignore)
+                unify mTy (TFun (tUnit, tBool)) |> ignore
+                let cTy = st.Fresh ()
+                (if not (tryResolveDot false (50000000 + fo) enTy cTy "Current") then
+                    tryResolveDot true (50000000 + fo) enTy cTy "Current" |> ignore)
+                unify bt cTy |> ignore
+        | _ -> ()
     // index sites whose receiver only took shape through a parked dot: the
     // element type is known now, so name the read and tie the result to it
     for offset, recvTy, result, br, idxTy in vecToList pendingIndex do
@@ -4612,10 +4689,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for offset, ty in vecToList pendingRecords do
         vecAdd fieldOwnersRaw (offset, instName ty)
 
-    // contextual casts: the target is whatever the context settled on
+    // contextual casts: the target is whatever the context settled on.
+    // A STRUCT target is flagged: `defaultof` of a struct is a ZEROED value,
+    // not a null, and lowering needs to know which to build.
     for offset, ty in vecToList pendingCasts do
         match prune ty with
-        | TCon (n, _) -> vecAdd memberSitesRaw (offset, n)
+        | TCon (n, _) ->
+            if (dictTryFind structTypes n) = Some true
+            then vecAdd memberSitesRaw (offset, "$struct:" + n)
+            else vecAdd memberSitesRaw (offset, n)
         | _ -> ()
 
     // Anything still parked has an indeterminate receiver. We do NOT guess a
@@ -4702,7 +4784,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // can walk without anything having been parked for it
         (vecToList arrKindsRaw
          @ (vecToList lateLoopSources
-            |> List.choose (fun (off, ty) ->
+            |> List.choose (fun (_, off, ty, _) ->
                 match prune ty with
                 | TCon ("list", [ _ ]) | TCon ("array", [ _ ]) -> Some (off, ty)
                 // a string walks by index under the sentinel, and can never

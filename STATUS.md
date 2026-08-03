@@ -600,29 +600,50 @@ member index — keyed by plain spelling, while inference's fields table keys
 definition). propSetter now consults the fields table first, exactly as
 `memberAt` does.
 
-Stage 2 on the clean prefix, updated:
+Stage 2 on the clean prefix: 36 errors at first contact, now FIVE, and the
+smoke test is within sight. Landed this stretch (gates pending as this was
+written):
 
-* **KeyValue binders**: the port now rewrites `for (KeyValue(k, v)) in d do`
-  into a plain binder plus two destructuring lets — F++ has no single-case
-  active patterns (the parser requires >= 2 cases; a prelude `(|KeyValue|)`
-  was tried and does not LOWER, so it came out again). Four sites rewrote.
-* **`AdaptiveSynchronizationContext`**: excised by the port (`EXCISED` list
-  in port-adaptive.py) — it IS a System.Threading.SynchronizationContext.
-* **OPEN — the List alias fails to expand, but only at scale.** In the smoke
-  prefix, `let inline private swap (heap: List<'T>) ...` (HeapExtensions)
-  hovers as `List<'a>` — the prelude's `type List<'a> = ResizeArray<'a>`
-  did not expand — and every `heap.[l]` then fails to lower ("List cannot
-  be indexed"), ~20 errors. A faithful small repro (module + inline private
-  + the `type List<'T> with` extension + AutoOpen) expands CORRECTLY, so
-  something earlier in the 13,816-line prefix breaks the entry. The
-  full-file measure (58) NEVER SEES these: they are lowering-side, and
-  group.fsx only reads Workspace.Diagnostics. Next move: binary-search the
-  prefix length for where the hover at the swap annotation flips from
-  ResizeArray to List — eight runs, mechanical. Suspect list: a probe-pass
-  unification mutating the SHARED alias param vars (BuiltinCache.copyDict
-  copies keys, not Var objects), or an overwrite of aliases["List"].
-* Also still open from before: `for n in all` and `for r in data.Array` —
-  two for-in sites that are not KeyValue-shaped.
+* **Late loop sources get the enumerator protocol**: `for kv in d` over a
+  Dictionary whose type settles late (a ctor result) parked nothing and was
+  silently unlowerable; finalization now wires GetEnumerator/MoveNext/
+  Current at the same synthetic offsets the eager branch uses.
+* **`Unchecked.defaultof<T>` pins its written argument** (registers into
+  instRaw so the existing pinning grounds it), and a STRUCT default lowers
+  as a zeroed ERecord under a `$struct:` marker — UNVERIFIED for POD
+  layouts, kept because null trapped anyway.
+* **Member-`new` constructors predeclare** in `and` groups (struct-block
+  types like MapExtEnumerator have no other constructor), and a SINGLE
+  candidate is taken when the ordinary path has no scheme; the chosen-ctor
+  arm now records the SPECIALIZATION DEMAND (instRaw) itself — without it
+  the stamper dropped the template ("unbound variable Dictionary").
+* **A destructuring let types its VALUE first** and hands the pattern
+  patExpect — `let (v, _) = kvp.Value` over a struct tuple now reads, as it
+  does in a match arm.
+* **Prelude Dictionary** gained the comparer ctor (ignored — structural
+  hashing; divergence), TryAdd, TryRemove.
+* **Port**: VolatileSetData de-structed to a class with a zero ctor;
+  ConcurrentDictionary → Dictionary; qualified System.Collections.Generic
+  names stripped; comparer-passing create bodies simplified; the private
+  rename is now ARITY-AWARE (Traceable<'S,'D> inside a renamed cache class
+  stays the record).
+
+The five left, all in Utilities/Cache.fs and one helper:
+
+* `ReferenceHashSet.create` passes ReferenceEqualityComparer — needs the
+  same spot-simplification (divergence: structural equality).
+* THREE `match cache.TryGetValue v with | (true, (r, ref))` sites bind to
+  **MapExt's** TryGetValue — hover shows `MapExt<int,'a> -> ...` on a
+  receiver that hovers as Dictionary. Last hypothesis: the dot ran while
+  the receiver was parked and the FORCED stage bound via the BARE-name
+  fields key, where the last declaration wins. Print fieldCandidates for
+  "Dictionary.TryGetValue" and the parked list before theorizing further.
+* One occurs-check downstream of the same sites.
+
+The smoke test: cval → AVal.map → force → transact → force, appended to the
+port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from
+adaptive.fpp by the recipe in the session notes; group.fsx/ms.fsx in the
+scratchpad are the measurement and hover probes.
 
 ## Compiling is not the same as running
 

@@ -202,12 +202,42 @@ def qualify_colliding_types(src):
             continue
         enc = enclosing(i, len(d.group(1)))
         if enc is not None:
-            renames.append((name, enc[0] + "_" + name, enc[1], enc[2]))
+            n = 1 + lines[i][d.end():].split(">")[0].count(",") if "<" in lines[i][d.end():d.end()+2] else 0
+            renames.append((name, enc[0] + "_" + name, enc[1], enc[2], n))
 
-    for old, new_name, a, b in renames:
+    def arity_at(line, k):
+        depth, commas, j = 0, 0, k
+        while j < len(line):
+            c = line[j]
+            if c == "<":
+                depth += 1
+            elif c == ">":
+                depth -= 1
+                if depth == 0:
+                    return commas + 1
+            elif c == "," and depth == 1:
+                commas += 1
+            j += 1
+        return None
+
+    for old, new_name, a, b, decl_arity in renames:
         pat = re.compile(r"(?<![A-Za-z0-9_.])" + re.escape(old) + r"\b")
         for i in range(a, min(b, len(lines))):
-            lines[i] = pat.sub(new_name, lines[i])
+            def sub(m):
+                # the GLOBAL type of this name may appear in the same module
+                # at a DIFFERENT arity — `static let trace : Traceable<'S,'D>`
+                # inside the renamed cache class means the record, not the
+                # cache. The written argument count says which.
+                line = lines[i]
+                j = m.end()
+                while j < len(line) and line[j] == " ":
+                    j += 1
+                if j < len(line) and line[j] == "<":
+                    n = arity_at(line, j)
+                    if n is not None and n != decl_arity:
+                        return m.group(0)
+                return new_name
+            lines[i] = pat.sub(sub, lines[i])
     return "\n".join(lines)
 
 
@@ -241,11 +271,59 @@ def rewrite_keyvalue_binders(src):
         if kp != "_":
             out.append("%s    let %s = %s.Key" % (ind, kp, kv))
         if vp != "_":
-            out.append("%s    let %s = %s.Value" % (ind, vp, kv))
+            # a parenthesised pair over a STRUCT payload needs F#'s own
+            # `let struct (...)` spelling; Cache.fs's is the one such site
+            if vp == "(v,_)":
+                out.append("%s    let struct (v, _) = %s.Value" % (ind, kv))
+            else:
+                out.append("%s    let %s = %s.Value" % (ind, vp, kv))
     return "\n".join(out)
 
 
 EXCISED = ["AdaptiveSynchronizationContext"]
+
+# Targeted spot-rewrites, applied verbatim. Each is a documented divergence.
+SPOT = [
+    # VolatileSetData is [<Struct>] purely as a .NET optimization ("~10%
+    # faster transactions than unbox", says its comment). Here a class with
+    # F++'s synthesized zero-init unit constructor is the same program:
+    # `data` has exactly one owner and is only ever mutated through it.
+    ("and [<Struct>] private VolatileSetData =",
+     "and private VolatileSetData() ="),
+    ("Unchecked.defaultof<VolatileSetData>",
+     "VolatileSetData()"),
+    # ConcurrentDictionary minus the concurrency IS the prelude Dictionary
+    # (single-threaded wasm); TryAdd/TryRemove exist there with the same
+    # shapes. Callbacks.fs is the only user.
+    ("System.Collections.Concurrent.ConcurrentDictionary",
+     "Dictionary"),
+    # `List<T>()` constructs through a type ABBREVIATION, which F++ cannot
+    # emit; the target's own name can. One site (Index garbage collection).
+    ("let all = List<IndexNode>()",
+     "let all = ResizeArray<IndexNode>()"),
+    # the prelude Dictionary/MutableHashSet hash structurally and IGNORE a
+    # passed comparer (see the prelude's comparer ctor); passing
+    # DefaultEqualityComparer — itself the structural default — is the
+    # identity, and the property-as-argument shape trips ctor selection
+    ("Dictionary<'Key, 'Value>(DefaultEqualityComparer<'Key>.Instance)",
+     "Dictionary<'Key, 'Value>()"),
+    ("MutableHashSet<'T>(DefaultEqualityComparer<'T>.Instance)",
+     "MutableHashSet<'T>()"),
+    # fully qualified .NET collection names resolve to nothing here — the
+    # prelude's types answer to their BARE names only
+    ("System.Collections.Generic.Dictionary",
+     "Dictionary"),
+    ("System.Collections.Generic.MutableHashSet",
+     "MutableHashSet"),
+    ("MutableHashSet<'T>(ReferenceEqualityComparer<'T>.Instance)",
+     "MutableHashSet<'T>()"),
+]
+
+def spot_rewrites(src):
+    for old, new in SPOT:
+        src = src.replace(old, new)
+    return src
+
 
 def excise_types(src):
     """Types that exist to interoperate with a .NET runtime service — an
@@ -296,7 +374,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))
+    text = spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks)))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

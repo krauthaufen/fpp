@@ -2200,6 +2200,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some "int64" -> ELit (LInt "0L")
                  | Some "float" -> ELit (LFloat "0.0")
                  | Some "float32" -> ELit (LFloat "0.0f")
+                 | Some tn when tn.StartsWith "$struct:" ->
+                     // the zero of a STRUCT is a zeroed instance, never null:
+                     // the first field-set on a null traps. Fields come from
+                     // inference's table; ERecord matches them by NAME, so
+                     // dictionary order is fine.
+                     let sn = tn.Substring 8
+                     let zeroOf (t : Fpp.Analysis.Types.Type) : Expr =
+                         match Fpp.Analysis.Types.prune t with
+                         | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool"), _) -> ELit (LInt "0")
+                         | Fpp.Analysis.Types.TCon (("int64" | "uint64"), _) -> ELit (LInt "0L")
+                         | Fpp.Analysis.Types.TCon ("float", _) -> ELit (LFloat "0.0")
+                         | Fpp.Analysis.Types.TCon (("float32" | "float16"), _) -> ELit (LFloat "0.0f")
+                         | _ -> ELit LNull
+                     let zfields =
+                         dictPairs fieldsTable
+                         |> List.choose (fun (k, fi) ->
+                             if fi.TypeName = sn && fi.DefKey.IsNone && not fi.IsStatic
+                                && k.StartsWith (sn + ".") && not (k.Contains "#") then
+                                 Some (k.Substring (sn.Length + 1), zeroOf fi.FieldType)
+                             else None)
+                     if List.isEmpty zfields then ELit LNull else ERecord (sn, zfields)
                  | _ -> ELit LNull)
             | DotExpr when
                 (match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
