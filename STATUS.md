@@ -628,17 +628,19 @@ written):
   rename is now ARITY-AWARE (Traceable<'S,'D> inside a renamed cache class
   stays the record).
 
-The five left, all in Utilities/Cache.fs and one helper:
+ALL FIVE fixed. The "self-host regression" that parked this branch was
+nothing of the kind: the leftover `GetEnvironmentVariable` debug toggles in
+Infer are not compilable by F++, so the self-compiled compiler STUBBED the
+whole `infer` function and trapped on entry. Strip the instrumentation
+BEFORE gating — the stub warnings named it all along.
 
-* `ReferenceHashSet.create` passes ReferenceEqualityComparer — needs the
-  same spot-simplification (divergence: structural equality).
-* THREE `match cache.TryGetValue v with | (true, (r, ref))` sites bind to
-  **MapExt's** TryGetValue — hover shows `MapExt<int,'a> -> ...` on a
-  receiver that hovers as Dictionary. Last hypothesis: the dot ran while
-  the receiver was parked and the FORCED stage bound via the BARE-name
-  fields key, where the last declaration wins. Print fieldCandidates for
-  "Dictionary.TryGetValue" and the parked list before theorizing further.
-* One occurs-check downstream of the same sites.
+The TryGetValue mystery was the OUT-VIEW choice: a still-variable argument
+fits the full byref signature in a trial, so the full signature swallowed
+the variable (`v := 'k * ByRefCell<'v>`). F#'s rule is syntactic — one
+written element means the view, the full count means the .NET signature —
+so `dotDemand` now carries the written ARGUMENT COUNT and the choice reads
+it. The MapExt owner in the hover was a red herring (the bare-name display
+of a poisoned binding, not the actual resolution).
 
 The smoke test: cval → AVal.map → force → transact → force, appended to the
 port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from

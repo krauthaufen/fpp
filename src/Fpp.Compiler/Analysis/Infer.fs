@@ -490,7 +490,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// that unification widens arguments — `hs.UnionWith [ 5; 6 ]` passes a
     /// list where a seq is declared — and a demand unified directly would
     /// refuse it.
-    let mutable dotDemand : (int * Type) option = None
+    /// (offset, demanded type, SYNTACTIC argument count). The count is what
+    /// separates `d.TryGetValue v` from `d.TryGetValue (k, &v)` when v's
+    /// type is still a variable: one written element means the out-parameter
+    /// VIEW, the full count means the .NET signature — exactly F#'s rule.
+    let mutable dotDemand : (int * Type * int) option = None
 
     /// The TUPLE VIEW of a member whose last parameter is an out. F#
     /// synthesizes one for every such method — `d.TryGetValue k` returns
@@ -571,15 +575,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                List.iter2 (unifyAt offset) sargs args
                                // the same out-parameter view the general path
                                // takes; a member of THIS file arrives here
-                               let demanded =
+                               let demanded, argc =
                                    match dotDemand with
-                                   | Some (off, want) when off = offset -> want
-                                   | _ -> result
+                                   | Some (off, want, c) when off = offset -> want, Some c
+                                   | _ -> result, None
+                               // the WRITTEN element count decides between the
+                               // .NET byref signature and its tuple view — a
+                               // still-variable argument fits both, and the
+                               // full signature then swallowed the variable
+                               let viewFits () =
+                                   match outView memT with
+                                   | Some (v, outName) when (Types.unifyTrial false v demanded).IsNone ->
+                                       Some (v, outName)
+                                   | _ -> None
+                               let fullParams =
+                                   match prune memT with
+                                   | TFun (d, _) ->
+                                       (match prune d with TTuple ps -> List.length ps | _ -> 1)
+                                   | _ -> 0
+                               let preferView =
+                                   match argc with
+                                   | Some c -> c = fullParams - 1
+                                   | None -> false
                                let memT =
-                                   if (Types.unifyTrial false memT demanded).IsNone then memT
+                                   if preferView then
+                                       match viewFits () with
+                                       | Some (v, outName) ->
+                                           vecAdd fieldOwnersRaw (offset, "$out:" + outName)
+                                           v
+                                       | None -> memT
+                                   elif (Types.unifyTrial false memT demanded).IsNone then memT
                                    else
-                                       match outView memT with
-                                       | Some (v, outName) when (Types.unifyTrial false v demanded).IsNone ->
+                                       match viewFits () with
+                                       | Some (v, outName) ->
                                            vecAdd fieldOwnersRaw (offset, "$out:" + outName)
                                            v
                                        | _ -> memT
@@ -627,7 +655,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // breaks genuine ties in declaration order.
                  let demanded =
                      match dotDemand with
-                     | Some (off, want) when off = offset -> want
+                     | Some (off, want, _) when off = offset -> want
                      | _ -> result
                  let informative =
                      match prune demanded with
@@ -1925,8 +1953,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       // its LAST declaration, which may be
                                       // the wrong variant entirely
                                       let hasVariants = (arityVariants d.Name).Length > 1
-                                      if (System.Environment.GetEnvironmentVariable "FPP_DBG_CTOR") = "1" && d.Name = "Dictionary" then
-                                          eprintfn "CTOR Dictionary written=%A cands=%d" written cands.Length
                                       (match cands with
                                        | cs when cs.Length > 1 -> Some (ht, cs)
                                        // ONE candidate is still the answer
@@ -2133,7 +2159,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match Green.tokens (GNode only) |> List.tryHead with
                            | Some t -> demandArg <- Some (t.Offset, argTy)
                            | None -> ())
-                          dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()))
+                          // how many elements the call WROTE
+                          let argc =
+                              let counted (m : GreenNode) =
+                                  if m.NodeKind = TupleExpr
+                                  then nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.length
+                                  else 1
+                              if only.NodeKind = ParenExpr then
+                                  match nodesOf only |> List.filter (fun m -> isExprish m.NodeKind) with
+                                  | [ t ] -> counted t
+                                  | xs -> List.length xs
+                              else counted only
+                          dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()), argc)
                       | _ -> ())
                      let want = expected
                      let mutable funTy = exprType (GNode head)
@@ -3339,8 +3376,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // lowering derives the same three and reads what
                           // they bound to
                           ignore tn
-                          if (System.Environment.GetEnvironmentVariable "FPP_DBG_FOR") = "1" then
-                              eprintfn "FORIN tn=%s" tn
                           let fo =
                               match Green.tokens (GNode n) |> List.tryHead with
                               | Some t -> t.Offset
@@ -3912,8 +3947,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         |> Option.map (fun t -> t.Offset)
                 (match siteOffset with
                  | Some off ->
-                     if (System.Environment.GetEnvironmentVariable "FPP_DBG_CTOR") = "1" && name.StartsWith "Dictionary" then
-                         eprintfn "REG new under %s (prior %d)" name prior.Length
                      setScheme off csch
                      dictSet ctors name (prior @ [ off, csch ])
                  | None -> ())
@@ -4645,8 +4678,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon (_, _) ->
             let enTy = st.Fresh ()
             let gTy = st.Fresh ()
-            if (System.Environment.GetEnvironmentVariable "FPP_DBG_FOR") = "1" then
-                eprintfn "LATELOOP fo=%d ct=%s" fo (Types.typeString ct)
             if tryResolveDot false (30000000 + fo) ct gTy "GetEnumerator"
                || tryResolveDot true (30000000 + fo) ct gTy "GetEnumerator" then
                 unify gTy (TFun (tUnit, enTy)) |> ignore
