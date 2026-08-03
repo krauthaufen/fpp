@@ -870,6 +870,31 @@ Known deliberate gaps, all banked: `Item5`+ tuple
 fields, exceptions-as-types (NotSupportedException etc. stub), the
 poisoned-scheme root cause behind the divergence cap.
 
+## Test-suite port state (tests/adaptive-suite/Tests.fpp)
+
+27 tests green under wasmtime (AVal 12, Transaction-file 7, ASet 8). The
+harness is a hand-port of the plain [<Test>] cases; FsCheck properties need
+the reference implementation and are not started. Six ASet tests are parked
+as TEMP-SKIP with these open compiler bugs, in rough order of leverage:
+
+* **Base-ctor calls resolve arity-blind**: `AbstractReader<'S,'D>`'s own
+  `inherit AbstractReader<'D>(...)` calls ITSELF (b882_575193 recurses), and
+  every stamped reader subclass (UnionConstantSingleReader, BindReader,
+  MapUseReader) calls the arity-2 ctor which casts its argument to
+  Traceable -> cast failure. Blocks: union constant, filterA, content bind,
+  mapUse. The ctorKeys / base-name path in Lower/Link needs the same
+  arity decoration types already get.
+* **Override parameters never see the abstract's signature**: Infer has no
+  `override` handling at all, so `InputChangedObject(_, o)` types `o` fresh,
+  `o.Tag` falls to the field-owner guess (VolatileSetData) and `:? aval<'b>`
+  compiles to a single-typeid test. Blocks: the three reduceByA tests.
+* **History.Update cast failure under ASet.range's reader** (untriaged
+  beyond the trap site). Blocks: range smoke, range systematic.
+* **Float reduction runs uniform arithmetic**: ASet.sum on cset<float>
+  reaches $addv/$toi on f64 boxes — the AdaptiveReduction record's closures
+  are built at the uniform representation and never stamped at float.
+  Blocks: reduce empty after lots of operations.
+
 ## Compiling is not the same as running
 
 The port has only ever been INFERRED. Lowering and emission are a separate
