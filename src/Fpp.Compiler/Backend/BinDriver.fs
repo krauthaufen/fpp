@@ -2009,7 +2009,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             (match dictTryFind st.CaseTag "InvalidCast" with
              | Some tg ->
                  ic f tg
-                 emitNode st f lv (ELit (LString ("\"invalid cast to " + tn + "\"")))
+                 emitNode st f lv (ELit (LString ("\"invalid cast to " + tn + " from typeid \"")))
+                 gcT f "ref.cast" "$str"
+                 lg f t
+                 gcT f "ref.cast" "$obj"
+                 gcTF f "struct.get" "$obj" 0
+                 gcT f "ref.cast" "$desc"
+                 gcTF f "struct.get" "$desc" 0
+                 callf f "$itoa"
+                 gcT f "ref.cast" "$str"
+                 callf f "$strcat"
                  gcT f "struct.new" "$du1"
                  throwExn f
              | None -> ins f "unreachable")
@@ -2167,6 +2176,20 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f (tblIdx f.M "$cmpvBoxed.w0")
         refNull f "any"
         gcT f "struct.new" "$clo"
+    | EUnknown n when n.StartsWith "$class:Ordered:compare:" && n.Contains "#" ->
+        // an UNSTAMPED template's compare — the operand type is a variable
+        // that canonical (all-reference) code never substitutes. The runtime
+        // $cmpv dispatches through the descriptor's compare slot, so the
+        // value's OWN ordering applies; structural is the fallback.
+        requestWrapper st f "$cmpvBoxed" 2
+        ic f (tblIdx f.M "$cmpvBoxed.w0")
+        refNull f "any"
+        gcT f "struct.new" "$clo"
+    | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" && n.Contains "#" ->
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$cmpv"
+        callf f "$ofi"
     | EApp (EUnknown n, [ a ]) when n.Contains "#" && not (n.StartsWith "pad") ->
         // conversions whose source kind inference resolved: target#srckind
         let target = n.Substring (0, n.IndexOf "#")
@@ -3797,8 +3820,11 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 |> List.tryPick (fun c ->
                     ownMembersOf c |> Option.bind (fun own -> own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
             else None
-    // slots 0 and 1 of every vtable are Equals and GetHashCode
-    let identitySlots = 2
+    // slots 0, 1 and 2 of every vtable are Equals, GetHashCode and Compare
+    // (the last is NULL unless the type declares CompareTo — the runtime
+    // $cmpv dispatches through it, which is what makes an Index inside a
+    // generic comparer order by ITS OWN rule rather than structurally)
+    let identitySlots = 3
     let declaredMembers =
         decls |> List.choose (fun d -> match d with DMembers (n, own) -> Some (n, own) | _ -> None)
     let identityImpl (cn : string) (name : string) : VarId option =
@@ -3941,10 +3967,10 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 vtableSlots |> List.choose (fun (i, mn) -> slotImpl cn i mn |> Option.map (fun v -> v.Path, v.Offset))))
         @ (declaredMembers
            |> List.collect (fun (_, own) ->
-                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" then Some (v.Path, v.Offset) else None)))
+                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" || mn = "CompareTo" then Some (v.Path, v.Offset) else None)))
         @ (classDecls
            |> List.collect (fun (_, _, own, _) ->
-                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" then Some (v.Path, v.Offset) else None)))
+                own |> List.choose (fun (mn, v) -> if mn = "Equals" || mn = "GetHashCode" || mn = "CompareTo" then Some (v.Path, v.Offset) else None)))
     let isIfaceImpl (key : string * int) = List.contains key ifaceImplKeys
     let scalarKindOfTy (t : Fpp.Analysis.Types.Type) : string =
         match Fpp.Analysis.Types.prune t with
@@ -4169,7 +4195,8 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         objRecordNames
         |> List.map (fun cn ->
             let identity =
-                [ "Equals", "$eq_" + cn, 2; "GetHashCode", "$hash_" + cn, 1 ]
+                [ "Equals", "$eq_" + cn, 2; "GetHashCode", "$hash_" + cn, 1
+                  "CompareTo", "", 2 ]
                 |> List.map (fun (mname, generated, wantArity) ->
                     match identityImpl cn mname with
                     | Some v ->

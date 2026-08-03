@@ -930,6 +930,15 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     for d in vecToList out do
         match d with
         | DLet (_, _, _, e) -> noteRefs e
+        // a class's member list REFERENCES its members — they are reached
+        // through the vtable, and dropping an object expression's template
+        // member left its interface slot null
+        | DClass (_, _, own, impls) ->
+            for _, v in own do dictSet stillNamed (v.Path, v.Offset) true
+            for _, ms in impls do
+                for _, v in ms do dictSet stillNamed (v.Path, v.Offset) true
+        | DMembers (_, own) ->
+            for _, v in own do dictSet stillNamed (v.Path, v.Offset) true
         | _ -> ()
     for _, d in dictPairs stamped do
         match d with

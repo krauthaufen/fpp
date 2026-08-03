@@ -278,7 +278,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             else 0
         ifaceNameOf tn
         |> Option.map (fun nm ->
-            if argCount > 0 && not (nm.Contains "`") then nm + "`" + string argCount else nm)
+            // the same rule inference's arityName applies: decorate ONLY
+            // when a colliding variant exists at exactly this arity — the
+            // first-declared arity keeps the plain name
+            if argCount > 0 && not (nm.Contains "`")
+               && (dictTryFind tyAliases ("$arity:" + nm + ":" + string argCount)).IsSome
+            then nm + "`" + string argCount
+            else nm)
 
 
     let litOf (t : Token) : Lit option =
@@ -555,7 +561,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
              | [] -> PWild)
         | TypeTestPat ->
-            (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceNameOf with
+            (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceKeyOf with
              | Some tn -> PTypeTest tn
              | None -> PWild)
         | TuplePat -> PTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
@@ -2336,7 +2342,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | CastExpr ->
                 let operand = nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind)
                 let target =
-                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceNameOf
+                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceKeyOf
                 let isDown = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?>")
                 let isTest = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?")
                 (match operand, target with

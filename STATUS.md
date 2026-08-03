@@ -647,6 +647,33 @@ port prefix cut at Traceable/History.fs. `smoke.fpp` is rebuilt from
 adaptive.fpp by the recipe in the session notes; group.fsx/ms.fsx in the
 scratchpad are the measurement and hover probes.
 
+## ALL FOUR ADAPTIVE COLLECTIONS RUN END TO END
+
+The collection smoke prints, in one run: aval 2/42, aset add AND remove
+propagation, amap mapping, and `alist 3 60` — three appends through
+History/applyDelta/Index allocation, mapped and summed. What finished it:
+
+* **Compare is REAL.** The descriptor grew a third identity slot
+  ([eq, hash, cmp]); a type declaring CompareTo fills it, and the runtime
+  $cmpv dispatches through it before falling back to structural — so an
+  Index inside a generic comparer orders by ITS OWN rule. The template's
+  `$class:Ordered:compare:#K` emits as $cmpv (both value and application
+  positions), CompareTo joins the canonical-signature set, and identitySlots
+  went 2 -> 3 (every vtable index shifts automatically through SlotOf).
+* **stillNamed covers class member lists** — an object expression's template
+  member is reached only through the vtable, and dropping it left the
+  interface slot null.
+* **Cast targets are arity-aware.** `node :?> Inner<'K>` resolved the BARE
+  name and tested against the WRONG Inner (two exist, arities 1 and 2 —
+  first-declared keeps the plain name, later ones decorate). ifaceKeyOf now
+  mirrors arityName exactly (decorate only when a variant exists at that
+  arity, via the $arity: aliases), and casts/type-tests use it. The
+  invalid-cast exception now names the RUNTIME typeid, which is what cracked
+  this.
+
+Next: the FDA test suite proper; ComputationExpressions.fs (parked builder
+sugar); ctor-through-abbreviation (cval/cset/clist as constructors).
+
 ## aval, aset AND amap RUN — alist is one dispatch away
 
 The collection smoke now prints: aval 2/42, aset add+remove propagation

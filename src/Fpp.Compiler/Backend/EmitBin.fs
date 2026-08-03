@@ -2851,6 +2851,41 @@ let rtCore7 (m : Mod) (tupArities : int list) (duHashDirect : bool) : unit =
     callf f "$cmpv"
     ret f
     endB f
+    // objects: dispatch through the descriptor's COMPARE slot (vt[2]) when
+    // the type declares one — an Index orders by its own CompareTo, not by
+    // its fields. A null slot falls through to the numeric path, which
+    // traps as loudly as it always did for an incomparable object.
+    lg f "$a"
+    gcT f "ref.test" "$obj"
+    lg f "$b"
+    gcT f "ref.test" "$obj"
+    ins f "i32.and"
+    ifE f
+    lg f "$a"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    gcT f "ref.cast" "$desc"
+    gcTF f "struct.get" "$desc" 1
+    ic f 2
+    gcT f "array.get" "$vt"
+    ins f "ref.is_null"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$a"
+    lg f "$b"
+    lg f "$a"
+    gcT f "ref.cast" "$obj"
+    gcTF f "struct.get" "$obj" 0
+    gcT f "ref.cast" "$desc"
+    gcTF f "struct.get" "$desc" 1
+    ic f 2
+    gcT f "array.get" "$vt"
+    gcT f "ref.cast" "$v2"
+    callRef f "$v2"
+    callf f "$toi"
+    ret f
+    endB f
+    endB f
     // numeric / immediates
     lg f "$a"
     callf f "$toi"
