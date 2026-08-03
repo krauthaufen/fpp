@@ -386,6 +386,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable pendingStructAttr = false
     let memberSitesRaw = vecNew<int * string> ()
     let fieldOwnersRaw = vecNew<int * string> ()
+    let pendingOwners = vecNew<int * Type> ()
     /// dot accesses that bound to a plain DATA field (a record or DU field,
     /// never a member with a body). Assigning to one is as safe to unify
     /// through as assigning to a variable — see the `assign` case.
@@ -868,7 +869,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      unifyMemberAt offset result chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then
-                         vecAdd fieldOwnersRaw (offset, instName recvTy)
+                         // named AFTER solving, like a record literal: at
+                         // this moment the receiver's arguments may still be
+                         // variables, and naming it now produced the BARE
+                         // template name while the write named the
+                         // instantiation — two representations for one value
+                         vecAdd pendingOwners (offset, recvTy)
                          dictSet recordFieldTargets offset true
                      // a SAME-FILE member is a generic function once lifted:
                      // this use is a specialization demand like any other,
@@ -1656,7 +1662,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // recorded in the OWNER channel, which is where lowering
                  // already looks for a struct pattern's instantiated name
                  (match Green.tokens (GNode n) |> List.tryHead with
-                  | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                  | Some t -> vecAdd pendingOwners (t.Offset, TCon (sn, args))
                   | None -> ())
                  TCon (sn, args)
              | None ->
@@ -1803,7 +1809,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             sn.StartsWith "StructTuple" && List.length args = List.length many ->
                          List.iter2 (fun t a -> unify t a |> ignore) many args
                          (match Green.tokens (GNode n) |> List.tryHead with
-                          | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                          | Some t -> vecAdd pendingOwners (t.Offset, TCon (sn, args))
                           | None -> ())
                          TCon (sn, args)
                      | _ -> TTuple many)
@@ -3051,7 +3057,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // a struct tuple's instantiated name
                           List.iter2 (fun a e -> unify a e |> ignore) args elems
                           (match Green.tokens (GNode n) |> List.tryHead with
-                           | Some t -> vecAdd fieldOwnersRaw (t.Offset, sn)
+                           | Some t -> vecAdd pendingOwners (t.Offset, TCon (sn, args))
                            | None -> ())
                           TCon (sn, args)
                       | _ -> TTuple elems)
@@ -5034,6 +5040,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     // record literals: name the instantiation once everything is solved
     for offset, ty in vecToList pendingRecords do
+        vecAdd fieldOwnersRaw (offset, instName ty)
+    // field READS the same way, for the same reason
+    for offset, ty in vecToList pendingOwners do
         vecAdd fieldOwnersRaw (offset, instName ty)
 
     // contextual casts: the target is whatever the context settled on.
