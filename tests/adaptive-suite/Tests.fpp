@@ -389,8 +389,7 @@ let go =
         transact (fun () -> list.Remove 0 |> ignore)
         checkInt "zero gone" 20 (AVal.force res))
 
-    // TEMP-SKIP: reduction state vars default int in the float stamp (ReduceValue float_int_int; task 12)
-    let skipFR = fun () -> test "[ASet] reduce empty after lots of operations" (fun () ->
+    test "[ASet] reduce empty after lots of operations" (fun () ->
         let s = cset<float> (HashSet.empty ())
         let r = ASet.sum s
         let rand = Lcg 42
@@ -615,7 +614,7 @@ let go =
                             upper.Value <- u)
                         checkRange ())
 
-    // TEMP-SKIP: all-ref BindReader cache still splits $tup2/record (task 16; record-filter attempt broke struct-tuple arrays in self-host)
+    // TEMP-SKIP: BindReader voption<struct> cache at obj,obj — uniform write vs specialized read (task 16)
     let skipCB = fun () -> test "[ASet] content bind" (fun () ->
         let set = cset<int> (HashSet.empty ())
         let res = (set :> aset<int>).Content |> ASet.bind (fun x -> ASet.ofHashSet (x.Map(fun v -> v * 2)))
@@ -650,7 +649,6 @@ let go =
         checkSet "u11" [1; 2; 3; 4] (ASet.force union1)
         checkSet "u12" [1; 2; 3; 4] (ASet.force union2))
 
-    // TEMP-SKIP: one struct-tuple write/read pair still split in FilterA Compute stamp (task 16)
     let skipFA = fun () -> test "[ASet] filterA" (fun () ->
         let takeEven = AVal.init true
         let takeOdd = AVal.init true
@@ -1099,8 +1097,7 @@ let go =
         transact (fun () -> list.Clear())
         checkInt "clear" 0 (AVal.force res))
 
-    // TEMP-SKIP: float reduction state through AList (task 12; NOTE ASet.reduceBy float PASSES — compare)
-    let skipALF0 = fun () -> test "[AList] reduceBy group" (fun () ->
+    test "[AList] reduceBy group" (fun () ->
         let list = clist (IndexList.ofList [1; 2; 3])
         let res = AList.reduceBy (AdaptiveReduction.sum ()) (fun _ v -> float v) list
         checkFloat "initial" 6.0 (AVal.force res)
@@ -1111,8 +1108,7 @@ let go =
         transact (fun () -> list.Clear())
         checkFloat "clear" 0.0 (AVal.force res))
 
-    // TEMP-SKIP: float reduction state through AList (task 12; NOTE ASet.reduceBy float PASSES — compare)
-    let skipALF1 = fun () -> test "[AList] reduceBy fold" (fun () ->
+    test "[AList] reduceBy fold" (fun () ->
         let list = clist (IndexList.ofList [1; 2; 3])
         let res = AList.reduceBy (AdaptiveReduction.fold 0.0 (+)) (fun _ v -> float v) list
         checkFloat "initial" 6.0 (AVal.force res)
@@ -1188,8 +1184,7 @@ let go =
         transact (fun () -> l.Add 5 |> ignore)
         checkSet "added" [1; 2; 3; 5] (ASet.force s))
 
-    // TEMP-SKIP: Index.GetHashCode -> IndexNode identity hash unresolved (universal GetHashCode gap)
-    let skipALX0 = fun () -> test "[AList] mapA" (fun () ->
+    test "[AList] mapA" (fun () ->
         let l = clist (IndexList.ofList [1; 2; 3])
         let even = cval 1
         let odd = cval 0
@@ -1213,8 +1208,7 @@ let go =
         transact (fun () -> even.Value <- 1; odd.Value <- 0)
         checkL [1; 0; 1])
 
-    // TEMP-SKIP: Index.GetHashCode -> IndexNode identity hash unresolved (universal GetHashCode gap)
-    let skipALX1 = fun () -> test "[AList] chooseA" (fun () ->
+    test "[AList] chooseA" (fun () ->
         let l = clist (IndexList.ofList [1; 2; 3])
         let even = cval (Some 1)
         let odd = cval (Some 0)
@@ -1244,8 +1238,7 @@ let go =
         transact (fun () -> l.RemoveAt 1 |> ignore; even.Value <- Some 1; odd.Value <- Some 123)
         checkL [1; 1])
 
-    // TEMP-SKIP: Index.GetHashCode -> IndexNode identity hash unresolved (universal GetHashCode gap)
-    let skipALX2 = fun () -> test "[AList] filterA" (fun () ->
+    test "[AList] filterA" (fun () ->
         let a = Index.after Index.zero
         let b = Index.after a
         let c = Index.after b

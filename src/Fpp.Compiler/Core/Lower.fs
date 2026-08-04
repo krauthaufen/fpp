@@ -15,9 +15,10 @@ type private LetShape =
     | SimpleLet of bool * VarId * Scheme * Expr * Expr option
     | DestructureLet of Pat * Expr * Expr option
     /// `let struct(a, b) = e`: bind the struct once, then read its fields.
-    /// One slot per ELEMENT, empty where the element is a wildcard — a
-    /// binder list alone would renumber `struct(_, n)` as Item1.
-    | StructLet of (VarId * Scheme) option list * string * Expr * Expr option
+    /// One NODE per element (wildcards keep their position — a binder list
+    /// alone would renumber `struct(_, n)` as Item1; a nested tuple stays
+    /// one element and is matched out of its field).
+    | StructLet of GreenNode list * string * Expr * Expr option
 
 let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (schemes : Dict<string, Scheme>) (opKinds : Dict<int, string>)
@@ -696,6 +697,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         (structPayloadOf p).IsSome
         || (p.NodeKind = TuplePat
             && (nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) |> List.exists hasStructPayload))
+
+    /// Top-level elements of a struct-tuple pattern. Parens peel; a NESTED
+    /// tuple stays ONE element — `ValueSome((_,old), rest)` has two slots,
+    /// and flattening it read `rest` out of Item3 of a two-field struct.
+    let structElems (p : GreenNode) : GreenNode list =
+        let rec top (m : GreenNode) : GreenNode list =
+            match nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) with
+            | [ one ] when one.NodeKind = ParenPat || one.NodeKind = TuplePat -> top one
+            | [] -> [ m ]
+            | kids -> kids
+        top p
 
     let structSlots (p : GreenNode) : (VarId * Scheme) option list =
         let rec unwrap (m : GreenNode) =
@@ -1987,14 +1999,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let binds =
                         pats |> List.map (fun p ->
                             if p.NodeKind = StructTuplePat then
-                                let binders = structSlots p
+                                let elems = structElems p
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf p) with
                                     | Some o -> o
-                                    | None -> "StructTuple" + string binders.Length
+                                    | None -> "StructTuple" + string elems.Length
                                 let arg = { Path = path; Offset = offsetOf p + 650000; Name = "_sarg" }
                                 let sch = mono (TCon (tn, []))
-                                bodyW <- structLetExpr binders tn (EVar (arg, sch)) bodyW
+                                bodyW <- structLetElems elems tn (EVar (arg, sch)) bodyW
                                 arg, sch
                             else
                                 match lowerPat p with
@@ -2052,11 +2064,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     match structPayloadOf p with
                                     | Some i -> i
                                     | None -> p
+                                let elems = structElems inner
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf inner) with
                                     | Some o -> o
-                                    | None -> "StructTuple" + string (List.length (structSlots inner))
-                                let binders = structSlots inner
+                                    | None -> "StructTuple" + string elems.Length
                                 let tmp = { Path = path; Offset = offsetOf inner + 4200000; Name = "_cp" }
                                 let sch = mono (TCon (tn, []))
                                 let ctorName, ctorSch =
@@ -2066,8 +2078,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     | None -> "?", mono (TCon ("?", []))
                                 if (structPayloadOf p).IsSome then
                                     PCtor (ctorName, ctorSch, [ PVar (tmp, sch) ]),
-                                    (guard |> Option.map (structLetExpr binders tn (EVar (tmp, sch)))),
-                                    structLetExpr binders tn (EVar (tmp, sch)) body
+                                    (guard |> Option.map (structLetElems elems tn (EVar (tmp, sch)))),
+                                    structLetElems elems tn (EVar (tmp, sch)) body
                                 else
                                     // the case sits inside a TUPLE pattern —
                                     // a clause may match a tuple of them —
@@ -2080,7 +2092,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             let tn2 =
                                                 match dictTryFind fieldOwners (offsetOf inr) with
                                                 | Some o -> o
-                                                | None -> "StructTuple" + string (List.length (structSlots inr))
+                                                | None -> "StructTuple" + string (List.length (structElems inr))
                                             let tmp2 = { Path = path; Offset = offsetOf inr + 4200000; Name = "_cp" }
                                             let sch2 = mono (TCon (tn2, []))
                                             vecAdd wraps (inr, tmp2, sch2, tn2)
@@ -2100,22 +2112,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         |> List.rev
                                         |> List.fold
                                             (fun acc (inr, tmp2, sch2, tn2) ->
-                                                structLetExpr (structSlots inr) tn2 (EVar (tmp2, sch2)) acc)
+                                                structLetElems (structElems inr) tn2 (EVar (tmp2, sch2)) acc)
                                             x
                                     pat2, Option.map wrap guard, wrap body
                             | [ p ] when p.NodeKind = StructTuplePat ->
                                 // `| struct(a, b) ->`: bind the whole value,
                                 // then read its fields into the binders
-                                let binders = structSlots p
+                                let elems = structElems p
                                 let tn =
                                     match dictTryFind fieldOwners (offsetOf p) with
                                     | Some o -> o
-                                    | None -> "StructTuple" + string binders.Length
+                                    | None -> "StructTuple" + string elems.Length
                                 let tmp = { Path = path; Offset = offsetOf p + 4100000; Name = "_sm" }
                                 let sch = mono (TCon (tn, []))
                                 PVar (tmp, sch),
-                                (guard |> Option.map (structLetExpr binders tn (EVar (tmp, sch)))),
-                                structLetExpr binders tn (EVar (tmp, sch)) body
+                                (guard |> Option.map (structLetElems elems tn (EVar (tmp, sch)))),
+                                structLetElems elems tn (EVar (tmp, sch)) body
                             // a struct pattern at ANY nesting depth —
                             // `(true, struct(r, cnt))`, a tuple position, a
                             // constructor payload — binds its node whole and
@@ -2143,7 +2155,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         let tn =
                                             match dictTryFind fieldOwners (offsetOf sq) with
                                             | Some o -> o
-                                            | None -> "StructTuple" + string (List.length (structSlots sq))
+                                            | None -> "StructTuple" + string (List.length (structElems sq))
                                         let tmp = { Path = path; Offset = offsetOf sq + 4200000; Name = "_sp" }
                                         let sch = mono (TCon (tn, []))
                                         vecAdd wraps (sq, tmp, sch, tn)
@@ -2172,7 +2184,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     |> List.rev
                                     |> List.fold
                                         (fun acc (sq, tmp2, sch2, tn2) ->
-                                            structLetExpr (structSlots sq) tn2 (EVar (tmp2, sch2)) acc)
+                                            structLetElems (structElems sq) tn2 (EVar (tmp2, sch2)) acc)
                                         x
                                 pat2, Option.map wrap guard, wrap body
                             | [ p ] -> lowerPat p, guard, body
@@ -2197,7 +2209,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some (DestructureLet (pat, rhs, cont)) ->
                      EMatch (rhs, [ pat, None, (match cont with Some c -> c | None -> ELit LUnit) ])
                  | Some (StructLet (bs, tn, rhs, cont)) ->
-                     structLetExpr bs tn rhs (match cont with Some c -> c | None -> ELit LUnit)
+                     structLetElems bs tn rhs (match cont with Some c -> c | None -> ELit LUnit)
                  | None -> note (offsetOf n) "let shape")
             | RecordExpr ->
                 let fields =
@@ -2695,10 +2707,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              let tn =
                                  match dictTryFind fieldOwners (offsetOf sp) with
                                  | Some o -> o
-                                 | None -> "StructTuple" + string (List.length (structSlots sp))
+                                 | None -> "StructTuple" + string (List.length (structElems sp))
                              let tmp = { Path = path; Offset = offsetOf sp + 4300000; Name = "_fe" }
                              let sch = mono (TCon (tn, []))
-                             Some (ELet (false, tmp, sch, elem, structLetExpr (structSlots sp) tn (EVar (tmp, sch)) bodyE))
+                             Some (ELet (false, tmp, sch, elem, structLetElems (structElems sp) tn (EVar (tmp, sch)) bodyE))
                          | None -> None
                      (match lowerPat ip, lowerExpr (GNode range) with
                       // `for _ in 1 .. n do` counts without naming the
@@ -2915,7 +2927,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some c, [] -> c
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
-                    structLetExpr bs tn rhs tail
+                    structLetElems bs tn rhs tail
                 | None -> ESeq [ note (offsetOf item) "let shape"; lowerBlock rest ]
             else
                 match rest with
@@ -3066,22 +3078,41 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             yieldInto <- Some acc
             EAssign (acc, EPrim ("::", [ e; EVar (acc, anonScheme) ]))
 
-    and structLetExpr (slots : (VarId * Scheme) option list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
-        match slots |> List.choose id with
-        | [] -> body
-        | (first, _) :: _ ->
-            let tmp = { Path = first.Path; Offset = first.Offset + 4000000; Name = "_st" }
-            let tsch = mono (TCon (tn, []))
-            let inner =
-                List.foldBack
-                    (fun (i, slot) acc ->
-                        match slot with
-                        | Some (v, vsch) ->
-                            ELet (false, v, vsch, EField (EVar (tmp, tsch), "Item" + string (i + 1), tn), acc)
+    /// Bind the elements of a struct-tuple pattern from its fields. A simple
+    /// binder reads its ItemN directly; a STRUCTURED element (a nested tuple,
+    /// a constructor pattern) binds the field whole and matches it — its own
+    /// binders are inside the ELEMENT, not extra slots of the struct.
+    and structLetElems (elems : GreenNode list) (tn : string) (rhs : Expr) (body : Expr) : Expr =
+        let slotOf (m : GreenNode) =
+            Green.tokens (GNode m)
+            |> List.filter (fun t -> t.Kind = Ident)
+            |> List.tryHead
+            |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
+            |> Option.map (fun d -> varIdOf d, schemeOf d)
+        let structured (m : GreenNode) =
+            m.NodeKind = AppPat
+            || ((m.NodeKind = ParenPat || m.NodeKind = TuplePat)
+                && List.length (structElems m) > 1)
+        if elems |> List.forall (fun m -> not (structured m) && (slotOf m).IsNone) then body
+        else
+        let anchor = match elems with e :: _ -> offsetOf e | [] -> 0
+        let tmp = { Path = path; Offset = anchor + 4000000; Name = "_st" }
+        let tsch = mono (TCon (tn, []))
+        let inner =
+            List.foldBack
+                (fun (i, m : GreenNode) acc ->
+                    let field = EField (EVar (tmp, tsch), "Item" + string (i + 1), tn)
+                    if structured m then
+                        let et = { Path = path; Offset = offsetOf m + 4300000; Name = "_se" }
+                        let esch = mono (TCon ("?", []))
+                        ELet (false, et, esch, field, EMatch (EVar (et, esch), [ lowerPat m, None, acc ]))
+                    else
+                        match slotOf m with
+                        | Some (v, vsch) -> ELet (false, v, vsch, field, acc)
                         | None -> acc)
-                    (slots |> List.mapi (fun i b -> i, b))
-                    body
-            ELet (false, tmp, tsch, rhs, inner)
+                (elems |> List.mapi (fun i b -> i, b))
+                body
+        ELet (false, tmp, tsch, rhs, inner)
 
     /// Classify and lower a LetDecl node.
     and lowerLetParts (n : GreenNode) : LetShape option =
@@ -3127,14 +3158,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `let struct(a, b) = rhs`
         match pats with
         | [ sp ] when sp.NodeKind = StructTuplePat ->
-            let binders = structSlots sp
-            if binders |> List.forall Option.isNone then None
+            if structSlots sp |> List.forall Option.isNone then None
             else
+                let elems = structElems sp
                 let tn =
                     match dictTryFind fieldOwners (offsetOf sp) with
                     | Some o -> o
-                    | None -> "StructTuple" + string binders.Length
-                Some (StructLet (binders, tn, lowerBlock rhsExprs, cont))
+                    | None -> "StructTuple" + string elems.Length
+                Some (StructLet (elems, tn, lowerBlock rhsExprs, cont))
         | _ ->
         if isDestructure then
             // `let (k, v) = e` carries ONE flat ParenPat; the tuple pattern
