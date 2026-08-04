@@ -389,17 +389,38 @@ type TypeState() =
             freeVars t
             |> List.filter (fun v -> v.Level > level)
             |> List.distinctBy (fun v -> v.Id)
-        let quantified = qs |> List.map (fun v -> v.Id) |> Set.ofList
-        let kept =
-            cs |> List.filter (fun c ->
-                constraintVars c |> List.exists (fun v -> Set.contains v.Id quantified))
+        // a constraint is carried when it mentions a quantified variable, and
+        // carrying it quantifies the REST of its variables — which can make
+        // another constraint eligible, so iterate to a fixpoint. sum()'s
+        // Num<'s> reaches the type only through Add<'s,'a>: dropping it left
+        // it in the pool, where numeric defaulting bound the scheme's own
+        // variable to int behind its back.
+        let mutable quantified = qs |> List.map (fun v -> v.Id) |> Set.ofList
+        let mutable kept : Constraint list = []
+        let mutable rest = cs
+        let mutable progress = true
+        while progress do
+            progress <- false
+            let keep =
+                rest |> List.filter (fun c ->
+                    constraintVars c |> List.exists (fun v -> Set.contains v.Id quantified))
+            rest <-
+                rest |> List.filter (fun c ->
+                    not (constraintVars c |> List.exists (fun v -> Set.contains v.Id quantified)))
+            for c in keep do
+                for v in constraintVars c do
+                    if v.Level > level && not (Set.contains v.Id quantified) then
+                        quantified <- Set.add v.Id quantified
+                        progress <- true
+            kept <- kept @ keep
         // a variable that ONLY appears in the context (an associated-type
         // result, say) is still part of the scheme: it has to be freshened
         // per use or two call sites would share it
+        let qids = qs |> List.map (fun v -> v.Id) |> Set.ofList
         let extra =
             kept
             |> List.collect constraintVars
-            |> List.filter (fun v -> v.Level > level && not (Set.contains v.Id quantified))
+            |> List.filter (fun v -> v.Level > level && not (Set.contains v.Id qids))
             |> List.distinctBy (fun v -> v.Id)
         { Quantified = qs @ extra; Constraints = kept; Body = t }
 
