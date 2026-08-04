@@ -3453,6 +3453,13 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
         ic f (if b then 1 else 0)
         ins f "i32.ne"
         brIf f failLbl
+    | PCtor (name, _, _) when (dictTryFind st.EnumConst name).IsSome ->
+        // an ENUM literal in pattern position: the value is its int
+        lg f slot
+        callf f "$toi"
+        ic f (dictTryFind st.EnumConst name).Value
+        ins f "i32.ne"
+        brIf f failLbl
     | PCtor (name, _, args) ->
         (match dictTryFind st.CaseArity name, dictTryFind st.CaseTag name with
          | Some 0, Some t ->

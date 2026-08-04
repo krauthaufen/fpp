@@ -144,6 +144,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ -> ()
     root.Children |> List.iter collectTop
     let structNames = vecNew<string> ()
+    /// ctor-param-backed fields of a [<Struct>] CLASS-shaped type, by name:
+    /// what a zeroed instance has to provide (the record path knows its
+    /// fields from the fields table; these are private to the constructor)
+    let structCtorFields = dictNew<string, string list> ()
 
     let useDefs = dictNew<int, Resolve.Definition> ()
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
@@ -1300,9 +1304,40 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           EApp (EUnknown "strsub", [ ss; sst; sln ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ cn ] when bv.Name = "zeroCreate" && bv.Path = "(builtin)" ->
                           let nm = match dictTryFind arrKinds (offsetOf n) with Some x -> x | None -> ""
-                          // the zero value is per-representation, so the
-                          // marker survives to the emitter, which knows it
-                          EArrayCreate (nm, cn, EUnknown "$zero")
+                          // a STRUCT element zeroes to an INSTANCE, as .NET
+                          // does — a null slot made the first member call on
+                          // an element nothing had written a cast failure
+                          // (the Myers differ reads positions it never set)
+                          let core = if nm.Contains "$<" then nm.Substring (0, nm.IndexOf "$<") else nm
+                          if core <> "" && List.contains core (vecToList structNames) then
+                              let zeroOf (t : Fpp.Analysis.Types.Type) : Expr =
+                                  match Fpp.Analysis.Types.prune t with
+                                  | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool"), _) -> ELit (LInt "0")
+                                  | Fpp.Analysis.Types.TCon (("int64" | "uint64"), _) -> ELit (LInt "0L")
+                                  | Fpp.Analysis.Types.TCon ("float", _) -> ELit (LFloat "0.0")
+                                  | Fpp.Analysis.Types.TCon (("float32" | "float16"), _) -> ELit (LFloat "0.0f")
+                                  | _ -> ELit LNull
+                              let zfields =
+                                  dictPairs fieldsTable
+                                  |> List.choose (fun (k, fi) ->
+                                      if fi.TypeName = core && fi.DefKey.IsNone && not fi.IsStatic
+                                         && k.StartsWith (core + ".") && not (k.Contains "#") then
+                                          Some (k.Substring (core.Length + 1), zeroOf fi.FieldType)
+                                      else None)
+                              let zfields =
+                                  if not (List.isEmpty zfields) then zfields
+                                  else
+                                      // a class-shaped struct: its storage is
+                                      // the constructor's parameters
+                                      match dictTryFind structCtorFields core with
+                                      | Some fs -> fs |> List.map (fun fn -> fn, ELit LNull)
+                                      | None -> []
+                              if List.isEmpty zfields then EArrayCreate (nm, cn, EUnknown "$zero")
+                              else EArrayCreate (nm, cn, ERecord (nm, zfields))
+                          else
+                              // the zero value is per-representation, so the
+                              // marker survives to the emitter, which knows it
+                              EArrayCreate (nm, cn, EUnknown "$zero")
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ cn; cv ] when bv.Name = "create" && bv.Path = "(builtin)" ->
                           let nm =
                               match dictTryFind arrKinds (offsetOf n) with
@@ -3612,6 +3647,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | _ -> ())
         if isClass then
             for v, _ in instanceFields do dictSet fieldOfVar (v.Path, v.Offset) (name, v.Name)
+            if pendingStruct then
+                vecAdd structNames name
+                dictSet structCtorFields name (instanceFields |> List.map (fun (v, _) -> v.Name))
             vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))
 
             // ---- the constructor ----------------------------------------

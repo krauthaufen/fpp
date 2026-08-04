@@ -1383,7 +1383,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // has not met the annotation that ties its variable down yet, and
             // a lone instance would let improvement ground it. The wanteds
             // stay pooled for the enclosing top-level binding.
-            st.Generalize ty
+            //
+            // And a local may NOT generalize a variable those wanteds
+            // mention: its body is emitted once inside the enclosing
+            // binding, so the operation must resolve through the ENCLOSING
+            // substitution. Freshening the variable at the use severed that
+            // tie — `let cmp a b = compare b a` in sortDescending kept its
+            // constraint on a variable nothing ever pinned, and the compare
+            // defaulted to int behind the body's back.
+            let constrained =
+                wanted
+                |> List.collect (fun (_, c) -> constraintVars c)
+                |> List.map (fun v -> v.Id)
+                |> Set.ofList
+            let sch = st.Generalize ty
+            // spelled out, not `with`-copied: Quantified is also a FieldInfo
+            // field, and the copy resolves its record by FIELD NAME
+            { Quantified = sch.Quantified |> List.filter (fun v -> not (Set.contains v.Id constrained))
+              Constraints = sch.Constraints
+              Body = sch.Body }
         else
         // solve UNDER the binding's declared context: without it, a lone
         // instance lets improvement GROUND the annotated variable — a
