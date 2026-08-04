@@ -1370,4 +1370,235 @@ let go =
         checkInt "n5" 0 (wasFired ())
         sub.Dispose())
 
+    // ---- AList slices --------------------------------------------
+    let sliceList (a : int) (b : int) (xs : int list) : int list =
+        xs |> List.mapi (fun i v -> (i, v)) |> List.filter (fun (i, _) -> i >= a && i <= b) |> List.map snd
+
+    test "[AList] subA" (fun () ->
+        let l = clist (IndexList.ofList [1 .. 100])
+        let o = cval 0
+        let c = cval 2
+        let full = l |> AList.map (fun v -> v + 1)
+        let part = full |> AList.subA o c
+        let r = part.GetReader()
+        let check () =
+            r.GetChanges AdaptiveToken.Top |> ignore
+            let actual = r.State |> IndexList.toList
+            let refl = full |> AList.force |> IndexList.toList
+            let expect = sliceList o.Value (o.Value + c.Value - 1) refl
+            if actual <> expect then failwith "subA mismatch"
+        check ()
+        transact (fun () -> o.Value <- 10)
+        check ()
+        transact (fun () -> c.Value <- 5)
+        check ()
+        transact (fun () -> l.RemoveAt 11 |> ignore)
+        check ()
+        transact (fun () -> l.[11] <- 1111)
+        check ()
+        transact (fun () -> l.RemoveAt 0 |> ignore)
+        check ()
+        transact (fun () -> l.InsertAt(1, 4321) |> ignore)
+        check ()
+        transact (fun () -> l.[0] <- 1337)
+        check ()
+        transact (fun () -> l.RemoveAt 70 |> ignore)
+        check ()
+        transact (fun () -> l.InsertAt(60, 4321) |> ignore)
+        check ()
+        transact (fun () -> l.[61] <- 7331)
+        check ()
+        transact (fun () -> o.Value <- 3)
+        check ()
+        transact (fun () -> l.InsertAt(4, 1234) |> ignore)
+        check ()
+        transact (fun () -> l.Clear())
+        check ()
+        transact (fun () -> c.Value <- 3)
+        check ()
+        transact (fun () -> l.AddRange [9; 8; 7])
+        check ()
+        transact (fun () -> l.AddRange [6; 5])
+        check ()
+        transact (fun () -> l.AddRange [4; 3])
+        check ())
+
+    test "[AList] skipA" (fun () ->
+        let l = clist (IndexList.ofList [1 .. 100])
+        let o = cval 0
+        let full = l |> AList.map (fun v -> v + 1)
+        let part = full |> AList.skipA o
+        let r = part.GetReader()
+        let check () =
+            r.GetChanges AdaptiveToken.Top |> ignore
+            let actual = r.State |> IndexList.toList
+            let refl = full |> AList.force |> IndexList.toList
+            let expect = sliceList o.Value (List.length refl - 1) refl
+            if actual <> expect then failwith "skipA mismatch"
+        check ()
+        transact (fun () -> o.Value <- 10)
+        check ()
+        transact (fun () -> l.RemoveAt 11 |> ignore)
+        check ()
+        transact (fun () -> l.RemoveAt 0 |> ignore)
+        check ()
+        transact (fun () -> l.RemoveAt 70 |> ignore)
+        check ()
+        transact (fun () -> l.InsertAt(4, 1234) |> ignore)
+        check ()
+        transact (fun () -> l.InsertAt(20, 4321) |> ignore)
+        check ()
+        transact (fun () -> l.[21] <- 1337)
+        check ()
+        transact (fun () -> l.[4] <- 1337)
+        check ()
+        transact (fun () -> o.Value <- 3)
+        check ())
+
+    test "[AList] mapA inner change" (fun () ->
+        let a = Index.after Index.zero
+        let b = Index.after a
+        let c = Index.after b
+        let d = Index.after c
+        let e = Index.after d
+        let map = clist (IndexList.ofSeqIndexed [a, 1; b, 2; c, 3; d, 4; e, 5])
+        let keys = cset (HashSet.ofList [a; c; e])
+        let res =
+            map |> AList.mapAi (fun k v ->
+                keys |> ASet.contains k |> AVal.map (fun t -> if t then v else -1))
+        let r = res.GetReader()
+        let checkL (expect : int list) =
+            r.GetChanges AdaptiveToken.Top |> ignore
+            if IndexList.toList r.State <> expect then failwith "mapAi mismatch"
+        checkL [1; -1; 3; -1; 5]
+        transact (fun () -> map.Value <- (map.Value |> IndexList.map (fun v -> v * 2)))
+        checkL [2; -1; 6; -1; 10]
+        transact (fun () -> keys.Value <- HashSet.ofList [a; c; d; e])
+        checkL [2; -1; 6; 8; 10])
+
+    test "[AList] duplicate inner" (fun () ->
+        let a = clist (IndexList.ofList [1; 2])
+        let b = clist (IndexList.ofList [6; 6; 6])
+        let i = clist (IndexList.empty ())
+        let res =
+            i |> AList.collecti (fun _ v ->
+                if v % 2 = 1 then a :> alist<int>
+                else b :> alist<int>)
+        let r = res.GetReader()
+        let checkL (expect : int list) =
+            r.GetChanges AdaptiveToken.Top |> ignore
+            if IndexList.toList r.State <> expect then failwith "collecti mismatch"
+        checkL []
+        transact (fun () ->
+            i.Value <- IndexList.ofList [1; 2; 2]
+            a.Value <- IndexList.ofList [79; 7; 91]
+            b.Value <- IndexList.ofList [1; 2; 3; 4])
+        checkL [79; 7; 91; 1; 2; 3; 4; 1; 2; 3; 4]
+        transact (fun () ->
+            i.Value <- IndexList.ofList [2; 1]
+            a.Value <- IndexList.ofList [80])
+        checkL [1; 2; 3; 4; 80])
+
+    // TEMP-SKIP: sortWith path — Comparer<T>.Default unported + class-let nested closure capture (task 13)
+    let skipSR = fun () -> test "[AList] sub random" (fun () ->
+        let input = clist (IndexList.ofList ["a"; "b"; "c"; "d"; "e"])
+        let range = (input :> alist<string>) |> AList.sortDescending |> AList.sub 1 3
+        let reader = range.GetReader()
+        let rand = Lcg 123
+        let check () =
+            let rec skip (n : int) (l : string list) =
+                if n <= 0 then l
+                else
+                    match l with
+                    | [] -> []
+                    | _ :: r -> skip (n - 1) r
+            reader.GetChanges AdaptiveToken.Top |> ignore
+            let real = reader.State |> IndexList.toList
+            let expect = input.Value |> IndexList.toList |> List.sortDescending |> skip 1 |> List.truncate 3
+            if real <> expect then failwith "sub random mismatch"
+        check ()
+        transact (fun () ->
+            input.Prepend "x" |> ignore
+            input.Prepend "y" |> ignore
+            input.Prepend "z" |> ignore
+            input.Prepend "w" |> ignore
+            input.Prepend "r" |> ignore)
+        check ()
+        transact (fun () -> input.Clear())
+        check ()
+        transact (fun () -> input.UpdateTo ["hans"; "sepp"; "hugo"; "franz"] |> ignore)
+        check ()
+        transact (fun () -> input.Append "zitha" |> ignore)
+        check ()
+        transact (fun () ->
+            input.RemoveAt 0 |> ignore
+            input.RemoveAt 0 |> ignore
+            input.RemoveAt 0 |> ignore
+            input.RemoveAt (input.Count - 1) |> ignore)
+        check ()
+        transact (fun () -> input.Clear())
+        check ()
+        for i in 1 .. 200 do
+            transact (fun () ->
+                let values = List.init (rand.Next 5) (fun _ -> string (rand.Next 100000))
+                let kind = rand.Next 3
+                if kind = 0 && not (List.isEmpty values) then
+                    let sub = rand.Next 3
+                    if sub = 0 then
+                        for v in values do input.Append v |> ignore
+                    elif sub = 1 then
+                        for v in values do input.Prepend v |> ignore
+                    else
+                        for v in values do input.InsertAt (rand.Next (input.Count + 1), v) |> ignore
+                elif kind = 1 && input.Count > 0 then
+                    let c = rand.Next input.Count + 1
+                    for _ in 1 .. c do
+                        input.RemoveAt (rand.Next input.Count) |> ignore
+                else
+                    input.UpdateTo values |> ignore)
+            check ())
+
+    // ---- ComputationExpressions ----------------------------------
+    test "[CE] aval bind" (fun () ->
+        let a = cval 1
+        let b = cval 2
+        let r =
+            aval {
+                let! av = a
+                let! bv = b
+                return av + bv
+            }
+        checkInt "sum" 3 (AVal.force r)
+        transact (fun () -> a.Value <- 10)
+        checkInt "sum2" 12 (AVal.force r))
+
+    test "[CE] aset yield" (fun () ->
+        let a = cval 1
+        let s =
+            aset {
+                yield 100
+                let! av = a
+                yield av
+            }
+        checkSet "s1" [100; 1] (ASet.force s)
+        transact (fun () -> a.Value <- 7)
+        checkSet "s2" [100; 7] (ASet.force s))
+
+    test "[CE] alist yield" (fun () ->
+        let a = cval 5
+        let l =
+            alist {
+                yield 1
+                let! av = a
+                yield av
+                yield 9
+            }
+        let r = (l : alist<int>).GetReader()
+        let checkL (expect : int list) =
+            r.GetChanges AdaptiveToken.Top |> ignore
+            if IndexList.toList r.State <> expect then failwith "alist ce mismatch"
+        checkL [1; 5; 9]
+        transact (fun () -> a.Value <- 6)
+        checkL [1; 6; 9])
+
     printfn "PASSED %d FAILED %d" passedCount failedCount

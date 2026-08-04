@@ -797,8 +797,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some d ->
                           // an ABBREVIATION in expression position IS the
                           // constructor of the type it names: `cval 1`
-                          // constructs a ChangeableValue
+                          // constructs a ChangeableValue. Only when the
+                          // binding IS the type: a VALUE that shares the
+                          // alias' name (the `aval` builder beside the
+                          // `aval<'T>` abbreviation) is itself the use.
                           let d =
+                              if d.Kind <> Resolve.DefType then d else
                               match dictTryFind tyAliases d.Name with
                               | Some (_, body) ->
                                   (match prune body with
@@ -1446,6 +1450,24 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           if identityFn then lowerExpr (GNode l)
                           else EApp (lowerExpr (GNode r), [ lowerExpr (GNode l) ])
                       | "<|" -> EApp (lowerExpr (GNode l), [ lowerExpr (GNode r) ])
+                      | "||>" | "|||>" ->
+                          // `(a, b) ||> f` is `f a b`; a non-literal tuple
+                          // binds once and its elements are read out
+                          let f = lowerExpr (GNode r)
+                          (match lowerExpr (GNode l) with
+                           | ETuple xs when (op.Text = "||>" && xs.Length = 2) || (op.Text = "|||>" && xs.Length = 3) ->
+                               EApp (f, xs)
+                           | lv ->
+                               let arity = if op.Text = "||>" then 2 else 3
+                               let tmp = { Path = path; Offset = offsetOf n + 670000; Name = "_pp" }
+                               let sch = mono (TCon ("?", []))
+                               let binders =
+                                   List.init arity (fun i ->
+                                       { Path = path; Offset = offsetOf n + 670001 + i; Name = "_p" + string i })
+                               ELet (false, tmp, sch, lv,
+                                     EMatch (EVar (tmp, sch),
+                                             [ PTuple (binders |> List.map (fun b -> PVar (b, sch))), None,
+                                               EApp (f, binders |> List.map (fun b -> EVar (b, sch))) ])))
                       // f >> g  ==  fun x -> g (f x)   (and << the other way)
                       | ">>" | "<<" ->
                           let first, second =

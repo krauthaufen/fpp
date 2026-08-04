@@ -86,6 +86,13 @@ def strip_namespace_headers(src, first):
         t = line.strip()
         if t.startswith("namespace "):
             continue
+        # a SELF-open: the library opening its own namespace is a no-op in
+        # the original, but in the flattened single module it re-injects
+        # EARLIER declarations over later ones — `open FSharp.Data.Adaptive`
+        # after ComputationExpressions put the `aval` TYPE ALIAS back over
+        # the builder value.
+        if t == "open FSharp.Data.Adaptive" or t == "open FSharp.Data.Traceable" or t == "open FSharp.Data":
+            continue
         if t.startswith("module ") and t.endswith(" =") is False and " " in t and first:
             pass
         out.append(line)
@@ -447,8 +454,10 @@ SPOT = [
      "    static let mutable CurrentEvaluationDepth = 0"),
     ("LanguagePrimitives.FastGenericComparer<'Key>",
      "{ new IComparer<'Key> with member __.Compare(a : 'Key, b : 'Key) = compare a b }"),
+    # NOT `compare a b`: SortWithReader's constructor parameter is NAMED
+    # `compare`, and the shadow applied the element comparison to indices
     ("LanguagePrimitives.FastGenericComparer<Index>",
-     "{ new IComparer<Index> with member __.Compare(a : Index, b : Index) = compare a b }"),
+     "{ new IComparer<Index> with member __.Compare(a : Index, b : Index) = a.CompareTo b }"),
     ("LanguagePrimitives.FastGenericComparer<'T2>",
      "{ new IComparer<'T2> with member __.Compare(a : 'T2, b : 'T2) = compare a b }"),
     ("LanguagePrimitives.FastGenericComparer",
@@ -838,7 +847,7 @@ def main():
     # ComputationExpressions.fs is the aset{}/alist{} builder SUGAR — heavy
     # inline overload families, nothing the core machinery calls. Parked
     # until the test suite demands it; see DIVERGENCES.md.
-    files = [f for f in files if not f.endswith("ComputationExpressions.fs")]
+    # (ComputationExpressions.fs now rides along: the CE tests demand it)
     chunks = ["module Adaptive"]
     shims = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive-shims")
     for i, f in enumerate(files):
