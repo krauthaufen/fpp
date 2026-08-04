@@ -462,6 +462,10 @@ SPOT = [
      "{ new IComparer<'T2> with member __.Compare(a : 'T2, b : 'T2) = compare a b }"),
     ("LanguagePrimitives.FastGenericComparer",
      "{ new IComparer<_> with member __.Compare(a, b) = compare a b }"),
+    # .NET's default comparer, spelled as the same obj-expr; Index has its
+    # own CompareTo, and `compare` would be shadowed by ctor params here
+    ("Comparer<Index>.Default :> IComparer<_>",
+     "{ new IComparer<Index> with member __.Compare(a : Index, b : Index) = a.CompareTo b }"),
     ("MutableHashSet<'T>(ReferenceEqualityComparer<'T>.Instance)",
      "MutableHashSet<'T>()"),
 ]
