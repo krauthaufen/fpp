@@ -727,8 +727,7 @@ let go =
         transact (fun () -> c.[14] <- 10)
         checkR ())
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR0 = fun () -> test "[AMap] reduce group" (fun () ->
+    test "[AMap] reduce group" (fun () ->
         let set = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let res = AMap.reduce (AdaptiveReduction.sum ()) set
         checkInt "initial" 6 (AVal.force res)
@@ -741,8 +740,7 @@ let go =
         transact (fun () -> set.Clear())
         checkInt "clear" 0 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR1 = fun () -> test "[AMap] reduce half group" (fun () ->
+    test "[AMap] reduce half group" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let res = AMap.reduce (AdaptiveReduction.product ()) list
         checkInt "initial" 6 (AVal.force res)
@@ -763,8 +761,7 @@ let go =
         transact (fun () -> list.[10] <- 20)
         checkInt "grow" 40 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR2 = fun () -> test "[AMap] reduce fold" (fun () ->
+    test "[AMap] reduce fold" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let res = AMap.reduce (AdaptiveReduction.fold 0 (+)) list
         checkInt "initial" 6 (AVal.force res)
@@ -777,8 +774,7 @@ let go =
         transact (fun () -> list.Clear())
         checkInt "clear" 0 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR3 = fun () -> test "[AMap] reduceBy group" (fun () ->
+    test "[AMap] reduceBy group" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let res = AMap.reduceBy (AdaptiveReduction.sum ()) (fun _ v -> float v) list
         checkFloat "initial" 6.0 (AVal.force res)
@@ -789,8 +785,7 @@ let go =
         transact (fun () -> list.Clear())
         checkFloat "clear" 0.0 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR4 = fun () -> test "[AMap] reduceBy fold" (fun () ->
+    test "[AMap] reduceBy fold" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let res = AMap.reduceBy (AdaptiveReduction.fold 0.0 (+)) (fun _ v -> float v) list
         checkFloat "initial" 6.0 (AVal.force res)
@@ -801,8 +796,7 @@ let go =
         transact (fun () -> list.Clear())
         checkFloat "clear" 0.0 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR5 = fun () -> test "[AMap] reduceByA group" (fun () ->
+    test "[AMap] reduceByA group" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let even = cval 1
         let odd = cval 0
@@ -838,8 +832,7 @@ let go =
         transact (fun () -> even.Value <- 0; list.[1] <- 2)
         checkInt "m12" 2 (AVal.force res))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR6 = fun () -> test "[AMap] reduceByA half group" (fun () ->
+    test "[AMap] reduceByA half group" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let even = cval 1
         let odd = cval 0
@@ -881,8 +874,7 @@ let go =
         checkInt "h12" 2 (AVal.force res)
         check "sub failed at least once" (fails > 0))
 
-    // TEMP-SKIP: AMap.reduce template invoked (demand chain; task 13 follow-up)
-    let skipAMR7 = fun () -> test "[AMap] reduceByA fold" (fun () ->
+    test "[AMap] reduceByA fold" (fun () ->
         let list = cmap (HashMap.ofList [1, 1; 2, 2; 3, 3])
         let even = cval 1
         let odd = cval 0

@@ -291,6 +291,16 @@ def qualify_colliding_types(src):
             j += 1
         return None
 
+    # a QUALIFIED reference from OUTSIDE the declaring module's extent
+    # (`MapReductions.ReduceValue(...)` in module AMap) must follow the
+    # rename too, or the constructor resolves as an unknown field
+    joined = "\n".join(lines)
+    for old, new_name, a, b, decl_arity in renames:
+        if new_name.endswith("_" + old):
+            enc = new_name[: len(new_name) - len(old) - 1]
+            joined = re.sub(r"(?<![A-Za-z0-9_.])" + re.escape(enc) + r"\." + re.escape(old) + r"\b",
+                            enc + "." + new_name, joined)
+    lines = joined.split("\n")
     for old, new_name, a, b, decl_arity in renames:
         pat = re.compile(r"(?<![A-Za-z0-9_.])" + re.escape(old) + r"\b")
         for i in range(a, min(b, len(lines))):
