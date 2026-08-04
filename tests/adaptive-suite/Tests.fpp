@@ -579,8 +579,8 @@ let go =
         transact (fun () -> list.Value <- HashSet.ofList [1; 3; 5])
         checkInt "f11" 3 (AVal.force res))
 
-    // TEMP-SKIP: History.Update cast failure under the range reader
-    let skipR = fun () -> test "[ASet] range smoke" (fun () ->
+    // TEMP-SKIP: generic .. arithmetic in the stamped range Compute (addv/toi trap; task 11)
+    let skipRg = fun () -> test "[ASet] range smoke" (fun () ->
         let lower = cval 1
         let upper = cval 1
         let actual = ASet.range lower upper
@@ -596,8 +596,8 @@ let go =
             upper.Value <- 4)
         checkRange ())
 
-    // TEMP-SKIP: History.Update cast failure under the range reader
-    let skipR = fun () -> test "[ASet] range systematic int32" (fun () ->
+    // TEMP-SKIP: generic .. arithmetic in the stamped range Compute (addv/toi trap; task 11)
+    let skipRg = fun () -> test "[ASet] range systematic int32" (fun () ->
         for pl in 0 .. 4 do
             for pu in 0 .. 4 do
                 for l in 0 .. 4 do

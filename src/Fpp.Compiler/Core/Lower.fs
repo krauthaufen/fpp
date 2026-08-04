@@ -2298,8 +2298,43 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let lo = match toks |> List.tryHead with Some t -> t.Offset | None -> 0
                 let hi = match toks |> List.tryLast with Some t -> t.Offset | None -> 0
                 let synth = "obj@" + string lo
-                let iface =
-                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceKeyOf
+                let tyNode = nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+                let iface = tyNode |> Option.bind ifaceKeyOf
+                // `{ new AbstractReader<'d>(args) with ... }` — parenthesised
+                // constructor arguments mark a CLASS base, not an interface:
+                // the anonymous class inherits its fields and vtable and the
+                // members are OVERRIDES
+                let ctorParen =
+                    nodesOf n |> List.tryFind (fun m -> m.NodeKind = ParenExpr)
+
+                let baseWrittenArity =
+                    match tyNode with
+                    | Some tn when tn.NodeKind = AppType ->
+                        (nodesOf tn |> List.filter (fun m -> isTypeKind m.NodeKind) |> List.length) - 1
+                    | _ -> 0
+                let classBase =
+                    match ctorParen, tyNode with
+                    | Some _, Some tn ->
+                        // the base NAME is the head of the application —
+                        // the last ident is a type ARGUMENT's
+                        (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
+                         | Some bt ->
+                             let bn0 = bt.Text
+                             let bdef =
+                                 match dictTryFind typeDeclDefs (bn0 + "`" + string baseWrittenArity) with
+                                 | Some d -> Some d
+                                 | None -> dictTryFind useDefs bt.Offset
+                             (match bdef with
+                              | Some d when d.Kind = Resolve.DefType ->
+                                  let bn =
+                                      if baseWrittenArity > 0 && not (bn0.Contains "`")
+                                         && (dictTryFind tyAliases ("$arity:" + bn0 + ":" + string baseWrittenArity)).IsSome
+                                      then bn0 + "`" + string baseWrittenArity
+                                      else bn0
+                                  Some (bn, d)
+                              | _ -> None)
+                         | None -> None)
+                    | _ -> None
                 // captures: uses inside the expression bound to a LOCAL
                 // definition outside it (top-level bindings need no capture)
                 let captured = vecNew<VarId * Scheme> ()
@@ -2354,8 +2389,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some p -> dictSet fieldOfVar k p
                     | None -> dictRemove fieldOfVar k
                 vecAdd decls
-                    (DClass (synth, None, [],
-                             match iface with Some i -> [ i, bound ] | None -> []))
+                    (match classBase with
+                     | Some (bn, _) ->
+                         // members OVERRIDE the base's: own members, so the
+                         // vtable resolves them through the chain
+                         DClass (synth, Some bn, bound, [])
+                     | None ->
+                         DClass (synth, None, [],
+                                 match iface with Some i -> [ i, bound ] | None -> []))
                 // the CONSTRUCTION reads each captured var in the enclosing
                 // scope — where it may itself be a field of the class being
                 // lowered (a nested object expression, or a ctor parameter
@@ -2370,7 +2411,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         // local, so the raw cell needs asking for)
                         EApp (EUnknown "$cellof", [ EVar (v, sch) ])
                     | _ -> EVar (v, sch)
-                ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, capInit (v, sch)))
+                let capFields = caps |> List.map (fun (v, sch) -> v.Name, capInit (v, sch))
+                (match classBase with
+                 | Some (_, bd) ->
+                     let args =
+                         match ctorParen with
+                         | Some pn ->
+                             (match nodesOf pn |> List.filter (fun m -> isExprish m.NodeKind) with
+                              | [] -> [ ELit LUnit ]
+                              | xs -> xs |> List.map (fun m -> lowerExpr (GNode m)))
+                         | None -> [ ELit LUnit ]
+                     ERecordExt (synth, EApp (EVar (varIdOf bd, schemeOf bd), args), capFields)
+                 | None -> ERecord (synth, capFields))
             // `downcast e` / `upcast e`: inference resolved the target from
             // the context and recorded it at the keyword
             | StructTupleExpr ->

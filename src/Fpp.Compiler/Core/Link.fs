@@ -954,6 +954,35 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                      | None -> []
                                  vecAdd instClasses (sub, n, impls, own)
                              ERecord (sub, fs)
+                         | ERecordExt (n, b, fs) when n.StartsWith "obj@" && (dictTryFind classImplsOf n).IsSome && not (List.isEmpty inst) ->
+                             let sub = mangleInst n inst
+                             let enclosingSubst =
+                                 if sch.Quantified.Length = inst.Length then
+                                     List.zip sch.Quantified inst
+                                     |> List.map (fun (qv, nm) -> "#" + string (prunedId qv), nm)
+                                 else []
+                             let objStamp (mv : VarId) : VarId =
+                                 if List.isEmpty enclosingSubst then mv
+                                 else
+                                     let mm = mangleFor mv inst
+                                     if not (dictTryFind seen mm).IsSome then
+                                         dictSet seen mm true
+                                         vecAdd queue ((mv.Path, mv.Offset), inst, enclosingSubst)
+                                     { Path = mv.Path
+                                       Offset = stampOffsetOf mv.Offset mm
+                                       Name = mm }
+                             if not (dictTryFind instClassSeen sub).IsSome then
+                                 dictSet instClassSeen sub true
+                                 let impls =
+                                     match dictTryFind classImplsOf n with
+                                     | Some xs -> xs |> List.map (fun (ifn, ms) -> ifn, ms |> List.map (fun (mn, mv) -> mn, objStamp mv))
+                                     | None -> []
+                                 let own =
+                                     match dictTryFind classOwnOf n with
+                                     | Some xs -> xs |> List.map (fun (mn, mv) -> mn, objStamp mv)
+                                     | None -> []
+                                 vecAdd instClasses (sub, n, impls, own)
+                             ERecordExt (sub, b, fs)
                          | other -> other)
                      x
              let clone =

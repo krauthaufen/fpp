@@ -3233,6 +3233,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 for m in nodesOf n do
                     if m.NodeKind = MemberDecl then
                         inferMember (synth + "." + ifaceName) ivars [] selfTy m
+                    // a CLASS base's constructor arguments:
+                    // `{ new AbstractReader<'d>(empty) with ... }` — typed
+                    // like any expression, so their member accesses resolve
+                    elif isExprish m.NodeKind then
+                        exprType (GNode m) |> ignore
                 ifaceTy
             // `downcast e` / `upcast e`: the target is whatever the context
             // demands, so park the result and read it back once solved

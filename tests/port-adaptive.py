@@ -736,7 +736,7 @@ def call_thunked_statics(src):
 
 THUNKED_MODULE_VALUES = ["HashSet", "HashMap", "MapExt", "IndexList",
                          "HashMapDelta", "IndexListDelta", "MultiSetMap",
-                         "ASet", "AMap", "AList"]
+                         "HashSetDelta", "ASet", "AMap", "AList"]
 
 
 def thunk_module_generic_values(src):
@@ -757,7 +757,7 @@ def thunk_module_generic_values(src):
             in_module = None
         thunked = False
         if in_module:
-            m = re.match(r"(    let empty<[^=>]*>)( : [^=]*)?( =\s*)$|(    let empty<[^=>]*>)( : [^=]*)?( = .*)$", l)
+            m = re.match(r"(    let (?:inline )?empty<[^=>]*>)( : [^=]*)?( =\s*)$|(    let (?:inline )?empty<[^=>]*>)( : [^=]*)?( = .*)$", l)
             if m:
                 g = m.groups()
                 head, ann, eq = (g[0], g[1], g[2]) if g[0] else (g[3], g[4], g[5])

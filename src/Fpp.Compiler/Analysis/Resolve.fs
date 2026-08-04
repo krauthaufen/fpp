@@ -527,6 +527,9 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 for c in n.Children do
                     match c with
                     | GNode m when m.NodeKind = MemberDecl -> walkMember owner env m
+                    // a CLASS base's constructor arguments are ordinary
+                    // expressions and their names must bind
+                    | GNode m when m.NodeKind = ParenExpr || m.NodeKind = AppExpr -> walkExpr env c |> ignore
                     | _ -> ()
                 env
             | DotExpr ->
