@@ -3506,6 +3506,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 vecAdd implemented (iname, bound)
             currentClass <- ""
             if isClass then vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
+            // a DECLARED-STORAGE type (val fields) implementing interfaces
+            // needs a vtable too: without the class declaration its impls
+            // were computed and dropped, and every dispatch slot stayed null
+            elif not (List.isEmpty valFields) && not (List.isEmpty (vecToList implemented)) && not pendingStruct then
+                vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
             // records and DUs are not classes but may still declare members,
             // and an Equals/GetHashCode among them overrides the generated one
             if not (List.isEmpty (vecToList ownMembers)) then

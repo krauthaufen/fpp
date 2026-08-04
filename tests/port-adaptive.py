@@ -682,6 +682,40 @@ def rewrite_level_exception(src):
     return src
 
 
+def unbox_struct_enumerators(src):
+    """The prelude's sequence protocol dispatches MoveNext through the
+    object vtable; a STRUCT enumerator's boxed record is not an object and
+    the dispatch cast trapped. Iteration state gains nothing from being a
+    struct here — the struct/end wrapper is removed so these become
+    ordinary (boxed, dispatchable) classes."""
+    lines = src.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        # the [<Struct>] ATTRIBUTE form: drop the attribute line
+        if l.strip() == "[<Struct>]" and i + 1 < len(lines) \
+           and re.match(r"\s*(?:and|type)\s+(?:internal\s+)?\w*Enumerator(?:<[^>]*>)?\s*=\s*$", lines[i + 1]):
+            i += 1
+            continue
+        is_enum_decl = re.match(r"\s*(?:and|type)\s+(?:internal\s+)?\w*Enumerator(?:<[^>]*>)?\s*=\s*$", l)
+        if is_enum_decl and i + 1 < len(lines) and lines[i + 1].strip() == "struct":
+            ind = len(lines[i + 1]) - len(lines[i + 1].lstrip())
+            out.append(l)
+            j = i + 2
+            while j < len(lines):
+                lj = lines[j]
+                if lj.strip() == "end" and (len(lj) - len(lj.lstrip())) == ind:
+                    break
+                out.append(lj[4:] if lj.startswith("    ") and lj.strip() else lj)
+                j += 1
+            i = j + 1
+        else:
+            out.append(l)
+            i += 1
+    return "\n".join(out)
+
+
 def spot_rewrites(src):
     for old, new in SPOT:
         src = src.replace(old, new)
@@ -814,7 +848,7 @@ def main():
             chunks.append(open(os.path.join(shims, REPLACED[base])).read())
         else:
             chunks.append(port(os.path.join(root, f), i == 0))
-    text = thunk_module_generic_values(call_thunked_statics(rewrite_lazy_keyword(rewrite_bare_list(rewrite_static_val_mutable(rewrite_regex_spots(rewrite_level_exception(spot_rewrites(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks))))))))))))
+    text = thunk_module_generic_values(call_thunked_statics(rewrite_lazy_keyword(rewrite_bare_list(rewrite_static_val_mutable(rewrite_regex_spots(rewrite_level_exception(spot_rewrites(unbox_struct_enumerators(excise_types(rewrite_keyvalue_binders(qualify_colliding_types("\n".join(chunks)))))))))))))
     open(out, "w").write(text + "\n")
     print(str(len(files)) + " files ported to " + out)
 

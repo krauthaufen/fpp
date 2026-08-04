@@ -223,6 +223,17 @@ def drop_dotnet_interop_interfaces(src):
             while i < len(lines) and (lines[i].strip() == "" or indent(lines[i]) > base):
                 i += 1
             continue
+        if t.startswith("interface System.Collections.Generic.IEnumerator<"):
+            # .NET reaches MoveNext through the NON-generic IEnumerator this
+            # pass drops; the vtable needs it on the generic one
+            base = indent(line)
+            out.append(line)
+            out.append(" " * (base + 4) + "member x.MoveNext() = x.MoveNext()")
+            i += 1
+            while i < len(lines) and (lines[i].strip() == "" or indent(lines[i]) > base):
+                out.append(lines[i])
+                i += 1
+            continue
         if t.startswith("interface System.Collections.Generic.ISet<"):
             base = indent(line)
             out.append(line)

@@ -709,8 +709,7 @@ let go =
         checkInt "double free count" 0 r.State.Count
         checkInt "double free refs" 0 refCount)
 
-    // TEMP-SKIP: prelude seq MoveNext cast failure under sortBy pair iteration (task 13 follow-up)
-    let skipTAS = fun () -> test "[AMap] toASet" (fun () ->
+    test "[AMap] toASet" (fun () ->
         let c = cmap (HashMap.ofList (List.init 100 (fun i -> i, i)))
         let sorted = c |> AMap.toASet |> ASet.sortBy snd
         let r = sorted.GetReader()
