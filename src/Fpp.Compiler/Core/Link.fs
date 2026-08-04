@@ -414,7 +414,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | _ -> ()
 
     let stamped = dictNew<string, Decl> ()      // mangled name -> clone
-    let queue = vecNew<(string * int) * string list> ()
+    let queue = vecNew<(string * int) * string list * (string * string) list> ()
     let seen = dictNew<string, bool> ()
     // A DIVERGENCE CAP. Poisoned member schemes (class vars mutated by a
     // use — the shared-representative hazard) hand the vtable stamper
@@ -478,7 +478,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             let mangled = mangleFor v i
             if not (dictTryFind seen mangled).IsSome then
                 dictSet seen mangled true
-                vecAdd queue (key, i)
+                vecAdd queue (key, i, [])
             EVar ({ Path = v.Path; Offset = stampOffsetOf v.Offset mangled
                     Name = mangled }, substScheme i sch)
         | None -> fallback
@@ -549,7 +549,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                       | Some (_, _, _, _) ->
                           if not (dictTryFind seen mangled).IsSome then
                               dictSet seen mangled true
-                              vecAdd queue (key, i)
+                              vecAdd queue (key, i, [])
                           EVar ({ Path = v.Path; Offset = stampOffsetOf v.Offset mangled
                                   Name = mangled }, substScheme i sch)
                       | None ->
@@ -806,7 +806,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
 
     let mutable i = 0
     while i < vecLen queue do
-        let key, inst = vecGet queue i
+        let key, inst, substOverride = vecGet queue i
         (match dictTryFind bodies key with
          | Some (rc, v, sch, e) ->
              let mangled = mangleFor v inst
@@ -817,6 +817,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
                  |> List.iter (fun (qv, n) -> dictSet subst ("#" + string (prunedId qv)) n)
+             // an OBJECT EXPRESSION member: monomorphic in its own scheme,
+             // generic through its captures — the enclosing stamp's
+             // substitution rides along explicitly
+             for k, nm in substOverride do dictSet subst k nm
              // A recursive call carries no instantiation: inside its own
              // body a function is monomorphic, so the self-call is a plain
              // EVar. In a stamped clone it must target the clone, not the
@@ -871,7 +875,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                   let mm = mangleFor mv minst
                                   if not (dictTryFind seen mm).IsSome then
                                       dictSet seen mm true
-                                      vecAdd queue ((mv.Path, mv.Offset), minst)
+                                      vecAdd queue ((mv.Path, mv.Offset), minst, [])
                                   { Path = mv.Path
                                     Offset = stampOffsetOf mv.Offset mm
                                     Name = mm }
@@ -903,10 +907,59 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              | ERecordExt (n, b, fs) when n = cn -> ERecordExt (sub, b, fs)
                              | other -> other)
                          x
+             // an OBJECT EXPRESSION in a stamped body is an anonymous class
+             // generic in the enclosing binding's variables: its allocation
+             // must name a stamped subclass whose members carry this
+             // instantiation, or the members run the uniform template
+             // against specialized state
+             let idMap = dictNew<int, string> ()
+             if sch.Quantified.Length = inst.Length then
+                 List.zip sch.Quantified inst
+                 |> List.iter (fun (qv, nm) -> dictSet idMap (prunedId qv) nm)
+             let objFix (x : Expr) =
+                 mapExpr
+                     (fun y ->
+                         match y with
+                         | ERecord (n, fs) when n.StartsWith "obj@" && (dictTryFind classImplsOf n).IsSome && not (List.isEmpty inst) ->
+                             let sub = mangleInst n inst
+                             let enclosingSubst =
+                                 if sch.Quantified.Length = inst.Length then
+                                     List.zip sch.Quantified inst
+                                     |> List.map (fun (qv, nm) -> "#" + string (prunedId qv), nm)
+                                 else []
+                             let objStamp (mv : VarId) : VarId =
+                                 if List.isEmpty enclosingSubst then mv
+                                 else
+                                     let mm = mangleFor mv inst
+                                     if not (dictTryFind seen mm).IsSome then
+                                         dictSet seen mm true
+                                         // the enclosing inst DRIVES THE NAME
+                                         // (the member's own scheme is
+                                         // monomorphic, so the positional
+                                         // subst no-ops and the override
+                                         // carries the variables)
+                                         vecAdd queue ((mv.Path, mv.Offset), inst, enclosingSubst)
+                                     { Path = mv.Path
+                                       Offset = stampOffsetOf mv.Offset mm
+                                       Name = mm }
+                             if not (dictTryFind instClassSeen sub).IsSome then
+                                 dictSet instClassSeen sub true
+                                 let impls =
+                                     match dictTryFind classImplsOf n with
+                                     | Some xs -> xs |> List.map (fun (ifn, ms) -> ifn, ms |> List.map (fun (mn, mv) -> mn, objStamp mv))
+                                     | None -> []
+                                 let own =
+                                     match dictTryFind classOwnOf n with
+                                     | Some xs -> xs |> List.map (fun (mn, mv) -> mn, objStamp mv)
+                                     | None -> []
+                                 vecAdd instClasses (sub, n, impls, own)
+                             ERecord (sub, fs)
+                         | other -> other)
+                     x
              let clone =
                  DLet (rc, nv, substScheme inst sch,
                        alphaRename (10000000 + (abs (strHash mangled) % 1000000) * 10)
-                           (allocFix (selfFix (rewrite mangled selfKey subst false e))))
+                           (objFix (allocFix (selfFix (rewrite mangled selfKey subst false e)))))
              dictSet stamped mangled clone
          | None -> ())
         i <- i + 1

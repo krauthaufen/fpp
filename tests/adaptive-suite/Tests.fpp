@@ -305,8 +305,7 @@ let go =
 
     // ---- ASet.fs -------------------------------------------------
     // DIV: single-threaded, so the disposable ref-count is a plain mutable
-    // TEMP-SKIP: Cache refcount misread through struct(r,ref) in stamped Dictionary (task 16)
-    let skipMU = fun () -> test "[ASet] mapUse" (fun () ->
+    test "[ASet] mapUse" (fun () ->
         let input = cset (HashSet.ofList [1; 2; 3; 4])
         let mutable refCount = 0
         let newDisposable () =
@@ -621,7 +620,7 @@ let go =
                             upper.Value <- u)
                         checkRange ())
 
-    // TEMP-SKIP: BindReader obj-stamp writes cache as uniform $tup2, reads $r_StructTuple2 (task 16)
+    // TEMP-SKIP: all-ref BindReader cache still splits $tup2/record (task 16; record-filter attempt broke struct-tuple arrays in self-host)
     let skipCB = fun () -> test "[ASet] content bind" (fun () ->
         let set = cset<int> (HashSet.empty ())
         let res = (set :> aset<int>).Content |> ASet.bind (fun x -> ASet.ofHashSet (x.Map(fun v -> v * 2)))
@@ -656,8 +655,7 @@ let go =
         checkSet "u11" [1; 2; 3; 4] (ASet.force union1)
         checkSet "u12" [1; 2; 3; 4] (ASet.force union2))
 
-    // TEMP-SKIP: struct(v,p) stored via uniform $tup2 but read back as the
-    // specialized $r_StructTuple2$<obj.bool> record (state.[m] in FilterAReader)
+    // TEMP-SKIP: one struct-tuple write/read pair still split in FilterA Compute stamp (task 16)
     let skipFA = fun () -> test "[ASet] filterA" (fun () ->
         let takeEven = AVal.init true
         let takeOdd = AVal.init true
