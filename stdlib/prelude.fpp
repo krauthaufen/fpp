@@ -941,6 +941,18 @@ let sign (x : 'a) : int when Num<'a> when Ordered<'a> =
 /// form where it takes more than one argument (`Math.Max (a, b)`) — the same
 /// source has to compile under F#. The single-argument ones are the class
 /// operations under their .NET names, so `Math.Abs -3` is an int exactly as
+/// The list a countable range denotes: `[ a .. b ]` and a range used as a
+/// VALUE both lower to this, at every Integral element. For-loops keep
+/// their direct while lowering and never allocate the list.
+type RangeOps =
+    static member Seq (lo : 'a, hi : 'a) : list<'a> when Integral<'a> when Ordered<'a> =
+        let mutable i = hi
+        let mutable out : list<'a> = []
+        while i >= lo do
+            out <- i :: out
+            i <- i - One
+        out
+
 /// it is in .NET, not a float.
 module Math =
     let PI : float = 3.141592653589793

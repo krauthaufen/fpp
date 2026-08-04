@@ -2056,4 +2056,15 @@ let go =
                             else l.Value <- HashMap.ofList (List.init (rand.Next 5) (fun _ -> (rand.Next 20, rand.Next 50))))
                     check "step")
 
+    test "[Range] typeclass materialization" (fun () ->
+        checkInt "int sum" 5050 (List.sum [ 1 .. 100 ])
+        checkInt "i64 len" 5 (List.length [ 1L .. 5L ])
+        checkInt "u32 len" 4 (List.length [ 1u .. 4u ])
+        checkInt "byte len" 6 (List.length [ 250uy .. 255uy ])
+        checkInt "value pos" 3 (List.length (2 .. 4))
+        checkBool "empty" true (List.isEmpty [ 5 .. 1 ])
+        let mutable acc = 0L
+        for i in 1L .. 4L do acc <- acc + i
+        checkBool "for i64" true (acc = 10L))
+
     printfn "PASSED %d FAILED %d" passedCount failedCount

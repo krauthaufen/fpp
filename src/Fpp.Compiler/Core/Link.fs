@@ -863,7 +863,12 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
              let subst = dictNew<string, string> ()
              if sch.Quantified.Length = inst.Length then
                  List.zip sch.Quantified inst
-                 |> List.iter (fun (qv, n) -> dictSet subst ("#" + string (prunedId qv)) n)
+                 |> List.iter (fun (qv, n) ->
+                        // keyed by BOTH spellings: a late parked-member
+                        // retry can re-link a quantified var after one
+                        // channel rendered its id and before another did
+                        dictSet subst ("#" + string (prunedId qv)) n
+                        dictSet subst ("#" + string qv.Id) n)
              // an OBJECT EXPRESSION member: monomorphic in its own scheme,
              // generic through its captures — the enclosing stamp's
              // substitution rides along explicitly
@@ -984,7 +989,9 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                       | Some bsch when bsch.Quantified.Length = binst.Length ->
                                           let bsubst = dictNew<string, string> ()
                                           List.zip bsch.Quantified binst
-                                          |> List.iter (fun (qv, nm) -> dictSet bsubst ("#" + string (prunedId qv)) nm)
+                                          |> List.iter (fun (qv, nm) ->
+                                                dictSet bsubst ("#" + string (prunedId qv)) nm
+                                                dictSet bsubst ("#" + string qv.Id) nm)
                                           walkBase bn bsubst
                                       | _ -> ())
                              | None -> ()
@@ -1023,7 +1030,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              let enclosingSubst =
                                  if sch.Quantified.Length = inst.Length then
                                      List.zip sch.Quantified inst
-                                     |> List.map (fun (qv, nm) -> "#" + string (prunedId qv), nm)
+                                     |> List.collect (fun (qv, nm) ->
+                                            let keys = [ "#" + string (prunedId qv), nm ]
+                                            if qv.Id <> prunedId qv then ("#" + string qv.Id, nm) :: keys
+                                            else keys)
                                  else []
                              let objStamp (mv : VarId) : VarId =
                                  if List.isEmpty enclosingSubst then mv
@@ -1057,7 +1067,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              let enclosingSubst =
                                  if sch.Quantified.Length = inst.Length then
                                      List.zip sch.Quantified inst
-                                     |> List.map (fun (qv, nm) -> "#" + string (prunedId qv), nm)
+                                     |> List.collect (fun (qv, nm) ->
+                                            let keys = [ "#" + string (prunedId qv), nm ]
+                                            if qv.Id <> prunedId qv then ("#" + string qv.Id, nm) :: keys
+                                            else keys)
                                  else []
                              let objStamp (mv : VarId) : VarId =
                                  if List.isEmpty enclosingSubst then mv

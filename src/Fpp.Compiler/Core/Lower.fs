@@ -497,6 +497,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `a .. b` as a VALUE — the list from a to b. Built DOWNWARDS so the
     /// conses come out in order and nothing has to be reversed; both ends
     /// are bound first, so each is evaluated once.
+    /// is this op a range, and at which element? "" = unresolved/int
+    let rangeElem (op : string) : string option =
+        if op = ".." then Some ""
+        elif op.StartsWith "..@" then Some (op.Substring 3)
+        else None
+
     let rangeList (off : int) (lo : Expr) (hi : Expr) : Expr =
         let ish = mono (TCon ("int", []))
         let anonScheme = mono (TCon ("?", []))
@@ -510,6 +516,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                        ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anonScheme) ]))
                               EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ])) ])
                      EVar (outV, anonScheme) ])))
+
+    /// A range at its ELEMENT: int stays on the inline builder, anything
+    /// else calls the prelude's RangeOps.Seq, stamped per element
+    let rangeMaterialize (off : int) (elem : string) (lo : Expr) (hi : Expr) : Expr =
+        if elem = "" || elem = "int" then rangeList off lo hi
+        else
+            match dictTryFind memberIndex "RangeOps.Seq" with
+            | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ elem ]), [ ETuple [ lo; hi ] ])
+            | None -> rangeList off lo hi
 
     // ---- patterns ---------------------------------------------------------
 
@@ -1514,6 +1529,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                      EMatch (EVar (tmp, sch),
                                              [ PTuple (binders |> List.map (fun b -> PVar (b, sch))), None,
                                                EApp (f, binders |> List.map (fun b -> EVar (b, sch))) ])))
+                      | ".." ->
+                          // the element rides the op string ("..@int64"), so
+                          // the consumers — for-loops, slices, list/value
+                          // ranges — can specialize without a token
+                          let elem =
+                              match dictTryFind instSites op.Offset with
+                              | Some [ e ] when e <> "" -> "@" + e
+                              | _ -> ""
+                          EPrim (".." + elem, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
                       // f >> g  ==  fun x -> g (f x)   (and << the other way)
                       | ">>" | "<<" ->
                           let first, second =
@@ -2005,10 +2029,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // once.
                 let rangeItems =
                     match vecToList items with
-                    | [ EPrim ("..", [ lo; hi ]) ] -> Some (lo, hi)
+                    | [ EPrim (op2, [ lo; hi ]) ] when (rangeElem op2).IsSome -> Some ((rangeElem op2).Value, lo, hi)
                     | _ -> None
                 match rangeItems with
-                | Some (lo, hi) -> rangeList (offsetOf n) lo hi
+                | Some (el, lo, hi) -> rangeMaterialize (offsetOf n) el lo hi
                 | None ->
                 match arrowFor with
                 | Some f ->
@@ -2373,7 +2397,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some br -> (dictTryFind fieldOwners br.Offset) = Some "$slice"
                          | None -> false
                      (match indexer, idx with
-                      | _, [ EPrim ("..", [ lo; hi ]) ] when isSlice ->
+                      | _, [ EPrim (rop, [ lo; hi ]) ] when isSlice && (rangeElem rop).IsSome ->
                           // `a.[lo..hi]` — a fresh array of the range, copied
                           sliceRead (offsetOf n) nm (lowerExpr (GNode lhs)) lo hi
                       | Some fn, [ i ] -> EApp (fn, [ lowerExpr (GNode lhs); i ])
@@ -2820,7 +2844,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // stepped range: `for i in a .. s .. b` — the parse
                       // nests the first `..`, and the direction follows the
                       // STEP's sign at run time, as in F#
-                      | (PVar _ | PWild), EPrim ("..", [ EPrim ("..", [ lo; step ]); hi ]) ->
+                      | (PVar _ | PWild), EPrim (rop1, [ EPrim (rop2, [ lo; step ]); hi ]) when
+                            (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
                           let iv, isch =
                               match lowerPat ip with
                               | PVar (v, sch) -> v, sch
@@ -2839,7 +2864,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 EWhile (cond,
                                   ESeq [ loopBody body
                                          EAssign (iv, EPrim ("+", [ EVar (iv, isch); EVar (stV, isch) ])) ]))))
-                      | (PVar _ | PWild), EPrim ("..", [ lo; hi ]) ->
+                      | (PVar _ | PWild), EPrim (rop1, [ lo; hi ]) when (rangeElem rop1).IsSome ->
                           let iv, isch =
                               match lowerPat ip with
                               | PVar (v, sch) -> v, sch
@@ -3833,9 +3858,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let rec fixRanges (e : Expr) : Expr =
         let r = fixRanges
         match e with
-        | EPrim ("..", [ lo; hi ]) ->
+        | EPrim (rop, [ lo; hi ]) when (rangeElem rop).IsSome ->
             rangeSeq <- rangeSeq + 1
-            rangeList (200000000 + rangeSeq * 100) (r lo) (r hi)
+            rangeMaterialize (200000000 + rangeSeq * 100) (rangeElem rop).Value (r lo) (r hi)
         | ELam (ps, b) -> ELam (ps, r b)
         | EApp (f, args) -> EApp (r f, List.map r args)
         | ELet (rc, v, sc, rhs, b) -> ELet (rc, v, sc, r rhs, r b)

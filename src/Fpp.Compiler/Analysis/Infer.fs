@@ -147,11 +147,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         else
             let subst = dictNew<int, Type> ()
             let fresh = sch.Quantified |> List.map (fun v ->
-                let f = st.Fresh ()
                 // keyed by the var's CURRENT representative: unification may
-                // have re-pointed the recorded var since generalization
-                dictSet subst (prunedId v) f
-                f)
+                // have re-pointed the recorded var since generalization —
+                // including onto ANOTHER quantified var (a parked member
+                // resolution retried after the snapshot). Two entries that
+                // pruned together share ONE fresh copy, or the use split a
+                // variable the body meanwhile proved equal.
+                let k = prunedId v
+                match dictTryFind subst k with
+                | Some f -> f
+                | None ->
+                    let f = st.Fresh ()
+                    dictSet subst k f
+                    f)
             let rec go (t : Type) : Type =
                 match prune t with
                 | TVar v -> (match dictTryFind subst v.Id with Some f -> f | None -> TVar v)
@@ -1899,6 +1907,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if text = "&&" || text = "||" then "logic"
         elif text = "::" then "cons"
         elif text = "|>" then "pipe"
+        elif text = ".." then "range"
         elif text = "||>" then "pipe2"
         elif text = "|||>" then "pipe3"
         elif text = "<|" then "pipeBack"
@@ -2770,6 +2779,33 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt op.Offset lt tBool
                           unifyAt op.Offset rt tBool
                           tBool
+                      | "range" ->
+                          // `a .. b` in VALUE position denotes the list of
+                          // its elements, for ANY countable ordered element.
+                          // A STEPPED range's inner `..` already produced the
+                          // list, so its element is the shared one. The
+                          // element travels in the instantiation channel so
+                          // lowering can specialize the materializer.
+                          let elem =
+                              match prune lt with
+                              | TCon ("list", [ e ]) ->
+                                  unifyAt op.Offset e rt
+                                  e
+                              | _ ->
+                                  unifyAt op.Offset lt rt
+                                  lt
+                          // constrain only a CONCRETE element: a variable
+                          // resolves per stamp inside RangeOps.Seq, and a
+                          // wanted here would numeric-default a generic
+                          // wrapper's parameter to int behind its back
+                          (match prune elem with
+                           | TVar _ -> ()
+                           | _ ->
+                               addWanted op.Offset { Class = "Integral"; Args = [ elem ]; Assoc = [] }
+                               addWanted op.Offset { Class = "Ordered"; Args = [ elem ]; Assoc = [] }
+                               solveWanted ())
+                          vecAdd instRaw (op.Offset, [ elem ])
+                          TCon ("list", [ elem ])
                       | "cmp" ->
                           // comparison stays homogeneous; what the class adds
                           // is that a body generic in the operand type gets
@@ -3159,7 +3195,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         exprType (GNode m) |> ignore
                     elif isExprish m.NodeKind then
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
-                        unifyAt off (exprType (GNode m)) elem
+                        // a RANGE item splices: `[ a .. b ]` is the range's
+                        // own list, not a list holding one
+                        let isRange =
+                            m.NodeKind = BinaryExpr
+                            && (m.Children |> List.exists (fun c ->
+                                    match c with
+                                    | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
+                                    | _ -> false))
+                        if isRange then unifyAt off (exprType (GNode m)) (tList elem)
+                        else unifyAt off (exprType (GNode m)) elem
                 for m in nodesOf n do addItems m
                 tList elem
             | LambdaExpr ->
@@ -3304,6 +3349,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some t -> "obj@" + string t.Offset
                     | None -> "obj@?"
                 let ivars = dictNew<string, Type> ()
+                // the enclosing binding's written variables stay visible: a
+                // `^T` in the obj-expression's base type IS the enclosing
+                // `^T`, and a fresh scope split it into a second quantified
+                // variable nothing at the use site ever pinned
+                for k, v in dictPairs tyScope do dictSet ivars k v
                 let ifaceTy =
                     match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
                     | Some tn -> typeFromNode ivars tn
@@ -4456,7 +4506,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  (match tokensOf sa |> List.tryFind (fun t -> t.Kind = Ident) with
                   | Some kt when (dictTryFind defsAt kt.Offset).IsSome ->
                       let defTy = TFun (selfTy, setTy)
-                      setScheme kt.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
+                      setScheme kt.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
                       (match nameTok with
                        | Some pn ->
                            // registerField, not a raw set: an overloaded
@@ -4477,7 +4527,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  recordDef t propTy
                  let defTy = TFun (selfTy, propTy)
                  if (dictTryFind defsAt t.Offset).IsSome then
-                     setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
+                     setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
                  let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
                  registerField (tyName + "." + t.Text)
                      { TypeName = tyName; Params = classParams
@@ -4565,7 +4615,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // quantify explicitly: the class' own type parameters live at
                 // the type-declaration level, which level-based
                 // generalization would refuse to close over
-                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
+                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
             let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
             let quantified =
                 freeVars memberTy
@@ -4601,7 +4651,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if (dictTryFind defsAt t.Offset).IsSome then
             setScheme t.Offset
                 (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
-                 for v in qs do v.Level <- 0
+                 // only the member's OWN vars go declaration-level: an
+                 // OBJ-EXPRESSION member's type mentions the enclosing
+                 // binding's variables, and zeroing those un-generalized it
+                 for v in qs do (if v.Level > st.Level then v.Level <- 0)
                  { Quantified = qs; Constraints = []; Body = defTy })
 
     /// Type an instance's bodies. Separate from registering it, because a
