@@ -941,6 +941,54 @@ let sign (x : 'a) : int when Num<'a> when Ordered<'a> =
 /// form where it takes more than one argument (`Math.Max (a, b)`) — the same
 /// source has to compile under F#. The single-argument ones are the class
 /// operations under their .NET names, so `Math.Abs -3` is an int exactly as
+/// A deterministic PRNG for property-based generation: same seed, same
+/// values, on every platform.
+type Rand(seed : int) =
+    let mutable state = seed
+    member x.Next (bound : int) : int =
+        state <- (state * 1103515245 + 12345) &&& 0x3FFFFFFF
+        if bound <= 0 then 0 else state % bound
+    member x.NextFloat () : float =
+        float (x.Next 1000000) / 1000000.0
+
+/// Property-based generation. Instances are written ONLY for primitives and
+/// containers: the compiler DERIVES an instance for any record or union
+/// that declares none — fields generate recursively, a union picks a case
+/// at random and generates its payload.
+class Arb<'a>
+    static arbitrary : Rand -> 'a
+
+instance Arb<int>
+    static arbitrary (r : Rand) = r.Next 201 - 100
+instance Arb<int64>
+    static arbitrary (r : Rand) = int64 (r.Next 201 - 100)
+instance Arb<bool>
+    static arbitrary (r : Rand) = r.Next 2 = 1
+instance Arb<float>
+    static arbitrary (r : Rand) = r.NextFloat () * 200.0 - 100.0
+instance Arb<string>
+    static arbitrary (r : Rand) = string (r.Next 100000)
+instance Arb<list<'a>> when Arb<'a>
+    static arbitrary (r : Rand) =
+        let n = r.Next 8
+        let mutable out : list<'a> = []
+        let mutable i = 0
+        while i < n do
+            out <- arbitrary r :: out
+            i <- i + 1
+        out
+instance Arb<'a[]> when Arb<'a>
+    static arbitrary (r : Rand) =
+        let n = r.Next 8
+        let mutable out : list<'a> = []
+        let mutable i = 0
+        while i < n do
+            out <- arbitrary r :: out
+            i <- i + 1
+        Array.ofList out
+instance Arb<option<'a>> when Arb<'a>
+    static arbitrary (r : Rand) = if r.Next 4 = 0 then None else Some (arbitrary r)
+
 /// The list a countable range denotes: `[ a .. b ]` and a range used as a
 /// VALUE both lower to this, at every Integral element. For-loops keep
 /// their direct while lowering and never allocate the list.

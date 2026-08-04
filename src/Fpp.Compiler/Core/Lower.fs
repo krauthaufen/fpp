@@ -31,7 +31,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (classUses : Dict<int, Fpp.Analysis.Classes.InstMember>)
           (classPending : Dict<int, string>)
           (opTypes : Dict<int, string>)
-          (tyAliases : Dict<string, Var list * Type>) : LowerResult =
+          (tyAliases : Dict<string, Var list * Type>)
+          (arbDerive : (string * string * int * bool * (string * string list) list) list) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -3937,6 +3938,50 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // `&location` becomes copy-in/copy-out, in EVERY binding — members and
     // lifted lambdas reach `decls` by their own routes, so the pass runs
     // here rather than at any one of them
+    // ---- derived Arb bodies ----------------------------------------------
+    // One function per derived instance: a record generates every field, a
+    // union picks a case and generates its payload. The $class references
+    // resolve at link time — to written instances for primitives and
+    // containers, to other derived ones for nested shapes.
+    for (key, recordName, off, isUnion, entries) in arbDerive do
+        let rv = { Path = path; Offset = off + 1; Name = "_r" }
+        let rsch = mono (TCon ("Rand", []))
+        let genOf (tyName : string) : Expr =
+            EApp (EUnknown ("$class:Arb:arbitrary:" + tyName), [ EVar (rv, rsch) ])
+        let body =
+            if not isUnion then
+                ERecord (recordName, entries |> List.map (fun (fn, comps) -> fn, genOf (List.head comps)))
+            else
+                let pick =
+                    match dictTryFind memberIndex "Rand.Next" with
+                    | Some d ->
+                        EApp (EVar (varIdOf d, schemeOf d),
+                              [ EVar (rv, rsch); ELit (LInt (string (List.length entries))) ])
+                    | None -> ELit (LInt "0")
+                let kv = { Path = path; Offset = off + 2; Name = "_k" }
+                let ksch = mono (TCon ("int", []))
+                let caseExpr (cn : string) (comps : string list) : Expr =
+                    // a multi-payload case carries ONE tupled payload
+                    let args =
+                        match comps |> List.map genOf with
+                        | [] -> []
+                        | [ one ] -> [ one ]
+                        | many -> [ ETuple many ]
+                    ECtor (cn, mono (TCon ("?", [])), args)
+                let rec chain (i : int) (es : (string * string list) list) : Expr =
+                    match es with
+                    | [] -> ELit LNull
+                    | [ (cn, comps) ] -> caseExpr cn comps
+                    | (cn, comps) :: rest ->
+                        EIf (EPrim ("=", [ EVar (kv, ksch); ELit (LInt (string i)) ]),
+                             caseExpr cn comps,
+                             chain (i + 1) rest)
+                ELet (false, kv, ksch, pick, chain 0 entries)
+        vecAdd decls
+            (DLet (false, { Path = path; Offset = off; Name = "$arbD@" + key },
+                   mono (TFun (TCon ("Rand", []), TCon ("?", []))),
+                   ELam ([ rv, rsch ], body)))
+
     { Decls =
         vecToList decls
         |> List.map (fun d ->

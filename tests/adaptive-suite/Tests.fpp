@@ -82,6 +82,17 @@ type SetTreeNode =
     { value : int
       nodes : cset<SetTreeNode> }
 
+type ArbShade =
+    | ALight
+    | ADark of int
+    | ANamed of string * int
+
+type ArbPt =
+    { ax : int
+      ay : int
+      atag : ArbShade
+      amore : int list }
+
 let checkBool (msg : string) (expected : bool) (actual : bool) : unit =
     if actual <> expected then failwith (msg + ": bool mismatch")
 
@@ -2066,5 +2077,27 @@ let go =
         let mutable acc = 0L
         for i in 1L .. 4L do acc <- acc + i
         checkBool "for i64" true (acc = 10L))
+
+    test "[Arb] derived instances" (fun () ->
+        let r = Rand 42
+        let ints : int list = List.init 50 (fun _ -> arbitrary r)
+        checkBool "int range" true (ints |> List.forall (fun v -> v >= -100 && v <= 100))
+        let ps : ArbPt list = arbitrary r
+        for p in ps do
+            (match p.atag with
+             | ALight -> ()
+             | ADark d -> checkBool "dark" true (d >= -100 && d <= 100)
+             | ANamed (n, k) -> checkBool "named" true (n <> "" && k >= -100))
+        let r1 = Rand 7
+        let r2 = Rand 7
+        let a : ArbPt = arbitrary r1
+        let b : ArbPt = arbitrary r2
+        checkBool "deterministic" true (a = b)
+        let o1 : option<int> = arbitrary r
+        let f1 : float = arbitrary r
+        checkBool "float range" true (f1 >= -100.0 && f1 <= 100.0)
+        (match o1 with
+         | Some v -> checkBool "opt" true (v >= -100)
+         | None -> ()))
 
     printfn "PASSED %d FAILED %d" passedCount failedCount

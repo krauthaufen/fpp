@@ -800,7 +800,7 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (blameAt path off ("not lowerable: " + why))
@@ -835,7 +835,7 @@ type Workspace() =
         for k, v in bi.OpTypes do dictSet bot k v
         let blow =
             Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes bok bak bik bms bfo bcs
-                r.Members r.Fields r.Interfaces bcu bcp bot r.Aliases
+                r.Members r.Fields r.Interfaces bcu bcp bot r.Aliases bi.ArbDerive
         for d in blow.Decls do vecAdd allDecls d
         // one function per primitive instance member, so `Add.(+)` denotes
         // something callable even where `a + b` is a machine instruction
@@ -930,7 +930,7 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -963,7 +963,7 @@ type Workspace() =
             for off, t in inf.ClassPending do dictSet cp off t
             let ot = dictNew<int, string> ()
             for off, t in inf.OpTypes do dictSet ot off t
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.
