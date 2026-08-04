@@ -2669,6 +2669,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let exprs = nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
                 (match pats, exprs with
                  | [ ip ], [ range; body ] ->
+                     // a STRUCT-TUPLE binder reads its fields out of the
+                     // element, the way a struct pattern in a match does —
+                     // the plain tuple destructure read a record as a tuple
+                     let structBindElem (elem : Expr) (bodyE : Expr) : Expr option =
+                         let inner =
+                             if ip.NodeKind = StructTuplePat then Some ip
+                             else
+                                 match nodesOf ip |> List.tryFind (fun m -> m.NodeKind = StructTuplePat) with
+                                 | Some i when ip.NodeKind = ParenPat -> Some i
+                                 | _ -> None
+                         match inner with
+                         | Some sp ->
+                             let tn =
+                                 match dictTryFind fieldOwners (offsetOf sp) with
+                                 | Some o -> o
+                                 | None -> "StructTuple" + string (List.length (structSlots sp))
+                             let tmp = { Path = path; Offset = offsetOf sp + 4300000; Name = "_fe" }
+                             let sch = mono (TCon (tn, []))
+                             Some (ELet (false, tmp, sch, elem, structLetExpr (structSlots sp) tn (EVar (tmp, sch)) bodyE))
+                         | None -> None
                      (match lowerPat ip, lowerExpr (GNode range) with
                       // `for _ in 1 .. n do` counts without naming the
                       // counter; the loop still needs one, so a wildcard
@@ -2717,6 +2737,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           let ish = mono (TCon ("int", []))
                           let elem = EIndex (nm, EVar (av, anon), EVar (ix, ish))
                           let inner =
+                              match structBindElem elem (loopBody body) with
+                              | Some e -> e
+                              | None ->
                               match pat with
                               | PVar (iv, isch) -> ELet (false, iv, isch, elem, loopBody body)
                               | p -> EMatch (elem, [ p, None, loopBody body ])
@@ -2754,12 +2777,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  call (synth "Current" 50000000) (EVar (enV, anon)) false with
                            | Some g, Some m, Some c ->
                                let inner =
+                                   match structBindElem c (loopBody body) with
+                                   | Some e -> e
+                                   | None ->
                                    match pat with
                                    | PVar (iv, isch) ->
                                        ELet (false, iv, isch, c, loopBody body)
                                    | p ->
-                                       // tuple and struct-tuple binders
-                                       // destructure the current element
+                                       // tuple binders destructure the
+                                       // current element
                                        EMatch (c, [ p, None, loopBody body ])
                                ELet (false, enV, anon, g, EWhile (m, inner))
                            | _ -> note (offsetOf n) "for-in (no GetEnumerator on the source)"))

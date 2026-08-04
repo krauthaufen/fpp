@@ -395,6 +395,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
     let pendingDots = vecNew<int * Type * Type * string> ()
+    /// `when 'B :> IFace` — the subtype bound, by the variable's id: member
+    /// access on the bounded variable resolves through the interface
+    let subtypeBounds = dictNew<int, string> ()
     /// computation-expression offset -> the builder expression's type. Only
     /// the PROBE pass fills this: by the time the rewrite has run there is
     /// no CompExpr left to see.
@@ -608,7 +611,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
-    let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+    let rec tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
         // members are inherited: walk up the base chain to the type that
         // actually declares this one, and bind to THAT declaration
         // Walk to the type that declares this member, carrying the receiver's
@@ -723,6 +726,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> false)
             | _ -> false
         match prune recvTy, name with
+        // a variable BOUNDED by `when 'B :> IFace` dispatches its members
+        // through the bound, exactly as F# types it
+        | TVar v, _ when (dictTryFind subtypeBounds v.Id).IsSome ->
+            tryResolveDot force offset (TCon ((dictTryFind subtypeBounds v.Id).Value, [])) result name
         // `.Length` on an array or a string is a BUILTIN: there is no
         // "array.Length" in the fields table, so without this the parked
         // path fell through to a by-name field lookup and bound the access
@@ -1482,6 +1489,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | None -> None
 
     let constraintOf (vars : Dict<string, Type>) (n : GreenNode) : Constraint option =
+        // `when 'B :> IFace` is not a class constraint, but the BOUND is
+        // what resolves member access on 'B — recorded as a side effect,
+        // since every when-clause reader comes through here
+        (let rec scanBound (ts : Token list) =
+            match ts with
+            | a :: b :: c :: rest when
+                    a.Kind = Operator && a.Text = "'" && b.Kind = Ident
+                    && c.Kind = Operator && c.Text = ":>" ->
+                let rec ifaceOf (ts2 : Token list) (last : Token option) =
+                    match ts2 with
+                    | t :: more when t.Kind = Ident -> ifaceOf more (Some t)
+                    | t :: more when t.Kind = Operator && t.Text = "." -> ifaceOf more last
+                    | _ -> last
+                (match ifaceOf rest None, dictTryFind vars b.Text with
+                 | Some it, Some tv ->
+                     (match prune tv with
+                      | TVar v -> dictSet subtypeBounds v.Id it.Text
+                      | _ -> ())
+                 | _ -> ())
+                scanBound rest
+            | _ :: rest -> scanBound rest
+            | [] -> ()
+         scanBound (tokensOf n))
         match fsharpInlineConstraint vars n with
         | Some c -> Some c
         | None ->
