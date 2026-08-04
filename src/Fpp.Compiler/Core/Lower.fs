@@ -2693,6 +2693,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // `for _ in 1 .. n do` counts without naming the
                       // counter; the loop still needs one, so a wildcard
                       // binder gets a synthetic variable
+                      // stepped range: `for i in a .. s .. b` — the parse
+                      // nests the first `..`, and the direction follows the
+                      // STEP's sign at run time, as in F#
+                      | (PVar _ | PWild), EPrim ("..", [ EPrim ("..", [ lo; step ]); hi ]) ->
+                          let iv, isch =
+                              match lowerPat ip with
+                              | PVar (v, sch) -> v, sch
+                              | _ ->
+                                  { Path = path; Offset = offsetOf n + 19000000; Name = "_i" },
+                                  mono (TCon ("int", []))
+                          let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
+                          let stV = { Path = iv.Path; Offset = iv.Offset + 1100000; Name = "_st" }
+                          let cond =
+                              EIf (EPrim (">=", [ EVar (stV, isch); ELit (LInt "0") ]),
+                                   EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
+                                   EPrim (">=", [ EVar (iv, isch); EVar (hiV, isch) ]))
+                          ELet (false, iv, isch, lo,
+                            ELet (false, hiV, isch, hi,
+                              ELet (false, stV, isch, step,
+                                EWhile (cond,
+                                  ESeq [ loopBody body
+                                         EAssign (iv, EPrim ("+", [ EVar (iv, isch); EVar (stV, isch) ])) ]))))
                       | (PVar _ | PWild), EPrim ("..", [ lo; hi ]) ->
                           let iv, isch =
                               match lowerPat ip with
@@ -3408,6 +3430,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | [ p ] -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ p, None, body ]))
                              | pps -> ELam ([ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ])))
                     vecAdd decls (DLet (false, varIdOf cd, schemeOf cd, rhs))
+                    // the FIRST `new` doubles as the type-name constructor,
+                    // but a use may still bind to the `new` KEYWORD's own
+                    // definition — alias it so neither spelling is unbound
+                    if i = 0 && ctorPat.IsNone then
+                        (match tokensOf nc |> List.tryFind (fun t -> t.Kind = Keyword && t.Text = "new")
+                               |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+                         | Some kd when kd.Offset <> cd.Offset ->
+                             vecAdd decls (DLet (false, varIdOf kd, schemeOf kd, EVar (varIdOf cd, schemeOf cd)))
+                         | _ -> ())
                 | None -> ())
 
         if not (List.isEmpty valFields) then

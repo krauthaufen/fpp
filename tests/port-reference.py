@@ -223,7 +223,7 @@ def drop_dotnet_interop_interfaces(src):
             while i < len(lines) and (lines[i].strip() == "" or indent(lines[i]) > base):
                 i += 1
             continue
-        if t.startswith("interface System.Collections.Generic.IEnumerator<"):
+        if t.startswith("interface System.Collections.Generic.IEnumerator<") or t.startswith("interface IEnumerator<"):
             # .NET reaches MoveNext through the NON-generic IEnumerator this
             # pass drops; the vtable needs it on the generic one
             base = indent(line)

@@ -328,7 +328,7 @@ def rewrite_keyvalue_binders(src):
     and destructures in two lets, which is the same program."""
     out = []
     counter = [0]
-    pat = re.compile(r"^(\s*)for\s*\(KeyValue\s*\((.*)\)\)\s+in\s+(.*?)\s+do\s*(//.*)?$")
+    pat = re.compile(r"^(\s*)for\s*\(?KeyValue\s*\((.*?)\)\)?\s+in\s+(.*?)\s+do\s*(//.*)?$")
     for line in src.split("\n"):
         m = pat.match(line)
         if not m:

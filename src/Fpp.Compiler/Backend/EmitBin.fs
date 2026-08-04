@@ -1157,12 +1157,56 @@ let rtCore2 (m : Mod) : unit =
     ins f "i32.add"
     refI31 f
     elseB f
-    lg f "$a"
-    callf f "$toi"
-    lg f "$b"
-    callf f "$toi"
-    ins f "i32.add"
-    callf f "$ofi"
+    // FLOAT on either side adds as floats (an int seed meets float
+    // elements at the uniform representation): generic `+` reaches every
+    // numeric kind, not only int. A MINIMAL runtime (no float support
+    // declared) keeps the int-only fallback.
+    if funcIdx m "$tof" >= 0 && funcIdx m "$off" >= 0 then
+        lg f "$a"
+        gcT f "ref.test" "$boxf"
+        lg f "$b"
+        gcT f "ref.test" "$boxf"
+        ins f "i32.or"
+        ifA f
+        lg f "$a"
+        gcAbs f "ref.test" "i31"
+        ifV f "f64"
+        lg f "$a"
+        gcAbs f "ref.cast" "i31"
+        i31get f
+        ins f "f64.convert_i32_s"
+        elseB f
+        lg f "$a"
+        callf f "$tof"
+        endB f
+        lg f "$b"
+        gcAbs f "ref.test" "i31"
+        ifV f "f64"
+        lg f "$b"
+        gcAbs f "ref.cast" "i31"
+        i31get f
+        ins f "f64.convert_i32_s"
+        elseB f
+        lg f "$b"
+        callf f "$tof"
+        endB f
+        ins f "f64.add"
+        callf f "$off"
+        elseB f
+        lg f "$a"
+        callf f "$toi"
+        lg f "$b"
+        callf f "$toi"
+        ins f "i32.add"
+        callf f "$ofi"
+        endB f
+    else
+        lg f "$a"
+        callf f "$toi"
+        lg f "$b"
+        callf f "$toi"
+        ins f "i32.add"
+        callf f "$ofi"
     endB f
     endFn f
 
