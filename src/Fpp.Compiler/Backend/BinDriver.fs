@@ -1894,6 +1894,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         // list/array/string test their representation; a class tests its
         // descriptor id against itself and its subclasses; an interface
         // against its implementors. GUARDED: a non-object answers false.
+        // An INSTANTIATED name (a stamped `:? 'T`) tests its erased head:
+        // the descriptor does not carry type arguments.
+        let tn = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
         let t = freshLocal f "$bq" "anyref"
         emitNode st f lv e2
         ls f t
@@ -1949,6 +1952,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         // widening: representation unchanged, nothing to do at runtime
         emitNode st f lv e2
     | ECast (tn, e2, true) ->
+        let tn = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
         // a downcast CHECKS (representation is uniform); null casts to null
         let t = freshLocal f "$bq" "anyref"
         emitNode st f lv e2
@@ -3553,7 +3557,9 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
         brIf f failLbl
     | PLit LUnit -> ()
     | PTypeTest tn ->
-        // `:? T` in a pattern: same tests as ETypeTest, branch to fail
+        // `:? T` in a pattern: same tests as ETypeTest, branch to fail.
+        // An instantiated name tests its erased head — see ETypeTest.
+        let tn = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
         let idOf () =
             lg f slot
             gcT f "ref.cast" "$obj"

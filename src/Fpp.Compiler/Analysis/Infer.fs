@@ -420,6 +420,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `downcast`/`upcast` sites: the target type is only known once the
     /// surrounding expression has been solved
     let pendingCasts = vecNew<int * Type> ()
+    let pendingBaseInsts = vecNew<int * Type> ()
     /// `a.[i]` whose receiver was still a variable when the walk reached it —
     /// which is every index into the result of a PARKED dot access, e.g.
     /// `(s.Split ':').[0]`. Retried once the dot fixpoint has run.
@@ -1679,9 +1680,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   | _ -> st.Fresh ())
              | [] -> st.Fresh ())
         | TypeTestPat ->
-            // `:? T` narrows to T; the scrutinee itself stays a supertype
+            // `:? T` narrows to T; the scrutinee itself stays a supertype.
+            // The resolved target is recorded in the owner channel: written
+            // against a GENERIC parameter the name alone is meaningless, and
+            // lowering needs the symbolic form stamping can substitute.
             (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
-             | Some tn -> typeFromNode pvars tn
+             | Some tn ->
+                 let ty = typeFromNode pvars tn
+                 (match Green.tokens (GNode tn) |> List.tryHead with
+                  | Some t -> vecAdd pendingOwners (t.Offset, ty)
+                  | None -> ())
+                 ty
              | None -> st.Fresh ())
         | TuplePat ->
             let want = patExpect
@@ -3320,7 +3329,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
                  | Some operand -> exprType (GNode operand) |> ignore
                  | None -> ())
-                if hasOpToken ":?" n then tBool
+                if hasOpToken ":?" n then
+                    (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
+                     | Some tn ->
+                         let ty = typeFromNode cvars tn
+                         (match Green.tokens (GNode tn) |> List.tryHead with
+                          | Some t -> vecAdd pendingOwners (t.Offset, ty)
+                          | None -> ())
+                     | None -> ())
+                    tBool
                 else
                     match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
                     | Some tn -> typeFromNode cvars tn
@@ -4063,6 +4080,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       vecToList tyParams
                       |> List.choose (fun t -> match prune t with TVar v -> Some v | _ -> None)
                   let baseTy = typeFromNode vars tn
+                  // the instantiation handed to the base, rendered once
+                  // solving settles: stamping a construction substitutes the
+                  // class' variables, so an inherited layout-dependent
+                  // member can specialize at the BASE's own arguments
+                  (match Green.tokens (GNode tn) |> List.tryHead with
+                   | Some t -> vecAdd pendingBaseInsts (t.Offset, baseTy)
+                   | None -> ())
                   // `and IAdaptiveValue<'T> = inherit IAdaptiveValue` names
                   // the SAME key as the type being declared, because a type
                   // is keyed by its bare name. Recording it would make the
@@ -5093,6 +5117,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // field READS the same way, for the same reason
     for offset, ty in vecToList pendingOwners do
         vecAdd fieldOwnersRaw (offset, instName ty)
+    // base instantiations keep their FULL argument names — member stamping
+    // maps the base's parameters positionally against them
+    for offset, ty in vecToList pendingBaseInsts do
+        match prune ty with
+        | TCon (_, args) when not (List.isEmpty args) ->
+            vecAdd fieldOwnersRaw (offset, "$baseinst:" + String.concat "@" (args |> List.map typeConName))
+        | _ -> ()
 
     // contextual casts: the target is whatever the context settled on.
     // A STRUCT target is flagged: `defaultof` of a struct is a ZEROED value,

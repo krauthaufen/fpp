@@ -590,9 +590,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
              | [] -> PWild)
         | TypeTestPat ->
-            (match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceKeyOf with
-             | Some tn -> PTypeTest tn
-             | None -> PWild)
+            // a test against a GENERIC parameter carries the symbolic name
+            // inference recorded, so stamping can substitute the argument
+            let tyNode = nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+            let recorded =
+                tyNode
+                |> Option.bind (fun m -> Green.tokens (GNode m) |> List.tryHead)
+                |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset)
+            (match recorded, tyNode |> Option.bind ifaceKeyOf with
+             | Some o, _ when o.StartsWith "#" -> PTypeTest o
+             | _, Some tn -> PTypeTest tn
+             | _ -> PWild)
         | TuplePat -> PTuple (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
         | ConsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
@@ -2473,8 +2481,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> note (offsetOf n) "cast shape")
             | CastExpr ->
                 let operand = nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind)
+                let targetNode = nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+                let target = targetNode |> Option.bind ifaceKeyOf
+                // a test against a GENERIC parameter uses the symbolic name
+                // inference recorded, so stamping can substitute the argument
                 let target =
-                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) |> Option.bind ifaceKeyOf
+                    match targetNode
+                          |> Option.bind (fun m -> Green.tokens (GNode m) |> List.tryHead)
+                          |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset) with
+                    | Some o when o.StartsWith "#" -> Some o
+                    | _ -> target
                 let isDown = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?>")
                 let isTest = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = ":?")
                 (match operand, target with
@@ -3587,6 +3603,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let bound = ms |> List.collect liftMember
                 vecAdd implemented (iname, bound)
             currentClass <- ""
+            let baseInst =
+                inheritNode |> Option.bind baseTypeNode
+                |> Option.bind (fun tn -> Green.tokens (GNode tn) |> List.tryHead)
+                |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset)
+                |> Option.bind (fun o ->
+                    if o.StartsWith "$baseinst:" then Some ((o.Substring 10).Split '@' |> Array.toList)
+                    else None)
+            (match baseInst with
+             | Some inst when isClass -> vecAdd decls (DBaseInst (name, inst))
+             | _ -> ())
             if isClass then vecAdd decls (DClass (name, baseName, vecToList ownMembers, vecToList implemented))
             // a DECLARED-STORAGE type (val fields) implementing interfaces
             // needs a vtable too: without the class declaration its impls

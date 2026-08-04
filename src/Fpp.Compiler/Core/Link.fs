@@ -305,9 +305,16 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         // the GUARD counts as much as the body: an operator or array op in
         // a `when` clause is just as unshareable across instantiations
         | EMatch (s, cs) ->
+            let rec patLayout (p : Pat) =
+                match p with
+                | PTypeTest tn -> tn.Contains "#"
+                | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.exists patLayout ps
+                | PCons (a, b) -> patLayout a || patLayout b
+                | PAs (inner, _, _) -> patLayout inner
+                | _ -> false
             usesLayoutVar s
-            || (cs |> List.exists (fun (_, g, b) ->
-                    usesLayoutVar b || (match g with Some x -> usesLayoutVar x | None -> false)))
+            || (cs |> List.exists (fun (p, g, b) ->
+                    patLayout p || usesLayoutVar b || (match g with Some x -> usesLayoutVar x | None -> false)))
         | ETuple xs | EListLit xs | ESeq xs -> anyOf xs
         // an operator at a type variable cannot be shared either: the
         // instance — and so the machine instruction — differs per type
@@ -323,8 +330,8 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
         | ERecordExt (_, bse, fs) -> usesLayoutVar bse || (fs |> List.exists (fun (_, v) -> usesLayoutVar v))
         | EField (r, _, o) -> o.Contains "#" || usesLayoutVar r
         | EIfaceCall (_, _, recv, args) -> usesLayoutVar recv || anyOf args
-        | ECast (_, x, _) -> usesLayoutVar x
-        | ETypeTest (_, x) -> usesLayoutVar x
+        | ECast (t, x, _) -> t.Contains "#" || usesLayoutVar x
+        | ETypeTest (t, x) -> t.Contains "#" || usesLayoutVar x
         | EFieldSet (r, _, o, v) -> o.Contains "#" || usesLayoutVar r || usesLayoutVar v
         | EWhile (c, b) -> usesLayoutVar c || usesLayoutVar b
         | EAssign (_, x) -> usesLayoutVar x
@@ -400,6 +407,19 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             if ms |> List.exists (fun mv -> (dictTryFind layoutDependent (mv.Path, mv.Offset)) = Some true) then
                 dictSet vtableLayoutDep n true
         | _ -> ()
+    // ... and DOWN the inheritance chain: a subclass INHERITS the dependent
+    // member, so its own constructions need a stamped vtable just the same
+    let mutable vprop = true
+    while vprop do
+        vprop <- false
+        for d in decls do
+            match d with
+            | DClass (n, Some b, _, _) when
+                    (dictTryFind vtableLayoutDep b) = Some true
+                    && (dictTryFind vtableLayoutDep n) <> Some true ->
+                dictSet vtableLayoutDep n true
+                vprop <- true
+            | _ -> ()
     /// constructors forced into stamping by their class' vtable, NOT by
     /// anything in their own body
     let vtableCtor = dictNew<string * int, bool> ()
@@ -690,6 +710,20 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                       | None -> EUnknown ("$class:" + cls + ":" + memberName + ":" + tn))
                  | _ -> EUnknown n)
             | ERecord (n, fs) -> ERecord (substName subst n, fs)
+            | ECast (t, x, d) -> ECast (substName subst t, x, d)
+            | ETypeTest (t, x) -> ETypeTest (substName subst t, x)
+            | EMatch (sc, cs) ->
+                let rec subPat (p : Pat) =
+                    match p with
+                    | PTypeTest tn -> PTypeTest (substName subst tn)
+                    | PCtor (n2, s2, ps) -> PCtor (n2, s2, List.map subPat ps)
+                    | PTuple ps -> PTuple (List.map subPat ps)
+                    | PListLit ps -> PListLit (List.map subPat ps)
+                    | POr ps -> POr (List.map subPat ps)
+                    | PCons (a, b) -> PCons (subPat a, subPat b)
+                    | PAs (inner, v2, s2) -> PAs (subPat inner, v2, s2)
+                    | other -> other
+                EMatch (sc, cs |> List.map (fun (p, g, b) -> subPat p, g, b))
             | EField (x, fn, o) -> EField (x, fn, substName subst o)
             | EFieldSet (x, fn, o, v) -> EFieldSet (x, fn, substName subst o, v)
             | EArray (n, xs) -> EArray (substName subst n, xs)
@@ -782,6 +816,8 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
     // unchanged, and `:? C` still answers true because the chain says so.
     let classImplsOf = dictNew<string, (string * (string * VarId) list) list> ()
     let classOwnOf = dictNew<string, (string * VarId) list> ()
+    let classBaseOf = dictNew<string, string> ()
+    let classBaseInstOf = dictNew<string, string list> ()
     for d in decls do
         match d with
         // a class with OWN members and no direct impls still needs the
@@ -792,13 +828,20 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             dictSet classImplsOf n impls
             dictSet classOwnOf n own
         | _ -> ()
+    for d in decls do
+        match d with
+        | DClass (n, Some b, _, _) -> dictSet classBaseOf n b
+        | DBaseInst (n, inst) -> dictSet classBaseInstOf n inst
+        | _ -> ()
     /// the class a constructor builds — a class' ctor is the top-level
     /// function that carries its name
     let classOfCtor = dictNew<string * int, string> ()
+    let ctorSchemeOf = dictNew<string, Scheme> ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam _) when (dictTryFind classImplsOf v.Name).IsSome ->
+        | DLet (_, v, sch, ELam _) when (dictTryFind classImplsOf v.Name).IsSome ->
             dictSet classOfCtor (v.Path, v.Offset) v.Name
+            dictSet ctorSchemeOf v.Name sch
         | _ -> ()
     /// the instantiated subclasses to declare, in discovery order
     let instClasses = vecNew<string * string * (string * (string * VarId) list) list * (string * VarId) list> ()
@@ -848,13 +891,13 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                      // `self` is generic in gets this instantiation, and a
                      // variable the class does not name is unconstrained
                      // here, which is what canonical means.
-                     let memberInst (msch : Scheme) : string list option =
+                     let memberInstFor (ownerName : string) (ownerInst : string list) (msch : Scheme) : string list option =
                          match prune msch.Body with
                          | TFun (self, _) ->
                              (match prune self with
-                              | TCon (n, args) when n = cn && args.Length = inst.Length ->
+                              | TCon (n, args) when n = ownerName && args.Length = ownerInst.Length ->
                                   let m = dictNew<int, string> ()
-                                  List.zip args inst
+                                  List.zip args ownerInst
                                   |> List.iter (fun (a, t) ->
                                         match prune a with
                                         | TVar v -> dictSet m v.Id t
@@ -866,6 +909,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                               | None -> "obj"))
                               | _ -> None)
                          | _ -> None
+                     let memberInst (msch : Scheme) : string list option = memberInstFor cn inst msch
                      let stampMember (mv : VarId) : VarId =
                          match dictTryFind bodies (mv.Path, mv.Offset) with
                          | Some (_, _, msch, _) when not (List.isEmpty msch.Quantified) ->
@@ -891,7 +935,57 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              match dictTryFind classOwnOf cn with
                              | Some xs -> xs |> List.map (fun (mn, mv) -> mn, stampMember mv)
                              | None -> []
-                         vecAdd instClasses (sub, cn, impls, own)
+                         // INHERITED layout-dependent members (a base body
+                         // tests `:? 'T`, reads a packed field...): stamped
+                         // at the BASE's instantiation — recorded at the
+                         // inherit clause, substituted through this stamp —
+                         // and hung on the subclass, where the vtable walk
+                         // finds them before the canonical base body
+                         let taken = dictNew<string, bool> ()
+                         for mn, _ in own do dictSet taken mn true
+                         for _, ms in impls do for mn, _ in ms do dictSet taken mn true
+                         let inherited = vecNew<string * VarId> ()
+                         let rec walkBase (child : string) (csubst : Dict<string, string>) =
+                             match dictTryFind classBaseOf child with
+                             | Some bn ->
+                                 let binst =
+                                     match dictTryFind classBaseInstOf child with
+                                     | Some xs -> xs |> List.map (substName csubst)
+                                     | None -> []
+                                 if not (List.isEmpty binst) then
+                                     (match dictTryFind classOwnOf bn with
+                                      | Some bown ->
+                                          for mn, mv in bown do
+                                              if not (dictTryFind taken mn).IsSome
+                                                 && (dictTryFind layoutDependent (mv.Path, mv.Offset)) = Some true then
+                                                  (match dictTryFind bodies (mv.Path, mv.Offset) with
+                                                   | Some (_, _, msch, _) when not (List.isEmpty msch.Quantified) ->
+                                                       (match memberInstFor bn binst msch with
+                                                        | Some minst ->
+                                                            let minst = capInst minst
+                                                            let mm = mangleFor mv minst
+                                                            if not (dictTryFind seen mm).IsSome then
+                                                                dictSet seen mm true
+                                                                vecAdd queue ((mv.Path, mv.Offset), minst, [])
+                                                            dictSet taken mn true
+                                                            vecAdd inherited
+                                                                (mn,
+                                                                 { Path = mv.Path
+                                                                   Offset = stampOffsetOf mv.Offset mm
+                                                                   Name = mm })
+                                                        | None -> ())
+                                                   | _ -> ())
+                                      | None -> ())
+                                     (match dictTryFind ctorSchemeOf bn with
+                                      | Some bsch when bsch.Quantified.Length = binst.Length ->
+                                          let bsubst = dictNew<string, string> ()
+                                          List.zip bsch.Quantified binst
+                                          |> List.iter (fun (qv, nm) -> dictSet bsubst ("#" + string (prunedId qv)) nm)
+                                          walkBase bn bsubst
+                                      | _ -> ())
+                             | None -> ()
+                         walkBase cn subst
+                         vecAdd instClasses (sub, cn, impls, own @ vecToList inherited)
                      Some sub
                  | None -> None
              // allocate the subclass instead of the class itself

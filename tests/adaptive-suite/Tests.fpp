@@ -72,6 +72,9 @@ let checkSet (msg : string) (expected : int list) (actual : HashSet<int>) : unit
     let ev = List.sort expected
     if av <> ev then failwith (msg + ": set mismatch")
 
+let checkBool (msg : string) (expected : bool) (actual : bool) : unit =
+    if actual <> expected then failwith (msg + ": bool mismatch")
+
 let checkFloat (msg : string) (expected : float) (actual : float) : unit =
     if actual <> expected then failwith msg
 
@@ -648,7 +651,7 @@ let go =
         checkSet "u11" [1; 2; 3; 4] (ASet.force union1)
         checkSet "u12" [1; 2; 3; 4] (ASet.force union2))
 
-    let skipFA = fun () -> test "[ASet] filterA" (fun () ->
+    test "[ASet] filterA" (fun () ->
         let takeEven = AVal.init true
         let takeOdd = AVal.init true
         let set = ASet.ofArray (Array.init 5 (fun i -> i))
@@ -1254,5 +1257,40 @@ let go =
         checkL [2; 6; 10]
         transact (fun () -> keys.Value <- HashSet.ofList [a; c; d; e])
         checkL [2; 6; 8; 10])
+
+    // ---- CollectionExtensions.fs ---------------------------------
+    test "[Seq] existsA basic" (fun () ->
+        let a = cval false
+        let b = cval false
+        let l = [a :> aval<bool>; b :> aval<bool>]
+        let result = Seq.existsA id l
+        checkBool "e0" false (AVal.force result)
+        transact (fun () -> a.Value <- true)
+        checkBool "e1" true (AVal.force result)
+        transact (fun () -> b.Value <- true; a.Value <- false)
+        checkBool "e2" true (AVal.force result)
+        transact (fun () -> b.Value <- false)
+        checkBool "e3" false (AVal.force result)
+        transact (fun () -> a.Value <- true)
+        checkBool "e4" true (AVal.force result)
+        transact (fun () -> b.Value <- true)
+        checkBool "e5" true (AVal.force result))
+
+    test "[Seq] forallA basic" (fun () ->
+        let a = cval false
+        let b = cval false
+        let l = [a :> aval<bool>; b :> aval<bool>]
+        let result = Seq.forallA id l
+        checkBool "f0" false (AVal.force result)
+        transact (fun () -> a.Value <- true)
+        checkBool "f1" false (AVal.force result)
+        transact (fun () -> b.Value <- true; a.Value <- false)
+        checkBool "f2" false (AVal.force result)
+        transact (fun () -> b.Value <- false)
+        checkBool "f3" false (AVal.force result)
+        transact (fun () -> a.Value <- true)
+        checkBool "f4" false (AVal.force result)
+        transact (fun () -> b.Value <- true)
+        checkBool "f5" true (AVal.force result))
 
     printfn "PASSED %d FAILED %d" passedCount failedCount

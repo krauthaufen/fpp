@@ -101,6 +101,10 @@ type Decl =
     /// class name, base class, its own members as (name, function), and
     /// per implemented interface the functions implementing its methods
     | DClass of string * string option * (string * VarId) list * (string * (string * VarId) list) list
+    /// the INSTANTIATION a class hands its base (`inherit B<aval<bool>>` on
+    /// C<'A> records B at [IAdaptiveValue`1$<bool>]) — symbolic in the
+    /// class' own variables, substituted when a construction is stamped
+    | DBaseInst of string * string list
     /// type name and its own members as (name, function). Emitted for ANY
     /// type that declares members — records and DUs included — so an
     /// override can be found without the type being a class.
@@ -212,6 +216,8 @@ let printDecl (d : Decl) : string =
         "interface " + n + " = {" + String.concat "; " (ms |> List.map (fun (m, a) -> m + "/" + string a)) + "}"
     | DMembers (n, own) ->
         "members " + n + " {" + String.concat "; " (own |> List.map fst) + "}"
+    | DBaseInst (n, inst) ->
+        "baseinst " + n + " <" + String.concat ", " inst + ">"
     | DClass (n, bse, own, impls) ->
         "class " + n
         + (match bse with Some b -> " inherit " + b | None -> "")
