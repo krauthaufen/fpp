@@ -1297,7 +1297,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // System.Object.ReferenceEquals(a, b): the identity
                       // primitive, however the namespace is spelled
                       | EField (EField (EUnknown "System", "Object", _), "ReferenceEquals", _), [ ETuple [ ra; rb ] ]
-                      | EField (EUnknown "Object", "ReferenceEquals", _), [ ETuple [ ra; rb ] ] ->
+                      | EField (EUnknown "Object", "ReferenceEquals", _), [ ETuple [ ra; rb ] ]
+                      | EField (EUnknown "obj", "ReferenceEquals", _), [ ETuple [ ra; rb ] ] ->
                           EApp (EUnknown "refEq", [ ra; rb ])
                       // `obj.Equals (a, b)` is .NET's STRUCTURAL comparison,
                       // which is what `=` already means here — including on
@@ -2545,6 +2546,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // the zero of whatever type the context resolved
                 let t = Green.tokens (GNode n) |> List.filter (fun x -> x.Kind = Ident) |> List.last
                 (match dictTryFind memberSites t.Offset with
+                 // a VARIABLE target: the zero is the stamp's to choose —
+                 // a null here lands in slots the instantiation unboxes
+                 | Some sym when sym.StartsWith "#" -> EUnknown ("$zero:" + sym)
                  | Some "int" | Some "bool" | Some "char" | Some "uint32"
                  | Some "int16" | Some "uint16" -> ELit (LInt "0")
                  | Some "uint64" -> ELit (LInt "0L")
@@ -2701,6 +2705,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // the UNIVERSAL object members: identity hash
                           // from the runtime's __idhash slot (assigned on
                           // first ask), identity equality
+                          elif owner = "$hasflag" && name.Text = "HasFlag" then
+                              let fl = { Path = path; Offset = offsetOf n + 26000000; Name = "_fl" }
+                              let anon2 = mono (TCon ("?", []))
+                              ELam ([ fl, anon2 ], EApp (EUnknown "$hasflag", [ lowerExpr (GNode lhs); EVar (fl, anon2) ]))
                           elif owner = "$object" && name.Text = "GetHashCode" then
                               let u = { Path = path; Offset = offsetOf n + 24000000; Name = "_u" }
                               let anon2 = mono (TCon ("?", []))

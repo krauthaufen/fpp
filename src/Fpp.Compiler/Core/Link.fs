@@ -322,7 +322,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
             (match opTypeName op with Some n -> symbolic n | None -> false) || anyOf xs
         // an unresolved class member is unshareable for the same reason an
         // operator is: which function it denotes depends on the type
-        | EUnknown n -> n.StartsWith "$class:" && n.Contains "#"
+        | EUnknown n -> (n.StartsWith "$class:" || n.StartsWith "$zero:") && n.Contains "#"
         | ECtor (_, _, xs) -> anyOf xs
         // a record whose NAME still mentions a type variable has no layout
         // yet, so code building it must be stamped just like an array op
@@ -627,6 +627,10 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
+            | EUnknown n when n.StartsWith "$zero:" ->
+                // the zero of the SUBSTITUTED type: scalar stamps get their
+                // scalar zero, reference ones stay null (resolved at emission)
+                EUnknown ("$zero:" + substName subst (n.Substring 6))
             | EUnknown n when n.StartsWith "$sizeof:" ->
                 // resolve the SYMBOLIC instantiation the way $class does:
                 // the size is only knowable once the stamp names the type

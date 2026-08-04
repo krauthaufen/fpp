@@ -763,6 +763,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | _ -> unifyMemberAt offset result (TFun (TCon ("obj", []), tBool)))
                     vecAdd memberSitesRaw (offset, "$object")
                     true
+                elif name = "HasFlag" then
+                    // enums answer HasFlag: `(x &&& f) = f` over the int
+                    // representation, marked for lowering by a sentinel
+                    unifyMemberAt offset result (TFun (TCon (tn, args), tBool))
+                    vecAdd memberSitesRaw (offset, "$hasflag")
+                    true
                 else false
             (match declaringOwner tn args with
              | Some (cands, own, ownArgs) ->
@@ -4421,7 +4427,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  (match tokensOf sa |> List.tryFind (fun t -> t.Kind = Ident) with
                   | Some kt when (dictTryFind defsAt kt.Offset).IsSome ->
                       let defTy = TFun (selfTy, setTy)
-                      setScheme kt.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = defTy }
+                      setScheme kt.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
                       (match nameTok with
                        | Some pn ->
                            // registerField, not a raw set: an overloaded
@@ -4442,7 +4448,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  recordDef t propTy
                  let defTy = TFun (selfTy, propTy)
                  if (dictTryFind defsAt t.Offset).IsSome then
-                     setScheme t.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = defTy }
+                     setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
                  let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
                  registerField (tyName + "." + t.Text)
                      { TypeName = tyName; Params = classParams
@@ -4530,7 +4536,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // quantify explicitly: the class' own type parameters live at
                 // the type-declaration level, which level-based
                 // generalization would refuse to close over
-                setScheme t.Offset { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id); Constraints = []; Body = defTy }
+                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do v.Level <- 0); { Quantified = qs; Constraints = []; Body = defTy })
             let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
             let quantified =
                 freeVars memberTy
@@ -4565,8 +4571,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         recordDef t valueTy
         if (dictTryFind defsAt t.Offset).IsSome then
             setScheme t.Offset
-                { Quantified = freeVars defTy |> List.distinctBy (fun v -> v.Id)
-                  Constraints = []; Body = defTy }
+                (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                 for v in qs do v.Level <- 0
+                 { Quantified = qs; Constraints = []; Body = defTy })
 
     /// Type an instance's bodies. Separate from registering it, because a
     /// body may mention a type declared further down the file, while the
@@ -5134,6 +5141,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if (dictTryFind structTypes n) = Some true
             then vecAdd memberSitesRaw (offset, "$struct:" + n)
             else vecAdd memberSitesRaw (offset, n)
+        // still a variable: `defaultof<'Value>` inside a generic body. The
+        // zero depends on what the STAMP substitutes — record the symbolic
+        // name so lowering can defer the choice instead of writing a null
+        // into a slot the instantiation unboxes as int.
+        | TVar v -> vecAdd memberSitesRaw (offset, "#" + string v.Id)
         | _ -> ()
 
     // Anything still parked has an indeterminate receiver. We do NOT guess a

@@ -1220,6 +1220,14 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | ELit LUnit ->
         ic f 0
         refI31 f
+    | EUnknown n when n.StartsWith "$zero:" ->
+        // the zero of a stamped `defaultof<'T>`: scalars get 0, the
+        // rest (refs, $ref, still-symbolic canon copies) get null
+        (match n.Substring 6 with
+         | "int" | "bool" | "char" | "byte" | "sbyte" | "int16" | "uint16" | "uint32" -> ic f 0; refI31 f
+         | "int64" | "uint64" -> lc f 0L; callf f "$ofl"
+         | "float" | "float32" -> fc f 0L; callf f "$off"
+         | _ -> refNull f "any")
     | EUnknown n when n.StartsWith "$sizeof:" ->
         // the byte size of the named type, from the SAME tables the layouts
         // come from: primitives at C's widths, a POD struct at its computed
@@ -2182,6 +2190,20 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ins f "ref.eq"
         refI31 f
     // the identity hash, boxed for expression position
+    | EApp (EUnknown "$hasflag", [ a; b ]) ->
+        // enum HasFlag: (a &&& b) = b on the int representation
+        let t = freshLocal f "$bq" "anyref"
+        emitNode st f lv b
+        ls f t
+        emitNode st f lv a
+        callf f "$toi"
+        lg f t
+        callf f "$toi"
+        ins f "i32.and"
+        lg f t
+        callf f "$toi"
+        ins f "i32.eq"
+        refI31 f
     | EApp (EUnknown "$idhash", [ a ]) ->
         emitNode st f lv a
         callf f "$idhash"
