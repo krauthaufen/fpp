@@ -32,7 +32,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (classPending : Dict<int, string>)
           (opTypes : Dict<int, string>)
           (tyAliases : Dict<string, Var list * Type>)
-          (arbDerive : (string * string * int * bool * (string * string list) list) list) : LowerResult =
+          (arbDerive : (string * string * int * bool * int list * (string * string list) list) list) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -3943,7 +3943,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // union picks a case and generates its payload. The $class references
     // resolve at link time — to written instances for primitives and
     // containers, to other derived ones for nested shapes.
-    for (key, recordName, off, isUnion, entries) in arbDerive do
+    for (key, recordName, off, isUnion, paramIds, entries) in arbDerive do
         let rv = { Path = path; Offset = off + 1; Name = "_r" }
         let rsch = mono (TCon ("Rand", []))
         let genOf (tyName : string) : Expr =
@@ -3977,9 +3977,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              caseExpr cn comps,
                              chain (i + 1) rest)
                 ELet (false, kv, ksch, pick, chain 0 entries)
+        // generic shapes quantify the type's OWN parameters, by id: the
+        // stamper's zip substitutes the "#id" spellings in the body
+        let quantified =
+            paramIds
+            |> List.map (fun id ->
+                { Id = id; Level = 1; Link = None; Rigid = false } : Fpp.Analysis.Types.Var)
         vecAdd decls
             (DLet (false, { Path = path; Offset = off; Name = "$arbD@" + key },
-                   mono (TFun (TCon ("Rand", []), TCon ("?", []))),
+                   { Quantified = quantified; Constraints = []
+                     Body = TFun (TCon ("Rand", []), TCon ("?", [])) },
                    ELam ([ rv, rsch ], body)))
 
     { Decls =

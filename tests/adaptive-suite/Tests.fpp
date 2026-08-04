@@ -93,6 +93,12 @@ type ArbPt =
       atag : ArbShade
       amore : int list }
 
+let genMany (rr : Rand) (n : int) : 'a list when Arb<'a> =
+    let mutable out : 'a list = []
+    for i in 1 .. n do
+        out <- (arbitrary rr : 'a) :: out
+    out
+
 let checkBool (msg : string) (expected : bool) (actual : bool) : unit =
     if actual <> expected then failwith (msg + ": bool mismatch")
 
@@ -2099,5 +2105,13 @@ let go =
         (match o1 with
          | Some v -> checkBool "opt" true (v >= -100)
          | None -> ()))
+
+    test "[Arb] generic contexts derive" (fun () ->
+        let r = Rand 42
+        let shades : ArbShade list = genMany r 5
+        checkInt "shades" 5 (List.length shades)
+        let ps : ArbPt list = genMany r 3
+        checkInt "pts" 3 (List.length ps)
+        for p in ps do checkBool "range" true (p.ax >= -100 && p.ax <= 100))
 
     printfn "PASSED %d FAILED %d" passedCount failedCount

@@ -30,7 +30,7 @@ type InferResult =
       InstSites : (int * string list) list
       /// derived Arb shapes: (instance key, record/ctor name, synth offset,
       /// isUnion, entries as (field-or-case, component type names))
-      ArbDerive : (string * string * int * bool * (string * string list) list) list
+      ArbDerive : (string * string * int * bool * int list * (string * string list) list) list
       /// member/field name-token offset -> the receiver's type name. Member
       /// names are not unique, so this — not the name — binds a dot-access
       /// to the member it calls.
@@ -1201,75 +1201,92 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let addWanted (offset : int) (c : Constraint) : unit = wanted <- wanted @ [ offset, c ]
 
     // ---- derived Arb instances -------------------------------------------
-    // A record or union with no written Arb instance GETS one: fields
-    // generate recursively, a union picks a case at random. The instance is
-    // registered here so solving proceeds; the function body is synthesized
-    // by lowering from the shapes recorded below.
+    // A record or union with no written Arb instance GETS one, GENERIC in
+    // the type's own parameters: fields generate recursively, a union picks
+    // a case at random. Registered on demand AND eagerly for every declared
+    // shape, so a stamped generic use resolves even when no ground demand
+    // ever named the type. The body is synthesized by lowering.
     /// union name -> (its parameters, cases as (name, payload components))
     let unionCasesReg = dictNew<string, Var list * (string * Type list) list> ()
     /// a GADT declares per-case signatures; deriving those would be wrong
     let unionGadt = dictNew<string, bool> ()
-    let arbDeriveRaw = vecNew<string * string * int * bool * (string * Type list) list> ()
+    /// types declared as RECORDS — classes never derive (their constructor
+    /// is the only sanctioned builder)
+    let recordsReg = dictNew<string, bool> ()
+    let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
     let arbDerived = dictNew<string, bool> ()
     let mutable arbSynthNext = 300000000
 
-    let deriveArb (c : Constraint) : bool =
-        match c.Args |> List.map prune with
-        | [ TCon (tn, targs) ] ->
-            let key = typeConName (TCon (tn, targs))
-            if (dictTryFind arbDerived key).IsSome then true
-            elif (dictTryFind unionGadt tn).IsSome then false
+    let deriveArbGeneric (tn : string) : bool =
+        if (dictTryFind arbDerived tn).IsSome then true
+        elif (dictTryFind unionGadt tn).IsSome then false
+        else
+            let hasWritten =
+                match dictTryFind classes.Instances "Arb" with
+                | Some insts ->
+                    vecToList insts
+                    |> List.exists (fun i ->
+                        match i.Head with
+                        | [ h ] ->
+                            (match prune h with
+                             | TCon (hn, _) -> hn = tn
+                             | _ -> false)
+                        | _ -> false)
+                | None -> false
+            if hasWritten then false
             else
-                let subst = dictNew<int, Type> ()
-                let entries, isUnion =
+                let shape =
                     match dictTryFind unionCasesReg tn with
-                    | Some (ps, cases) ->
-                        (if List.length ps = List.length targs then
-                            List.iter2 (fun (pv : Var) t -> dictSet subst (prunedId pv) t) ps targs)
-                        cases, true
+                    | Some (ps, cases) -> Some (ps, cases, true)
                     | None ->
-                        let fs =
-                            dictPairs fields
-                            |> List.choose (fun (k, fi) ->
-                                if fi.TypeName = tn && fi.DefKey.IsNone && not fi.IsStatic
-                                   && k.StartsWith (tn + ".")
-                                   && not ((k.Substring (tn.Length + 1)).Contains ".") then
-                                    (if List.length fi.Params = List.length targs then
-                                        List.iter2 (fun (pv : Var) t -> dictSet subst (prunedId pv) t) fi.Params targs)
-                                    Some (k.Substring (tn.Length + 1), [ fi.FieldType ])
-                                else None)
-                        fs, false
-                if List.isEmpty entries then false
-                else
-                let entries2 =
-                    entries |> List.map (fun (n2, comps) -> n2, comps |> List.map (substVars subst))
-                let generable =
-                    entries2 |> List.forall (fun (_, comps) ->
-                        comps |> List.forall (fun t ->
-                            match prune t with
-                            | TFun (_, _) -> false
-                            | TVar _ -> false
-                            | _ -> true))
-                if not generable then false
-                else
-                    let off = arbSynthNext
-                    arbSynthNext <- arbSynthNext + 10
-                    let name = "$arbD@" + key
-                    dictSet arbDerived key true
-                    vecAdd arbDeriveRaw (key, instName (TCon (tn, targs)), off, isUnion, entries2)
-                    let ctx =
-                        entries2
-                        |> List.collect (fun (_, comps) -> comps)
-                        |> List.map (fun t -> { Class = "Arb"; Args = [ t ]; Assoc = [] })
-                    Classes.addInstance classes
-                        { Class = "Arb"; Params = []
-                          Head = [ TCon (tn, targs) ]
-                          Assoc = []
-                          Context = ctx
-                          Members = [ "arbitrary", { MPath = path; MOffset = off; MName = name; MTakesUnit = false; MInst = [] } ]
-                          Builtin = false; Path = path; Offset = off }
-                    true
-        | _ -> false
+                        if (dictTryFind recordsReg tn).IsSome then
+                            let fs =
+                                dictPairs fields
+                                |> List.choose (fun (k, fi) ->
+                                    if fi.TypeName = tn && fi.DefKey.IsNone && not fi.IsStatic
+                                       && k.StartsWith (tn + ".")
+                                       && not ((k.Substring (tn.Length + 1)).Contains ".") then
+                                        Some (fi.Params, (k.Substring (tn.Length + 1), [ fi.FieldType ]))
+                                    else None)
+                            (match fs with
+                             | [] -> None
+                             | (ps, _) :: _ -> Some (ps, fs |> List.map snd, false))
+                        else None
+                match shape with
+                | None -> false
+                | Some (ps, entries, isUnion) ->
+                    // every component must be generatable: a concrete type,
+                    // or one of the TYPE'S OWN parameters (those resolve per
+                    // stamp). A function, or a foreign variable, refuses.
+                    let generable =
+                        entries |> List.forall (fun (_, comps) ->
+                            comps |> List.forall (fun t ->
+                                match prune t with
+                                | TFun (_, _) -> false
+                                | TVar v -> ps |> List.exists (fun p -> prunedId p = v.Id)
+                                | _ -> true))
+                    if not generable || List.isEmpty entries then false
+                    else
+                        let off = arbSynthNext
+                        arbSynthNext <- arbSynthNext + 10
+                        let name2 = "$arbD@" + tn
+                        dictSet arbDerived tn true
+                        let headArgs = ps |> List.map TVar
+                        vecAdd arbDeriveRaw
+                            (tn, instName (TCon (tn, headArgs)), off, isUnion,
+                             ps |> List.map prunedId, entries)
+                        let ctx =
+                            entries
+                            |> List.collect (fun (_, comps) -> comps)
+                            |> List.map (fun t -> { Class = "Arb"; Args = [ t ]; Assoc = [] })
+                        Classes.addInstance classes
+                            { Class = "Arb"; Params = ps
+                              Head = [ TCon (tn, headArgs) ]
+                              Assoc = []
+                              Context = ctx
+                              Members = [ "arbitrary", { MPath = path; MOffset = off; MName = name2; MTakesUnit = false; MInst = [] } ]
+                              Builtin = false; Path = path; Offset = off }
+                        true
 
     let isGround (c : Constraint) : bool = List.isEmpty (List.collect freeVars c.Args)
 
@@ -1362,7 +1379,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              + " — neither is more specific")
                     else vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
-                    if c.Class = "Arb" && isGround c && deriveArb c then
+                    if c.Class = "Arb"
+                       && (match c.Args |> List.map prune with
+                           | [ TCon (tn, _) ] -> deriveArbGeneric tn
+                           | _ -> false) then
                         // derived on demand: requeue, the instance now exists
                         progress <- true
                         vecAdd queue (offset, c)
@@ -4338,6 +4358,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         for m in nodesOf n do
             match m.NodeKind with
             | RecordRepr ->
+                dictSet recordsReg name true
                 for f in nodesOf m do
                     if f.NodeKind = RecordField then
                         let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
@@ -5162,6 +5183,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     predeclareAndGroups root.Children
     for c in root.Children do inferDecl c
 
+    // Every record and union answers Arb unless it wrote its own instance:
+    // a stamped GENERIC use may demand one that no ground use ever named,
+    // and by then only the instance table can answer.
+    for tn, _ in dictPairs recordsReg do deriveArbGeneric tn |> ignore
+    for tn, _ in dictPairs unionCasesReg do deriveArbGeneric tn |> ignore
+
     solveWanted ()
 
     // Numeric defaulting, as F# does it: a constraint nothing in the program
@@ -5354,8 +5381,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         |> List.filter (fun (_, k) -> k <> "")
       ArbDerive =
         vecToList arbDeriveRaw
-        |> List.map (fun (key, rn, off, isU, entries) ->
-            key, rn, off, isU,
+        |> List.map (fun (key, rn, off, isU, pids, entries) ->
+            key, rn, off, isU, pids,
             entries |> List.map (fun (n2, comps) -> n2, comps |> List.map typeConName))
       InstSites =
         vecToList instRaw
