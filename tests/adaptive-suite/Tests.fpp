@@ -467,8 +467,7 @@ let go =
         transact (fun () -> list.Clear())
         checkFloat "after clear" 0.0 (AVal.force res))
 
-    // TEMP-SKIP: override params lack the abstract signature (o.Tag misresolves)
-    let skipRBA1 = fun () -> test "[ASet] reduceByA group" (fun () ->
+    test "[ASet] reduceByA group" (fun () ->
         let list = cset (HashSet.ofList [1; 2; 3])
         let even = cval 1
         let odd = cval 0
@@ -503,8 +502,7 @@ let go =
         transact (fun () -> list.Value <- HashSet.ofList [1; 3; 5])
         checkInt "s11" 3 (AVal.force res))
 
-    // TEMP-SKIP: override params lack the abstract signature (o.Tag misresolves)
-    let skipRBA2 = fun () -> test "[ASet] reduceByA half group" (fun () ->
+    test "[ASet] reduceByA half group" (fun () ->
         let list = cset (HashSet.ofList [1; 2; 3])
         let even = cval 1
         let odd = cval 0
@@ -546,8 +544,7 @@ let go =
         checkInt "h11" 3 (AVal.force res)
         check "sub failed at least once" (fails > 0))
 
-    // TEMP-SKIP: override params lack the abstract signature (o.Tag misresolves)
-    let skipRBA3 = fun () -> test "[ASet] reduceByA fold" (fun () ->
+    test "[ASet] reduceByA fold" (fun () ->
         let list = cset (HashSet.ofList [1; 2; 3])
         let even = cval 1
         let odd = cval 0
