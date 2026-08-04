@@ -2661,6 +2661,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                 [ ELit (LString "\"the list is empty\"") ]) ])
                           elif owner = "list" && name.Text = "Length" then
                               EApp (EUnknown "$listLength", [ lowerExpr (GNode lhs) ])
+                          // the UNIVERSAL object members: identity hash
+                          // from the runtime's __idhash slot (assigned on
+                          // first ask), identity equality
+                          elif owner = "$object" && name.Text = "GetHashCode" then
+                              let u = { Path = path; Offset = offsetOf n + 24000000; Name = "_u" }
+                              let anon2 = mono (TCon ("?", []))
+                              ELam ([ u, anon2 ], EApp (EUnknown "$idhash", [ lowerExpr (GNode lhs) ]))
+                          elif owner = "$object" && name.Text = "Equals" then
+                              let o2 = { Path = path; Offset = offsetOf n + 25000000; Name = "_o" }
+                              let anon2 = mono (TCon ("?", []))
+                              ELam ([ o2, anon2 ], EApp (EUnknown "refEq", [ lowerExpr (GNode lhs); EVar (o2, anon2) ]))
                           else EField (lowerExpr (GNode lhs), name.Text, owner))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->

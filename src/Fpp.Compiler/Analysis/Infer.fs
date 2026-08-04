@@ -750,6 +750,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | _ ->
         match prune recvTy with
         | TCon (tn, args) ->
+            let universal () =
+                // .NET's UNIVERSAL object members: every class answers
+                // GetHashCode and Equals even without declaring them. The
+                // defaults are reference semantics (a constant hash is
+                // legal — all-equal — and Equals is identity), marked for
+                // lowering by a sentinel owner.
+                if (name = "GetHashCode" || name = "Equals") && (dictTryFind knownTypes tn).IsSome then
+                    (match name with
+                     | "GetHashCode" -> unifyMemberAt offset result (TFun (tUnit, tInt))
+                     | _ -> unifyMemberAt offset result (TFun (TCon ("obj", []), tBool)))
+                    vecAdd memberSitesRaw (offset, "$object")
+                    true
+                else false
             (match declaringOwner tn args with
              | Some (cands, own, ownArgs) ->
                  // one candidate is today's path; several are an overload
@@ -910,8 +923,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // is complete — during the main pass a member declared later
                  // in the same class has not registered yet, and giving up
                  // here silently unbound `for e in x` over self. Stay parked;
-                 // the forced pass concedes.
-                 force)
+                 // the forced pass concedes — to the UNIVERSAL object
+                 // members, when the name is one of theirs.
+                 if force then (universal () || true) else false)
         | _ -> false
 
     /// `recv.[i]` where the receiver declares `member x.Item` — a .NET

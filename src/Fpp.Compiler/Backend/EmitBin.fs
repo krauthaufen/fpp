@@ -519,6 +519,16 @@ let memCopy (f : Fn) : unit =
 
 // ---- globals / exports / data ----------------------------------------------
 
+/// (global $name (mut i32) (i32.const init))
+let globalI32 (m : Mod) (name : string) (init : int) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitByte m.GlobalBody (valByte "i32")
+    emitByte m.GlobalBody 1
+    emitByte m.GlobalBody opI32Const
+    emitU32 m.GlobalBody init
+    emitByte m.GlobalBody opEnd
+
 /// (global $name (mut anyref) (ref.null any))
 let globalAnyref (m : Mod) (name : string) : unit =
     dictSet m.GlobalIdx name m.GlobalCount
@@ -1064,6 +1074,9 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyArrayFuncref m "$vt"
     tyStruct m "$desc" [ fld false "i32"; fldRef false "$vt" ]
     tyStructSub m "$obj" "" true [ fld true "anyref" ]
+    // every CLASS roots here: __desc plus the lazily-assigned identity
+    // hash, which is what .NET's default GetHashCode is
+    tyStructSub m "$objh" "$obj" true [ fld true "anyref"; fld true "anyref" ]
     tyStruct m "$du0" [ fld false "i32" ]
     tyStruct m "$du1" [ fld false "i32"; fld false "anyref" ]
     for k in vArities do
@@ -4642,9 +4655,11 @@ let rtDecls9 (m : Mod) : unit =
     declFn m "$iterNext" "$rt_a2a"
     declFn m "$iterCur" "$rt_a2a"
     declFn m "$hashvBoxed" "$v1"
+    declFn m "$idhash" "$rt_a2i"
     declFn m "$strPad" "$rt_siii2a"
 
 let rtCore9 (m : Mod) : unit =
+    globalI32 m "$idctr" 1
     // $isBuiltinSeq
     let f = beginFn m [ "$v" ]
     localsDone f
@@ -4817,6 +4832,43 @@ let rtCore9 (m : Mod) : unit =
     lg f "$v"
     callf f "$hashv"
     callf f "$ofi"
+    endFn f
+    // $idhash: the OBJECT IDENTITY hash — assigned on first ask, stored in
+    // the class-universal __idhash slot; non-objects fall back to the
+    // structural hash
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"
+    gcT f "ref.test" "$objh"
+    ifV f "i32"
+    // assign on first ask: the slot still holds the i31 ZERO every
+    // construction writes
+    lg f "$v"
+    gcT f "ref.cast" "$objh"
+    gcTF f "struct.get" "$objh" 1
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    ins f "i32.eqz"
+    ifE f
+    lg f "$v"
+    gcT f "ref.cast" "$objh"
+    gg f "$idctr"
+    refI31 f
+    gcTF f "struct.set" "$objh" 1
+    gg f "$idctr"
+    ic f 1
+    ins f "i32.add"
+    gs f "$idctr"
+    endB f
+    lg f "$v"
+    gcT f "ref.cast" "$objh"
+    gcTF f "struct.get" "$objh" 1
+    gcAbs f "ref.cast" "i31"
+    i31get f
+    elseB f
+    lg f "$v"
+    callf f "$hashv"
+    endB f
     endFn f
     // $strPad
     let f = beginFn m [ "$v"; "$w"; "$c"; "$left" ]

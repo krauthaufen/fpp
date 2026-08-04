@@ -2177,6 +2177,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         castEq f
         ins f "ref.eq"
         refI31 f
+    // the identity hash, boxed for expression position
+    | EApp (EUnknown "$idhash", [ a ]) ->
+        emitNode st f lv a
+        callf f "$idhash"
+        refI31 f
     | EUnknown "$class:Ordered:compare:$ref" ->
         // `compare` at a UNIFORM reference: the runtime compares structurally
         requestWrapper st f "$cmpvBoxed" 2
@@ -4097,7 +4102,9 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             let super =
                 match baseOf rn with
                 | Some b when b <> rn && isObjRecord b -> "$r_" + b
-                | _ -> "$obj"
+                // a base-less CLASS roots at $objh (identity-hash slot);
+                // plain records keep $obj
+                | _ -> if isClassName rn then "$objh" else "$obj"
             tyStructSub m ("$r_" + rn) super false (names |> List.map (fun _ -> fld true "anyref"))
         else
             tyStruct m ("$r_" + rn) (names |> List.map (fun _ -> fld true "anyref"))
