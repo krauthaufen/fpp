@@ -1499,7 +1499,7 @@ let go =
             a.Value <- IndexList.ofList [80])
         checkL [1; 2; 3; 4; 80])
 
-    // TEMP-SKIP: sortWith path — Comparer<T>.Default unported + class-let nested closure capture (task 13)
+    // TEMP-SKIP: UCmp<struct('a*Index)> — struct-tuple repr split between UCmp write site and cmp-closure read (task 13)
     let skipSR = fun () -> test "[AList] sub random" (fun () ->
         let input = clist (IndexList.ofList ["a"; "b"; "c"; "d"; "e"])
         let range = (input :> alist<string>) |> AList.sortDescending |> AList.sub 1 3

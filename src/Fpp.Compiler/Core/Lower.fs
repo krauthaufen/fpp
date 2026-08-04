@@ -631,9 +631,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // becomes a synthetic match (v1: keep simple — represent structured
         // params as PVar-less lam over a fresh name is overkill; instead we
         // keep the pattern and let emission handle simple cases)
+        let isStructParam (p : GreenNode) =
+            p.NodeKind = StructTuplePat
+            || (p.NodeKind = ParenPat
+                && (match nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) with
+                    | [ one ] -> one.NodeKind = StructTuplePat
+                    | _ -> false))
         let binds =
             pats
             |> List.map (fun p ->
+                // a STRUCT pattern lowers to PWild (lowerPat has no struct
+                // form), which the wildcard arm would swallow as an ignored
+                // parameter — report it structured so the caller
+                // destructures it instead
+                if isStructParam p then None, PWild else
                 match lowerPat p with
                 | PVar (v, s) -> Some (v, s), PVar (v, s)
                 | PLit LUnit -> Some ({ Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit), PLit LUnit
@@ -3100,12 +3111,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 else
                     match paramBinds ps with
                     | bs, [] -> bs, body
-                    | _, structured ->
-                        let arg = { Path = path; Offset = d.Offset + 700000; Name = "_arg" }
-                        let asch = mono (TCon ("?", []))
-                        (match structured with
-                         | [ pp ] -> [ arg, asch ], EMatch (EVar (arg, asch), [ pp, None, body ])
-                         | pps -> [ arg, asch ], EMatch (EVar (arg, asch), [ PTuple pps, None, body ]))
+                    | _ ->
+                        // same rule as SimpleLet: curried destructure, so a
+                        // struct-pattern parameter keeps its binders
+                        let bs, bodyW = paramBindsFull ps body
+                        bs, bodyW
             let allBinds =
                 if not isStaticM then selfBind :: binds
                 elif List.isEmpty binds then
@@ -3132,6 +3142,42 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let e = lowerExpr (GNode body)
             yieldInto <- Some acc
             EAssign (acc, EPrim ("::", [ e; EVar (acc, anonScheme) ]))
+
+    /// Curried parameters INCLUDING struct-tuple ones: each parameter keeps
+    /// its own binder; a struct pattern's fields are read out of a synthetic
+    /// argument in the body (lowerPat has no struct form — it lowered to
+    /// PWild and the binders surfaced as phantom captures).
+    and paramBindsFull (pats : GreenNode list) (body : Expr) : (VarId * Scheme) list * Expr =
+        let mutable bodyW = body
+        let binds =
+            pats
+            |> List.map (fun p ->
+                let core =
+                    if p.NodeKind = ParenPat then
+                        match nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) with
+                        | [ one ] when one.NodeKind = StructTuplePat -> one
+                        | _ -> p
+                    else p
+                if core.NodeKind = StructTuplePat then
+                    let elems = structElems core
+                    let tn =
+                        match dictTryFind fieldOwners (offsetOf core) with
+                        | Some o -> o
+                        | None -> "StructTuple" + string elems.Length
+                    let arg = { Path = path; Offset = offsetOf core + 650000; Name = "_sarg" }
+                    let sch = mono (TCon (tn, []))
+                    bodyW <- structLetElems elems tn (EVar (arg, sch)) bodyW
+                    arg, sch
+                else
+                match lowerPat p with
+                | PVar (v, s) -> v, s
+                | PLit LUnit -> { Path = path; Offset = offsetOf p; Name = "_unit" }, mono tUnit
+                | other ->
+                    let arg = { Path = path; Offset = offsetOf p + 660000; Name = "_arg" }
+                    let sch = mono (TCon ("?", []))
+                    bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
+                    arg, sch)
+        binds, bodyW
 
     /// Bind the elements of a struct-tuple pattern from its fields. A simple
     /// binder reads its ItemN directly; a STRUCTURED element (a nested tuple,
@@ -3245,12 +3291,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      else
                          match paramBinds paramPats with
                          | binds, [] -> ELam (binds, body)
-                         | _, structured ->
-                             let arg = { Path = path; Offset = d.Offset + 600000; Name = "_arg" }
-                             let sch = mono (TCon ("?", []))
-                             (match structured with
-                              | [ p ] -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ p, None, body ]))
-                              | ps -> ELam ([ arg, sch ], EMatch (EVar (arg, sch), [ PTuple ps, None, body ])))
+                         | _ ->
+                             // structured parameters keep their own binders:
+                             // the curried path destructures each in the
+                             // body (a STRUCT pattern's fields read out, a
+                             // tuple matched) — collapsing to one tupled
+                             // argument lost struct binders to PWild
+                             let binds, bodyW = paramBindsFull paramPats body
+                             ELam (binds, bodyW)
                  Some (SimpleLet (isRec, varIdOf d, schemeOf d, rhs, cont))
              | None -> None)
         | [] -> None
