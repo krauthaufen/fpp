@@ -2192,6 +2192,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | LetDecl ->
                 (match lowerLetParts n with
                  | Some (SimpleLet (isRec, v, sch, rhs, cont)) ->
+                     let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
                      ELet (isRec, v, sch, rhs, (match cont with Some c -> c | None -> ELit LUnit))
                  | Some (DestructureLet (pat, rhs, cont)) ->
                      EMatch (rhs, [ pat, None, (match cont with Some c -> c | None -> ELit LUnit) ])
@@ -2303,6 +2304,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // definition outside it (top-level bindings need no capture)
                 let captured = vecNew<VarId * Scheme> ()
                 let seen = dictNew<string * int, bool> ()
+                // names the object expression ASSIGNS: a captured mutable
+                // must become a CELL, or the member writes a private copy
+                let assigned = dictNew<string, bool> ()
+                (let rec mark (ts : Token list) =
+                    match ts with
+                    | a :: b :: rest ->
+                        if a.Kind = Ident && b.Kind = Operator && b.Text = "<-" then dictSet assigned a.Text true
+                        mark (b :: rest)
+                    | _ -> ()
+                 mark toks)
                 for t in toks do
                     if t.Kind = Ident then
                         match dictTryFind useDefs t.Offset with
@@ -2318,6 +2329,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       && not (dictTryFind topLevelDefs d.Offset).IsSome
                                       && not (dictTryFind seen (d.Path, d.Offset)).IsSome ->
                             dictSet seen (d.Path, d.Offset) true
+                            if (dictTryFind assigned d.Name).IsSome then
+                                dictSet cellFields (d.Path, d.Offset) true
                             vecAdd captured (varIdOf d, schemeOf d)
                         | _ -> ()
                 let caps = vecToList captured
@@ -2351,6 +2364,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match currentSelf, dictTryFind fieldOfVar (v.Path, v.Offset) with
                     | Some (sv, ssch), Some (owner, fname) when owner = currentClass ->
                         EField (EVar (sv, ssch), fname, currentClass)
+                    | _ when (dictTryFind cellFields (v.Path, v.Offset)).IsSome ->
+                        // a MUTATED capture shares the CELL, not a snapshot
+                        // of its value (the emitter auto-derefs a cell-backed
+                        // local, so the raw cell needs asking for)
+                        EApp (EUnknown "$cellof", [ EVar (v, sch) ])
                     | _ -> EVar (v, sch)
                 ERecord (synth, caps |> List.map (fun (v, sch) -> v.Name, capInit (v, sch)))
             // `downcast e` / `upcast e`: inference resolved the target from
@@ -2771,6 +2789,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some c, [] -> c
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
+                    let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
                     ELet (isRec, v, sch, rhs, disposeOf v sch tail)
                 | Some (DestructureLet (pat, rhs, cont)) ->
                     let tail =
