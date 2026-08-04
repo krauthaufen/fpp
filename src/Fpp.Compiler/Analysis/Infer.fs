@@ -1899,6 +1899,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if text = "&&" || text = "||" then "logic"
         elif text = "::" then "cons"
         elif text = "|>" then "pipe"
+        elif text = "||>" then "pipe2"
+        elif text = "|||>" then "pipe3"
         elif text = "<|" then "pipeBack"
         elif text = ">>" then "compose"
         elif text = "<<" then "composeBack"
@@ -2855,6 +2857,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                unifyArg op.Offset pt lt
                                unifyAt op.Offset res rt2
                            | _ -> unifyAt op.Offset rt (TFun (lt, res)))
+                          res
+                      | "pipe2" | "pipe3" ->
+                          // `(a, b) ||> f` is `f a b`: the left is a tuple,
+                          // the right a curried function over its elements
+                          let arity = if opClass op.Text = "pipe2" then 2 else 3
+                          let elems = List.init arity (fun _ -> st.Fresh ())
+                          let res = st.Fresh ()
+                          unifyAt op.Offset lt (TTuple elems)
+                          unifyAt op.Offset rt (List.foldBack (fun e acc -> TFun (e, acc)) elems res)
                           res
                       | "pipeBack" ->
                           let res = st.Fresh ()

@@ -1864,4 +1864,196 @@ let go =
         transact (fun () -> a.Value <- 6)
         checkL [1; 6; 9])
 
+    // ---- reference-impl properties (deterministic FsCheck stand-in) ----
+    test "[AVal] reference impl" (fun () ->
+        for seed in 1 .. 5 do
+            let rand = Lcg (1000 + seed)
+            let leaves = ResizeArray<cval<int>>()
+            let rec gen (depth : int) : aval<int> * (unit -> int) =
+                if depth = 0 || rand.Next 5 = 0 then
+                    if rand.Next 2 = 0 then
+                        let c = cval (rand.Next 100)
+                        leaves.Add c
+                        (c :> aval<int>, fun () -> c.Value)
+                    else
+                        let v = rand.Next 100
+                        (AVal.constant v, fun () -> v)
+                else
+                    let kind = rand.Next 4
+                    if kind = 0 then
+                        let (a, ra) = gen (depth - 1)
+                        let k = rand.Next 10
+                        (AVal.map (fun x -> x + k) a, fun () -> ra () + k)
+                    elif kind = 1 then
+                        let (a, ra) = gen (depth - 1)
+                        let (b, rb) = gen (depth - 1)
+                        (AVal.map2 (fun x y -> x + y) a b, fun () -> ra () + rb ())
+                    elif kind = 2 then
+                        let (c, rc) = gen (depth - 1)
+                        let (a, ra) = gen (depth - 1)
+                        let (b, rb) = gen (depth - 1)
+                        (AVal.bind (fun x -> if x % 2 = 0 then a else b) c,
+                         fun () -> if rc () % 2 = 0 then ra () else rb ())
+                    else
+                        let (a, ra) = gen (depth - 1)
+                        (AVal.map (fun x -> x * 3) a, fun () -> ra () * 3)
+            let (real, reference) = gen 4
+            checkInt "initial" (reference ()) (AVal.force real)
+            if leaves.Count > 0 then
+                for i in 1 .. 40 do
+                    transact (fun () ->
+                        for j in 0 .. rand.Next 3 do
+                            let l = leaves.[rand.Next leaves.Count]
+                            l.Value <- rand.Next 100)
+                    checkInt "step" (reference ()) (AVal.force real))
+
+    test "[ASet] reference impl" (fun () ->
+        for seed in 1 .. 5 do
+            let rand = Lcg (2000 + seed)
+            let leaves = ResizeArray<cset<int>>()
+            let rec gen (depth : int) : aset<int> * (unit -> int list) =
+                if depth = 0 || rand.Next 5 = 0 then
+                    let init = List.init (rand.Next 5) (fun _ -> rand.Next 50)
+                    let c = cset (HashSet.ofList init)
+                    leaves.Add c
+                    (c :> aset<int>, fun () -> HashSet.toList c.Value)
+                else
+                    let kind = rand.Next 4
+                    if kind = 0 then
+                        let (a, ra) = gen (depth - 1)
+                        let m = 2 + rand.Next 20
+                        (ASet.map (fun x -> x % m) a, fun () -> ra () |> List.map (fun x -> x % m))
+                    elif kind = 1 then
+                        let (a, ra) = gen (depth - 1)
+                        (ASet.filter (fun x -> x % 2 = 0) a, fun () -> ra () |> List.filter (fun x -> x % 2 = 0))
+                    elif kind = 2 then
+                        let (a, ra) = gen (depth - 1)
+                        let (b, rb) = gen (depth - 1)
+                        (ASet.union a b, fun () -> ra () @ rb ())
+                    else
+                        let (a, ra) = gen (depth - 1)
+                        let o = rand.Next 10
+                        (a |> ASet.collect (fun x -> ASet.ofList [x; x + o]),
+                         fun () -> ra () |> List.collect (fun x -> [x; x + o]))
+            let (real, reference) = gen 3
+            let norm (xs : int list) = xs |> List.distinct |> List.sort
+            let check (msg : string) =
+                let av = HashSet.toList (ASet.force real) |> List.sort
+                if av <> norm (reference ()) then failwith (msg + ": set model mismatch")
+            check "initial"
+            if leaves.Count > 0 then
+                for i in 1 .. 40 do
+                    transact (fun () ->
+                        for j in 0 .. rand.Next 2 do
+                            let l = leaves.[rand.Next leaves.Count]
+                            let op = rand.Next 4
+                            if op = 0 then l.Add (rand.Next 50) |> ignore
+                            elif op = 1 then
+                                if l.Count > 0 then
+                                    let v = HashSet.toList l.Value |> List.item (rand.Next l.Count)
+                                    l.Remove v |> ignore
+                            elif op = 2 then l.Clear ()
+                            else l.Value <- HashSet.ofList (List.init (rand.Next 5) (fun _ -> rand.Next 50)))
+                    check "step")
+
+    test "[AList] reference impl" (fun () ->
+        for seed in 1 .. 5 do
+            let rand = Lcg (3000 + seed)
+            let leaves = ResizeArray<clist<int>>()
+            let rec gen (depth : int) : alist<int> * (unit -> int list) =
+                if depth = 0 || rand.Next 5 = 0 then
+                    let init = List.init (rand.Next 5) (fun _ -> rand.Next 50)
+                    let c = clist (IndexList.ofList init)
+                    leaves.Add c
+                    (c :> alist<int>, fun () -> IndexList.toList c.Value)
+                else
+                    let kind = rand.Next 4
+                    if kind = 0 then
+                        let (a, ra) = gen (depth - 1)
+                        let k = rand.Next 10
+                        (AList.map (fun x -> x + k) a, fun () -> ra () |> List.map (fun x -> x + k))
+                    elif kind = 1 then
+                        let (a, ra) = gen (depth - 1)
+                        (AList.filter (fun x -> x % 2 = 0) a, fun () -> ra () |> List.filter (fun x -> x % 2 = 0))
+                    elif kind = 2 then
+                        let (a, ra) = gen (depth - 1)
+                        let (b, rb) = gen (depth - 1)
+                        (AList.append a b, fun () -> ra () @ rb ())
+                    else
+                        let (a, ra) = gen (depth - 1)
+                        let o = rand.Next 10
+                        (a |> AList.collect (fun x -> AList.ofList [x; x + o]),
+                         fun () -> ra () |> List.collect (fun x -> [x; x + o]))
+            let (real, reference) = gen 3
+            let check (msg : string) =
+                let av = IndexList.toList (AList.force real)
+                if av <> reference () then failwith (msg + ": list model mismatch")
+            check "initial"
+            if leaves.Count > 0 then
+                for i in 1 .. 40 do
+                    transact (fun () ->
+                        for j in 0 .. rand.Next 2 do
+                            let l = leaves.[rand.Next leaves.Count]
+                            let op = rand.Next 4
+                            if op = 0 then l.Add (rand.Next 50) |> ignore
+                            elif op = 1 then
+                                if l.Count > 0 then l.RemoveAt (rand.Next l.Count) |> ignore
+                            elif op = 2 then
+                                if l.Count > 0 then l.[rand.Next l.Count] <- rand.Next 50
+                            else l.InsertAt (rand.Next (l.Count + 1), rand.Next 50) |> ignore)
+                    check "step")
+
+    test "[AMap] reference impl" (fun () ->
+        for seed in 1 .. 5 do
+            let rand = Lcg (4000 + seed)
+            let leaves = ResizeArray<cmap<int, int>>()
+            let rec gen (depth : int) : amap<int, int> * (unit -> (int * int) list) =
+                if depth = 0 || rand.Next 5 = 0 then
+                    let init = List.init (rand.Next 5) (fun _ -> (rand.Next 20, rand.Next 50))
+                    let c = cmap (HashMap.ofList init)
+                    leaves.Add c
+                    (c :> amap<int, int>, fun () -> HashMap.toList c.Value)
+                else
+                    let kind = rand.Next 4
+                    if kind = 0 then
+                        let (a, ra) = gen (depth - 1)
+                        let k = rand.Next 10
+                        (AMap.map (fun _ v -> v + k) a, fun () -> ra () |> List.map (fun (kk, v) -> (kk, v + k)))
+                    elif kind = 1 then
+                        let (a, ra) = gen (depth - 1)
+                        (AMap.filter (fun k v -> (k + v) % 2 = 0) a,
+                         fun () -> ra () |> List.filter (fun (kk, v) -> (kk + v) % 2 = 0))
+                    elif kind = 2 then
+                        let (a, ra) = gen (depth - 1)
+                        let (b, rb) = gen (depth - 1)
+                        (AMap.union a b,
+                         fun () ->
+                            let mutable m = HashMap.ofList (ra ())
+                            for (kk, v) in rb () do m <- HashMap.add kk v m
+                            HashMap.toList m)
+                    else
+                        let (a, ra) = gen (depth - 1)
+                        (AMap.choose (fun k v -> if v % 3 = 0 then None else Some (v * 2)) a,
+                         fun () -> ra () |> List.choose (fun (kk, v) -> if v % 3 = 0 then None else Some (kk, v * 2)))
+            let (real, reference) = gen 3
+            let check (msg : string) =
+                let av = HashMap.toList (AMap.force real) |> List.sortBy fst
+                let ev = reference () |> List.sortBy fst
+                if av <> ev then failwith (msg + ": map model mismatch")
+            check "initial"
+            if leaves.Count > 0 then
+                for i in 1 .. 40 do
+                    transact (fun () ->
+                        for j in 0 .. rand.Next 2 do
+                            let l = leaves.[rand.Next leaves.Count]
+                            let op = rand.Next 4
+                            if op = 0 then l.Add (rand.Next 20, rand.Next 50) |> ignore
+                            elif op = 1 then
+                                if l.Count > 0 then
+                                    let kv = HashMap.toList l.Value |> List.item (rand.Next l.Count)
+                                    l.Remove (fst kv) |> ignore
+                            elif op = 2 then l.Clear ()
+                            else l.Value <- HashMap.ofList (List.init (rand.Next 5) (fun _ -> (rand.Next 20, rand.Next 50))))
+                    check "step")
+
     printfn "PASSED %d FAILED %d" passedCount failedCount

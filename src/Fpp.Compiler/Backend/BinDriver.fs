@@ -38,7 +38,7 @@ type St =
       /// let-bound mutables that a lambda mentions: capture copies the env
       /// BY VALUE, so these live in a one-field $cell and the copy that
       /// lands in the closure's env is a copy of the CELL REFERENCE
-      CellVars : Dict<string * int, bool>
+      mutable CellVars : Dict<string * int, bool>
       /// class machinery: obj records (carry __desc), class ids, dispatch
       /// slots, interface implementors, subclass sets
       ObjRec : Dict<string, bool>
@@ -110,7 +110,7 @@ type St =
       /// callee and caller agree (the frame that would unbox is gone)
       mutable CurRet : string
       /// mentioned inside some lambda: those can never be rail locals
-      InLambda : Dict<string * int, bool>
+      mutable InLambda : Dict<string * int, bool>
       /// struct-record fields with their declared TYPE names (uniform
       /// records erase types; POD navigation needs them back)
       StructFields : Dict<string, (string * string) list>
@@ -4300,10 +4300,32 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // lambdas discovered only AFTER globals/functions are registered, so
     // the capture filter (below) can exclude them — a global or a known
     // function resolves directly and is never an env slot
-    for d in decls do
+    // Cell-ness is PER DECLARATION: the tables are keyed by (path, offset),
+    // and alpha-renamed stamp clones can COLLIDE across declarations — one
+    // clone's captured mutable marked another clone's plain parameter as a
+    // cell, so the build stored raw and the read dereferenced. Each body is
+    // emitted under its OWN declaration's scan; a lambda under its OWNER's.
+    let perDeclCells =
+        decls |> List.map (fun d ->
+            match d with
+            | DLet (_, _, _, _) -> cellScan [ d ]
+            | _ -> (dictNew (), dictNew ()))
+    let setCellCtx (di : int) : unit =
+        let (cells, inl) = List.item di perDeclCells
+        st.CellVars <- cells
+        st.InLambda <- inl
+    let lamOwner = dictNew<string, int> ()
+    decls |> List.iteri (fun di d ->
         match d with
-        | DLet (_, _, _, body) -> discoverLams st (dictNew ()) body
-        | _ -> ()
+        | DLet (_, _, _, body) ->
+            let before = vecLen st.LamBody
+            discoverLams st (dictNew ()) body
+            let mutable j = before
+            while j < vecLen st.LamBody do
+                let (nm, _, _) = vecGet st.LamBody j
+                dictSet lamOwner nm di
+                j <- j + 1
+        | _ -> ())
     for name, _, _ in vecToList st.LamBody do
         declFn m name "$u1"
         tblIdx m name |> ignore
@@ -4372,9 +4394,10 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         globalArrI32 m "$dbgFrames" 512
     // bodies in DECLARATION order: all functions first, then all inits —
     // interleaving them put code into the wrong slots
-    for d in decls do
+    decls |> List.iteri (fun declIdx d ->
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
+            setCellCtx declIdx
             // parameters keep the names they were WRITTEN with, so a debugger's
             // scope view reads `p` rather than `a0`. Uniquified by position,
             // since two parameters may share a spelling after inlining.
@@ -4433,7 +4456,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             if debugBuild && emitted then dbgFrame f -1 -1
             st.CurRet <- "u"
             endFn f
-        | _ -> ()
+        | _ -> ())
     // generated identity bodies — a record compares and hashes over its
     // fields; a class is reference-equal with a lazily assigned id number
     // (wasm-GC exposes no identity of its own: ref.eq compares, it does
@@ -4536,6 +4559,9 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // The capture FILTER at each build site is "is it a local there", so the
     // body maps every free key optimistically; unreached slots never read.
     for name, (pv, _), body in vecToList st.LamBody do
+        (match dictTryFind lamOwner name with
+         | Some di -> setCellCtx di
+         | None -> ())
         let f = beginFn m [ "$a"; "$env" ]
         let lv = dictNew<string * int, string> ()
         dictSet lv (pv.Path, pv.Offset) "$a"
@@ -4563,16 +4589,17 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         markTails st body
         emitWithLocals st f lv name body true |> ignore
         endFn f
-    for d in decls do
+    decls |> List.iteri (fun declIdx d ->
         match d with
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) ->
+            setCellCtx declIdx
             let f = beginFn m []
             let lv = dictNew<string * int, string> ()
             if emitWithLocals st f lv (mangle v) rhs true then
                 gs f (dictTryFind st.GlobalOf (v.Path, v.Offset)).Value
             endFn f
-        | _ -> ()
+        | _ -> ())
     let f = beginFn m []
     localsDone f
     callf f "$strinit"
