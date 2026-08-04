@@ -614,8 +614,7 @@ let go =
                             upper.Value <- u)
                         checkRange ())
 
-    // TEMP-SKIP: BindReader voption<struct> cache at obj,obj — uniform write vs specialized read (task 16)
-    let skipCB = fun () -> test "[ASet] content bind" (fun () ->
+    test "[ASet] content bind" (fun () ->
         let set = cset<int> (HashSet.empty ())
         let res = (set :> aset<int>).Content |> ASet.bind (fun x -> ASet.ofHashSet (x.Map(fun v -> v * 2)))
         for i in 1 .. 100 do
@@ -1119,8 +1118,7 @@ let go =
         transact (fun () -> list.Clear())
         checkFloat "clear" 0.0 (AVal.force res))
 
-    // TEMP-SKIP: IndexList.Map<T2> generic-method template invoked unstamped (task 13 follow-up)
-    let skipALRA = fun () -> test "[AList] reduceByA group" (fun () ->
+    test "[AList] reduceByA group" (fun () ->
         let list = clist (IndexList.ofList [1; 2; 3])
         let even = cval 1
         let odd = cval 0

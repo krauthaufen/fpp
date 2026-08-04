@@ -1878,7 +1878,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | [] -> ELit LUnit
                  | [ one ] -> lowerExpr (GNode one)
                  | many -> ESeq (List.map (fun m -> lowerExpr (GNode m)) many))
-            | TupleExpr -> ETuple (nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m)))
+            | TupleExpr ->
+                // a comma expression the context coerced to a STRUCT tuple:
+                // inference marked the instantiated name at the first token,
+                // and building the boxed tuple here instead is a WRITE the
+                // record-typed readers of the same value cannot survive
+                let elems = nodesOf n |> List.filter (fun m -> isExprish m.NodeKind)
+                (match Green.tokens (GNode n) |> List.tryHead |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset) with
+                 | Some o when o.StartsWith "StructTuple" ->
+                     ERecord (o, elems |> List.mapi (fun i m -> "Item" + string (i + 1), lowerExpr (GNode m)))
+                 | _ -> ETuple (elems |> List.map (fun m -> lowerExpr (GNode m))))
             | ListExpr ->
                 let items = vecNew<Expr> ()
                 let mutable comprehension = false
