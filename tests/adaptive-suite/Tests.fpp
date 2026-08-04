@@ -78,6 +78,10 @@ type NonEqualObject() =
     override x.GetHashCode() : int = failwith "BrokenEquality.GetHashCode should not be called"
     override x.Equals (_o : obj) : bool = failwith "BrokenEquality.Equals should not be called"
 
+type SetTreeNode =
+    { value : int
+      nodes : cset<SetTreeNode> }
+
 let checkBool (msg : string) (expected : bool) (actual : bool) : unit =
     if actual <> expected then failwith (msg + ": bool mismatch")
 
@@ -1556,6 +1560,266 @@ let go =
                 else
                     input.UpdateTo values |> ignore)
             check ())
+
+    test "[AVal] cast equality" (fun () ->
+        let a = cval [1; 2; 3]
+        let b = a |> AVal.cast<seq<int>>
+        let c = a |> AVal.cast<seq<int>>
+        checkBool "cached" true (System.Object.ReferenceEquals (b, c)))
+
+    test "[AList] reduce empty after lots of operations" (fun () ->
+        let s = clist (IndexList.empty ())
+        let r = AList.sum s
+        let rand = Lcg 77
+        transact (fun () ->
+            for i in 1 .. 1000 do
+                s.Add (rand.NextDouble ()) |> ignore)
+        r |> AVal.force |> ignore
+        transact (fun () -> s.Clear ())
+        checkFloat "clear" 0.0 (AVal.force r)
+        transact (fun () ->
+            for i in 1 .. 1000 do
+                s.Add (rand.NextDouble ()) |> ignore)
+        let element = s.Value |> Seq.item (rand.Next s.Count)
+        transact (fun () -> s.Value <- IndexList.single element)
+        checkFloat "single" element (AVal.force r))
+
+    test "[AList] reduceBy half group" (fun () ->
+        let list = clist (IndexList.ofList [1; 2; 3])
+        let reduction = AdaptiveReduction.product ()
+        let res = AList.reduceBy reduction (fun _ v -> float v) list
+        checkFloat "p0" 6.0 (AVal.force res)
+        transact (fun () -> list.Add 4 |> ignore)
+        checkFloat "p1" 24.0 (AVal.force res)
+        transact (fun () -> list.RemoveAt 0 |> ignore)
+        checkFloat "p2" 24.0 (AVal.force res)
+        transact (fun () -> list.Clear ())
+        checkFloat "p3" 1.0 (AVal.force res)
+        transact (fun () -> list.Add 0 |> ignore)
+        checkFloat "p4" 0.0 (AVal.force res)
+        transact (fun () -> list.Add 10 |> ignore)
+        checkFloat "p5" 0.0 (AVal.force res)
+        transact (fun () -> list.Add 2 |> ignore)
+        checkFloat "p6" 0.0 (AVal.force res)
+        transact (fun () -> list.Add 2 |> ignore)
+        checkFloat "p7" 0.0 (AVal.force res)
+        transact (fun () -> list.RemoveAt 0 |> ignore)
+        checkFloat "p8" 40.0 (AVal.force res))
+
+    test "[AList] reduceByA half group" (fun () ->
+        let list = clist (IndexList.ofList [1; 2; 3])
+        let even = cval 1
+        let odd = cval 0
+        let mapping _ v =
+            if v % 2 = 0 then even :> aval<int>
+            else odd :> aval<int>
+        let fails = ref 0
+        let baseRed = AdaptiveReduction.sum ()
+        let reduction =
+            { baseRed with
+                sub = fun s v ->
+                    if s % 2 = 0 then ValueSome (s - v)
+                    else
+                        fails.Value <- fails.Value + 1
+                        ValueNone }
+        let res = AList.reduceByA reduction mapping list
+        checkInt "h0" 1 (AVal.force res)
+        transact (fun () -> even.Value <- 2)
+        checkInt "h1" 2 (AVal.force res)
+        transact (fun () -> even.Value <- 1)
+        checkInt "h2" 1 (AVal.force res)
+        transact (fun () -> odd.Value <- 3)
+        checkInt "h3" 7 (AVal.force res)
+        transact (fun () -> odd.Value <- 1; even.Value <- 0)
+        checkInt "h4" 2 (AVal.force res)
+        transact (fun () -> list.Append 4 |> ignore)
+        checkInt "h5" 2 (AVal.force res)
+        transact (fun () -> odd.Value <- 0; even.Value <- 1)
+        checkInt "h6" 2 (AVal.force res)
+        transact (fun () -> list.Append 5 |> ignore)
+        checkInt "h7" 2 (AVal.force res)
+        transact (fun () -> list.Append 6 |> ignore)
+        checkInt "h8" 3 (AVal.force res)
+        transact (fun () ->
+            list.RemoveAt 4 |> ignore
+            list.RemoveAt 2 |> ignore
+            list.RemoveAt 0 |> ignore
+            odd.Value <- 1)
+        checkInt "h9" 3 (AVal.force res)
+        transact (fun () -> list.Value <- IndexList.ofList [1; 3; 5])
+        checkInt "h10" 3 (AVal.force res)
+        checkBool "fails" true (fails.Value > 0))
+
+    test "[AList] reduceByA fold" (fun () ->
+        let list = clist (IndexList.ofList [1; 2; 3])
+        let even = cval 1
+        let odd = cval 0
+        let mapping _ v =
+            if v % 2 = 0 then even :> aval<int>
+            else odd :> aval<int>
+        let reduction = AdaptiveReduction.fold 0 (+)
+        let res = AList.reduceByA reduction mapping list
+        checkInt "f0" 1 (AVal.force res)
+        transact (fun () -> even.Value <- 2)
+        checkInt "f1" 2 (AVal.force res)
+        transact (fun () -> even.Value <- 1)
+        checkInt "f2" 1 (AVal.force res)
+        transact (fun () -> odd.Value <- 3)
+        checkInt "f3" 7 (AVal.force res)
+        transact (fun () -> odd.Value <- 1; even.Value <- 0)
+        checkInt "f4" 2 (AVal.force res)
+        transact (fun () -> list.Append 4 |> ignore)
+        checkInt "f5" 2 (AVal.force res)
+        transact (fun () -> odd.Value <- 0; even.Value <- 1)
+        checkInt "f6" 2 (AVal.force res))
+
+    test "[AMap] reduce empty after lots of operations" (fun () ->
+        let s = cmap (HashMap.empty ())
+        let r = AMap.reduce (AdaptiveReduction.sum ()) s
+        let rand = Lcg 99
+        transact (fun () ->
+            for i in 1 .. 1000 do
+                let v = rand.NextDouble ()
+                s.Add (v, v) |> ignore)
+        r |> AVal.force |> ignore
+        transact (fun () -> s.Clear ())
+        checkFloat "clear" 0.0 (AVal.force r)
+        transact (fun () ->
+            for i in 1 .. 1000 do
+                let v = rand.NextDouble ()
+                s.Add (v, v) |> ignore)
+        let kv = s.Value |> Seq.item (rand.Next s.Count)
+        let k = fst kv
+        let v = snd kv
+        transact (fun () -> s.Value <- HashMap.single k v)
+        checkFloat "single" v (AVal.force r))
+
+    test "[IndexMapping] correct" (fun () ->
+        let m = IndexMapping<int * int>()
+        let rand = Lcg 555
+        for i in 1 .. 20 do
+            let data = List.init 30 (fun _ -> (rand.Next 100000, rand.Next 100000)) |> List.distinct
+            let indices = data |> List.map (fun t -> m.Invoke t)
+            let mutable acc = MapExt.empty ()
+            for (ix, v) in List.zip indices data do
+                acc <- MapExt.add ix v acc
+            let sorted = MapExt.toList acc |> List.map snd
+            if List.sort data <> sorted then failwith "IndexMapping order mismatch")
+
+    test "[MapExt] neighbours" (fun () ->
+        let rand = Lcg 321
+        let l = List.init 200 (fun v -> v * 2)
+        let shuffled =
+            l
+            |> List.map (fun v -> (rand.Next 100000, v))
+            |> List.sortBy fst
+            |> List.map snd
+        let m = shuffled |> List.map (fun i -> (i, i)) |> MapExt.ofList
+        for i in -1 .. 399 do
+            let (lo, se, hi) = MapExt.neighbours i m
+            if i % 2 = 0 then
+                let el = if i > 0 then Some (i - 2, i - 2) else None
+                let er = if i < 398 then Some (i + 2, i + 2) else None
+                if lo <> el then failwith "left mismatch"
+                if hi <> er then failwith "right mismatch"
+                if se <> Some i then failwith "self mismatch"
+            else
+                let el = if i > 0 then Some (i - 1, i - 1) else None
+                let er = if i < 398 then Some (i + 1, i + 1) else None
+                if lo <> el then failwith "left mismatch odd"
+                if hi <> er then failwith "right mismatch odd"
+                (match se with
+                 | Some _ -> failwith "self should be none"
+                 | None -> ()))
+
+    test "[ASet] range systematic int64" (fun () ->
+        for pl in 0 .. 4 do
+            for pu in 0 .. 4 do
+                for l in 0 .. 4 do
+                    for u in 0 .. 4 do
+                        let lower = cval (int64 pl)
+                        let upper = cval (int64 pu)
+                        let actual = ASet.range lower upper
+                        let reader = actual.GetReader()
+                        let checkRange () =
+                            reader.GetChanges AdaptiveToken.Top |> ignore
+                            let av = CountingHashSet.toList reader.State |> List.sort
+                            let ev = [ lower.Value .. upper.Value ]
+                            if av <> ev then failwith "range64 mismatch"
+                        checkRange ()
+                        transact (fun () ->
+                            lower.Value <- int64 l
+                            upper.Value <- int64 u)
+                        checkRange ())
+
+    test "[AList] range systematic int64" (fun () ->
+        for pl in 0 .. 4 do
+            for pu in 0 .. 4 do
+                for l in 0 .. 4 do
+                    for u in 0 .. 4 do
+                        let lower = cval (int64 pl)
+                        let upper = cval (int64 pu)
+                        let actual = AList.range lower upper
+                        let r = actual.GetReader()
+                        let checkIt () =
+                            r.GetChanges AdaptiveToken.Top |> ignore
+                            let av = IndexList.toList r.State
+                            let ev = [ lower.Value .. upper.Value ]
+                            if av <> ev then failwith "range64 list mismatch"
+                        checkIt ()
+                        transact (fun () ->
+                            lower.Value <- int64 l
+                            upper.Value <- int64 u)
+                        checkIt ())
+
+    test "[ASet] ofSetTree" (fun () ->
+        let roots = cset<SetTreeNode> (HashSet.empty ())
+        let filter = AVal.init 0
+        let set =
+            roots
+            |> ASet.filterA (fun (n : SetTreeNode) -> filter |> AVal.map (fun f -> (n.value % 2) = f))
+            |> ASet.ofSetTree (fun (n : SetTreeNode) -> n.nodes |> ASet.filterA (fun (n2 : SetTreeNode) -> filter |> AVal.map (fun f -> (n2.value % 2) = f)))
+        let rec cnt (nodes : cset<SetTreeNode>) (f : int) =
+            let mutable sum = 0
+            let children : SetTreeNode list = HashSet.toList nodes.Value
+            for sn in children do
+                if (sn.value % 2) = f then
+                    sum <- sum + (cnt sn.nodes f) + 1
+            sum
+        let nodes = ResizeArray<SetTreeNode>()
+        let rnd = Lcg 2225
+        for i in 0 .. 800 do
+            transact (fun () ->
+                if rnd.NextDouble () < 0.1 then
+                    let newFilter = if filter.Value = 0 then 1 else 0
+                    filter.Value <- newFilter
+                else
+                    if roots.Count = 0 || rnd.NextDouble () < 0.45 then
+                        let nv = rnd.Next 100000
+                        let n = { value = nv; nodes = cset<SetTreeNode> (HashSet.empty ()) }
+                        if roots.Count = 0 || rnd.NextDouble () < 0.25 then
+                            roots.Add n |> ignore
+                        else
+                            let index = rnd.Next nodes.Count
+                            nodes.[index].nodes.Add n |> ignore
+                        nodes.Add n |> ignore
+                    else
+                        if rnd.NextDouble () < 0.2 then
+                            let index = rnd.Next roots.Count
+                            let n = roots.Value |> HashSet.toList |> List.skip index |> List.head
+                            nodes.Remove n |> ignore
+                            roots.Remove n |> ignore
+                        else
+                            let index = rnd.Next nodes.Count
+                            let n = nodes.[index]
+                            if n.nodes.Count > 0 then
+                                let indexRem = rnd.Next n.nodes.Count
+                                let nr = n.nodes.Value |> HashSet.toList |> List.skip indexRem |> List.head
+                                nodes.Remove nr |> ignore
+                                n.nodes.Remove nr |> ignore)
+            let refCnt = cnt roots (filter |> AVal.force)
+            let setCnt = (set |> ASet.force).Count
+            if refCnt <> setCnt then failwith "ofSetTree count mismatch")
 
     // ---- ComputationExpressions ----------------------------------
     test "[CE] aval bind" (fun () ->
