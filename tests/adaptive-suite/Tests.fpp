@@ -72,6 +72,12 @@ let checkSet (msg : string) (expected : int list) (actual : HashSet<int>) : unit
     let ev = List.sort expected
     if av <> ev then failwith (msg + ": set mismatch")
 
+/// fails on GetHashCode/Equals so reference-hash internals are proven
+type NonEqualObject() =
+    inherit AdaptiveObject()
+    override x.GetHashCode() : int = failwith "BrokenEquality.GetHashCode should not be called"
+    override x.Equals (_o : obj) : bool = failwith "BrokenEquality.Equals should not be called"
+
 let checkBool (msg : string) (expected : bool) (actual : bool) : unit =
     if actual <> expected then failwith (msg + ": bool mismatch")
 
@@ -1292,5 +1298,76 @@ let go =
         checkBool "f4" false (AVal.force result)
         transact (fun () -> b.Value <- true)
         checkBool "f5" true (AVal.force result))
+
+    // ---- WeakOutputSet.fs ----------------------------------------
+    test "[WeakOutputSet] add" (fun () ->
+        [0; 1; 2; 4; 8; 9; 20] |> List.iter (fun cnt ->
+            let set = WeakOutputSet()
+            let many = Array.init cnt (fun _ -> NonEqualObject() :> IAdaptiveObject)
+            for m in many do
+                checkBool "add" true (set.Add m)
+            let arr = ref (Array.zeroCreate 8)
+            let n = set.Consume(arr)
+            checkInt "consume count" many.Length n
+            for i in 0 .. n - 1 do
+                let a = arr.Value.[i]
+                checkBool "member" true (many |> Array.exists (fun m -> System.Object.ReferenceEquals(m, a)))))
+
+    test "[WeakOutputSet] remove" (fun () ->
+        [0; 1; 2; 4; 8; 9; 20] |> List.iter (fun cnt ->
+            let set = WeakOutputSet()
+            let many = Array.init cnt (fun _ -> NonEqualObject() :> IAdaptiveObject)
+            for m in many do checkBool "add" true (set.Add m)
+            for m in many do checkBool "remove" true (set.Remove m)
+            let arr = ref (Array.zeroCreate 8)
+            let n = set.Consume(arr)
+            checkInt "empty" 0 n))
+
+    // ---- Callbacks.fs --------------------------------------------
+    test "[MarkingCallback] fired" (fun () ->
+        let m = cval 10
+        let d = m |> AVal.map (fun v -> v)
+        let fired = ref 0
+        let callback = fun () -> fired.Value <- fired.Value + 1
+        let wasFired = fun () ->
+            let v = fired.Value
+            fired.Value <- 0
+            v
+        let sub = d.AddMarkingCallback(callback)
+        checkInt "c0" 0 (wasFired ())
+        AVal.force d |> ignore
+        checkInt "c1" 0 (wasFired ())
+        transact (fun () -> m.Value <- 100)
+        checkInt "c2" 1 (wasFired ())
+        transact (fun () -> m.Value <- 20)
+        checkInt "c3" 0 (wasFired ())
+        AVal.force d |> ignore
+        checkInt "c4" 0 (wasFired ())
+        transact (fun () -> m.Value <- 15)
+        checkInt "c5" 1 (wasFired ())
+        sub.Dispose())
+
+    test "[OnNextMarking] fired" (fun () ->
+        let m = cval 10
+        let d = m |> AVal.map (fun v -> v)
+        let fired = ref 0
+        let callback = fun () -> fired.Value <- fired.Value + 1
+        let wasFired = fun () ->
+            let v = fired.Value
+            fired.Value <- 0
+            v
+        let sub = d.OnNextMarking(callback)
+        checkInt "n0" 0 (wasFired ())
+        AVal.force d |> ignore
+        checkInt "n1" 0 (wasFired ())
+        transact (fun () -> m.Value <- 100)
+        checkInt "n2" 1 (wasFired ())
+        transact (fun () -> m.Value <- 20)
+        checkInt "n3" 0 (wasFired ())
+        AVal.force d |> ignore
+        checkInt "n4" 0 (wasFired ())
+        transact (fun () -> m.Value <- 15)
+        checkInt "n5" 0 (wasFired ())
+        sub.Dispose())
 
     printfn "PASSED %d FAILED %d" passedCount failedCount
