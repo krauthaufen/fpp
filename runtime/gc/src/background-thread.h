@@ -73,10 +73,12 @@ gc_make_background_thread(void) {
   thread->state = GC_BACKGROUND_THREAD_STARTING;
   pthread_mutex_init(&thread->lock, NULL);
   pthread_cond_init(&thread->cond, NULL);
+#ifndef GC_NO_BACKGROUND_THREAD
   if (pthread_create(&thread->thread, NULL, gc_background_thread, thread)) {
     perror("spawning background thread failed");
     GC_CRASH();
   }
+#endif
   return thread;
 }
 
@@ -147,7 +149,9 @@ gc_destroy_background_thread(struct gc_background_thread *thread) {
   thread->state = GC_BACKGROUND_THREAD_STOPPING;
   pthread_mutex_unlock(&thread->lock);
   pthread_cond_signal(&thread->cond);
+#ifndef GC_NO_BACKGROUND_THREAD
   pthread_join(thread->thread, NULL);
+#endif
   free(thread->tasks);
   free(thread);
 }

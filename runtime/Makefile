@@ -39,9 +39,9 @@ WASM_FLAGS = -O2 -Igc/api -Igc/src -I. -DNDEBUG -DGC_PRECISE_ROOTS=1 \
   -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
   -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1
 
-WASM_SRCS = gc-platform-wasm.c gc/src/gc-stack.c gc/src/gc-options.c \
-  gc/src/gc-tracepoint.c gc/src/gc-ephemeron.c gc/src/gc-finalizer.c \
-  gc/src/semi.c fpprt.c
+WASM_SRCS_COMMON = gc-platform-wasm.c gc/src/gc-stack.c gc/src/gc-options.c \
+  gc/src/gc-tracepoint.c gc/src/gc-ephemeron.c gc/src/gc-finalizer.c fpprt.c
+WASM_SRCS = $(WASM_SRCS_COMMON) gc/src/semi.c
 
 build/wasm/test_rt.wasm: test/test_rt.c $(WASM_SRCS) fpprt.h fpprt-embedder.h
 	@mkdir -p build/wasm
@@ -51,6 +51,17 @@ build/wasm/test_rt.wasm: test/test_rt.c $(WASM_SRCS) fpprt.h fpprt-embedder.h
 	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
 	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
 
+# mmc on wasm: single mutator, no background thread (fixed-size heap needs
+# none of its periodic work), and real per-object PINNING under wasm32
+build/wasm/test_rt_mmc.wasm: test/test_rt.c $(WASM_SRCS_COMMON) gc/src/mmc.c fpprt.h fpprt-embedder.h
+	@mkdir -p build/wasm
+	$(WASM_CC) $(filter %.c,$^) -O2 -Igc/api -Igc/src -I. -DNDEBUG -DGC_PRECISE_ROOTS=1 \
+	  -DGC_NO_BACKGROUND_THREAD=1 \
+	  -DGC_ATTRS=\"$(abspath gc/api/mmc-attrs.h)\" \
+	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
+	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
+
 .PHONY: test-wasm
-test-wasm: build/wasm/test_rt.wasm
-	$(HOME)/.wasmtime/bin/wasmtime run $<
+test-wasm: build/wasm/test_rt.wasm build/wasm/test_rt_mmc.wasm
+	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt.wasm
+	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt_mmc.wasm

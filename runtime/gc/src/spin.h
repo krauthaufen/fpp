@@ -5,8 +5,14 @@
 #include <unistd.h>
 
 static inline void yield_for_spin(size_t spin_count) {
-  if (spin_count < 10)
+  if (spin_count < 10) {
+    /* wasm32/arm have no pause instruction; a compiler barrier suffices */
+#ifdef __x86_64__
     __builtin_ia32_pause();
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+  }
   else if (spin_count < 20)
     sched_yield();
   else

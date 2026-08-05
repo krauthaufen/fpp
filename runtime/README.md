@@ -11,7 +11,7 @@ make COLLECTOR=semi test    # semispace: moves EVERYTHING, the root shakeout
 make COLLECTOR=pcc  test    # parallel copying (default)
 make COLLECTOR=mmc  test    # Immix-style mark-region: real per-object pinning
 make test-all               # all three
-make test-wasm              # wasm32 via emscripten standalone, run under wasmtime
+make test-wasm              # wasm32 (semi AND mmc-with-pinning) under wasmtime
 ```
 
 ## What v0 gives the backends
@@ -34,7 +34,9 @@ make test-wasm              # wasm32 via emscripten standalone, run under wasmti
   payloads never scanned, never a per-element bounds-checked opcode.
 * **Threads-shaped API.** `pcc`/`mmc` trace in parallel today; mutator
   threads are a Whippet feature this wrapper does not yet expose. The wasm
-  build is single-threaded `semi` until the platform shim grows atomics.
+  builds are single-threaded (`semi`, and `mmc` with
+  `GC_NO_BACKGROUND_THREAD` — a fixed-size heap needs none of the
+  background thread's periodic work), so PINNING works under wasm32 too.
 
 ## Layout
 
@@ -43,8 +45,10 @@ make test-wasm              # wasm32 via emscripten standalone, run under wasmti
   `(typeid << 1) | 1` live, forwarding pointer when bit 0 is clear.
 * `gc-platform-wasm.c` — the platform shim for emscripten/wasi builds
   (aligned_alloc reservations, no threads, no signals).
-* `gc/` — vendored Whippet, unmodified except `semi.c`'s allocation
-  counter widened to `uint64_t` for wasm32 (see `gc/VENDORED`).
+* `gc/` — vendored Whippet. Local changes (candidates for upstream):
+  `semi.c` allocation counter widened to `uint64_t` for wasm32; `spin.h`
+  pause portable off x86; `background-thread.h` gains
+  `GC_NO_BACKGROUND_THREAD` for single-threaded wasm.
 * `test/test_rt.c` — the v0 gate: list churn through forced compacting
   collections, ref/scalar arrays, weak death and weak survival, pin
   stability. Must pass under all three collectors AND the wasm build.
