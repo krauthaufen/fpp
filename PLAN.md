@@ -2592,7 +2592,18 @@ match declFn order; abs-heap ref.cast uses NEGATIVE s33 (gcAbs); wasmtime
 needs `-W gc=y` (and exceptions once the tag lands).
 
 ================================================================================
-## CONTINUE HERE — binary emitter (branch `binary-emitter`)
+## CURRENT STATE (2026-08-05) — the adaptive quest is DONE
+
+FSharp.Data.Adaptive compiles whole and RUNS: 100-test suite green under
+wasmtime, property harnesses included (PORT-ADAPTIVE.md has the runner).
+Gates: 658 Expecto, corpus and self-host fixpoints byte-identical. Landed
+on the way out: typeclass ranges (RangeOps.Seq per Integral element),
+derived Arb instances (generic + eager, records and unions), real object
+identity ($objh/__idhash), generic type tests stamping through inherited
+members, per-declaration cell analysis, `||>`/`|||>`. The roadmap lives in
+STATUS.md; the section below is the binary-emitter history it grew out of.
+
+## HISTORY — binary emitter (branch `binary-emitter`, since merged)
 ================================================================================
 
 ### State (updated after the oracle gate closed)

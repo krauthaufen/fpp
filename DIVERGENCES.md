@@ -502,3 +502,67 @@ default.
 
 One type, the prelude's name for it. The `type List<'T> with` heap-order
 extensions become `type ResizeArray<'T> with`.
+
+## A value-position range is a LIST
+
+`(a .. b)` handed around as a value is `seq<'a>` in F#, materialized lazily.
+F++ has no lazy seq machinery to hang it on, so a range DENOTES its list —
+`[ a .. b ]`, a value range, and a range spliced into brackets all build the
+same list, at any `Integral` element, through the prelude's `RangeOps.Seq`
+stamped per element type. `for i in a .. b` never materializes anything: it
+keeps the direct while lowering. A program that leans on a range's laziness
+(`Seq.take 5 (0 .. 1000000000)`) would build the list; the library has no
+such use.
+
+`seq { a .. b }` is the same divergence one level up: the computation
+expression does not SPLICE a range item yet, so the port rewrites the two
+sites the library has onto the list bracket. Native CE splicing is on the
+roadmap (STATUS.md).
+
+## A generic type test checks the HEAD
+
+`:? IAdaptiveValue<int>` under .NET checks the full instantiation; F++
+descriptors carry no type arguments, so the test is against the erased
+constructor — any `IAdaptiveValue<_>` answers yes. The library's uses all
+re-discriminate behind the test (a `Tag` string, a payload match), so the
+difference is invisible there. A program relying on the ARGUMENTS of a
+generic type test to discriminate would take the wrong branch. Type tests
+against a generic PARAMETER (`:? 'T`) work — the stamp substitutes the
+concrete head, including for members inherited from a generic base.
+
+## A local binding does not generalize its CONSTRAINED variables
+
+`let cmp a b = compare b a` inside a function stays monomorphic in the
+variable `compare`'s `Ordered` constraint mentions: the local's body is
+emitted once inside the enclosing binding, so the operation must resolve
+through the ENCLOSING instantiation — generalizing the variable severed
+that tie and the comparison silently ran at int. The cost: a LOCAL helper
+with a class constraint cannot be used at two different types in one body
+(F# allows it). Hoist it to the top level, where constrained generalization
+is the supported path — the error message points at the second use.
+
+## `Comparer<T>.Default` and `FastGenericComparer` become obj-expressions
+
+Both are .NET factory surfaces for "the comparer this type already
+implies". The port rewrites them to `{ new IComparer<_> with member
+__.Compare(a, b) = compare a b }` — except at `Index`, whose sites sit in
+scopes where a constructor parameter NAMED `compare` shadows the builtin;
+those spell `a.CompareTo b` directly.
+
+## Derived `Arb` covers records and unions — not tuples, not GADTs
+
+Property-generation instances are derived for every record and union that
+declares none, generically in the type's own parameters. Plain tuples are
+uniform references with nothing to dispatch on (`instName` says `$ref`), a
+GADT's per-case signatures make uniform generation wrong, and a
+function-typed component has no canonical inhabitant — all three refuse to
+the ordinary "no instance Arb<...>" diagnostic. Struct tuples and records
+with tuple FIELDS work: the field's components are what derivation walks.
+
+## The two adaptive `range` functions carry return ascriptions
+
+`ASet.range`/`AList.range` in the port are ascribed `: aset< ^T >` /
+`: alist< ^T >`. F# infers the same type; the ascription is belt-and-braces
+against a class of higher-order-application inference gaps that used to
+leave the result element unpinned (since fixed — see STATUS.md), kept
+because it states nothing false and costs nothing.

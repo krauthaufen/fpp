@@ -7,43 +7,49 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-653 tests
-corpus fixpoint    53463 bytes, byte-identical
-self-host fixpoint 1622242 bytes, byte-identical
+658 tests
+corpus fixpoint      77486 bytes, byte-identical
+self-host fixpoint 1783546 bytes, byte-identical
+adaptive suite     100 tests, 0 failed, 0 skipped (under wasmtime)
 ```
 
-## What we are working towards
+## The goal, and where it landed
 
-**FSharp.Data.Adaptive compiles as F++, whole.** All 41 files, 24,792 lines,
-with the heart untouched: the algorithms, the data structures and the
-adaptive machinery stay the library's. What may be replaced is what depends
-on a runtime service F++ does not have, and each replacement must be a real
-construct rather than a stub that lies.
+**FSharp.Data.Adaptive compiles as F++, whole — and RUNS.** All 39 ported
+files (the two skips are documented in `DIVERGENCES.md`), with the heart
+untouched: the algorithms, the data structures and the adaptive machinery
+are the library's. The measure is no longer a parse frontier: it is a
+100-test suite executing under wasmtime — every portable plain test from
+every reference test file, plus four deterministic reference-implementation
+property harnesses (random expression DAGs checked against naive-recompute
+models over hundreds of transactions), the aval/aset/alist computation
+expressions, and typeclass ranges. The only reference tests not ported are
+the ones that cannot mean anything here: GC-memory metering and real
+threads.
 
-It is a means, not the end. The library is a hard, real, self-consistent
-body of F# — everything it needs, a hundred other projects need too. Each
-gap it exposes gets closed in the COMPILER, generally, not worked around in
-the port. Nothing so far has needed a FSharp.Data.Adaptive-specific hack.
+It was a means, not the end, and it worked as one: every gap the library
+exposed was closed in the COMPILER, generally. Nothing needed an
+FSharp.Data.Adaptive-specific hack. The sections below are the history of
+those closures, kept because each records a mechanism and what it cost.
 
 `PORT-ADAPTIVE.md` has the port's own detail: the driver, what is replaced
-and why, and the work list.
+and why, and how to regenerate and run the suite.
 
-## How much is left — measured
+Two features landed on the way out that are language surface, not port
+plumbing:
 
-The first-error frontier (line ~8,027 of 22,635 in the concatenated port) is
-a pessimistic number: it stops at the first problem and says nothing about
-the rest. Parsing each file ON ITS OWN is the honest measure, because a
-parse error is a missing syntax feature while a type error mostly needs
-cross-file context:
-
-```
-27 of 40 files parse clean standalone
-13 have a parse error, every count a cascade from one construct
-```
-
-Re-run it with the loop in `PORT-ADAPTIVE.md`. The single biggest blocker
-found this way was not a language feature at all — `#nowarn "7331"` stopped
-six files outright.
+* **Typeclass ranges.** `[ a .. b ]` and a range used as a value denote
+  their list at ANY `Integral` element — int64, uint32, byte, a future
+  user instance — via the prelude's `RangeOps.Seq`, stamped per element.
+  Brackets splice; int stays on the inline fast path; `for` loops keep the
+  allocation-free direct lowering.
+* **Derived `Arb`.** Property-based generation as a typeclass: `Rand` and
+  primitive/container instances live in the prelude, and the compiler
+  derives an instance for every record and union that declares none —
+  generic in the type's own parameters, eagerly registered, so `arbitrary`
+  works inside generic code stamped at types no ground demand ever named.
+  Tuples, GADTs and function-typed components refuse to the ordinary
+  no-instance diagnostic.
 
 ## What was closed, and what it cost
 
@@ -870,52 +876,61 @@ Known deliberate gaps, all banked: `Item5`+ tuple
 fields, exceptions-as-types (NotSupportedException etc. stub), the
 poisoned-scheme root cause behind the divergence cap.
 
-## Test-suite port state (tests/adaptive-suite/Tests.fpp)
+## Test-suite state (tests/adaptive-suite/Tests.fpp)
 
-27 tests green under wasmtime (AVal 12, Transaction-file 7, ASet 8). The
-harness is a hand-port of the plain [<Test>] cases; FsCheck properties need
-the reference implementation and are not started. Six ASet tests are parked
-as TEMP-SKIP with these open compiler bugs, in rough order of leverage:
+**100 green under wasmtime, nothing skipped.** Rebuild and run with:
 
-* DONE (faf9773): base-ctor arity resolution, method-value eta-expansion,
-  override params from the abstract's signature — union constant and
-  content-bind-adjacent machinery run.
-* **Struct-tuple representation splits through stamped Dictionary storage**:
-  `state.[m] <- struct(v, p)` writes the uniform boxed $tup2 while reads use
-  the specialized record ($r_StructTuple2$<obj.bool>), and Cache's
-  struct(r, ref) refcounts misread the same way. Blocks: mapUse (dispose
-  semantics), filterA, content bind, and is likely under reduceByA too.
-  The read site cannot decide (bare owners legitimately hold BOTH reps —
-  reverting to uniform broke three struct-tuple Expecto tests); the fix is
-  making the WRITE side name its instantiation (pendingRecords/instName).
-* **Base-ctor calls resolve arity-blind** (FIXED above, kept for context): `AbstractReader<'S,'D>`'s own
-  `inherit AbstractReader<'D>(...)` calls ITSELF (b882_575193 recurses), and
-  every stamped reader subclass (UnionConstantSingleReader, BindReader,
-  MapUseReader) calls the arity-2 ctor which casts its argument to
-  Traceable -> cast failure. Blocks: union constant, filterA, content bind,
-  mapUse. The ctorKeys / base-name path in Lower/Link needs the same
-  arity decoration types already get.
-* **Override parameters never see the abstract's signature**: Infer has no
-  `override` handling at all, so `InputChangedObject(_, o)` types `o` fresh,
-  `o.Tag` falls to the field-owner guess (VolatileSetData) and `:? aval<'b>`
-  compiles to a single-typeid test. Blocks: the three reduceByA tests.
-* **History.Update cast failure under ASet.range's reader** (untriaged
-  beyond the trap site). Blocks: range smoke, range systematic.
-* **Float reduction runs uniform arithmetic**: ASet.sum on cset<float>
-  reaches $addv/$toi on f64 boxes — the AdaptiveReduction record's closures
-  are built at the uniform representation and never stamped at float.
-  Blocks: reduce empty after lots of operations.
+```bash
+python3 tests/port-adaptive.py \
+    ~/projects/FSharp.Data.Adaptive/src/FSharp.Data.Adaptive /tmp/lib.fpp
+cat /tmp/lib.fpp tests/adaptive-suite/Tests.fpp > /tmp/suite.fpp
+dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/suite.wasm /tmp/suite.fpp
+~/.wasmtime/bin/wasmtime -W function-references,gc /tmp/suite.wasm
+```
 
-## Compiling is not the same as running
+Every bug the suite flushed out was fixed in the compiler; the list that
+used to live here — struct-tuple representation splits, arity-blind base
+constructors, override parameters, float reductions, the History.Update
+cast, generic type tests, enum patterns, `Comparer.Default`, the Myers
+differ's zero-created struct arrays — is all closed, each with its
+mechanism recorded in the git history and the memorable ones in
+`CLAUDE.md`.
 
-The port has only ever been INFERRED. Lowering and emission are a separate
-pass with their own failure class, and there is one known instance: a generic
-class implementing a non-generic interface type-checks and then traps
-(`unbound variable Accept`). How big that stage is has NOT been measured.
-The cheap measurement is a twenty-line smoke test — build a cval, map it,
-transact, read it back — which exercises the machinery end to end without
-needing the 6,667-line test suite.
+## What remains open
 
-That suite needs NUnit, FsUnit and FsCheck. FsCheck's generators are
-reflection-driven, so it is a hand-written harness or nothing; there is
-precedent in this repo for exactly that.
+One reproducible defect (`tests/known-issues/`):
+
+* **generic-class-through-interface.fpp** — a generic class constructed
+  inside another generic class' member (the .NET `Enumerator<'a>` shape)
+  canonicalizes the inner instantiation and traps reading `Current`. The
+  library port never hits it because its enumerators were restructured
+  (see DIVERGENCES.md); plain user code can.
+
+And `let-rec-and-group-self-host.fpp` stays as the record of a shape to
+avoid, not a live defect.
+
+## Roadmap
+
+In rough order of leverage:
+
+1. **The last known-issue** — inner-generic-class stamping through the
+   enclosing member's instantiation (diagnosis in the repro file).
+2. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift, MMTk (Boehm to
+   start). The wasm-GC backend is the semantics reference it will be
+   diffed against.
+3. **Deriving as a plugin surface** (Stage 4.9): `Arb` and the
+   CompareTo-instance rule are built-in derivations; `Unmanaged`,
+   `Serialize` and user classes want the same mechanism exposed as a
+   TAST -> TAST plugin API instead of compiler edits.
+4. **Performance toward C**: the vertex benchmark stands at 191 ms against
+   C's 71 ms. The measured next steps live in CLAUDE.md's optimization
+   section — and so do the dead ends already paid for.
+5. **CE range splice**: `seq { a .. b }` still relies on a port rewrite to
+   the list bracket; the computation-expression path should splice a range
+   item natively.
+6. **The first-identifier audit**: ~30 remaining
+   `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer/Lower, each
+   correct only if its head cannot be qualified.
+7. **Tuple `Arb`** — struct tuples and records derive; plain tuples name
+   themselves `$ref` and have nothing to dispatch on. Wants the same
+   canonical-naming answer the struct-tuple work established.

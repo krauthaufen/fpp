@@ -29,60 +29,33 @@ dotnet run -c Release --project src/Fpp.Cli -- check /tmp/adaptive.fpp
 The driver reads the compile order from the `.fsproj`, so it ports what the
 library itself says is the library, in the order the library says.
 
-## How much is actually left — measured, not guessed
+## Where it stands: DONE, and running
 
-The first-error frontier is pessimistic: it stops at the first problem and
-says nothing about the 14,000 lines behind it. Parsing each of the 40 files
-ON ITS OWN answers the real question, because a parse error is a missing
-SYNTAX feature while a type error mostly needs cross-file context:
+The port compiles whole and RUNS: `tests/adaptive-suite/Tests.fpp` holds
+**100 tests, all green under wasmtime** — every portable plain test from
+every reference test file (AVal, ASet, AMap, AList, History, Transaction,
+Callbacks, WeakOutputSet, CollectionExtensions, AdaptifyHelpers-adjacent,
+IndexMapping, MapExt), four deterministic reference-implementation property
+harnesses standing in for the FsCheck suites (seeded random expression DAGs
+diffed against naive-recompute models over hundreds of transactions), the
+aval/aset/alist computation-expression builders, and derived-`Arb`
+generation. The reference tests NOT ported are the ones that cannot mean
+anything here: GC-memory metering (`History weak`, the AddCallback GC
+pair) and the real-threads async test.
 
-    27 of 40 files parse clean
-    13 have a parse error, and the error counts are cascades —
-       one construct produces hundreds of "unexpected token"
+Run it:
 
-The distinct blockers behind those 13 are a short list, and the biggest one
-was not a language feature at all: SIX files were stopped by `#nowarn
-"7331"`, a compiler directive. Skipping directives took ten lines and made
-four more files parse clean on the spot.
+```bash
+python3 tests/port-adaptive.py \
+    ~/projects/FSharp.Data.Adaptive/src/FSharp.Data.Adaptive /tmp/lib.fpp
+cat /tmp/lib.fpp tests/adaptive-suite/Tests.fpp > /tmp/suite.fpp
+dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/suite.wasm /tmp/suite.fpp
+~/.wasmtime/bin/wasmtime -W function-references,gc /tmp/suite.wasm
+# PASSED 100 FAILED 0
+```
 
-That is the shape of this work. The remaining constructs are ordinary F#
-that any project would use — flexible types in a member's parameters
-(`aval<#seq<'T1>>`), `do base.M()` in a class body — not exotica. Type
-extensions on dotted names, computation expressions and `use`/`IDisposable`
-were all on this list, and all three are done. Nothing so far has needed a
-FSharp.Data.Adaptive-specific hack, and every fix has been small and
-general.
-
-## Where it stands
-
-The port parses and type-checks from line 1 to **8156 of 22,635** — through
-`ShallowEquality`, `Equality`, `FableHelpers`, all 4,500 lines of
-`HashCollections.fs`, `Operations`, `Deltas`, `Index.fs`, all 3,908 lines
-of `MapExt.fs`, and into `IndexList.fs`. Everything past the frontier is unknown, not known-bad: the
-errors after the first are a cascade until the first is fixed.
-
-The frontier is inside `IndexList.fs`. Two things are known to be waiting
-there and beyond:
-
-* ~~**`&x` on a mutable LOCATION**~~ — **done.** Forwarding a byref
-  parameter hands the same cell on; taking the address of a mutable local or
-  field copies in and out around the call, in both the tuple form
-  (`m.TryGetValue(k, &v)`) and the curried one (`bump &current`).
-* **Inline type-parameter constraints as TYPECLASSES.** `'Key : comparison`
-  parses, stays in the tree and no longer counts as a type parameter — but
-  **done.** Both spellings bind and are enforced — the constraint travels on
-  the type's constructor, so `Sorted<Opaque>` is rejected by name:
-
-  | F# | F++ |
-  | --- | --- |
-  | `'a : comparison` | `Ordered<'a>` |
-  | `'a : equality` | structural `=`, which is builtin — nothing to add |
-  | `'a : unmanaged` | the one worth most: exactly the POD/blittable
-    property the layout machinery already computes for struct arrays and
-    C-compatible layout. As a class it would let USER code demand it, which
-    is what a zero-copy `Buffer<'t>` needs |
-  | `'a : struct` / `not struct` | the value-vs-reference split
-    `ShallowEquality` wants too |
+The sections below are kept as the record of how the frontier moved and
+what each closure cost; the numbers in them are historical.
 
 ## What is replaced, and what it became
 

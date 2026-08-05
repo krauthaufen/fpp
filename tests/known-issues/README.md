@@ -13,6 +13,16 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
+* `generic-class-through-interface.fpp` — a generic class constructed
+  inside another generic class' member (the .NET `Enumerator<'a>` shape)
+  canonicalizes the inner instantiation and traps reading `Current`. The
+  diagnosis at the top of the file still holds.
 * `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
-  isolation; the note records exactly what was ruled out.
+  isolation; the note records exactly what was ruled out. Kept as the
+  record of a shape to avoid, not a live defect.
+
+Fixed and removed (see git history for the repros):
+`print-class-polymorphic` (class-polymorphic print converted as int) and
+`user-type-shadows-prelude-type` (a user type merging with a prelude type
+of the same name) both pass as of the adaptive-port arc.

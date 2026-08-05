@@ -4,6 +4,11 @@ F# without .NET. The syntax and semantics you know, extended with typeclasses
 and higher-kinded types, compiled ahead of time to wasm-GC — no JIT, no CLR,
 no runtime to install alongside the program.
 
+The proof of surface: **FSharp.Data.Adaptive compiles whole and runs** — a
+100-test port of its own test suite is green under wasmtime, property
+harnesses included (`PORT-ADAPTIVE.md`). The compiler compiles itself; the
+self-host fixpoint is byte-identical and gates every change.
+
 - **DESIGN.md** — the language, and why each decision went the way it did
 - **STATUS.md** — where things stand, what is being worked towards, what is known broken
 - **PLAN.md** — what is built, what is not, in the order it is being built
@@ -40,7 +45,7 @@ curl https://wasmtime.dev/install.sh -sSf | bash
 git clone git@github.com:krauthaufen/fpp.git
 cd fpp
 dotnet build -c Release
-dotnet test  -c Release          # 578 tests; exits non-zero if any fail
+dotnet test  -c Release          # 658 tests; exits non-zero if any fail
 ```
 
 The suite includes the oracle gate: every program in it is also valid F#, so
