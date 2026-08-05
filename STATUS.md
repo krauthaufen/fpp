@@ -922,7 +922,9 @@ it hardens the semantics it will be diffed against):
    ALSO flow out of canonical paths — a generic static empty-singleton is
    evaluated once, canonically, and a newly-stamped accessor casting it
    traps. The real fix has to reconcile stamped members with
-   canonically-constructed instances first.
+   canonically-constructed instances first — the refined analysis (why a
+   layout-variant-field guard is NOT enough, and why the answer is
+   descriptor-carried constructors) is in `tests/known-issues/README.md`.
 2. ~~**Deriving as a plugin surface**~~ — **done.** `deriveArb` joins the
    builtin generators: the same derivation the compiler does internally,
    emitted as readable contextual instances (`instance Arb<Pair<'a>> when
