@@ -56,7 +56,8 @@ struct fpprt_type {
 /* reserved typeids; the compiler registers its own from FPPRT_TID_FIRST */
 #define FPPRT_TID_EPHEMERON 0u
 #define FPPRT_TID_REF_ARRAY 1u
-#define FPPRT_TID_FIRST     2u
+#define FPPRT_TID_HASHBOX   2u
+#define FPPRT_TID_FIRST     3u
 
 /* Register `t` under `tid`. Registration is startup-only: it is not
  * thread-safe and must complete before the second mutator exists. */
@@ -65,7 +66,11 @@ void fpprt_register_type(uint32_t tid, struct fpprt_type t);
 /* ---- lifecycle --------------------------------------------------------- */
 
 struct fpprt_opts {
-  size_t heap_bytes;        /* 0 = default (64 MB), fixed-size policy */
+  size_t heap_bytes;        /* INITIAL size; 0 = default (16 MB). The heap
+                               GROWS as live data does (growable policy,
+                               synchronous at collection — no background
+                               thread), so this is a floor, not a limit. */
+  size_t max_heap_bytes;    /* hard ceiling; 0 = none */
   int parallelism;          /* 0 = default */
 };
 
@@ -119,6 +124,14 @@ void fpprt_write_ref(fpprt_ref o, uint32_t byteoff, fpprt_ref v);
  * alive, and reads as 0 once the target is collected. */
 fpprt_ref fpprt_weak_new(fpprt_ref target);
 fpprt_ref fpprt_weak_get(fpprt_ref weak);
+
+/* ---- identity hash ----------------------------------------------------- */
+
+/* .NET's default GetHashCode: a per-object value, assigned on first ask,
+ * STABLE for the object's whole life however often the collector moves it,
+ * and holding nothing alive. Backed by an ephemeron weak table whose
+ * address-keyed buckets rehash after every collection. */
+uintptr_t fpprt_idhash(fpprt_ref o);
 
 /* ---- pinning ----------------------------------------------------------- */
 

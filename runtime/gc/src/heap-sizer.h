@@ -9,6 +9,13 @@
 
 struct gc_heap_sizer {
   enum gc_heap_size_policy policy;
+  // How much heap the collector needs per byte of live data to FUNCTION:
+  // 2 for the copying collectors (to-space must fit a full copy), 1 for
+  // in-place collectors. The sizing policies below reason about live
+  // data; this converts their answers into this collector's terms —
+  // without it, growable sizing walled a semispace heap at ~1.3x live
+  // and the collector died at two-thirds of what it could hold.
+  size_t space_multiplier;
   union {
     struct gc_growable_heap_sizer* growable;
     struct gc_adaptive_heap_sizer* adaptive;
@@ -18,10 +25,11 @@ struct gc_heap_sizer {
 static struct gc_heap_sizer
 gc_make_heap_sizer(struct gc_heap *heap,
                    const struct gc_common_options *options,
+                   size_t space_multiplier,
                    uint64_t (*get_allocation_counter_from_thread)(struct gc_heap*),
                    void (*set_heap_size_from_thread)(struct gc_heap*, size_t),
                    struct gc_background_thread *thread) {
-  struct gc_heap_sizer ret = { options->heap_size_policy, };
+  struct gc_heap_sizer ret = { options->heap_size_policy, space_multiplier, };
   switch (options->heap_size_policy) {
     case GC_HEAP_SIZE_FIXED:
       break;
@@ -54,11 +62,13 @@ gc_heap_sizer_target_size(struct gc_heap_sizer sizer,
 
     case GC_HEAP_SIZE_GROWABLE:
       return gc_growable_heap_sizer_target_size(sizer.growable, heap_size,
-                                                live_bytes);
+                                                live_bytes
+                                                * sizer.space_multiplier);
 
     case GC_HEAP_SIZE_ADAPTIVE:
       return gc_adaptive_heap_sizer_target_size(sizer.adaptive, heap_size,
-                                                live_bytes);
+                                                live_bytes
+                                                * sizer.space_multiplier);
 
     default:
       GC_CRASH();
@@ -74,15 +84,17 @@ gc_heap_sizer_on_gc(struct gc_heap_sizer sizer, size_t heap_size,
       break;
 
     case GC_HEAP_SIZE_GROWABLE:
-      gc_growable_heap_sizer_on_gc(sizer.growable, heap_size, live_bytes,
+      gc_growable_heap_sizer_on_gc(sizer.growable, heap_size,
+                                   live_bytes * sizer.space_multiplier,
                                    pause_ns, set_heap_size);
       break;
 
     case GC_HEAP_SIZE_ADAPTIVE:
       if (sizer.adaptive->background_task_id < 0)
         gc_adaptive_heap_sizer_background_task(sizer.adaptive);
-      gc_adaptive_heap_sizer_on_gc(sizer.adaptive, live_bytes, pause_ns,
-                                   set_heap_size);
+      gc_adaptive_heap_sizer_on_gc(sizer.adaptive,
+                                   live_bytes * sizer.space_multiplier,
+                                   pause_ns, set_heap_size);
       break;
 
     default:

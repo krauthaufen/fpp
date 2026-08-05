@@ -30,6 +30,18 @@ make test-wasm              # wasm32 (semi AND mmc-with-pinning) under wasmtime
 * **Real pinning** (`fpprt_pin`) on `mmc`: the object never moves again —
   no handle indirection, no copy-in/copy-out bounce, no
   one-pin-poisons-the-kind analysis.
+* **Identity hashes** (`fpprt_idhash`) — .NET's default GetHashCode:
+  assigned on first ask, stable across every move, holding nothing alive.
+  An ephemeron weak table with address-keyed buckets; the buckets rehash
+  in the post-collection window (world still stopped, addresses final,
+  nothing allocates), and dead keys drop in the same walk.
+* **A growing heap.** The growable policy resizes synchronously at
+  collection time — no background thread, so it works under wasm. The
+  sizing layer now knows each collector's SPACE MULTIPLIER (2 for the
+  copying collectors, 1 for mark-region): without it, sizing targeted
+  ~1.3x live and a semispace heap died at two-thirds of what it could
+  hold. The growth gate starts at 2 MB and keeps 48 MB live, under every
+  collector.
 * **Arrays** with ref or scalar elements: `[tag][len][elems]`, scalar
   payloads never scanned, never a per-element bounds-checked opcode.
 * **Threads-shaped API.** `pcc`/`mmc` trace in parallel today; mutator
@@ -48,10 +60,15 @@ make test-wasm              # wasm32 (semi AND mmc-with-pinning) under wasmtime
 * `gc/` — vendored Whippet. Local changes (candidates for upstream):
   `semi.c` allocation counter widened to `uint64_t` for wasm32; `spin.h`
   pause portable off x86; `background-thread.h` gains
-  `GC_NO_BACKGROUND_THREAD` for single-threaded wasm.
-* `test/test_rt.c` — the v0 gate: list churn through forced compacting
-  collections, ref/scalar arrays, weak death and weak survival, pin
-  stability. Must pass under all three collectors AND the wasm build.
+  `GC_NO_BACKGROUND_THREAD` for single-threaded wasm; `heap-sizer.h`
+  carries the collector's space multiplier so sizing policies reason in
+  live bytes and answer in this collector's terms.
+* `test/test_rt.c`, `test/test_grow.c` — the v0 gate, fully
+  self-checking: list churn through forced compacting collections,
+  ref/scalar arrays, weak death and weak survival, identity-hash
+  stability across moves and weakness after death, pin stability, and
+  2 MB -> 48 MB live growth. Must pass under all three collectors AND
+  both wasm builds (`make test-all test-wasm`).
 
 ## What is deliberately NOT here yet
 

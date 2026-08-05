@@ -19,9 +19,13 @@ build/$(GC_COLLECTOR)/fpprt.o: fpprt.c fpprt.h fpprt-embedder.h | $(GC_OBJDIR)
 build/$(GC_COLLECTOR)/test_rt: test/test_rt.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
 	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
 
+build/$(GC_COLLECTOR)/test_grow: test/test_grow.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
+	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
+
 .PHONY: test test-all clean
-test: build/$(GC_COLLECTOR)/test_rt
-	./$<
+test: build/$(GC_COLLECTOR)/test_rt build/$(GC_COLLECTOR)/test_grow
+	./build/$(GC_COLLECTOR)/test_rt
+	./build/$(GC_COLLECTOR)/test_grow
 
 test-all:
 	$(MAKE) GC_COLLECTOR=semi test
@@ -61,7 +65,16 @@ build/wasm/test_rt_mmc.wasm: test/test_rt.c $(WASM_SRCS_COMMON) gc/src/mmc.c fpp
 	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
 	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
 
+build/wasm/test_grow_mmc.wasm: test/test_grow.c $(WASM_SRCS_COMMON) gc/src/mmc.c fpprt.h fpprt-embedder.h
+	@mkdir -p build/wasm
+	$(WASM_CC) $(filter %.c,$^) -O2 -Igc/api -Igc/src -I. -DNDEBUG -DGC_PRECISE_ROOTS=1 \
+	  -DGC_NO_BACKGROUND_THREAD=1 \
+	  -DGC_ATTRS=\"$(abspath gc/api/mmc-attrs.h)\" \
+	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
+	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
+
 .PHONY: test-wasm
-test-wasm: build/wasm/test_rt.wasm build/wasm/test_rt_mmc.wasm
+test-wasm: build/wasm/test_rt.wasm build/wasm/test_rt_mmc.wasm build/wasm/test_grow_mmc.wasm
 	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt.wasm
 	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt_mmc.wasm
+	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_grow_mmc.wasm

@@ -1266,7 +1266,7 @@ static int heap_init(struct gc_heap *heap, const struct gc_options *options) {
     GC_CRASH();
 
   heap->background_thread = gc_make_background_thread();
-  heap->sizer = gc_make_heap_sizer(heap, &options->common,
+  heap->sizer = gc_make_heap_sizer(heap, &options->common, 2,
                                    allocation_counter_from_thread,
                                    set_heap_size_from_thread,
                                    heap->background_thread);

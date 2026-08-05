@@ -676,7 +676,7 @@ static int heap_init(struct gc_heap *heap, const struct gc_options *options) {
   if (!heap->finalizer_state)
     GC_CRASH();
 
-  heap->sizer = gc_make_heap_sizer(heap, &options->common,
+  heap->sizer = gc_make_heap_sizer(heap, &options->common, 2,
                                    get_allocation_counter,
                                    ignore_async_heap_size_adjustment,
                                    NULL);

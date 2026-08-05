@@ -63,7 +63,7 @@ int main(void) {
     if (r % 10 == 0) fpprt_collect();
     CHECK(list_sum(f_slots[0]) == 499500);
   }
-  printf("list %zu\n", list_sum(f_slots[0]));
+  CHECK(list_sum(f_slots[0]) == 499500);
 
   /* 2: ref array holds across collection; scalar array data survives */
   f_slots[1] = fpprt_alloc_array(FPPRT_TID_REF_ARRAY, 64);
@@ -80,10 +80,10 @@ int main(void) {
     for (int i = 0; i < 64; i++)
       s += cons_val(fpprt_read_ref(f_slots[1],
                                    (uint32_t)(2 + i) * sizeof(uintptr_t)));
-    printf("refarray %zu\n", s); }              /* 3*(0+..+63) = 6048 */
+    CHECK(s == 6048); }
   { double *xs = fpprt_elems(f_slots[2]); double s = 0;
     for (int i = 0; i < 1000; i++) s += xs[i];
-    printf("f64array %.1f\n", s); }             /* 249750.0 */
+    CHECK(s == 249750.0); }
 
   /* 3: a weak ref keeps nothing alive and reads 0 once the target dies */
   { fpprt_ref t = fpprt_alloc(TID_CONS);
@@ -92,13 +92,12 @@ int main(void) {
     t = 0; }
   fpprt_collect();
   fpprt_collect();
-  printf("weak %s\n", fpprt_weak_get(f_slots[3]) ? "ALIVE" : "dead");
+  CHECK(fpprt_weak_get(f_slots[3]) == 0);
 
   /* 4: a weak ref to a LIVE target stays readable across collections */
   f_slots[3] = fpprt_weak_new(f_slots[0]);
   fpprt_collect();
-  printf("weaklive %s\n",
-         fpprt_weak_get(f_slots[3]) == f_slots[0] ? "ok" : "WRONG");
+  CHECK(fpprt_weak_get(f_slots[3]) == f_slots[0]);
 
   /* 5: pinning, where the collector supports it */
   if (fpprt_can_pin()) {
@@ -108,15 +107,44 @@ int main(void) {
     fpprt_ref before = pf_slots[0];
     fpprt_pin(pf_slots[0]);
     fpprt_collect();
-    printf("pin %s\n", pf_slots[0] == before ? "stable" : "MOVED");
+    CHECK(pf_slots[0] == before);
     FPPRT_LEAVE(pf);
   } else {
     printf("pin unsupported\n");
   }
 
-  printf("allocatedMB %" PRIuPTR "\n",
-         (uintptr_t)(fpprt_allocated_bytes() / (1024 * 1024)));
-  printf("OK\n");
+  /* 6: identity hashes — assigned once, stable across moves, weak */
+  { FPPRT_FRAME(hf, 2);
+    hf_slots[0] = fpprt_alloc_array(FPPRT_TID_REF_ARRAY, 256);
+    uintptr_t hashes[256];
+    for (int i = 0; i < 256; i++) {
+      fpprt_ref c = fpprt_alloc(TID_CONS);
+      fpprt_write_ref(hf_slots[0], (uint32_t)(2 + i) * sizeof(uintptr_t), c);
+      hashes[i] = fpprt_idhash(
+          fpprt_read_ref(hf_slots[0], (uint32_t)(2 + i) * sizeof(uintptr_t)));
+      CHECK(hashes[i] != 0);
+    }
+    /* distinct objects get distinct hashes (256 draws from 61 bits) */
+    for (int i = 1; i < 256; i++) CHECK(hashes[i] != hashes[0]);
+    /* asking twice is the same answer */
+    CHECK(fpprt_idhash(fpprt_read_ref(hf_slots[0], 2 * sizeof(uintptr_t)))
+          == hashes[0]);
+    /* every hash survives a compacting collection (objects MOVE, the
+       table rehashes) */
+    fpprt_collect();
+    for (int i = 0; i < 256; i++)
+      CHECK(fpprt_idhash(fpprt_read_ref(hf_slots[0],
+                (uint32_t)(2 + i) * sizeof(uintptr_t))) == hashes[i]);
+    /* and hashed objects still die: drop the array, collect, then hash
+       fresh objects into the same table without incident */
+    hf_slots[0] = 0;
+    fpprt_collect();
+    hf_slots[1] = fpprt_alloc(TID_CONS);
+    CHECK(fpprt_idhash(hf_slots[1]) != 0);
+    FPPRT_LEAVE(hf); }
+
+  CHECK(fpprt_allocated_bytes() > 4 * 1024 * 1024);
+  printf("rt OK (pin %s)\n", fpprt_can_pin() ? "checked" : "unsupported");
   FPPRT_LEAVE(f);
   return 0;
 }
