@@ -4,7 +4,7 @@ module Fpp.Backend.CEmit
 // consumes, emitted as one C file against the fpprt runtime (runtime/).
 // One emitter, two targets — gcc for native, emcc for wasm-linear — and
 // the wasm-GC backend is the ORACLE: every construct this learns is gated
-// on printing exactly what that backend prints.
+// on printing exactly what that backend prints (tests/tooling/cback).
 //
 // Value model (PLAN-CBACK.md): V = uintptr_t. Tagged scalar when bit 0 is
 // set ((x<<1)|1 — int, bool, char, unit); heap reference when bit 0 is
@@ -15,33 +15,44 @@ module Fpp.Backend.CEmit
 // frame slot — tagged values cost nothing there (the tracer skips them),
 // and no liveness analysis is needed for v0 soundness. The `semi`
 // collector exists to punish anything this gets wrong.
+//
+// Gaps are RUNTIME traps (fpp_not_emitted), never compile errors: like
+// the wasm backend's not-ported stubs, a dead prelude corner must not
+// block a live program, and a reached gap must never be silent.
 
 open Fpp.Prelude
 open Fpp.Analysis.Types
 open Fpp.Core.Ir
 
+// tid classes, mirrored in fpprt-lang.h (fpp_reg_struct)
+let private clsRecord = 1
+let private clsCase = 2
+
 type CSt =
-    { Out : Vec<string>                    // completed function definitions
-      Fwd : Vec<string>                    // forward declarations
-      Globals : Vec<string>                // global V slots
-      Inits : Vec<string>                  // statements for fpp_main, in order
-      TypeReg : Vec<string>                // fpprt_register_type calls
-      Errors : Vec<string>
-      Fns : Dict<string * int, int>        // (path,offset) -> arity of top-level fn
-      GlobalOf : Dict<string * int, string>  // (path,offset) -> C global name
-      mutable NextTid : int }
+    { Out : Vec<string>
+      Fwd : Vec<string>
+      Globals : Vec<string>
+      Inits : Vec<string>
+      Reg : Vec<string>                      // type/meta registration in main
+      Fns : Dict<string * int, int>          // top-level fn -> arity
+      GlobalOf : Dict<string * int, string>
+      RecTid : Dict<string, int>             // record name -> tid
+      RecFields : Dict<string, string list>  // record name -> field order
+      CaseTid : Dict<string, int>            // union case name -> tid
+      CaseArity : Dict<string, int>
+      EnumVal : Dict<string, int>            // enum case name -> value
+      FnClo : Dict<string * int, string>     // fn used as value -> global clo
+      mutable NextTid : int
+      mutable NextLam : int }
 
 let private isIdentChar (c : char) = isLetterOrDigit c || c = '_'
+let private sane (n : string) = n |> String.map (fun c -> if isIdentChar c then c else '_')
 
 let private cname (v : VarId) : string =
-    "f_" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_"
-    + (v.Name |> String.map (fun c -> if isIdentChar c then c else '_'))
-
+    "f_" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_" + sane v.Name
 let private gname (v : VarId) : string =
-    "g_" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_"
-    + (v.Name |> String.map (fun c -> if isIdentChar c then c else '_'))
+    "g_" + string (abs (strHash v.Path % 1000)) + "_" + string v.Offset + "_" + sane v.Name
 
-/// a C string literal from source-text bytes
 let private cstr (s : string) : string =
     let out = vecNew<string> ()
     vecAdd out "\""
@@ -52,24 +63,27 @@ let private cstr (s : string) : string =
         elif ch = '\t' then vecAdd out "\\t"
         elif ch = '\r' then vecAdd out "\\r"
         elif int ch < 32 || int ch > 126 then
-            // close and reopen the literal: a C hex escape is GREEDY, and
-            // "\xbb" followed by 'r' would read as the escape \xbbr
+            // close and reopen the literal: a C hex escape is GREEDY
             vecAdd out ("\\x" + (let h = "0123456789abcdef" in
-                                 string (charAt h ((int ch >>> 4) &&& 15)) + string (charAt h (int ch &&& 15)))
+                                 string (charAt h ((int ch >>> 4) &&& 15))
+                                 + string (charAt h (int ch &&& 15)))
                         + "\" \"")
         else vecAdd out (string ch)
     vecAdd out "\""
     String.concat "" (vecToList out)
 
-// ---- per-function emission ------------------------------------------------
-// Statements accumulate in `body`; every expression's value lands in a
-// frame SLOT (S(i)), so the emitter returns slot indices, not C
-// expressions. Slots double as GC roots.
+let private freshTid (st : CSt) : int =
+    let t = st.NextTid
+    st.NextTid <- t + 1
+    t
+
+// ---- per-function state ---------------------------------------------------
 
 type CFn =
     { Body : Vec<string>
       mutable NSlots : int
-      Locals : Dict<string * int, int> }   // VarId key -> slot
+      Locals : Dict<string * int, int>
+      Cells : Dict<string * int, bool> }    // locals boxed in cells
 
 let private slot (f : CFn) : int =
     let i = f.NSlots
@@ -77,14 +91,169 @@ let private slot (f : CFn) : int =
     i
 
 let private stmt (f : CFn) (s : string) : unit = vecAdd f.Body ("  " + s)
-
 let private sref (i : int) : string = "F[" + string i + "]"
 
+// ---- free variables and captured-mutable discovery ------------------------
+
+let rec private walkE (g : Expr -> unit) (e : Expr) : unit =
+    g e
+    match e with
+    | ELam (_, b) -> walkE g b
+    | EApp (h, args) -> walkE g h; for a in args do walkE g a
+    | ELet (_, _, _, r, b) -> walkE g r; walkE g b
+    | EIf (a, b, c) -> walkE g a; walkE g b; walkE g c
+    | EMatch (s, cs) ->
+        walkE g s
+        for _, gd, b in cs do
+            (match gd with Some x -> walkE g x | None -> ())
+            walkE g b
+    | ETry (b, cs) ->
+        walkE g b
+        for _, gd, x in cs do
+            (match gd with Some y -> walkE g y | None -> ())
+            walkE g x
+    | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) ->
+        for x in xs do walkE g x
+    | ERecord (_, fs) -> for _, v in fs do walkE g v
+    | ERecordExt (_, b, fs) -> walkE g b; (for _, v in fs do walkE g v)
+    | EField (r, _, _) -> walkE g r
+    | EFieldSet (r, _, _, v) -> walkE g r; walkE g v
+    | EWhile (c, b) -> walkE g c; walkE g b
+    | EAssign (_, x) -> walkE g x
+    | EIndex (_, a, i) -> walkE g a; walkE g i
+    | EIndexSet (_, a, i, v) -> walkE g a; walkE g i; walkE g v
+    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) ->
+        walkE g a
+    | EArrayCreate (_, a, b) -> walkE g a; walkE g b
+    | EIfaceCall (_, _, r, args) -> walkE g r; for a in args do walkE g a
+    | ECast (_, x, _) | ETypeTest (_, x) -> walkE g x
+    | _ -> ()
+
+let rec private patBinders (p : Pat) (acc : Vec<string * int>) : unit =
+    match p with
+    | PVar (v, _) -> vecAdd acc (v.Path, v.Offset)
+    | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps ->
+        for q in ps do patBinders q acc
+    | PCons (a, b) -> patBinders a acc; patBinders b acc
+    | PAs (q, v, _) -> patBinders q acc; vecAdd acc (v.Path, v.Offset)
+    | _ -> ()
+
+/// variables a lambda BODY references that are bound OUTSIDE it
+let private freeVarsOf (ps : (VarId * Scheme) list) (body : Expr)
+                       (isOutside : string * int -> bool) : (string * int) list =
+    let bound = dictNew<string * int, bool> ()
+    for pv, _ in ps do dictSet bound (pv.Path, pv.Offset) true
+    let free = vecNew<string * int> ()
+    let seen = dictNew<string * int, bool> ()
+    let note (k : string * int) =
+        if not (dictTryFind bound k).IsSome && isOutside k
+           && not (dictTryFind seen k).IsSome then
+            dictSet seen k true
+            vecAdd free k
+    let rec go (e : Expr) : unit =
+        match e with
+        | EVar (v, _) | EVarI (v, _, _) -> note (v.Path, v.Offset)
+        | EAssign (v, x) ->
+            note (v.Path, v.Offset)
+            go x
+        | ELam (ps2, b) ->
+            for pv, _ in ps2 do dictSet bound (pv.Path, pv.Offset) true
+            go b
+        | ELet (_, v, _, r, b) ->
+            go r
+            dictSet bound (v.Path, v.Offset) true
+            go b
+        | EMatch (s, cs) ->
+            go s
+            for p, gd, b in cs do
+                let acc = vecNew<string * int> ()
+                patBinders p acc
+                for k in vecToList acc do dictSet bound k true
+                (match gd with Some x -> go x | None -> ())
+                go b
+        | ETry (b, cs) ->
+            go b
+            for p, gd, x in cs do
+                let acc = vecNew<string * int> ()
+                patBinders p acc
+                for k in vecToList acc do dictSet bound k true
+                (match gd with Some y -> go y | None -> ())
+                go x
+        | EApp (h, args) -> go h; for a in args do go a
+        | EIf (a, b, c) -> go a; go b; go c
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) ->
+            for x in xs do go x
+        | ERecord (_, fs) -> for _, v in fs do go v
+        | ERecordExt (_, b2, fs) -> go b2; (for _, v in fs do go v)
+        | EField (r, _, _) -> go r
+        | EFieldSet (r, _, _, v) -> go r; go v
+        | EWhile (c, b) -> go c; go b
+        | EIndex (_, a, i) -> go a; go i
+        | EIndexSet (_, a, i, v) -> go a; go i; go v
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> go a
+        | EArrayCreate (_, a, b) -> go a; go b
+        | EIfaceCall (_, _, r, args) -> go r; for a in args do go a
+        | ECast (_, x, _) | ETypeTest (_, x) -> go x
+        | _ -> ()
+    go body
+    vecToList free
+
+/// locals assigned somewhere AND referenced from an inner lambda: cells
+let private cellLocals (body : Expr) : Dict<string * int, bool> =
+    let assigned = dictNew<string * int, bool> ()
+    let captured = dictNew<string * int, bool> ()
+    walkE (fun e ->
+        match e with
+        | EAssign (v, _) -> dictSet assigned (v.Path, v.Offset) true
+        | ELam (_, b) ->
+            walkE (fun x ->
+                match x with
+                | EVar (v, _) | EVarI (v, _, _) -> dictSet captured (v.Path, v.Offset) true
+                | EAssign (v, _) -> dictSet captured (v.Path, v.Offset) true
+                | _ -> ()) b
+        | _ -> ()) body
+    let cells = dictNew<string * int, bool> ()
+    for k, _ in dictPairs assigned do
+        if (dictTryFind captured k).IsSome then dictSet cells k true
+    cells
+
+// ---- expression emission --------------------------------------------------
+
+let private opBase (op0 : string) : string * char =
+    // "=i" -> ("=", 'i'); a bare op is int-kinded
+    if strLen op0 >= 2 then
+        let last = charAt op0 (strLen op0 - 1)
+        let head = op0.Substring (0, strLen op0 - 1)
+        let known =
+            head = "+" || head = "-" || head = "*" || head = "/" || head = "%"
+            || head = "=" || head = "<>" || head = "<" || head = ">"
+            || head = "<=" || head = ">=" || head = "&&&" || head = "|||"
+            || head = "^^^" || head = "<<<" || head = ">>>"
+        if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
+                     || last = 'l' || last = 's' || last = 'u') then head, last
+        else op0, 'i'
+    else op0, 'i'
+
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
+    let trap (what : string) : int =
+        let d = slot f
+        stmt f (sref d + " = fpp_not_emitted(" + cstr what + ");")
+        d
+    let unitV () : int =
+        let d = slot f
+        stmt f (sref d + " = VUNIT;")
+        d
+    let fieldIdx (order : string list) (fname : string) : int =
+        let rec find (i : int) (rest : string list) =
+            match rest with
+            | r :: more -> if r = fname then i else find (i + 1) more
+            | [] -> -1
+        find 0 order
     match e with
     | ELit (LInt s) ->
         let d = slot f
-        stmt f (sref d + " = TAGI(" + s + "L);")
+        let txt = if s.EndsWith "L" then s.Substring (0, strLen s - 1) else s
+        stmt f (sref d + " = TAGI(" + txt + "L);")
         d
     | ELit (LBool b) ->
         let d = slot f
@@ -92,28 +261,33 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         d
     | ELit (LChar s) ->
         let d = slot f
-        stmt f (sref d + " = TAGI(" + string (int (charAt s 0)) + ");")
+        stmt f (sref d + " = TAGI(" + string (Fpp.Backend.BinDriver.charCode s) + ");")
         d
-    | ELit LUnit ->
-        let d = slot f
-        stmt f (sref d + " = VUNIT;")
-        d
+    | ELit LUnit -> unitV ()
     | ELit LNull ->
         let d = slot f
         stmt f (sref d + " = 0;")
         d
     | ELit (LFloat s) ->
         let d = slot f
-        let txt = if s.EndsWith "f" then s.Substring (0, strLen s - 1) else s
+        let t0 = if s.EndsWith "f" then s.Substring (0, strLen s - 1) else s
+        let txt = if t0.EndsWith "." then t0 + "0" else t0
         stmt f (sref d + " = fpp_box_f64(" + txt + ");")
         d
     | ELit (LString s) ->
         let d = slot f
-        stmt f (sref d + " = fpp_str_c(" + cstr s + ", " + string (strLen s) + ");")
+        let bs = Fpp.Backend.BinDriver.unescape s
+        let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
+        stmt f (sref d + " = fpp_str_c(" + cstr txt + ", " + string bs.Length + ");")
         d
     | EVar (v, _) | EVarI (v, _, _) ->
         (match dictTryFind f.Locals (v.Path, v.Offset) with
-         | Some i -> i
+         | Some i ->
+             if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
+                 let d = slot f
+                 stmt f (sref d + " = fpp_cell_get(" + sref i + ");")
+                 d
+             else i
          | None ->
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g ->
@@ -121,91 +295,189 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  stmt f (sref d + " = " + g + ";")
                  d
              | None ->
-                 // a top-level FUNCTION used as a value — M4 (closures)
-                 let d = slot f
-                 stmt f (sref d + " = fpp_not_emitted(" + cstr ("fn value " + v.Name) + ");")
-                 d)
+                 match dictTryFind st.Fns (v.Path, v.Offset) with
+                 | Some _ ->
+                     let g = fnCloGlobal st v
+                     let d = slot f
+                     stmt f (sref d + " = " + g + ";")
+                     d
+                 | None ->
+                     match dictTryFind st.EnumVal v.Name with
+                     | Some ev ->
+                         let d = slot f
+                         stmt f (sref d + " = TAGI(" + string ev + ");")
+                         d
+                     | None -> trap ("free var " + v.Name))
     | EApp (EUnknown "print", [ a ]) ->
         let x = emitE st f a
-        let d = slot f
         stmt f ("fpp_print(" + sref x + ");")
-        stmt f (sref d + " = VUNIT;")
-        d
+        unitV ()
     | EApp (EUnknown ("string" | "string#"), [ a ]) ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_string(" + sref x + ");")
         d
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Fns (v.Path, v.Offset)).IsSome ->
-        let arity = (dictTryFind st.Fns (v.Path, v.Offset)).Value
-        if List.length args <> arity then
-            let d = slot f
-            stmt f (sref d + " = fpp_not_emitted(" + cstr ("partial app " + v.Name) + ");")
-            d
-        else
-            let xs = args |> List.map (emitE st f)
-            let d = slot f
-            stmt f (sref d + " = " + cname v + "("
-                    + String.concat ", " (xs |> List.map sref) + ");")
-            d
-    | EPrim (op0, [ a; b ]) ->
-        // operators arrive KIND-SUFFIXED from lowering ("=i", "+f", "<l");
-        // the tagged-int forms strip the suffix, boxed kinds join later
-        let op =
-            if strLen op0 >= 2 then
-                let last = charAt op0 (strLen op0 - 1)
-                let head = op0.Substring (0, strLen op0 - 1)
-                if (last = 'i' || last = 'b' || last = 'c')
-                   && (head = "+" || head = "-" || head = "*" || head = "/" || head = "%"
-                       || head = "=" || head = "<>" || head = "<" || head = ">"
-                       || head = "<=" || head = ">=") then head
-                else op0
-            else op0
+    | EApp (EUnknown "$cellget", [ c ]) ->
+        let x = emitE st f c
+        let d = slot f
+        stmt f (sref d + " = fpp_cell_get(" + sref x + ");")
+        d
+    | EApp (EUnknown "$cellset", [ c; v ]) ->
+        let x = emitE st f c
+        let y = emitE st f v
+        stmt f ("fpp_cell_set(" + sref x + ", " + sref y + ");")
+        unitV ()
+    | EApp (EUnknown "refEq", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b
         let d = slot f
+        stmt f (sref d + " = TAGI(" + sref x + " == " + sref y + ");")
+        d
+    | EApp (EUnknown "compare", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + "));")
+        d
+    | EApp (EUnknown "hash", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_hashv(" + sref x + "));")
+        d
+    | EApp (EUnknown "ignore", [ a ]) ->
+        emitE st f a |> ignore
+        unitV ()
+    | EApp (EUnknown ("failwith" | "raise"), [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_raise(" + sref x + ");")
+        unitV ()
+    | EApp (EUnknown ("float" | "float#"), [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_to_f64(" + sref x + ");")
+        d
+    | EApp (EUnknown ("int" | "int#"), [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_to_int(" + sref x + ");")
+        d
+    | EApp (EUnknown ("char" | "char#"), [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_to_int(" + sref x + ");")
+        d
+    | EApp (EUnknown "isNull", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(" + sref x + " == 0);")
+        d
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
+          (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
+        let xs = args |> List.map (emitE st f)
+        let d = slot f
+        stmt f (sref d + " = " + cname v + "("
+                + String.concat ", " (xs |> List.map sref) + ");")
+        d
+    | EApp (h, args) ->
+        // the closure protocol: args in CONSECUTIVE slots, rooted during apply
+        let c = emitE st f h
+        let xs = args |> List.map (emitE st f)
+        let first = f.NSlots
+        for x in xs do
+            let s2 = slot f
+            stmt f (sref s2 + " = " + sref x + ";")
+        let d = slot f
+        stmt f (sref d + " = fpp_apply(" + sref c + ", &F[" + string first + "], "
+                + string (List.length xs) + ");")
+        d
+    | ELam (ps, body) -> emitLam st f ps body
+    | EPrim ("::", [ h; t ]) ->
+        let x = emitE st f h
+        let y = emitE st f t
+        let d = slot f
+        stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref y + ");")
+        d
+    | EPrim (op0, [ a; b ]) ->
+        let op, k = opBase op0
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        let arith (cop : string) =
+            if k = 'f' then
+                stmt f (sref d + " = fpp_box_f64(fpp_unbox_f64(" + sref x + ") " + cop
+                        + " fpp_unbox_f64(" + sref y + "));")
+            elif k = 'l' then
+                stmt f (sref d + " = fpp_box_i64(fpp_unbox_i64(" + sref x + ") " + cop
+                        + " fpp_unbox_i64(" + sref y + "));")
+            else
+                stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
+                        + " UNTAGI(" + sref y + "));")
+        let rel (cop : string) =
+            if k = 'f' then
+                stmt f (sref d + " = TAGI(fpp_unbox_f64(" + sref x + ") " + cop
+                        + " fpp_unbox_f64(" + sref y + "));")
+            elif k = 'l' then
+                stmt f (sref d + " = TAGI(fpp_unbox_i64(" + sref x + ") " + cop
+                        + " fpp_unbox_i64(" + sref y + "));")
+            elif k = 's' then
+                stmt f (sref d + " = TAGI(fpp_str_cmp(" + sref x + ", " + sref y + ") "
+                        + cop + " 0);")
+            else
+                stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
+                        + " UNTAGI(" + sref y + "));")
         (match op with
-         | "+" | "-" | "*" ->
-             stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + op + " UNTAGI(" + sref y + "));")
-         | "/" | "%" ->
-             stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + op + " UNTAGI(" + sref y + "));")
-         | "<" | ">" | "<=" | ">=" ->
-             stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + op + " UNTAGI(" + sref y + "));")
-         | "=" ->
-             stmt f (sref d + " = TAGI(" + sref x + " == " + sref y + ");")
-         | "<>" ->
-             stmt f (sref d + " = TAGI(" + sref x + " != " + sref y + ");")
-         | "&&" ->
-             stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") && UNTAGI(" + sref y + "));")
-         | "||" ->
-             stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") || UNTAGI(" + sref y + "));")
-         | _ ->
-             stmt f (sref d + " = fpp_not_emitted(" + cstr ("op " + op) + ");"))
+         | "+" when k = 's' ->
+             stmt f (sref d + " = fpp_str_concat(" + sref x + ", " + sref y + ");")
+         | "+" | "-" | "*" | "/" | "%" -> arith op
+         | "<" | ">" | "<=" | ">=" -> rel op
+         | "=" -> stmt f (sref d + " = TAGI(fpp_eqv(" + sref x + ", " + sref y + "));")
+         | "<>" -> stmt f (sref d + " = TAGI(!fpp_eqv(" + sref x + ", " + sref y + "));")
+         | "&&" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") && UNTAGI(" + sref y + "));")
+         | "||" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") || UNTAGI(" + sref y + "));")
+         | "&&&" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") & UNTAGI(" + sref y + "));")
+         | "|||" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") | UNTAGI(" + sref y + "));")
+         | "^^^" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") ^ UNTAGI(" + sref y + "));")
+         | "<<<" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") << UNTAGI(" + sref y + "));")
+         | ">>>" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") >> UNTAGI(" + sref y + "));")
+         | _ -> stmt f (sref d + " = fpp_not_emitted(" + cstr ("op " + op0) + ");"))
         d
     | EPrim ("not", [ a ]) | EApp (EUnknown "not", [ a ]) ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = TAGI(!UNTAGI(" + sref x + "));")
         d
+    | EPrim (("~-" | "~-i"), [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(-UNTAGI(" + sref x + "));")
+        d
+    | EPrim ("~-f", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_box_f64(-fpp_unbox_f64(" + sref x + "));")
+        d
     | ELet (_, v, _, rhs, body) ->
         let x = emitE st f rhs
-        // the binding OWNS a slot: later reassignment must not clobber the
-        // rhs temp another expression still reads
         let l = slot f
-        stmt f (sref l + " = " + sref x + ";")
+        if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
+            stmt f (sref l + " = fpp_cell_new(" + sref x + ");")
+        else
+            stmt f (sref l + " = " + sref x + ";")
         dictSet f.Locals (v.Path, v.Offset) l
         emitE st f body
     | EAssign (v, rhs) ->
         let x = emitE st f rhs
         (match dictTryFind f.Locals (v.Path, v.Offset) with
-         | Some l -> stmt f (sref l + " = " + sref x + ";")
+         | Some l ->
+             if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
+                 stmt f ("fpp_cell_set(" + sref l + ", " + sref x + ");")
+             else
+                 stmt f (sref l + " = " + sref x + ";")
          | None ->
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g -> stmt f (g + " = " + sref x + ";")
              | None -> stmt f ("fpp_not_emitted(" + cstr ("assign " + v.Name) + ");"))
-        let d = slot f
-        stmt f (sref d + " = VUNIT;")
-        d
+        unitV ()
     | EIf (c, t, e2) ->
         let x = emitE st f c
         let d = slot f
@@ -223,15 +495,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("if (!UNTAGI(" + sref x + ")) break;")
         emitE st f b |> ignore
         stmt f ("}")
-        let d = slot f
-        stmt f (sref d + " = VUNIT;")
-        d
+        unitV ()
     | ESeq xs ->
         (match xs with
-         | [] ->
-             let d = slot f
-             stmt f (sref d + " = VUNIT;")
-             d
+         | [] -> unitV ()
          | _ ->
              let rec go (rest : Expr list) : int =
                  match rest with
@@ -239,49 +506,418 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  | x :: more ->
                      emitE st f x |> ignore
                      go more
-                 | [] -> 0
+                 | [] -> unitV ()
              go xs)
-    | EApp (EUnknown "ignore", [ a ]) ->
-        emitE st f a |> ignore
+    | ETuple xs ->
+        let vs = xs |> List.map (emitE st f)
         let d = slot f
-        stmt f (sref d + " = VUNIT;")
+        stmt f (sref d + " = fpp_tuple(" + string (List.length xs) + ");")
+        vs |> List.iteri (fun i x ->
+            stmt f ("fpp_tuple_set(" + sref d + ", " + string i + ", " + sref x + ");"))
         d
-    | EUnknown n ->
+    | EListLit xs ->
+        let vs = xs |> List.map (emitE st f)
         let d = slot f
-        stmt f (sref d + " = fpp_not_emitted(" + cstr ("builtin " + n) + ");")
+        stmt f (sref d + " = 0;")
+        for x in List.rev vs do
+            stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref d + ");")
         d
+    | ERecord (name, fs) ->
+        (match dictTryFind st.RecTid name with
+         | Some tid ->
+             let order = (dictTryFind st.RecFields name).Value
+             let d = slot f
+             stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             for fn2, v in fs do
+                 let x = emitE st f v
+                 let idx = fieldIdx order fn2
+                 if idx < 0 then
+                     stmt f ("fpp_not_emitted(" + cstr ("field " + name + "." + fn2) + ");")
+                 else
+                     stmt f ("fpprt_write_ref(" + sref d + ", "
+                             + string ((idx + 1) * 8) + ", " + sref x + ");")
+             d
+         | None -> trap ("record " + name))
+    | ERecordExt (name, b, fs) ->
+        (match dictTryFind st.RecTid name with
+         | Some tid ->
+             let src = emitE st f b
+             let order = (dictTryFind st.RecFields name).Value
+             let n = List.length order
+             let d = slot f
+             stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             for i in 0 .. n - 1 do
+                 stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 1) * 8)
+                         + ", fpprt_read_ref(" + sref src + ", " + string ((i + 1) * 8) + "));")
+             for fn2, v in fs do
+                 let x = emitE st f v
+                 let idx = fieldIdx order fn2
+                 if idx >= 0 then
+                     stmt f ("fpprt_write_ref(" + sref d + ", "
+                             + string ((idx + 1) * 8) + ", " + sref x + ");")
+             d
+         | None -> trap ("record " + name))
+    | EField (r, fname, owner) ->
+        (match dictTryFind st.RecFields owner with
+         | Some order ->
+             let x = emitE st f r
+             let idx = fieldIdx order fname
+             if idx < 0 then trap ("field " + owner + "." + fname)
+             else
+                 let d = slot f
+                 stmt f (sref d + " = fpprt_read_ref(" + sref x + ", "
+                         + string ((idx + 1) * 8) + ");")
+                 d
+         | None -> trap ("field of " + owner + "." + fname))
+    | EFieldSet (r, fname, owner, v) ->
+        (match dictTryFind st.RecFields owner with
+         | Some order ->
+             let x = emitE st f r
+             let y = emitE st f v
+             let idx = fieldIdx order fname
+             if idx < 0 then trap ("fieldset " + owner + "." + fname)
+             else
+                 stmt f ("fpprt_write_ref(" + sref x + ", "
+                         + string ((idx + 1) * 8) + ", " + sref y + ");")
+                 unitV ()
+         | None -> trap ("fieldset of " + owner))
+    | ECtor (cn, _, args) ->
+        (match dictTryFind st.CaseTid cn with
+         | Some tid ->
+             let vs = args |> List.map (emitE st f)
+             let d = slot f
+             stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             vs |> List.iteri (fun i x ->
+                 stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 1) * 8)
+                         + ", " + sref x + ");"))
+             d
+         | None ->
+             match dictTryFind st.EnumVal cn with
+             | Some ev ->
+                 let d = slot f
+                 stmt f (sref d + " = TAGI(" + string ev + ");")
+                 d
+             | None -> trap ("ctor " + cn))
+    | EMatch (scrut, clauses) ->
+        let sv = emitE st f scrut
+        let d = slot f
+        let matched = slot f
+        stmt f (sref matched + " = TAGI(0);")
+        for p, guard, body in clauses do
+            stmt f ("if (!UNTAGI(" + sref matched + ")) {")
+            let ok = slot f
+            stmt f (sref ok + " = TAGI(1);")
+            emitPat st f p sv ok
+            (match guard with
+             | Some g ->
+                 stmt f ("if (UNTAGI(" + sref ok + ")) {")
+                 let gv = emitE st f g
+                 stmt f (sref ok + " = " + sref gv + ";")
+                 stmt f ("}")
+             | None -> ())
+            stmt f ("if (UNTAGI(" + sref ok + ")) {")
+            let bv = emitE st f body
+            stmt f (sref d + " = " + sref bv + ";")
+            stmt f (sref matched + " = TAGI(1);")
+            stmt f ("}")
+            stmt f ("}")
+        stmt f ("if (!UNTAGI(" + sref matched + ")) fpp_match_fail();")
+        d
+    | ETry (body, handlers) ->
+        let d = slot f
+        let ex = slot f
+        stmt f ("{ struct fpp_handler H;")
+        stmt f ("if (!fpp_try(&H)) {")
+        let bv = emitE st f body
+        stmt f (sref d + " = " + sref bv + ";")
+        stmt f ("fpp_try_pop();")
+        stmt f ("} else {")
+        stmt f (sref ex + " = fpp_exn_value();")
+        let matched = slot f
+        stmt f (sref matched + " = TAGI(0);")
+        for p, guard, hb in handlers do
+            stmt f ("if (!UNTAGI(" + sref matched + ")) {")
+            let ok = slot f
+            stmt f (sref ok + " = TAGI(1);")
+            emitPat st f p ex ok
+            (match guard with
+             | Some g ->
+                 stmt f ("if (UNTAGI(" + sref ok + ")) {")
+                 let gv = emitE st f g
+                 stmt f (sref ok + " = " + sref gv + ";")
+                 stmt f ("}")
+             | None -> ())
+            stmt f ("if (UNTAGI(" + sref ok + ")) {")
+            let bv = emitE st f hb
+            stmt f (sref d + " = " + sref bv + ";")
+            stmt f (sref matched + " = TAGI(1);")
+            stmt f ("}")
+            stmt f ("}")
+        stmt f ("if (!UNTAGI(" + sref matched + ")) fpp_reraise();")
+        stmt f ("} }")
+        d
+    | EArray (_, xs) ->
+        let vs = xs |> List.map (emitE st f)
+        let d = slot f
+        stmt f (sref d + " = fpp_arr_new(" + string (List.length xs) + ");")
+        vs |> List.iteri (fun i x ->
+            stmt f ("fpp_arr_set(" + sref d + ", " + string i + ", " + sref x + ");"))
+        d
+    | EArrayCreate (_, n, v) ->
+        let nv = emitE st f n
+        let d = slot f
+        stmt f (sref d + " = fpp_arr_new((size_t)UNTAGI(" + sref nv + "));")
+        (match v with
+         | EUnknown "$zero" -> ()
+         | _ ->
+             let x = emitE st f v
+             stmt f ("{ size_t N = fpprt_array_len(" + sref d + ");")
+             stmt f ("for (size_t I = 0; I < N; I++) fpp_arr_set(" + sref d
+                     + ", I, " + sref x + "); }"))
+        d
+    | EIndex (_, a, i) ->
+        let av = emitE st f a
+        let iv = emitE st f i
+        let d = slot f
+        stmt f (sref d + " = fpp_arr_get(" + sref av + ", (size_t)UNTAGI(" + sref iv + "));")
+        d
+    | EIndexSet (_, a, i, v) ->
+        let av = emitE st f a
+        let iv = emitE st f i
+        let xv = emitE st f v
+        stmt f ("fpp_arr_set(" + sref av + ", (size_t)UNTAGI(" + sref iv + "), " + sref xv + ");")
+        unitV ()
+    | EArrayLen (_, a) ->
+        let av = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpprt_array_len(" + sref av + "));")
+        d
+    | ECast (_, x, _) ->
+        // uniform representation: a cast is bit-identity; the CHECKED ones
+        // learn to check with the class machinery (M5)
+        emitE st f x
+    | ETypeTest (tn, x) ->
+        let xv = emitE st f x
+        (match dictTryFind st.RecTid tn with
+         | Some tid ->
+             let d = slot f
+             stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
+                     + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
+             d
+         | None ->
+             match dictTryFind st.CaseTid tn with
+             | Some tid ->
+                 let d = slot f
+                 stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
+                         + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
+                 d
+             | None -> trap ("typetest " + tn))
+    | EUnknown "$zero" ->
+        let d = slot f
+        stmt f (sref d + " = 0;")
+        d
+    | EUnknown n -> trap ("builtin " + n)
     | other ->
-        // NOT an error: like the wasm backend's not-ported stubs, the gap
-        // traps only if the program actually reaches it — dead prelude
-        // corners must not block a live program
-        let d = slot f
         let p0 = printExpr other
         let p = if strLen p0 > 60 then p0.Substring (0, 60) else p0
-        stmt f (sref d + " = fpp_not_emitted(" + cstr p + ");")
-        d
+        trap ("form " + p)
+
+/// pattern TEST against value slot `sv`: leaves `ok` false on mismatch,
+/// binds pattern variables on the tested path
+and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit =
+    match p with
+    | PWild -> ()
+    | PVar (v, _) ->
+        let l = slot f
+        stmt f (sref l + " = " + sref sv + ";")
+        dictSet f.Locals (v.Path, v.Offset) l
+    | PAs (q, v, _) ->
+        emitPat st f q sv ok
+        let l = slot f
+        stmt f (sref l + " = " + sref sv + ";")
+        dictSet f.Locals (v.Path, v.Offset) l
+    | PLit (LInt s) ->
+        let txt = if s.EndsWith "L" then s.Substring (0, strLen s - 1) else s
+        stmt f ("if (" + sref sv + " != TAGI(" + txt + "L)) " + sref ok + " = TAGI(0);")
+    | PLit (LBool b) ->
+        stmt f ("if (" + sref sv + " != TAGI(" + (if b then "1" else "0") + ")) "
+                + sref ok + " = TAGI(0);")
+    | PLit (LChar s) ->
+        stmt f ("if (" + sref sv + " != TAGI(" + string (Fpp.Backend.BinDriver.charCode s) + ")) "
+                + sref ok + " = TAGI(0);")
+    | PLit LUnit -> ()
+    | PLit LNull ->
+        stmt f ("if (" + sref sv + " != 0) " + sref ok + " = TAGI(0);")
+    | PLit (LString s) ->
+        let lit = slot f
+        let bs = Fpp.Backend.BinDriver.unescape s
+        let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
+        stmt f (sref lit + " = fpp_str_c(" + cstr txt + ", " + string bs.Length + ");")
+        stmt f ("if (!fpp_eqv(" + sref sv + ", " + sref lit + ")) " + sref ok + " = TAGI(0);")
+    | PLit (LFloat s) ->
+        let t0 = if s.EndsWith "f" then s.Substring (0, strLen s - 1) else s
+        stmt f ("if (!(" + sref sv + " && !(" + sref sv + " & 1) && fpp_unbox_f64("
+                + sref sv + ") == " + t0 + ")) " + sref ok + " = TAGI(0);")
+    | PTuple ps ->
+        ps |> List.iteri (fun i q ->
+            let el = slot f
+            stmt f ("if (UNTAGI(" + sref ok + ")) " + sref el + " = fpp_tuple_get("
+                    + sref sv + ", " + string i + ");")
+            emitPat st f q el ok)
+    | PCons (h, t) ->
+        stmt f ("if (!fpp_is_tid(" + sref sv + ", FPP_TID_CONS)) " + sref ok + " = TAGI(0);")
+        let hv = slot f
+        let tv = slot f
+        stmt f ("if (UNTAGI(" + sref ok + ")) { " + sref hv + " = fpprt_read_ref("
+                + sref sv + ", 8); " + sref tv + " = fpprt_read_ref(" + sref sv + ", 16); }")
+        emitPat st f h hv ok
+        emitPat st f t tv ok
+    | PListLit ps ->
+        let cur = slot f
+        stmt f (sref cur + " = " + sref sv + ";")
+        for q in ps do
+            stmt f ("if (!fpp_is_tid(" + sref cur + ", FPP_TID_CONS)) "
+                    + sref ok + " = TAGI(0);")
+            let hv = slot f
+            stmt f ("if (UNTAGI(" + sref ok + ")) " + sref hv + " = fpprt_read_ref("
+                    + sref cur + ", 8);")
+            emitPat st f q hv ok
+            stmt f ("if (UNTAGI(" + sref ok + ")) " + sref cur + " = fpprt_read_ref("
+                    + sref cur + ", 16);")
+        stmt f ("if (UNTAGI(" + sref ok + ") && " + sref cur + " != 0) "
+                + sref ok + " = TAGI(0);")
+    | PCtor (cn, _, ps) ->
+        (match dictTryFind st.CaseTid cn with
+         | Some tid ->
+             stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+                     + sref ok + " = TAGI(0);")
+             ps |> List.iteri (fun i q ->
+                 let el = slot f
+                 stmt f ("if (UNTAGI(" + sref ok + ")) " + sref el + " = fpprt_read_ref("
+                         + sref sv + ", " + string ((i + 1) * 8) + ");")
+                 emitPat st f q el ok)
+         | None ->
+             match dictTryFind st.EnumVal cn with
+             | Some ev ->
+                 stmt f ("if (" + sref sv + " != TAGI(" + string ev + ")) "
+                         + sref ok + " = TAGI(0);")
+             | None ->
+                 stmt f (sref ok + " = fpp_not_emitted(" + cstr ("pat ctor " + cn) + ");"))
+    | PTypeTest tn ->
+        (match dictTryFind st.RecTid tn with
+         | Some tid ->
+             stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+                     + sref ok + " = TAGI(0);")
+         | None ->
+             match dictTryFind st.CaseTid tn with
+             | Some tid ->
+                 stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+                         + sref ok + " = TAGI(0);")
+             | None ->
+                 stmt f (sref ok + " = fpp_not_emitted(" + cstr ("pat typetest " + tn) + ");"))
+    | POr ps ->
+        let any = slot f
+        stmt f (sref any + " = TAGI(0);")
+        for q in ps do
+            stmt f ("if (!UNTAGI(" + sref any + ")) {")
+            let sub = slot f
+            stmt f (sref sub + " = TAGI(1);")
+            emitPat st f q sv sub
+            stmt f ("if (UNTAGI(" + sref sub + ")) " + sref any + " = TAGI(1);")
+            stmt f ("}")
+        stmt f ("if (!UNTAGI(" + sref any + ")) " + sref ok + " = TAGI(0);")
+
+/// a lambda in expression position: lift to a code function, allocate the
+/// closure capturing its free variables. Closure layout:
+/// [tag][code][arity][env0..] — code and arity raw scalars off the map.
+and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Expr) : int =
+    let lamId = st.NextLam
+    st.NextLam <- lamId + 1
+    let code = "lam_" + string lamId
+    let isOutside (k : string * int) = (dictTryFind f.Locals k).IsSome
+    let frees = freeVarsOf ps body isOutside
+    let lf = { Body = vecNew<string> (); NSlots = 0
+               Locals = dictNew<string * int, int> (); Cells = f.Cells }
+    frees |> List.iteri (fun i k ->
+        let l = slot lf
+        stmt lf (sref l + " = fpprt_read_ref(self, " + string ((i + 3) * 8) + ");")
+        dictSet lf.Locals k l)
+    ps |> List.iteri (fun i (pv, _) ->
+        let l = slot lf
+        stmt lf (sref l + " = args[" + string i + "];")
+        dictSet lf.Locals (pv.Path, pv.Offset) l)
+    let r = emitE st lf body
+    vecAdd st.Fwd ("static V " + code + "(V self, V *args);")
+    let all = vecNew<string> ()
+    vecAdd all ("static V " + code + "(V self, V *args) {")
+    vecAdd all ("  (void)self; (void)args;")
+    vecAdd all ("  FPPRT_FRAME(Fr, " + string (max lf.NSlots 1) + "); V *F = Fr_slots;")
+    for line in vecToList lf.Body do vecAdd all line
+    vecAdd all ("  FPPRT_LEAVE(Fr);")
+    vecAdd all ("  return " + sref r + ";")
+    vecAdd all "}"
+    vecAdd st.Out (String.concat "\n" (vecToList all))
+    let tid = freshTid st
+    vecAdd st.Reg ("  fpp_reg_clo(" + string tid + ", " + string (List.length frees) + ");")
+    let d = slot f
+    stmt f (sref d + " = fpp_clo_new(" + string tid + ", (fpp_code_t)" + code + ", "
+            + string (List.length ps) + ", " + string (List.length frees) + ");")
+    frees |> List.iteri (fun i k ->
+        match dictTryFind f.Locals k with
+        | Some l ->
+            stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 3) * 8) + ", "
+                    + sref l + ");")
+        | None -> stmt f ("fpp_not_emitted(\"capture miss\");"))
+    d
+
+/// the singleton closure for a top-level function used as a value
+and private fnCloGlobal (st : CSt) (v : VarId) : string =
+    match dictTryFind st.FnClo (v.Path, v.Offset) with
+    | Some g -> g
+    | None ->
+        let fn = cname v
+        let arity = (dictTryFind st.Fns (v.Path, v.Offset)).Value
+        let g = "clo_" + fn
+        let code = "code_" + fn
+        dictSet st.FnClo (v.Path, v.Offset) g
+        vecAdd st.Globals ("static V " + g + ";")
+        vecAdd st.Fwd ("static V " + code + "(V self, V *args);")
+        let psx =
+            if arity = 0 then []
+            else List.init arity (fun i -> "args[" + string i + "]")
+        vecAdd st.Out
+            ("static V " + code + "(V self, V *args) {\n  (void)self; (void)args;\n  return "
+             + fn + "(" + String.concat ", " psx + ");\n}")
+        let tid = freshTid st
+        vecAdd st.Reg ("  fpp_reg_clo(" + string tid + ", 0);")
+        vecAdd st.Inits ("  " + g + " = fpp_clo_new(" + string tid + ", (fpp_code_t)"
+                         + code + ", " + string arity + ", 0);")
+        g
 
 /// one function body, wrapped in its shadow frame
-let private emitFn (st : CSt) (name : string) (ps : (VarId * Scheme) list) (body : Expr) : unit =
-    let f = { Body = vecNew<string> (); NSlots = 0; Locals = dictNew<string * int, int> () }
-    // parameters copy into frame slots: they are roots too
+and private emitFn (st : CSt) (name : string) (ps : (VarId * Scheme) list) (body : Expr) : unit =
+    let f = { Body = vecNew<string> (); NSlots = 0
+              Locals = dictNew<string * int, int> (); Cells = cellLocals body }
     let pnames = ps |> List.mapi (fun i (pv, _) -> "p" + string i, pv)
     for pn, pv in pnames do
         let l = slot f
-        stmt f (sref l + " = " + pn + ";")
+        if (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome then
+            stmt f (sref l + " = fpp_cell_new(" + pn + ");")
+        else
+            stmt f (sref l + " = " + pn + ";")
         dictSet f.Locals (pv.Path, pv.Offset) l
     let r = emitE st f body
-    let head =
-        "static V " + name + "("
-        + (if List.isEmpty pnames then "void"
-           else String.concat ", " (pnames |> List.map (fun (pn, _) -> "V " + pn)))
-        + ") {"
     vecAdd st.Fwd
         ("static V " + name + "("
          + (if List.isEmpty pnames then "void"
             else String.concat ", " (pnames |> List.map (fun _ -> "V")))
          + ");")
     let all = vecNew<string> ()
-    vecAdd all head
+    vecAdd all
+        ("static V " + name + "("
+         + (if List.isEmpty pnames then "void"
+            else String.concat ", " (pnames |> List.map (fun (pn, _) -> "V " + pn)))
+         + ") {")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max f.NSlots 1) + "); V *F = Fr_slots;")
     for line in vecToList f.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
@@ -295,32 +931,52 @@ let emitC (decls : Decl list) : string * string list =
     let st =
         { Out = vecNew<string> (); Fwd = vecNew<string> ()
           Globals = vecNew<string> (); Inits = vecNew<string> ()
-          TypeReg = vecNew<string> (); Errors = vecNew<string> ()
+          Reg = vecNew<string> ()
           Fns = dictNew<string * int, int> ()
           GlobalOf = dictNew<string * int, string> ()
-          NextTid = 0 }
-    // pass 1: names — every top-level fn's arity, every global's C name
+          RecTid = dictNew<string, int> ()
+          RecFields = dictNew<string, string list> ()
+          CaseTid = dictNew<string, int> ()
+          CaseArity = dictNew<string, int> ()
+          EnumVal = dictNew<string, int> ()
+          FnClo = dictNew<string * int, string> ()
+          NextTid = 32                          // FPP_TID_USER in fpprt-lang.h
+          NextLam = 0 }
+    // pass 1: names, record layouts, union cases, enums
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) ->
             dictSet st.Fns (v.Path, v.Offset) (List.length ps)
         | DLet (_, v, _, _) ->
             dictSet st.GlobalOf (v.Path, v.Offset) (gname v)
+        | DRecord (n, _, fields, _) ->
+            if not (dictTryFind st.RecTid n).IsSome then
+                let tid = freshTid st
+                dictSet st.RecTid n tid
+                dictSet st.RecFields n (fields |> List.map fst)
+                vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
+                               + string (List.length fields) + ", 1, " + cstr n + ");")
+        | DUnion (_, _, cases) ->
+            for cn, arity in cases do
+                if not (dictTryFind st.CaseTid cn).IsSome then
+                    let tid = freshTid st
+                    dictSet st.CaseTid cn tid
+                    dictSet st.CaseArity cn arity
+                    vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
+                                   + string arity + ", 2, " + cstr cn + ");")
+        | DEnum (_, cases) ->
+            for cn, v in cases do dictSet st.EnumVal cn v
         | _ -> ()
     // pass 2: emission
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) ->
-            emitFn st (cname v) ps body
+        | DLet (_, v, _, ELam (ps, body)) -> emitFn st (cname v) ps body
         | DLet (_, v, _, rhs) ->
             vecAdd st.Globals ("static V " + gname v + ";")
-            // the init runs inside fpp_main's frame: emit as a function so
-            // its temps have their own slots, called in decl order
             let initName = "init_" + gname v
             emitFn st initName [] rhs
             vecAdd st.Inits ("  " + gname v + " = " + initName + "();")
-        | DExtern _ | DExport _ | DUnion _ | DRecord _ | DInterface _
-        | DClass _ | DEnum _ | DMembers _ | DBaseInst _ -> ()
+        | _ -> ()
     let out = vecNew<string> ()
     vecAdd out "/* generated by fpp --target c */"
     vecAdd out "#include \"fpprt-lang.h\""
@@ -334,17 +990,11 @@ let emitC (decls : Decl list) : string * string list =
         vecAdd out ""
     vecAdd out "int main(void) {"
     vecAdd out "  fpp_lang_init();"
-    let nglobals = vecLen st.Globals
-    if nglobals > 0 then
-        // globals are contiguous? NO — separate statics. Register each as a
-        // one-slot range: correct, and the count is small.
-        ()
     for g in vecToList st.Globals do
-        // "static V g_x;" -> g_x
         let n = g.Substring (9, strLen g - 10)
         vecAdd out ("  fpprt_add_static_roots(&" + n + ", 1);")
-    for t in vecToList st.TypeReg do vecAdd out t
+    for t in vecToList st.Reg do vecAdd out t
     for i in vecToList st.Inits do vecAdd out i
     vecAdd out "  return 0;"
     vecAdd out "}"
-    String.concat "\n" (vecToList out), vecToList st.Errors
+    String.concat "" ((vecToList out) |> List.map (fun l -> l + "\n")), []

@@ -18,7 +18,7 @@ gcc -O1 -g -I"$root/runtime" -I"$root/runtime/gc/api" \
     -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     -DGC_ATTRS="\"$root/runtime/gc/api/semi-attrs.h\"" \
     -DGC_EMBEDDER="\"$root/runtime/fpprt-embedder.h\"" \
-    "$out/p.c" "$root/runtime/fpprt.c" \
+    "$out/p.c" "$root/runtime/fpprt.c" "$root/runtime/fpprt-lang.c" \
     "$root/runtime/gc/src/gc-platform-gnu-linux.c" "$root/runtime/gc/src/gc-stack.c" \
     "$root/runtime/gc/src/gc-options.c" "$root/runtime/gc/src/gc-tracepoint.c" \
     "$root/runtime/gc/src/gc-ephemeron.c" "$root/runtime/gc/src/gc-finalizer.c" \

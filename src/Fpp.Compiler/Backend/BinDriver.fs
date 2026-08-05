@@ -192,7 +192,7 @@ let private escapeAt (s : string) (i : int) : int * int =
         else int c, 2
     | c -> int c, 2
 
-let private unescape (raw : string) : byte[] =
+let unescape (raw : string) : byte[] =
     let raw = if strLen raw > 1 && charAt raw (strLen raw - 1) = 'B' then substr raw 0 (strLen raw - 1) else raw
     let isTriple =
         strLen raw >= 6 && charAt raw 0 = '"' && charAt raw 1 = '"' && charAt raw 2 = '"'
@@ -240,7 +240,7 @@ let private unescape (raw : string) : byte[] =
 
 /// a char literal is ONE code point; reading it out of the unescaped BYTES
 /// would take only the first byte of a multi-byte escape
-let private charCode (raw : string) : int =
+let charCode (raw : string) : int =
     let inner = if strLen raw >= 2 then substr raw 1 (strLen raw - 2) else raw
     if strLen inner > 1 && charAt inner 0 = '\\' then fst (escapeAt inner 0)
     else
