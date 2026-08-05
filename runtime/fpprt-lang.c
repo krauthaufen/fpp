@@ -398,6 +398,20 @@ V fpp_to_string(V x) {
   return fpp_str_c("<obj>", 5);
 }
 
+V fpp_f64_to_string(V x) {
+  /* mirrors the wasm backend's formatting: shortest %.17g that reads back,
+   * tried at increasing precision — parity decides if this needs refining */
+  double d = fpp_unbox_f64(x);
+  char buf[40];
+  int n = 0;
+  for (int prec = 1; prec <= 17; prec++) {
+    n = snprintf(buf, sizeof buf, "%.*g", prec, d);
+    double back = strtod(buf, NULL);
+    if (back == d) break;
+  }
+  return fpp_str_c(buf, (size_t)n);
+}
+
 /* ---- init --------------------------------------------------------------- */
 
 void fpp_lang_init(void) {

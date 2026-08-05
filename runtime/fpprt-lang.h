@@ -200,6 +200,15 @@ static inline V fpp_to_i64(V x) {
 }
 
 V fpp_to_string(V x);
+V fpp_f64_to_string(V x);
+static inline V fpp_bool_to_string(V x) {
+  return UNTAGI(x) ? fpp_str_c("True", 4) : fpp_str_c("False", 5);
+}
+static inline V fpp_char_to_string(V x) {
+  V s = fpprt_alloc_array(FPP_TID_STR, 1);
+  fpp_str_units(s)[0] = (uint16_t)UNTAGI(x);
+  return s;
+}
 
 void fpp_print(V s);                     /* UTF-8 encode + newline */
 

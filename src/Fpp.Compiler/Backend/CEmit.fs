@@ -230,7 +230,8 @@ let private opBase (op0 : string) : string * char =
             || head = "<=" || head = ">=" || head = "&&&" || head = "|||"
             || head = "^^^" || head = "<<<" || head = ">>>"
         if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
-                     || last = 'l' || last = 's' || last = 'u') then head, last
+                     || last = 'l' || last = 's' || last = 'u' || last = 't'
+                     || last = 'o') then head, last
         else op0, 'i'
     else op0, 'i'
 
@@ -312,10 +313,15 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         stmt f ("fpp_print(" + sref x + ");")
         unitV ()
-    | EApp (EUnknown ("string" | "string#"), [ a ]) ->
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" ->
         let x = emitE st f a
         let d = slot f
-        stmt f (sref d + " = fpp_to_string(" + sref x + ");")
+        let k = if strLen n > 6 then charAt n (strLen n - 1) else ' '
+        (match k with
+         | 'b' -> stmt f (sref d + " = fpp_bool_to_string(" + sref x + ");")
+         | 'f' -> stmt f (sref d + " = fpp_f64_to_string(" + sref x + ");")
+         | 'c' -> stmt f (sref d + " = fpp_char_to_string(" + sref x + ");")
+         | _ -> stmt f (sref d + " = fpp_to_string(" + sref x + ");"))
         d
     | EApp (EUnknown "$cellget", [ c ]) ->
         let x = emitE st f c
@@ -351,12 +357,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         stmt f ("fpp_raise(" + sref x + ");")
         unitV ()
-    | EApp (EUnknown ("float" | "float#"), [ a ]) ->
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float" && not (n.StartsWith "float32") ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_f64(" + sref x + ");")
         d
-    | EApp (EUnknown ("int" | "int#"), [ a ]) ->
+    | EApp (EUnknown n, [ a ]) when (n.StartsWith "int" && not (n.StartsWith "int64") && not (n.StartsWith "int16")) ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_int(" + sref x + ");")
@@ -397,6 +403,22 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref y + ");")
         d
+    | EPrim (op0, [ a; b ]) when op0.Contains "@" ->
+        // "op@Type": the operand type rides on the operator. Uniformly
+        // represented values answer the whole family structurally.
+        let baseOp = op0.Substring (0, op0.IndexOf "@")
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        (match baseOp with
+         | "=" -> stmt f (sref d + " = TAGI(fpp_eqv(" + sref x + ", " + sref y + "));")
+         | "<>" -> stmt f (sref d + " = TAGI(!fpp_eqv(" + sref x + ", " + sref y + "));")
+         | "<" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") < 0);")
+         | ">" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") > 0);")
+         | "<=" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") <= 0);")
+         | ">=" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") >= 0);")
+         | _ -> stmt f (sref d + " = fpp_not_emitted(" + cstr ("op " + op0) + ");"))
+        d
     | EPrim (op0, [ a; b ]) ->
         let op, k = opBase op0
         let x = emitE st f a
@@ -413,7 +435,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                 stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
                         + " UNTAGI(" + sref y + "));")
         let rel (cop : string) =
-            if k = 'f' then
+            if k = 't' || k = 'o' then
+                stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") "
+                        + cop + " 0);")
+            elif k = 'f' then
                 stmt f (sref d + " = TAGI(fpp_unbox_f64(" + sref x + ") " + cop
                         + " fpp_unbox_f64(" + sref y + "));")
             elif k = 'l' then
@@ -456,15 +481,27 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_box_f64(-fpp_unbox_f64(" + sref x + "));")
         d
-    | ELet (_, v, _, rhs, body) ->
-        let x = emitE st f rhs
-        let l = slot f
-        if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
-            stmt f (sref l + " = fpp_cell_new(" + sref x + ");")
-        else
-            stmt f (sref l + " = " + sref x + ";")
-        dictSet f.Locals (v.Path, v.Offset) l
-        emitE st f body
+    | ELet (isRec, v, _, rhs, body) ->
+        (match rhs with
+         | ELam _ when isRec ->
+             // a local recursive closure captures ITSELF: the knot ties
+             // through a cell — capture the cell empty, then fill it
+             dictSet f.Cells (v.Path, v.Offset) true
+             let l = slot f
+             stmt f (sref l + " = fpp_cell_new(0);")
+             dictSet f.Locals (v.Path, v.Offset) l
+             let x = emitE st f rhs
+             stmt f ("fpp_cell_set(" + sref l + ", " + sref x + ");")
+             emitE st f body
+         | _ ->
+             let x = emitE st f rhs
+             let l = slot f
+             if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
+                 stmt f (sref l + " = fpp_cell_new(" + sref x + ");")
+             else
+                 stmt f (sref l + " = " + sref x + ";")
+             dictSet f.Locals (v.Path, v.Offset) l
+             emitE st f body)
     | EAssign (v, rhs) ->
         let x = emitE st f rhs
         (match dictTryFind f.Locals (v.Path, v.Offset) with
