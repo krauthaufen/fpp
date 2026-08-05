@@ -183,7 +183,15 @@ static V fpp_pap_code_(V self, V *args) {
 }
 
 V fpp_apply(V clo, V *args, size_t n) {
-  if (!clo || (clo & 1)) fpp_not_emitted("apply to non-closure");
+  if (!clo || (clo & 1)) {
+    fprintf(stderr, "fpp: apply to %s\n", clo ? "tagged value" : "null");
+    fpp_not_emitted("apply to non-closure");
+  }
+  if (fpp_tclass_[fpprt_typeid(clo)] != FPP_TC_CLO) {
+    fprintf(stderr, "fpp: apply to non-closure %s\n",
+            fpprt_type_name(fpprt_typeid(clo)));
+    fpp_not_emitted("apply to non-closure object");
+  }
   size_t arity = fpp_clo_arity(clo);
   if (n == arity)
     return fpp_clo_code(clo)(clo, args);
@@ -250,6 +258,77 @@ V fpp_vcall(V obj, int slot, V *args, size_t n) {
   return fn(obj, args);
 }
 
+V fpp_arr_zeroed(int kind, size_t n) {
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = fpprt_alloc_array(FPP_TID_ARR, n);
+  if (kind == 1) {
+    for (size_t i = 0; i < n; i++)
+      ((uintptr_t *)f_slots[0])[i + 2] = TAGI(0);   /* tagged: no barrier */
+  } else if (kind == 2) {
+    for (size_t i = 0; i < n; i++)
+      fpp_arr_set(f_slots[0], i, fpp_box_f64(0.0));
+  } else if (kind == 3) {
+    for (size_t i = 0; i < n; i++)
+      fpp_arr_set(f_slots[0], i, fpp_box_i64(0));
+  }
+  V r = f_slots[0];
+  FPPRT_LEAVE(f);
+  return r;
+}
+
+/* ---- builtin seq enumerators -------------------------------------------- */
+/* [tag][src][idx] — idx tagged; for a LIST src walks the cons chain */
+
+V fpp_seq_getenum(V self, V *args) {
+  (void)args;
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = self;
+  V e = fpprt_alloc(FPP_TID_ENUM);
+  fpprt_write_ref(e, 1 * sizeof(V), f_slots[0]);
+  ((uintptr_t *)e)[2] = TAGI(-1);
+  FPPRT_LEAVE(f);
+  return e;
+}
+
+V fpp_enum_movenext(V self, V *args) {
+  (void)args;
+  V src = fpprt_read_ref(self, 1 * sizeof(V));
+  if (src == 0) return TAGI(0);
+  if (fpp_is_tid(src, FPP_TID_ARR) || fpp_is_tid(src, FPP_TID_STR)
+      || fpp_is_tid(src, FPP_TID_TUPLE)) {
+    intptr_t i = UNTAGI(((uintptr_t *)self)[2]) + 1;
+    ((uintptr_t *)self)[2] = TAGI(i);
+    return TAGI((size_t)i < fpprt_array_len(src));
+  }
+  /* a list: idx == -1 means "before first" — first MoveNext stays on src,
+   * later ones advance the chain */
+  if (((intptr_t)UNTAGI(((uintptr_t *)self)[2])) < 0) {
+    ((uintptr_t *)self)[2] = TAGI(0);
+    return TAGI(fpp_is_tid(src, FPP_TID_CONS));
+  }
+  V next = fpp_is_tid(src, FPP_TID_CONS) ? fpprt_read_ref(src, 2 * sizeof(V)) : 0;
+  fpprt_write_ref(self, 1 * sizeof(V), next);
+  return TAGI(fpp_is_tid(next, FPP_TID_CONS));
+}
+
+V fpp_enum_current(V self, V *args) {
+  (void)args;
+  V src = fpprt_read_ref(self, 1 * sizeof(V));
+  if (fpp_is_tid(src, FPP_TID_CONS))
+    return fpprt_read_ref(src, 1 * sizeof(V));
+  if (fpp_is_tid(src, FPP_TID_STR)) {
+    intptr_t i = UNTAGI(((uintptr_t *)self)[2]);
+    return TAGI(fpp_str_units(src)[i]);
+  }
+  intptr_t i = UNTAGI(((uintptr_t *)self)[2]);
+  return fpprt_read_ref(src, (uint32_t)((i + 2) * sizeof(V)));
+}
+
+V fpp_enum_dispose(V self, V *args) {
+  (void)self; (void)args;
+  return VUNIT;
+}
+
 /* ---- exceptions --------------------------------------------------------- */
 
 void fpp_raise(V payload) {
@@ -285,7 +364,10 @@ static int fpp_tclass_of_(V v) {
 }
 
 int fpp_eqv(V a, V b) {
-  if (a == b) return 1;
+  /* the identity fast path must not answer for floats: the same NaN box
+   * still compares UNEQUAL to itself */
+  if (a == b && !((a && !(a & 1)) && fpprt_typeid(a) == FPP_TID_F64)) return 1;
+  if (a == b) return fpp_unbox_f64(a) == fpp_unbox_f64(b);
   if ((a & 1) || (b & 1) || !a || !b) return 0;
   uint32_t ta = fpprt_typeid(a), tb = fpprt_typeid(b);
   if (ta != tb) return 0;
@@ -450,6 +532,113 @@ V fpp_f64_to_string(V x) {
   return fpp_str_c(buf, (size_t)n);
 }
 
+/* ---- generic arithmetic: the oracle's $addv family ---------------------- */
+
+#define FPP_ARITH2(name, op, strcase)                                   \
+V name(V a, V b) {                                                      \
+  if ((a & 1) && (b & 1))                                               \
+    return TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(a) op (int32_t)UNTAGI(b))); \
+  if (fpp_is_tid(a, FPP_TID_F64) && fpp_is_tid(b, FPP_TID_F64))         \
+    return fpp_box_f64(fpp_unbox_f64(a) op fpp_unbox_f64(b));           \
+  if (fpp_is_tid(a, FPP_TID_I64) && fpp_is_tid(b, FPP_TID_I64))         \
+    return fpp_box_i64(fpp_unbox_i64(a) op fpp_unbox_i64(b));           \
+  strcase                                                               \
+  fprintf(stderr, "fpp: mixed arith a=%s b=%s\n",                       \
+          (a & 1) ? "tagged" : a ? fpprt_type_name(fpprt_typeid(a)) : "null", \
+          (b & 1) ? "tagged" : b ? fpprt_type_name(fpprt_typeid(b)) : "null"); \
+  fpp_not_emitted("generic arith on mixed values");                     \
+  return 0;                                                             \
+}
+FPP_ARITH2(fpp_addv, +,
+  if (fpp_is_tid(a, FPP_TID_STR) && fpp_is_tid(b, FPP_TID_STR))
+    return fpp_str_concat(a, b);)
+FPP_ARITH2(fpp_subv, -, )
+FPP_ARITH2(fpp_mulv, *, )
+
+V fpp_divv(V a, V b) {
+  if ((a & 1) && (b & 1)) {
+    if (UNTAGI(b) == 0) fpp_raise(fpp_str_c("division by zero", 16));
+    return TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(a) / (int32_t)UNTAGI(b)));
+  }
+  if (fpp_is_tid(a, FPP_TID_F64) && fpp_is_tid(b, FPP_TID_F64))
+    return fpp_box_f64(fpp_unbox_f64(a) / fpp_unbox_f64(b));
+  if (fpp_is_tid(a, FPP_TID_I64) && fpp_is_tid(b, FPP_TID_I64))
+    return fpp_box_i64(fpp_unbox_i64(a) / fpp_unbox_i64(b));
+  fpp_not_emitted("generic div on mixed values");
+  return 0;
+}
+V fpp_modv(V a, V b) {
+  if ((a & 1) && (b & 1)) {
+    if (UNTAGI(b) == 0) fpp_raise(fpp_str_c("division by zero", 16));
+    return TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(a) % (int32_t)UNTAGI(b)));
+  }
+  if (fpp_is_tid(a, FPP_TID_F64) && fpp_is_tid(b, FPP_TID_F64))
+    return fpp_box_f64(__builtin_fmod(fpp_unbox_f64(a), fpp_unbox_f64(b)));
+  if (fpp_is_tid(a, FPP_TID_I64) && fpp_is_tid(b, FPP_TID_I64))
+    return fpp_box_i64(fpp_unbox_i64(a) % fpp_unbox_i64(b));
+  fpp_not_emitted("generic mod on mixed values");
+  return 0;
+}
+
+V fpp_negv(V a) {
+  if (a & 1) return TAGI(-UNTAGI(a));
+  if (fpp_is_tid(a, FPP_TID_F64)) return fpp_box_f64(-fpp_unbox_f64(a));
+  if (fpp_is_tid(a, FPP_TID_I64)) return fpp_box_i64(-fpp_unbox_i64(a));
+  fpp_not_emitted("generic negation");
+  return 0;
+}
+
+V fpp_absv(V a) {
+  if (a & 1) { intptr_t v = UNTAGI(a); return TAGI(v < 0 ? -v : v); }
+  if (fpp_is_tid(a, FPP_TID_F64))
+    return fpp_box_f64(__builtin_fabs(fpp_unbox_f64(a)));
+  if (fpp_is_tid(a, FPP_TID_I64)) {
+    int64_t v = fpp_unbox_i64(a);
+    return fpp_box_i64(v < 0 ? -v : v);
+  }
+  fpp_not_emitted("abs");
+  return 0;
+}
+
+V fpp_signv(V a) {
+  if (a & 1) { intptr_t v = UNTAGI(a); return TAGI(v < 0 ? -1 : v > 0 ? 1 : 0); }
+  if (fpp_is_tid(a, FPP_TID_F64)) {
+    double v = fpp_unbox_f64(a);
+    return TAGI(v < 0 ? -1 : v > 0 ? 1 : 0);
+  }
+  if (fpp_is_tid(a, FPP_TID_I64)) {
+    int64_t v = fpp_unbox_i64(a);
+    return TAGI(v < 0 ? -1 : v > 0 ? 1 : 0);
+  }
+  fpp_not_emitted("sign");
+  return 0;
+}
+
+double fpp_round_even(double x) {
+  /* .NET Math.Round: banker's rounding */
+  double r = __builtin_nearbyint(x);
+  return r == 0.0 ? 0.0 : r;   /* normalize -0 */
+}
+
+/* ---- show and the print family ------------------------------------------ */
+
+V fpp_showv(V x) {
+  /* the generic renderer; grows toward the oracle's $showv as parity
+   * demands (records, unions, lists) */
+  return fpp_to_string(x);
+}
+
+void fpp_print_any(V x) {
+  fpp_print(fpp_showv(x));
+}
+
+void fpp_print_u32(V x) {
+  char buf[16];
+  int n = snprintf(buf, sizeof buf, "%u", (unsigned)UNTAGI(x));
+  V s = fpp_str_c(buf, (size_t)n);
+  fpp_print(s);
+}
+
 /* ---- init --------------------------------------------------------------- */
 
 void fpp_lang_init(void) {
@@ -465,6 +654,218 @@ void fpp_lang_init(void) {
   fpprt_register_type(FPP_TID_ARR, (struct fpprt_type){
     0, FPPRT_KIND_REF_ARRAY, 0, NULL, "array" });
   fpp_reg_struct(FPP_TID_CONS, 2, FPP_TC_OTHER, "cons");
+  /* [tag][src][idx]: idx is a TAGGED int, so both fields sit on the map
+   * and the tracer skips the tagged one */
+  fpp_reg_struct(FPP_TID_ENUM, 2, FPP_TC_OTHER, "enum");
   fpp_reg_struct(FPP_TID_CELL, 1, FPP_TC_OTHER, "cell");
   fpp_reg_clo(FPP_TID_PAP, 2);
+}
+
+/* ---- string methods: the $str.* family, .NET semantics ------------------ */
+
+static int fpp_str_index_of_(V s, V what, intptr_t start, int last) {
+  size_t n = fpp_str_len(s);
+  uint16_t *u = fpp_str_units(s);
+  if (what & 1) {
+    uint16_t c = (uint16_t)UNTAGI(what);
+    if (last) {
+      for (intptr_t i = (intptr_t)n - 1; i >= start; i--)
+        if (u[i] == c) return (int)i;
+    } else {
+      for (size_t i = (size_t)start; i < n; i++)
+        if (u[i] == c) return (int)i;
+    }
+    return -1;
+  }
+  size_t m = fpp_str_len(what);
+  uint16_t *w = fpp_str_units(what);
+  if (m == 0) return last ? (int)n : (int)start;
+  if (m > n) return -1;
+  if (last) {
+    for (intptr_t i = (intptr_t)(n - m); i >= start; i--)
+      if (memcmp(u + i, w, m * 2) == 0) return (int)i;
+  } else {
+    for (size_t i = (size_t)start; i + m <= n; i++)
+      if (memcmp(u + i, w, m * 2) == 0) return (int)i;
+  }
+  return -1;
+}
+
+static V fpp_str_sub_(V s, size_t start, size_t len) {
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = s;
+  V r = fpprt_alloc_array(FPP_TID_STR, len);
+  memcpy(fpp_str_units(r), fpp_str_units(f_slots[0]) + start, len * 2);
+  FPPRT_LEAVE(f);
+  return r;
+}
+
+static int fpp_str_ws_(uint16_t c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+      || c == '\v' || c == '\f' || c == 0xa0;
+}
+
+V fpp_str_method(const char *m, V recv, V *args, size_t nargs) {
+  size_t n = fpp_str_len(recv);
+  uint16_t *u = fpp_str_units(recv);
+  if (!strcmp(m, "Contains"))
+    return TAGI(fpp_str_index_of_(recv, args[0], 0, 0) >= 0);
+  if (!strcmp(m, "IndexOf")) {
+    intptr_t start = nargs > 1 ? UNTAGI(args[1]) : 0;
+    return TAGI(fpp_str_index_of_(recv, args[0], start, 0));
+  }
+  if (!strcmp(m, "LastIndexOf"))
+    return TAGI(fpp_str_index_of_(recv, args[0], 0, 1));
+  if (!strcmp(m, "StartsWith")) {
+    size_t mlen = fpp_str_len(args[0]);
+    return TAGI(mlen <= n && memcmp(u, fpp_str_units(args[0]), mlen * 2) == 0);
+  }
+  if (!strcmp(m, "EndsWith")) {
+    size_t mlen = fpp_str_len(args[0]);
+    return TAGI(mlen <= n
+                && memcmp(u + n - mlen, fpp_str_units(args[0]), mlen * 2) == 0);
+  }
+  if (!strcmp(m, "Substring")) {
+    size_t start = (size_t)UNTAGI(args[0]);
+    size_t len = nargs > 1 ? (size_t)UNTAGI(args[1]) : n - start;
+    if (start > n || start + len > n)
+      fpp_raise(fpp_str_c("Substring out of range", 22));
+    return fpp_str_sub_(recv, start, len);
+  }
+  if (!strcmp(m, "Remove")) {
+    size_t start = (size_t)UNTAGI(args[0]);
+    size_t cut = nargs > 1 ? (size_t)UNTAGI(args[1]) : n - start;
+    FPPRT_FRAME(f, 1);
+    f_slots[0] = recv;
+    V r = fpprt_alloc_array(FPP_TID_STR, n - cut);
+    memcpy(fpp_str_units(r), fpp_str_units(f_slots[0]), start * 2);
+    memcpy(fpp_str_units(r) + start, fpp_str_units(f_slots[0]) + start + cut,
+           (n - start - cut) * 2);
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "Insert")) {
+    size_t at = (size_t)UNTAGI(args[0]);
+    FPPRT_FRAME(f, 2);
+    f_slots[0] = recv;
+    f_slots[1] = args[1];
+    size_t mlen = fpp_str_len(f_slots[1]);
+    V r = fpprt_alloc_array(FPP_TID_STR, n + mlen);
+    memcpy(fpp_str_units(r), fpp_str_units(f_slots[0]), at * 2);
+    memcpy(fpp_str_units(r) + at, fpp_str_units(f_slots[1]), mlen * 2);
+    memcpy(fpp_str_units(r) + at + mlen, fpp_str_units(f_slots[0]) + at,
+           (n - at) * 2);
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "Replace")) {
+    /* build by scanning; args may be chars or strings */
+    FPPRT_FRAME(f, 3);
+    f_slots[0] = recv;
+    f_slots[1] = args[0];
+    f_slots[2] = args[1];
+    if ((f_slots[1] & 1) && (f_slots[2] & 1)) {
+      V r = fpp_str_sub_(f_slots[0], 0, n);
+      uint16_t from = (uint16_t)UNTAGI(f_slots[1]);
+      uint16_t to = (uint16_t)UNTAGI(f_slots[2]);
+      for (size_t i = 0; i < n; i++)
+        if (fpp_str_units(r)[i] == from) fpp_str_units(r)[i] = to;
+      FPPRT_LEAVE(f);
+      return r;
+    }
+    size_t flen = fpp_str_len(f_slots[1]);
+    size_t tlen = fpp_str_len(f_slots[2]);
+    /* count matches */
+    size_t count = 0;
+    for (size_t i = 0; flen && i + flen <= n;) {
+      if (memcmp(fpp_str_units(f_slots[0]) + i, fpp_str_units(f_slots[1]),
+                 flen * 2) == 0) { count++; i += flen; }
+      else i++;
+    }
+    V r = fpprt_alloc_array(FPP_TID_STR, n + count * tlen - count * flen);
+    uint16_t *out = fpp_str_units(r);
+    size_t k = 0;
+    for (size_t i = 0; i < n;) {
+      if (flen && i + flen <= n
+          && memcmp(fpp_str_units(f_slots[0]) + i, fpp_str_units(f_slots[1]),
+                    flen * 2) == 0) {
+        memcpy(out + k, fpp_str_units(f_slots[2]), tlen * 2);
+        k += tlen;
+        i += flen;
+      } else out[k++] = fpp_str_units(f_slots[0])[i++];
+    }
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "ToUpper") || !strcmp(m, "ToLower")) {
+    int up = m[2] == 'U';
+    FPPRT_FRAME(f, 1);
+    f_slots[0] = recv;
+    V r = fpp_str_sub_(f_slots[0], 0, n);
+    for (size_t i = 0; i < n; i++) {
+      uint16_t c = fpp_str_units(r)[i];
+      if (up && c >= 'a' && c <= 'z') fpp_str_units(r)[i] = c - 32;
+      if (!up && c >= 'A' && c <= 'Z') fpp_str_units(r)[i] = c + 32;
+    }
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "Trim") || !strcmp(m, "TrimStart") || !strcmp(m, "TrimEnd")) {
+    size_t a = 0, b = n;
+    int doStart = strcmp(m, "TrimEnd") != 0;
+    int doEnd = strcmp(m, "TrimStart") != 0;
+    if (doStart) while (a < b && fpp_str_ws_(u[a])) a++;
+    if (doEnd) while (b > a && fpp_str_ws_(u[b - 1])) b--;
+    return fpp_str_sub_(recv, a, b - a);
+  }
+  if (!strcmp(m, "PadLeft") || !strcmp(m, "PadRight")) {
+    size_t want = (size_t)UNTAGI(args[0]);
+    uint16_t fill = nargs > 1 ? (uint16_t)UNTAGI(args[1]) : ' ';
+    if (want <= n) return recv;
+    FPPRT_FRAME(f, 1);
+    f_slots[0] = recv;
+    V r = fpprt_alloc_array(FPP_TID_STR, want);
+    size_t pad = want - n;
+    if (m[3] == 'L') {
+      for (size_t i = 0; i < pad; i++) fpp_str_units(r)[i] = fill;
+      memcpy(fpp_str_units(r) + pad, fpp_str_units(f_slots[0]), n * 2);
+    } else {
+      memcpy(fpp_str_units(r), fpp_str_units(f_slots[0]), n * 2);
+      for (size_t i = 0; i < pad; i++) fpp_str_units(r)[n + i] = fill;
+    }
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "ToCharArray")) {
+    FPPRT_FRAME(f, 1);
+    f_slots[0] = recv;
+    V r = fpp_arr_new(n);
+    for (size_t i = 0; i < n; i++)
+      ((uintptr_t *)r)[i + 2] = TAGI(fpp_str_units(f_slots[0])[i]);
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  if (!strcmp(m, "Split")) {
+    /* split on one char (tagged) — .NET drops nothing by default */
+    FPPRT_FRAME(f, 2);
+    f_slots[0] = recv;
+    uint16_t sep = (uint16_t)UNTAGI(args[0]);
+    size_t parts = 1;
+    for (size_t i = 0; i < n; i++) if (u[i] == sep) parts++;
+    f_slots[1] = fpp_arr_new(parts);
+    size_t start = 0, k = 0;
+    for (size_t i = 0; i <= n; i++) {
+      if (i == n || fpp_str_units(f_slots[0])[i] == sep) {
+        V piece = fpp_str_sub_(f_slots[0], start, i - start);
+        fpp_arr_set(f_slots[1], k++, piece);
+        start = i + 1;
+      }
+    }
+    V r = f_slots[1];
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  fprintf(stderr, "fpp: string method %s\n", m);
+  fpp_not_emitted("string method");
+  return 0;
 }

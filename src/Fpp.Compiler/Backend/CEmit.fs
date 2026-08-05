@@ -42,6 +42,7 @@ type CSt =
       CaseArity : Dict<string, int>
       EnumVal : Dict<string, int>            // enum case name -> value
       FnClo : Dict<string * int, string>     // fn used as value -> global clo
+      CloInits : Vec<string>                 // closure singletons: BEFORE all global inits
       VSlot : Dict<string * string, int>     // (bare iface, member) -> slot
       VWrap : Dict<string * int, string>     // member fn -> uniform wrapper
       ClassBase : Dict<string, string>       // class -> base
@@ -224,6 +225,25 @@ let private cellLocals (body : Expr) : Dict<string * int, bool> =
 
 // ---- expression emission --------------------------------------------------
 
+let private mathSet (b : string) : bool =
+    b = "abs" || b = "sqrt" || b = "floor" || b = "ceil"
+    || b = "truncate" || b = "round" || b = "sign" || b = "exp"
+    || b = "log" || b = "log2" || b = "log10" || b = "sin" || b = "cos"
+    || b = "tan" || b = "asin" || b = "acos" || b = "atan"
+    || b = "sinh" || b = "cosh" || b = "tanh"
+
+/// the FULL name wins before suffix stripping: "abs" must not lose its s
+let private mathBase (op0 : string) : string option =
+    if mathSet op0 then Some op0
+    elif strLen op0 > 1 then
+        let c = charAt op0 (strLen op0 - 1)
+        if c = 'i' || c = 'f' || c = 'l' || c = 's' || c = 'h'
+           || c = 'w' || c = 'v' || c = 'b' || c = 'c' then
+            let b = op0.Substring (0, strLen op0 - 1)
+            if mathSet b then Some b else None
+        else None
+    else None
+
 let private opBase (op0 : string) : string * char =
     // "=i" -> ("=", 'i'); a bare op is int-kinded
     if strLen op0 >= 2 then
@@ -236,9 +256,9 @@ let private opBase (op0 : string) : string * char =
             || head = "^^^" || head = "<<<" || head = ">>>"
         if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
                      || last = 'l' || last = 's' || last = 'u' || last = 't'
-                     || last = 'o') then head, last
-        else op0, 'i'
-    else op0, 'i'
+                     || last = 'o' || last = 'w' || last = 'v' || last = 'h') then head, last
+        else op0, '?'
+    else op0, '?'
 
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     let trap (what : string) : int =
@@ -257,9 +277,22 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         find 0 order
     match e with
     | ELit (LInt s) ->
+        // the literal keeps its SOURCE suffix (5L, 3uy, 7us, 0x1F);
+        // int64/uint64 box, everything else tags
         let d = slot f
-        let txt = if s.EndsWith "L" then s.Substring (0, strLen s - 1) else s
-        stmt f (sref d + " = TAGI(" + txt + "L);")
+        let mutable cut = strLen s
+        while cut > 0 && (let c = charAt s (cut - 1) in
+                          c = 'L' || c = 'l' || c = 'u' || c = 'U'
+                          || c = 'y' || c = 's' || c = 'n') && cut > 1
+              && not (cut = strLen s && strLen s >= 2 && charAt s 0 = '0'
+                      && (charAt s 1 = 'x' || charAt s 1 = 'X') && cut <= 2) do
+            cut <- cut - 1
+        let num = s.Substring (0, cut)
+        let suffix = s.Substring cut
+        if suffix.Contains "L" || suffix.Contains "l" then
+            stmt f (sref d + " = fpp_box_i64(" + num + "LL);")
+        else
+            stmt f (sref d + " = TAGI(" + num + "L);")
         d
     | ELit (LBool b) ->
         let d = slot f
@@ -315,17 +348,42 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                          d
                      | None -> trap ("free var " + v.Name))
     | EApp (EUnknown "print", [ a ]) ->
+        // the GENERIC print: a string prints raw, anything else through the
+        // value renderer — the oracle's $showv path
+        let x = emitE st f a
+        stmt f ("fpp_print_any(" + sref x + ");")
+        unitV ()
+    | EApp (EUnknown "prints", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_print(" + sref x + ");")
         unitV ()
+    | EApp (EUnknown "printb", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_print(fpp_bool_to_string(" + sref x + "));")
+        unitV ()
+    | EApp (EUnknown "printc", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_print(fpp_char_to_string(" + sref x + "));")
+        unitV ()
+    | EApp (EUnknown "printu", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_print_u32(" + sref x + ");")
+        unitV ()
+    | EApp (EUnknown "showv", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_showv(" + sref x + ");")
+        d
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" ->
         let x = emitE st f a
         let d = slot f
         let k = if strLen n > 6 then charAt n (strLen n - 1) else ' '
         (match k with
          | 'b' -> stmt f (sref d + " = fpp_bool_to_string(" + sref x + ");")
-         | 'f' -> stmt f (sref d + " = fpp_f64_to_string(" + sref x + ");")
+         | 'f' | 's' | 'h' -> stmt f (sref d + " = fpp_f64_to_string(" + sref x + ");")
          | 'c' -> stmt f (sref d + " = fpp_char_to_string(" + sref x + ");")
+         | 'v' -> stmt f (sref d + " = fpp_u64_to_string(" + sref x + ");")
+         | 'w' -> stmt f (sref d + " = fpp_u32_to_string(" + sref x + ");")
          | _ -> stmt f (sref d + " = fpp_to_string(" + sref x + ");"))
         d
     | EApp (EUnknown "$cellof", [ inner ]) ->
@@ -382,7 +440,25 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_to_f64(" + sref x + ");")
         d
-    | EApp (EUnknown n, [ a ]) when (n.StartsWith "int" && not (n.StartsWith "int64") && not (n.StartsWith "int16")) ->
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int64" || n.StartsWith "uint64" ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_to_i64(" + sref x + ");")
+        d
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte" || n.StartsWith "sbyte"
+                                    || n.StartsWith "int16" || n.StartsWith "uint16"
+                                    || n.StartsWith "uint32" ->
+        let x = emitE st f a
+        let d = slot f
+        let mask =
+            if n.StartsWith "byte" then "(intptr_t)(uint8_t)"
+            elif n.StartsWith "sbyte" then "(intptr_t)(int8_t)"
+            elif n.StartsWith "int16" then "(intptr_t)(int16_t)"
+            elif n.StartsWith "uint16" then "(intptr_t)(uint16_t)"
+            else "(intptr_t)(uint32_t)"
+        stmt f (sref d + " = TAGI(" + mask + "UNTAGI(fpp_to_int(" + sref x + ")));")
+        d
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int" ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_int(" + sref x + ");")
@@ -391,6 +467,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_int(" + sref x + ");")
+        d
+    | EApp (EUnknown n, [ a ]) when (mathBase n).IsSome ->
+        emitE st f (EPrim (n, [ a ]))
+    | EApp (EUnknown n, recv :: args) when n.StartsWith "$str." ->
+        let m = n.Substring 5
+        let r = emitE st f recv
+        let xs = args |> List.map (emitE st f)
+        let first = f.NSlots
+        for x in xs do
+            let s2 = slot f
+            stmt f (sref s2 + " = " + sref x + ";")
+        let d = slot f
+        stmt f (sref d + " = fpp_str_method(" + cstr m + ", " + sref r
+                + ", &F[" + string first + "], " + string (List.length xs) + ");")
         d
     | EApp (EUnknown "isNull", [ a ]) ->
         let x = emitE st f a
@@ -445,28 +535,50 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let y = emitE st f b
         let d = slot f
         let arith (cop : string) =
-            if k = 'f' then
+            if k = '?' then
+                // int carries NO kind suffix, and neither does generic code:
+                // dispatch at runtime, exactly as the oracle's $addv does
+                let fn =
+                    match cop with
+                    | "+" -> "fpp_addv" | "-" -> "fpp_subv" | "*" -> "fpp_mulv"
+                    | "/" -> "fpp_divv" | _ -> "fpp_modv"
+                stmt f (sref d + " = " + fn + "(" + sref x + ", " + sref y + ");")
+            elif k = 'f' then
                 stmt f (sref d + " = fpp_box_f64(fpp_unbox_f64(" + sref x + ") " + cop
                         + " fpp_unbox_f64(" + sref y + "));")
+            elif k = 's' || k = 'h' then
+                // float32/float16 ride in f64 boxes; rounding through
+                // (float) after every op keeps single precision semantics
+                stmt f (sref d + " = fpp_box_f64((double)(float)((float)fpp_unbox_f64("
+                        + sref x + ") " + cop + " (float)fpp_unbox_f64(" + sref y + ")));")
             elif k = 'l' then
                 stmt f (sref d + " = fpp_box_i64(fpp_unbox_i64(" + sref x + ") " + cop
                         + " fpp_unbox_i64(" + sref y + "));")
+            elif k = 'v' then
+                stmt f (sref d + " = fpp_box_i64((int64_t)((uint64_t)fpp_unbox_i64("
+                        + sref x + ") " + cop + " (uint64_t)fpp_unbox_i64(" + sref y + ")));")
+            elif k = 'w' then
+                stmt f (sref d + " = TAGI((intptr_t)(uint32_t)((uint32_t)UNTAGI("
+                        + sref x + ") " + cop + " (uint32_t)UNTAGI(" + sref y + ")));")
             else
-                stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
-                        + " UNTAGI(" + sref y + "));")
+                stmt f (sref d + " = TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(" + sref x + ") " + cop
+                        + " (int32_t)UNTAGI(" + sref y + ")));")
         let rel (cop : string) =
-            if k = 't' || k = 'o' then
+            if k = '?' || k = 't' || k = 'o' then
                 stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") "
                         + cop + " 0);")
-            elif k = 'f' then
+            elif k = 'f' || k = 's' || k = 'h' then
                 stmt f (sref d + " = TAGI(fpp_unbox_f64(" + sref x + ") " + cop
                         + " fpp_unbox_f64(" + sref y + "));")
             elif k = 'l' then
                 stmt f (sref d + " = TAGI(fpp_unbox_i64(" + sref x + ") " + cop
                         + " fpp_unbox_i64(" + sref y + "));")
-            elif k = 's' then
-                stmt f (sref d + " = TAGI(fpp_str_cmp(" + sref x + ", " + sref y + ") "
-                        + cop + " 0);")
+            elif k = 'v' then
+                stmt f (sref d + " = TAGI((uint64_t)fpp_unbox_i64(" + sref x + ") " + cop
+                        + " (uint64_t)fpp_unbox_i64(" + sref y + "));")
+            elif k = 'w' then
+                stmt f (sref d + " = TAGI((uint32_t)UNTAGI(" + sref x + ") " + cop
+                        + " (uint32_t)UNTAGI(" + sref y + "));")
             else
                 stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
                         + " UNTAGI(" + sref y + "));")
@@ -479,17 +591,76 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | "<>" -> stmt f (sref d + " = TAGI(!fpp_eqv(" + sref x + ", " + sref y + "));")
          | "&&" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") && UNTAGI(" + sref y + "));")
          | "||" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") || UNTAGI(" + sref y + "));")
-         | "&&&" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") & UNTAGI(" + sref y + "));")
-         | "|||" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") | UNTAGI(" + sref y + "));")
-         | "^^^" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") ^ UNTAGI(" + sref y + "));")
-         | "<<<" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") << UNTAGI(" + sref y + "));")
-         | ">>>" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") >> UNTAGI(" + sref y + "));")
+         | "&&&" | "|||" | "^^^" | "<<<" | ">>>" ->
+             let cop =
+                 match op with
+                 | "&&&" -> "&" | "|||" -> "|" | "^^^" -> "^"
+                 | "<<<" -> "<<" | _ -> ">>"
+             if k = 'l' then
+                 // int64: unbox; shift COUNTS are tagged ints
+                 let rhs =
+                     if op = "<<<" || op = ">>>" then "UNTAGI(" + sref y + ")"
+                     else "fpp_unbox_i64(" + sref y + ")"
+                 stmt f (sref d + " = fpp_box_i64(fpp_unbox_i64(" + sref x + ") "
+                         + cop + " " + rhs + ");")
+             elif k = 'v' then
+                 let rhs =
+                     if op = "<<<" || op = ">>>" then "UNTAGI(" + sref y + ")"
+                     else "(uint64_t)fpp_unbox_i64(" + sref y + ")"
+                 stmt f (sref d + " = fpp_box_i64((int64_t)((uint64_t)fpp_unbox_i64("
+                         + sref x + ") " + cop + " " + rhs + "));")
+             elif k = 'w' then
+                 stmt f (sref d + " = TAGI((intptr_t)(uint32_t)((uint32_t)UNTAGI("
+                         + sref x + ") " + cop + " (uint32_t)UNTAGI(" + sref y + ")));")
+             elif op = ">>>" && k = '?' then
+                 // bare shift right on int32 stays ARITHMETIC in .NET
+                 stmt f (sref d + " = TAGI((intptr_t)((int32_t)UNTAGI(" + sref x
+                         + ") >> UNTAGI(" + sref y + ")));")
+             else
+                 stmt f (sref d + " = TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(" + sref x + ") "
+                         + cop + " UNTAGI(" + sref y + ")));")
          | _ -> stmt f (sref d + " = fpp_not_emitted(" + cstr ("op " + op0) + ");"))
+        d
+    | EPrim (("unot" | "unoti" | "unotb"), [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(!UNTAGI(" + sref x + "));")
         d
     | EPrim ("not", [ a ]) | EApp (EUnknown "not", [ a ]) ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = TAGI(!UNTAGI(" + sref x + "));")
+        d
+    | EPrim (op0, [ a ]) when (mathBase op0).IsSome ->
+        let bare = (mathBase op0).Value
+        let x = emitE st f a
+        let d = slot f
+        (match bare with
+         | "abs" -> stmt f (sref d + " = fpp_absv(" + sref x + ");")
+         | "sign" -> stmt f (sref d + " = fpp_signv(" + sref x + ");")
+         | "truncate" -> stmt f (sref d + " = fpp_box_f64(__builtin_trunc(fpp_unbox_f64(" + sref x + ")));")
+         | "round" -> stmt f (sref d + " = fpp_box_f64(fpp_round_even(fpp_unbox_f64(" + sref x + ")));")
+         | m ->
+             let cfn =
+                 match m with
+                 | "ceil" -> "__builtin_ceil"
+                 | "log" -> "__builtin_log"
+                 | _ -> "__builtin_" + m
+             stmt f (sref d + " = fpp_box_f64(" + cfn + "(fpp_unbox_f64(" + sref x + ")));"))
+        d
+    | EPrim (op0, [ a ]) when op0.StartsWith "u-" ->
+        let x = emitE st f a
+        let d = slot f
+        let k = if strLen op0 > 2 then charAt op0 2 else '?'
+        (match k with
+         | 'f' | 's' | 'h' ->
+             stmt f (sref d + " = fpp_box_f64(-fpp_unbox_f64(" + sref x + "));")
+         | 'l' | 'v' ->
+             stmt f (sref d + " = fpp_box_i64(-fpp_unbox_i64(" + sref x + "));")
+         | 'i' | 'b' | 'c' | 'w' ->
+             stmt f (sref d + " = TAGI(-UNTAGI(" + sref x + "));")
+         | _ ->
+             stmt f (sref d + " = fpp_negv(" + sref x + ");"))
         d
     | EPrim (("~-" | "~-i"), [ a ]) ->
         let x = emitE st f a
@@ -720,17 +891,34 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         vs |> List.iteri (fun i x ->
             stmt f ("fpp_arr_set(" + sref d + ", " + string i + ", " + sref x + ");"))
         d
-    | EArrayCreate (_, n, v) ->
+    | EArrayCreate (nm, n, v) ->
         let nv = emitE st f n
         let d = slot f
-        stmt f (sref d + " = fpp_arr_new((size_t)UNTAGI(" + sref nv + "));")
         (match v with
-         | EUnknown "$zero" -> ()
+         | EUnknown "$zero" ->
+             // .NET zeros by ELEMENT KIND: an int slot is tagged 0, never
+             // null — generic code adds it without looking
+             let zk =
+                 match nm with
+                 | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
+                 | "uint16" | "uint32" | "enum" -> "1"
+                 | "float" | "float32" | "double" | "single" -> "2"
+                 | "int64" | "uint64" -> "3"
+                 | _ -> "0"
+             stmt f (sref d + " = fpp_arr_zeroed(" + zk + ", (size_t)UNTAGI("
+                     + sref nv + "));")
          | _ ->
+             stmt f (sref d + " = fpp_arr_new((size_t)UNTAGI(" + sref nv + "));")
              let x = emitE st f v
              stmt f ("{ size_t N = fpprt_array_len(" + sref d + ");")
              stmt f ("for (size_t I = 0; I < N; I++) fpp_arr_set(" + sref d
                      + ", I, " + sref x + "); }"))
+        d
+    | EIndex ("$str", a, i) ->
+        let av = emitE st f a
+        let iv = emitE st f i
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_str_units(" + sref av + ")[UNTAGI(" + sref iv + ")]);")
         d
     | EIndex (_, a, i) ->
         let av = emitE st f a
@@ -743,6 +931,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let iv = emitE st f i
         let xv = emitE st f v
         stmt f ("fpp_arr_set(" + sref av + ", (size_t)UNTAGI(" + sref iv + "), " + sref xv + ");")
+        unitV ()
+    | EIndexSet ("$str", a, i, v) ->
+        let av = emitE st f a
+        let iv = emitE st f i
+        let xv = emitE st f v
+        stmt f ("fpp_str_units(" + sref av + ")[UNTAGI(" + sref iv + ")] = (uint16_t)UNTAGI(" + sref xv + ");")
         unitV ()
     | EArrayLen (_, a) ->
         let av = emitE st f a
@@ -812,8 +1006,21 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
         stmt f (sref l + " = " + sref sv + ";")
         dictSet f.Locals (v.Path, v.Offset) l
     | PLit (LInt s) ->
-        let txt = if s.EndsWith "L" then s.Substring (0, strLen s - 1) else s
-        stmt f ("if (" + sref sv + " != TAGI(" + txt + "L)) " + sref ok + " = TAGI(0);")
+        let mutable cut = strLen s
+        while cut > 1 && (let c = charAt s (cut - 1) in
+                          c = 'L' || c = 'l' || c = 'u' || c = 'U'
+                          || c = 'y' || c = 's' || c = 'n') do
+            cut <- cut - 1
+        let num = s.Substring (0, cut)
+        let suffix = s.Substring cut
+        if suffix.Contains "L" || suffix.Contains "l" then
+            let lit = slot f
+            stmt f (sref lit + " = fpp_box_i64(" + num + "LL);")
+            stmt f ("if (!fpp_eqv(" + sref sv + ", " + sref lit + ")) "
+                    + sref ok + " = TAGI(0);")
+        else
+            stmt f ("if (" + sref sv + " != TAGI(" + num + "L)) "
+                    + sref ok + " = TAGI(0);")
     | PLit (LBool b) ->
         stmt f ("if (" + sref sv + " != TAGI(" + (if b then "1" else "0") + ")) "
                 + sref ok + " = TAGI(0);")
@@ -986,8 +1193,10 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
              + fn + "(" + String.concat ", " psx + ");\n}")
         let tid = freshTid st
         vecAdd st.Reg ("  fpp_reg_clo(" + string tid + ", 0);")
-        vecAdd st.Inits ("  " + g + " = fpp_clo_new(" + string tid + ", (fpp_code_t)"
-                         + code + ", " + string arity + ", 0);")
+        // a fn-closure singleton has no dependencies: it initializes before
+        // EVERY global initializer, whatever order emission discovered it
+        vecAdd st.CloInits ("  " + g + " = fpp_clo_new(" + string tid + ", (fpp_code_t)"
+                            + code + ", " + string arity + ", 0);")
         g
 
 /// one function body, wrapped in its shadow frame
@@ -1036,6 +1245,7 @@ let emitC (decls : Decl list) : string * string list =
           CaseArity = dictNew<string, int> ()
           EnumVal = dictNew<string, int> ()
           FnClo = dictNew<string * int, string> ()
+          CloInits = vecNew<string> ()
           VSlot = dictNew<string * string, int> ()
           VWrap = dictNew<string * int, string> ()
           ClassBase = dictNew<string, string> ()
@@ -1089,6 +1299,22 @@ let emitC (decls : Decl list) : string * string list =
                     dictSet st.VSlot (bare, mn) st.NVSlots
                     st.NVSlots <- st.NVSlots + 1
         | _ -> ()
+    // stamped record clones ("ResizeArray$int") arrive with EMPTY field
+    // lists — the layout is the base's, uniform representation makes every
+    // stamp identical, so they simply inherit the base record's fields.
+    // Registration must agree (dictPairs snapshots, so mutation is safe).
+    for n, flds in dictPairs st.RecFields do
+        if List.isEmpty flds && n.Contains "$" then
+            let baseName = n.Substring (0, n.IndexOf "$")
+            match dictTryFind st.RecFields baseName with
+            | Some bf when not (List.isEmpty bf) ->
+                dictSet st.RecFields n bf
+                match dictTryFind st.RecTid n with
+                | Some tid ->
+                    vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
+                                   + string (List.length bf) + ", 1, " + cstr n + ");")
+                | None -> ()
+            | _ -> ()
     // pass 1.5: vtables — every class registers its impl chain's members
     // (nearest declaration wins, walking the base chain)
     let vtReg = vecNew<string> ()
@@ -1130,6 +1356,26 @@ let emitC (decls : Decl list) : string * string list =
                       | None -> go <- false)
              | None -> ())
         | _ -> ()
+    // builtin seq protocol: arrays, lists, strings and tuples answer
+    // IEnumerable/IEnumerator through runtime enumerators, wired into THIS
+    // program's slot numbers
+    (match dictTryFind st.VSlot ("IEnumerable", "GetEnumerator") with
+     | Some sl ->
+         for tid in [ "FPP_TID_ARR"; "FPP_TID_CONS"; "FPP_TID_STR"; "FPP_TID_TUPLE" ] do
+             vecAdd vtReg ("  fpp_vt_set(" + tid + ", " + string sl + ", fpp_seq_getenum);")
+     | None -> ())
+    (match dictTryFind st.VSlot ("IEnumerator", "MoveNext") with
+     | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_movenext);")
+     | None -> ())
+    (match dictTryFind st.VSlot ("IEnumerator", "Current") with
+     | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_current);")
+     | None -> ())
+    (match dictTryFind st.VSlot ("IEnumerator", "Dispose") with
+     | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_dispose);")
+     | None -> ())
+    (match dictTryFind st.VSlot ("IDisposable", "Dispose") with
+     | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_dispose);")
+     | None -> ())
     // pass 2: emission
     for d in decls do
         match d with
@@ -1187,6 +1433,7 @@ let emitC (decls : Decl list) : string * string list =
         vecAdd out ("  fpprt_add_static_roots(&" + n + ", 1);")
     for t in vecToList st.Reg do vecAdd out t
     for t in vecToList vtReg do vecAdd out t
+    for i in vecToList st.CloInits do vecAdd out i
     for i in vecToList st.Inits do vecAdd out i
     vecAdd out "  return 0;"
     vecAdd out "}"

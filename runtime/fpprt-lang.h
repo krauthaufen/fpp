@@ -31,6 +31,7 @@ typedef fpprt_ref V;
 #define FPP_TID_CELL   (FPPRT_TID_FIRST + 5)   /* one mutable ref */
 #define FPP_TID_ARR    (FPPRT_TID_FIRST + 6)   /* ref array, REFERENCE eq */
 #define FPP_TID_PAP    (FPPRT_TID_FIRST + 7)   /* partial application */
+#define FPP_TID_ENUM   (FPPRT_TID_FIRST + 8)   /* builtin seq enumerator */
 #define FPP_TID_USER   (FPPRT_TID_FIRST + 29)  /* == 32, CEmit's first tid */
 
 /* what a tid MEANS to equality/printing; index = tid */
@@ -69,6 +70,7 @@ V fpp_str_utf8(const char *bytes, size_t len);   /* decode UTF-8 -> UTF-16 */
 #define fpp_str_c fpp_str_utf8
 
 V fpp_str_concat(V a, V b);
+V fpp_str_method(const char *m, V recv, V *args, size_t nargs);
 int fpp_str_cmp(V a, V b);
 
 /* ---- boxes ------------------------------------------------------------- */
@@ -103,6 +105,7 @@ static inline V fpp_cell_get(V c) { return fpprt_read_ref(c, sizeof(V)); }
 static inline void fpp_cell_set(V c, V v) { fpprt_write_ref(c, sizeof(V), v); }
 
 static inline V fpp_arr_new(size_t n) { return fpprt_alloc_array(FPP_TID_ARR, n); }
+V fpp_arr_zeroed(int kind, size_t n);   /* 0 ref, 1 tagged 0, 2 f64 0.0, 3 i64 0 */
 static inline V fpp_arr_get(V a, size_t i) {
   if (i >= fpprt_array_len(a)) {
     fprintf(stderr, "fpp: index out of range\n");
@@ -142,6 +145,13 @@ V fpp_apply(V clo, V *args, size_t n);
 
 void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn);
 V fpp_vcall(V obj, int slot, V *args, size_t n);
+
+/* builtin seq protocol over arrays, lists and strings: the compiler wires
+ * these into ITS slot numbers for IEnumerable/IEnumerator */
+V fpp_seq_getenum(V self, V *args);
+V fpp_enum_movenext(V self, V *args);
+V fpp_enum_current(V self, V *args);
+V fpp_enum_dispose(V self, V *args);
 
 /* ---- exceptions --------------------------------------------------------- */
 
@@ -205,7 +215,29 @@ static inline V fpp_to_i64(V x) {
 }
 
 V fpp_to_string(V x);
+V fpp_showv(V x);
+void fpp_print_any(V x);
+void fpp_print_u32(V x);
+V fpp_negv(V a);
+V fpp_absv(V a);
+V fpp_signv(V a);
+double fpp_round_even(double x);
+V fpp_addv(V a, V b);
+V fpp_subv(V a, V b);
+V fpp_mulv(V a, V b);
+V fpp_divv(V a, V b);
+V fpp_modv(V a, V b);
 V fpp_f64_to_string(V x);
+static inline V fpp_u64_to_string(V x) {
+  char buf[24];
+  int n = snprintf(buf, sizeof buf, "%" PRIu64, (uint64_t)fpp_unbox_i64(x));
+  return fpp_str_c(buf, (size_t)n);
+}
+static inline V fpp_u32_to_string(V x) {
+  char buf[16];
+  int n = snprintf(buf, sizeof buf, "%u", (unsigned)UNTAGI(x));
+  return fpp_str_c(buf, (size_t)n);
+}
 static inline V fpp_bool_to_string(V x) {
   return UNTAGI(x) ? fpp_str_c("True", 4) : fpp_str_c("False", 5);
 }

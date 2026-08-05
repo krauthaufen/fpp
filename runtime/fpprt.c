@@ -121,6 +121,11 @@ void fpprt_register_type(uint32_t tid, struct fpprt_type t) {
   if (tid >= fpprt_ntypes_) fpprt_ntypes_ = tid + 1;
 }
 
+const char *fpprt_type_name(uint32_t tid) {
+  if (tid < fpprt_ntypes_ && fpprt_types_[tid].name) return fpprt_types_[tid].name;
+  return "?";
+}
+
 /* ---- lifecycle --------------------------------------------------------- */
 
 void fpprt_init(const struct fpprt_opts *opts) {

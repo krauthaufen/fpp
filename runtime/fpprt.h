@@ -125,6 +125,8 @@ void fpprt_write_ref(fpprt_ref o, uint32_t byteoff, fpprt_ref v);
 fpprt_ref fpprt_weak_new(fpprt_ref target);
 fpprt_ref fpprt_weak_get(fpprt_ref weak);
 
+const char *fpprt_type_name(uint32_t tid);
+
 /* ---- static roots ------------------------------------------------------ */
 
 /* Register a range of GLOBAL slots the collector reads and updates —
