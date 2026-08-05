@@ -1022,11 +1022,36 @@ and private emitPodWordStore (st : St) (f : Fn) (nm : string) (hl : string) (bl 
         ic f w
         ins f "i32.add"
     if everPinned then
-        // the array may be in linear memory: the runtime function decides
-        podPushHandle st f hl
-        idx ()
-        pushValue ()
-        callf f ("$hwset" + podSfxOf st nm)
+        match (if st.Opt then dictTryFind st.PodBase hl else None) with
+        | Some (sto, ptr) ->
+            // the base and the linear pointer are HOISTED: test the pin on
+            // the hoisted storage inline, exactly as the read path does. A
+            // program that pins f32 arrays ANYWHERE (float formatting does)
+            // marks the whole kind ever-pinned, and a store in a hot fill
+            // loop was paying a call plus two casts per word for it —
+            // hwsets was 17% of the vertex benchmark.
+            lg f sto
+            ins f "ref.is_null"
+            ifE f
+            lg f ptr
+            idx ()
+            ic f width
+            ins f "i32.mul"
+            ins f "i32.add"
+            pushValue ()
+            mem f storeOp
+            elseB f
+            lg f sto
+            idx ()
+            pushValue ()
+            gcT f "array.set" ty
+            endB f
+        | None ->
+            // the array may be in linear memory: the runtime function decides
+            podPushHandle st f hl
+            idx ()
+            pushValue ()
+            callf f ("$hwset" + podSfxOf st nm)
     else
         (match dictTryFind st.PodBase hl with
          | Some (sto, _) -> lg f sto
@@ -1038,6 +1063,17 @@ and private emitPodWordStore (st : St) (f : Fn) (nm : string) (hl : string) (bl 
         idx ()
         pushValue ()
         gcT f "array.set" ty
+
+/// A statically all-zero init value: `array.new_default` already IS this
+/// fill for a packed array. LNull counts — a POD layout has no reference
+/// slots, so null only ever spells a numeric zero here.
+and private podIsZeroInit (e : Expr) : bool =
+    match e with
+    | ERecord (_, fs) -> fs |> List.forall (fun (_, x) -> podIsZeroInit x)
+    | ELit (LInt "0") | ELit (LInt "0L") -> true
+    | ELit (LFloat "0.0") | ELit (LFloat "0.0f") -> true
+    | ELit LNull -> true
+    | _ -> false
 
 /// Push the handle. `hl` is normally a local, but for an array whose base a
 /// loop hoisted it is the GLOBAL's name — the write paths still want the
@@ -1218,8 +1254,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ic f (if b then 1 else 0)
         refI31 f
     | ELit LUnit ->
-        ic f 0
-        refI31 f
+        pushUnit f
     | EUnknown n when n.StartsWith "$zero:" ->
         // the zero of a stamped `defaultof<'T>`: scalars get 0, the
         // rest (refs, $ref, still-symbolic canon copies) get null
@@ -1252,12 +1287,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | ESeq xs ->
         (match List.rev xs with
          | [] ->
-             ic f 0
-             refI31 f
+             pushUnit f
          | last :: initRev ->
              for x in List.rev initRev do
                  emitNode st f lv x
-                 ins f "drop"
+                 dropU f
              emitNode st f lv last)
     | EVarI (v, sch, _) -> emitNode st f lv (EVar (v, sch))
     | EVar (v, _) when st.Opt && (dictTryFind st.ConstGlobal (v.Path, v.Offset)).IsSome
@@ -1500,8 +1534,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  | None -> 0
              order |> List.iteri (fun i fname ->
                  if fname = "__idhash" then
-                     ic f 0
-                     refI31 f
+                     pushUnit f
                  elif fname = "__desc" && (dictTryFind st.ObjRec rn).IsSome then
                      gg f ("$desc_" + rn)
                  else
@@ -1572,8 +1605,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$printval"
         ic f 10
         callf f "$putc"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "$str.Substring", [ s; start ]) ->
         let sl = freshLocal f "$sbs" "i32"
         let sv = freshLocal f "$sbv" "anyref"
@@ -1889,8 +1921,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  lg f t
                  gcT f "ref.test" "$iter"
                  ifA f
-                 ic f 0
-                 refI31 f
+                 pushUnit f
                  elseB f
                  dispatch ()
                  endB f
@@ -2079,8 +2110,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv n
         callf f "$toi"
         memCopy f
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "memLoadByte", [ p ]) ->
         emitNode st f lv p
         callf f "$toi"
@@ -2092,8 +2122,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f "$toi"
         mem f "i32.store8"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "memLoadInt", [ p ]) ->
         emitNode st f lv p
         callf f "$toi"
@@ -2105,8 +2134,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f "$toi"
         mem f "i32.store"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "memLoadInt64", [ p ]) ->
         emitNode st f lv p
         callf f "$toi"
@@ -2118,8 +2146,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f "$tol"
         mem f "i64.store"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "memLoadFloat", [ p ]) ->
         emitNode st f lv p
         callf f "$toi"
@@ -2131,8 +2158,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f "$tof"
         mem f "f64.store"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EUnknown "hash" ->
         requestWrapper st f "$hashvBoxed" 1
         ic f (tblIdx f.M "$hashvBoxed.w0")
@@ -2171,8 +2197,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "ref.cast" "$cell"
         emitNode st f lv value
         gcTF f "struct.set" "$cell" 0
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "compare", [ a; b ]) ->
         emitNode st f lv a
         emitNode st f lv b
@@ -2398,8 +2423,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$prints"
         ic f 10
         callf f "$putc"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "printb", [ a ]) ->
         // Boolean.ToString spells it with a capital
         emitNode st f lv a
@@ -2416,8 +2440,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         endB f
         ic f 10
         callf f "$putc"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "printc", [ a ]) ->
         // a char prints as the character, not its code
         emitNode st f lv a
@@ -2425,14 +2448,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$putc"
         ic f 10
         callf f "$putc"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "prints", [ a ]) ->
         emitNode st f lv a
         gcT f "ref.cast" "$str"
         callf f "$prints"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EPrim ("+", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
         // both sides statically int: skip $addv's runtime dispatch — and on
         // rail operands the un/box pairs cancel to a bare i32.add
@@ -2709,8 +2730,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$printval"
         ic f 10
         callf f "$putc"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EPrim ("u-f", [ a ]) ->
         emitNode st f lv a
         callf f "$tof"
@@ -2795,8 +2815,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                   | None when fname = "__desc" && (dictTryFind st.ObjRec rn).IsSome ->
                       gg f ("$desc_" + rn)
                   | None when fname = "__idhash" ->
-                      ic f 0
-                      refI31 f
+                      pushUnit f
                   | None ->
                       err st ("binary: missing field " + fname + " in " + rn + " (have " + String.concat "," (fields |> List.map fst) + ")")
                       refNull f "any")
@@ -2881,8 +2900,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              gcT f "ref.cast" ("$r_" + rn)
              emitNode st f lv v
              gcTF f "struct.set" ("$r_" + rn) idx
-             ic f 0
-             refI31 f
+             pushUnit f
          | None ->
              err st ("binary: unknown field " + fname)
              refNull f "any")
@@ -2936,8 +2954,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "ref.cast" "$cell"
         emitNode st f lv rhs
         gcTF f "struct.set" "$cell" 0
-        ic f 0
-        refI31 f
+        pushUnit f
     | EAssign (v, rhs) ->
         (match dictTryFind lv (v.Path, v.Offset) with
          | Some l when not (l.StartsWith "@env:") ->
@@ -2954,8 +2971,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                  emitNode st f lv rhs
                  gs f g
              | None -> err st ("binary: assignment to unknown " + v.Name))
-        ic f 0
-        refI31 f
+        pushUnit f
     | EWhile (c, b) ->
         let hoisted = podHoistLoop st f [ c; b ]
         // Two bodies per test where the shape allows it. The remainder loop
@@ -2971,9 +2987,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              ins f "i32.eqz"
              brIf f "$wbrk2"
              emitNode st f lv b
-             ins f "drop"
+             dropU f
              emitNode st f lv b
-             ins f "drop"
+             dropU f
              br f "$wgo2"
              endB f
              endB f
@@ -2985,13 +3001,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ins f "i32.eqz"
         brIf f "$wbrk"
         emitNode st f lv b
-        ins f "drop"
+        dropU f
         br f "$wgo"
         endB f
         endB f
         for g in hoisted do dictRemove st.PodBase g
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "failwith", [ a ]) ->
         // the payload is Failure(msg), so `with Failure msg` matches it
         (match dictTryFind st.CaseTag "Failure" with
@@ -3001,18 +3016,15 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              gcT f "struct.new" "$du1"
          | None -> emitNode st f lv a)
         throwExn f
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "raise", [ a ]) ->
         emitNode st f lv a
         throwExn f
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "ignore", [ a ]) ->
         emitNode st f lv a
         ins f "drop"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EApp (EUnknown "isNull", [ a ]) ->
         emitNode st f lv a
         ins f "ref.is_null"
@@ -3024,8 +3036,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         let cn = freshLocal f "$lc" "anyref"
         emitNode st f lv a
         ls f cl
-        ic f 0
-        refI31 f
+        pushUnit f
         ls f cn
         blockE f "$ldone"
         loopE f "$lgo"
@@ -3125,8 +3136,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                          | "s" -> sc f 0
                          | "l" -> lc f 0L
                          | _ -> ic f 0)) w)
-        ic f 0
-        refI31 f
+        pushUnit f
     | EIndexSet (nm, a, i, v) when (dictTryFind st.Pod nm).IsSome ->
         let _, _, wd = (dictTryFind st.Pod nm).Value
         let hl = podHandleLocal st f lv a
@@ -3141,9 +3151,25 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         ls f vl
         for w in 0 .. wd - 1 do
             emitPodWordStore st f nm hl bl w (fun () -> emitPodWord st f nm vl w)
-        ic f 0
-        refI31 f
+        pushUnit f
     | EArrayCreate (nm, n, EUnknown "$zero") when (dictTryFind st.Pod nm).IsSome ->
+        let _, _, wd = (dictTryFind st.Pod nm).Value
+        emitNode st f lv n
+        callf f "$toi"
+        ic f wd
+        ins f "i32.mul"
+        let arrTy2, _, _, _, _ = podRtOf st nm
+        gcT f "array.new_default" arrTy2
+        ic f 0
+        ic f 0
+        gcT f "struct.new" "$hnd"
+    | EArrayCreate (nm, n, v) when (dictTryFind st.Pod nm).IsSome && podIsZeroInit v ->
+        // zeroCreate of a POD struct arrives as a zero-RECORD init (struct
+        // elements zero to instances — a null slot is a trap for CLASS
+        // shapes), but a packed array has no instance slots at all:
+        // array.new_default IS the zero fill. The seeding loop this
+        // replaces called $hwset per WORD — 3M calls on the vertex
+        // benchmark's zeroCreate, a quarter of its whole runtime.
         let _, _, wd = (dictTryFind st.Pod nm).Value
         emitNode st f lv n
         callf f "$toi"
@@ -3258,8 +3284,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f (unboxOfK k)
         gcT f "array.set" (parrTy k)
-        ic f 0
-        refI31 f
+        pushUnit f
     | EArrayCreate (nm, n, EUnknown "$zero") when parrK nm <> "" ->
         emitNode st f lv n
         callf f "$toi"
@@ -3306,8 +3331,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              gcT f "struct.new" "$boxf"
          | "int" | "uint32" | "int64" | "uint64" | "int16" | "uint16"
          | "byte" | "sbyte" | "char" | "bool" ->
-             ic f 0
-             refI31 f
+             pushUnit f
          | _ -> refNull f "any")
         emitNode st f lv n
         callf f "$toi"
@@ -3343,8 +3367,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv v
         callf f "$toi"
         gcT f "array.set" "$str"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EIndex (_, a, i) ->
         emitNode st f lv a
         gcT f "ref.cast" "$arr"
@@ -3358,8 +3381,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$toi"
         emitNode st f lv v
         gcT f "array.set" "$arr"
-        ic f 0
-        refI31 f
+        pushUnit f
     | EArrayLen (("$str" | "byte" | "sbyte"), a) ->
         emitNode st f lv a
         gcT f "ref.cast" "$str"
@@ -3665,7 +3687,7 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
     let scratch =
         { SrcNames = dictNew (); M = f.M; B = scratchB; LocalIdx = dictNew (); LocalTys = vecNew ()
           NParams = f.NParams; Labels = labelsNew (); PatchAt = 0; Replay = -1
-          PeepLast = None; PeepPrev = None }
+          PeepLast = None; PeepPrev = None; UnitAt = -1; UnitEnd = -1 }
     for k, v in dictPairs f.LocalIdx do
         if (dictTryFind scratch.LocalIdx k).IsNone then dictSet scratch.LocalIdx k v
     let lv0 = dictNew<string * int, string> ()
@@ -4491,8 +4513,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
                 i31get f
                 ins f "i32.eqz"
                 ifE f
-                ic f 0
-                refI31 f
+                pushUnit f
                 ret f
                 endB f
             ic f 1
@@ -4555,8 +4576,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         let f = beginFn m names
         localsDone f
         for n in names do lg f n
-        ic f 0
-        refI31 f
+        pushUnit f
         callf f target
         endFn f
     // lambda bodies: param + env; captured keys read from the env array.

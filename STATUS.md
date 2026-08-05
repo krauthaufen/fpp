@@ -955,9 +955,14 @@ it hardens the semantics it will be diffed against):
    gains pair and triple `Arb` instances, and every path resolves —
    direct demands, stamped generics, container element contexts, and
    derived records with tuple fields.
-6. **Performance toward C**: the vertex benchmark stands at 191 ms against
-   C's 71 ms. The measured next steps live in CLAUDE.md's optimization
-   section — and so do the dead ends already paid for.
+6. **Performance toward C**: the 2026-08 pass took the vertex benchmark
+   from 202 ms to 149 ms against C's ~62 (zeroCreate seeded an
+   already-zero array, statements materialized units their contexts
+   dropped, hoisted-base stores still called the pin-test helper); `add`
+   and `read` now BEAT C warm. What remains on vertices (149 vs 62) and
+   shapes (686 vs 248) is per-access bounds checks and no SIMD — engine
+   and spec territory. The dead ends already paid for live in CLAUDE.md's
+   optimization section.
 7. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift, MMTk (Boehm to
    start). Last on purpose: the wasm-GC backend is the semantics reference
    it will be diffed against, and every item above makes that reference

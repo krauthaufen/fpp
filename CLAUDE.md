@@ -65,8 +65,8 @@ the bug, not the demand.
 ## Measure, do not reason
 
 Almost every performance intuition recorded in this repo's history was wrong,
-including several in a row. The vertex benchmark went from 3615 ms to 191 ms
-against C's 71 ms, and the causes were never where they looked:
+including several in a row. The vertex benchmark went from 3615 ms to 149 ms
+against C's ~62 ms, and the causes were never where they looked:
 
 * "the field read is slow" — reads were ~5 ns; the *fill* loop was being
   counted as read time
@@ -88,6 +88,27 @@ that was really a validation error with stderr piped to `/dev/null`.
 
 Benchmarks that compare against C live in `tests/tooling/perf/`;
 `tests/tooling/abi/` checks struct layout against emscripten.
+
+**Measure WARM.** wasmtime caches module compilation on disk: the first run
+of a fresh binary pays the whole Cranelift compile and reads 3-6x slower
+than every run after it. A 433 ms "regression" on the read benchmark was a
+cold cache; warm, the same binary beat C. Best-of-three, never first-of-one.
+
+The 2026-08 pass found three real wastes, each visible only in a profile
+(`perf record -k 1` + `--profile jitdump` + `perf inject -j`):
+`Array.zeroCreate` of a POD struct spent a quarter of the benchmark seeding
+zero fields into an `array.new_default` that was already zero (the seeding
+is for CLASS-shaped elements, which need instances in the slots); every
+statement answered with a boxed unit that its context immediately dropped
+(`pushUnit`/`dropU` cancel the pair positionally, like the box/unbox
+peephole); and a store into a hoisted-base POD array still called the
+`$hwset` runtime helper whenever ANYTHING in the program pinned that
+element kind — float formatting does — so the pin test is now inlined on
+the hoisted storage, mirroring the read path. After all three: vertices
+149 ms vs C 62, add 65 vs 67, read 88 vs 103 (both now BEAT C), shapes 686
+vs 248. What remains on vertices/shapes is per-access bounds checks and no
+SIMD — wasm-GC array.get has no unchecked or vector form, so that gap
+belongs to the engine and the spec, not to emitted-code waste.
 
 ## Optimisations, and the switch that turns them off
 

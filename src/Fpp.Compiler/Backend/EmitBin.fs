@@ -208,13 +208,18 @@ type Fn =
       /// positional — the entry only counts if NOTHING was emitted since
       /// (Count = endOffset), so no other emitter needs to invalidate it.
       mutable PeepLast : (string * int * int) option
-      mutable PeepPrev : (string * int * int) option }
+      mutable PeepPrev : (string * int * int) option
+      /// span of a just-emitted boxed-zero push (`i32.const 0; ref.i31`),
+      /// valid only while UnitEnd = B.Count: a statement-position drop
+      /// erases the push instead of materializing a value nobody reads
+      mutable UnitAt : int
+      mutable UnitEnd : int }
 
 /// open a body: params get indices 0.., locals follow as they are created
 let beginFn (m : Mod) (paramNames : string list) : Fn =
     let f = { SrcNames = dictNew (); M = m; B = m.CodeBody; LocalIdx = dictNew (); LocalTys = vecNew ()
               NParams = List.length paramNames; Labels = labelsNew (); PatchAt = 0; Replay = -1
-              PeepLast = None; PeepPrev = None }
+              PeepLast = None; PeepPrev = None; UnitAt = -1; UnitEnd = -1 }
     f.PatchAt <- beginPatch m.CodeBody
     let mutable i = 0
     for p in paramNames do
@@ -450,6 +455,30 @@ let refI31 (f : Fn) : unit =
     // an i31 wrap is a peephole producer: `$toi` right after reads it back
     f.PeepPrev <- f.PeepLast
     f.PeepLast <- Some ("ref.i31", at, f.B.Count)
+
+/// the boxed zero most statements answer with — recorded so that a
+/// statement-position `dropU` can erase it, while `$toi` still cancels
+/// against the recorded ref.i31 the ordinary way
+let pushUnit (f : Fn) : unit =
+    let at = f.B.Count
+    ic f 0
+    refI31 f
+    f.UnitAt <- at
+    f.UnitEnd <- f.B.Count
+
+/// drop for STATEMENT position: a value that is the just-pushed boxed zero
+/// is erased rather than materialized and dropped
+let dropU (f : Fn) : unit =
+    if f.UnitEnd = f.B.Count && f.UnitAt >= 0 then
+        f.B.Count <- f.UnitAt
+        f.UnitEnd <- -1
+        f.UnitAt <- -1
+        // the peephole entries pointed into the erased bytes; positional
+        // validity already rejects them, but stale spans equal to the new
+        // Count could lie, so clear outright
+        f.PeepLast <- None
+        f.PeepPrev <- None
+    else emitByte f.B 0x1A
 
 // blocks: named labels resolve to depths at branch sites
 let blockA (f : Fn) (label : string) : unit =
