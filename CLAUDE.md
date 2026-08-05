@@ -236,9 +236,15 @@ entry, and none of them pointed anywhere near it. The tell was a HOVER on a
 parameter disagreeing with its own written annotation — when those disagree,
 suspect the alias table first.
 
-There are ~30 more `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
-and Lower. Each one is this question — first or last — and each is right
-only if its head cannot be qualified. Worth auditing as a group.
+The remaining 35 `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer
+and Lower were audited as a group: all safe. Each is a binder/declaration
+head (unqualifiable), an IdentExpr-guarded site (a dotted head parses as
+DotExpr and takes a tryLast path), or a TypeDecl name. Two invariants carry
+that conclusion, so guard them: `tokensOf` reads DIRECT children only —
+switching a site to the recursive `Green.tokens` re-opens the trap — and
+the parser collapses a dotted type-declaration name
+(`type System.Threading.Interlocked with`) to its last segment, which is
+the single point protecting every TypeDecl site.
 
 ## Overload resolution, and why it cannot be approximated
 

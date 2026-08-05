@@ -2108,3 +2108,37 @@ let multiArityTests =
             Expect.equal out "s\n" "State and Delta stay distinct"
         }
     ]
+
+[<Tests>]
+let tupleArbTests =
+    testList "tuple Arb" [
+        test "pairs and triples dispatch by arity, through every path" {
+            // direct demand, a STAMPED generic's context, a container's
+            // element context, and a derived record's tuple field — each
+            // resolves through the $tup<N> instance names, which is what
+            // "$ref" (the layout name every tuple shares) never could
+            let out =
+                runProgram (String.concat "\n" [
+                    "type Rec = { Pos : int * int; Tag : string }"
+                    "let pick (rr : Rand) : 'a when Arb<'a> = arbitrary rr"
+                    "let main () ="
+                    "    let r = Rand 11"
+                    "    let p : int * bool = arbitrary r"
+                    "    let (a, b) = p"
+                    "    printfn \"%d\" a"
+                    "    let t : int * int * string = arbitrary r"
+                    "    let (x, y, z) = t"
+                    "    printfn \"%d\" (x + y)"
+                    "    let q : bool * int = pick r"
+                    "    let (c, d) = q"
+                    "    printfn \"%d\" d"
+                    "    let ls : list<int * bool> = arbitrary r"
+                    "    printfn \"%b\" (List.length ls <= 8)"
+                    "    let g : Rec = arbitrary r"
+                    "    let (px, py) = g.Pos"
+                    "    printfn \"%d\" (px + py)"
+                    "let go = main ()"
+                    "" ])
+            Expect.equal out "24\n10\n-1\ntrue\n2\n" "all five dispatch paths draw values"
+        }
+    ]

@@ -939,12 +939,20 @@ it hardens the semantics it will be diffed against):
    range as one value), and the port rewrite that papered over it is
    retired — the adaptive lib's `range` combinator now exercises the
    native path.
-4. **The first-identifier audit**: ~30 remaining
-   `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer/Lower, each
-   correct only if its head cannot be qualified.
-5. **Tuple `Arb`** — struct tuples and records derive; plain tuples name
-   themselves `$ref` and have nothing to dispatch on. Wants the same
-   canonical-naming answer the struct-tuple work established.
+4. ~~**The first-identifier audit**~~ — **done.** All 35 sites audited;
+   none suspect. Every one is a binder/declaration head (unqualifiable),
+   an IdentExpr-guarded site (dotted heads are DotExpr, keyed by tryLast
+   on their own paths), or a TypeDecl name (the parser collapses the
+   dotted extension spelling to its last segment before Infer or Lower
+   ever look). Two invariants carry the whole set — `tokensOf` reads
+   DIRECT children only, and the parser's dotted-type-name collapse —
+   both now recorded in CLAUDE.md.
+5. ~~**Tuple `Arb`**~~ — **done.** Class-instance DISPATCH names tuples
+   by arity and elements (`$tup2$<int.bool>`, `Types.instConName`) while
+   layout naming keeps sharing every tuple as one `$ref`; the prelude
+   gains pair and triple `Arb` instances, and every path resolves —
+   direct demands, stamped generics, container element contexts, and
+   derived records with tuple fields.
 6. **Performance toward C**: the vertex benchmark stands at 191 ms against
    C's 71 ms. The measured next steps live in CLAUDE.md's optimization
    section — and so do the dead ends already paid for.

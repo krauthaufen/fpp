@@ -104,6 +104,19 @@ let rec typeConName (t : Type) : string =
     | TTuple _ -> "$ref"
     | _ -> ""
 
+/// The name of a type where CLASS-INSTANCE dispatch is the consumer. The
+/// same grammar as `typeConName`, except a TUPLE carries its arity and its
+/// elements: layout naming deliberately shares every tuple as one "$ref",
+/// but `Arb<int * bool>` and a triple are DIFFERENT instances, and a name
+/// that cannot tell them apart cannot dispatch.
+let rec instConName (t : Type) : string =
+    match prune t with
+    | TTuple ts ->
+        "$tup" + string (List.length ts) + "$<" + String.concat "." (List.map instConName ts) + ">"
+    | TCon (n, args) when not (List.isEmpty args) ->
+        n + "$<" + String.concat "." (List.map instConName args) + ">"
+    | other -> typeConName other
+
 /// Map every type inside a constraint.
 let mapConstraint (f : Type -> Type) (c : Constraint) : Constraint =
     { Class = c.Class

@@ -525,6 +525,25 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                                 // is no representation to specialize for)
                                 if isTemplate then t else "obj"
                         else t)
+                // a TUPLE argument stamps by its elements only where a class
+                // CONSTRAINT observes that variable — element names are what
+                // instance dispatch needs, and nothing else reads them. An
+                // unconstrained tuple slot collapses to the shared uniform
+                // body, or every generic a tuple passes through would stamp
+                // per element combination
+                let inst =
+                    if List.length sch.Quantified = List.length inst
+                       && inst |> List.exists (fun t -> t.StartsWith "$tup") then
+                        List.map2
+                            (fun (qv : Var) (t : string) ->
+                                if t.StartsWith "$tup"
+                                   && not (sch.Constraints |> List.exists (fun c ->
+                                            c.Args
+                                            |> List.collect freeVars
+                                            |> List.exists (fun fv -> fv.Id = qv.Id)))
+                                then "$ref" else t)
+                            sch.Quantified inst
+                    else inst
                 let needsLayout = (dictTryFind layoutDependent (v.Path, v.Offset)) = Some true
                 // A demand with no NAME at all can never become one: stamping
                 // substitutes "#id" variables, and there is nothing to
@@ -1494,7 +1513,7 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
         | None -> ()
         | Some cd ->
             for i in vecToList insts do
-                let heads = i.Head |> List.map typeConName
+                let heads = i.Head |> List.map instConName
                 for index, (m, _) in List.indexed cd.Members do
                     let key = instanceKey cls m heads
                     match i.Members |> List.tryPick (fun (mn, im) -> if mn = m then Some im else None) with

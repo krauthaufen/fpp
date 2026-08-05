@@ -2208,8 +2208,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         callf f "$idhash"
         refI31 f
-    | EUnknown "$class:Ordered:compare:$ref" ->
-        // `compare` at a UNIFORM reference: the runtime compares structurally
+    | EUnknown n when n = "$class:Ordered:compare:$ref" || n.StartsWith "$class:Ordered:compare:$tup" ->
+        // `compare` at a UNIFORM reference: the runtime compares structurally.
+        // A TUPLE spells its dispatch name by arity ("$tup2$<int.int>") so
+        // Arb and friends can tell pair from triple — but its representation
+        // is the same uniform reference, and the structural walk is still
+        // the comparison
         requestWrapper st f "$cmpvBoxed" 2
         ic f (tblIdx f.M "$cmpvBoxed.w0")
         refNull f "any"

@@ -988,6 +988,10 @@ instance Arb<'a[]> when Arb<'a>
         Array.ofList out
 instance Arb<option<'a>> when Arb<'a>
     static arbitrary (r : Rand) = if r.Next 4 = 0 then None else Some (arbitrary r)
+instance Arb<'a * 'b> when Arb<'a> when Arb<'b>
+    static arbitrary (r : Rand) = (arbitrary r, arbitrary r)
+instance Arb<'a * 'b * 'c> when Arb<'a> when Arb<'b> when Arb<'c>
+    static arbitrary (r : Rand) = (arbitrary r, arbitrary r, arbitrary r)
 
 /// The list a countable range denotes: `[ a .. b ]` and a range used as a
 /// VALUE both lower to this, at every Integral element. For-loops keep

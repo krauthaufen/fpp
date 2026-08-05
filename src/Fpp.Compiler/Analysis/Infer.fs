@@ -1552,10 +1552,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // named like any other instantiation, ARGUMENTS and
                          // all — an instance over `'a[]` reached at float[][]
                          // must stamp at float[], not at a bare "array"
-                         | TCon (_, targs) when not (List.isEmpty targs) -> typeConName t
+                         | TCon (_, targs) when not (List.isEmpty targs) -> instConName t
                          | TCon (n, _) -> n
                          | TVar tv -> "#" + string tv.Id
-                         | TTuple _ | TFun _ -> "$ref"
+                         | TTuple _ -> instConName t
+                         | TFun _ -> "$ref"
                          | _ -> "")
                     | None -> "")
             let attach (k : Classes.InstMember) = { k with Classes.MInst = instArgs }
@@ -5434,7 +5435,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         vecToList arbDeriveRaw
         |> List.map (fun (key, rn, off, isU, pids, entries) ->
             key, rn, off, isU, pids,
-            entries |> List.map (fun (n2, comps) -> n2, comps |> List.map typeConName))
+            entries |> List.map (fun (n2, comps) -> n2, comps |> List.map instConName))
       InstSites =
         vecToList instRaw
         |> List.map (fun (off, fresh) ->
@@ -5448,16 +5449,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // `instance Sized<list<'a>>` had no element type to resolve.
                 // (This is only the INSTANTIATION name; a field owner is
                 // still named by its constructor alone — see `instName`.)
-                | TCon (_, args) when not (List.isEmpty args) -> typeConName f
+                | TCon (_, args) when not (List.isEmpty args) -> instConName f
                 | TCon (n, _) -> n
                 // still a variable: this use sits inside a generic body and
                 // instantiates at the ENCLOSING binding's type variable —
                 // name it so stamping can substitute the caller's argument
                 | TVar v -> "#" + string v.Id
-                // a tuple (or a function) is a uniform reference: it names
-                // itself so that every such instantiation SHARES one body,
-                // instead of arriving unnamed and looking layout-dependent
-                | TTuple _ | TFun _ -> "$ref"
+                // a TUPLE names its arity and elements — instance dispatch
+                // needs pair and triple apart, and the elements resolve the
+                // instance's own `when` contexts
+                | TTuple _ -> instConName f
+                // a function is a uniform reference with nothing to dispatch
+                | TFun _ -> "$ref"
                 | _ -> ""))
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
