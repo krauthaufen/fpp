@@ -138,6 +138,11 @@ static inline V fpp_clo_new(uint32_t tid, fpp_code_t code, size_t arity,
  * calls then applies the rest */
 V fpp_apply(V clo, V *args, size_t n);
 
+/* ---- interface dispatch: [typeid][slot] -> uniform member wrapper ------- */
+
+void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn);
+V fpp_vcall(V obj, int slot, V *args, size_t n);
+
 /* ---- exceptions --------------------------------------------------------- */
 
 struct fpp_handler {

@@ -42,6 +42,11 @@ type CSt =
       CaseArity : Dict<string, int>
       EnumVal : Dict<string, int>            // enum case name -> value
       FnClo : Dict<string * int, string>     // fn used as value -> global clo
+      VSlot : Dict<string * string, int>     // (bare iface, member) -> slot
+      VWrap : Dict<string * int, string>     // member fn -> uniform wrapper
+      ClassBase : Dict<string, string>       // class -> base
+      ClassImpls : Dict<string, (string * (string * VarId) list) list>
+      mutable NVSlots : int
       mutable NextTid : int
       mutable NextLam : int }
 
@@ -323,6 +328,21 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | 'c' -> stmt f (sref d + " = fpp_char_to_string(" + sref x + ");")
          | _ -> stmt f (sref d + " = fpp_to_string(" + sref x + ");"))
         d
+    | EApp (EUnknown "$cellof", [ inner ]) ->
+        // the CELL itself, not its content: a non-cell-marked local already
+        // HOLDS the cell (class ctor `let n = $forcecell ...`), a cell-marked
+        // one is the slot raw
+        (match inner with
+         | EVar (v, _) | EVarI (v, _, _) ->
+             (match dictTryFind f.Locals (v.Path, v.Offset) with
+              | Some i -> i
+              | None -> emitE st f inner)
+         | _ -> emitE st f inner)
+    | EApp (EUnknown "$forcecell", [ r ]) ->
+        let x = emitE st f r
+        let d = slot f
+        stmt f (sref d + " = fpp_cell_new(" + sref x + ");")
+        d
     | EApp (EUnknown "$cellget", [ c ]) ->
         let x = emitE st f c
         let d = slot f
@@ -451,7 +471,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                 stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
                         + " UNTAGI(" + sref y + "));")
         (match op with
-         | "+" when k = 's' ->
+         | "+" when k = 's' || k = 't' ->
              stmt f (sref d + " = fpp_str_concat(" + sref x + ", " + sref y + ");")
          | "+" | "-" | "*" | "/" | "%" -> arith op
          | "<" | ">" | "<=" | ">=" -> rel op
@@ -729,6 +749,24 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = TAGI((intptr_t)fpprt_array_len(" + sref av + "));")
         d
+    | EIfaceCall (iface, memberName, recv, args) ->
+        let bare =
+            match iface.IndexOf "`" with
+            | i when i > 0 -> iface.Substring (0, i)
+            | _ -> iface
+        (match dictTryFind st.VSlot (bare, memberName) with
+         | Some vslot ->
+             let r = emitE st f recv
+             let xs = args |> List.map (emitE st f)
+             let first = f.NSlots
+             for x in xs do
+                 let s2 = slot f
+                 stmt f (sref s2 + " = " + sref x + ";")
+             let d = slot f
+             stmt f (sref d + " = fpp_vcall(" + sref r + ", " + string vslot
+                     + ", &F[" + string first + "], " + string (List.length xs) + ");")
+             d
+         | None -> trap ("iface slot " + bare + "." + memberName))
     | ECast (_, x, _) ->
         // uniform representation: a cast is bit-identity; the CHECKED ones
         // learn to check with the class machinery (M5)
@@ -907,6 +945,27 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
         | None -> stmt f ("fpp_not_emitted(\"capture miss\");"))
     d
 
+/// a uniform (self, args) wrapper around a member function, for vtables
+and private vtWrapper (st : CSt) (mv : VarId) : string =
+    match dictTryFind st.VWrap (mv.Path, mv.Offset) with
+    | Some w -> w
+    | None ->
+        let fn = cname mv
+        let w = "vt_" + fn
+        dictSet st.VWrap (mv.Path, mv.Offset) w
+        let arity =
+            match dictTryFind st.Fns (mv.Path, mv.Offset) with
+            | Some a -> a
+            | None -> 1
+        vecAdd st.Fwd ("static V " + w + "(V self, V *args);")
+        let extra =
+            if arity <= 1 then []
+            else List.init (arity - 1) (fun i -> "args[" + string i + "]")
+        vecAdd st.Out
+            ("static V " + w + "(V self, V *args) {\n  (void)args;\n  return "
+             + fn + "(" + String.concat ", " ("self" :: extra) + ");\n}")
+        w
+
 /// the singleton closure for a top-level function used as a value
 and private fnCloGlobal (st : CSt) (v : VarId) : string =
     match dictTryFind st.FnClo (v.Path, v.Offset) with
@@ -977,6 +1036,11 @@ let emitC (decls : Decl list) : string * string list =
           CaseArity = dictNew<string, int> ()
           EnumVal = dictNew<string, int> ()
           FnClo = dictNew<string * int, string> ()
+          VSlot = dictNew<string * string, int> ()
+          VWrap = dictNew<string * int, string> ()
+          ClassBase = dictNew<string, string> ()
+          ClassImpls = dictNew<string, (string * (string * VarId) list) list> ()
+          NVSlots = 0
           NextTid = 32                          // FPP_TID_USER in fpprt-lang.h
           NextLam = 0 }
     // pass 1: names, record layouts, union cases, enums
@@ -1003,6 +1067,68 @@ let emitC (decls : Decl list) : string * string list =
                                    + string arity + ", 2, " + cstr cn + ");")
         | DEnum (_, cases) ->
             for cn, v in cases do dictSet st.EnumVal cn v
+        | DClass (n, b, _, impls) ->
+            (match b with Some x -> dictSet st.ClassBase n x | None -> ())
+            dictSet st.ClassImpls n impls
+            for iface, ms in impls do
+                let bare =
+                    match iface.IndexOf "`" with
+                    | i when i > 0 -> iface.Substring (0, i)
+                    | _ -> iface
+                for mn, _ in ms do
+                    if not (dictTryFind st.VSlot (bare, mn)).IsSome then
+                        dictSet st.VSlot (bare, mn) st.NVSlots
+                        st.NVSlots <- st.NVSlots + 1
+        | DInterface (n, ms) ->
+            let bare =
+                match n.IndexOf "`" with
+                | i when i > 0 -> n.Substring (0, i)
+                | _ -> n
+            for mn, _ in ms do
+                if not (dictTryFind st.VSlot (bare, mn)).IsSome then
+                    dictSet st.VSlot (bare, mn) st.NVSlots
+                    st.NVSlots <- st.NVSlots + 1
+        | _ -> ()
+    // pass 1.5: vtables — every class registers its impl chain's members
+    // (nearest declaration wins, walking the base chain)
+    let vtReg = vecNew<string> ()
+    for d in decls do
+        match d with
+        | DClass (n, _, _, _) ->
+            (match dictTryFind st.RecTid n with
+             | Some tid ->
+                 let filled = dictNew<int, bool> ()
+                 let mutable cur = n
+                 let mutable steps = 0
+                 let mutable go = true
+                 while go && steps < 32 do
+                     (match dictTryFind st.ClassImpls cur with
+                      | Some impls ->
+                          for iface, ms in impls do
+                              let bare =
+                                  match iface.IndexOf "`" with
+                                  | i when i > 0 -> iface.Substring (0, i)
+                                  | _ -> iface
+                              for mn, mv in ms do
+                                  match dictTryFind st.VSlot (bare, mn) with
+                                  | Some sl when not (dictTryFind filled sl).IsSome
+                                                 // a DCE'd member body has no
+                                                 // function to point at; its
+                                                 // slot stays empty and traps
+                                                 // only if dispatch reaches it
+                                                 && (dictTryFind st.Fns (mv.Path, mv.Offset)).IsSome ->
+                                      dictSet filled sl true
+                                      let w = vtWrapper st mv
+                                      vecAdd vtReg ("  fpp_vt_set(" + string tid + ", "
+                                                    + string sl + ", " + w + ");")
+                                  | _ -> ()
+                      | None -> ())
+                     (match dictTryFind st.ClassBase cur with
+                      | Some b ->
+                          cur <- b
+                          steps <- steps + 1
+                      | None -> go <- false)
+             | None -> ())
         | _ -> ()
     // pass 2: emission
     for d in decls do
@@ -1016,6 +1142,35 @@ let emitC (decls : Decl list) : string * string list =
         | _ -> ()
     let out = vecNew<string> ()
     vecAdd out "/* generated by fpp --target c */"
+    // FPP_CBACK_DUMP=1: every declaration as a comment, for reading what
+    // the backend actually receives
+    if System.Environment.GetEnvironmentVariable "FPP_CBACK_DUMP" = "1" then
+        for d in decls do
+            match d with
+            | DLet (r, v, _, body) ->
+                let p0 = printExpr body
+                let p = if strLen p0 > 400 then p0.Substring (0, 400) else p0
+                vecAdd out ("/* DLET " + (if r then "rec " else "") + v.Name
+                            + " @" + v.Path + ":" + string v.Offset + "
+   "
+                            + (p |> String.map (fun c -> if c = '*' then '#' else c)) + " */")
+            | DClass (n, b, own, impls) ->
+                vecAdd out ("/* DCLASS " + n
+                            + (match b with Some x -> " : " + x | None -> "")
+                            + " own=[" + String.concat ", " (own |> List.map (fun (m, mv) -> m + "@" + string mv.Offset)) + "]"
+                            + " impls=[" + String.concat "; " (impls |> List.map (fun (i, ms) -> i + ":" + String.concat "," (ms |> List.map fst))) + "] */")
+            | DRecord (n, _, fs, isS) ->
+                vecAdd out ("/* DRECORD " + n + (if isS then " struct" else "")
+                            + " [" + String.concat ", " (fs |> List.map fst) + "] */")
+            | DInterface (n, ms) ->
+                vecAdd out ("/* DIFACE " + n + " [" + String.concat ", " (ms |> List.map fst) + "] */")
+            | DUnion (n, _, cs) ->
+                vecAdd out ("/* DUNION " + n + " [" + String.concat ", " (cs |> List.map fst) + "] */")
+            | DMembers (n, ms) ->
+                vecAdd out ("/* DMEMBERS " + n + " [" + String.concat ", " (ms |> List.map (fun (m, mv) -> m + "@" + string mv.Offset)) + "] */")
+            | DBaseInst (n, xs) ->
+                vecAdd out ("/* DBASEINST " + n + " [" + String.concat ", " xs + "] */")
+            | _ -> ()
     vecAdd out "#include \"fpprt-lang.h\""
     vecAdd out ""
     for g in vecToList st.Globals do vecAdd out g
@@ -1031,6 +1186,7 @@ let emitC (decls : Decl list) : string * string list =
         let n = g.Substring (9, strLen g - 10)
         vecAdd out ("  fpprt_add_static_roots(&" + n + ", 1);")
     for t in vecToList st.Reg do vecAdd out t
+    for t in vecToList vtReg do vecAdd out t
     for i in vecToList st.Inits do vecAdd out i
     vecAdd out "  return 0;"
     vecAdd out "}"

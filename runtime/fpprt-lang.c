@@ -212,6 +212,44 @@ V fpp_apply(V clo, V *args, size_t n) {
   }
 }
 
+/* ---- interface dispatch ------------------------------------------------- */
+
+static fpp_code_t *fpp_vt_ = NULL;
+static size_t fpp_vt_tids_ = 0;
+static int fpp_vt_slots_ = 0;
+
+void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn) {
+  if (tid >= fpp_vt_tids_ || slot >= fpp_vt_slots_) {
+    size_t ntids = fpp_vt_tids_ ? fpp_vt_tids_ : 64;
+    while (tid >= ntids) ntids *= 2;
+    int nslots = fpp_vt_slots_ ? fpp_vt_slots_ : 32;
+    while (slot >= nslots) nslots *= 2;
+    fpp_code_t *nt = calloc(ntids * (size_t)nslots, sizeof(fpp_code_t));
+    if (!nt) abort();
+    for (size_t t = 0; t < fpp_vt_tids_; t++)
+      for (int s = 0; s < fpp_vt_slots_; s++)
+        nt[t * (size_t)nslots + s] = fpp_vt_[t * (size_t)fpp_vt_slots_ + s];
+    free(fpp_vt_);
+    fpp_vt_ = nt;
+    fpp_vt_tids_ = ntids;
+    fpp_vt_slots_ = nslots;
+  }
+  fpp_vt_[tid * (size_t)fpp_vt_slots_ + slot] = fn;
+}
+
+V fpp_vcall(V obj, int slot, V *args, size_t n) {
+  (void)n;
+  if (!obj || (obj & 1)) fpp_not_emitted("vcall on non-object");
+  uint32_t tid = fpprt_typeid(obj);
+  fpp_code_t fn = (tid < fpp_vt_tids_ && slot < fpp_vt_slots_)
+    ? fpp_vt_[tid * (size_t)fpp_vt_slots_ + slot] : NULL;
+  if (!fn) {
+    fprintf(stderr, "fpp: no vtable entry (tid %u slot %d)\n", tid, slot);
+    abort();
+  }
+  return fn(obj, args);
+}
+
 /* ---- exceptions --------------------------------------------------------- */
 
 void fpp_raise(V payload) {
