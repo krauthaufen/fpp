@@ -1214,7 +1214,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// is the only sanctioned builder)
     let recordsReg = dictNew<string, bool> ()
     let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
-    let arbDerived = dictNew<string, bool> ()
+    /// type name -> the synthesized instance's offset, so a WRITTEN instance
+    /// arriving later (a generated file lands after the type it derives for)
+    /// can evict the derived one instead of overlapping with it
+    let arbDerived = dictNew<string, int> ()
     let mutable arbSynthNext = 300000000
 
     let deriveArbGeneric (tn : string) : bool =
@@ -1270,7 +1273,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let off = arbSynthNext
                         arbSynthNext <- arbSynthNext + 10
                         let name2 = "$arbD@" + tn
-                        dictSet arbDerived tn true
+                        dictSet arbDerived tn off
                         let headArgs = ps |> List.map TVar
                         vecAdd arbDeriveRaw
                             (tn, instName (TCon (tn, headArgs)), off, isUnion,
@@ -5031,6 +5034,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             { Classes.MPath = path; MOffset = t.Offset
                               MName = t.Text; MTakesUnit = takesUnit; MInst = [] }))
                   Builtin = builtin; Path = path; Offset = offset }
+            // a WRITTEN Arb instance beats a derived one even when it is
+            // written LATER: eager derivation ran at the end of an earlier
+            // file, and a generated instance file necessarily comes after
+            // the types it derives for
+            if name = "Arb" then
+                (match args with
+                 | [ h ] ->
+                     (match prune h with
+                      | TCon (tn, _) ->
+                          // the derived one is recognizable by its synthesized
+                          // member, whatever file's inference created it
+                          (match dictTryFind classes.Instances "Arb" with
+                           | Some insts ->
+                               let synth = "$arbD@" + tn
+                               let keep =
+                                   vecToList insts
+                                   |> List.filter (fun i ->
+                                       not (i.Members |> List.exists (fun (_, m) -> m.MName = synth)))
+                               if List.length keep <> vecLen insts then
+                                   vecClear insts
+                                   for i in keep do vecAdd insts i
+                           | None -> ())
+                      | _ -> ())
+                 | _ -> ())
             Classes.addInstance classes inst
             match dictTryFind classes.Classes name with
             | None -> vecAdd diags (offset, "unknown class " + name)

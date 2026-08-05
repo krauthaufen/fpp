@@ -923,10 +923,17 @@ it hardens the semantics it will be diffed against):
    evaluated once, canonically, and a newly-stamped accessor casting it
    traps. The real fix has to reconcile stamped members with
    canonically-constructed instances first.
-2. **Deriving as a plugin surface** (Stage 4.9): `Arb` and the
-   CompareTo-instance rule are built-in derivations; `Unmanaged`,
-   `Serialize` and user classes want the same mechanism exposed as a
-   TAST -> TAST plugin API instead of compiler edits.
+2. ~~**Deriving as a plugin surface**~~ — **done.** `deriveArb` joins the
+   builtin generators: the same derivation the compiler does internally,
+   emitted as readable contextual instances (`instance Arb<Pair<'a>> when
+   Arb<'a>`), generic heads included — which `deriveGen` never covered. The
+   built-in stays as the zero-config path (generators cost a pre-inference
+   pass and run only when registered), and yields to whatever the generator
+   emits: a written `Arb` instance now evicts an eagerly-derived one even
+   when it arrives in a LATER file, which is where a generated file
+   necessarily lands. `Serialize` already had `deriveSerialize`; the
+   CompareTo rule stays an inference rule — it points at an existing
+   member and synthesizes nothing, which no source generator could say.
 3. **CE range splice**: `seq { a .. b }` still relies on a port rewrite to
    the list bracket; the computation-expression path should splice a range
    item natively.

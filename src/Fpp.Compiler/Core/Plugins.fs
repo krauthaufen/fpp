@@ -42,7 +42,11 @@ type GenField =
 type GenCase =
     { CName : string
       /// one entry per payload type, as written
-      CArgs : string list }
+      CArgs : string list
+      /// the case was written WITH a signature (`| Lit : int -> Tm<int>`) —
+      /// the GADT form, where CArgs holds the signature rather than a
+      /// payload, and deriving from it would be wrong
+      CSig : bool }
 
 type GenTypeDecl =
     { TName : string
@@ -482,6 +486,8 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
                     match toks c |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
                     | Some nt ->
                         Some { CName = nt.Text
+                               CSig =
+                                 toks c |> List.exists (fun t -> t.Kind = Operator && t.Text = ":")
                                CArgs =
                                  nodes c
                                  |> List.filter (fun x -> isTypeNode x.NodeKind)
@@ -690,6 +696,9 @@ type GDecl =
     | GClassOf of string * string list * (string * GTy) list
     /// class name, head types, member bodies
     | GInstanceOf of string * GTy list * GMember list
+    /// the CONTEXTUAL form: class name, head types, the constraint heads
+    /// rendered as `when ...` clauses, member bodies
+    | GInstanceWhen of string * GTy list * GTy list * GMember list
     /// Literal F++ source — quotation. Write the code, splice the holes with
     /// `exText` / `tyText` (F# interpolation supplies the brackets F# keeps for
     /// its own typed quotations), and `renderFileChecked` parses it so a
@@ -862,7 +871,7 @@ let private paramText (ps : (string * GTy option) list) =
         | None -> n)
     |> String.concat " "
 
-let declLines (d : GDecl) : string list =
+let rec declLines (d : GDecl) : string list =
     match d with
     | GComment c -> [ "// " + c ]
     | GOpen m -> [ "open " + m ]
@@ -902,7 +911,10 @@ let declLines (d : GDecl) : string list =
             | _ -> xs
         trimTail (trimHead ls)
     | GInstanceOf (name, heads, members) ->
-        ("instance " + name + "<" + String.concat ", " (List.map tyText heads) + ">")
+        declLines (GInstanceWhen (name, heads, [], members))
+    | GInstanceWhen (name, heads, ctxs, members) ->
+        ("instance " + name + "<" + String.concat ", " (List.map tyText heads) + ">"
+         + String.concat "" (ctxs |> List.map (fun c -> " when " + tyText c)))
         :: (members
             |> List.collect (fun m ->
                 let head =
@@ -1561,7 +1573,145 @@ let logCalls =
 
     { GName = "logCalls"; GAfter = None; Generate = generate }
 
-let builtinGenerators = [ deriveGen; deriveToString; deriveSerialize; logCalls ]
+// ---- deriveArb: the built-in Arb derivation, as GENERATED SOURCE ----------
+// The compiler derives `Arb` for records and unions internally, with no
+// registration (see Infer) — that is the zero-config path, and it stays.
+// This generator is the SAME derivation through the plugin surface, emitted
+// as ordinary instances anyone can read, and it covers the built-in's whole
+// ground — generic heads included: `Pair<'a>` gets
+// `instance Arb<Pair<'a>> when Arb<'a>`, discharged at each use like any
+// written contextual instance. The built-in yields to whatever this emits
+// (a generated instance IS a written one by the time inference looks), so
+// registering the generator moves the derivation into inspectable source
+// rather than doubling it.
+
+let deriveArb =
+    let generate (view : ProgramView) : (string * GenOutput) list =
+        let byName = dictNew<string, GenTypeDecl> ()
+        for t in view.Types do
+            if t.TKind = "record" || t.TKind = "union" then dictSet byName t.TName t
+        let handWritten = dictNew<string, bool> ()
+        for i in view.Instances do
+            if i.IClass = "Arb" then
+                for h in i.IHead do
+                    let c = compact h
+                    let bare =
+                        let k = c.IndexOf '<'
+                        if k < 0 then c else c.Substring (0, k)
+                    dictSet handWritten bare true
+        let scalar (t : string) =
+            t = "int" || t = "int64" || t = "bool" || t = "float" || t = "string"
+        /// `HashMap<int,string>` -> its argument spellings, split at TOP-LEVEL
+        /// commas only
+        let argsOf (t : string) : string list =
+            let k = t.IndexOf '<'
+            if k < 0 || not (t.EndsWith ">") then []
+            else
+                let inner = t.Substring (k + 1, t.Length - k - 2)
+                let parts = vecNew<string> ()
+                let mutable depth = 0
+                let mutable cur = ""
+                for ch in inner do
+                    if ch = '<' then depth <- depth + 1
+                    if ch = '>' then depth <- depth - 1
+                    if ch = ',' && depth = 0 then
+                        vecAdd parts cur
+                        cur <- ""
+                    else cur <- cur + string ch
+                if cur <> "" then vecAdd parts cur
+                vecToList parts
+        /// can `arbitrary` produce this type inside an instance whose
+        /// contexts supply Arb for each of `ps`? `seen` keeps a recursive
+        /// type from asking about itself forever — a type this generator will
+        /// emit for counts as covered.
+        let rec ok (seen : string list) (ps : string list) (t : string) : bool =
+            let ty = compact t
+            if ty.Contains "->" || ty.Contains "*" then false
+            elif scalar ty then true
+            elif ps |> List.exists (fun p -> ty = "'" + p) then true
+            elif ty.StartsWith "list<" || ty.StartsWith "option<" || ty.StartsWith "Option<"
+                 || ty.StartsWith "array<" || ty.EndsWith "[]"
+                 || (ty.EndsWith "list" && ty.Length > 4 && not (ty.Contains "<"))
+                 || (ty.EndsWith "option" && ty.Length > 6 && not (ty.Contains "<")) then
+                let elem =
+                    if ty.EndsWith "[]" then ty.Substring (0, ty.Length - 2)
+                    elif ty.Contains "<" then (match argsOf ty with [ one ] -> one | _ -> "?")
+                    elif ty.EndsWith "list" then ty.Substring (0, ty.Length - 4)
+                    else ty.Substring (0, ty.Length - 6)
+                ok seen ps elem
+            else
+                let bare =
+                    let k = ty.IndexOf '<'
+                    if k < 0 then ty else ty.Substring (0, k)
+                if (dictTryFind handWritten bare).IsSome then
+                    argsOf ty |> List.forall (ok seen ps)
+                elif List.contains bare seen then true
+                else
+                    match dictTryFind byName bare with
+                    | Some d ->
+                        (not (d.TCases |> List.exists (fun c -> c.CSig)))
+                        && argsOf ty |> List.forall (ok seen ps)
+                        && (d.TFields |> List.forall (fun f -> ok (bare :: seen) d.TParams f.FType))
+                        && (d.TCases |> List.forall (fun c -> c.CArgs |> List.forall (ok (bare :: seen) d.TParams)))
+                    | None -> false
+        let gen = GApp (GVar "arbitrary", [ GVar "r" ])
+        let decls = vecNew<GDecl> ()
+        let skipped = vecNew<string> ()
+        for name, d in dictPairs byName do
+            if (dictTryFind handWritten name).IsSome then ()
+            elif d.TCases |> List.exists (fun c -> c.CSig) then
+                vecAdd skipped (name + " (a GADT declares per-case signatures)")
+            elif (d.TKind = "record" && not (d.TFields |> List.forall (fun f -> ok [ name ] d.TParams f.FType)))
+                 || (d.TKind = "union" && not (d.TCases |> List.forall (fun c -> c.CArgs |> List.forall (ok [ name ] d.TParams)))) then
+                vecAdd skipped (name + " (a component has no Arb)")
+            elif d.TKind = "union" && List.isEmpty d.TCases then ()
+            else
+                let body =
+                    if d.TKind = "record" then
+                        GRec (d.TFields |> List.map (fun f -> f.FName, gen))
+                    else
+                        let build (c : GenCase) =
+                            match c.CArgs with
+                            | [] -> GVar c.CName
+                            | [ _ ] -> GApp (GVar c.CName, [ gen ])
+                            | many -> GApp (GVar c.CName, [ GTuple (many |> List.map (fun _ -> gen)) ])
+                        let rec chain (i : int) (cs : GenCase list) : GEx =
+                            match cs with
+                            | [] -> GRaw "()"
+                            | [ last ] -> build last
+                            | c :: rest -> GIf (GBin ("=", GVar "__k", GInt i), build c, chain (i + 1) rest)
+                        if List.length d.TCases = 1 then chain 0 d.TCases
+                        else
+                            GLet ("__k",
+                                  GApp (GField (GVar "r", "Next"), [ GInt (List.length d.TCases) ]),
+                                  chain 0 d.TCases)
+                let head =
+                    if List.isEmpty d.TParams then GTyName name
+                    else GTyApp (name, d.TParams |> List.map GTyVar)
+                let ctxs = d.TParams |> List.map (fun p -> GTyApp ("Arb", [ GTyVar p ]))
+                vecAdd decls (GComment ("Arb for " + name))
+                vecAdd decls
+                    (GInstanceWhen ("Arb", [ head ], ctxs,
+                        [ { MName = "arbitrary"
+                            MParams = [ "r", Some (GTyName "Rand") ]
+                            MBody = body } ]))
+        if vecLen decls = 0 then []
+        else
+            let opens =
+                view.Types
+                |> List.filter (fun t -> (dictTryFind byName t.TName).IsSome && t.TModule <> "")
+                |> List.map (fun t -> t.TModule)
+                |> List.distinct
+                |> List.sort
+                |> List.map GOpen
+            let header =
+                [ GComment "deriveArb: Arb instances for the program's own types." ]
+                @ (if vecLen skipped = 0 then []
+                   else [ GComment ("skipped: " + String.concat ", " (vecToList skipped)) ])
+            [ "deriveArb.fpp", Source (renderFile (header @ opens @ vecToList decls)) ]
+    { GName = "deriveArb"; GAfter = None; Generate = generate }
+
+let builtinGenerators = [ deriveGen; deriveToString; deriveSerialize; deriveArb; logCalls ]
 
 let builtinPlugins = [ constFold; deriveShallowEquals ]
 

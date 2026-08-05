@@ -1021,3 +1021,47 @@ let monoLayoutTests =
             Expect.equal out "10\n1.5\n" "both specializations compute correctly"
         }
     ]
+
+[<Tests>]
+let deriveArbTests =
+    testList "deriveArb (Arb through the generator surface)" [
+        test "generic instances derive with contexts and the program draws from them" {
+            let out =
+                runGenerated [ Fpp.Core.Plugins.deriveArb ]
+                    [ "types.fpp",
+                      [ "type Pair<'a> = { First : 'a; Rest : list<'a> }"
+                        "type Mix = | Just of int | Pairy of Pair<bool> | Nothing" ]
+                      "main.fpp",
+                      [ "let r = Rand 7"
+                        "let p : Pair<int> = arbitrary r"
+                        "print (string (List.length p.Rest <= 8))"
+                        "let mutable i = 0"
+                        "while i < 20 do"
+                        "    let m : Mix = arbitrary r"
+                        "    (match m with"
+                        "     | Pairy q -> print (string (List.length q.Rest <= 8))"
+                        "     | Just _ -> ()"
+                        "     | Nothing -> ())"
+                        "    i <- i + 1"
+                        "print \"done\"" ] ]
+            Expect.stringEnds (out.Trim ()) "done" "the program runs to completion"
+            Expect.isFalse (out.Contains "False") "every drawn list respects the size bound"
+            Expect.stringContains out "True" "at least one structural check actually ran"
+        }
+        test "a written instance wins and a GADT refuses" {
+            let text =
+                generatedText [ Fpp.Core.Plugins.deriveArb ]
+                    [ "a.fpp",
+                      [ "type Handled = { V : int }"
+                        "instance Arb<Handled>"
+                        "    static arbitrary (r : Rand) = { V = 1 }"
+                        "type Tm<_> ="
+                        "    | Lit : int -> Tm<int>"
+                        "type Fine = | A | B of string"
+                        "let keep = ({ V = 2 } : Handled)"
+                        "print (string keep.V)" ] ]
+            Expect.stringContains text "instance Arb<Fine>" "the plain union derives"
+            Expect.isFalse (text.Contains "Arb<Handled>") "the hand-written instance's type is left alone"
+            Expect.stringContains text "Tm (a GADT" "the GADT is skipped, and says so"
+        }
+    ]
