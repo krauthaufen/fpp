@@ -29,6 +29,7 @@
     <Compile Include="Backend/WasmBinary.fs" />
     <Compile Include="Backend/EmitBin.fs" />
     <Compile Include="Backend/BinDriver.fs" />
+    <Compile Include="Backend/CEmit.fs" />
     <Compile Include="Backend/SourceMap.fs" />
     <Compile Include="Query.fs" />
     <Compile Include="Project.fs" />

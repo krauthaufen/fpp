@@ -206,6 +206,17 @@ fpprt_ref fpprt_weak_get(fpprt_ref weak) {
       gc_ephemeron_value((struct gc_ephemeron *)weak));
 }
 
+/* ---- static roots ------------------------------------------------------ */
+
+void fpprt_add_static_roots(fpprt_ref *base, size_t n) {
+  size_t i = heap_roots_.nranges++;
+  heap_roots_.ranges = realloc(heap_roots_.ranges,
+                               heap_roots_.nranges
+                               * sizeof(*heap_roots_.ranges));
+  if (!heap_roots_.ranges) abort();
+  heap_roots_.ranges[i] = (struct fpprt_static_range){ base, n };
+}
+
 /* ---- identity hash ----------------------------------------------------- */
 
 uintptr_t fpprt_idhash(fpprt_ref o) {

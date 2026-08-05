@@ -43,13 +43,24 @@ let private build (out : string) (files : string list) : int =
         ws.AddLibrary l (readSource l)
     for f in srcs do
         ws.SetFileText f (readSource f)
-    let bytes, errors = ws.EmitProgramWasm ()
-    if not (List.isEmpty errors) then
-        for e in errors do eprintfn "error: %s" e
-        1
+    // an `-o something.c` selects the C backend (fpprt runtime); anything
+    // else is the wasm-GC module
+    if out.EndsWith ".c" then
+        let text, errors = ws.EmitProgramC ()
+        if not (List.isEmpty errors) then
+            for e in errors do eprintfn "error: %s" e
+            1
+        else
+            System.IO.File.WriteAllText(out, text)
+            0
     else
-        System.IO.File.WriteAllBytes(out, bytes)
-        0
+        let bytes, errors = ws.EmitProgramWasm ()
+        if not (List.isEmpty errors) then
+            for e in errors do eprintfn "error: %s" e
+            1
+        else
+            System.IO.File.WriteAllBytes(out, bytes)
+            0
 
 // `fpp exe` — a platform executable. The module is compiled to machine code at
 // BUILD time and linked into a launcher that embeds wasmtime, so the result

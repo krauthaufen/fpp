@@ -93,15 +93,21 @@ static inline size_t gc_trace_object(struct gc_ref ref,
   switch (t->kind) {
   case FPPRT_EMB_KIND_STRUCT:
     if (visit)
-      for (uint32_t i = 0; i < t->nrefs; i++)
-        visit(gc_edge((char *)obj + t->refoffs[i]), heap, trace_data);
+      for (uint32_t i = 0; i < t->nrefs; i++) {
+        uintptr_t *slot = (uintptr_t *)((char *)obj + t->refoffs[i]);
+        /* a slot on the map can hold a TAGGED SCALAR (bit 0 set) where its
+         * static type is generic — those are values, not edges */
+        if (*slot && !(*slot & 1))
+          visit(gc_edge(slot), heap, trace_data);
+      }
     return t->size;
   case FPPRT_EMB_KIND_REF_ARRAY: {
     uintptr_t len = ((uintptr_t *)obj)[1];
     if (visit) {
       uintptr_t *elems = (uintptr_t *)obj + 2;
       for (uintptr_t i = 0; i < len; i++)
-        visit(gc_edge(&elems[i]), heap, trace_data);
+        if (elems[i] && !(elems[i] & 1))
+          visit(gc_edge(&elems[i]), heap, trace_data);
     }
     return 2 * sizeof(uintptr_t) + len * sizeof(uintptr_t);
   }
@@ -127,9 +133,15 @@ struct fpprt_frame_intern {
 struct gc_mutator_roots {
   struct fpprt_frame_intern **top; /* &fpprt_top_frame */
 };
+struct fpprt_static_range {
+  uintptr_t *base;
+  size_t n;
+};
 struct gc_heap_roots {
-  uintptr_t *statics;              /* compiler-known global refs */
+  uintptr_t *statics;              /* the idhash buckets */
   size_t nstatics;
+  struct fpprt_static_range *ranges; /* compiler-registered global roots */
+  size_t nranges;
 };
 
 static inline void gc_trace_mutator_roots(struct gc_mutator_roots *roots,
@@ -141,7 +153,7 @@ static inline void gc_trace_mutator_roots(struct gc_mutator_roots *roots,
   if (!roots) return;
   for (struct fpprt_frame_intern *f = *roots->top; f; f = f->prev)
     for (uint32_t i = 0; i < f->nslots; i++)
-      if (f->slots[i])
+      if (f->slots[i] && !(f->slots[i] & 1))
         trace_edge(gc_edge(&f->slots[i]), heap, trace_data);
 }
 
@@ -153,8 +165,14 @@ static inline void gc_trace_heap_roots(struct gc_heap_roots *roots,
                                        void *trace_data) {
   if (!roots) return;
   for (size_t i = 0; i < roots->nstatics; i++)
-    if (roots->statics[i])
+    if (roots->statics[i] && !(roots->statics[i] & 1))
       trace_edge(gc_edge(&roots->statics[i]), heap, trace_data);
+  for (size_t r = 0; r < roots->nranges; r++) {
+    uintptr_t *base = roots->ranges[r].base;
+    for (size_t i = 0; i < roots->ranges[r].n; i++)
+      if (base[i] && !(base[i] & 1))
+        trace_edge(gc_edge(&base[i]), heap, trace_data);
+  }
 }
 
 static inline void

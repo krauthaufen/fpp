@@ -748,7 +748,10 @@ type Workspace() =
     member private this.EmitCore (optimize : bool) : byte[] * string list =
         this.EmitCoreMapped optimize ""
 
-    member private this.EmitCoreMapped (optimize : bool) (mapUrl : string) : byte[] * string list =
+    /// Everything both backends share: generators, check, lower, link,
+    /// monomorphize, optimize, DCE. Returns the linked program and any
+    /// errors; an erroring program returns an empty decl list.
+    member private this.LinkedCore (optimize : bool) : Fpp.Core.Ir.Decl list * string list =
         this.RunGenerators ()
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
@@ -848,7 +851,7 @@ type Workspace() =
             let _, _, ds = Fpp.Core.Serialize.decodeLib text
             for d in ds do vecAdd libDecls d
         for pe in this.PluginErrors do vecAdd errs pe
-        if vecLen errs > 0 then [||], vecToList errs
+        if vecLen errs > 0 then [], vecToList errs
         else
             let program = this.RunWholeProgram (vecToList libDecls @ vecToList allDecls)
             // tier-1: stamp per struct instantiation, share one body for
@@ -872,13 +875,25 @@ type Workspace() =
             // the definitions inlining made unreachable
             let opt = if optimize then Fpp.Core.Optimize.optimize mono else mono
             let linked = Fpp.Core.Link.deadCodeEliminate opt
-            if not (List.isEmpty monoErrs) then [||], monoErrs
-            else
-                let bytes, berrs, warns, positions =
-                    Fpp.Backend.BinDriver.emitBinaryWithPositions mapUrl linked
-                for w in warns do ewarn ("warn: " + w)
-                lastPositions <- positions
-                bytes, berrs
+            if not (List.isEmpty monoErrs) then [], monoErrs
+            else linked, []
+
+    member private this.EmitCoreMapped (optimize : bool) (mapUrl : string) : byte[] * string list =
+        let linked, errs = this.LinkedCore optimize
+        if not (List.isEmpty errs) then [||], errs
+        else
+            let bytes, berrs, warns, positions =
+                Fpp.Backend.BinDriver.emitBinaryWithPositions mapUrl linked
+            for w in warns do ewarn ("warn: " + w)
+            lastPositions <- positions
+            bytes, berrs
+
+    /// The program as ONE C translation unit against the fpprt runtime
+    /// (runtime/): gcc for native, emcc for wasm-linear. PLAN-CBACK.md.
+    member this.EmitProgramC () : string * string list =
+        let linked, errs = this.LinkedCore true
+        if not (List.isEmpty errs) then "", errs
+        else Fpp.Backend.CEmit.emitC linked
 
     /// The program as a direct .wasm module: bytes out, no text anywhere.
     member this.EmitProgramWasm () : byte[] * string list = this.EmitCore true

@@ -125,6 +125,13 @@ void fpprt_write_ref(fpprt_ref o, uint32_t byteoff, fpprt_ref v);
 fpprt_ref fpprt_weak_new(fpprt_ref target);
 fpprt_ref fpprt_weak_get(fpprt_ref weak);
 
+/* ---- static roots ------------------------------------------------------ */
+
+/* Register a range of GLOBAL slots the collector reads and updates —
+ * compiled code's top-level bindings. Slots holding tagged scalars
+ * (bit 0 set) or 0 are ignored. Startup-only, like type registration. */
+void fpprt_add_static_roots(fpprt_ref *base, size_t n);
+
 /* ---- identity hash ----------------------------------------------------- */
 
 /* .NET's default GetHashCode: a per-object value, assigned on first ask,
