@@ -2896,8 +2896,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // resolves per stamp inside RangeOps.Seq, and a
                           // wanted here would numeric-default a generic
                           // wrapper's parameter to int behind its back
+                          // ... and only when the classes exist at all: the
+                          // dogfooding gate infers with an EMPTY prelude,
+                          // where a constraint could never be discharged
                           (match prune elem with
                            | TVar _ -> ()
+                           | _ when (dictTryFind classes.Classes "Integral").IsNone -> ()
                            | _ ->
                                addWanted op.Offset { Class = "Integral"; Args = [ elem ]; Assoc = [] }
                                addWanted op.Offset { Class = "Ordered"; Args = [ elem ]; Assoc = [] }
@@ -3468,7 +3472,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // object expression defaulted instead of going class-pending
                 for m in nodesOf n do
                     if m.NodeKind = MemberDecl then
-                        inferMember (synth + "." + ifaceName) ivars [] selfTy m
+                        inferMember (synth + "." + ifaceName) ivars [] selfTy (Some ifaceTy) m
                     // a CLASS base's constructor arguments:
                     // `{ new AbstractReader<'d>(empty) with ... }` — typed
                     // like any expression, so their member accesses resolve
@@ -4459,7 +4463,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      setScheme off csch
                      dictSet ctors name (prior @ [ off, csch ])
                  | None -> ())
-            | MemberDecl -> inferMember name vars (paramVarList ()) selfTy m
+            | MemberDecl -> inferMember name vars (paramVarList ()) selfTy None m
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
                 // are not accessible as members of the class itself
@@ -4484,7 +4488,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      dictSet impls name (inm :: prior)
                  | None -> ())
                 for x in nodesOf m do
-                    if x.NodeKind = MemberDecl then inferMember owner vars (paramVarList ()) selfTy x
+                    if x.NodeKind = MemberDecl then inferMember owner vars (paramVarList ()) selfTy None x
             | k when isPatKind k ->
                 // primary-ctor params — and the class becomes constructible:
                 // `State(src, toks)` gets the scheme ctorArgs -> Self
@@ -4550,7 +4554,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       Offset = off }
         | _ -> ()
 
-    and inferMember (tyName : string) (tyVars : Dict<string, Type>) (classParams : Var list) (selfTy : Type) (n : GreenNode) : unit =
+    and inferMember (tyName : string) (tyVars : Dict<string, Type>) (classParams : Var list) (selfTy : Type) (ifacePin : Type option) (n : GreenNode) : unit =
         // member scope: the class type variables plus the member's own
         let mvars = dictNew<string, Type> ()
         for k, v in dictPairs tyVars do dictSet mvars k v
@@ -4664,8 +4668,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // receiver unresolvable — the access fell to a by-name field guess
         let isOverride =
             tokensOf n |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "override" || t.Text = "default"))
+        // an OBJECT EXPRESSION'S members take the interface's declared
+        // types — but only when the declaration is fully CLOSED after
+        // substituting the written arguments. An open declaration might be
+        // the wrong arity variant of a split interface name, and pinning
+        // that corrupted the member; a closed one can only be the truth or
+        // a unification error at this very member, which is the right place.
+        let ifaceDecl (nm : Token) : Type option =
+            match ifacePin |> Option.map prune with
+            | Some (TCon (ifn, iargs)) ->
+                (match dictTryFind fields (ifn + "." + nm.Text) with
+                 | Some fi when List.length fi.Params = List.length iargs ->
+                     let fs = dictNew<int, Type> ()
+                     List.iter2 (fun (pv : Var) a -> dictSet fs (prunedId pv) a) fi.Params iargs
+                     let r = substVars fs fi.FieldType
+                     if List.isEmpty (freeVars r) then Some r else None
+                 | _ -> None)
+            | _ -> None
         (match nameTok with
-         | Some nm when isOverride && not (List.isEmpty paramTys) ->
+         | Some nm when (isOverride || ifacePin.IsSome) && not (List.isEmpty paramTys) ->
              // walk the base chain for the declaration, substituting each
              // hop's own parameters by the instantiation the subclass wrote
              let rec findDecl (cls : string) (args : Type list) (fuel : int) : Type option =
@@ -4692,7 +4713,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                | _ -> findDecl bn bargs (fuel - 1))
                           | _ -> None)
                      | _ -> None
-             (match findDecl tyName (classParams |> List.map TVar) 8 with
+             let declared =
+                 if isOverride then findDecl tyName (classParams |> List.map TVar) 8
+                 else ifaceDecl nm
+             (match declared with
               | Some declared ->
                   let rec pin (ps : Type list) (d : Type) =
                       match ps, prune d with
@@ -4770,7 +4794,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
                  // only the member's OWN vars go declaration-level: an
                  // OBJ-EXPRESSION member's type mentions the enclosing
-                 // binding's variables, and zeroing those un-generalized it
+                 // binding's variables, and zeroing those un-generalized it.
                  for v in qs do (if v.Level > st.Level then v.Level <- 0)
                  { Quantified = qs; Constraints = []; Body = defTy })
 
