@@ -30,7 +30,10 @@ let private run (exe : string) (args : string) : string * string * int =
 
 [<Tests>]
 let adaptiveSuiteTests =
-    testList "adaptive suite" [
+    // sequenced: an eight-minute in-process compile sharing the runner with
+    // the parallel batch starves it — three unrelated tests flaked when
+    // this ran alongside them
+    testSequenced <| testList "adaptive suite" [
         if not (System.IO.Directory.Exists adaptiveRoot) then
             ptest "the ported library's test suite runs green (SKIPPED: no FSharp.Data.Adaptive checkout)" { () }
         else

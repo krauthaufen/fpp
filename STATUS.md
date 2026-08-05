@@ -911,26 +911,35 @@ avoid, not a live defect.
 
 ## Roadmap
 
-In rough order of leverage:
+In the order set (the native backend deliberately LAST — everything before
+it hardens the semantics it will be diffed against):
 
 1. **The last known-issue** — inner-generic-class stamping through the
-   enclosing member's instantiation (diagnosis in the repro file).
-2. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift, MMTk (Boehm to
-   start). The wasm-GC backend is the semantics reference it will be
-   diffed against.
-3. **Deriving as a plugin surface** (Stage 4.9): `Arb` and the
+   enclosing member's instantiation (diagnosis in the repro file). One
+   attempt is already paid for: running the layout-dependence passes to a
+   shared fixpoint (so a member constructing a vtable-forced class stamps
+   too) fixes the repro but cascades stamping into classes whose instances
+   ALSO flow out of canonical paths — a generic static empty-singleton is
+   evaluated once, canonically, and a newly-stamped accessor casting it
+   traps. The real fix has to reconcile stamped members with
+   canonically-constructed instances first.
+2. **Deriving as a plugin surface** (Stage 4.9): `Arb` and the
    CompareTo-instance rule are built-in derivations; `Unmanaged`,
    `Serialize` and user classes want the same mechanism exposed as a
    TAST -> TAST plugin API instead of compiler edits.
-4. **Performance toward C**: the vertex benchmark stands at 191 ms against
-   C's 71 ms. The measured next steps live in CLAUDE.md's optimization
-   section — and so do the dead ends already paid for.
-5. **CE range splice**: `seq { a .. b }` still relies on a port rewrite to
+3. **CE range splice**: `seq { a .. b }` still relies on a port rewrite to
    the list bracket; the computation-expression path should splice a range
    item natively.
-6. **The first-identifier audit**: ~30 remaining
+4. **The first-identifier audit**: ~30 remaining
    `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer/Lower, each
    correct only if its head cannot be qualified.
-7. **Tuple `Arb`** — struct tuples and records derive; plain tuples name
+5. **Tuple `Arb`** — struct tuples and records derive; plain tuples name
    themselves `$ref` and have nothing to dispatch on. Wants the same
    canonical-naming answer the struct-tuple work established.
+6. **Performance toward C**: the vertex benchmark stands at 191 ms against
+   C's 71 ms. The measured next steps live in CLAUDE.md's optimization
+   section — and so do the dead ends already paid for.
+7. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift, MMTk (Boehm to
+   start). Last on purpose: the wasm-GC backend is the semantics reference
+   it will be diffed against, and every item above makes that reference
+   harder to drift from.
