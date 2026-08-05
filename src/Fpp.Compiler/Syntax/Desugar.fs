@@ -308,7 +308,18 @@ and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : G
     // is an implicit yield — unless the probe found it has no value, which
     // is exactly what makes it a statement instead.
     | _ when not explicit && not (statementAt (offsetOf item)) ->
-        combine (call b "Yield" [ walk (GNode item) ])
+        // a bare RANGE splices: `seq { a .. b }` yields the range's
+        // ELEMENTS — F#'s reading — where a Yield would hand the builder
+        // the whole range as one value
+        let isRange =
+            item.NodeKind = BinaryExpr
+            && (item.Children
+                |> List.exists (fun c ->
+                    match c with
+                    | GToken t -> t.Kind = Operator && t.Text = ".."
+                    | _ -> false))
+        if isRange then combine (call b "YieldFrom" [ walk (GNode item) ])
+        else combine (call b "Yield" [ walk (GNode item) ])
     | _ when List.isEmpty rest -> Green.node BlockExpr [ walk (GNode item); call b "Zero" [] ]
     | _ -> sequential ()
 

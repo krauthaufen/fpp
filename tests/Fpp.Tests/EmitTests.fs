@@ -1026,6 +1026,16 @@ let computationExpressionTests =
                     "" ])
             Expect.equal out "10\n1\n2\n" "Combine and Delay compose the parts"
         }
+        test "a bare range item splices its elements" {
+            let out =
+                runProgram (String.concat "\n" [
+                    "module M"
+                    "let lo = 3"
+                    "let b = seq { lo .. 6 }"
+                    "let go = for x in b do printfn \"%d\" x"
+                    "" ])
+            Expect.equal out "3\n4\n5\n6\n" "seq { a .. b } is a YieldFrom of the range, never a Yield of it"
+        }
         test "for and while are the builder's, not the language's" {
             let out =
                 runProgram (String.concat "\n" [

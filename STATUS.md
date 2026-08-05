@@ -934,9 +934,11 @@ it hardens the semantics it will be diffed against):
    necessarily lands. `Serialize` already had `deriveSerialize`; the
    CompareTo rule stays an inference rule — it points at an existing
    member and synthesizes nothing, which no source generator could say.
-3. **CE range splice**: `seq { a .. b }` still relies on a port rewrite to
-   the list bracket; the computation-expression path should splice a range
-   item natively.
+3. ~~**CE range splice**~~ — **done.** A bare range item in a CE body
+   desugars to `YieldFrom` (F#'s reading: the range's ELEMENTS, not the
+   range as one value), and the port rewrite that papered over it is
+   retired — the adaptive lib's `range` combinator now exercises the
+   native path.
 4. **The first-identifier audit**: ~30 remaining
    `List.tryFind (fun t -> t.Kind = Ident)` lookups in Infer/Lower, each
    correct only if its head cannot be qualified.

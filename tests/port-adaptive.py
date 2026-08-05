@@ -379,12 +379,6 @@ SPOT = [
      "let inline range (lowerBound: aval< ^T >) (upperBound: aval< ^T >) : aset< ^T > =\n        if lowerBound.IsConstant && upperBound.IsConstant then\n            constant (fun () -> HashSet.ofSeq"),
     ("let inline range (lowerBound: aval< ^T >) (upperBound: aval< ^T >) =\n        if lowerBound.IsConstant && upperBound.IsConstant then\n            ofSeq",
      "let inline range (lowerBound: aval< ^T >) (upperBound: aval< ^T >) : alist< ^T > =\n        if lowerBound.IsConstant && upperBound.IsConstant then\n            ofSeq"),
-    # `seq { a .. b }` — the CE does not SPLICE a range item yet; the list
-    # bracket does, and materializes through the same typeclass path
-    ("HashSet.ofSeq (seq { AVal.force lowerBound .. AVal.force upperBound })",
-     "HashSet.ofList [ AVal.force lowerBound .. AVal.force upperBound ]"),
-    ("ofSeq (seq { AVal.force lowerBound .. AVal.force upperBound })",
-     "ofList [ AVal.force lowerBound .. AVal.force upperBound ]"),
     # VolatileSetData is [<Struct>] purely as a .NET optimization ("~10%
     # faster transactions than unbox", says its comment). Here a class with
     # F++'s synthesized zero-init unit constructor is the same program:
