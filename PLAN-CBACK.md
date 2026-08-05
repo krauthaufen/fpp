@@ -57,6 +57,26 @@ frame also snapshots the shadow-stack top so unwinding restores roots.
 - `fpprt_add_static_roots(V *base, size_t n)` — multiple ranges  [M1]
 - nothing else: weak = fpprt_weak, hash = fpprt_idhash, pin = fpprt_pin
 
+## State (2026-08-05 evening)
+
+M1-M7 CORE DONE: fib, m2-data, m3-classes and stdlib/dotnet.fpp (142
+values) all PARITY OK vs the wasm-GC oracle, native gcc + fpprt(semi).
+Remaining: M8 — the adaptive suite (lib.fpp + Tests.fpp), then the emcc
+build, then wire the gates. Micros in tests/tooling/cback/, runner is
+run.sh. FPP_CBACK_DUMP=1 prints the IR as C comments. Traps name their
+gap; ASan build of the generated C gives the call path.
+
+Learned the hard way (do not re-learn): LString/LChar carry SOURCE
+spellings (use BinDriver.unescape/charCode); int literals keep suffixes
+(L boxes); kind letters are f/s=f32/h=f16/l/w=u32/v=u64/t=STRING/b/c and
+INT IS UNSUFFIXED (bare ops dispatch at runtime like $addv); classes are
+records + member fns + DClass metadata (vtables only for EIfaceCall);
+stamped record clones have EMPTY field lists (inherit the base's);
+fn-closure singletons must init before ALL global inits; zeroCreate seeds
+by element kind (int slots are tagged 0, NEVER null); the eqv identity
+fast path must exempt floats (NaN); "$str." methods are builtins; the
+seq protocol is runtime enumerators wired into the program's slots.
+
 ## Milestones (tasks #21-#28)
 
 - M1 core exprs: lit/arith/let/if/while/fn/call/print — fib parity
