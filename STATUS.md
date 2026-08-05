@@ -963,7 +963,13 @@ it hardens the semantics it will be diffed against):
    shapes (686 vs 248) is per-access bounds checks and no SIMD — engine
    and spec territory. The dead ends already paid for live in CLAUDE.md's
    optimization section.
-7. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift, MMTk (Boehm to
-   start). Last on purpose: the wasm-GC backend is the semantics reference
-   it will be diffed against, and every item above makes that reference
-   harder to drift from.
+7. **Native backend** (PLAN.md Stage 7): LLVM or Cranelift. Last on
+   purpose: the wasm-GC backend is the semantics reference it will be
+   diffed against, and every item above makes that reference harder to
+   drift from. **The runtime exists first** (`runtime/`): fpprt, a C
+   object model + precise moving GC over vendored Whippet — semispace,
+   parallel-copying and Immix-style collectors behind one API, shadow-stack
+   roots, ephemeron-backed weak refs, real pinning — passing its gate
+   under all three collectors natively AND compiled to wasm32 under
+   wasmtime. Both future backends (native and wasm-linear) target this
+   one runtime; there is no v0 without a real GC.
