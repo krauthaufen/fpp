@@ -190,6 +190,21 @@ never caught it because dotnet.fpp's floats are small), and `prints` no
 longer double-newlines (it mapped to the newline-adding printer; the
 suite's internal PASS check couldn't see it, byte-diff did).
 
+P2.5 (raw direct-call ABI, commit 49f84df): FnSig/FnRet registry from the
+post-mono schemes; DIRECT calls pass proven-primitive params and results
+as raw C values (gcc inlines through them); the uniform (self,args)
+wrappers un/box at the closure/vtable boundary; intrinsic members keep
+the uniform ABI. Call-heavy float bench: 14x FASTER than the oracle.
+The adaptive suite's wall time is unchanged (0.53s) — after the cmpv
+fix it is not allocation-bound.
+
+OPEN (the "no spill anywhere" decision): wasm32's 31-bit tag cannot hold
+int32; the choices are the value-dependent spill (one branch in TAGI,
+32-bit only) or always-boxing int32 there (fully static, but every
+emitted tagged pointer-compare — enum matches, int patterns — must
+become structural equality). No third static option exists. 64-bit is
+branch-free tagging either way. Waiting on the user's call.
+
 What still boxes, and why: f64/i64 fields of ORDINARY records/classes —
 the oracle's wasm-GC layout is all-anyref for those too (only [<Struct>]
 POD records get typed layouts there), so cback matches oracle cost;
