@@ -193,6 +193,19 @@ let private mathBase (op0 : string) : string option =
         else None
     else None
 
+/// scalar-array info for a CONCRETE element type name: the runtime tid
+/// macro, the typed-accessor suffix, and the element's raw kind. int16 and
+/// sbyte stay in ref arrays — unsigned storage would lose their sign.
+let private elemInfo (nm : string) : (string * string * char) option =
+    match nm with
+    | "float" | "double" -> Some ("FPP_TID_AF64", "f64", 'f')
+    | "float32" | "single" -> Some ("FPP_TID_AF32", "f32", 's')
+    | "int64" | "uint64" -> Some ("FPP_TID_AI64", "i64", 'l')
+    | "int" | "enum" | "uint32" -> Some ("FPP_TID_AI32", "i32", 'i')
+    | "char" | "uint16" -> Some ("FPP_TID_AU16", "u16", 'i')
+    | "byte" | "bool" -> Some ("FPP_TID_AU8", "u8", 'i')
+    | _ -> None
+
 /// the raw kind a CONCRETE monomorphized type stores at, or None (uniform)
 let private schemeRawKind (sc : Scheme) : char option =
     match prune sc.Body with
@@ -303,6 +316,10 @@ let rec private rawKindOf (f : CFn) (e : Expr) : char option =
         if b <> "abs" && b <> "sign" && strLen op0 = strLen b + 1
            && charAt op0 (strLen op0 - 1) = 'f' then Some 'f'
         else None
+    | EIndex (nm, _, _) when nm <> "$str" ->
+        (match elemInfo nm with
+         | Some (_, _, k) -> Some k
+         | None -> None)
     | EIf (_, t, e2) ->
         (match rawKindOf f t, rawKindOf f e2 with
          | Some ka, Some kb when ka = kb -> Some ka
@@ -523,6 +540,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EApp (EUnknown _, [ _ ]) when (rawKindOf f e).IsSome ->
         let k, a = emitRaw st f e
         boxRaw f k a
+    | EIndex _ when (rawKindOf f e).IsSome ->
+        let k, a = emitRaw st f e
+        boxRaw f k a
     | ELit (LInt s) ->
         // the literal keeps its SOURCE suffix (5L, 3uy, 7us, 0x1F);
         // int64/uint64 box, everything else tags
@@ -605,8 +625,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("fpp_print_any(" + sref x + ");")
         unitV ()
     | EApp (EUnknown "prints", [ a ]) ->
+        // RAW string out, no newline — printfn's format carries its own
         let x = emitE st f a
-        stmt f ("fpp_print(" + sref x + ");")
+        stmt f ("fpp_prints(" + sref x + ");")
         unitV ()
     | EApp (EUnknown "printb", [ a ]) ->
         let x = emitE st f a
@@ -1281,18 +1302,34 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("if (!UNTAGI(" + sref matched + ")) fpp_reraise();")
         stmt f ("} }")
         d
-    | EArray (_, xs) ->
-        let vs = xs |> List.map (emitE st f)
-        let d = slot f
-        stmt f (sref d + " = fpp_arr_new(" + string (List.length xs) + ");")
-        vs |> List.iteri (fun i x ->
-            stmt f ("fpp_arr_set(" + sref d + ", " + string i + ", " + sref x + ");"))
-        d
+    | EArray (nm, xs) ->
+        (match elemInfo nm with
+         | Some (tid, suffix, k) ->
+             // typed literal: scalar array, elements stored RAW
+             let atoms = xs |> List.map (emitRawAs st f k)
+             let d = slot f
+             stmt f (sref d + " = fpprt_alloc_array(" + tid + ", "
+                     + string (List.length xs) + ");")
+             atoms |> List.iteri (fun i a ->
+                 stmt f ("fpp_arr_set_" + suffix + "(" + sref d + ", "
+                         + string i + ", " + a + ");"))
+             d
+         | None ->
+             let vs = xs |> List.map (emitE st f)
+             let d = slot f
+             stmt f (sref d + " = fpp_arr_new(" + string (List.length xs) + ");")
+             vs |> List.iteri (fun i x ->
+                 stmt f ("fpp_arr_set(" + sref d + ", " + string i + ", " + sref x + ");"))
+             d)
     | EArrayCreate (nm, n, v) ->
         let nv = emitE st f n
         let d = slot f
-        (match v with
-         | EUnknown "$zero" ->
+        (match v, elemInfo nm with
+         | EUnknown "$zero", Some (tid, _, _) ->
+             // typed zeroCreate: a SCALAR array — the allocator zeroes
+             stmt f (sref d + " = fpprt_alloc_array(" + tid + ", (size_t)UNTAGI("
+                     + sref nv + "));")
+         | EUnknown "$zero", None ->
              // .NET zeros by ELEMENT KIND: an int slot is tagged 0, never
              // null — generic code adds it without looking
              let zk =
@@ -1304,7 +1341,14 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  | _ -> "0"
              stmt f (sref d + " = fpp_arr_zeroed(" + zk + ", (size_t)UNTAGI("
                      + sref nv + "));")
-         | _ ->
+         | _, Some (tid, suffix, k) ->
+             stmt f (sref d + " = fpprt_alloc_array(" + tid + ", (size_t)UNTAGI("
+                     + sref nv + "));")
+             let a = emitRawAs st f k v
+             stmt f ("{ size_t N = fpprt_array_len(" + sref d + ");")
+             stmt f ("for (size_t I = 0; I < N; I++) fpp_arr_set_" + suffix
+                     + "(" + sref d + ", I, " + a + "); }")
+         | _, None ->
              stmt f (sref d + " = fpp_arr_new((size_t)UNTAGI(" + sref nv + "));")
              let x = emitE st f v
              stmt f ("{ size_t N = fpprt_array_len(" + sref d + ");")
@@ -1323,6 +1367,14 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_arr_get(" + sref av + ", (size_t)UNTAGI(" + sref iv + "));")
         d
+    | EIndexSet (nm, a, i, v) when nm <> "$str" && (elemInfo nm).IsSome ->
+        let _, suffix, k = (elemInfo nm).Value
+        let av = emitE st f a
+        let ia = emitRawAs st f 'i' i
+        let xa = emitRawAs st f k v
+        stmt f ("fpp_arr_set_" + suffix + "(" + sref av + ", (size_t)" + ia
+                + ", " + xa + ");")
+        unitV ()
     | EIndexSet (_, a, i, v) ->
         let av = emitE st f a
         let iv = emitE st f i
@@ -1893,6 +1945,15 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let n = rawNew f 'f'
             stmt f (n + " = " + cfn + "(" + aa + ");")
             'f', n
+        | EIndex (nm, a, i) ->
+            let acc = (elemInfo nm).Value
+            let _, suffix, _ = acc
+            let av = emitE st f a
+            let ia = emitRawAs st f 'i' i
+            let n = rawNew f rk
+            stmt f (n + " = fpp_arr_get_" + suffix + "(" + sref av
+                    + ", (size_t)" + ia + ");")
+            rk, n
         | EIf (c, t, e2) ->
             let ck, ca = emitRaw st f c
             let n = rawNew f rk
@@ -2272,7 +2333,9 @@ let emitC (decls : Decl list) : string * string list =
     // program's slot numbers
     (match dictTryFind st.VSlot ("IEnumerable", "GetEnumerator") with
      | Some sl ->
-         for tid in [ "FPP_TID_ARR"; "FPP_TID_CONS"; "FPP_TID_STR"; "FPP_TID_TUPLE" ] do
+         for tid in [ "FPP_TID_ARR"; "FPP_TID_CONS"; "FPP_TID_STR"; "FPP_TID_TUPLE"
+                      "FPP_TID_AF64"; "FPP_TID_AF32"; "FPP_TID_AI64"
+                      "FPP_TID_AI32"; "FPP_TID_AU16"; "FPP_TID_AU8" ] do
              vecAdd vtReg ("  fpp_vt_set(" + tid + ", " + string sl + ", fpp_seq_getenum);")
      | None -> ())
     (match dictTryFind st.VSlot ("IEnumerator", "MoveNext") with

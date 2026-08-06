@@ -56,6 +56,17 @@ static inline intptr_t UNTAGI_(V v) {
 #define FPP_TID_PAP    (FPPRT_TID_FIRST + 7)   /* partial application */
 #define FPP_TID_ENUM   (FPPRT_TID_FIRST + 8)   /* builtin seq enumerator */
 #define FPP_TID_CMPCLO (FPPRT_TID_FIRST + 9)   /* the structural-compare closure */
+/* scalar arrays: RAW element storage, one tid per element width. Typed
+ * code creates and reads these; GENERIC code still creates ref arrays —
+ * every accessor dispatches on the array's tid, so both reprs flow
+ * everywhere soundly (no type descriptors needed). Reference equality,
+ * exactly like FPP_TID_ARR. */
+#define FPP_TID_AF64   (FPPRT_TID_FIRST + 10)  /* float[] */
+#define FPP_TID_AF32   (FPPRT_TID_FIRST + 11)  /* float32[] */
+#define FPP_TID_AI64   (FPPRT_TID_FIRST + 12)  /* int64[]/uint64[] */
+#define FPP_TID_AI32   (FPPRT_TID_FIRST + 13)  /* int[]/uint32[]/enum[] */
+#define FPP_TID_AU16   (FPPRT_TID_FIRST + 14)  /* char[]/int16[]/uint16[] */
+#define FPP_TID_AU8    (FPPRT_TID_FIRST + 15)  /* byte[]/bool[] */
 #define FPP_TID_USER   (FPPRT_TID_FIRST + 29)  /* == 32, CEmit's first tid */
 
 /* what a tid MEANS to equality/printing; index = tid */
@@ -97,6 +108,7 @@ V fpp_str_utf8(const char *bytes, size_t len);   /* decode UTF-8 -> UTF-16 */
 V fpp_str_concat(V a, V b);
 V fpp_str_method(const char *m, V recv, V *args, size_t nargs);
 int fpp_str_cmp(V a, V b);
+void fpp_prints(V s);   /* NO newline — printfn-formatted text carries its own */
 
 /* ---- boxes ------------------------------------------------------------- */
 
@@ -130,21 +142,39 @@ static inline V fpp_cell_get(V c) { return fpprt_read_ref(c, sizeof(V)); }
 static inline void fpp_cell_set(V c, V v) { fpprt_write_ref(c, sizeof(V), v); }
 
 static inline V fpp_arr_new(size_t n) { return fpprt_alloc_array(FPP_TID_ARR, n); }
-V fpp_arr_zeroed(int kind, size_t n);   /* 0 ref, 1 tagged 0, 2 f64 0.0, 3 i64 0 */
-static inline V fpp_arr_get(V a, size_t i) {
+V fpp_arr_zeroed(int kind, size_t n);   /* 0 ref, 1 int, 2 f64, 3 i64 */
+
+/* dispatching accessors: correct on BOTH reprs; scalar elems box on get */
+V fpp_arr_get(V a, size_t i);
+void fpp_arr_set(V a, size_t i, V v);
+
+static inline void fpp_arr_check_(V a, size_t i) {
   if (i >= fpprt_array_len(a)) {
     fprintf(stderr, "fpp: index out of range\n");
     abort();
   }
-  return fpprt_read_ref(a, (uint32_t)((i + 2) * sizeof(V)));
 }
-static inline void fpp_arr_set(V a, size_t i, V v) {
-  if (i >= fpprt_array_len(a)) {
-    fprintf(stderr, "fpp: index out of range\n");
-    abort();
+
+/* typed RAW accessors: direct on the matching scalar tid, dispatch (and
+ * box/unbox) otherwise — the hot path never allocates */
+#define FPP_SARR_ACC(NAME, CT, TID, UNBOX, BOX)                              \
+  static inline CT fpp_arr_get_##NAME(V a, size_t i) {                       \
+    fpp_arr_check_(a, i);                                                    \
+    if (fpprt_typeid(a) == TID) return ((CT *)fpprt_elems(a))[i];            \
+    { V e_ = fpp_arr_get(a, i); return (CT)(UNBOX); }                        \
+  }                                                                          \
+  static inline void fpp_arr_set_##NAME(V a, size_t i, CT v_) {              \
+    fpp_arr_check_(a, i);                                                    \
+    if (fpprt_typeid(a) == TID) { ((CT *)fpprt_elems(a))[i] = v_; return; }  \
+    fpp_arr_set(a, i, (BOX));                                                \
   }
-  fpprt_write_ref(a, (uint32_t)((i + 2) * sizeof(V)), v);
-}
+FPP_SARR_ACC(f64, double,   FPP_TID_AF64, fpp_unbox_f64(e_), fpp_box_f64(v_))
+FPP_SARR_ACC(f32, float,    FPP_TID_AF32, fpp_unbox_f64(e_), fpp_box_f64((double)v_))
+FPP_SARR_ACC(i64, int64_t,  FPP_TID_AI64, fpp_unbox_i64(e_), fpp_box_i64(v_))
+FPP_SARR_ACC(i32, int32_t,  FPP_TID_AI32, UNTAGI(e_), TAGI((intptr_t)v_))
+FPP_SARR_ACC(u16, uint16_t, FPP_TID_AU16, UNTAGI(e_), TAGI((intptr_t)v_))
+FPP_SARR_ACC(u8,  uint8_t,  FPP_TID_AU8,  UNTAGI(e_), TAGI((intptr_t)v_))
+#undef FPP_SARR_ACC
 
 /* ---- ConditionalWeakTable ------------------------------------------------
  * The table object's FIRST field (offset sizeof(V)) holds a ref-array of

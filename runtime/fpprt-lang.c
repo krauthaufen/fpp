@@ -110,7 +110,7 @@ int fpp_str_cmp(V a, V b) {
   return la < lb ? -1 : la > lb ? 1 : 0;
 }
 
-void fpp_print(V s) {
+void fpp_prints(V s) {
   uint16_t *u = fpp_str_units(s);
   size_t n = fpp_str_len(s);
   for (size_t i = 0; i < n; i++) {
@@ -135,6 +135,10 @@ void fpp_print(V s) {
       fputc(0x80 | (cp & 0x3f), stdout);
     }
   }
+}
+
+void fpp_print(V s) {
+  fpp_prints(s);
   fputc('\n', stdout);
 }
 
@@ -382,21 +386,11 @@ V fpp_vcall(V obj, int slot, V *args, size_t n) {
 }
 
 V fpp_arr_zeroed(int kind, size_t n) {
-  FPPRT_FRAME(f, 1);
-  f_slots[0] = fpprt_alloc_array(FPP_TID_ARR, n);
-  if (kind == 1) {
-    for (size_t i = 0; i < n; i++)
-      ((uintptr_t *)f_slots[0])[i + 2] = TAGI(0);   /* tagged: no barrier */
-  } else if (kind == 2) {
-    for (size_t i = 0; i < n; i++)
-      fpp_arr_set(f_slots[0], i, fpp_box_f64(0.0));
-  } else if (kind == 3) {
-    for (size_t i = 0; i < n; i++)
-      fpp_arr_set(f_slots[0], i, fpp_box_i64(0));
-  }
-  V r = f_slots[0];
-  FPPRT_LEAVE(f);
-  return r;
+  /* primitive elements now live in SCALAR arrays — the allocator zeroes */
+  if (kind == 1) return fpprt_alloc_array(FPP_TID_AI32, n);
+  if (kind == 2) return fpprt_alloc_array(FPP_TID_AF64, n);
+  if (kind == 3) return fpprt_alloc_array(FPP_TID_AI64, n);
+  return fpprt_alloc_array(FPP_TID_ARR, n);
 }
 
 /* ---- builtin seq enumerators -------------------------------------------- */
@@ -417,11 +411,14 @@ V fpp_enum_movenext(V self, V *args) {
   (void)args;
   V src = fpprt_read_ref(self, 1 * sizeof(V));
   if (src == 0) return TAGI(0);
-  if (fpp_is_tid(src, FPP_TID_ARR) || fpp_is_tid(src, FPP_TID_STR)
-      || fpp_is_tid(src, FPP_TID_TUPLE)) {
-    intptr_t i = UNTAGI(((uintptr_t *)self)[2]) + 1;
-    ((uintptr_t *)self)[2] = TAGI(i);
-    return TAGI((size_t)i < fpprt_array_len(src));
+  {
+    uint32_t t = fpprt_typeid(src);
+    if (t == FPP_TID_ARR || t == FPP_TID_STR || t == FPP_TID_TUPLE
+        || (t >= FPP_TID_AF64 && t <= FPP_TID_AU8)) {
+      intptr_t i = UNTAGI(((uintptr_t *)self)[2]) + 1;
+      ((uintptr_t *)self)[2] = TAGI(i);
+      return TAGI((size_t)i < fpprt_array_len(src));
+    }
   }
   /* a list: idx == -1 means "before first" — first MoveNext stays on src,
    * later ones advance the chain */
@@ -444,7 +441,7 @@ V fpp_enum_current(V self, V *args) {
     return TAGI(fpp_str_units(src)[i]);
   }
   intptr_t i = UNTAGI(((uintptr_t *)self)[2]);
-  return fpprt_read_ref(src, (uint32_t)((i + 2) * sizeof(V)));
+  return fpp_arr_get(src, (size_t)i);
 }
 
 V fpp_enum_dispose(V self, V *args) {
@@ -712,6 +709,40 @@ intptr_t fpp_hashv(V v) {
 
 /* ---- to-string ---------------------------------------------------------- */
 
+/* the ORACLE's $ftoa, ported instruction-for-instruction: NaN, sign,
+ * U+221E infinity, /10 normalization only at >= 1e18, integer part, up to
+ * 15 fractional digits stopping on an EXACTLY-zero residual, E+exponent.
+ * Byte-identical output is the parity contract. */
+static size_t fpp_ftoa_(double v, char *buf) {
+  size_t p = 0;
+  if (v != v) { buf[0] = 'N'; buf[1] = 'a'; buf[2] = 'N'; return 3; }
+  if (v < 0) { buf[p++] = '-'; v = -v; }
+  if (v == __builtin_inf()) {
+    buf[p++] = (char)0xe2; buf[p++] = (char)0x88; buf[p++] = (char)0x9e;
+    return p;
+  }
+  int e = 0;
+  if (v >= 1e18) {
+    while (!(v < 10.0)) { v /= 10.0; e++; }
+  }
+  double ip = __builtin_floor(v);
+  p += (size_t)snprintf(buf + p, 24, "%" PRId64, (int64_t)ip);
+  double frac = v - ip;
+  if (frac > 0.0) {
+    buf[p++] = '.';
+    for (int k = 0; k < 15; k++) {
+      frac *= 10.0;
+      int d = (int)__builtin_floor(frac);
+      buf[p++] = (char)('0' + d);
+      frac -= __builtin_floor(frac);
+      if (frac == 0.0) break;
+    }
+  }
+  if (e != 0)
+    p += (size_t)snprintf(buf + p, 8, "E+%d", e);
+  return p;
+}
+
 V fpp_to_string(V x) {
   if (x & 1) {
     char buf[32];
@@ -722,9 +753,8 @@ V fpp_to_string(V x) {
   uint32_t t = fpprt_typeid(x);
   if (t == FPP_TID_STR) return x;
   if (t == FPP_TID_F64) {
-    char buf[40];
-    int n = snprintf(buf, sizeof buf, "%g", fpp_unbox_f64(x));
-    return fpp_str_c(buf, (size_t)n);
+    char buf[48];
+    return fpp_str_c(buf, fpp_ftoa_(fpp_unbox_f64(x), buf));
   }
   if (t == FPP_TID_I64) {
     char buf[32];
@@ -735,17 +765,8 @@ V fpp_to_string(V x) {
 }
 
 V fpp_f64_to_string(V x) {
-  /* mirrors the wasm backend's formatting: shortest %.17g that reads back,
-   * tried at increasing precision — parity decides if this needs refining */
-  double d = fpp_unbox_f64(x);
-  char buf[40];
-  int n = 0;
-  for (int prec = 1; prec <= 17; prec++) {
-    n = snprintf(buf, sizeof buf, "%.*g", prec, d);
-    double back = strtod(buf, NULL);
-    if (back == d) break;
-  }
-  return fpp_str_c(buf, (size_t)n);
+  char buf[48];
+  return fpp_str_c(buf, fpp_ftoa_(fpp_unbox_f64(x), buf));
 }
 
 /* ---- generic arithmetic: the oracle's $addv family ---------------------- */
@@ -902,6 +923,18 @@ void fpp_lang_init(void) {
     0, FPPRT_KIND_REF_ARRAY, 0, NULL, "tuple" });
   fpprt_register_type(FPP_TID_ARR, (struct fpprt_type){
     0, FPPRT_KIND_REF_ARRAY, 0, NULL, "array" });
+  fpprt_register_type(FPP_TID_AF64, (struct fpprt_type){
+    sizeof(double), FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "float[]" });
+  fpprt_register_type(FPP_TID_AF32, (struct fpprt_type){
+    sizeof(float), FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "float32[]" });
+  fpprt_register_type(FPP_TID_AI64, (struct fpprt_type){
+    sizeof(int64_t), FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "int64[]" });
+  fpprt_register_type(FPP_TID_AI32, (struct fpprt_type){
+    sizeof(int32_t), FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "int[]" });
+  fpprt_register_type(FPP_TID_AU16, (struct fpprt_type){
+    sizeof(uint16_t), FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "char[]" });
+  fpprt_register_type(FPP_TID_AU8, (struct fpprt_type){
+    1, FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "byte[]" });
   fpp_reg_struct(FPP_TID_CONS, 2, FPP_TC_OTHER, "cons");
   /* [tag][src][idx]: idx is a TAGGED int, so both fields sit on the map
    * and the tracer skips the tagged one */
@@ -1211,3 +1244,32 @@ V fpp_cwt_indexof(V self, V k) {
  * inline helpers in the header run before fpp_box_i64 is declared) */
 V fpp_box_i64_(int64_t x) { return fpp_box_i64(x); }
 int64_t fpp_unbox_i64_(V b) { return fpp_unbox_i64(b); }
+
+/* ---- dispatching array accessors ---------------------------------------- */
+
+V fpp_arr_get(V a, size_t i) {
+  fpp_arr_check_(a, i);
+  switch (fpprt_typeid(a)) {
+  case FPP_TID_AF64: return fpp_box_f64(((double *)fpprt_elems(a))[i]);
+  case FPP_TID_AF32: return fpp_box_f64((double)((float *)fpprt_elems(a))[i]);
+  case FPP_TID_AI64: return fpp_box_i64(((int64_t *)fpprt_elems(a))[i]);
+  case FPP_TID_AI32: return TAGI((intptr_t)((int32_t *)fpprt_elems(a))[i]);
+  case FPP_TID_AU16: return TAGI((intptr_t)((uint16_t *)fpprt_elems(a))[i]);
+  case FPP_TID_AU8:  return TAGI((intptr_t)((uint8_t *)fpprt_elems(a))[i]);
+  default: return fpprt_read_ref(a, (uint32_t)((i + 2) * sizeof(V)));
+  }
+}
+
+void fpp_arr_set(V a, size_t i, V v) {
+  fpp_arr_check_(a, i);
+  switch (fpprt_typeid(a)) {
+  /* stores coerce representational drift the way the arith family does */
+  case FPP_TID_AF64: ((double *)fpprt_elems(a))[i] = fpp_as_f64_(v); return;
+  case FPP_TID_AF32: ((float *)fpprt_elems(a))[i] = (float)fpp_as_f64_(v); return;
+  case FPP_TID_AI64: ((int64_t *)fpprt_elems(a))[i] = fpp_as_i64_(v); return;
+  case FPP_TID_AI32: ((int32_t *)fpprt_elems(a))[i] = (int32_t)fpp_as_i64_(v); return;
+  case FPP_TID_AU16: ((uint16_t *)fpprt_elems(a))[i] = (uint16_t)fpp_as_i64_(v); return;
+  case FPP_TID_AU8:  ((uint8_t *)fpprt_elems(a))[i] = (uint8_t)fpp_as_i64_(v); return;
+  default: fpprt_write_ref(a, (uint32_t)((i + 2) * sizeof(V)), v);
+  }
+}
