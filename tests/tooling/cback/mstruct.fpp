@@ -15,3 +15,15 @@ let go =
     b.N <- 7
     print a.N
     print b.N
+
+let bump (v : MV) : MV =
+    let mutable w = v           // the param travels BY VALUE
+    w.N <- w.N + 1
+    w
+
+let go2 =
+    let mutable a = { X = 0.5; N = 10 }
+    let b = bump a              // a must be untouched
+    print a.N
+    print b.N
+    print (bump (bump b)).N

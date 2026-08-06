@@ -59,10 +59,11 @@ type CSt =
       PodTid : Dict<string, int>             // blittable struct -> its tid
       PodArrTid : Dict<string, int>          // blittable struct -> array tid
       Typedefs : Vec<string>                 // C typedefs for blittable structs
-      FnSig : Dict<string * int, string>     // per-param storage kinds
+      FnSig : Dict<string * int, string list> // per-param storage kinds
+                                             // "V"/"u"/prim char/"S<tid>"
                                              // ('V' = uniform); RAW params
                                              // ride the direct-call ABI
-      FnRet : Dict<string * int, char>       // return storage kind
+      FnRet : Dict<string * int, string>     // return storage kind
       Intrin : Dict<string * int, string>    // member fn -> runtime intrinsic:
                                              // WeakReference / CWT members get
                                              // REAL weak semantics on fpprt
@@ -282,16 +283,31 @@ let private schemeRawKind (sc : Scheme) : char option =
     | TCon ("float32", []) -> Some 's'
     | _ -> None
 
-/// a function's call-ABI: one storage kind per param ('V' = uniform) and
-/// the return's. Everything the schemes cannot PROVE primitive stays V.
-let private fnSigCompute (ps : (VarId * Scheme) list) (sc : Scheme) : string * char =
-    let pk =
-        ps
-        |> List.map (fun ((_ : VarId), psc) ->
-            match schemeRawKind psc with
-            | Some k -> string k
-            | None -> "V")
-        |> String.concat ""
+/// the C type a signature kind spells
+let private sigCTy (k : string) : string =
+    if k = "V" then "V"
+    elif k = "u" then "void"
+    elif k.StartsWith "S" then "P_" + k.Substring 1
+    else rawTy (charAt k 0)
+
+/// a function's call-ABI: one storage kind per param ("V" = uniform,
+/// "S<tid>" = pod struct BY VALUE) and the return's. `podTidOf` is the
+/// pod classification — empty during pass 1, real in the re-registration
+/// pass after classification.
+let private fnSigCompute (podTidOf : string -> int option)
+                         (ps : (VarId * Scheme) list) (sc : Scheme)
+                         : string list * string =
+    let kindOfScheme (psc : Scheme) : string =
+        match schemeRawKind psc with
+        | Some k -> string k
+        | None ->
+            match schemePodName psc with
+            | Some tn ->
+                (match podTidOf tn with
+                 | Some tid -> "S" + string tid
+                 | None -> "V")
+            | None -> "V"
+    let pk = ps |> List.map (fun ((_ : VarId), psc) -> kindOfScheme psc)
     let rec peel (t : Type) (n : int) : Type option =
         if n = 0 then Some t
         else
@@ -300,11 +316,8 @@ let private fnSigCompute (ps : (VarId * Scheme) list) (sc : Scheme) : string * c
             | _ -> None
     let rk =
         match peel sc.Body (List.length ps) with
-        | Some t ->
-            (match schemeRawKind (mono t) with
-             | Some k -> k
-             | None -> 'V')
-        | None -> 'V'
+        | Some t -> kindOfScheme (mono t)
+        | None -> "V"
     pk, rk
 
 /// an int literal's (digits, suffix) — the same trimming the V emitter does
@@ -320,12 +333,13 @@ let private intLitParts (s : string) : string * string =
 
 /// the ABI actually emitted for a fn: intrinsic members keep the uniform
 /// one — their bodies are hand-written against V params
-let private fnAbiOf (st : CSt) (key : string * int) : (string * char) option =
+let private fnAbiOf (st : CSt) (key : string * int)
+                    : (string list * string) option =
     if (dictTryFind st.Intrin key).IsSome then None
     else
         match dictTryFind st.FnSig key, dictTryFind st.FnRet key with
         | Some pk, Some rk ->
-            if pk |> Seq.forall (fun c -> c = 'V') && (rk = 'V') then None
+            if pk |> List.forall (fun k -> k = "V") && rk = "V" then None
             else Some (pk, rk)
         | _ -> None
 
@@ -431,7 +445,8 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
         (match fnAbiOf st (v.Path, v.Offset) with
-         | Some (_, rk) when rk <> 'V' && rk <> 'u' -> Some rk
+         | Some (_, rk) when rk <> "V" && rk <> "u" && not (rk.StartsWith "S") ->
+             Some (charAt rk 0)
          | _ -> None)
     | EIf (_, t, e2) ->
         (match rawKindOf st f t, rawKindOf st f e2 with
@@ -977,26 +992,53 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | Some (pk, rk) ->
              // the RAW-ABI direct call: proven-primitive params and result
              // travel unboxed; unit params evaluate but are not passed
+             let podArg (tid : string) (a : Expr) : string =
+                 // a struct travels BY VALUE: a stack local passes itself
+                 // (C copies), anything else copies out of its blob
+                 match a with
+                 | EVar (av, _) | EVarI (av, _, _) when
+                       (match dictTryFind f.Locals (av.Path, av.Offset) with
+                        | Some i when i < 0 ->
+                            fst (vecGet f.RawVars (-i - 1)) = 'S'
+                        | _ -> false) ->
+                     snd (vecGet f.RawVars
+                              (-(dictTryFind f.Locals (av.Path, av.Offset)).Value - 1))
+                 | _ ->
+                     let x = emitE st f a
+                     "*(P_" + tid + " *)((char *)" + sref x + " + FPP_POD_OFF)"
              let atoms =
-                 args
-                 |> List.mapi (fun i a ->
-                     let k = charAt pk i
-                     if k = 'u' then (emitE st f a |> ignore; None)
-                     elif k = 'V' then Some (sref (emitE st f a))
-                     else Some (emitRawAs st f k a))
+                 List.map2 (fun k a ->
+                     if k = "u" then (emitE st f a |> ignore; None)
+                     elif k = "V" then Some (sref (emitE st f a))
+                     elif (k : string).StartsWith "S" then
+                         Some (podArg (k.Substring 1) a)
+                     else Some (emitRawAs st f (charAt k 0) a)) pk args
                  |> List.choose (fun x -> x)
              let callx = fn + "(" + String.concat ", " atoms + ")"
-             if rk = 'u' then
+             if rk = "u" then
                  stmt f (callx + ";")
                  unitV ()
-             elif rk = 'V' then
+             elif rk = "V" then
                  let d = slot f
                  stmt f (sref d + " = " + callx + ";")
                  d
-             else
-                 let n = rawNew f rk
+             elif rk.StartsWith "S" then
+                 // a struct RETURN arrives by value: box it at this boundary
+                 let tid = rk.Substring 1
+                 let i = f.NRaw
+                 f.NRaw <- i + 1
+                 let n = "R" + string i
+                 vecAdd f.RawDecls ("P_" + tid + " " + n + ";")
                  stmt f (n + " = " + callx + ";")
-                 boxRaw f rk n
+                 let d = slot f
+                 stmt f (sref d + " = fpprt_alloc(" + tid + ");")
+                 stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, &" + n
+                         + ", sizeof(P_" + tid + "));")
+                 d
+             else
+                 let n = rawNew f (charAt rk 0)
+                 stmt f (n + " = " + callx + ";")
+                 boxRaw f (charAt rk 0) n
          | None ->
              let xs = args |> List.map (emitE st f)
              let d = slot f
@@ -2083,17 +2125,27 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
         let pk, rk =
             match fnAbiOf st (mv.Path, mv.Offset) with
             | Some (pks, rks) -> pks, rks
-            | None -> String.replicate arity "V", 'V'
+            | None -> List.replicate arity "V", "V"
         let arg (i : int) (src : string) =
-            let k = charAt pk i
-            if k = 'V' then src else unboxExpr k src
+            let k = List.item i pk
+            if k = "V" then src
+            elif k.StartsWith "S" then
+                "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
+            else unboxExpr (charAt k 0) src
         let extra =
             if arity <= 1 then []
             else List.init (arity - 1) (fun i -> arg (i + 1) ("args[" + string i + "]"))
         let callx = fn + "(" + String.concat ", " (arg 0 "self" :: extra) + ")"
+        let bodyx =
+            if rk = "V" then "  (void)args;\n  return " + callx + ";"
+            elif rk.StartsWith "S" then
+                let tid = rk.Substring 1
+                "  (void)args;\n  P_" + tid + " r_ = " + callx + ";\n  V b_ = fpprt_alloc("
+                + tid + ");\n  memcpy((char *)b_ + FPP_POD_OFF, &r_, sizeof(P_" + tid
+                + "));\n  return b_;"
+            else "  (void)args;\n  return " + boxExpr (charAt rk 0) callx + ";"
         vecAdd st.Out
-            ("static V " + w + "(V self, V *args) {\n  (void)args;\n  return "
-             + (if rk = 'V' then callx else boxExpr rk callx) + ";\n}")
+            ("static V " + w + "(V self, V *args) {\n" + bodyx + "\n}")
         w
 
 /// the singleton closure for a payload-carrying constructor as a value
@@ -2143,18 +2195,28 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
         let pk, rk =
             match fnAbiOf st (v.Path, v.Offset) with
             | Some (pks, rks) -> pks, rks
-            | None -> String.replicate arity "V", 'V'
+            | None -> List.replicate arity "V", "V"
         let psx =
             if arity = 0 then []
             else
                 List.init arity (fun i ->
-                    let k = charAt pk i
+                    let k = List.item i pk
                     let src = "args[" + string i + "]"
-                    if k = 'V' then src else unboxExpr k src)
+                    if k = "V" then src
+                    elif k.StartsWith "S" then
+                        "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
+                    else unboxExpr (charAt k 0) src)
         let callx = fn + "(" + String.concat ", " psx + ")"
+        let bodyx =
+            if rk = "V" then "  (void)self; (void)args;\n  return " + callx + ";"
+            elif rk.StartsWith "S" then
+                let tid = rk.Substring 1
+                "  (void)self; (void)args;\n  P_" + tid + " r_ = " + callx
+                + ";\n  V b_ = fpprt_alloc(" + tid + ");\n  memcpy((char *)b_ + FPP_POD_OFF, &r_, sizeof(P_"
+                + tid + "));\n  return b_;"
+            else "  (void)self; (void)args;\n  return " + boxExpr (charAt rk 0) callx + ";"
         vecAdd st.Out
-            ("static V " + code + "(V self, V *args) {\n  (void)self; (void)args;\n  return "
-             + (if rk = 'V' then callx else boxExpr rk callx) + ";\n}")
+            ("static V " + code + "(V self, V *args) {\n" + bodyx + "\n}")
         let tid = freshTid st
         vecAdd st.Reg ("  fpp_reg_clo(" + string tid + ", 0);")
         // a fn-closure singleton has no dependencies: it initializes before
@@ -2177,20 +2239,35 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
         | Some k ->
             (match fnAbiOf st k with
              | Some (pks, rks) -> pks, rks
-             | None -> String.replicate (List.length ps) "V", 'V')
-        | None -> String.replicate (List.length ps) "V", 'V'
-    let pnames = ps |> List.mapi (fun i (pv, _) -> "p" + string i, pv, charAt pk i)
+             | None -> List.replicate (List.length ps) "V", "V")
+        | None -> List.replicate (List.length ps) "V", "V"
+    let pnames =
+        List.map2 (fun i ((pv : VarId), _) -> "p" + string i, pv)
+                  [ 0 .. List.length ps - 1 ] ps
+        |> List.map2 (fun k (pn, pv) -> pn, pv, k) pk
     for pn, pv, k in pnames do
         let isCell = (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome
-        if k <> 'V' && not isCell then
-            // arrives RAW on the direct-call ABI
-            let n = rawNew f k
-            stmt f (n + " = " + pn + ";")
-            vecAdd f.RawVars (k, n)
+        if (k : string).StartsWith "S" && not isCell then
+            // a struct param arrives BY VALUE: the C parameter IS the
+            // caller's copy — it simply becomes the stack local
+            vecAdd f.RawVars ('S', pn)
+            dictSet f.PodOfRaw pn (int (k.Substring 1))
             dictSet f.Locals (pv.Path, pv.Offset) (-(vecLen f.RawVars))
-        elif k <> 'V' then
+        elif k <> "V" && not isCell then
+            // arrives RAW on the direct-call ABI
+            let kc = charAt k 0
+            let n = rawNew f kc
+            stmt f (n + " = " + pn + ";")
+            vecAdd f.RawVars (kc, n)
+            dictSet f.Locals (pv.Path, pv.Offset) (-(vecLen f.RawVars))
+        elif k <> "V" then
             // raw param that must live in a CELL: box, then wrap
-            let b = boxRaw f k pn
+            let b =
+                if k.StartsWith "S" then
+                    let tid = int (k.Substring 1)
+                    dictSet f.PodOfRaw pn tid
+                    boxRaw f 'S' pn
+                else boxRaw f (charAt k 0) pn
             let l = slot f
             stmt f (sref l + " = fpp_cell_new(" + sref b + ");")
             dictSet f.Locals (pv.Path, pv.Offset) l
@@ -2201,18 +2278,22 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
             else
                 stmt f (sref l + " = " + pn + ";")
             dictSet f.Locals (pv.Path, pv.Offset) l
-    let retTy = if rk = 'V' then "V" else rawTy rk
+    let retTy = sigCTy rk
     let sigOf (withNames : bool) =
         if List.isEmpty pnames then "void"
         else
             pnames
             |> List.map (fun (pn, _, k) ->
-                let t = if k = 'V' then "V" else rawTy k
+                let t = sigCTy k
                 if withNames then t + " " + pn else t)
             |> String.concat ", "
     let rAtom =
-        if rk = 'V' then sref (emitE st f body)
-        else emitRawAs st f rk body
+        if rk = "V" then sref (emitE st f body)
+        elif rk.StartsWith "S" then
+            // return the struct BY VALUE: copy out of the result blob
+            let r = emitE st f body
+            "*(P_" + rk.Substring 1 + " *)((char *)" + sref r + " + FPP_POD_OFF)"
+        else emitRawAs st f (charAt rk 0) body
     vecAdd st.Fwd ("static " + retTy + " " + name + "(" + sigOf false + ");")
     let all = vecNew<string> ()
     vecAdd all ("static " + retTy + " " + name + "(" + sigOf true + ") {")
@@ -2383,12 +2464,14 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let fn = (dictTryFind st.FnName (v.Path, v.Offset)).Value
             let pk, _ = (fnAbiOf st (v.Path, v.Offset)).Value
             let atoms =
-                args
-                |> List.mapi (fun i a ->
-                    let k = charAt pk i
-                    if k = 'u' then (emitE st f a |> ignore; None)
-                    elif k = 'V' then Some (sref (emitE st f a))
-                    else Some (emitRawAs st f k a))
+                List.map2 (fun (k : string) a ->
+                    if k = "u" then (emitE st f a |> ignore; None)
+                    elif k = "V" then Some (sref (emitE st f a))
+                    elif k.StartsWith "S" then
+                        let x = emitE st f a
+                        Some ("*(P_" + k.Substring 1 + " *)((char *)" + sref x
+                              + " + FPP_POD_OFF)")
+                    else Some (emitRawAs st f (charAt k 0) a)) pk args
                 |> List.choose (fun x -> x)
             let n = rawNew f rk
             stmt f (n + " = " + fn + "(" + String.concat ", " atoms + ");")
@@ -2468,8 +2551,8 @@ let emitC (decls : Decl list) : string * string list =
           PodTid = dictNew<string, int> ()
           PodArrTid = dictNew<string, int> ()
           Typedefs = vecNew<string> ()
-          FnSig = dictNew<string * int, string> ()
-          FnRet = dictNew<string * int, char> ()
+          FnSig = dictNew<string * int, string list> ()
+          FnRet = dictNew<string * int, string> ()
           Intrin = dictNew<string * int, string> ()
           NVSlots = 0
           NextTid = 32                          // FPP_TID_USER in fpprt-lang.h
@@ -2483,7 +2566,7 @@ let emitC (decls : Decl list) : string * string list =
         | DLet (_, v, sc, ELam (ps, _)) ->
             dictSet st.Fns (v.Path, v.Offset) (List.length ps)
             dictSet st.FnName (v.Path, v.Offset) (cname v)
-            let pk, rk = fnSigCompute ps sc
+            let pk, rk = fnSigCompute (fun _ -> None) ps sc
             dictSet st.FnSig (v.Path, v.Offset) pk
             dictSet st.FnRet (v.Path, v.Offset) rk
         | DLet (_, v, _, _) ->
@@ -2509,21 +2592,18 @@ let emitC (decls : Decl list) : string * string list =
                         match schemeRawKind (mono tt) with
                         | Some k -> k
                         | None -> 'V'
-                let pk = args |> List.map (kindOfT >> string) |> String.concat ""
-                let rk = kindOfT ret
+                let pk = args |> List.map (kindOfT >> string)
+                let rk = string (kindOfT ret)
                 dictSet st.Fns (v.Path, v.Offset) (List.length args)
                 dictSet st.FnName (v.Path, v.Offset) (sane v.Name)
                 dictSet st.FnSig (v.Path, v.Offset) pk
                 dictSet st.FnRet (v.Path, v.Offset) rk
-                let cty (k : char) =
-                    if k = 'V' then "V" elif k = 'u' then "void" else rawTy k
                 let ps2 =
                     pk
-                    |> Seq.filter (fun c -> c <> 'u')
-                    |> Seq.map cty
-                    |> List.ofSeq
+                    |> List.filter (fun k -> k <> "u")
+                    |> List.map sigCTy
                 vecAdd st.Fwd
-                    ("extern " + cty rk + " " + sane v.Name + "("
+                    ("extern " + sigCTy rk + " " + sane v.Name + "("
                      + (if List.isEmpty ps2 then "void" else String.concat ", " ps2)
                      + ");")
         | DRecord (n, _, fields, isS) ->
@@ -2625,6 +2705,15 @@ let emitC (decls : Decl list) : string * string list =
     for d in decls do
         match d with
         | DRecord (n, _, _, true) -> podOf n |> ignore
+        | _ -> ()
+    // RE-register call ABIs now that pod classification exists: struct
+    // params and returns travel BY VALUE from here on
+    for d in decls do
+        match d with
+        | DLet (_, v, sc, ELam (ps, _)) ->
+            let pk, rk = fnSigCompute (fun tn -> dictTryFind st.PodTid tn) ps sc
+            dictSet st.FnSig (v.Path, v.Offset) pk
+            dictSet st.FnRet (v.Path, v.Offset) rk
         | _ -> ()
     // typedefs in DECLARATION order (F# forbids forward refs, so nested
     // structs are declared before their containers)

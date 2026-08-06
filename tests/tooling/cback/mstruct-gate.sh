@@ -19,7 +19,7 @@ gcc -O1 -g -I"$rt" -I"$rt/gc/api" -I"$rt/gc/src" -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     "$out/m.c" "$rt/build/mmc/fpprt.o" "$out/fpprt-lang.o" \
     "$rt/build/mmc/libwhippet.a" -lm -lpthread -o "$out/m"
 "$out/m" > "$out/got.txt"
-printf '3\n42\n3\n99\n42\n7\n' > "$out/want.txt"
+printf '3\n42\n3\n99\n42\n7\n10\n11\n13\n' > "$out/want.txt"
 if diff -u "$out/want.txt" "$out/got.txt"; then
     echo "MUTABLE STRUCTS OK (fsi-pinned)"
 else
