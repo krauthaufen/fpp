@@ -243,3 +243,61 @@ machinery, not on the uniform-stamp rule cback uses today.
 Every milestone: parity-diff vs the wasm-GC backend, committed green.
 CEmit.fs stays F++-inferable (the dogfood gate reads it). The wasm-GC
 gates keep running — nothing regresses behind this work.
+
+## True structs (the .NET model, decided 2026-08-06)
+
+The copy-in/copy-out byref and the blob-in-uniform-position struct were
+wasm-GC workarounds. The C backend gets the REAL model: sequential layout
+for every struct, stack residency, in-place mutation, aliasing byrefs —
+".NET with Sequential layout in all regards". The design that fits fpprt:
+
+1. STRUCT VALUES ARE C STRUCT VALUES. The raw-value layer grows a struct
+   kind (KPod tid alongside the char prims — the kind type becomes a DU):
+   locals, params, returns of struct type are C struct values; copy on
+   assignment IS C assignment; mutation is in place. Uniform positions box
+   into the existing blob form at the boundary, exactly like f64.
+
+2. FRAMES GET LAYOUT DESCRIPTORS. Ref-holding structs on the C stack must
+   be visible to the precise collector. The shadow frame stops being a bare
+   V array: each function gets ONE C frame struct (its V slots + its struct
+   locals) and a static descriptor listing the byte offsets of every ref in
+   it — including ref fields inside structs — computed with offsetof.
+   gc_trace_mutator_roots walks descriptor offsets; the mover updates refs
+   in place. Structs stay contiguous and ADDRESSABLE; the existing V-slot
+   discipline is the degenerate all-refs descriptor.
+
+3. BYREF IS A FAT POINTER (container, byte offset). Into the heap: the
+   container ref is a traced slot, the offset survives moves, and every
+   deref recomputes container+offset — a real alias that the moving
+   collector cannot break. Into the stack: container = 0, offset = the
+   absolute address (frames do not move). A byref to a stack local IS the
+   stack address passed down like any C pointer; the pair form exists
+   because one byref PARAM can receive heap targets from one call site
+   and stack targets from another — the stack case leaves the container
+   empty. Byrefs live only in locals and
+   params (as in .NET — no byref fields), so they never enter the heap.
+   Calls pass the pair on the raw ABI. Writes through a byref are aliased
+   writes, immediately visible to the caller — the copy-in/copy-out
+   semantics and its "not an alias" caveat DIE on this backend.
+
+4. LOWER SPLITS BY BACKEND CAPABILITY. `fixAddrs` (copy-in/copy-out) stays
+   for wasm-GC; the C backend receives `&location` intact ($addr nodes plus
+   the byref-param markers) and lowers them to fat pointers. The oracle
+   keeps its documented divergence; the C backend is the reference
+   semantics from here.
+
+5. ARRAYS AND FIELDS OF STRUCTS ARE FLAT EVERYWHERE. Ref-holding struct
+   arrays: a new fpprt array kind carrying elem size + per-element ref
+   offsets (the embedder walks elements). Struct fields inside records/
+   classes: inline sequential storage with the container's descriptor
+   extended accordingly. Per-stamp StructTupleN layouts ride the same
+   machinery once stamps get their own tids (canonName).
+
+Order: (a) kind-S raw layer + stack locals for blittable structs and
+in-place mutation (mutable structs become CORRECT, not trapped);
+(b) frame descriptors + ref-holding structs; (c) fat byrefs + the Lower
+capability split; (d) struct arrays/fields flat for ref-holding elements;
+(e) per-stamp tuples. Gates at every step: the existing battery plus a
+mutable-struct/byref semantics program diffed against dotnet fsi — the
+ORACLE CANNOT CHECK THESE (its byref is the workaround), so fsi is the
+reference for this arc.

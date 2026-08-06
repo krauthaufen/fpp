@@ -1285,7 +1285,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("}")
         d
     | EWhile (c, b) ->
+        // a loop that never allocates must still let a collection start:
+        // the poll is one relaxed load and a never-taken branch
         stmt f ("for (;;) {")
+        stmt f ("FPPRT_POLL_AT(SPF_);")
         let ck, ca = emitRaw st f c
         if ck = 'V' then stmt f ("if (!UNTAGI(" + ca + ")) break;")
         else stmt f ("if (!(" + ca + ")) break;")
@@ -1967,6 +1970,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     vecAdd all ("static V " + code + "(V self, V *args) {")
     vecAdd all ("  (void)self; (void)args;")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max lf.NSlots 1) + "); V *F = Fr_slots;")
+    vecAdd all "  int *const SPF_ = fpprt_sp_flag_; (void)SPF_;"
     for line in vecToList lf.RawDecls do vecAdd all ("  " + line)
     for line in vecToList lf.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
@@ -2144,6 +2148,7 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
     let all = vecNew<string> ()
     vecAdd all ("static " + retTy + " " + name + "(" + sigOf true + ") {")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max f.NSlots 1) + "); V *F = Fr_slots;")
+    vecAdd all "  int *const SPF_ = fpprt_sp_flag_; (void)SPF_;"
     for line in vecToList f.RawDecls do vecAdd all ("  " + line)
     for line in vecToList f.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")

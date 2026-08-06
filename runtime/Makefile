@@ -22,10 +22,21 @@ build/$(GC_COLLECTOR)/test_rt: test/test_rt.c build/$(GC_COLLECTOR)/fpprt.o $(GC
 build/$(GC_COLLECTOR)/test_grow: test/test_grow.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
 	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
 
-.PHONY: test test-all clean
+build/$(GC_COLLECTOR)/test_threads: test/test_threads.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
+	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
+
+.PHONY: test test-all test-threads clean
 test: build/$(GC_COLLECTOR)/test_rt build/$(GC_COLLECTOR)/test_grow
 	./build/$(GC_COLLECTOR)/test_rt
 	./build/$(GC_COLLECTOR)/test_grow
+
+# multi-mutator gate: the parallel collectors only (semi = single-mutator
+# shakeout)
+test-threads:
+	$(MAKE) GC_COLLECTOR=pcc build/pcc/test_threads
+	./build/pcc/test_threads
+	$(MAKE) GC_COLLECTOR=mmc build/mmc/test_threads
+	./build/mmc/test_threads
 
 test-all:
 	$(MAKE) GC_COLLECTOR=semi test

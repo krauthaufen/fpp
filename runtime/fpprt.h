@@ -84,7 +84,7 @@ struct fpprt_frame {
   fpprt_ref *slots;         /* points at the caller's slot array */
 };
 
-extern struct fpprt_frame *fpprt_top_frame;
+extern _Thread_local struct fpprt_frame *fpprt_top_frame;
 
 /* `FPPRT_FRAME(f, 3);` declares frame f with f_slots[3], zeroed, pushed.
  * Slots are refs the GC may read AND UPDATE (moving collector). */
@@ -158,8 +158,24 @@ int fpprt_can_pin(void);
 
 /* ---- control ----------------------------------------------------------- */
 
+/* threads: every OS thread touching the heap attaches ONE mutator; park
+ * around blocking waits so collection never stalls on a blocked thread */
+void fpprt_thread_attach(void);
+void fpprt_thread_detach(void);
+void fpprt_thread_park(void);
+void fpprt_thread_unpark(void);
+
 void fpprt_collect(void);            /* full collection, for tests        */
 void fpprt_safepoint(void);          /* poll: park if a GC wants the world */
+/* the collector's stop-request flag for THIS thread — emitted loops test
+ * it inline and only call fpprt_safepoint when it is set */
+extern _Thread_local int *fpprt_sp_flag_;
+#define FPPRT_POLL() \
+  do { if (__builtin_expect(*fpprt_sp_flag_ != 0, 0)) \
+         fpprt_safepoint(); } while (0)
+/* the flag pointer hoisted into a local (one TLS lookup per function) */
+#define FPPRT_POLL_AT(p) \
+  do { if (__builtin_expect(*(p) != 0, 0)) fpprt_safepoint(); } while (0)
 size_t fpprt_allocated_bytes(void);  /* lifetime allocation counter        */
 
 #ifdef __cplusplus

@@ -8,8 +8,8 @@ unsigned char *fpp_tclass_ = NULL;
 unsigned int *fpp_tfields_ = NULL;
 size_t fpp_tmeta_cap_ = 0;
 
-struct fpp_handler *fpp_handler_top_ = NULL;
-V fpp_exn_ = 0;
+_Thread_local struct fpp_handler *fpp_handler_top_ = NULL;
+_Thread_local V fpp_exn_ = 0;
 
 void fpp_reg_meta_(uint32_t tid, int tclass, unsigned nfields) {
   if (tid >= fpp_tmeta_cap_) {

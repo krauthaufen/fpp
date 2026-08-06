@@ -244,8 +244,8 @@ struct fpp_handler {
   struct fpprt_frame *frame_top;   /* shadow stack restores on unwind */
   const char *site;                /* diagnostics: the pushing function */
 };
-extern struct fpp_handler *fpp_handler_top_;
-extern V fpp_exn_;
+extern _Thread_local struct fpp_handler *fpp_handler_top_;
+extern _Thread_local V fpp_exn_;
 
 /* handler-event ring for diagnosing leaks (FPP_HLOG builds) */
 extern const char *fpp_hlog_site_[64];

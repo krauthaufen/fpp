@@ -1,4 +1,5 @@
 /* fpprt implementation over the Whippet gc-api. */
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,11 +21,13 @@ struct fpprt_type_intern *fpprt_types_ = NULL;
 uint32_t fpprt_ntypes_ = 0;
 static uint32_t types_cap_ = 0;
 
-struct fpprt_frame *fpprt_top_frame = NULL;
+_Thread_local struct fpprt_frame *fpprt_top_frame = NULL;
+static int fpprt_sp_zero_ = 0;
+_Thread_local int *fpprt_sp_flag_ = &fpprt_sp_zero_;
 
 static struct gc_heap *heap_;
-static struct gc_mutator *mut_;
-static struct gc_mutator_roots roots_;
+static _Thread_local struct gc_mutator *mut_;
+static _Thread_local struct gc_mutator_roots roots_;
 static struct gc_heap_roots heap_roots_;
 
 /* ---- identity-hash table ----------------------------------------------
@@ -189,6 +192,8 @@ void fpprt_init(const struct fpprt_opts *opts) {
   }
   roots_.top = (struct fpprt_frame_intern **)&fpprt_top_frame;
   gc_mutator_set_roots(mut_, &roots_);
+  if (gc_cooperative_safepoint_kind() != GC_COOPERATIVE_SAFEPOINT_NONE)
+    fpprt_sp_flag_ = gc_safepoint_flag_loc(mut_);
   idh_buckets_ = calloc(64, sizeof(*idh_buckets_));
   if (!idh_buckets_) abort();
   idh_nbuckets_ = 64;
@@ -290,7 +295,12 @@ void fpprt_add_static_roots(fpprt_ref *base, size_t n) {
 
 /* ---- identity hash ----------------------------------------------------- */
 
-uintptr_t fpprt_idhash(fpprt_ref o) {
+/* idhash is SHARED state across mutators: one lock around bucket access.
+ * The insert path allocates (which may collect and rehash), so the lock is
+ * released before allocation and the bucket re-searched after. */
+static pthread_mutex_t idh_lock_ = PTHREAD_MUTEX_INITIALIZER;
+
+static uintptr_t idh_find_(fpprt_ref o) {
   size_t b = idh_bucket_of_((uintptr_t)o, idh_nbuckets_);
   for (struct gc_ephemeron *e = idh_buckets_[b]
          ? gc_ephemeron_chain_head(&idh_buckets_[b]) : NULL;
@@ -300,27 +310,42 @@ uintptr_t fpprt_idhash(fpprt_ref o) {
       return *(uintptr_t *)fpprt_elems(box);
     }
   }
-  /* first ask: assign. Allocations below can collect, which MOVES o and
-   * rehashes the table — hold o in a frame and look the bucket up again
-   * before inserting. */
+  return 0;
+}
+
+uintptr_t fpprt_idhash(fpprt_ref o) {
+  pthread_mutex_lock(&idh_lock_);
+  uintptr_t found = idh_find_(o);
+  pthread_mutex_unlock(&idh_lock_);
+  if (found) return found;
+  /* first ask: assign. The allocations below can collect, which MOVES o
+   * and rehashes the table — hold o in a frame, and NEVER hold the lock
+   * across an allocation (the holder would block a collection another
+   * thread started). Re-search under the lock before inserting: a racing
+   * thread may have assigned meanwhile, and ITS hash must win. */
   FPPRT_FRAME(f, 2);
   f_slots[0] = o;
-  idh_next_ = idh_next_ * 0xd1342543de82ef95ull + 0x2545f4914f6cdd1dull;
-  uintptr_t h = idh_next_ >> 3;
-  if (!h) h = 1;
   fpprt_ref box = fpprt_alloc_array(FPPRT_TID_HASHBOX, 1);
-  *(uintptr_t *)fpprt_elems(box) = h;
   f_slots[1] = box;
   struct gc_ephemeron *e = gc_allocate_ephemeron(mut_);
   ((struct fpprt_header *)e)->tag = ((uintptr_t)FPPRT_TID_EPHEMERON << 1) | 1;
   gc_ephemeron_init(mut_, e, gc_ref((uintptr_t)f_slots[0]),
                     gc_ref((uintptr_t)f_slots[1]));
-  b = idh_bucket_of_((uintptr_t)f_slots[0], idh_nbuckets_);
-  gc_ephemeron_chain_push(&idh_buckets_[b], e);
-  idh_count_++;
+  pthread_mutex_lock(&idh_lock_);
+  uintptr_t h = idh_find_(f_slots[0]);
+  if (!h) {
+    idh_next_ = idh_next_ * 0xd1342543de82ef95ull + 0x2545f4914f6cdd1dull;
+    h = idh_next_ >> 3;
+    if (!h) h = 1;
+    *(uintptr_t *)fpprt_elems(f_slots[1]) = h;
+    size_t b = idh_bucket_of_((uintptr_t)f_slots[0], idh_nbuckets_);
+    gc_ephemeron_chain_push(&idh_buckets_[b], e);
+    idh_count_++;
+    if (idh_count_ > idh_nbuckets_ * 4)
+      idh_rebuild_(idh_buckets_, idh_nbuckets_, idh_nbuckets_ * 2);
+  }
+  pthread_mutex_unlock(&idh_lock_);
   FPPRT_LEAVE(f);
-  if (idh_count_ > idh_nbuckets_ * 4)
-    idh_rebuild_(idh_buckets_, idh_nbuckets_, idh_nbuckets_ * 2);
   return h;
 }
 
@@ -342,4 +367,26 @@ void fpprt_pin(fpprt_ref o) {
 
 void fpprt_collect(void) { gc_collect(mut_, GC_COLLECTION_COMPACTING); }
 void fpprt_safepoint(void) { gc_safepoint(mut_); }
+
+/* ---- threads: one GC mutator per OS thread ----------------------------- */
+
+void fpprt_thread_attach(void) {
+  if (mut_) return;
+  mut_ = gc_init_for_thread(gc_empty_stack_addr(), heap_);
+  roots_.top = (struct fpprt_frame_intern **)&fpprt_top_frame;
+  gc_mutator_set_roots(mut_, &roots_);
+  if (gc_cooperative_safepoint_kind() != GC_COOPERATIVE_SAFEPOINT_NONE)
+    fpprt_sp_flag_ = gc_safepoint_flag_loc(mut_);
+}
+
+void fpprt_thread_detach(void) {
+  if (!mut_) return;
+  gc_finish_for_thread(mut_);
+  mut_ = NULL;
+}
+
+/* park while BLOCKED outside GC'd code (a barrier or lock wait): the
+ * collector may run without this thread reaching a safepoint */
+void fpprt_thread_park(void) { gc_deactivate(mut_); }
+void fpprt_thread_unpark(void) { gc_reactivate(mut_); }
 size_t fpprt_allocated_bytes(void) { return gc_allocation_counter(heap_); }
