@@ -1,5 +1,8 @@
 /* fpprt-lang: the non-inline bodies. See fpprt-lang.h. */
 #include "fpprt-lang.h"
+#if !defined(__wasm__)
+#include <sys/mman.h>
+#endif
 
 unsigned char *fpp_tclass_ = NULL;
 unsigned int *fpp_tfields_ = NULL;
@@ -1404,39 +1407,56 @@ intptr_t fpp_pod_hash(V v) {
 
 /* ---- linear memory arena ------------------------------------------------ */
 
+/* Addresses in the Memory/pin world are ABSOLUTE 32-bit-representable
+ * pointers: on wasm32 every pointer already is one; natively the heap and
+ * this arena live in the low 2GB (MAP_32BIT reservations). fpp_mem_base()
+ * returns NULL so foreign code's base+offset arithmetic stays valid. */
 static char *fpp_mem_ = NULL;
-static int32_t fpp_mem_top_ = 8;      /* offset 0 stays unused */
-static int32_t fpp_mem_cap_ = 0;
+static size_t fpp_mem_top_ = 0;
+static size_t fpp_mem_cap_ = 0;
 
-char *fpp_mem_base(void) {
-  if (!fpp_mem_) {
-    fpp_mem_cap_ = 1 << 24;           /* 16 MB to start, grows */
-    fpp_mem_ = malloc((size_t)fpp_mem_cap_);
-    if (!fpp_mem_) abort();
-    memset(fpp_mem_, 0, (size_t)fpp_mem_cap_);
+static void fpp_mem_init_(void) {
+  if (fpp_mem_) return;
+  fpp_mem_cap_ = (size_t)1 << 26;     /* 64 MB, fixed: addresses are stable */
+#if defined(__wasm__)
+  fpp_mem_ = calloc(1, fpp_mem_cap_);
+  if (!fpp_mem_) abort();
+#else
+  void *m = MAP_FAILED;
+#ifdef MAP_32BIT
+  m = mmap(NULL, fpp_mem_cap_, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+#endif
+  if (m == MAP_FAILED)
+    m = mmap(NULL, fpp_mem_cap_, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (m == MAP_FAILED) abort();
+  fpp_mem_ = (char *)m;
+#endif
+  if ((uintptr_t)fpp_mem_ + fpp_mem_cap_ > 0x7fffffffu) {
+    fprintf(stderr, "fpp: Memory arena outside the 32-bit address range\n");
+    abort();
   }
-  return fpp_mem_;
 }
+
+char *fpp_mem_base(void) { return NULL; }
 
 int32_t fpp_mem_alloc(int32_t n) {
-  fpp_mem_base();
-  int32_t off = (fpp_mem_top_ + 7) & ~7;
-  while (off + n > fpp_mem_cap_) {
-    int32_t ncap = fpp_mem_cap_ * 2;
-    char *nb = realloc(fpp_mem_, (size_t)ncap);
-    if (!nb) abort();
-    memset(nb + fpp_mem_cap_, 0, (size_t)(ncap - fpp_mem_cap_));
-    fpp_mem_ = nb;
-    fpp_mem_cap_ = ncap;
+  fpp_mem_init_();
+  size_t off = (fpp_mem_top_ + 7) & ~(size_t)7;
+  if (off + (size_t)n > fpp_mem_cap_) {
+    fprintf(stderr, "fpp: Memory arena exhausted\n");
+    abort();
   }
-  fpp_mem_top_ = off + n;
-  return off;
+  fpp_mem_top_ = off + (size_t)n;
+  return (int32_t)(uintptr_t)(fpp_mem_ + off);
 }
 
-int32_t fpp_mem_size(void) { fpp_mem_base(); return fpp_mem_cap_; }
+int32_t fpp_mem_size(void) { fpp_mem_init_(); return (int32_t)fpp_mem_cap_; }
 
 void fpp_mem_copy(int32_t dst, int32_t src, int32_t n) {
-  memmove(fpp_mem_base() + dst, fpp_mem_base() + src, (size_t)n);
+  memmove((char *)(uintptr_t)(uint32_t)dst, (char *)(uintptr_t)(uint32_t)src,
+          (size_t)n);
 }
 
 int32_t fpp_arr_bytesize(V a) {
@@ -1452,33 +1472,27 @@ int32_t fpp_arr_bytesize(V a) {
   return (int32_t)(fpprt_array_len(a) * elem);
 }
 
-/* pinning: copy INTO the arena; unpin copies back. Entries are individually
- * malloc'd so their V slot can be a permanent GC root. */
-struct fpp_pin_ { V arr; int32_t off; int32_t bytes; struct fpp_pin_ *next; };
-static struct fpp_pin_ *fpp_pins_ = NULL;
-
+/* pinning is IN-PLACE: the flat element storage IS the C image, the
+ * collector guarantees the object never moves (mmc; the always-moving
+ * collectors abort — pinning workloads run the pinning collector). The
+ * pinned array stays reachable through the program's own references;
+ * foreign writes are visible through the array IMMEDIATELY, .NET `fixed`
+ * semantics. Unpin is a no-op: mmc pins are for the object's lifetime. */
 int32_t fpp_arr_pin(V a) {
-  int32_t bytes = fpp_arr_bytesize(a);
-  int32_t off = fpp_mem_alloc(bytes);
-  memcpy(fpp_mem_base() + off, fpprt_elems(a), (size_t)bytes);
-  struct fpp_pin_ *p = malloc(sizeof *p);
-  if (!p) abort();
-  p->arr = a; p->off = off; p->bytes = bytes; p->next = fpp_pins_;
-  fpp_pins_ = p;
-  fpprt_add_static_roots(&p->arr, 1);
-  return off;
+  if (!fpprt_can_pin()) {
+    fprintf(stderr, "fpp: Array.pin needs the pinning collector (mmc)\n");
+    abort();
+  }
+  fpprt_pin(a);
+  uintptr_t addr = (uintptr_t)fpprt_elems(a);
+  if (addr > 0x7fffffffu) {
+    fprintf(stderr, "fpp: pinned address outside the 32-bit range\n");
+    abort();
+  }
+  return (int32_t)addr;
 }
 
-void fpp_arr_unpin(V a) {
-  for (struct fpp_pin_ *p = fpp_pins_; p; p = p->next)
-    if (p->arr == a) {
-      memcpy(fpprt_elems(p->arr), fpp_mem_base() + p->off, (size_t)p->bytes);
-      p->arr = 0;                     /* root slot cleared, entry retired */
-      return;
-    }
-  fprintf(stderr, "fpp: unpin of an unpinned array\n");
-  abort();
-}
+void fpp_arr_unpin(V a) { (void)a; }
 
 /* ---- dispatching array accessors ---------------------------------------- */
 

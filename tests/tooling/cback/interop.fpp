@@ -42,8 +42,10 @@ let go =
     // pin, let C READ the flat image
     let p2 = Array.pin a2
     print (c_sum_v2d p2 2)                 // 1+2+3+4 = 10
-    // C WRITES through the pointer; unpin copies back; F++ sees the writes
+    // C WRITES through the pointer; pinning is IN-PLACE, so the writes are
+    // visible through the array IMMEDIATELY — before any unpin
     c_scale_v2d p2 2 10.0
+    print a2.[0].X                          // 1 * 10 = 10, LIVE visibility
     Array.unpin a2
     print a2.[1].Y                          // 4 * 10 = 40
     // int arrays: same contract on a plain scalar array

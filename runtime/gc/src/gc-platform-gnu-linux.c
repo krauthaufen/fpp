@@ -137,7 +137,15 @@ struct gc_reservation gc_platform_reserve_memory(size_t size,
   GC_ASSERT_EQ(alignment, align_down(alignment, getpagesize()));
 
   size_t extent = size + alignment;
-  void *mem = mmap(NULL, extent, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+  /* fpprt: prefer the low 2GB so heap addresses fit the 32-bit pin/Memory
+   * contract (Array.pin : 'a[] -> int); fall back to anywhere. */
+  void *mem = MAP_FAILED;
+#ifdef MAP_32BIT
+  mem = mmap(NULL, extent, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT,
+             -1, 0);
+#endif
+  if (mem == MAP_FAILED)
+    mem = mmap(NULL, extent, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 
   if (mem == MAP_FAILED) {
     perror("failed to reserve address space");
@@ -185,8 +193,14 @@ gc_platform_acquire_memory(size_t size, size_t alignment) {
   if (alignment == 0) {
     GC_ASSERT_EQ(size, align_down(size, getpagesize()));
     // Use just one syscall instead of two.
-    void *mem = mmap(NULL, size, PROT_READ|PROT_WRITE,
-                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    void *mem = MAP_FAILED;
+#ifdef MAP_32BIT
+    mem = mmap(NULL, size, PROT_READ|PROT_WRITE,
+               MAP_PRIVATE|MAP_ANONYMOUS|MAP_32BIT, -1, 0);
+#endif
+    if (mem == MAP_FAILED)
+      mem = mmap(NULL, size, PROT_READ|PROT_WRITE,
+                 MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
       perror("failed to reserve address space");
       GC_CRASH();

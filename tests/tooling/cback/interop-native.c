@@ -1,8 +1,9 @@
 /* The OTHER side of the interop gate: an independently written C file with
  * its own declarations of the structs interop.fpp pins. If F++'s layout is
- * not the C ABI, the size check or the sums diverge. Addresses arriving
- * from F++ are OFFSETS into the runtime's linear-memory arena; the runtime
- * exports its base. */
+ * not the C ABI, the size check or the sums diverge. Pinning is IN-PLACE:
+ * the address F++ hands over is the pinned array's real element storage
+ * (32-bit-representable on every target; fpp_mem_base() is NULL and only
+ * kept so base+offset arithmetic stays spellable). */
 #include <stdint.h>
 #include <math.h>
 

@@ -843,42 +843,42 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EApp (EUnknown "memLoadByte", [ a ]) ->
         let x = emitE st f a
         let d = slot f
-        stmt f (sref d + " = TAGI((intptr_t)*(uint8_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        stmt f (sref d + " = TAGI((intptr_t)*(uint8_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")));")
         d
     | EApp (EUnknown "memStoreByte", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b
-        stmt f ("*(uint8_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = (uint8_t)UNTAGI(" + sref y + ");")
+        stmt f ("*(uint8_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")) = (uint8_t)UNTAGI(" + sref y + ");")
         unitV ()
     | EApp (EUnknown "memLoadInt", [ a ]) ->
         let x = emitE st f a
         let d = slot f
-        stmt f (sref d + " = TAGI((intptr_t)*(int32_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        stmt f (sref d + " = TAGI((intptr_t)*(int32_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")));")
         d
     | EApp (EUnknown "memStoreInt", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b
-        stmt f ("*(int32_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = (int32_t)UNTAGI(" + sref y + ");")
+        stmt f ("*(int32_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")) = (int32_t)UNTAGI(" + sref y + ");")
         unitV ()
     | EApp (EUnknown "memLoadInt64", [ a ]) ->
         let x = emitE st f a
         let d = slot f
-        stmt f (sref d + " = fpp_box_i64(*(int64_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        stmt f (sref d + " = fpp_box_i64(*(int64_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")));")
         d
     | EApp (EUnknown "memStoreInt64", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b
-        stmt f ("*(int64_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = fpp_unbox_i64(" + sref y + ");")
+        stmt f ("*(int64_t *)((char *)(uintptr_t)UNTAGI(" + sref x + ")) = fpp_unbox_i64(" + sref y + ");")
         unitV ()
     | EApp (EUnknown "memLoadFloat", [ a ]) ->
         let x = emitE st f a
         let d = slot f
-        stmt f (sref d + " = fpp_box_f64(*(double *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        stmt f (sref d + " = fpp_box_f64(*(double *)((char *)(uintptr_t)UNTAGI(" + sref x + ")));")
         d
     | EApp (EUnknown "memStoreFloat", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b
-        stmt f ("*(double *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = fpp_unbox_f64(" + sref y + ");")
+        stmt f ("*(double *)((char *)(uintptr_t)UNTAGI(" + sref x + ")) = fpp_unbox_f64(" + sref y + ");")
         unitV ()
     | EApp (EUnknown "doubleBits", [ a ]) ->
         let x = emitE st f a
