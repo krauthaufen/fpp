@@ -101,14 +101,72 @@ statement and generated code writes `if (!setjmp(H.jb))` directly (the
 single deepest bug of the arc; handler-pop identity checks + the hlog
 ring in fpprt-lang caught it).
 
-CURRENT: suite completes tests but the tail ([IndexMapping] onward) is
-GC-thrash-slow: ~8 GB allocated per 2 min (uniform boxing) on the SEMI
-collector; FPP_HEAP_MB env sets the floor; full run with 2048 MB and 40
-min budget pending — get GREEN first, then either mmc for the harness or
-allocation diet (small-int64 tagging etc). suite2.fpp in the scratchpad =
-suite + TRC instrumentation; micros in tests/tooling/cback; harness
-run.sh (uses semi); FPP_CBACK_DUMP/FPP_CBACK_CHECK/FPP_GC_LOG debug
-switches.
+Two more, found chasing an mmc-only segfault in test 87 (core dump →
+object at the very END of the heap mapping): **ERecordExt copied the
+DERIVED layout's field count from a BASE-class instance** — a class ctor
+lowers as an extension over the base ctor's result, so every ctor with a
+smaller base read past the base object (harmless mid-heap: the values
+are immediately overwritten; SEGV when the base sat at a mapping edge).
+Both copy paths now clamp to the SOURCE object's runtime field count
+(fpp_tfields_). And **WeakReference / ConditionalWeakTable are really
+weak on fpprt**: the prelude bodies are strong (wasm-GC has no weak
+refs) and retained every test's adaptive graph — semi grew to 17 GB over
+the run. Their members are now runtime intrinsics (CSt.Intrin, DClass
+registration by recBase, emitIntrinFn): WeakReference's field holds a
+fpprt_weak, CWT's field 0 an ephemeron table (fpp_cwt_* in fpprt-lang,
+fpprt_eph_new/key/value in fpprt). TryGetTarget returns false once the
+target is collected — TRUER to .NET than the oracle, so weak-dependent
+divergence vs wasm-GC is expected and correct.
+
+**M8 IS GREEN EVERYWHERE: PASSED 100 FAILED 0 native (mmc AND semi, 64-
+and 32-bit -m32) and WASM-LINEAR (emcc + wasmtime).** The wasm leg's
+traps, in the order they fell: emscripten setjmp needs
+`-fwasm-exceptions -sSUPPORT_LONGJMP=wasm -sWASM_LEGACY_EXCEPTIONS=0`
+(default SjLj imports JS trampolines; without -fwasm-exceptions the
+longjmp lowers to the LEGACY EH format wasmtime 47 rejects) and wasmtime
+runs it with `-W exceptions=y`; generated field offsets are emitted as
+FPPOFF(slot) = slot*sizeof(V), never bytes — wasm32 slots are 4 bytes;
+an int32 beyond 31 bits cannot tag on a 32-bit V, so TAGI SPILLS to an
+i64 box there (Int32.MaxValue is Transaction.RunningLevel's sentinel!)
+and the eqv/cmpv drift coercion keeps spilled ints equal to tagged
+twins; and emscripten's DEFAULT 64KB STACK blows on the tree recursion —
+`-sSTACK_SIZE=8388608`. The -m32 native build is the cheap way to debug
+wasm32 layout with gdb; gate: tests/tooling/cback/adaptive-gate.sh. The
+last two failures shared one root: CLASS TYPE TESTS compared exact tids,
+so `:? IndexedReader<'a>` in AbstractDirtyReader.InputChangedObject was
+false for every stamped/base instance and the dirty notification was
+DROPPED — every CE-built alist (append-of-bind) silently stopped
+updating. Type tests on classes now collapse the tested name to its
+canonical base (stamps share the base's uniform repr; instances can
+carry the base tid or a SIBLING stamp's) and fpp_isa walks a per-tid
+parent chain (fpp_reg_parent, emitted beside fpp_reg_struct). Remaining
+leg: the same C through emcc (wasm-linear, mmc single-threaded), then
+wire the gates.
+
+The "slow tail" was a BUG, not boxing cost: cmpv on MIXED tagged/boxed
+numerics said "tagged is always less", so an int64 that drifts between
+representations gave MapExt an INCONSISTENT ordering — inserts looped
+forever ([ASet] range systematic int64 wedged 10+ min; instant after).
+cmpv AND eqv now coerce the mixed case numerically (hashv already
+agreed by accident). More from the same hunt: classes overriding
+Equals/GetHashCode dispatch through vt slots (fpp_reg_eq/fpp_reg_hash,
+same shape as CompareTo; nullary members may carry a unit param — pass
+VUNIT) — Index is VALUE-keyed in dictionaries, identity hashing lost
+logically-equal instances and collecti left stale elements behind;
+$idhash builtin (GetHashCode with no override); op @ = fpp_append —
+note bare "@" must match BEFORE the "op@Type" family case; fpp_vcall
+treats a NULL receiver as the EMPTY SEQ on the GetEnumerator/MoveNext/
+Dispose slots (null IS the empty list — String.concat over [] died),
+slots handed over via fpp_seq_slots; DUCK-TYPED enumerator classes
+(MoveNext/Current/GetEnumerator members, no interface) wire into the
+IEnumerator/IEnumerable slots too — the 8525a21 nearestOwn rework had
+dropped them and dotnet.fpp's gate was not rerun (it broke silently:
+rerun EVERY gate after touching vtables).
+
+Harness notes: suite stdout is block-buffered into files — run under
+`stdbuf -oL` or a timeout kill eats every RUN line; micros in
+tests/tooling/cback; run.sh (semi); FPP_CBACK_DUMP/FPP_CBACK_CHECK/
+FPP_GC_LOG/FPP_GC_CENSUS/FPP_HEAP_MB switches.
 
 ## Milestones (tasks #21-#28)
 

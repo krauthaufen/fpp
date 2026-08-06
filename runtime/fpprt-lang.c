@@ -267,6 +267,89 @@ static int fpp_cmp_slot_of_(uint32_t tid) {
   return tid < fpp_cmp_cap_ ? fpp_cmp_slot_[tid] : -1;
 }
 
+/* same shape for Equals / GetHashCode: a class overriding them must be
+ * VALUE-keyed in dictionaries the way the oracle keys it, not identity */
+static int *fpp_eq_slot_ = NULL;
+static size_t fpp_eq_cap_ = 0;
+void fpp_reg_eq(uint32_t tid, int slot) {
+  if (tid >= fpp_eq_cap_) {
+    size_t cap = fpp_eq_cap_ ? fpp_eq_cap_ : 64;
+    while (tid >= cap) cap *= 2;
+    int *n = malloc(cap * sizeof(int));
+    if (!n) abort();
+    for (size_t i = 0; i < cap; i++) n[i] = i < fpp_eq_cap_ ? fpp_eq_slot_[i] : -1;
+    free(fpp_eq_slot_);
+    fpp_eq_slot_ = n;
+    fpp_eq_cap_ = cap;
+  }
+  fpp_eq_slot_[tid] = slot;
+}
+static int fpp_eq_slot_of_(uint32_t tid) {
+  return tid < fpp_eq_cap_ ? fpp_eq_slot_[tid] : -1;
+}
+static int *fpp_hash_slot_ = NULL;
+static size_t fpp_hash_cap_ = 0;
+void fpp_reg_hash(uint32_t tid, int slot) {
+  if (tid >= fpp_hash_cap_) {
+    size_t cap = fpp_hash_cap_ ? fpp_hash_cap_ : 64;
+    while (tid >= cap) cap *= 2;
+    int *n = malloc(cap * sizeof(int));
+    if (!n) abort();
+    for (size_t i = 0; i < cap; i++) n[i] = i < fpp_hash_cap_ ? fpp_hash_slot_[i] : -1;
+    free(fpp_hash_slot_);
+    fpp_hash_slot_ = n;
+    fpp_hash_cap_ = cap;
+  }
+  fpp_hash_slot_[tid] = slot;
+}
+static int fpp_hash_slot_of_(uint32_t tid) {
+  return tid < fpp_hash_cap_ ? fpp_hash_slot_[tid] : -1;
+}
+
+/* parent tid per tid: `:? Base` walks up from the object's exact tid */
+static uint32_t *fpp_parent_ = NULL;
+static size_t fpp_parent_cap_ = 0;
+void fpp_reg_parent(uint32_t tid, uint32_t parent) {
+  if (tid >= fpp_parent_cap_) {
+    size_t cap = fpp_parent_cap_ ? fpp_parent_cap_ : 64;
+    while (tid >= cap) cap *= 2;
+    uint32_t *n = malloc(cap * sizeof(uint32_t));
+    if (!n) abort();
+    for (size_t i = 0; i < cap; i++) n[i] = i < fpp_parent_cap_ ? fpp_parent_[i] : 0;
+    free(fpp_parent_);
+    fpp_parent_ = n;
+    fpp_parent_cap_ = cap;
+  }
+  fpp_parent_[tid] = parent;
+}
+int fpp_isa(V x, uint32_t tid) {
+  if (!x || (x & 1)) return 0;
+  uint32_t t = fpprt_typeid(x);
+  for (int guard = 0; guard < 64; guard++) {
+    if (t == tid) return 1;
+    uint32_t p = t < fpp_parent_cap_ ? fpp_parent_[t] : 0;
+    if (!p || p == t) return 0;
+    t = p;
+  }
+  return 0;
+}
+
+V fpp_append(V a, V b) {
+  FPPRT_FRAME(f, 3);
+  f_slots[0] = a; f_slots[1] = b; f_slots[2] = 0;
+  while (fpp_is_tid(f_slots[0], FPP_TID_CONS)) {
+    f_slots[2] = fpp_cons(fpprt_read_ref(f_slots[0], sizeof(V)), f_slots[2]);
+    f_slots[0] = fpprt_read_ref(f_slots[0], 2 * sizeof(V));
+  }
+  while (fpp_is_tid(f_slots[2], FPP_TID_CONS)) {
+    f_slots[1] = fpp_cons(fpprt_read_ref(f_slots[2], sizeof(V)), f_slots[1]);
+    f_slots[2] = fpprt_read_ref(f_slots[2], 2 * sizeof(V));
+  }
+  V r = f_slots[1];
+  FPPRT_LEAVE(f);
+  return r;
+}
+
 int fpp_vt_has(V obj, int slot) {
   if (!obj || (obj & 1)) return 0;
   uint32_t tid = fpprt_typeid(obj);
@@ -274,8 +357,19 @@ int fpp_vt_has(V obj, int slot) {
       && fpp_vt_[tid * (size_t)fpp_vt_slots_ + slot] != NULL;
 }
 
+static int fpp_slot_ge_ = -1, fpp_slot_mn_ = -1, fpp_slot_disp_ = -1;
+void fpp_seq_slots(int ge, int mn, int disp) {
+  fpp_slot_ge_ = ge; fpp_slot_mn_ = mn; fpp_slot_disp_ = disp;
+}
+
 V fpp_vcall(V obj, int slot, V *args, size_t n) {
   (void)n;
+  if (!obj) {
+    /* null IS the empty list: enumerating it must work like the oracle */
+    if (slot == fpp_slot_ge_) return fpp_seq_getenum(0, NULL);
+    if (slot == fpp_slot_mn_) return TAGI(0);
+    if (slot == fpp_slot_disp_) return VUNIT;
+  }
   if (!obj || (obj & 1)) fpp_not_emitted("vcall on non-object");
   uint32_t tid = fpprt_typeid(obj);
   fpp_code_t fn = (tid < fpp_vt_tids_ && slot < fpp_vt_slots_)
@@ -434,7 +528,17 @@ int fpp_eqv(V a, V b) {
    * still compares UNEQUAL to itself */
   if (a == b && !((a && !(a & 1)) && fpprt_typeid(a) == FPP_TID_F64)) return 1;
   if (a == b) return fpp_unbox_f64(a) == fpp_unbox_f64(b);
-  if ((a & 1) || (b & 1) || !a || !b) return 0;
+  if (!a || !b) return 0;
+  if ((a & 1) || (b & 1)) {
+    /* representational drift: tagged vs boxed of the SAME number is equal */
+    V r = (a & 1) ? b : a;
+    if (r & 1) return 0;
+    intptr_t tv = (intptr_t)UNTAGI((a & 1) ? a : b);
+    uint32_t tr = fpprt_typeid(r);
+    if (tr == FPP_TID_I64) return fpp_unbox_i64(r) == (int64_t)tv;
+    if (tr == FPP_TID_F64) return fpp_unbox_f64(r) == (double)tv;
+    return 0;
+  }
   uint32_t ta = fpprt_typeid(a), tb = fpprt_typeid(b);
   if (ta != tb) return 0;
   switch (ta) {
@@ -463,6 +567,13 @@ int fpp_eqv(V a, V b) {
                      fpprt_read_ref(b, (i + 1) * sizeof(V)))) return 0;
       return 1;
     }
+    if (tc == FPP_TC_CLASS) {
+      int slot = fpp_eq_slot_of_(ta);
+      if (slot >= 0) {
+        V arg = b;
+        return UNTAGI(fpp_vcall(a, slot, &arg, 1)) != 0;
+      }
+    }
     return 0;                              /* closures, classes: identity */
   }
   }
@@ -474,7 +585,25 @@ int fpp_cmpv(V a, V b) {
     return UNTAGI(a) < UNTAGI(b) ? -1 : UNTAGI(a) > UNTAGI(b) ? 1 : 0;
   if (!a) return -1;
   if (!b) return 1;
-  if ((a & 1) || (b & 1)) return (a & 1) ? -1 : 1;
+  if ((a & 1) || (b & 1)) {
+    /* representational drift: the same numeric value can arrive TAGGED on
+     * one side and BOXED on the other — order NUMERICALLY or int64 map
+     * keys get an inconsistent ordering (MapExt inserts then loop) */
+    V r = (a & 1) ? b : a;
+    intptr_t tv = (intptr_t)UNTAGI((a & 1) ? a : b);
+    uint32_t tr = fpprt_typeid(r);
+    if (tr == FPP_TID_I64) {
+      int64_t x = (a & 1) ? (int64_t)tv : fpp_unbox_i64(a);
+      int64_t y = (b & 1) ? (int64_t)tv : fpp_unbox_i64(b);
+      return x < y ? -1 : x > y ? 1 : 0;
+    }
+    if (tr == FPP_TID_F64) {
+      double x = (a & 1) ? (double)tv : fpp_unbox_f64(a);
+      double y = (b & 1) ? (double)tv : fpp_unbox_f64(b);
+      return x < y ? -1 : x > y ? 1 : 0;
+    }
+    return (a & 1) ? -1 : 1;
+  }
   uint32_t ta = fpprt_typeid(a), tb = fpprt_typeid(b);
   if (ta != tb) return ta < tb ? -1 : 1;
   switch (ta) {
@@ -568,6 +697,13 @@ intptr_t fpp_hashv(V v) {
       for (unsigned i = 0; i < n; i++)
         h = h * 31 + fpp_hashv(fpprt_read_ref(v, (i + 1) * sizeof(V)));
       return h & 0x3fffffff;
+    }
+    if (tc == FPP_TC_CLASS) {
+      int slot = fpp_hash_slot_of_(t);
+      if (slot >= 0) {
+        V arg = VUNIT;                 /* nullary members may take unit */
+        return (intptr_t)UNTAGI(fpp_vcall(v, slot, &arg, 1));
+      }
     }
     return (intptr_t)fpprt_idhash(v);
   }
@@ -985,3 +1121,93 @@ V fpp_str_method(const char *m, V recv, V *args, size_t nargs) {
   fpp_not_emitted("string method");
   return 0;
 }
+
+/* ---- ConditionalWeakTable ----------------------------------------------- */
+
+#define CWT_SLOT_(i) ((uint32_t)(((i) + 2) * sizeof(V)))
+
+void fpp_cwt_init(V self) {
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = self;
+  V a = fpp_arr_zeroed(0, 8);
+  fpprt_write_ref(f_slots[0], sizeof(V), a);
+  FPPRT_LEAVE(f);
+}
+
+V fpp_cwt_tryget(V self, V k) {
+  V a = fpprt_read_ref(self, sizeof(V));
+  size_t n = fpprt_array_len(a);
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (e && fpprt_eph_key(e) == k)
+      return fpprt_eph_value(e);
+  }
+  return 0;
+}
+
+void fpp_cwt_add(V self, V k, V v) {
+  FPPRT_FRAME(f, 4);
+  f_slots[0] = self; f_slots[1] = k; f_slots[2] = v;
+  f_slots[3] = fpprt_eph_new(f_slots[1], f_slots[2]);
+  V a = fpprt_read_ref(f_slots[0], sizeof(V));
+  size_t n = fpprt_array_len(a);
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (!e || !fpprt_eph_key(e)) {
+      fpprt_write_ref(a, CWT_SLOT_(i), f_slots[3]);
+      FPPRT_LEAVE(f);
+      return;
+    }
+  }
+  /* full: grow, keeping only live entries */
+  V b = fpp_arr_zeroed(0, n * 2);
+  a = fpprt_read_ref(f_slots[0], sizeof(V));
+  size_t j = 0;
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (e && fpprt_eph_key(e))
+      fpprt_write_ref(b, CWT_SLOT_(j++), e);
+  }
+  fpprt_write_ref(b, CWT_SLOT_(j), f_slots[3]);
+  fpprt_write_ref(f_slots[0], sizeof(V), b);
+  FPPRT_LEAVE(f);
+}
+
+V fpp_cwt_remove(V self, V k) {
+  V a = fpprt_read_ref(self, sizeof(V));
+  size_t n = fpprt_array_len(a);
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (e && fpprt_eph_key(e) == k) {
+      fpprt_write_ref(a, CWT_SLOT_(i), 0);
+      return TAGI(1);
+    }
+  }
+  return TAGI(0);
+}
+
+V fpp_cwt_count(V self) {
+  V a = fpprt_read_ref(self, sizeof(V));
+  size_t n = fpprt_array_len(a), c = 0;
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (e && fpprt_eph_key(e)) c++;
+  }
+  return TAGI((intptr_t)c);
+}
+
+V fpp_cwt_indexof(V self, V k) {
+  V a = fpprt_read_ref(self, sizeof(V));
+  size_t n = fpprt_array_len(a);
+  for (size_t i = 0; i < n; i++) {
+    V e = fpprt_read_ref(a, CWT_SLOT_(i));
+    if (e && fpprt_eph_key(e) == k)
+      return TAGI((intptr_t)i);
+  }
+  return TAGI(-1);
+}
+
+/* out-of-line i64 box hooks for the 32-bit TAGI/UNTAGI spill path (the
+ * inline helpers in the header run before fpp_box_i64 is declared) */
+V fpp_box_i64_(int64_t x) { return fpp_box_i64(x); }
+int64_t fpp_unbox_i64_(V b) { return fpp_unbox_i64(b); }

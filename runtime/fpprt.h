@@ -125,6 +125,12 @@ void fpprt_write_ref(fpprt_ref o, uint32_t byteoff, fpprt_ref v);
 fpprt_ref fpprt_weak_new(fpprt_ref target);
 fpprt_ref fpprt_weak_get(fpprt_ref weak);
 
+/* The general form: value stays alive only while KEY is alive; both read
+ * as 0 once the key is collected (ConditionalWeakTable's entry). */
+fpprt_ref fpprt_eph_new(fpprt_ref key, fpprt_ref value);
+fpprt_ref fpprt_eph_key(fpprt_ref e);
+fpprt_ref fpprt_eph_value(fpprt_ref e);
+
 const char *fpprt_type_name(uint32_t tid);
 
 /* ---- static roots ------------------------------------------------------ */

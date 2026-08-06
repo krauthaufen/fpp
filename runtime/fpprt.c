@@ -91,9 +91,39 @@ static void log_prepare_gc_(void *data, enum gc_collection_kind kind,
     gc_log_ = e && e[0] == '1';
   }
   gc_count_++;
-  if (gc_log_ && (gc_count_ & 0x3f) == 0)
+  if (gc_log_ && (gc_count_ & 0xf) == 0)
     fprintf(stderr, "[gc %u allocated=%llu MB]\n", gc_count_,
             (unsigned long long)(counter >> 20));
+}
+#ifdef FPP_GC_CENSUS
+size_t fpprt_census_[4096];
+#endif
+
+static void log_live_(void *data, size_t size) {
+#ifdef FPP_GC_CENSUS
+  if (gc_log_ > 0 && (gc_count_ & 0xf) == 0) {
+    for (int r = 0; r < 5; r++) {
+      size_t best = 0; uint32_t bi = 0;
+      for (uint32_t i = 0; i < 4096; i++)
+        if (fpprt_census_[i] > best) { best = fpprt_census_[i]; bi = i; }
+      if (!best) break;
+      fprintf(stderr, "  [census %s tid=%u %zu MB]\n",
+              fpprt_type_name(bi), bi, best >> 20);
+      fpprt_census_[bi] = 0;
+    }
+    memset(fpprt_census_, 0, sizeof fpprt_census_);
+  } else
+    memset(fpprt_census_, 0, sizeof fpprt_census_);
+#endif
+  if (gc_log_ > 0 && (gc_count_ & 0xf) == 0) {
+    size_t nframes = 0, nslots = 0;
+    for (struct fpprt_frame *fr = fpprt_top_frame; fr; fr = fr->prev) {
+      nframes++;
+      nslots += fr->nslots;
+    }
+    fprintf(stderr, "[gc %u live=%zu MB idh=%zu frames=%zu slots=%zu]\n",
+            gc_count_, size >> 20, idh_count_, nframes, nslots);
+  }
 }
 
 #define FPPRT_EVENT_LISTENER                                   \
@@ -115,7 +145,7 @@ static void log_prepare_gc_(void *data, enum gc_collection_kind kind,
     gc_null_event_listener_mutator_restarted,                  \
     gc_null_event_listener_mutator_removed,                    \
     gc_null_event_listener_heap_resized,                       \
-    gc_null_event_listener_live_data_size,                     \
+    log_live_,                                                 \
   })
 
 /* ---- types ------------------------------------------------------------- */
@@ -223,6 +253,28 @@ fpprt_ref fpprt_weak_new(fpprt_ref target) {
 fpprt_ref fpprt_weak_get(fpprt_ref weak) {
   return (fpprt_ref)gc_ref_value(
       gc_ephemeron_value((struct gc_ephemeron *)weak));
+}
+
+fpprt_ref fpprt_eph_new(fpprt_ref key, fpprt_ref value) {
+  FPPRT_FRAME(f, 2);
+  f_slots[0] = key;
+  f_slots[1] = value;
+  struct gc_ephemeron *e = gc_allocate_ephemeron(mut_);
+  ((struct fpprt_header *)e)->tag = ((uintptr_t)FPPRT_TID_EPHEMERON << 1) | 1;
+  gc_ephemeron_init(mut_, e, gc_ref((uintptr_t)f_slots[0]),
+                    gc_ref((uintptr_t)f_slots[1]));
+  FPPRT_LEAVE(f);
+  return (fpprt_ref)e;
+}
+
+fpprt_ref fpprt_eph_key(fpprt_ref e) {
+  return (fpprt_ref)gc_ref_value(
+      gc_ephemeron_key((struct gc_ephemeron *)e));
+}
+
+fpprt_ref fpprt_eph_value(fpprt_ref e) {
+  return (fpprt_ref)gc_ref_value(
+      gc_ephemeron_value((struct gc_ephemeron *)e));
 }
 
 /* ---- static roots ------------------------------------------------------ */

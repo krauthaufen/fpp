@@ -81,6 +81,11 @@ static inline void gc_extern_space_start_gc(struct gc_extern_space *space,
 static inline void gc_extern_space_finish_gc(struct gc_extern_space *space,
                                              int is_minor_gc) {}
 
+/* FPP_GC_CENSUS builds: bytes traced per typeid, dumped by fpprt.c */
+#ifdef FPP_GC_CENSUS
+extern size_t fpprt_census_[4096];
+#endif
+
 static inline size_t gc_trace_object(struct gc_ref ref,
                                      void (*visit)(struct gc_edge edge,
                                                    struct gc_heap *heap,
@@ -90,6 +95,10 @@ static inline size_t gc_trace_object(struct gc_ref ref,
   void *obj = gc_ref_heap_object(ref);
   uintptr_t tag = *fpprt_tag_word_(ref);
   struct fpprt_type_intern *t = &fpprt_types_[tag >> 1];
+#ifdef FPP_GC_CENSUS
+  if ((tag >> 1) < 4096)
+    fpprt_census_[tag >> 1] += fpprt_object_size_(tag, obj);
+#endif
   switch (t->kind) {
   case FPPRT_EMB_KIND_STRUCT:
     if (visit)

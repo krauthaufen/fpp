@@ -18,9 +18,32 @@
 
 typedef fpprt_ref V;
 
+#if UINTPTR_MAX > 0xffffffffu
 #define TAGI(x)   ((V)((((intptr_t)(x)) << 1) | 1))
 #define UNTAGI(v) (((intptr_t)(v)) >> 1)
+#else
+/* 32-bit target: an int32 needs 32 bits, the tag holds 31 — values out of
+ * range spill into i64 BOXES (Int32.MaxValue is a real sentinel: it is
+ * Transaction.RunningLevel outside a transaction). eqv/cmpv/arith already
+ * coerce the mixed tagged/boxed case, so a spilled int stays equal and
+ * ordered against its tagged twin. */
+V fpp_box_i64_(int64_t x);                /* wrapper, defined in fpprt-lang.c */
+int64_t fpp_unbox_i64_(V b);
+static inline V TAGI_(intptr_t x) {
+  if (x >= -(intptr_t)0x40000000 && x < (intptr_t)0x40000000)
+    return (V)((x << 1) | 1);
+  return fpp_box_i64_((int64_t)x);
+}
+static inline intptr_t UNTAGI_(V v) {
+  return (v & 1) ? ((intptr_t)v >> 1) : (intptr_t)fpp_unbox_i64_(v);
+}
+#define TAGI(x)   TAGI_((intptr_t)(x))
+#define UNTAGI(v) UNTAGI_(v)
+#endif
 #define VUNIT     ((V)1)
+/* field offset of slot i in a heap object: generated code always speaks in
+ * SLOT indices — the byte width is the TARGET's pointer size (wasm32: 4) */
+#define FPPOFF(i) ((uint32_t)((i) * sizeof(V)))
 
 /* language-level typeids; compiler-assigned ones start at FPP_TID_USER */
 #define FPP_TID_STR    (FPPRT_TID_FIRST + 0)   /* UTF-16: u16 scalar array */
@@ -123,6 +146,18 @@ static inline void fpp_arr_set(V a, size_t i, V v) {
   fpprt_write_ref(a, (uint32_t)((i + 2) * sizeof(V)), v);
 }
 
+/* ---- ConditionalWeakTable ------------------------------------------------
+ * The table object's FIRST field (offset sizeof(V)) holds a ref-array of
+ * ephemerons: 0 = free slot, key reads 0 = dead entry. Keys are compared by
+ * IDENTITY, entries hold neither key nor value alive. The compiler routes
+ * the prelude class's ctor and members here. */
+void fpp_cwt_init(V self);
+V fpp_cwt_tryget(V self, V k);   /* value, or 0 when absent/dead   */
+void fpp_cwt_add(V self, V k, V v);
+V fpp_cwt_remove(V self, V k);   /* tagged bool                    */
+V fpp_cwt_count(V self);         /* tagged live-entry count        */
+V fpp_cwt_indexof(V self, V k);  /* tagged live index, -1 = absent */
+
 /* ---- closures and apply ------------------------------------------------- */
 
 static inline fpp_code_t fpp_clo_code(V c) {
@@ -149,11 +184,21 @@ void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn);
 V fpp_vcall(V obj, int slot, V *args, size_t n);
 int fpp_vt_has(V obj, int slot);   /* interface type-test: slot filled? */
 void fpp_reg_cmp(uint32_t tid, int slot);   /* class's CompareTo vt slot */
+void fpp_reg_eq(uint32_t tid, int slot);    /* class's Equals vt slot */
+void fpp_reg_hash(uint32_t tid, int slot);  /* class's GetHashCode vt slot */
+V fpp_append(V a, V b);                     /* list @ list */
+
+/* class inheritance: `:? Base` must accept derived and stamped tids */
+void fpp_reg_parent(uint32_t tid, uint32_t parent);
+int fpp_isa(V x, uint32_t tid);
 
 /* builtin seq protocol over arrays, lists and strings: the compiler wires
  * these into ITS slot numbers for IEnumerable/IEnumerator */
 V fpp_seq_getenum(V self, V *args);
 V fpp_enum_movenext(V self, V *args);
+/* the program's slot numbers for the seq protocol — lets fpp_vcall treat a
+ * NULL receiver as the empty sequence (null IS the empty list) */
+void fpp_seq_slots(int ge, int mn, int disp);
 V fpp_enum_current(V self, V *args);
 V fpp_enum_dispose(V self, V *args);
 

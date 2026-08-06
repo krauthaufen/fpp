@@ -54,6 +54,9 @@ type CSt =
       ClassBase : Dict<string, string>       // class -> base
       ClassImpls : Dict<string, (string * (string * VarId) list) list>
       ClassOwn : Dict<string, (string * VarId) list>
+      Intrin : Dict<string * int, string>    // member fn -> runtime intrinsic:
+                                             // WeakReference / CWT members get
+                                             // REAL weak semantics on fpprt
       mutable NVSlots : int
       mutable NextTid : int
       mutable NextLam : int
@@ -304,6 +307,14 @@ let private recTidOf (st : CSt) (name : string) : int option =
     | Some t -> Some t
     | None -> dictTryFind st.RecTid (recBase name)
 
+/// the tid a TYPE TEST checks: stamps share their base's uniform repr, so
+/// `:? Foo$<int>` collapses to Foo — instances may carry the base tid or a
+/// SIBLING stamp's, and fpp_isa only walks upward
+let private testTidOf (st : CSt) (name : string) : int option =
+    match dictTryFind st.RecTid (recBase name) with
+    | Some t -> Some t
+    | None -> recTidOf st name
+
 let private recFieldsOf (st : CSt) (name : string) : string list option =
     match dictTryFind st.RecFields name with
     | Some fs when not (List.isEmpty fs) -> Some fs
@@ -480,6 +491,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = TAGI(fpp_hashv(" + sref x + "));")
         d
+    | EApp (EUnknown "$idhash", [ a ]) ->
+        // object.GetHashCode with no override: the IDENTITY hash
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpprt_idhash(" + sref x + "));")
+        d
     | EApp (EUnknown "ignore", [ a ]) ->
         emitE st f a |> ignore
         unitV ()
@@ -491,7 +508,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | Some tid ->
              let w = slot f
              stmt f (sref w + " = fpprt_alloc(" + string tid + ");")
-             stmt f ("fpprt_write_ref(" + sref w + ", 8, " + sref x + ");")
+             stmt f ("fpprt_write_ref(" + sref w + ", FPPOFF(1), " + sref x + ");")
              stmt f ("fpp_raise(" + sref w + ");")
          | None ->
              stmt f ("fpp_raise(" + sref x + ");"))
@@ -613,6 +630,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref y + ");")
         d
+    | EPrim ("@", [ a; b ]) ->
+        // list append
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        stmt f (sref d + " = fpp_append(" + sref x + ", " + sref y + ");")
+        d
     | EPrim (op0, [ a; b ]) when op0.Contains "@" ->
         // "op@Type": the operand type rides on the operator. Uniformly
         // represented values answer the whole family structurally.
@@ -689,6 +713,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | "<" | ">" | "<=" | ">=" -> rel op
          | "=" -> stmt f (sref d + " = TAGI(fpp_eqv(" + sref x + ", " + sref y + "));")
          | "<>" -> stmt f (sref d + " = TAGI(!fpp_eqv(" + sref x + ", " + sref y + "));")
+         | "@" -> stmt f (sref d + " = fpp_append(" + sref x + ", " + sref y + ");")
          | "&&" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") && UNTAGI(" + sref y + "));")
          | "||" -> stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") || UNTAGI(" + sref y + "));")
          | "&&&" | "|||" | "^^^" | "<<<" | ">>>" ->
@@ -877,15 +902,25 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let order = (recFieldsOf st name).Value
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             // WeakReference holds its target through a REAL weak ref on
+             // fpprt (the prelude body is strong — a wasm-GC limitation)
+             let weakWrap = recBase name = "WeakReference"
              for fn2, v in fs do
-                 if fn2 = "base" then
+                 if weakWrap && fn2 = "value" then
+                     let x = emitE st f v
+                     let w = slot f
+                     stmt f (sref w + " = fpprt_weak_new(" + sref x + ");")
+                     let idx = fieldIdx order fn2
+                     stmt f ("fpprt_write_ref(" + sref d + ", "
+                             + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref w + ");")
+                 elif fn2 = "base" then
                      // the base constructor built a BASE instance; its
                      // fields are this layout's shared prefix — copy them
                      let b = emitE st f v
                      stmt f ("{ uint32_t NB = fpp_tfields_[fpprt_typeid(" + sref b + ")];")
                      stmt f ("for (uint32_t I = 0; I < NB; I++)")
-                     stmt f ("  fpprt_write_ref(" + sref d + ", (I + 1) * 8, fpprt_read_ref("
-                             + sref b + ", (I + 1) * 8)); }")
+                     stmt f ("  fpprt_write_ref(" + sref d + ", FPPOFF(I + 1), fpprt_read_ref("
+                             + sref b + ", FPPOFF(I + 1))); }")
                  else
                      let x = emitE st f v
                      let idx = fieldIdx order fn2
@@ -893,7 +928,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                          stmt f ("fpp_not_emitted(" + cstr ("field " + name + "." + fn2) + ");")
                      else
                          stmt f ("fpprt_write_ref(" + sref d + ", "
-                                 + string ((idx + 1) * 8) + ", " + sref x + ");")
+                                 + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref x + ");")
+             // ConditionalWeakTable: field 0 becomes the ephemeron table —
+             // its members are runtime intrinsics, the other fields unused
+             if recBase name = "ConditionalWeakTable" then
+                 stmt f ("fpp_cwt_init(" + sref d + ");")
              d
          | None -> trap ("record " + name))
     | ERecordExt (name, b, fs) ->
@@ -904,15 +943,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let n = List.length order
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
-             for i in 0 .. n - 1 do
-                 stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 1) * 8)
-                         + ", fpprt_read_ref(" + sref src + ", " + string ((i + 1) * 8) + "));")
+             // the source can be a BASE-class instance (a class ctor lowers as
+             // an extension over the base ctor's result) — copy only the
+             // fields the source OBJECT has, never the derived layout's count
+             stmt f ("{ uint32_t NB = fpp_tfields_[fpprt_typeid(" + sref src + ")];")
+             stmt f ("if (NB > " + string n + "u) NB = " + string n + "u;")
+             stmt f ("for (uint32_t I = 0; I < NB; I++)")
+             stmt f ("  fpprt_write_ref(" + sref d + ", FPPOFF(I + 1), fpprt_read_ref("
+                     + sref src + ", FPPOFF(I + 1))); }")
              for fn2, v in fs do
                  let x = emitE st f v
                  let idx = fieldIdx order fn2
                  if idx >= 0 then
                      stmt f ("fpprt_write_ref(" + sref d + ", "
-                             + string ((idx + 1) * 8) + ", " + sref x + ");")
+                             + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref x + ");")
              d
          | None -> trap ("record " + name))
     | EField (r, fname, owner) ->
@@ -928,7 +972,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                      stmt f ("fpp_chk(" + sref x + ", " + string idx + ", "
                              + cstr (owner + "." + fname) + ");")
                  stmt f (sref d + " = fpprt_read_ref(" + sref x + ", "
-                         + string ((idx + 1) * 8) + ");")
+                         + ("FPPOFF(" + string (idx + 1) + ")") + ");")
                  d
          | None -> trap ("field of " + owner + "." + fname))
     | EFieldSet (r, fname, owner, v) ->
@@ -944,7 +988,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                      stmt f ("fpp_chk(" + sref x + ", " + string idx + ", "
                              + cstr (owner + "." + fname) + ");")
                  stmt f ("fpprt_write_ref(" + sref x + ", "
-                         + string ((idx + 1) * 8) + ", " + sref y + ");")
+                         + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref y + ");")
                  unitV ()
          | None -> trap ("fieldset of " + owner))
     | ECtor (cn, _, []) when
@@ -961,7 +1005,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
              vs |> List.iteri (fun i x ->
-                 stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 1) * 8)
+                 stmt f ("fpprt_write_ref(" + sref d + ", " + ("FPPOFF(" + string (i + 1) + ")")
                          + ", " + sref x + ");"))
              d
          | None ->
@@ -1124,11 +1168,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              stmt f (sref d + " = TAGI(fpp_vt_has(" + sref xv + ", " + string rep + "));")
              d
          | None ->
-             match dictTryFind st.RecTid tn with
+             match testTidOf st tn with
              | Some tid ->
+                 // classes: accept DERIVED and STAMPED tids via the chain
                  let d = slot f
-                 stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
-                         + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
+                 stmt f (sref d + " = TAGI(fpp_isa(" + sref xv + ", " + string tid + "));")
                  d
              | None ->
                  match dictTryFind st.CaseTid tn with
@@ -1270,7 +1314,7 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
         let hv = slot f
         let tv = slot f
         stmt f ("if (UNTAGI(" + sref ok + ")) { " + sref hv + " = fpprt_read_ref("
-                + sref sv + ", 8); " + sref tv + " = fpprt_read_ref(" + sref sv + ", 16); }")
+                + sref sv + ", FPPOFF(1)); " + sref tv + " = fpprt_read_ref(" + sref sv + ", FPPOFF(2)); }")
         emitPat st f h hv ok
         emitPat st f t tv ok
     | PListLit ps ->
@@ -1281,10 +1325,10 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
                     + sref ok + " = TAGI(0);")
             let hv = slot f
             stmt f ("if (UNTAGI(" + sref ok + ")) " + sref hv + " = fpprt_read_ref("
-                    + sref cur + ", 8);")
+                    + sref cur + ", FPPOFF(1));")
             emitPat st f q hv ok
             stmt f ("if (UNTAGI(" + sref ok + ")) " + sref cur + " = fpprt_read_ref("
-                    + sref cur + ", 16);")
+                    + sref cur + ", FPPOFF(2));")
         stmt f ("if (UNTAGI(" + sref ok + ") && " + sref cur + " != 0) "
                 + sref ok + " = TAGI(0);")
     | PCtor (cn, _, ps) ->
@@ -1295,7 +1339,7 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
              ps |> List.iteri (fun i q ->
                  let el = slot f
                  stmt f ("if (UNTAGI(" + sref ok + ")) " + sref el + " = fpprt_read_ref("
-                         + sref sv + ", " + string ((i + 1) * 8) + ");")
+                         + sref sv + ", " + ("FPPOFF(" + string (i + 1) + ")") + ");")
                  emitPat st f q el ok)
          | None ->
              match dictTryFind st.EnumVal cn with
@@ -1314,9 +1358,10 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
              stmt f ("if (!fpp_vt_has(" + sref sv + ", " + string rep + ")) "
                      + sref ok + " = TAGI(0);")
          | None ->
-             match dictTryFind st.RecTid tn with
+             match testTidOf st tn with
              | Some tid ->
-                 stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+                 // classes: accept DERIVED and STAMPED tids via the chain
+                 stmt f ("if (!fpp_isa(" + sref sv + ", " + string tid + ")) "
                          + sref ok + " = TAGI(0);")
              | None ->
                  match dictTryFind st.CaseTid tn with
@@ -1350,7 +1395,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
                Locals = dictNew<string * int, int> (); Cells = f.Cells }
     frees |> List.iteri (fun i k ->
         let l = slot lf
-        stmt lf (sref l + " = fpprt_read_ref(self, " + string ((i + 3) * 8) + ");")
+        stmt lf (sref l + " = fpprt_read_ref(self, " + ("FPPOFF(" + string (i + 3) + ")") + ");")
         dictSet lf.Locals k l)
     ps |> List.iteri (fun i (pv, _) ->
         let l = slot lf
@@ -1375,7 +1420,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     frees |> List.iteri (fun i k ->
         match dictTryFind f.Locals k with
         | Some l ->
-            stmt f ("fpprt_write_ref(" + sref d + ", " + string ((i + 3) * 8) + ", "
+            stmt f ("fpprt_write_ref(" + sref d + ", " + ("FPPOFF(" + string (i + 3) + ")") + ", "
                     + sref l + ");")
         | None -> stmt f ("fpp_not_emitted(\"capture miss\");"))
     d
@@ -1422,7 +1467,7 @@ and private ctorCloGlobal (st : CSt) (cn : string) : string =
         vecAdd body "  (void)self;"
         vecAdd body ("  V r = fpprt_alloc(" + string tid + ");")
         for i in 0 .. arity - 1 do
-            vecAdd body ("  fpprt_write_ref(r, " + string ((i + 1) * 8)
+            vecAdd body ("  fpprt_write_ref(r, " + ("FPPOFF(" + string (i + 1) + ")")
                          + ", args[" + string i + "]);")
         vecAdd body "  return r;"
         vecAdd body "}"
@@ -1493,6 +1538,43 @@ and private emitFn (st : CSt) (name : string) (ps : (VarId * Scheme) list) (body
     vecAdd all "}"
     vecAdd st.Out (String.concat "\n" (vecToList all))
 
+/// a member whose body is a runtime intrinsic: WeakReference and
+/// ConditionalWeakTable get REAL weak semantics over fpprt's ephemerons —
+/// the prelude bodies are strong because wasm-GC has no weak refs. The
+/// receiver's payload sits in FIELD 0 (offset 8); out-params are cells.
+and private emitIntrinFn (st : CSt) (name : string) (nps : int) (tag : string) : unit =
+    let decl =
+        "static V " + name + "("
+        + String.concat ", " (List.init nps (fun i -> "V p" + string i)) + ")"
+    vecAdd st.Fwd
+        ("static V " + name + "("
+         + String.concat ", " (List.init nps (fun _ -> "V")) + ");")
+    let body =
+        if tag = "weak.TryGetTarget" then
+            "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  V t = w ? fpprt_weak_get(w) : 0;\n  if (!t) return TAGI(0);\n  fpprt_write_ref(p1, FPPOFF(1), t);\n  return TAGI(1);"
+        elif tag = "weak.Target" then
+            "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  return w ? fpprt_weak_get(w) : 0;"
+        elif tag = "weak.IsAlive" then
+            "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  return TAGI((w && fpprt_weak_get(w)) ? 1 : 0);"
+        elif tag = "cwt.TryGetValue" then
+            // two source args arrive TUPLED in p1 unless the decl untuples
+            (if nps >= 3
+             then "  V t = fpp_cwt_tryget(p0, p1);\n  if (!t) return TAGI(0);\n  fpprt_write_ref(p2, FPPOFF(1), t);\n  return TAGI(1);"
+             else "  V k = fpp_tuple_get(p1, 0);\n  V o = fpp_tuple_get(p1, 1);\n  V t = fpp_cwt_tryget(p0, k);\n  if (!t) return TAGI(0);\n  fpprt_write_ref(o, FPPOFF(1), t);\n  return TAGI(1);")
+        elif tag = "cwt.Add" then
+            (if nps >= 3
+             then "  fpp_cwt_add(p0, p1, p2);\n  return VUNIT;"
+             else "  fpp_cwt_add(p0, fpp_tuple_get(p1, 0), fpp_tuple_get(p1, 1));\n  return VUNIT;")
+        elif tag = "cwt.Remove" then
+            "  return fpp_cwt_remove(p0, p1);"
+        elif tag = "cwt.Count" then
+            "  return fpp_cwt_count(p0);"
+        elif tag = "cwt.IndexOf" then
+            "  return fpp_cwt_indexof(p0, p1);"
+        else
+            "  fpp_not_emitted(" + cstr ("intrinsic " + tag) + ");\n  return 0;"
+    vecAdd st.Out (decl + " {\n" + body + "\n}")
+
 // ---- whole program --------------------------------------------------------
 
 let emitC (decls : Decl list) : string * string list =
@@ -1516,6 +1598,7 @@ let emitC (decls : Decl list) : string * string list =
           ClassBase = dictNew<string, string> ()
           ClassImpls = dictNew<string, (string * (string * VarId) list) list> ()
           ClassOwn = dictNew<string, (string * VarId) list> ()
+          Intrin = dictNew<string * int, string> ()
           NVSlots = 0
           NextTid = 32                          // FPP_TID_USER in fpprt-lang.h
           NextLam = 0
@@ -1549,6 +1632,19 @@ let emitC (decls : Decl list) : string * string list =
             (match b with Some x -> dictSet st.ClassBase n x | None -> ())
             dictSet st.ClassImpls n impls
             dictSet st.ClassOwn n own
+            // WeakReference / ConditionalWeakTable: the prelude bodies are
+            // STRONG (wasm-GC has no weak refs); fpprt has real ephemerons,
+            // so their members route to runtime intrinsics here
+            let cbase = recBase n
+            if cbase = "WeakReference" then
+                for mn, mv in own do
+                    if mn = "TryGetTarget" || mn = "Target" || mn = "IsAlive" then
+                        dictSet st.Intrin (mv.Path, mv.Offset) ("weak." + mn)
+            if cbase = "ConditionalWeakTable" then
+                for mn, mv in own do
+                    if mn = "TryGetValue" || mn = "Add" || mn = "Remove"
+                       || mn = "Count" || mn = "IndexOf" then
+                        dictSet st.Intrin (mv.Path, mv.Offset) ("cwt." + mn)
             for iface, ms in impls do
                 let bare =
                     match iface.IndexOf "`" with
@@ -1645,6 +1741,22 @@ let emitC (decls : Decl list) : string * string list =
             vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
                            + string (List.length layout) + ", " + string tclass
                            + ", " + cstr n + ");")
+            // the tid's PARENT: a stamped clone's parent is its canonical
+            // base, a plain class's is its declared base — `:? Base`
+            // accepts the whole chain through fpp_isa
+            if isClass then
+                let pname =
+                    if recBase n <> n then recBase n
+                    else
+                        match dictTryFind st.ClassBase n with
+                        | Some b -> b
+                        | None -> n
+                if pname <> n then
+                    match dictTryFind st.RecTid pname with
+                    | Some ptid when ptid <> tid ->
+                        vecAdd st.Reg ("  fpp_reg_parent(" + string tid + ", "
+                                       + string ptid + ");")
+                    | _ -> ()
         | None -> ()
     // pass 1.5: vtables — every class registers its impl chain's members
     // (nearest declaration wins, walking the base chain)
@@ -1708,6 +1820,31 @@ let emitC (decls : Decl list) : string * string list =
                                     + ", " + w + ");")
                       vecAdd vtReg ("  fpp_reg_cmp(" + string tid + ", " + string sl + ");")
                   | _ -> ())
+                 // same for Equals / GetHashCode: a class overriding them
+                 // is VALUE-keyed in dictionaries, the way the oracle keys
+                 // it — identity hashing loses logically-equal instances
+                 let regDisp (mn : string) (arity : int) (reg : string) =
+                     match dictTryFind nearestOwn mn with
+                     | Some mv when
+                         (let a = dictTryFind st.Fns (mv.Path, mv.Offset)
+                          // a nullary member may carry a UNIT param
+                          a = Some arity || (arity = 1 && a = Some 2)) ->
+                         let key = (recBase n, mn)
+                         let sl =
+                             match dictTryFind st.VSlot key with
+                             | Some x -> x
+                             | None ->
+                                 let x = st.NVSlots
+                                 st.NVSlots <- x + 1
+                                 dictSet st.VSlot key x
+                                 x
+                         let w = vtWrapper st mv
+                         vecAdd vtReg ("  fpp_vt_set(" + string tid + ", " + string sl
+                                       + ", " + w + ");")
+                         vecAdd vtReg ("  " + reg + "(" + string tid + ", " + string sl + ");")
+                     | _ -> ()
+                 regDisp "Equals" 2 "fpp_reg_eq"
+                 regDisp "GetHashCode" 1 "fpp_reg_hash"
                  let fill (sl : int) (mv : VarId) =
                      if not (dictTryFind filled sl).IsSome
                         // a DCE'd member body has no function to point at;
@@ -1745,6 +1882,23 @@ let emitC (decls : Decl list) : string * string list =
                                   | Some sl -> fill sl mv
                                   | None -> ()
                       | None -> ())
+                 // DUCK-TYPED seq protocol: F# accepts any class with
+                 // MoveNext/Current as an enumerator and GetEnumerator as a
+                 // seq, no interface required — but GENERIC consumption
+                 // dispatches through the IEnumerator/IEnumerable slots, so
+                 // a duck class answers those too (explicit impls, filled
+                 // above, win)
+                 for mn, iface in [ "MoveNext", "IEnumerator"
+                                    "Current", "IEnumerator"
+                                    "Dispose", "IEnumerator"
+                                    "Dispose", "IDisposable"
+                                    "GetEnumerator", "IEnumerable" ] do
+                     match dictTryFind nearestOwn mn with
+                     | Some mv ->
+                         (match dictTryFind st.VSlot (iface, mn) with
+                          | Some sl -> fill sl mv
+                          | None -> ())
+                     | None -> ()
              | None -> ())
         | _ -> ()
     // builtin seq protocol: arrays, lists, strings and tuples answer
@@ -1767,10 +1921,22 @@ let emitC (decls : Decl list) : string * string list =
     (match dictTryFind st.VSlot ("IDisposable", "Dispose") with
      | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_dispose);")
      | None -> ())
+    // a NULL receiver on these slots is the EMPTY SEQUENCE (null is the
+    // empty list) — fpp_vcall needs the program's slot numbers to know
+    let slotOr (k : string * string) : string =
+        match dictTryFind st.VSlot k with
+        | Some s -> string s
+        | None -> "-1"
+    vecAdd vtReg ("  fpp_seq_slots(" + slotOr ("IEnumerable", "GetEnumerator")
+                  + ", " + slotOr ("IEnumerator", "MoveNext")
+                  + ", " + slotOr ("IEnumerator", "Dispose") + ");")
     // pass 2: emission
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) -> emitFn st (cname v) ps body
+        | DLet (_, v, _, ELam (ps, body)) ->
+            (match dictTryFind st.Intrin (v.Path, v.Offset) with
+             | Some tag -> emitIntrinFn st (cname v) (List.length ps) tag
+             | None -> emitFn st (cname v) ps body)
         | DLet (_, v, _, rhs) ->
             vecAdd st.Globals ("static V " + gname v + ";")
             let initName = "init_" + gname v
