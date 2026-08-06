@@ -198,12 +198,12 @@ the uniform ABI. Call-heavy float bench: 14x FASTER than the oracle.
 The adaptive suite's wall time is unchanged (0.53s) — after the cmpv
 fix it is not allocation-bound.
 
-OPEN (the "no spill anywhere" decision): wasm32's 31-bit tag cannot hold
-int32; the choices are the value-dependent spill (one branch in TAGI,
-32-bit only) or always-boxing int32 there (fully static, but every
-emitted tagged pointer-compare — enum matches, int patterns — must
-become structural equality). No third static option exists. 64-bit is
-branch-free tagging either way. Waiting on the user's call.
+DECIDED (2026-08-06): the 32-bit int32 spill STAYS — accepted for real
+32-bit ints at uniform positions (wasm32's 31-bit tag cannot hold
+int32; the static alternative — always-boxing — turns every tagged
+pointer-compare into a structural call). Typed locals, params, arrays
+and the direct-call ABI carry int32 raw and never spill; 64-bit tagging
+is branch-free everywhere.
 
 What still boxes, and why: f64/i64 fields of ORDINARY records/classes —
 the oracle's wasm-GC layout is all-anyref for those too (only [<Struct>]

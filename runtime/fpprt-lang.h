@@ -26,7 +26,11 @@ typedef fpprt_ref V;
  * range spill into i64 BOXES (Int32.MaxValue is a real sentinel: it is
  * Transaction.RunningLevel outside a transaction). eqv/cmpv/arith already
  * coerce the mixed tagged/boxed case, so a spilled int stays equal and
- * ordered against its tagged twin. */
+ * ordered against its tagged twin. This is the ACCEPTED design (decided
+ * 2026-08-06): the only static alternative is always-boxing int32 here,
+ * which turns every tagged pointer-compare into a structural call. The
+ * spill exists ONLY at uniform positions — typed locals, params, arrays
+ * and the direct-call ABI carry int32 raw and never spill. */
 V fpp_box_i64_(int64_t x);                /* wrapper, defined in fpprt-lang.c */
 int64_t fpp_unbox_i64_(V b);
 static inline V TAGI_(intptr_t x) {
