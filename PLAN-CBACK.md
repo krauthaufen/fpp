@@ -168,6 +168,38 @@ Harness notes: suite stdout is block-buffered into files — run under
 tests/tooling/cback; run.sh (semi); FPP_CBACK_DUMP/FPP_CBACK_CHECK/
 FPP_GC_LOG/FPP_GC_CENSUS/FPP_HEAP_MB switches.
 
+## The allocation diet (2026-08-06, after M8)
+
+P1 (raw-value layer, commit e10470a): kind-suffixed op chains, conversions,
+float math, if-phis, seq tails, MUTABLE LOCALS and PROVEN-primitive PARAMS
+compute in raw C locals (rawKindOf predicate — PURE, never emits — decides;
+emitRaw emits; boxes only at uniform boundaries: calls, fields, captures,
+returns). Box-heavy loop bench 0.62s -> 0.016s; the oracle runs it in
+0.026s. Raw locals are plain C locals — invisible to the collector, so no
+frame-slot cost either.
+
+P2 (scalar arrays, commit 793c659): float/float32/int64/int/char+uint16/
+byte+bool arrays store RAW elements (int16/sbyte stay ref arrays — the
+unsigned storage would lose their sign). Typed sites go through
+fpp_arr_get_f64-style accessors that never allocate; generic code uses
+tid-DISPATCHING fpp_arr_get/set, so generic-created ref arrays and typed
+scalar arrays interoperate without type descriptors. Scalar tids answer
+the seq protocol (vt wiring + enumerators). Bycatch: float ToString now
+ports the oracle's $ftoa DIGIT-FOR-DIGIT (%g printed e-notation — parity
+never caught it because dotnet.fpp's floats are small), and `prints` no
+longer double-newlines (it mapped to the newline-adding printer; the
+suite's internal PASS check couldn't see it, byte-diff did).
+
+What still boxes, and why: f64/i64 fields of ORDINARY records/classes —
+the oracle's wasm-GC layout is all-anyref for those too (only [<Struct>]
+POD records get typed layouts there), so cback matches oracle cost;
+mutable class fields hold CELLS whatever their declared type, so field
+rawification by declared type alone is UNSOUND — any typed-field work
+must mirror BinDriver's POD/cell rules. POD-struct typed layouts (and
+per-stamp StructTupleN layouts) are the remaining diet item — they ride
+on the oracle's canonName/per-stamp machinery, not on the uniform-stamp
+rule cback uses today.
+
 ## Milestones (tasks #21-#28)
 
 - M1 core exprs: lit/arith/let/if/while/fn/call/print — fib parity
