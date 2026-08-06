@@ -99,8 +99,12 @@ let private freshTid (st : CSt) : int =
 type CFn =
     { Body : Vec<string>
       mutable NSlots : int
-      Locals : Dict<string * int, int>
-      Cells : Dict<string * int, bool> }    // locals boxed in cells
+      Locals : Dict<string * int, int>       // >= 0: V slot; < 0: raw local
+                                             // at RawVars.[-(v)-1]
+      Cells : Dict<string * int, bool>       // locals boxed in cells
+      RawVars : Vec<char * string>           // rawified locals: kind, C name
+      mutable NRaw : int
+      RawDecls : Vec<string> }               // C declarations for raw locals
 
 let private slot (f : CFn) : int =
     let i = f.NSlots
@@ -109,6 +113,209 @@ let private slot (f : CFn) : int =
 
 let private stmt (f : CFn) (s : string) : unit = vecAdd f.Body ("  " + s)
 let private sref (i : int) : string = "F[" + string i + "]"
+
+// ---- raw (unboxed) values -------------------------------------------------
+// Kinds: 'i' int32_t (also uint32/bool/char storage), 'l' int64_t (also
+// uint64), 'f' double, 's' float. 'v' marks the uniform V fallback. Raw
+// locals are plain C locals — never GC refs, so the tracer ignores them.
+
+let private rawTy (k : char) : string =
+    if k = 'l' then "int64_t"
+    elif k = 'v' then "uint64_t"
+    elif k = 'w' then "uint32_t"
+    elif k = 'f' then "double"
+    elif k = 's' then "float"
+    else "int32_t"
+
+let private rawNew (f : CFn) (k : char) : string =
+    let i = f.NRaw
+    f.NRaw <- i + 1
+    let n = "R" + string i
+    vecAdd f.RawDecls (rawTy k + " " + n + " = 0;")
+    n
+
+/// box a raw value into a fresh V slot ('V' atoms are already uniform)
+let private boxRaw (f : CFn) (k : char) (atom : string) : int =
+    let d = slot f
+    if k = 'V' then stmt f (sref d + " = " + atom + ";")
+    elif k = 'l' then stmt f (sref d + " = fpp_box_i64(" + atom + ");")
+    elif k = 'v' then stmt f (sref d + " = fpp_box_i64((int64_t)" + atom + ");")
+    elif k = 'f' then stmt f (sref d + " = fpp_box_f64(" + atom + ");")
+    elif k = 's' then stmt f (sref d + " = fpp_box_f64((double)" + atom + ");")
+    else stmt f (sref d + " = TAGI((intptr_t)" + atom + ");")
+    d
+
+/// a C expression converting a V atom to raw kind k
+let private unboxExpr (k : char) (vatom : string) : string =
+    if k = 'l' then "fpp_unbox_i64(" + vatom + ")"
+    elif k = 'v' then "(uint64_t)fpp_unbox_i64(" + vatom + ")"
+    elif k = 'w' then "(uint32_t)UNTAGI(" + vatom + ")"
+    elif k = 'f' then "fpp_unbox_f64(" + vatom + ")"
+    elif k = 's' then "(float)fpp_unbox_f64(" + vatom + ")"
+    else "(int32_t)UNTAGI(" + vatom + ")"
+
+/// numeric conversion between raw kinds as a C expression
+let private convExpr (kFrom : char) (kTo : char) (atom : string) : string =
+    if kFrom = kTo then atom
+    else "(" + rawTy kTo + ")" + atom
+
+let private opBase (op0 : string) : string * char =
+    // "=i" -> ("=", 'i'); a bare op is int-kinded
+    if strLen op0 >= 2 then
+        let last = charAt op0 (strLen op0 - 1)
+        let head = op0.Substring (0, strLen op0 - 1)
+        let known =
+            head = "+" || head = "-" || head = "*" || head = "/" || head = "%"
+            || head = "=" || head = "<>" || head = "<" || head = ">"
+            || head = "<=" || head = ">=" || head = "&&&" || head = "|||"
+            || head = "^^^" || head = "<<<" || head = ">>>"
+        if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
+                     || last = 'l' || last = 's' || last = 'u' || last = 't'
+                     || last = 'o' || last = 'w' || last = 'v' || last = 'h') then head, last
+        else op0, '?'
+    else op0, '?'
+
+let private mathSet (b : string) : bool =
+    b = "abs" || b = "sqrt" || b = "floor" || b = "ceil"
+    || b = "truncate" || b = "round" || b = "sign" || b = "exp"
+    || b = "log" || b = "log2" || b = "log10" || b = "sin" || b = "cos"
+    || b = "tan" || b = "asin" || b = "acos" || b = "atan"
+    || b = "sinh" || b = "cosh" || b = "tanh"
+
+let private mathBase (op0 : string) : string option =
+    if mathSet op0 then Some op0
+    elif strLen op0 > 1 then
+        let c = charAt op0 (strLen op0 - 1)
+        if c = 'i' || c = 'f' || c = 'l' || c = 's' || c = 'h'
+           || c = 'w' || c = 'v' || c = 'b' || c = 'c' then
+            let b = op0.Substring (0, strLen op0 - 1)
+            if mathSet b then Some b else None
+        else None
+    else None
+
+/// the raw kind a CONCRETE monomorphized type stores at, or None (uniform)
+let private schemeRawKind (sc : Scheme) : char option =
+    match prune sc.Body with
+    | TCon ("int", []) | TCon ("bool", []) | TCon ("char", [])
+    | TCon ("byte", []) | TCon ("sbyte", [])
+    | TCon ("int16", []) | TCon ("uint16", []) -> Some 'i'
+    | TCon ("uint32", []) -> Some 'w'
+    | TCon ("int64", []) -> Some 'l'
+    | TCon ("uint64", []) -> Some 'v'
+    | TCon ("float", []) -> Some 'f'
+    | TCon ("float32", []) -> Some 's'
+    | _ -> None
+
+/// an int literal's (digits, suffix) — the same trimming the V emitter does
+let private intLitParts (s : string) : string * string =
+    let mutable cut = strLen s
+    while cut > 0 && (let c = charAt s (cut - 1) in
+                      c = 'L' || c = 'l' || c = 'u' || c = 'U'
+                      || c = 'y' || c = 's' || c = 'n') && cut > 1
+          && not (cut = strLen s && strLen s >= 2 && charAt s 0 = '0'
+                  && (charAt s 1 = 'x' || charAt s 1 = 'X') && cut <= 2) do
+        cut <- cut - 1
+    s.Substring (0, cut), s.Substring cut
+
+/// the raw kind an expression can be computed at WITHOUT boxing, or None.
+/// PURE — must not emit; emitRaw relies on this to decide before writing.
+let rec private rawKindOf (f : CFn) (e : Expr) : char option =
+    match e with
+    | ELit (LInt s) ->
+        let _, suf = intLitParts s
+        if suf.Contains "L" || suf.Contains "l" then Some 'l' else Some 'i'
+    | ELit (LFloat s) -> Some (if s.EndsWith "f" then 's' else 'f')
+    | ELit (LBool _) -> Some 'i'
+    | ELit (LChar _) -> Some 'i'
+    | EVar (v, _) | EVarI (v, _, _) ->
+        (match dictTryFind f.Locals (v.Path, v.Offset) with
+         | Some i when i < 0 ->
+             let k, _ = vecGet f.RawVars (-i - 1)
+             Some k
+         | _ -> None)
+    | EPrim (op0, [ a; b ]) ->
+        let op, k = opBase op0
+        let numk =
+            if k = 'f' then Some 'f'
+            elif k = 's' || k = 'h' then Some 's'
+            elif k = 'l' then Some 'l'
+            elif k = 'v' then Some 'v'
+            elif k = 'w' then Some 'w'
+            elif k = 'i' || k = 'b' || k = 'c' then Some 'i'
+            else None
+        (match op with
+         | "+" when k = 's' || k = 't' -> None       // string concat
+         | "%" when k = 'f' || k = 's' || k = 'h' -> None
+         | "+" | "-" | "*" | "/" | "%" ->
+             (match numk with
+              | Some x -> Some x
+              | None ->
+                  if k = '?' then
+                      match rawKindOf f a, rawKindOf f b with
+                      | Some 'i', Some 'i' -> Some 'i'
+                      | _ -> None
+                  else None)
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" ->
+             (match numk with
+              | Some _ -> Some 'i'
+              | None ->
+                  if k = '?' then
+                      match rawKindOf f a, rawKindOf f b with
+                      | Some ka, Some kb when ka = kb -> Some 'i'
+                      | _ -> None
+                  else None)
+         | "&&&" | "|||" | "^^^" | "<<<" | ">>>" ->
+             if k = 'l' then Some 'l'
+             elif k = 'v' then Some 'v'
+             elif k = 'w' then Some 'w'
+             elif k = 'i' || k = 'b' then Some 'i'
+             elif k = '?' && not (op = "<<<" || op = ">>>") then
+                 (match rawKindOf f a, rawKindOf f b with
+                  | Some 'i', Some 'i' -> Some 'i'
+                  | _ -> None)
+             else None
+         | "&&" | "||" ->
+             (match rawKindOf f a, rawKindOf f b with
+              | Some 'i', Some 'i' -> Some 'i'
+              | _ -> None)
+         | _ -> None)
+    | EPrim (op0, [ a ]) when op0.StartsWith "u-" && strLen op0 <= 3 ->
+        let k = if strLen op0 > 2 then charAt op0 2 else '?'
+        if k = 'f' then Some 'f'
+        elif k = 's' || k = 'h' then Some 's'
+        elif k = 'l' || k = 'v' then Some 'l'
+        elif k = 'i' || k = 'b' || k = 'c' || k = 'w' then Some 'i'
+        elif k = '?' then
+            (match rawKindOf f a with Some 'i' -> Some 'i' | _ -> None)
+        else None
+    | EPrim (("~-" | "~-i"), [ _ ]) -> Some 'i'
+    | EPrim ("~-f", [ _ ]) -> Some 'f'
+    | EPrim (op0, [ _ ]) when op0.StartsWith "u~~~" ->
+        let k = if strLen op0 > 4 then charAt op0 4 else '?'
+        if k = 'l' then Some 'l'
+        elif k = 'v' then Some 'v'
+        elif k = 'w' then Some 'w'
+        elif k = 'i' || k = 'b' then Some 'i'
+        else None
+    | EPrim (op0, [ _ ]) when (mathBase op0).IsSome ->
+        // only FLOAT math goes raw ("sqrtf" etc); abs/sign stay dynamic
+        let b = (mathBase op0).Value
+        if b <> "abs" && b <> "sign" && strLen op0 = strLen b + 1
+           && charAt op0 (strLen op0 - 1) = 'f' then Some 'f'
+        else None
+    | EIf (_, t, e2) ->
+        (match rawKindOf f t, rawKindOf f e2 with
+         | Some ka, Some kb when ka = kb -> Some ka
+         | _ -> None)
+    | ESeq xs ->
+        (match List.tryLast xs with
+         | Some x -> rawKindOf f x
+         | None -> None)
+    | EApp (EUnknown n, [ _ ]) when n.StartsWith "float32" -> Some 's'
+    | EApp (EUnknown n, [ _ ]) when n.StartsWith "float" -> Some 'f'
+    | EApp (EUnknown n, [ _ ]) when n.StartsWith "int64" || n.StartsWith "uint64" ->
+        Some 'l'
+    | _ -> None
 
 // ---- free variables and captured-mutable discovery ------------------------
 
@@ -236,41 +443,7 @@ let private cellLocals (body : Expr) : Dict<string * int, bool> =
 
 // ---- expression emission --------------------------------------------------
 
-let private mathSet (b : string) : bool =
-    b = "abs" || b = "sqrt" || b = "floor" || b = "ceil"
-    || b = "truncate" || b = "round" || b = "sign" || b = "exp"
-    || b = "log" || b = "log2" || b = "log10" || b = "sin" || b = "cos"
-    || b = "tan" || b = "asin" || b = "acos" || b = "atan"
-    || b = "sinh" || b = "cosh" || b = "tanh"
-
 /// the FULL name wins before suffix stripping: "abs" must not lose its s
-let private mathBase (op0 : string) : string option =
-    if mathSet op0 then Some op0
-    elif strLen op0 > 1 then
-        let c = charAt op0 (strLen op0 - 1)
-        if c = 'i' || c = 'f' || c = 'l' || c = 's' || c = 'h'
-           || c = 'w' || c = 'v' || c = 'b' || c = 'c' then
-            let b = op0.Substring (0, strLen op0 - 1)
-            if mathSet b then Some b else None
-        else None
-    else None
-
-let private opBase (op0 : string) : string * char =
-    // "=i" -> ("=", 'i'); a bare op is int-kinded
-    if strLen op0 >= 2 then
-        let last = charAt op0 (strLen op0 - 1)
-        let head = op0.Substring (0, strLen op0 - 1)
-        let known =
-            head = "+" || head = "-" || head = "*" || head = "/" || head = "%"
-            || head = "=" || head = "<>" || head = "<" || head = ">"
-            || head = "<=" || head = ">=" || head = "&&&" || head = "|||"
-            || head = "^^^" || head = "<<<" || head = ">>>"
-        if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
-                     || last = 'l' || last = 's' || last = 'u' || last = 't'
-                     || last = 'o' || last = 'w' || last = 'v' || last = 'h') then head, last
-        else op0, '?'
-    else op0, '?'
-
 /// record lookups fall back to the BASE name: uniform representation makes
 /// every stamp of a record identical, so "AdaptiveReduction$<#37983...>"
 /// (a name the stamper never grounded) simply IS "AdaptiveReduction"
@@ -339,6 +512,17 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             | [] -> -1
         find 0 order
     match e with
+    // raw-able computation chains: compute UNBOXED, box once at this
+    // uniform boundary (consumers wanting raw call emitRaw and skip it)
+    | EPrim (_, [ _; _ ]) when (rawKindOf f e).IsSome ->
+        let k, a = emitRaw st f e
+        boxRaw f k a
+    | EPrim (_, [ _ ]) when (rawKindOf f e).IsSome ->
+        let k, a = emitRaw st f e
+        boxRaw f k a
+    | EApp (EUnknown _, [ _ ]) when (rawKindOf f e).IsSome ->
+        let k, a = emitRaw st f e
+        boxRaw f k a
     | ELit (LInt s) ->
         // the literal keeps its SOURCE suffix (5L, 3uy, 7us, 0x1F);
         // int64/uint64 box, everything else tags
@@ -384,6 +568,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         d
     | EVar (v, _) | EVarI (v, _, _) ->
         (match dictTryFind f.Locals (v.Path, v.Offset) with
+         | Some i when i < 0 ->
+             // a RAW local read in uniform context: box at the use
+             let k, n = vecGet f.RawVars (-i - 1)
+             boxRaw f k n
          | Some i ->
              if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
                  let d = slot f
@@ -456,8 +644,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         (match inner with
          | EVar (v, _) | EVarI (v, _, _) ->
              (match dictTryFind f.Locals (v.Path, v.Offset) with
-              | Some i -> i
-              | None -> emitE st f inner)
+              | Some i when i >= 0 -> i
+              | _ -> emitE st f inner)
          | _ -> emitE st f inner)
     | EApp (EUnknown "$forcecell", [ r ]) ->
         let x = emitE st f r
@@ -830,31 +1018,48 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              dictSet f.Locals (v.Path, v.Offset) l
              emitE st f body
          | _ ->
-             let x = emitE st f rhs
-             let l = slot f
-             if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
-                 stmt f (sref l + " = fpp_cell_new(" + sref x + ");")
+             let isCell = (dictTryFind f.Cells (v.Path, v.Offset)).IsSome
+             let rk, atom = emitRaw st f rhs
+             if rk <> 'V' && not isCell then
+                 // a local of KNOWN primitive kind lives in a raw C local;
+                 // mutation stays raw, uniform uses box at the use site
+                 let n = rawNew f rk
+                 stmt f (n + " = " + atom + ";")
+                 vecAdd f.RawVars (rk, n)
+                 dictSet f.Locals (v.Path, v.Offset) (-(vecLen f.RawVars))
+                 emitE st f body
              else
-                 stmt f (sref l + " = " + sref x + ";")
-             dictSet f.Locals (v.Path, v.Offset) l
-             emitE st f body)
+                 let x = if rk = 'V' then atom else sref (boxRaw f rk atom)
+                 let l = slot f
+                 if isCell then
+                     stmt f (sref l + " = fpp_cell_new(" + x + ");")
+                 else
+                     stmt f (sref l + " = " + x + ";")
+                 dictSet f.Locals (v.Path, v.Offset) l
+                 emitE st f body)
     | EAssign (v, rhs) ->
-        let x = emitE st f rhs
         (match dictTryFind f.Locals (v.Path, v.Offset) with
+         | Some l when l < 0 ->
+             let k, n = vecGet f.RawVars (-l - 1)
+             let atom = emitRawAs st f k rhs
+             stmt f (n + " = " + atom + ";")
          | Some l ->
+             let x = emitE st f rhs
              if (dictTryFind f.Cells (v.Path, v.Offset)).IsSome then
                  stmt f ("fpp_cell_set(" + sref l + ", " + sref x + ");")
              else
                  stmt f (sref l + " = " + sref x + ";")
          | None ->
+             let x = emitE st f rhs
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g -> stmt f (g + " = " + sref x + ";")
              | None -> stmt f ("fpp_not_emitted(" + cstr ("assign " + v.Name) + ");"))
         unitV ()
     | EIf (c, t, e2) ->
-        let x = emitE st f c
+        let ck, ca = emitRaw st f c
         let d = slot f
-        stmt f ("if (UNTAGI(" + sref x + ")) {")
+        if ck = 'V' then stmt f ("if (UNTAGI(" + ca + ")) {")
+        else stmt f ("if (" + ca + ") {")
         let tv = emitE st f t
         stmt f (sref d + " = " + sref tv + ";")
         stmt f ("} else {")
@@ -864,8 +1069,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         d
     | EWhile (c, b) ->
         stmt f ("for (;;) {")
-        let x = emitE st f c
-        stmt f ("if (!UNTAGI(" + sref x + ")) break;")
+        let ck, ca = emitRaw st f c
+        if ck = 'V' then stmt f ("if (!UNTAGI(" + ca + ")) break;")
+        else stmt f ("if (!(" + ca + ")) break;")
         emitE st f b |> ignore
         stmt f ("}")
         unitV ()
@@ -1392,7 +1598,9 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     let isOutside (k : string * int) = (dictTryFind f.Locals k).IsSome
     let frees = freeVarsOf ps body isOutside
     let lf = { Body = vecNew<string> (); NSlots = 0
-               Locals = dictNew<string * int, int> (); Cells = f.Cells }
+               Locals = dictNew<string * int, int> (); Cells = f.Cells
+               RawVars = vecNew<char * string> (); NRaw = 0
+               RawDecls = vecNew<string> () }
     frees |> List.iteri (fun i k ->
         let l = slot lf
         stmt lf (sref l + " = fpprt_read_ref(self, " + ("FPPOFF(" + string (i + 3) + ")") + ");")
@@ -1407,6 +1615,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     vecAdd all ("static V " + code + "(V self, V *args) {")
     vecAdd all ("  (void)self; (void)args;")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max lf.NSlots 1) + "); V *F = Fr_slots;")
+    for line in vecToList lf.RawDecls do vecAdd all ("  " + line)
     for line in vecToList lf.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
     vecAdd all ("  return " + sref r + ";")
@@ -1419,6 +1628,12 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
             + string (List.length ps) + ", " + string (List.length frees) + ");")
     frees |> List.iteri (fun i k ->
         match dictTryFind f.Locals k with
+        | Some l when l < 0 ->
+            // captured RAW local: box the current value into the env
+            let kk, n = vecGet f.RawVars (-l - 1)
+            let b = boxRaw f kk n
+            stmt f ("fpprt_write_ref(" + sref d + ", " + ("FPPOFF(" + string (i + 3) + ")") + ", "
+                    + sref b + ");")
         | Some l ->
             stmt f ("fpprt_write_ref(" + sref d + ", " + ("FPPOFF(" + string (i + 3) + ")") + ", "
                     + sref l + ");")
@@ -1510,15 +1725,26 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
 /// one function body, wrapped in its shadow frame
 and private emitFn (st : CSt) (name : string) (ps : (VarId * Scheme) list) (body : Expr) : unit =
     let f = { Body = vecNew<string> (); NSlots = 0
-              Locals = dictNew<string * int, int> (); Cells = cellLocals body }
+              Locals = dictNew<string * int, int> (); Cells = cellLocals body
+              RawVars = vecNew<char * string> (); NRaw = 0
+              RawDecls = vecNew<string> () }
     let pnames = ps |> List.mapi (fun i (pv, _) -> "p" + string i, pv)
-    for pn, pv in pnames do
-        let l = slot f
-        if (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome then
-            stmt f (sref l + " = fpp_cell_new(" + pn + ");")
-        else
-            stmt f (sref l + " = " + pn + ";")
-        dictSet f.Locals (pv.Path, pv.Offset) l
+    List.iter2 (fun (pn, pv) ((_ : VarId), sc) ->
+        let isCell = (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome
+        match (if isCell then None else schemeRawKind sc) with
+        | Some k ->
+            // a param of PROVEN primitive type unboxes once at entry
+            let n = rawNew f k
+            stmt f (n + " = " + unboxExpr k pn + ";")
+            vecAdd f.RawVars (k, n)
+            dictSet f.Locals (pv.Path, pv.Offset) (-(vecLen f.RawVars))
+        | None ->
+            let l = slot f
+            if isCell then
+                stmt f (sref l + " = fpp_cell_new(" + pn + ");")
+            else
+                stmt f (sref l + " = " + pn + ";")
+            dictSet f.Locals (pv.Path, pv.Offset) l) pnames ps
     let r = emitE st f body
     vecAdd st.Fwd
         ("static V " + name + "("
@@ -1532,6 +1758,7 @@ and private emitFn (st : CSt) (name : string) (ps : (VarId * Scheme) list) (body
             else String.concat ", " (pnames |> List.map (fun (pn, _) -> "V " + pn)))
          + ") {")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max f.NSlots 1) + "); V *F = Fr_slots;")
+    for line in vecToList f.RawDecls do vecAdd all ("  " + line)
     for line in vecToList f.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
     vecAdd all ("  return " + sref r + ";")
@@ -1574,6 +1801,145 @@ and private emitIntrinFn (st : CSt) (name : string) (nps : int) (tag : string) :
         else
             "  fpp_not_emitted(" + cstr ("intrinsic " + tag) + ");\n  return 0;"
     vecAdd st.Out (decl + " {\n" + body + "\n}")
+
+/// emit e as a RAW value when rawKindOf admits it; ('V', "F[i]") otherwise.
+/// Atoms are pure (locals, literals, casts of those) — all computation goes
+/// through statements, so sequencing matches the V emitter exactly.
+and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
+    match rawKindOf f e with
+    | None -> 'V', sref (emitE st f e)
+    | Some rk ->
+        match e with
+        | ELit (LInt s) ->
+            let num, _ = intLitParts s
+            rk, (if rk = 'l' then num + "LL" else num)
+        | ELit (LFloat s) ->
+            let t0 = if s.EndsWith "f" then s.Substring (0, strLen s - 1) else s
+            let txt = if t0.EndsWith "." then t0 + "0" else t0
+            rk, (if rk = 's' then "(float)" + txt else txt)
+        | ELit (LBool b) -> 'i', (if b then "1" else "0")
+        | ELit (LChar s) -> 'i', string (Fpp.Backend.BinDriver.charCode s)
+        | EVar (v, _) | EVarI (v, _, _) ->
+            let i = (dictTryFind f.Locals (v.Path, v.Offset)).Value
+            let k, n = vecGet f.RawVars (-i - 1)
+            k, n
+        | EPrim (op0, [ a; b ]) ->
+            let op, k0 = opBase op0
+            (match op with
+             | "+" | "-" | "*" | "/" | "%" ->
+                 let aa = emitRawAs st f rk a
+                 let ab = emitRawAs st f rk b
+                 let n = rawNew f rk
+                 if rk = 'i' then
+                     // int32 wraparound, the shape the V emitter uses
+                     stmt f (n + " = (int32_t)(" + aa + " " + op + " " + ab + ");")
+                 else
+                     stmt f (n + " = " + aa + " " + op + " " + ab + ";")
+                 rk, n
+             | "<" | ">" | "<=" | ">=" | "=" | "<>" ->
+                 let cop = if op = "=" then "==" elif op = "<>" then "!=" else op
+                 let okind =
+                     if k0 = 'f' then 'f'
+                     elif k0 = 's' || k0 = 'h' then 's'
+                     elif k0 = 'l' then 'l'
+                     elif k0 = 'v' then 'v'
+                     elif k0 = 'w' then 'w'
+                     elif k0 = 'i' || k0 = 'b' || k0 = 'c' then 'i'
+                     else (match rawKindOf f a with Some x -> x | None -> 'i')
+                 let aa = emitRawAs st f okind a
+                 let ab = emitRawAs st f okind b
+                 let n = rawNew f 'i'
+                 stmt f (n + " = " + aa + " " + cop + " " + ab + ";")
+                 'i', n
+             | "&&&" | "|||" | "^^^" | "<<<" | ">>>" ->
+                 let cop =
+                     if op = "&&&" then "&" elif op = "|||" then "|"
+                     elif op = "^^^" then "^"
+                     elif op = "<<<" then "<<" else ">>"
+                 let shift = op = "<<<" || op = ">>>"
+                 let aa = emitRawAs st f rk a
+                 let ab = emitRawAs st f (if shift then 'i' else rk) b
+                 let n = rawNew f rk
+                 if rk = 'i' && op = ">>>" then
+                     // bare/int32 shift right stays ARITHMETIC in .NET
+                     stmt f (n + " = " + aa + " >> " + ab + ";")
+                 else
+                     stmt f (n + " = " + aa + " " + cop + " " + ab + ";")
+                 rk, n
+             | "&&" | "||" ->
+                 let aa = emitRawAs st f 'i' a
+                 let ab = emitRawAs st f 'i' b
+                 let n = rawNew f 'i'
+                 stmt f (n + " = " + aa + " " + op + " " + ab + ";")
+                 'i', n
+             | _ -> 'V', sref (emitE st f e))
+        | EPrim (op0, [ a ]) when op0.StartsWith "u~~~" ->
+            let aa = emitRawAs st f rk a
+            let n = rawNew f rk
+            stmt f (n + " = ~" + aa + ";")
+            rk, n
+        | EPrim (op0, [ a ]) when op0.StartsWith "u-" || op0.StartsWith "~-" ->
+            let aa = emitRawAs st f rk a
+            let n = rawNew f rk
+            stmt f (n + " = -" + aa + ";")
+            rk, n
+        | EPrim (op0, [ a ]) when (mathBase op0).IsSome ->
+            let b = (mathBase op0).Value
+            let cfn =
+                if b = "truncate" then "__builtin_trunc"
+                elif b = "round" then "fpp_round_even"
+                else "__builtin_" + b
+            let aa = emitRawAs st f 'f' a
+            let n = rawNew f 'f'
+            stmt f (n + " = " + cfn + "(" + aa + ");")
+            'f', n
+        | EIf (c, t, e2) ->
+            let ck, ca = emitRaw st f c
+            let n = rawNew f rk
+            if ck = 'V' then stmt f ("if (UNTAGI(" + ca + ")) {")
+            else stmt f ("if (" + ca + ") {")
+            let ta = emitRawAs st f rk t
+            stmt f (n + " = " + ta + ";")
+            stmt f ("} else {")
+            let ea = emitRawAs st f rk e2
+            stmt f (n + " = " + ea + ";")
+            stmt f ("}")
+            rk, n
+        | ESeq xs ->
+            let rec go (rest : Expr list) : char * string =
+                match rest with
+                | [ last ] -> emitRaw st f last
+                | x :: more ->
+                    emitE st f x |> ignore
+                    go more
+                | [] -> 'V', sref (emitE st f e)
+            go xs
+        | EApp (EUnknown _, [ a ]) ->
+            // a conversion rawKindOf admitted: float / float32 / int64 / uint64
+            let k1, a1 = emitRaw st f a
+            if k1 = 'V' then
+                // dynamic conversion on a uniform value, then unbox
+                let d = slot f
+                if rk = 'f' || rk = 's' then
+                    stmt f (sref d + " = fpp_to_f64(" + a1 + ");")
+                else
+                    stmt f (sref d + " = fpp_to_i64(" + a1 + ");")
+                let n = rawNew f rk
+                stmt f (n + " = " + unboxExpr rk (sref d) + ";")
+                rk, n
+            else
+                rk, convExpr k1 rk a1
+        | _ -> 'V', sref (emitE st f e)
+
+/// emit e as raw kind k, coercing as needed
+and private emitRawAs (st : CSt) (f : CFn) (k : char) (e : Expr) : string =
+    let k1, a1 = emitRaw st f e
+    if k1 = k then a1
+    elif k1 = 'V' then
+        let n = rawNew f k
+        stmt f (n + " = " + unboxExpr k a1 + ";")
+        n
+    else convExpr k1 k a1
 
 // ---- whole program --------------------------------------------------------
 
