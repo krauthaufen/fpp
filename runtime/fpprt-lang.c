@@ -245,6 +245,35 @@ void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn) {
   fpp_vt_[tid * (size_t)fpp_vt_slots_ + slot] = fn;
 }
 
+/* per-tid CompareTo dispatch: a CLASS that defines its own ordering must
+ * order that way everywhere `compare` is asked — pointer order made the
+ * Index machinery spin forever */
+static int *fpp_cmp_slot_ = NULL;
+static size_t fpp_cmp_cap_ = 0;
+void fpp_reg_cmp(uint32_t tid, int slot) {
+  if (tid >= fpp_cmp_cap_) {
+    size_t cap = fpp_cmp_cap_ ? fpp_cmp_cap_ : 64;
+    while (tid >= cap) cap *= 2;
+    int *n = malloc(cap * sizeof(int));
+    if (!n) abort();
+    for (size_t i = 0; i < cap; i++) n[i] = i < fpp_cmp_cap_ ? fpp_cmp_slot_[i] : -1;
+    free(fpp_cmp_slot_);
+    fpp_cmp_slot_ = n;
+    fpp_cmp_cap_ = cap;
+  }
+  fpp_cmp_slot_[tid] = slot;
+}
+static int fpp_cmp_slot_of_(uint32_t tid) {
+  return tid < fpp_cmp_cap_ ? fpp_cmp_slot_[tid] : -1;
+}
+
+int fpp_vt_has(V obj, int slot) {
+  if (!obj || (obj & 1)) return 0;
+  uint32_t tid = fpprt_typeid(obj);
+  return tid < fpp_vt_tids_ && slot < fpp_vt_slots_
+      && fpp_vt_[tid * (size_t)fpp_vt_slots_ + slot] != NULL;
+}
+
 V fpp_vcall(V obj, int slot, V *args, size_t n) {
   (void)n;
   if (!obj || (obj & 1)) fpp_not_emitted("vcall on non-object");
@@ -331,7 +360,44 @@ V fpp_enum_dispose(V self, V *args) {
 
 /* ---- exceptions --------------------------------------------------------- */
 
+uint32_t fpp_failure_tid_ = 0;
+
+V fpp_failure(const char *msg, size_t len) {
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = fpp_str_c(msg, len);
+  V r = f_slots[0];
+  if (fpp_failure_tid_) {
+    r = fpprt_alloc(fpp_failure_tid_);
+    fpprt_write_ref(r, sizeof(V), f_slots[0]);
+  }
+  FPPRT_LEAVE(f);
+  return r;
+}
+
+const char *fpp_hlog_site_[64];
+char fpp_hlog_kind_[64];
+void *fpp_hlog_ptr_[64];
+unsigned fpp_hlog_n_ = 0;
+void fpp_hlog_dump(void) {
+  fflush(stdout);
+  unsigned start = fpp_hlog_n_ > 40 ? fpp_hlog_n_ - 40 : 0;
+  for (unsigned i = start; i < fpp_hlog_n_; i++)
+    fprintf(stderr, "  hlog %c %p %s\n", fpp_hlog_kind_[i & 63],
+            fpp_hlog_ptr_[i & 63], fpp_hlog_site_[i & 63]);
+}
+
 void fpp_raise(V payload) {
+  fpp_hlog_('R', fpp_handler_top_ ? fpp_handler_top_->site : "none",
+            (void *)fpp_handler_top_);
+#ifdef FPP_RAISE_DEBUG
+  {
+    int depth = 0;
+    for (struct fpp_handler *h = fpp_handler_top_; h; h = h->prev) depth++;
+    fprintf(stderr, "[raise depth=%d payload=%s]\n", depth,
+            (payload && !(payload & 1))
+              ? fpprt_type_name(fpprt_typeid(payload)) : "tagged");
+  }
+#endif
   if (!fpp_handler_top_) {
     fflush(stdout);
     fprintf(stderr, "fpp: unhandled exception\n");
@@ -353,7 +419,7 @@ void fpp_raise(V payload) {
 void fpp_reraise(void) { fpp_raise(fpp_exn_); }
 
 void fpp_match_fail(void) {
-  fpp_raise(fpp_str_c("match failure", 13));
+  fpp_raise(fpp_failure("match failure", 13));
 }
 
 /* ---- structural equality / hash / compare ------------------------------ */
@@ -447,7 +513,21 @@ int fpp_cmpv(V a, V b) {
       }
       return 0;
     }
-    return a < b ? -1 : 1;
+    if (tc == FPP_TC_CLASS) {
+      int slot = fpp_cmp_slot_of_(ta);
+      if (slot >= 0) {
+        V arg = b;
+        return (int)UNTAGI(fpp_vcall(a, slot, &arg, 1));
+      }
+    }
+    /* no defined ordering: order by IDENTITY HASH, which is stable for an
+     * object's whole life — raw pointers move with the collector and vary
+     * with ASLR, and a comparison that changes between calls corrupts
+     * every ordered structure built on it */
+    {
+      intptr_t ha = fpprt_idhash(a), hb = fpprt_idhash(b);
+      return ha < hb ? -1 : ha > hb ? 1 : (a < b ? -1 : a > b ? 1 : 0);
+    }
   }
   }
 }
@@ -534,6 +614,22 @@ V fpp_f64_to_string(V x) {
 
 /* ---- generic arithmetic: the oracle's $addv family ---------------------- */
 
+/* representational drift is REAL in the uniform pipeline: a generic zero
+ * seeds as a tagged int and meets int64 boxes — same source-level type,
+ * two runtime spellings. The dispatch coerces numeric mixes. */
+static inline int fpp_numeric_(V v) {
+  return (v & 1) || fpp_is_tid(v, FPP_TID_F64) || fpp_is_tid(v, FPP_TID_I64);
+}
+static inline double fpp_as_f64_(V v) {
+  if (v & 1) return (double)UNTAGI(v);
+  if (fpp_is_tid(v, FPP_TID_F64)) return fpp_unbox_f64(v);
+  return (double)fpp_unbox_i64(v);
+}
+static inline int64_t fpp_as_i64_(V v) {
+  if (v & 1) return (int64_t)UNTAGI(v);
+  return fpp_unbox_i64(v);
+}
+
 #define FPP_ARITH2(name, op, strcase)                                   \
 V name(V a, V b) {                                                      \
   if ((a & 1) && (b & 1))                                               \
@@ -542,6 +638,11 @@ V name(V a, V b) {                                                      \
     return fpp_box_f64(fpp_unbox_f64(a) op fpp_unbox_f64(b));           \
   if (fpp_is_tid(a, FPP_TID_I64) && fpp_is_tid(b, FPP_TID_I64))         \
     return fpp_box_i64(fpp_unbox_i64(a) op fpp_unbox_i64(b));           \
+  if (fpp_numeric_(a) && fpp_numeric_(b)) {                             \
+    if (fpp_is_tid(a, FPP_TID_F64) || fpp_is_tid(b, FPP_TID_F64))       \
+      return fpp_box_f64(fpp_as_f64_(a) op fpp_as_f64_(b));             \
+    return fpp_box_i64(fpp_as_i64_(a) op fpp_as_i64_(b));               \
+  }                                                                     \
   strcase                                                               \
   fprintf(stderr, "fpp: mixed arith a=%s b=%s\n",                       \
           (a & 1) ? "tagged" : a ? fpprt_type_name(fpprt_typeid(a)) : "null", \
@@ -557,7 +658,7 @@ FPP_ARITH2(fpp_mulv, *, )
 
 V fpp_divv(V a, V b) {
   if ((a & 1) && (b & 1)) {
-    if (UNTAGI(b) == 0) fpp_raise(fpp_str_c("division by zero", 16));
+    if (UNTAGI(b) == 0) fpp_raise(fpp_failure("division by zero", 16));
     return TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(a) / (int32_t)UNTAGI(b)));
   }
   if (fpp_is_tid(a, FPP_TID_F64) && fpp_is_tid(b, FPP_TID_F64))
@@ -569,7 +670,7 @@ V fpp_divv(V a, V b) {
 }
 V fpp_modv(V a, V b) {
   if ((a & 1) && (b & 1)) {
-    if (UNTAGI(b) == 0) fpp_raise(fpp_str_c("division by zero", 16));
+    if (UNTAGI(b) == 0) fpp_raise(fpp_failure("division by zero", 16));
     return TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(a) % (int32_t)UNTAGI(b)));
   }
   if (fpp_is_tid(a, FPP_TID_F64) && fpp_is_tid(b, FPP_TID_F64))
@@ -641,8 +742,20 @@ void fpp_print_u32(V x) {
 
 /* ---- init --------------------------------------------------------------- */
 
+V fpp_cmpv_clo_ = 0;
+static V fpp_cmpv_code_(V self, V *args) {
+  (void)self;
+  return TAGI(fpp_cmpv(args[0], args[1]));
+}
+
 void fpp_lang_init(void) {
-  fpprt_init(NULL);
+  /* FPP_HEAP_MB: initial heap for compiled programs. The growable policy
+   * still applies; a bigger floor keeps a copying collector out of
+   * near-boundary thrash on allocation-heavy workloads. */
+  struct fpprt_opts opts = { 0 };
+  const char *mb = getenv("FPP_HEAP_MB");
+  if (mb && mb[0]) opts.heap_bytes = (size_t)strtoull(mb, NULL, 10) << 20;
+  fpprt_init(opts.heap_bytes ? &opts : NULL);
   fpprt_register_type(FPP_TID_STR, (struct fpprt_type){
     2, FPPRT_KIND_SCALAR_ARRAY, 0, NULL, "string" });
   fpprt_register_type(FPP_TID_F64, (struct fpprt_type){
@@ -659,6 +772,9 @@ void fpp_lang_init(void) {
   fpp_reg_struct(FPP_TID_ENUM, 2, FPP_TC_OTHER, "enum");
   fpp_reg_struct(FPP_TID_CELL, 1, FPP_TC_OTHER, "cell");
   fpp_reg_clo(FPP_TID_PAP, 2);
+  fpp_reg_clo(FPP_TID_CMPCLO, 0);
+  fpp_cmpv_clo_ = fpp_clo_new(FPP_TID_CMPCLO, fpp_cmpv_code_, 2, 0);
+  fpprt_add_static_roots(&fpp_cmpv_clo_, 1);
 }
 
 /* ---- string methods: the $str.* family, .NET semantics ------------------ */
@@ -729,7 +845,7 @@ V fpp_str_method(const char *m, V recv, V *args, size_t nargs) {
     size_t start = (size_t)UNTAGI(args[0]);
     size_t len = nargs > 1 ? (size_t)UNTAGI(args[1]) : n - start;
     if (start > n || start + len > n)
-      fpp_raise(fpp_str_c("Substring out of range", 22));
+      fpp_raise(fpp_failure("Substring out of range", 22));
     return fpp_str_sub_(recv, start, len);
   }
   if (!strcmp(m, "Remove")) {

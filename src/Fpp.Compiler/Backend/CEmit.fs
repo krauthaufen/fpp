@@ -35,6 +35,11 @@ type CSt =
       Inits : Vec<string>
       Reg : Vec<string>                      // type/meta registration in main
       Fns : Dict<string * int, int>          // top-level fn -> arity
+      FnName : Dict<string * int, string>    // DECLARED C name: a call site
+                                             // may use another Name for the
+                                             // same (path,offset) — instance
+                                             // members do ("compare" vs
+                                             // "CompareTo")
       GlobalOf : Dict<string * int, string>
       RecTid : Dict<string, int>             // record name -> tid
       RecFields : Dict<string, string list>  // record name -> field order
@@ -44,12 +49,15 @@ type CSt =
       FnClo : Dict<string * int, string>     // fn used as value -> global clo
       CloInits : Vec<string>                 // closure singletons: BEFORE all global inits
       VSlot : Dict<string * string, int>     // (bare iface, member) -> slot
+      IfaceRep : Dict<string, int>           // bare iface -> representative slot
       VWrap : Dict<string * int, string>     // member fn -> uniform wrapper
       ClassBase : Dict<string, string>       // class -> base
       ClassImpls : Dict<string, (string * (string * VarId) list) list>
+      ClassOwn : Dict<string, (string * VarId) list>
       mutable NVSlots : int
       mutable NextTid : int
-      mutable NextLam : int }
+      mutable NextLam : int
+      Checked : bool }
 
 let private isIdentChar (c : char) = isLetterOrDigit c || c = '_'
 let private sane (n : string) = n |> String.map (fun c -> if isIdentChar c then c else '_')
@@ -260,6 +268,50 @@ let private opBase (op0 : string) : string * char =
         else op0, '?'
     else op0, '?'
 
+/// record lookups fall back to the BASE name: uniform representation makes
+/// every stamp of a record identical, so "AdaptiveReduction$<#37983...>"
+/// (a name the stamper never grounded) simply IS "AdaptiveReduction"
+let private recBase (name : string) : string =
+    match name.IndexOf "$" with
+    | i when i > 0 -> name.Substring (0, i)
+    | _ -> name
+
+/// "StructTuple7" -> 7; the synthetic struct-tuple types are declared
+/// nowhere — they register on first sight, fields Item1..ItemN
+let private structTupleArity (name : string) : int option =
+    let b = recBase name
+    if b.StartsWith "StructTuple" && strLen b > 11 then
+        let digits = b.Substring 11
+        let mutable ok = strLen digits > 0
+        for ch in digits do
+            if not (isDigit ch) then ok <- false
+        if ok then Some (int digits) else None
+    else None
+
+let private ensureStructTuple (st : CSt) (name : string) : unit =
+    if not (dictTryFind st.RecTid name).IsSome then
+        match structTupleArity name with
+        | Some n ->
+            let tid = freshTid st
+            dictSet st.RecTid name tid
+            dictSet st.RecFields name (List.init n (fun i -> "Item" + string (i + 1)))
+            vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", " + string n
+                           + ", 1, " + cstr name + ");")
+        | None -> ()
+
+let private recTidOf (st : CSt) (name : string) : int option =
+    match dictTryFind st.RecTid name with
+    | Some t -> Some t
+    | None -> dictTryFind st.RecTid (recBase name)
+
+let private recFieldsOf (st : CSt) (name : string) : string list option =
+    match dictTryFind st.RecFields name with
+    | Some fs when not (List.isEmpty fs) -> Some fs
+    | _ ->
+        match dictTryFind st.RecFields (recBase name) with
+        | Some fs when not (List.isEmpty fs) -> Some fs
+        | other -> other
+
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     let trap (what : string) : int =
         let d = slot f
@@ -431,7 +483,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EApp (EUnknown "ignore", [ a ]) ->
         emitE st f a |> ignore
         unitV ()
-    | EApp (EUnknown ("failwith" | "raise"), [ a ]) ->
+    | EApp (EUnknown "failwith", [ a ]) ->
+        // the payload is Failure(msg), exactly as the oracle wraps it — so
+        // `with Failure msg -> ...` matches
+        let x = emitE st f a
+        (match dictTryFind st.CaseTid "Failure" with
+         | Some tid ->
+             let w = slot f
+             stmt f (sref w + " = fpprt_alloc(" + string tid + ");")
+             stmt f ("fpprt_write_ref(" + sref w + ", 8, " + sref x + ");")
+             stmt f ("fpp_raise(" + sref w + ");")
+         | None ->
+             stmt f ("fpp_raise(" + sref x + ");"))
+        unitV ()
+    | EApp (EUnknown "raise", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_raise(" + sref x + ");")
         unitV ()
@@ -482,6 +547,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f (sref d + " = fpp_str_method(" + cstr m + ", " + sref r
                 + ", &F[" + string first + "], " + string (List.length xs) + ");")
         d
+    | EApp (EUnknown "$hasflag", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        stmt f (sref d + " = TAGI((UNTAGI(" + sref x + ") & UNTAGI(" + sref y
+                + ")) == UNTAGI(" + sref y + "));")
+        d
     | EApp (EUnknown "isNull", [ a ]) ->
         let x = emitE st f a
         let d = slot f
@@ -491,9 +563,17 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
           (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
         let xs = args |> List.map (emitE st f)
         let d = slot f
-        stmt f (sref d + " = " + cname v + "("
+        stmt f (sref d + " = " + (dictTryFind st.FnName (v.Path, v.Offset)).Value + "("
                 + String.concat ", " (xs |> List.map sref) + ");")
         d
+    | EApp (ECtor (cn, cs, []), args) when
+          (dictTryFind st.CaseArity cn) = Some (List.length args)
+          && not (List.isEmpty args) ->
+        // a curried constructor applied: build the case directly
+        emitE st f (ECtor (cn, cs, args))
+    | EApp (h, []) ->
+        // an empty application is its head — `Ctor (null)` lowers this way
+        emitE st f h
     | EApp (h, args) ->
         // the closure protocol: args in CONSECUTIVE slots, rooted during apply
         let c = emitE st f h
@@ -507,6 +587,26 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                 + string (List.length xs) + ");")
         d
     | ELam (ps, body) -> emitLam st f ps body
+    | EPrim (("&&" | "&&b" | "&&i"), [ a; b ]) ->
+        // SHORT-CIRCUIT: the right side must not evaluate when the left
+        // decides — `isNull x || x.f ...` depends on it
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = " + sref x + ";")
+        stmt f ("if (UNTAGI(" + sref d + ")) {")
+        let y = emitE st f b
+        stmt f (sref d + " = " + sref y + ";")
+        stmt f ("}")
+        d
+    | EPrim (("||" | "||b" | "||i"), [ a; b ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = " + sref x + ";")
+        stmt f ("if (!UNTAGI(" + sref d + ")) {")
+        let y = emitE st f b
+        stmt f (sref d + " = " + sref y + ";")
+        stmt f ("}")
+        d
     | EPrim ("::", [ h; t ]) ->
         let x = emitE st f h
         let y = emitE st f t
@@ -648,6 +748,16 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  | _ -> "__builtin_" + m
              stmt f (sref d + " = fpp_box_f64(" + cfn + "(fpp_unbox_f64(" + sref x + ")));"))
         d
+    | EPrim (op0, [ a ]) when op0.StartsWith "u~~~" ->
+        let x = emitE st f a
+        let d = slot f
+        let k = if strLen op0 > 4 then charAt op0 4 else '?'
+        (match k with
+         | 'l' -> stmt f (sref d + " = fpp_box_i64(~fpp_unbox_i64(" + sref x + "));")
+         | 'v' -> stmt f (sref d + " = fpp_box_i64((int64_t)~(uint64_t)fpp_unbox_i64(" + sref x + "));")
+         | 'w' -> stmt f (sref d + " = TAGI((intptr_t)(uint32_t)~(uint32_t)UNTAGI(" + sref x + "));")
+         | _ -> stmt f (sref d + " = TAGI((intptr_t)(int32_t)~(int32_t)UNTAGI(" + sref x + "));"))
+        d
     | EPrim (op0, [ a ]) when op0.StartsWith "u-" ->
         let x = emitE st f a
         let d = slot f
@@ -683,6 +793,16 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              dictSet f.Locals (v.Path, v.Offset) l
              let x = emitE st f rhs
              stmt f ("fpp_cell_set(" + sref l + ", " + sref x + ");")
+             emitE st f body
+         | EApp (EUnknown "$forcecell", [ inner ]) ->
+             // a class-level `let mutable`: the binding IS a cell, and
+             // every read must deref — the oracle's cellScan marks exactly
+             // this shape
+             let x = emitE st f inner
+             let l = slot f
+             stmt f (sref l + " = fpp_cell_new(" + sref x + ");")
+             dictSet f.Cells (v.Path, v.Offset) true
+             dictSet f.Locals (v.Path, v.Offset) l
              emitE st f body
          | _ ->
              let x = emitE st f rhs
@@ -751,26 +871,36 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref d + ");")
         d
     | ERecord (name, fs) ->
-        (match dictTryFind st.RecTid name with
+        ensureStructTuple st name
+        (match recTidOf st name with
          | Some tid ->
-             let order = (dictTryFind st.RecFields name).Value
+             let order = (recFieldsOf st name).Value
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
              for fn2, v in fs do
-                 let x = emitE st f v
-                 let idx = fieldIdx order fn2
-                 if idx < 0 then
-                     stmt f ("fpp_not_emitted(" + cstr ("field " + name + "." + fn2) + ");")
+                 if fn2 = "base" then
+                     // the base constructor built a BASE instance; its
+                     // fields are this layout's shared prefix — copy them
+                     let b = emitE st f v
+                     stmt f ("{ uint32_t NB = fpp_tfields_[fpprt_typeid(" + sref b + ")];")
+                     stmt f ("for (uint32_t I = 0; I < NB; I++)")
+                     stmt f ("  fpprt_write_ref(" + sref d + ", (I + 1) * 8, fpprt_read_ref("
+                             + sref b + ", (I + 1) * 8)); }")
                  else
-                     stmt f ("fpprt_write_ref(" + sref d + ", "
-                             + string ((idx + 1) * 8) + ", " + sref x + ");")
+                     let x = emitE st f v
+                     let idx = fieldIdx order fn2
+                     if idx < 0 then
+                         stmt f ("fpp_not_emitted(" + cstr ("field " + name + "." + fn2) + ");")
+                     else
+                         stmt f ("fpprt_write_ref(" + sref d + ", "
+                                 + string ((idx + 1) * 8) + ", " + sref x + ");")
              d
          | None -> trap ("record " + name))
     | ERecordExt (name, b, fs) ->
-        (match dictTryFind st.RecTid name with
+        (match recTidOf st name with
          | Some tid ->
              let src = emitE st f b
-             let order = (dictTryFind st.RecFields name).Value
+             let order = (recFieldsOf st name).Value
              let n = List.length order
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
@@ -786,29 +916,44 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              d
          | None -> trap ("record " + name))
     | EField (r, fname, owner) ->
-        (match dictTryFind st.RecFields owner with
+        ensureStructTuple st owner
+        (match recFieldsOf st owner with
          | Some order ->
              let x = emitE st f r
              let idx = fieldIdx order fname
              if idx < 0 then trap ("field " + owner + "." + fname)
              else
                  let d = slot f
+                 if st.Checked then
+                     stmt f ("fpp_chk(" + sref x + ", " + string idx + ", "
+                             + cstr (owner + "." + fname) + ");")
                  stmt f (sref d + " = fpprt_read_ref(" + sref x + ", "
                          + string ((idx + 1) * 8) + ");")
                  d
          | None -> trap ("field of " + owner + "." + fname))
     | EFieldSet (r, fname, owner, v) ->
-        (match dictTryFind st.RecFields owner with
+        ensureStructTuple st owner
+        (match recFieldsOf st owner with
          | Some order ->
              let x = emitE st f r
              let y = emitE st f v
              let idx = fieldIdx order fname
              if idx < 0 then trap ("fieldset " + owner + "." + fname)
              else
+                 if st.Checked then
+                     stmt f ("fpp_chk(" + sref x + ", " + string idx + ", "
+                             + cstr (owner + "." + fname) + ");")
                  stmt f ("fpprt_write_ref(" + sref x + ", "
                          + string ((idx + 1) * 8) + ", " + sref y + ");")
                  unitV ()
          | None -> trap ("fieldset of " + owner))
+    | ECtor (cn, _, []) when
+          (match dictTryFind st.CaseArity cn with Some a -> a > 0 | None -> false) ->
+        // a payload-carrying constructor as a VALUE: its singleton closure
+        let g = ctorCloGlobal st cn
+        let d = slot f
+        stmt f (sref d + " = " + g + ";")
+        d
     | ECtor (cn, _, args) ->
         (match dictTryFind st.CaseTid cn with
          | Some tid ->
@@ -855,11 +1000,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         let ex = slot f
         stmt f ("{ struct fpp_handler H;")
-        stmt f ("if (!fpp_try(&H)) {")
+        stmt f ("fpp_handler_push_(&H, __func__);")
+        stmt f ("if (!setjmp(H.jb)) {")
         let bv = emitE st f body
         stmt f (sref d + " = " + sref bv + ";")
-        stmt f ("fpp_try_pop();")
+        stmt f ("fpp_try_pop2(&H);")
         stmt f ("} else {")
+        stmt f ("fpp_hlog_('H', __func__, (void *)&H);")
         stmt f (sref ex + " = fpp_exn_value();")
         let matched = slot f
         stmt f (sref matched + " = TAGI(0);")
@@ -967,23 +1114,95 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         emitE st f x
     | ETypeTest (tn, x) ->
         let xv = emitE st f x
-        (match dictTryFind st.RecTid tn with
-         | Some tid ->
+        let bareI =
+            match tn.IndexOf "`" with
+            | i when i > 0 -> tn.Substring (0, i)
+            | _ -> tn
+        (match dictTryFind st.IfaceRep bareI with
+         | Some rep ->
              let d = slot f
-             stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
-                     + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
+             stmt f (sref d + " = TAGI(fpp_vt_has(" + sref xv + ", " + string rep + "));")
              d
          | None ->
-             match dictTryFind st.CaseTid tn with
+             match dictTryFind st.RecTid tn with
              | Some tid ->
                  let d = slot f
                  stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
                          + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
                  d
-             | None -> trap ("typetest " + tn))
+             | None ->
+                 match dictTryFind st.CaseTid tn with
+                 | Some tid ->
+                     let d = slot f
+                     stmt f (sref d + " = TAGI(" + sref xv + " != 0 && !(" + sref xv
+                             + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
+                     d
+                 | None -> trap ("typetest " + tn))
+    | EUnknown n when n.StartsWith "$class:Ordered:compare:" ->
+        // a still-symbolic Ordered dictionary member: uniform values answer
+        // it STRUCTURALLY, which is what the wasm backend's $cmpv does
+        let d = slot f
+        stmt f (sref d + " = fpp_cmpv_clo_;")
+        d
+    | EUnknown n when n.StartsWith "$zero:" ->
+        // defaultof at the named type; a still-symbolic one gets the
+        // reference zero, which is what canonical code means by it
+        let tn = n.Substring 6
+        let d = slot f
+        (match tn with
+         | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
+         | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
+         | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
+         | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
+         | _ -> stmt f (sref d + " = 0;"))
+        d
+    | EUnknown n when n.StartsWith "$sizeof:" ->
+        // primitives at their widths, anything else at pointer width — the
+        // oracle's own table and fallback
+        let tn = n.Substring 8
+        let size =
+            match tn with
+            | "byte" | "sbyte" | "bool" -> 1
+            | "char" | "int16" | "uint16" | "float16" -> 2
+            | "int" | "uint32" | "float32" -> 4
+            | _ -> 8
+        let d = slot f
+        stmt f (sref d + " = TAGI(" + string size + ");")
+        d
     | EUnknown "$zero" ->
         let d = slot f
         stmt f (sref d + " = 0;")
+        d
+    | EUnknown n when n.StartsWith "$class:Ordered:compare:" ->
+        // a still-symbolic Ordered dictionary member: uniform values answer
+        // it STRUCTURALLY, which is what the wasm backend's $cmpv does
+        let d = slot f
+        stmt f (sref d + " = fpp_cmpv_clo_;")
+        d
+    | EUnknown n when n.StartsWith "$zero:" ->
+        // defaultof at the named type; a still-symbolic one gets the
+        // reference zero, which is what canonical code means by it
+        let tn = n.Substring 6
+        let d = slot f
+        (match tn with
+         | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
+         | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
+         | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
+         | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
+         | _ -> stmt f (sref d + " = 0;"))
+        d
+    | EUnknown n when n.StartsWith "$sizeof:" ->
+        // primitives at their widths, anything else at pointer width — the
+        // oracle's own table and fallback
+        let tn = n.Substring 8
+        let size =
+            match tn with
+            | "byte" | "sbyte" | "bool" -> 1
+            | "char" | "int16" | "uint16" | "float16" -> 2
+            | "int" | "uint32" | "float32" -> 4
+            | _ -> 8
+        let d = slot f
+        stmt f (sref d + " = TAGI(" + string size + ");")
         d
     | EUnknown n -> trap ("builtin " + n)
     | other ->
@@ -1086,17 +1305,26 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
              | None ->
                  stmt f (sref ok + " = fpp_not_emitted(" + cstr ("pat ctor " + cn) + ");"))
     | PTypeTest tn ->
-        (match dictTryFind st.RecTid tn with
-         | Some tid ->
-             stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+        let bare =
+            match tn.IndexOf "`" with
+            | i when i > 0 -> tn.Substring (0, i)
+            | _ -> tn
+        (match dictTryFind st.IfaceRep bare with
+         | Some rep ->
+             stmt f ("if (!fpp_vt_has(" + sref sv + ", " + string rep + ")) "
                      + sref ok + " = TAGI(0);")
          | None ->
-             match dictTryFind st.CaseTid tn with
+             match dictTryFind st.RecTid tn with
              | Some tid ->
                  stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
                          + sref ok + " = TAGI(0);")
              | None ->
-                 stmt f (sref ok + " = fpp_not_emitted(" + cstr ("pat typetest " + tn) + ");"))
+                 match dictTryFind st.CaseTid tn with
+                 | Some tid ->
+                     stmt f ("if (!fpp_is_tid(" + sref sv + ", " + string tid + ")) "
+                             + sref ok + " = TAGI(0);")
+                 | None ->
+                     stmt f (sref ok + " = fpp_not_emitted(" + cstr ("pat typetest " + tn) + ");"))
     | POr ps ->
         let any = slot f
         stmt f (sref any + " = TAGI(0);")
@@ -1157,7 +1385,10 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
     match dictTryFind st.VWrap (mv.Path, mv.Offset) with
     | Some w -> w
     | None ->
-        let fn = cname mv
+        let fn =
+            match dictTryFind st.FnName (mv.Path, mv.Offset) with
+            | Some x -> x
+            | None -> cname mv
         let w = "vt_" + fn
         dictSet st.VWrap (mv.Path, mv.Offset) w
         let arity =
@@ -1173,12 +1404,44 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
              + fn + "(" + String.concat ", " ("self" :: extra) + ");\n}")
         w
 
+/// the singleton closure for a payload-carrying constructor as a value
+and private ctorCloGlobal (st : CSt) (cn : string) : string =
+    let key = ("$ctor", strHash cn)
+    match dictTryFind st.FnClo key with
+    | Some g -> g
+    | None ->
+        let tid = (dictTryFind st.CaseTid cn).Value
+        let arity = (dictTryFind st.CaseArity cn).Value
+        let g = "clo_ctor_" + sane cn + "_" + string tid
+        let code = "code_ctor_" + sane cn + "_" + string tid
+        dictSet st.FnClo key g
+        vecAdd st.Globals ("static V " + g + ";")
+        vecAdd st.Fwd ("static V " + code + "(V self, V *args);")
+        let body = vecNew<string> ()
+        vecAdd body ("static V " + code + "(V self, V *args) {")
+        vecAdd body "  (void)self;"
+        vecAdd body ("  V r = fpprt_alloc(" + string tid + ");")
+        for i in 0 .. arity - 1 do
+            vecAdd body ("  fpprt_write_ref(r, " + string ((i + 1) * 8)
+                         + ", args[" + string i + "]);")
+        vecAdd body "  return r;"
+        vecAdd body "}"
+        vecAdd st.Out (String.concat "\n" (vecToList body))
+        let ctid = freshTid st
+        vecAdd st.Reg ("  fpp_reg_clo(" + string ctid + ", 0);")
+        vecAdd st.CloInits ("  " + g + " = fpp_clo_new(" + string ctid
+                            + ", (fpp_code_t)" + code + ", " + string arity + ", 0);")
+        g
+
 /// the singleton closure for a top-level function used as a value
 and private fnCloGlobal (st : CSt) (v : VarId) : string =
     match dictTryFind st.FnClo (v.Path, v.Offset) with
     | Some g -> g
     | None ->
-        let fn = cname v
+        let fn =
+            match dictTryFind st.FnName (v.Path, v.Offset) with
+            | Some x -> x
+            | None -> cname v
         let arity = (dictTryFind st.Fns (v.Path, v.Offset)).Value
         let g = "clo_" + fn
         let code = "code_" + fn
@@ -1238,6 +1501,7 @@ let emitC (decls : Decl list) : string * string list =
           Globals = vecNew<string> (); Inits = vecNew<string> ()
           Reg = vecNew<string> ()
           Fns = dictNew<string * int, int> ()
+          FnName = dictNew<string * int, string> ()
           GlobalOf = dictNew<string * int, string> ()
           RecTid = dictNew<string, int> ()
           RecFields = dictNew<string, string list> ()
@@ -1247,17 +1511,23 @@ let emitC (decls : Decl list) : string * string list =
           FnClo = dictNew<string * int, string> ()
           CloInits = vecNew<string> ()
           VSlot = dictNew<string * string, int> ()
+          IfaceRep = dictNew<string, int> ()
           VWrap = dictNew<string * int, string> ()
           ClassBase = dictNew<string, string> ()
           ClassImpls = dictNew<string, (string * (string * VarId) list) list> ()
+          ClassOwn = dictNew<string, (string * VarId) list> ()
           NVSlots = 0
           NextTid = 32                          // FPP_TID_USER in fpprt-lang.h
-          NextLam = 0 }
+          NextLam = 0
+          // FPP_CBACK_CHECK=1: every field access validates its receiver
+          // and index against the runtime type table before touching memory
+          Checked = System.Environment.GetEnvironmentVariable "FPP_CBACK_CHECK" = "1" }
     // pass 1: names, record layouts, union cases, enums
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) ->
             dictSet st.Fns (v.Path, v.Offset) (List.length ps)
+            dictSet st.FnName (v.Path, v.Offset) (cname v)
         | DLet (_, v, _, _) ->
             dictSet st.GlobalOf (v.Path, v.Offset) (gname v)
         | DRecord (n, _, fields, _) ->
@@ -1265,8 +1535,6 @@ let emitC (decls : Decl list) : string * string list =
                 let tid = freshTid st
                 dictSet st.RecTid n tid
                 dictSet st.RecFields n (fields |> List.map fst)
-                vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
-                               + string (List.length fields) + ", 1, " + cstr n + ");")
         | DUnion (_, _, cases) ->
             for cn, arity in cases do
                 if not (dictTryFind st.CaseTid cn).IsSome then
@@ -1277,9 +1545,10 @@ let emitC (decls : Decl list) : string * string list =
                                    + string arity + ", 2, " + cstr cn + ");")
         | DEnum (_, cases) ->
             for cn, v in cases do dictSet st.EnumVal cn v
-        | DClass (n, b, _, impls) ->
+        | DClass (n, b, own, impls) ->
             (match b with Some x -> dictSet st.ClassBase n x | None -> ())
             dictSet st.ClassImpls n impls
+            dictSet st.ClassOwn n own
             for iface, ms in impls do
                 let bare =
                     match iface.IndexOf "`" with
@@ -1289,6 +1558,14 @@ let emitC (decls : Decl list) : string * string list =
                     if not (dictTryFind st.VSlot (bare, mn)).IsSome then
                         dictSet st.VSlot (bare, mn) st.NVSlots
                         st.NVSlots <- st.NVSlots + 1
+        | DMembers (n, ms) ->
+            // abstract/overridable members dispatched through the class:
+            // the slot keys by the DECLARING class's bare name
+            let bare = recBase n
+            for mn, _ in ms do
+                if not (dictTryFind st.VSlot (bare, mn)).IsSome then
+                    dictSet st.VSlot (bare, mn) st.NVSlots
+                    st.NVSlots <- st.NVSlots + 1
         | DInterface (n, ms) ->
             let bare =
                 match n.IndexOf "`" with
@@ -1298,36 +1575,150 @@ let emitC (decls : Decl list) : string * string list =
                 if not (dictTryFind st.VSlot (bare, mn)).IsSome then
                     dictSet st.VSlot (bare, mn) st.NVSlots
                     st.NVSlots <- st.NVSlots + 1
+                if not (dictTryFind st.IfaceRep bare).IsSome then
+                    dictSet st.IfaceRep bare (dictTryFind st.VSlot (bare, mn)).Value
+        | DMembers (n, ms) ->
+            // abstract/overridable members dispatched through the CLASS:
+            // slots key by the declaring class's bare name
+            let bare = recBase n
+            for mn, _ in ms do
+                if not (dictTryFind st.VSlot (bare, mn)).IsSome then
+                    dictSet st.VSlot (bare, mn) st.NVSlots
+                    st.NVSlots <- st.NVSlots + 1
         | _ -> ()
-    // stamped record clones ("ResizeArray$int") arrive with EMPTY field
-    // lists — the layout is the base's, uniform representation makes every
-    // stamp identical, so they simply inherit the base record's fields.
-    // Registration must agree (dictPairs snapshots, so mutation is safe).
-    for n, flds in dictPairs st.RecFields do
-        if List.isEmpty flds && n.Contains "$" then
-            let baseName = n.Substring (0, n.IndexOf "$")
-            match dictTryFind st.RecFields baseName with
-            | Some bf when not (List.isEmpty bf) ->
-                dictSet st.RecFields n bf
-                match dictTryFind st.RecTid n with
-                | Some tid ->
-                    vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
-                                   + string (List.length bf) + ", 1, " + cstr n + ");")
-                | None -> ()
-            | _ -> ()
+    // FINAL LAYOUTS. Three rules, applied in order:
+    //   1. a stamped clone with an empty field list inherits its base
+    //      name's OWN fields (uniform repr: every stamp is identical);
+    //   2. a CLASS lays out as its chain root-first — base fields form a
+    //      shared prefix, so a field index computed against any ancestor
+    //      is valid on every descendant instance;
+    //   3. registration carries the final count.
+    let ownFieldsOf (n : string) : string list =
+        match dictTryFind st.RecFields n with
+        | Some fs when not (List.isEmpty fs) -> fs
+        | _ ->
+            match dictTryFind st.RecFields (recBase n) with
+            | Some fs -> fs
+            | None -> []
+    let chainRootFirst (n0 : string) : string list =
+        let out = vecNew<string> ()
+        let seen = dictNew<string, bool> ()
+        let mutable cur = n0
+        let mutable go = true
+        let mutable steps = 0
+        while go && steps < 64 do
+            if (dictTryFind seen cur).IsSome then go <- false
+            else
+                dictSet seen cur true
+                vecAdd out cur
+                steps <- steps + 1
+                match dictTryFind st.ClassBase cur with
+                | Some b -> cur <- b
+                | None ->
+                    let bb = recBase cur
+                    if bb <> cur && ((dictTryFind st.ClassBase bb).IsSome
+                                     || (dictTryFind st.ClassOwn bb).IsSome) then cur <- bb
+                    else go <- false
+        List.rev (vecToList out)
+    let full = dictNew<string, string list> ()
+    for n, _ in dictPairs st.RecTid do
+        let isClass =
+            (dictTryFind st.ClassOwn n).IsSome || (dictTryFind st.ClassBase n).IsSome
+            || (dictTryFind st.ClassOwn (recBase n)).IsSome
+            || (dictTryFind st.ClassBase (recBase n)).IsSome
+        let layout =
+            if isClass then
+                chainRootFirst n |> List.collect ownFieldsOf
+            else ownFieldsOf n
+        dictSet full n layout
+    for n, layout in dictPairs full do
+        dictSet st.RecFields n layout
+        let isClass =
+            (dictTryFind st.ClassOwn n).IsSome || (dictTryFind st.ClassBase n).IsSome
+            || (dictTryFind st.ClassOwn (recBase n)).IsSome
+            || (dictTryFind st.ClassBase (recBase n)).IsSome
+        // records compare STRUCTURALLY, classes by IDENTITY — a cyclic
+        // object graph (the adaptive one) must never be walked by eqv
+        let tclass = if isClass then 4 else 1
+        match dictTryFind st.RecTid n with
+        | Some tid ->
+            vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
+                           + string (List.length layout) + ", " + string tclass
+                           + ", " + cstr n + ");")
+        | None -> ()
     // pass 1.5: vtables — every class registers its impl chain's members
     // (nearest declaration wins, walking the base chain)
     let vtReg = vecNew<string> ()
+    // the full ancestor chain of a class name: bases, and each stamped
+    // name's canonical base (a stamped decl lists only what stamping saw)
+    let chainOf (n0 : string) : string list =
+        let out = vecNew<string> ()
+        let seen = dictNew<string, bool> ()
+        let mutable cur = n0
+        let mutable steps = 0
+        let mutable go = true
+        while go && steps < 64 do
+            if (dictTryFind seen cur).IsSome then go <- false
+            else
+                dictSet seen cur true
+                vecAdd out cur
+                steps <- steps + 1
+                match dictTryFind st.ClassBase cur with
+                | Some b -> cur <- b
+                | None ->
+                    let bb = recBase cur
+                    if bb <> cur then cur <- bb else go <- false
+        vecToList out
     for d in decls do
         match d with
         | DClass (n, _, _, _) ->
             (match dictTryFind st.RecTid n with
              | Some tid ->
                  let filled = dictNew<int, bool> ()
-                 let mutable cur = n
-                 let mutable steps = 0
-                 let mutable go = true
-                 while go && steps < 32 do
+                 let chain = chainOf n
+                 let bareChain = chain |> List.map recBase |> List.distinct
+                 // the NEAREST override of a member name anywhere in the
+                 // chain: an interface slot recorded against a BASE class's
+                 // implementation still dispatches to the subclass override
+                 let nearestOwn = dictNew<string, VarId> ()
+                 for cur in chain do
+                     match dictTryFind st.ClassOwn cur with
+                     | Some own ->
+                         for mn, mv in own do
+                             if not (dictTryFind nearestOwn mn).IsSome
+                                && (dictTryFind st.Fns (mv.Path, mv.Offset)).IsSome then
+                                 dictSet nearestOwn mn mv
+                     | None -> ()
+                 // a class defining CompareTo gets a dispatch slot even when
+                 // no interface asked: `compare` on the class must use ITS
+                 // ordering, never identity order
+                 (match dictTryFind nearestOwn "CompareTo" with
+                  | Some mv when (dictTryFind st.Fns (mv.Path, mv.Offset)) = Some 2 ->
+                      let key = (recBase n, "CompareTo")
+                      let sl =
+                          match dictTryFind st.VSlot key with
+                          | Some x -> x
+                          | None ->
+                              let x = st.NVSlots
+                              st.NVSlots <- x + 1
+                              dictSet st.VSlot key x
+                              x
+                      let w = vtWrapper st mv
+                      vecAdd vtReg ("  fpp_vt_set(" + string tid + ", " + string sl
+                                    + ", " + w + ");")
+                      vecAdd vtReg ("  fpp_reg_cmp(" + string tid + ", " + string sl + ");")
+                  | _ -> ())
+                 let fill (sl : int) (mv : VarId) =
+                     if not (dictTryFind filled sl).IsSome
+                        // a DCE'd member body has no function to point at;
+                        // its slot stays empty and traps only if reached
+                        && (dictTryFind st.Fns (mv.Path, mv.Offset)).IsSome then
+                         dictSet filled sl true
+                         let w = vtWrapper st mv
+                         vecAdd vtReg ("  fpp_vt_set(" + string tid + ", "
+                                       + string sl + ", " + w + ");")
+                 for cur in chain do
+                     // interface implementations: keyed by the iface
                      (match dictTryFind st.ClassImpls cur with
                       | Some impls ->
                           for iface, ms in impls do
@@ -1336,24 +1727,24 @@ let emitC (decls : Decl list) : string * string list =
                                   | i when i > 0 -> iface.Substring (0, i)
                                   | _ -> iface
                               for mn, mv in ms do
+                                  let target =
+                                      match dictTryFind nearestOwn mn with
+                                      | Some ov -> ov
+                                      | None -> mv
                                   match dictTryFind st.VSlot (bare, mn) with
-                                  | Some sl when not (dictTryFind filled sl).IsSome
-                                                 // a DCE'd member body has no
-                                                 // function to point at; its
-                                                 // slot stays empty and traps
-                                                 // only if dispatch reaches it
-                                                 && (dictTryFind st.Fns (mv.Path, mv.Offset)).IsSome ->
-                                      dictSet filled sl true
-                                      let w = vtWrapper st mv
-                                      vecAdd vtReg ("  fpp_vt_set(" + string tid + ", "
-                                                    + string sl + ", " + w + ");")
-                                  | _ -> ()
+                                  | Some sl -> fill sl target
+                                  | None -> ()
                       | None -> ())
-                     (match dictTryFind st.ClassBase cur with
-                      | Some b ->
-                          cur <- b
-                          steps <- steps + 1
-                      | None -> go <- false)
+                     // OWN members answer abstract dispatch keyed by ANY
+                     // ancestor class that declares the member's slot
+                     (match dictTryFind st.ClassOwn cur with
+                      | Some own ->
+                          for mn, mv in own do
+                              for a in bareChain do
+                                  match dictTryFind st.VSlot (a, mn) with
+                                  | Some sl -> fill sl mv
+                                  | None -> ()
+                      | None -> ())
              | None -> ())
         | _ -> ()
     // builtin seq protocol: arrays, lists, strings and tuples answer
@@ -1428,9 +1819,16 @@ let emitC (decls : Decl list) : string * string list =
         vecAdd out ""
     vecAdd out "int main(void) {"
     vecAdd out "  fpp_lang_init();"
+    (match dictTryFind st.CaseTid "Failure" with
+     | Some tid -> vecAdd out ("  fpp_failure_tid_ = " + string tid + ";")
+     | None -> ())
     for g in vecToList st.Globals do
         let n = g.Substring (9, strLen g - 10)
         vecAdd out ("  fpprt_add_static_roots(&" + n + ", 1);")
+    // the slot map as comments: which (iface, member) each number means
+    for k, sl in dictPairs st.VSlot do
+        let iface, mem = k
+        vecAdd out ("  /* slot " + string sl + " = " + iface + "." + mem + " */")
     for t in vecToList st.Reg do vecAdd out t
     for t in vecToList vtReg do vecAdd out t
     for i in vecToList st.CloInits do vecAdd out i

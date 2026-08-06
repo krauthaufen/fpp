@@ -77,6 +77,39 @@ by element kind (int slots are tagged 0, NEVER null); the eqv identity
 fast path must exempt floats (NaN); "$str." methods are builtins; the
 seq protocol is runtime enumerators wired into the program's slots.
 
+## M8 state (2026-08-06, deep in the trap hunt)
+
+Suite runs 86+ tests before the slow tail. Fixed on the way, in order:
+canonical fn names (instance member call-site aliases); empty EApp = its
+head; stamped record names fall back to the base (recBase/recTidOf);
+$zero:/$sizeof: tables; stamped-class vtables complete via the canonical
+chain; abstract members dispatch via (declaring-class, member) slots
+(DMembers registers them); OVERRIDES WIN interface slots (nearestOwn);
+$hasflag; u~~~/u- with kinds; int64/uint64 shifts unbox; uint prints;
+'?'-kind (bare) ops dispatch dynamically (fpp_addv family) with NUMERIC
+COERCION for representational drift (generic zeros arrive tagged);
+first-class union ctors (ctorCloGlobal singletons + direct-app fold);
+interface TYPE TESTS via fpp_vt_has on a representative slot; on-demand
+StructTupleN registration; class layouts are CHAIN-CONCATENATED (base
+prefix; ERecord `base` entry copies the base ctor's fields); classes are
+FPP_TC_CLASS (identity eq — structural eqv on the cyclic adaptive graph
+recursed forever); class CompareTo registers a vt slot + fpp_reg_cmp so
+`compare` uses it; identity-order fallback uses IDHASH not pointers
+(ASLR nondeterminism!); **fpp_try was UB** — `return setjmp(...)` from an
+inline fn collapsed the longjmp path under -O1: push bookkeeping is now a
+statement and generated code writes `if (!setjmp(H.jb))` directly (the
+single deepest bug of the arc; handler-pop identity checks + the hlog
+ring in fpprt-lang caught it).
+
+CURRENT: suite completes tests but the tail ([IndexMapping] onward) is
+GC-thrash-slow: ~8 GB allocated per 2 min (uniform boxing) on the SEMI
+collector; FPP_HEAP_MB env sets the floor; full run with 2048 MB and 40
+min budget pending — get GREEN first, then either mmc for the harness or
+allocation diet (small-int64 tagging etc). suite2.fpp in the scratchpad =
+suite + TRC instrumentation; micros in tests/tooling/cback; harness
+run.sh (uses semi); FPP_CBACK_DUMP/FPP_CBACK_CHECK/FPP_GC_LOG debug
+switches.
+
 ## Milestones (tasks #21-#28)
 
 - M1 core exprs: lit/arith/let/if/while/fn/call/print — fib parity

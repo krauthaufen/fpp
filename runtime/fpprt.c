@@ -82,13 +82,27 @@ static void idh_on_restarting_mutators_(void *data) {
     idh_rebuild_(idh_buckets_, idh_nbuckets_, idh_nbuckets_);
 }
 
+static int gc_log_ = -1;
+static unsigned gc_count_ = 0;
+static void log_prepare_gc_(void *data, enum gc_collection_kind kind,
+                            uint64_t counter) {
+  if (gc_log_ < 0) {
+    const char *e = getenv("FPP_GC_LOG");
+    gc_log_ = e && e[0] == '1';
+  }
+  gc_count_++;
+  if (gc_log_ && (gc_count_ & 0x3f) == 0)
+    fprintf(stderr, "[gc %u allocated=%llu MB]\n", gc_count_,
+            (unsigned long long)(counter >> 20));
+}
+
 #define FPPRT_EVENT_LISTENER                                   \
   ((struct gc_event_listener) {                                \
     gc_null_event_listener_init,                               \
     gc_null_event_listener_requesting_stop,                    \
     gc_null_event_listener_waiting_for_stop,                   \
     gc_null_event_listener_mutators_stopped,                   \
-    gc_null_event_listener_prepare_gc,                         \
+    log_prepare_gc_,                                           \
     gc_null_event_listener_roots_traced,                       \
     gc_null_event_listener_heap_traced,                        \
     gc_null_event_listener_ephemerons_traced,                  \

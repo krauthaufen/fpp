@@ -32,6 +32,7 @@ typedef fpprt_ref V;
 #define FPP_TID_ARR    (FPPRT_TID_FIRST + 6)   /* ref array, REFERENCE eq */
 #define FPP_TID_PAP    (FPPRT_TID_FIRST + 7)   /* partial application */
 #define FPP_TID_ENUM   (FPPRT_TID_FIRST + 8)   /* builtin seq enumerator */
+#define FPP_TID_CMPCLO (FPPRT_TID_FIRST + 9)   /* the structural-compare closure */
 #define FPP_TID_USER   (FPPRT_TID_FIRST + 29)  /* == 32, CEmit's first tid */
 
 /* what a tid MEANS to equality/printing; index = tid */
@@ -39,6 +40,7 @@ typedef fpprt_ref V;
 #define FPP_TC_RECORD 1   /* structural equality over fields */
 #define FPP_TC_CASE   2   /* union case: tid + fields */
 #define FPP_TC_CLO    3   /* closures: reference equality */
+#define FPP_TC_CLASS  4   /* classes: reference equality, idhash */
 extern unsigned char *fpp_tclass_;
 extern unsigned int *fpp_tfields_;
 extern size_t fpp_tmeta_cap_;
@@ -145,6 +147,8 @@ V fpp_apply(V clo, V *args, size_t n);
 
 void fpp_vt_set(uint32_t tid, int slot, fpp_code_t fn);
 V fpp_vcall(V obj, int slot, V *args, size_t n);
+int fpp_vt_has(V obj, int slot);   /* interface type-test: slot filled? */
+void fpp_reg_cmp(uint32_t tid, int slot);   /* class's CompareTo vt slot */
 
 /* builtin seq protocol over arrays, lists and strings: the compiler wires
  * these into ITS slot numbers for IEnumerable/IEnumerator */
@@ -159,22 +163,58 @@ struct fpp_handler {
   jmp_buf jb;
   struct fpp_handler *prev;
   struct fpprt_frame *frame_top;   /* shadow stack restores on unwind */
+  const char *site;                /* diagnostics: the pushing function */
 };
 extern struct fpp_handler *fpp_handler_top_;
 extern V fpp_exn_;
 
-static inline int fpp_try(struct fpp_handler *h) {
+/* handler-event ring for diagnosing leaks (FPP_HLOG builds) */
+extern const char *fpp_hlog_site_[64];
+extern char fpp_hlog_kind_[64];
+extern void *fpp_hlog_ptr_[64];
+extern unsigned fpp_hlog_n_;
+static inline void fpp_hlog_(char kind, const char *site, void *p) {
+  fpp_hlog_kind_[fpp_hlog_n_ & 63] = kind;
+  fpp_hlog_site_[fpp_hlog_n_ & 63] = site;
+  fpp_hlog_ptr_[fpp_hlog_n_ & 63] = p;
+  fpp_hlog_n_++;
+}
+void fpp_hlog_dump(void);
+
+/* setjmp may ONLY appear as (nearly) the whole controlling expression —
+ * returning its value through a function is undefined behavior, and under
+ * -O1 the longjmp return path genuinely collapsed (the handler branch was
+ * never taken). So the push bookkeeping is a separate statement and the
+ * generated code writes `if (!setjmp(H.jb))` itself. */
+static inline void fpp_handler_push_(struct fpp_handler *h, const char *site) {
   h->prev = fpp_handler_top_;
   h->frame_top = fpprt_top_frame;
+  h->site = site;
   fpp_handler_top_ = h;
-  return setjmp(h->jb);
+  fpp_hlog_('T', site, (void *)h);
 }
 static inline void fpp_try_pop(void) {
   fpp_handler_top_ = fpp_handler_top_->prev;
 }
+/* identity-checked pop: the handler being popped MUST be the top — a
+ * mismatch means some try leaked its handler, and the next raise would
+ * longjmp into a dead stack frame */
+static inline void fpp_try_pop2(struct fpp_handler *h) {
+  fpp_hlog_('P', h->site, (void *)h);
+  if (fpp_handler_top_ != h) {
+    fpp_hlog_dump();
+    fflush(stdout);
+    fprintf(stderr, "fpp: handler pop mismatch (leaked from %s, popping in %s)\n",
+            fpp_handler_top_ ? fpp_handler_top_->site : "?", h->site);
+    abort();
+  }
+  fpp_handler_top_ = h->prev;
+}
 static inline V fpp_exn_value(void) { return fpp_exn_; }
 
 void fpp_raise(V payload);
+extern uint32_t fpp_failure_tid_;   /* the program's Failure case, 0 = none */
+V fpp_failure(const char *msg, size_t len);   /* Failure(msg) or raw string */
 void fpp_reraise(void);
 void fpp_match_fail(void);
 
@@ -256,6 +296,26 @@ static inline V fpp_not_emitted(const char *what) {
   fprintf(stderr, "fpp cback: not emitted: %s\n", what);
   abort();
 }
+
+/* checked-build field guard: receiver must be a REF whose type has more
+ * than `idx` fields; prints who/what before dying */
+static inline void fpp_chk(V recv, unsigned idx, const char *who) {
+  if (!recv || (recv & 1)) {
+    fflush(stdout);
+    fprintf(stderr, "fpp chk: %s on %s\n", who, recv ? "TAGGED" : "NULL");
+    abort();
+  }
+  uint32_t tid = fpprt_typeid(recv);
+  if (tid < fpp_tmeta_cap_ && fpp_tfields_[tid] <= idx
+      && fpp_tclass_[tid] != 0) {
+    fflush(stdout);
+    fprintf(stderr, "fpp chk: %s idx %u on %s (%u fields)\n", who, idx,
+            fpprt_type_name(tid), fpp_tfields_[tid]);
+    abort();
+  }
+}
+
+extern V fpp_cmpv_clo_;   /* arity-2 closure over fpp_cmpv, made at init */
 
 void fpp_lang_init(void);
 
