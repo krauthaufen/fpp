@@ -205,15 +205,27 @@ pointer-compare into a structural call). Typed locals, params, arrays
 and the direct-call ABI carry int32 raw and never spill; 64-bit tagging
 is branch-free everywhere.
 
-What still boxes, and why: f64/i64 fields of ORDINARY records/classes —
-the oracle's wasm-GC layout is all-anyref for those too (only [<Struct>]
-POD records get typed layouts there), so cback matches oracle cost;
-mutable class fields hold CELLS whatever their declared type, so field
-rawification by declared type alone is UNSOUND — any typed-field work
-must mirror BinDriver's POD/cell rules. POD-struct typed layouts (and
-per-stamp StructTupleN layouts) are the remaining diet item — they ride
-on the oracle's canonName/per-stamp machinery, not on the uniform-stamp
-rule cback uses today.
+What still boxes: f64/i64 fields of ORDINARY records/classes — the
+oracle's wasm-GC layout is all-anyref for those too, so cback matches
+oracle cost there; mutable class fields hold CELLS whatever their
+declared type, so field rawification by declared type alone is UNSOUND —
+any typed-field work must mirror BinDriver's cell rules.
+
+STRUCTS are a SEMANTIC GAP, not a cost gap (corrected 2026-08-06: C
+interop and PINNING make layout observable behaviour — the abi gate
+tests/tooling/abi checks the oracle's layout against emscripten). The
+spec (PLAN.md "native: direct C ABI, blittable structs" + user):
+structs have FLAT memory layout and live on the STACK, copied by value.
+BLITTABLE structs (all-POD fields) additionally have C-COMPATIBLE
+layout (the abi gate's clang-natural-alignment rules) — locals are C
+struct values, arrays of them are flat C-compatible storage, so
+pinning/blit/interop are byte-correct. Structs HOLDING REFS are also
+flat and stack-resident but need no C compat: scalar-replace into
+locals (raw fields as C locals, ref fields as shadow-frame V slots so
+the precise GC sees them); arrays of them store flat with PER-ELEMENT
+pointer maps (an embedder extension: elemsize + elem ref-offsets).
+This is the P3 arc, riding on the oracle's canonName/per-stamp layout
+machinery, not on the uniform-stamp rule cback uses today.
 
 ## Milestones (tasks #21-#28)
 
