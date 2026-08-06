@@ -112,6 +112,9 @@ type CFn =
                                              // at RawVars.[-(v)-1]
       Cells : Dict<string * int, bool>       // locals boxed in cells
       RawVars : Vec<char * string>           // rawified locals: kind, C name
+                                             // ('S' = a POD STRUCT stack
+                                             // value; tid in PodOfRaw)
+      PodOfRaw : Dict<string, int>           // 'S' local C name -> pod tid
       mutable NRaw : int
       RawDecls : Vec<string> }               // C declarations for raw locals
 
@@ -143,10 +146,16 @@ let private rawNew (f : CFn) (k : char) : string =
     vecAdd f.RawDecls (rawTy k + " " + n + " = 0;")
     n
 
-/// box a raw value into a fresh V slot ('V' atoms are already uniform)
+/// box a raw value into a fresh V slot ('V' atoms are already uniform;
+/// 'S' pod-struct stack values copy their payload into a fresh blob)
 let private boxRaw (f : CFn) (k : char) (atom : string) : int =
     let d = slot f
     if k = 'V' then stmt f (sref d + " = " + atom + ";")
+    elif k = 'S' then
+        let tid = (dictTryFind f.PodOfRaw atom).Value
+        stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+        stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, &" + atom
+                + ", sizeof(P_" + string tid + "));")
     elif k = 'l' then stmt f (sref d + " = fpp_box_i64(" + atom + ");")
     elif k = 'v' then stmt f (sref d + " = fpp_box_i64((int64_t)" + atom + ");")
     elif k = 'f' then stmt f (sref d + " = fpp_box_f64(" + atom + ");")
@@ -253,6 +262,12 @@ let private podCTy (k : char) : string =
 /// the RAW-value-layer storage kind for a pod field kind
 let private podRawKind (k : char) : char =
     if k = 'f' || k = 's' || k = 'l' || k = 'v' || k = 'w' then k else 'i'
+
+/// the pod-struct tid a CONCRETE scheme names, if any
+let private schemePodName (sc : Scheme) : string option =
+    match prune sc.Body with
+    | TCon (n, _) -> Some n
+    | _ -> None
 
 /// the raw kind a CONCRETE monomorphized type stores at, or None (uniform)
 let private schemeRawKind (sc : Scheme) : char option =
@@ -1212,6 +1227,27 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_box_f64(-fpp_unbox_f64(" + sref x + "));")
         d
+    | ELet (isRec, v, sc, rhs, body) when
+          (not isRec)
+          && (match schemePodName sc with
+              | Some tn -> (dictTryFind st.PodTid tn).IsSome
+              | None -> false)
+          && (dictTryFind f.Cells (v.Path, v.Offset)).IsNone ->
+        // a STRUCT local is a C stack value: copied in at the binding,
+        // mutated IN PLACE, copied out at uniform uses — the .NET model
+        let tid = (dictTryFind st.PodTid (schemePodName sc).Value).Value
+        let x = emitE st f rhs
+        let i = f.NRaw
+        f.NRaw <- i + 1
+        let n = "R" + string i
+        vecAdd f.RawDecls ("P_" + string tid + " " + n + ";")
+        stmt f ("memset(&" + n + ", 0, sizeof(P_" + string tid + "));")
+        stmt f ("memcpy(&" + n + ", (char *)" + sref x + " + FPP_POD_OFF, sizeof(P_"
+                + string tid + "));")
+        vecAdd f.RawVars ('S', n)
+        dictSet f.PodOfRaw n tid
+        dictSet f.Locals (v.Path, v.Offset) (-(vecLen f.RawVars))
+        emitE st f body
     | ELet (isRec, v, _, rhs, body) ->
         (match rhs with
          | ELam _ when isRec ->
@@ -1256,6 +1292,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  emitE st f body)
     | EAssign (v, rhs) ->
         (match dictTryFind f.Locals (v.Path, v.Offset) with
+         | Some l when l < 0 && fst (vecGet f.RawVars (-l - 1)) = 'S' ->
+             let _, n = vecGet f.RawVars (-l - 1)
+             let tid = (dictTryFind f.PodOfRaw n).Value
+             let x = emitE st f rhs
+             stmt f ("memcpy(&" + n + ", (char *)" + sref x
+                     + " + FPP_POD_OFF, sizeof(P_" + string tid + "));")
          | Some l when l < 0 ->
              let k, n = vecGet f.RawVars (-l - 1)
              let atom = emitRawAs st f k rhs
@@ -1363,9 +1405,34 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                      + "), sizeof(P_" + string stid + "));")
              d
          | _ -> trap ("pod field " + owner + "." + fname))
-    | EFieldSet (_, fname, owner, _) when (dictTryFind st.PodTid owner).IsSome ->
-        // struct VALUES are copies; .NET would mutate a copy — surface loudly
-        trap ("pod field set " + owner + "." + fname)
+    | EFieldSet (r, fname, owner, rhs) when (dictTryFind st.PodTid owner).IsSome ->
+        let tid = (dictTryFind st.PodTid owner).Value
+        let podVarOf (rv : VarId) =
+            match dictTryFind f.Locals (rv.Path, rv.Offset) with
+            | Some i when i < 0 && fst (vecGet f.RawVars (-i - 1)) = 'S' ->
+                Some (snd (vecGet f.RawVars (-i - 1)))
+            | _ -> None
+        (match r with
+         | EVar (rv, _) | EVarI (rv, _, _) when (podVarOf rv).IsSome ->
+             // a STRUCT stack local mutates IN PLACE — the .NET model
+             let nm = (podVarOf rv).Value
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+              | Some ty ->
+                  (match podPrimKind ty with
+                   | Some k ->
+                       let atom = emitRawAs st f (podRawKind k) rhs
+                       stmt f (nm + "." + sane fname + " = (" + podCTy k + ")" + atom + ";")
+                   | None ->
+                       let x = emitE st f rhs
+                       let stid = (dictTryFind st.PodTid ty).Value
+                       stmt f ("memcpy(&" + nm + "." + sane fname + ", (char *)" + sref x
+                               + " + FPP_POD_OFF, sizeof(P_" + string stid + "));"))
+              | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             unitV ()
+         | _ ->
+             // mutating a TEMPORARY would be lost — .NET rejects it too
+             trap ("pod field set on non-local " + owner + "." + fname))
     | ERecord (name, fs) ->
         ensureStructTuple st name
         (match recTidOf st name with
@@ -1955,6 +2022,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     let lf = { Body = vecNew<string> (); NSlots = 0
                Locals = dictNew<string * int, int> (); Cells = f.Cells
                RawVars = vecNew<char * string> (); NRaw = 0
+               PodOfRaw = dictNew<string, int> ()
                RawDecls = vecNew<string> () }
     frees |> List.iteri (fun i k ->
         let l = slot lf
@@ -2101,6 +2169,7 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
     let f = { Body = vecNew<string> (); NSlots = 0
               Locals = dictNew<string * int, int> (); Cells = cellLocals body
               RawVars = vecNew<char * string> (); NRaw = 0
+              PodOfRaw = dictNew<string, int> ()
               RawDecls = vecNew<string> () }
     // the emitted ABI: registry-driven so every call site agrees
     let pk, rk =
@@ -2286,11 +2355,21 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             'f', n
         | EField (r, fname, owner) ->
             let tid = (dictTryFind st.PodTid owner).Value
-            let x = emitE st f r
-            let n = rawNew f rk
-            stmt f (n + " = ((P_" + string tid + " *)((char *)" + sref x
-                    + " + FPP_POD_OFF))->" + sane fname + ";")
-            rk, n
+            let podVarOf (rv : VarId) =
+                match dictTryFind f.Locals (rv.Path, rv.Offset) with
+                | Some i when i < 0 && fst (vecGet f.RawVars (-i - 1)) = 'S' ->
+                    Some (snd (vecGet f.RawVars (-i - 1)))
+                | _ -> None
+            (match r with
+             | EVar (rv, _) | EVarI (rv, _, _) when (podVarOf rv).IsSome ->
+                 // the struct lives on the C stack: read the field directly
+                 rk, (podVarOf rv).Value + "." + sane fname
+             | _ ->
+                 let x = emitE st f r
+                 let n = rawNew f rk
+                 stmt f (n + " = ((P_" + string tid + " *)((char *)" + sref x
+                         + " + FPP_POD_OFF))->" + sane fname + ";")
+                 rk, n)
         | EIndex (nm, a, i) ->
             let acc = (elemInfo nm).Value
             let _, suffix, _ = acc
