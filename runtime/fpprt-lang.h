@@ -399,3 +399,34 @@ extern V fpp_cmpv_clo_;   /* arity-2 closure over fpp_cmpv, made at init */
 void fpp_lang_init(void);
 
 #endif /* FPPRT_LANG_H */
+
+/* ---- POD (blittable) structs and their arrays ---------------------------
+ * A blittable struct VALUE in uniform position is a heap BLOB:
+ * [tag][8-byte pad to FPP_POD_OFF][C-layout payload]. Field offsets and
+ * sizes come from the C compiler itself — the generated code registers
+ * them with offsetof/sizeof, so the layout IS the C ABI by construction.
+ * Arrays of blittable structs store elements FLAT (C stride). */
+#define FPP_POD_OFF 8
+#define FPP_TC_POD 5
+void fpp_reg_pod(uint32_t tid, uint32_t size, const char *name);
+void fpp_reg_pod_field(uint32_t tid, uint32_t off, char kind);
+void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
+                     const char *name);
+V fpp_pod_box(uint32_t tid, uint32_t size);          /* zeroed blob */
+V fpp_pod_get(V a, size_t i, uint32_t elemtid);      /* flat elem -> blob */
+void fpp_pod_set(V a, size_t i, V blob);             /* blob -> flat elem */
+int fpp_pod_eq(V a, V b);
+int fpp_pod_cmp(V a, V b);
+intptr_t fpp_pod_hash(V v);
+
+/* ---- linear memory (the Memory module) ----------------------------------
+ * The wasm oracle's Memory is real linear memory; natively it is ONE
+ * growable arena, addresses are int OFFSETS into it. `fpp_mem_base()` is
+ * exported so foreign C code can turn an offset into a pointer. */
+char *fpp_mem_base(void);
+int32_t fpp_mem_alloc(int32_t n);
+int32_t fpp_mem_size(void);
+void fpp_mem_copy(int32_t dst, int32_t src, int32_t n);
+int32_t fpp_arr_bytesize(V a);
+int32_t fpp_arr_pin(V a);       /* copy INTO the arena, remember */
+void fpp_arr_unpin(V a);        /* copy BACK, forget */

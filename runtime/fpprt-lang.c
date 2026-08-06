@@ -571,6 +571,7 @@ int fpp_eqv(V a, V b) {
         return UNTAGI(fpp_vcall(a, slot, &arg, 1)) != 0;
       }
     }
+    if (tc == FPP_TC_POD) return fpp_pod_eq(a, b);
     return 0;                              /* closures, classes: identity */
   }
   }
@@ -639,6 +640,7 @@ int fpp_cmpv(V a, V b) {
       }
       return 0;
     }
+    if (tc == FPP_TC_POD) return fpp_pod_cmp(a, b);
     if (tc == FPP_TC_CLASS) {
       int slot = fpp_cmp_slot_of_(ta);
       if (slot >= 0) {
@@ -695,6 +697,7 @@ intptr_t fpp_hashv(V v) {
         h = h * 31 + fpp_hashv(fpprt_read_ref(v, (i + 1) * sizeof(V)));
       return h & 0x3fffffff;
     }
+    if (tc == FPP_TC_POD) return fpp_pod_hash(v);
     if (tc == FPP_TC_CLASS) {
       int slot = fpp_hash_slot_of_(t);
       if (slot >= 0) {
@@ -1245,6 +1248,238 @@ V fpp_cwt_indexof(V self, V k) {
 V fpp_box_i64_(int64_t x) { return fpp_box_i64(x); }
 int64_t fpp_unbox_i64_(V b) { return fpp_unbox_i64(b); }
 
+/* ---- POD (blittable) structs -------------------------------------------- */
+
+struct fpp_pod_field_ { uint32_t off; char kind; };
+struct fpp_pod_info_ {
+  uint32_t size;
+  uint32_t nfields, cap;
+  struct fpp_pod_field_ *fields;
+  uint32_t elemtid;                 /* for ARRAY tids: the element's tid */
+};
+static struct fpp_pod_info_ **fpp_pods_ = NULL;
+static size_t fpp_pods_cap_ = 0;
+
+static struct fpp_pod_info_ *fpp_pod_info_(uint32_t tid) {
+  return tid < fpp_pods_cap_ ? fpp_pods_[tid] : NULL;
+}
+static struct fpp_pod_info_ *fpp_pod_ensure_(uint32_t tid) {
+  if (tid >= fpp_pods_cap_) {
+    size_t cap = fpp_pods_cap_ ? fpp_pods_cap_ : 64;
+    while (tid >= cap) cap *= 2;
+    struct fpp_pod_info_ **n = calloc(cap, sizeof(*n));
+    if (!n) abort();
+    for (size_t i = 0; i < fpp_pods_cap_; i++) n[i] = fpp_pods_[i];
+    free(fpp_pods_);
+    fpp_pods_ = n;
+    fpp_pods_cap_ = cap;
+  }
+  if (!fpp_pods_[tid]) {
+    fpp_pods_[tid] = calloc(1, sizeof(struct fpp_pod_info_));
+    if (!fpp_pods_[tid]) abort();
+  }
+  return fpp_pods_[tid];
+}
+
+void fpp_reg_pod(uint32_t tid, uint32_t size, const char *name) {
+  struct fpp_pod_info_ *p = fpp_pod_ensure_(tid);
+  p->size = size;
+  /* the heap blob: header pad to FPP_POD_OFF + payload, no ref fields */
+  uint32_t total = FPP_POD_OFF + ((size + 7u) & ~7u);
+  fpprt_register_type(tid, (struct fpprt_type){
+    total, FPPRT_KIND_STRUCT, 0, NULL, name });
+  fpp_reg_meta_(tid, FPP_TC_POD, 0);
+}
+
+void fpp_reg_pod_field(uint32_t tid, uint32_t off, char kind) {
+  struct fpp_pod_info_ *p = fpp_pod_ensure_(tid);
+  if (p->nfields == p->cap) {
+    p->cap = p->cap ? p->cap * 2 : 8;
+    p->fields = realloc(p->fields, p->cap * sizeof(*p->fields));
+    if (!p->fields) abort();
+  }
+  p->fields[p->nfields].off = off;
+  p->fields[p->nfields].kind = kind;
+  p->nfields++;
+}
+
+void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
+                     const char *name) {
+  struct fpp_pod_info_ *p = fpp_pod_ensure_(arrtid);
+  p->size = elemsz;
+  p->elemtid = elemtid;
+  fpprt_register_type(arrtid, (struct fpprt_type){
+    elemsz, FPPRT_KIND_SCALAR_ARRAY, 0, NULL, name });
+}
+
+V fpp_pod_box(uint32_t tid, uint32_t size) {
+  (void)size;
+  return fpprt_alloc(tid);            /* zeroed by the allocator */
+}
+
+V fpp_pod_get(V a, size_t i, uint32_t elemtid) {
+  fpp_arr_check_(a, i);
+  uint32_t sz = fpp_pod_info_(elemtid)->size;
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = a;
+  V b = fpprt_alloc(elemtid);
+  memcpy((char *)b + FPP_POD_OFF,
+         (char *)fpprt_elems(f_slots[0]) + i * sz, sz);
+  FPPRT_LEAVE(f);
+  return b;
+}
+
+void fpp_pod_set(V a, size_t i, V blob) {
+  fpp_arr_check_(a, i);
+  uint32_t sz = fpp_pod_info_(fpprt_typeid(blob))->size;
+  memcpy((char *)fpprt_elems(a) + i * sz, (char *)blob + FPP_POD_OFF, sz);
+}
+
+static int fpp_pod_field_cmp_(char k, const char *pa, const char *pb) {
+  switch (k) {
+  case 'f': { double x = *(double *)pa, y = *(double *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 's': { float x = *(float *)pa, y = *(float *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'l': { int64_t x = *(int64_t *)pa, y = *(int64_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'v': { uint64_t x = *(uint64_t *)pa, y = *(uint64_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'i': { int32_t x = *(int32_t *)pa, y = *(int32_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'w': { uint32_t x = *(uint32_t *)pa, y = *(uint32_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'm': { int16_t x = *(int16_t *)pa, y = *(int16_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'h': { uint16_t x = *(uint16_t *)pa, y = *(uint16_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  case 'n': { int8_t x = *(int8_t *)pa, y = *(int8_t *)pb;
+              return x < y ? -1 : x > y ? 1 : 0; }
+  default: { uint8_t x = *(uint8_t *)pa, y = *(uint8_t *)pb;
+             return x < y ? -1 : x > y ? 1 : 0; }
+  }
+}
+
+int fpp_pod_eq(V a, V b) {
+  struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(a));
+  const char *pa = (const char *)a + FPP_POD_OFF;
+  const char *pb = (const char *)b + FPP_POD_OFF;
+  for (uint32_t i = 0; i < p->nfields; i++)
+    if (fpp_pod_field_cmp_(p->fields[i].kind, pa + p->fields[i].off,
+                           pb + p->fields[i].off) != 0) return 0;
+  return 1;
+}
+
+int fpp_pod_cmp(V a, V b) {
+  struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(a));
+  const char *pa = (const char *)a + FPP_POD_OFF;
+  const char *pb = (const char *)b + FPP_POD_OFF;
+  for (uint32_t i = 0; i < p->nfields; i++) {
+    int c = fpp_pod_field_cmp_(p->fields[i].kind, pa + p->fields[i].off,
+                               pb + p->fields[i].off);
+    if (c) return c;
+  }
+  return 0;
+}
+
+intptr_t fpp_pod_hash(V v) {
+  struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(v));
+  const char *pv = (const char *)v + FPP_POD_OFF;
+  intptr_t h = 29 + (intptr_t)fpprt_typeid(v);
+  for (uint32_t i = 0; i < p->nfields; i++) {
+    const char *pf = pv + p->fields[i].off;
+    intptr_t x;
+    switch (p->fields[i].kind) {
+    case 'f': x = (intptr_t)*(double *)pf; break;
+    case 's': x = (intptr_t)*(float *)pf; break;
+    case 'l': case 'v': x = (intptr_t)*(int64_t *)pf; break;
+    case 'i': case 'w': x = (intptr_t)*(int32_t *)pf; break;
+    case 'm': case 'h': x = (intptr_t)*(uint16_t *)pf; break;
+    default: x = (intptr_t)*(uint8_t *)pf; break;
+    }
+    h = h * 31 + x;
+  }
+  return h & 0x3fffffff;
+}
+
+/* ---- linear memory arena ------------------------------------------------ */
+
+static char *fpp_mem_ = NULL;
+static int32_t fpp_mem_top_ = 8;      /* offset 0 stays unused */
+static int32_t fpp_mem_cap_ = 0;
+
+char *fpp_mem_base(void) {
+  if (!fpp_mem_) {
+    fpp_mem_cap_ = 1 << 24;           /* 16 MB to start, grows */
+    fpp_mem_ = malloc((size_t)fpp_mem_cap_);
+    if (!fpp_mem_) abort();
+    memset(fpp_mem_, 0, (size_t)fpp_mem_cap_);
+  }
+  return fpp_mem_;
+}
+
+int32_t fpp_mem_alloc(int32_t n) {
+  fpp_mem_base();
+  int32_t off = (fpp_mem_top_ + 7) & ~7;
+  while (off + n > fpp_mem_cap_) {
+    int32_t ncap = fpp_mem_cap_ * 2;
+    char *nb = realloc(fpp_mem_, (size_t)ncap);
+    if (!nb) abort();
+    memset(nb + fpp_mem_cap_, 0, (size_t)(ncap - fpp_mem_cap_));
+    fpp_mem_ = nb;
+    fpp_mem_cap_ = ncap;
+  }
+  fpp_mem_top_ = off + n;
+  return off;
+}
+
+int32_t fpp_mem_size(void) { fpp_mem_base(); return fpp_mem_cap_; }
+
+void fpp_mem_copy(int32_t dst, int32_t src, int32_t n) {
+  memmove(fpp_mem_base() + dst, fpp_mem_base() + src, (size_t)n);
+}
+
+int32_t fpp_arr_bytesize(V a) {
+  uint32_t tid = fpprt_typeid(a);
+  struct fpp_pod_info_ *p = fpp_pod_info_(tid);
+  uint32_t elem;
+  if (p && p->size) elem = p->size;
+  else if (tid == FPP_TID_AF64 || tid == FPP_TID_AI64) elem = 8;
+  else if (tid == FPP_TID_AF32 || tid == FPP_TID_AI32) elem = 4;
+  else if (tid == FPP_TID_AU16 || tid == FPP_TID_STR) elem = 2;
+  else if (tid == FPP_TID_AU8) elem = 1;
+  else elem = (uint32_t)sizeof(V);
+  return (int32_t)(fpprt_array_len(a) * elem);
+}
+
+/* pinning: copy INTO the arena; unpin copies back. Entries are individually
+ * malloc'd so their V slot can be a permanent GC root. */
+struct fpp_pin_ { V arr; int32_t off; int32_t bytes; struct fpp_pin_ *next; };
+static struct fpp_pin_ *fpp_pins_ = NULL;
+
+int32_t fpp_arr_pin(V a) {
+  int32_t bytes = fpp_arr_bytesize(a);
+  int32_t off = fpp_mem_alloc(bytes);
+  memcpy(fpp_mem_base() + off, fpprt_elems(a), (size_t)bytes);
+  struct fpp_pin_ *p = malloc(sizeof *p);
+  if (!p) abort();
+  p->arr = a; p->off = off; p->bytes = bytes; p->next = fpp_pins_;
+  fpp_pins_ = p;
+  fpprt_add_static_roots(&p->arr, 1);
+  return off;
+}
+
+void fpp_arr_unpin(V a) {
+  for (struct fpp_pin_ *p = fpp_pins_; p; p = p->next)
+    if (p->arr == a) {
+      memcpy(fpprt_elems(p->arr), fpp_mem_base() + p->off, (size_t)p->bytes);
+      p->arr = 0;                     /* root slot cleared, entry retired */
+      return;
+    }
+  fprintf(stderr, "fpp: unpin of an unpinned array\n");
+  abort();
+}
+
 /* ---- dispatching array accessors ---------------------------------------- */
 
 V fpp_arr_get(V a, size_t i) {
@@ -1256,7 +1491,11 @@ V fpp_arr_get(V a, size_t i) {
   case FPP_TID_AI32: return TAGI((intptr_t)((int32_t *)fpprt_elems(a))[i]);
   case FPP_TID_AU16: return TAGI((intptr_t)((uint16_t *)fpprt_elems(a))[i]);
   case FPP_TID_AU8:  return TAGI((intptr_t)((uint8_t *)fpprt_elems(a))[i]);
-  default: return fpprt_read_ref(a, (uint32_t)((i + 2) * sizeof(V)));
+  default: {
+    struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(a));
+    if (p && p->elemtid) return fpp_pod_get(a, i, p->elemtid);
+    return fpprt_read_ref(a, (uint32_t)((i + 2) * sizeof(V)));
+  }
   }
 }
 
@@ -1270,6 +1509,11 @@ void fpp_arr_set(V a, size_t i, V v) {
   case FPP_TID_AI32: ((int32_t *)fpprt_elems(a))[i] = (int32_t)fpp_as_i64_(v); return;
   case FPP_TID_AU16: ((uint16_t *)fpprt_elems(a))[i] = (uint16_t)fpp_as_i64_(v); return;
   case FPP_TID_AU8:  ((uint8_t *)fpprt_elems(a))[i] = (uint8_t)fpp_as_i64_(v); return;
-  default: fpprt_write_ref(a, (uint32_t)((i + 2) * sizeof(V)), v);
+  default: {
+    struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(a));
+    if (p && p->elemtid) { fpp_pod_set(a, i, v); return; }
+    fpprt_write_ref(a, (uint32_t)((i + 2) * sizeof(V)), v);
+  }
   }
 }
+

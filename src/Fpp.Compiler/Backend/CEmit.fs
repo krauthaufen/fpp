@@ -54,6 +54,11 @@ type CSt =
       ClassBase : Dict<string, string>       // class -> base
       ClassImpls : Dict<string, (string * (string * VarId) list) list>
       ClassOwn : Dict<string, (string * VarId) list>
+      StructFieldTys : Dict<string, (string * string) list>
+                                             // [<Struct>] record field TYPES
+      PodTid : Dict<string, int>             // blittable struct -> its tid
+      PodArrTid : Dict<string, int>          // blittable struct -> array tid
+      Typedefs : Vec<string>                 // C typedefs for blittable structs
       FnSig : Dict<string * int, string>     // per-param storage kinds
                                              // ('V' = uniform); RAW params
                                              // ride the direct-call ABI
@@ -218,6 +223,37 @@ let private elemInfo (nm : string) : (string * string * char) option =
     | "byte" | "bool" -> Some ("FPP_TID_AU8", "u8", 'i')
     | _ -> None
 
+/// blittable-struct field kinds: the C width of a primitive field type
+let private podPrimKind (ty : string) : char option =
+    match ty with
+    | "float" | "double" -> Some 'f'
+    | "float32" | "single" -> Some 's'
+    | "int64" -> Some 'l'
+    | "uint64" -> Some 'v'
+    | "int" | "enum" -> Some 'i'
+    | "uint32" -> Some 'w'
+    | "int16" -> Some 'm'
+    | "uint16" | "char" -> Some 'h'
+    | "byte" | "bool" -> Some 'b'
+    | "sbyte" -> Some 'n'
+    | _ -> None
+
+let private podCTy (k : char) : string =
+    if k = 'f' then "double"
+    elif k = 's' then "float"
+    elif k = 'l' then "int64_t"
+    elif k = 'v' then "uint64_t"
+    elif k = 'i' then "int32_t"
+    elif k = 'w' then "uint32_t"
+    elif k = 'm' then "int16_t"
+    elif k = 'h' then "uint16_t"
+    elif k = 'n' then "int8_t"
+    else "uint8_t"
+
+/// the RAW-value-layer storage kind for a pod field kind
+let private podRawKind (k : char) : char =
+    if k = 'f' || k = 's' || k = 'l' || k = 'v' || k = 'w' then k else 'i'
+
 /// the raw kind a CONCRETE monomorphized type stores at, or None (uniform)
 let private schemeRawKind (sc : Scheme) : char option =
     match prune sc.Body with
@@ -274,7 +310,7 @@ let private fnAbiOf (st : CSt) (key : string * int) : (string * char) option =
     else
         match dictTryFind st.FnSig key, dictTryFind st.FnRet key with
         | Some pk, Some rk ->
-            if pk |> Seq.forall (fun c -> c = 'V') && rk = 'V' then None
+            if pk |> Seq.forall (fun c -> c = 'V') && (rk = 'V') then None
             else Some (pk, rk)
         | _ -> None
 
@@ -364,6 +400,15 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
         if b <> "abs" && b <> "sign" && strLen op0 = strLen b + 1
            && charAt op0 (strLen op0 - 1) = 'f' then Some 'f'
         else None
+    | EField (_, fname, owner) when (dictTryFind st.PodTid owner).IsSome ->
+        (match dictTryFind st.StructFieldTys owner with
+         | Some fts ->
+             (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+              | Some ty -> (match podPrimKind ty with
+                            | Some k -> Some (podRawKind k)
+                            | None -> None)
+              | None -> None)
+         | None -> None)
     | EIndex (nm, _, _) when nm <> "$str" ->
         (match elemInfo nm with
          | Some (_, _, k) -> Some k
@@ -371,7 +416,7 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
         (match fnAbiOf st (v.Path, v.Offset) with
-         | Some (_, rk) when rk <> 'V' -> Some rk
+         | Some (_, rk) when rk <> 'V' && rk <> 'u' -> Some rk
          | _ -> None)
     | EIf (_, t, e2) ->
         (match rawKindOf st f t, rawKindOf st f e2 with
@@ -596,6 +641,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EIndex _ when (rawKindOf st f e).IsSome ->
         let k, a = emitRaw st f e
         boxRaw f k a
+    | EField _ when (rawKindOf st f e).IsSome ->
+        let k, a = emitRaw st f e
+        boxRaw f k a
     | ELit (LInt s) ->
         // the literal keeps its SOURCE suffix (5L, 3uy, 7us, 0x1F);
         // int64/uint64 box, everything else tags
@@ -775,6 +823,75 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | None ->
              stmt f ("fpp_raise(" + sref x + ");"))
         unitV ()
+    | EApp (EUnknown "memAlloc", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_mem_alloc((int32_t)UNTAGI(" + sref x + ")));")
+        d
+    | EApp (EUnknown "memSize", [ a ]) ->
+        emitE st f a |> ignore
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_mem_size());")
+        d
+    | EApp (EUnknown "memCopy", [ a; b; c ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        let z = emitE st f c
+        stmt f ("fpp_mem_copy((int32_t)UNTAGI(" + sref x + "), (int32_t)UNTAGI("
+                + sref y + "), (int32_t)UNTAGI(" + sref z + "));")
+        unitV ()
+    | EApp (EUnknown "memLoadByte", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)*(uint8_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        d
+    | EApp (EUnknown "memStoreByte", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        stmt f ("*(uint8_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = (uint8_t)UNTAGI(" + sref y + ");")
+        unitV ()
+    | EApp (EUnknown "memLoadInt", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)*(int32_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        d
+    | EApp (EUnknown "memStoreInt", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        stmt f ("*(int32_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = (int32_t)UNTAGI(" + sref y + ");")
+        unitV ()
+    | EApp (EUnknown "memLoadInt64", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_box_i64(*(int64_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        d
+    | EApp (EUnknown "memStoreInt64", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        stmt f ("*(int64_t *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = fpp_unbox_i64(" + sref y + ");")
+        unitV ()
+    | EApp (EUnknown "memLoadFloat", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = fpp_box_f64(*(double *)(fpp_mem_base() + UNTAGI(" + sref x + ")));")
+        d
+    | EApp (EUnknown "memStoreFloat", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        stmt f ("*(double *)(fpp_mem_base() + UNTAGI(" + sref x + ")) = fpp_unbox_f64(" + sref y + ");")
+        unitV ()
+    | EApp (EUnknown "doubleBits", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f ("{ double D_; int64_t B_; D_ = fpp_unbox_f64(" + sref x
+                + "); memcpy(&B_, &D_, 8); " + sref d + " = fpp_box_i64(B_); }")
+        d
+    | EApp (EUnknown "singleBits", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f ("{ float S_; int32_t B_; S_ = (float)fpp_unbox_f64(" + sref x
+                + "); memcpy(&B_, &S_, 4); " + sref d + " = TAGI((intptr_t)B_); }")
+        d
     | EApp (EUnknown "raise", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_raise(" + sref x + ");")
@@ -844,14 +961,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         (match fnAbiOf st (v.Path, v.Offset) with
          | Some (pk, rk) ->
              // the RAW-ABI direct call: proven-primitive params and result
-             // travel unboxed
+             // travel unboxed; unit params evaluate but are not passed
              let atoms =
-                 args |> List.mapi (fun i a ->
+                 args
+                 |> List.mapi (fun i a ->
                      let k = charAt pk i
-                     if k = 'V' then sref (emitE st f a)
-                     else emitRawAs st f k a)
+                     if k = 'u' then (emitE st f a |> ignore; None)
+                     elif k = 'V' then Some (sref (emitE st f a))
+                     else Some (emitRawAs st f k a))
+                 |> List.choose (fun x -> x)
              let callx = fn + "(" + String.concat ", " atoms + ")"
-             if rk = 'V' then
+             if rk = 'u' then
+                 stmt f (callx + ";")
+                 unitV ()
+             elif rk = 'V' then
                  let d = slot f
                  stmt f (sref d + " = " + callx + ";")
                  d
@@ -1195,6 +1318,51 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         for x in List.rev vs do
             stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref d + ");")
         d
+    | ERecord (name, fs) when (dictTryFind st.PodTid name).IsSome ->
+        // a blittable struct VALUE: flat C payload behind a blob header
+        let tid = (dictTryFind st.PodTid name).Value
+        let pn = "P_" + string tid
+        let fts = (dictTryFind st.StructFieldTys name).Value
+        let d = slot f
+        stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+        for fn2, v in fs do
+            (match fts |> List.tryPick (fun (a, ty) -> if a = fn2 then Some ty else None) with
+             | Some ty ->
+                 (match podPrimKind ty with
+                  | Some k ->
+                      let atom = emitRawAs st f (podRawKind k) v
+                      stmt f ("((" + pn + " *)((char *)" + sref d + " + FPP_POD_OFF))->"
+                              + sane fn2 + " = (" + podCTy k + ")" + atom + ";")
+                  | None ->
+                      let x = emitE st f v
+                      let stid = (dictTryFind st.PodTid ty).Value
+                      stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF + offsetof("
+                              + pn + ", " + sane fn2 + "), (char *)" + sref x
+                              + " + FPP_POD_OFF, sizeof(P_" + string stid + "));"))
+             | None ->
+                 stmt f ("fpp_not_emitted(" + cstr ("pod field " + name + "." + fn2) + ");"))
+        d
+    | EField (r, fname, owner) when (dictTryFind st.PodTid owner).IsSome ->
+        // reaching here means the field is a NESTED blittable struct
+        // (primitive fields took the raw path above): copy the sub-payload
+        let tid = (dictTryFind st.PodTid owner).Value
+        let fts = (dictTryFind st.StructFieldTys owner).Value
+        (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+         | Some ty when (dictTryFind st.PodTid ty).IsSome ->
+             let stid = (dictTryFind st.PodTid ty).Value
+             let x = emitE st f r
+             let xs = slot f
+             stmt f (sref xs + " = " + sref x + ";")
+             let d = slot f
+             stmt f (sref d + " = fpprt_alloc(" + string stid + ");")
+             stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, (char *)" + sref xs
+                     + " + FPP_POD_OFF + offsetof(P_" + string tid + ", " + sane fname
+                     + "), sizeof(P_" + string stid + "));")
+             d
+         | _ -> trap ("pod field " + owner + "." + fname))
+    | EFieldSet (_, fname, owner, _) when (dictTryFind st.PodTid owner).IsSome ->
+        // struct VALUES are copies; .NET would mutate a copy — surface loudly
+        trap ("pod field set " + owner + "." + fname)
     | ERecord (name, fs) ->
         ensureStructTuple st name
         (match recTidOf st name with
@@ -1375,6 +1543,15 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("if (!UNTAGI(" + sref matched + ")) fpp_reraise();")
         stmt f ("} }")
         d
+    | EArray (nm, xs) when (dictTryFind st.PodArrTid nm).IsSome ->
+        let atid = (dictTryFind st.PodArrTid nm).Value
+        let d = slot f
+        stmt f (sref d + " = fpprt_alloc_array(" + string atid + ", "
+                + string (List.length xs) + ");")
+        xs |> List.iteri (fun i v ->
+            let x = emitE st f v
+            stmt f ("fpp_pod_set(" + sref d + ", " + string i + ", " + sref x + ");"))
+        d
     | EArray (nm, xs) ->
         (match elemInfo nm with
          | Some (tid, suffix, k) ->
@@ -1394,6 +1571,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              vs |> List.iteri (fun i x ->
                  stmt f ("fpp_arr_set(" + sref d + ", " + string i + ", " + sref x + ");"))
              d)
+    | EArrayCreate (nm, n, v) when (dictTryFind st.PodArrTid nm).IsSome ->
+        let atid = (dictTryFind st.PodArrTid nm).Value
+        let nv = emitE st f n
+        let d = slot f
+        stmt f (sref d + " = fpprt_alloc_array(" + string atid + ", (size_t)UNTAGI("
+                + sref nv + "));")
+        (match v with
+         | EUnknown "$zero" -> ()                    // allocator zeroes
+         | _ ->
+             let x = emitE st f v
+             stmt f ("{ size_t N = fpprt_array_len(" + sref d + ");")
+             stmt f ("for (size_t I = 0; I < N; I++) fpp_pod_set(" + sref d
+                     + ", I, " + sref x + "); }"))
+        d
     | EArrayCreate (nm, n, v) ->
         let nv = emitE st f n
         let d = slot f
@@ -1440,6 +1631,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = fpp_arr_get(" + sref av + ", (size_t)UNTAGI(" + sref iv + "));")
         d
+    | EIndex (nm, a, i) when (dictTryFind st.PodArrTid nm).IsSome ->
+        let tid = (dictTryFind st.PodTid nm).Value
+        let av = emitE st f a
+        let ia = emitRawAs st f 'i' i
+        let d = slot f
+        stmt f (sref d + " = fpp_pod_get(" + sref av + ", (size_t)" + ia + ", "
+                + string tid + ");")
+        d
+    | EIndexSet (nm, a, i, v) when (dictTryFind st.PodArrTid nm).IsSome ->
+        let av = emitE st f a
+        let ia = emitRawAs st f 'i' i
+        let xv = emitE st f v
+        stmt f ("fpp_pod_set(" + sref av + ", (size_t)" + ia + ", " + sref xv + ");")
+        unitV ()
     | EIndexSet (nm, a, i, v) when nm <> "$str" && (elemInfo nm).IsSome ->
         let _, suffix, k = (elemInfo nm).Value
         let av = emitE st f a
@@ -1465,6 +1670,22 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = TAGI((intptr_t)fpprt_array_len(" + sref av + "));")
         d
+    | EArrayBytes (_, a) ->
+        let av = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_arr_bytesize(" + sref av + "));")
+        d
+    | EArrayPin (_, a) ->
+        // the pinned image in the arena IS the C layout; the address is an
+        // arena OFFSET (what the wasm oracle's linear memory means by it)
+        let av = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI((intptr_t)fpp_arr_pin(" + sref av + "));")
+        d
+    | EArrayUnpin (_, a) ->
+        let av = emitE st f a
+        stmt f ("fpp_arr_unpin(" + sref av + ");")
+        unitV ()
     | EIfaceCall (iface, memberName, recv, args) ->
         let bare =
             match iface.IndexOf "`" with
@@ -1529,7 +1750,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
          | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
          | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
-         | _ -> stmt f (sref d + " = 0;"))
+         | _ ->
+             match dictTryFind st.PodTid tn with
+             | Some tid -> stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             | None -> stmt f (sref d + " = 0;"))
         d
     | EUnknown n when n.StartsWith "$sizeof:" ->
         // primitives at their widths, anything else at pointer width — the
@@ -1564,7 +1788,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
          | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
          | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
-         | _ -> stmt f (sref d + " = 0;"))
+         | _ ->
+             match dictTryFind st.PodTid tn with
+             | Some tid -> stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
+             | None -> stmt f (sref d + " = 0;"))
         d
     | EUnknown n when n.StartsWith "$sizeof:" ->
         // primitives at their widths, anything else at pointer width — the
@@ -2052,6 +2279,13 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let n = rawNew f 'f'
             stmt f (n + " = " + cfn + "(" + aa + ");")
             'f', n
+        | EField (r, fname, owner) ->
+            let tid = (dictTryFind st.PodTid owner).Value
+            let x = emitE st f r
+            let n = rawNew f rk
+            stmt f (n + " = ((P_" + string tid + " *)((char *)" + sref x
+                    + " + FPP_POD_OFF))->" + sane fname + ";")
+            rk, n
         | EIndex (nm, a, i) ->
             let acc = (elemInfo nm).Value
             let _, suffix, _ = acc
@@ -2065,10 +2299,13 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let fn = (dictTryFind st.FnName (v.Path, v.Offset)).Value
             let pk, _ = (fnAbiOf st (v.Path, v.Offset)).Value
             let atoms =
-                args |> List.mapi (fun i a ->
+                args
+                |> List.mapi (fun i a ->
                     let k = charAt pk i
-                    if k = 'V' then sref (emitE st f a)
-                    else emitRawAs st f k a)
+                    if k = 'u' then (emitE st f a |> ignore; None)
+                    elif k = 'V' then Some (sref (emitE st f a))
+                    else Some (emitRawAs st f k a))
+                |> List.choose (fun x -> x)
             let n = rawNew f rk
             stmt f (n + " = " + fn + "(" + String.concat ", " atoms + ");")
             rk, n
@@ -2143,6 +2380,10 @@ let emitC (decls : Decl list) : string * string list =
           ClassBase = dictNew<string, string> ()
           ClassImpls = dictNew<string, (string * (string * VarId) list) list> ()
           ClassOwn = dictNew<string, (string * VarId) list> ()
+          StructFieldTys = dictNew<string, (string * string) list> ()
+          PodTid = dictNew<string, int> ()
+          PodArrTid = dictNew<string, int> ()
+          Typedefs = vecNew<string> ()
           FnSig = dictNew<string * int, string> ()
           FnRet = dictNew<string * int, char> ()
           Intrin = dictNew<string * int, string> ()
@@ -2163,7 +2404,47 @@ let emitC (decls : Decl list) : string * string list =
             dictSet st.FnRet (v.Path, v.Offset) rk
         | DLet (_, v, _, _) ->
             dictSet st.GlobalOf (v.Path, v.Offset) (gname v)
-        | DRecord (n, _, fields, _) ->
+        | DExtern (v, sc) ->
+            // REAL C interop: the symbol is the declared name; params and
+            // the result travel on the raw ABI. Names Lower claims as
+            // builtins never call through here.
+            let builtinNames =
+                [ "box"; "unbox"; "float16Bits"; "doubleBits"; "singleBits"
+                  "stackDepth"; "stackFrame" ]
+            if not (List.contains v.Name builtinNames)
+               && not (v.Name.StartsWith "mem") then
+                let rec peel (t : Type) (acc : Type list) =
+                    match prune t with
+                    | TFun (a, r) -> peel r (a :: acc)
+                    | r -> List.rev acc, r
+                let args, ret = peel sc.Body []
+                let kindOfT (t : Type) : char =
+                    match prune t with
+                    | TCon ("unit", []) -> 'u'
+                    | tt ->
+                        match schemeRawKind (mono tt) with
+                        | Some k -> k
+                        | None -> 'V'
+                let pk = args |> List.map (kindOfT >> string) |> String.concat ""
+                let rk = kindOfT ret
+                dictSet st.Fns (v.Path, v.Offset) (List.length args)
+                dictSet st.FnName (v.Path, v.Offset) (sane v.Name)
+                dictSet st.FnSig (v.Path, v.Offset) pk
+                dictSet st.FnRet (v.Path, v.Offset) rk
+                let cty (k : char) =
+                    if k = 'V' then "V" elif k = 'u' then "void" else rawTy k
+                let ps2 =
+                    pk
+                    |> Seq.filter (fun c -> c <> 'u')
+                    |> Seq.map cty
+                    |> List.ofSeq
+                vecAdd st.Fwd
+                    ("extern " + cty rk + " " + sane v.Name + "("
+                     + (if List.isEmpty ps2 then "void" else String.concat ", " ps2)
+                     + ");")
+        | DRecord (n, _, fields, isS) ->
+            if isS && not (List.isEmpty fields) then
+                dictSet st.StructFieldTys n fields
             if not (dictTryFind st.RecTid n).IsSome then
                 let tid = freshTid st
                 dictSet st.RecTid n tid
@@ -2232,6 +2513,67 @@ let emitC (decls : Decl list) : string * string list =
                     dictSet st.VSlot (bare, mn) st.NVSlots
                     st.NVSlots <- st.NVSlots + 1
         | _ -> ()
+    // BLITTABLE STRUCTS: flat C layouts, the C ABI by construction — the
+    // generated code registers offsets with offsetof/sizeof, so the C
+    // compiler IS the layout oracle. Non-generic [<Struct>] records whose
+    // fields are (recursively) primitive or blittable qualify; stamped
+    // clones have empty field lists and never do.
+    let visiting = dictNew<string, bool> ()
+    let rec podOf (n : string) : bool =
+        if (dictTryFind st.PodTid n).IsSome then true
+        elif (dictTryFind visiting n).IsSome then false
+        elif recBase n <> n then false
+            // STAMPED clones stay uniform: generic code reaches every stamp
+            // through the base's V layout (tuple ops, recTidOf fallback) —
+            // per-stamp flat layouts need the full canonName machinery
+        else
+            match dictTryFind st.StructFieldTys n, dictTryFind st.RecTid n with
+            | Some fts, Some tid ->
+                dictSet visiting n true
+                let ok =
+                    fts |> List.forall (fun ((_ : string), ty) ->
+                        (podPrimKind ty).IsSome || podOf ty)
+                if ok then
+                    dictSet st.PodTid n tid
+                    dictSet st.PodArrTid n (freshTid st)
+                ok
+            | _ -> false
+    for d in decls do
+        match d with
+        | DRecord (n, _, _, true) -> podOf n |> ignore
+        | _ -> ()
+    // typedefs in DECLARATION order (F# forbids forward refs, so nested
+    // structs are declared before their containers)
+    for d in decls do
+        match d with
+        | DRecord (n, _, _, true) when (dictTryFind st.PodTid n).IsSome ->
+            let tid = (dictTryFind st.PodTid n).Value
+            let fts = (dictTryFind st.StructFieldTys n).Value
+            let fdecl (fn2 : string, ty : string) =
+                match podPrimKind ty with
+                | Some k -> "  " + podCTy k + " " + sane fn2 + ";"
+                | None -> "  P_" + string (dictTryFind st.PodTid ty).Value + " " + sane fn2 + ";"
+            vecAdd st.Typedefs
+                ("typedef struct {\n" + String.concat "\n" (fts |> List.map fdecl)
+                 + "\n} P_" + string tid + ";")
+            // registration: size and every LEAF field offset from the C compiler
+            vecAdd st.Reg ("  fpp_reg_pod(" + string tid + ", (uint32_t)sizeof(P_"
+                           + string tid + "), " + cstr n + ");")
+            let rec leaves (prefix : string) (fts2 : (string * string) list) =
+                for fn2, ty in fts2 do
+                    let path = if prefix = "" then sane fn2 else prefix + "." + sane fn2
+                    match podPrimKind ty with
+                    | Some k ->
+                        vecAdd st.Reg ("  fpp_reg_pod_field(" + string tid
+                                       + ", (uint32_t)offsetof(P_" + string tid + ", " + path
+                                       + "), '" + string k + "');")
+                    | None ->
+                        leaves path (dictTryFind st.StructFieldTys ty).Value
+            leaves "" fts
+            let atid = (dictTryFind st.PodArrTid n).Value
+            vecAdd st.Reg ("  fpp_reg_pod_arr(" + string atid + ", " + string tid
+                           + ", (uint32_t)sizeof(P_" + string tid + "), " + cstr (n + "[]") + ");")
+        | _ -> ()
     // FINAL LAYOUTS. Three rules, applied in order:
     //   1. a stamped clone with an empty field list inherits its base
     //      name's OWN fields (uniform repr: every stamp is identical);
@@ -2286,7 +2628,8 @@ let emitC (decls : Decl list) : string * string list =
         // records compare STRUCTURALLY, classes by IDENTITY — a cyclic
         // object graph (the adaptive one) must never be walked by eqv
         let tclass = if isClass then 4 else 1
-        match dictTryFind st.RecTid n with
+        match (if (dictTryFind st.PodTid n).IsSome then None
+               else dictTryFind st.RecTid n) with
         | Some tid ->
             vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
                            + string (List.length layout) + ", " + string tclass
@@ -2527,6 +2870,10 @@ let emitC (decls : Decl list) : string * string list =
                 vecAdd out ("/* DBASEINST " + n + " [" + String.concat ", " xs + "] */")
             | _ -> ()
     vecAdd out "#include \"fpprt-lang.h\""
+    vecAdd out "#include <stddef.h>"
+    vecAdd out ""
+    for td in vecToList st.Typedefs do
+        vecAdd out td
     vecAdd out ""
     for g in vecToList st.Globals do vecAdd out g
     vecAdd out ""

@@ -166,6 +166,20 @@ values into `transact` through channels.
   schedule of the same phases (P = 1) — same semantics, code stays portable
   across all three backends.
 
+## GC extras this design can lean on
+
+"Do I hold the only reference?" is implementable HONESTLY here, unlike in
+.NET: every live reference is in a shadow-frame slot, a static root or a
+heap field (raw C locals never hold refs), so the question is well-defined.
+Two forms: an EXACT on-demand mark pass counting edges into x (O(live
+heap), stop-at-2), and an AMORTIZED watch-list variant answered as of the
+last collection (edge-counting piggybacked on the trace — nearly free, and
+conservative in the safe direction for copy-on-write reuse). The API wants
+a transactional shape (`GC.reuseIfUnique x (fun exclusive -> ...)`) so the
+reference cannot escape between check and use. Under threads the query
+runs at a safepoint. Also unexposed but present in the runtime: finalizers
+and heap introspection (live bytes, per-type census).
+
 ## Order of work
 
 1. Async CE + event loop (no threads; useful on every backend immediately).
