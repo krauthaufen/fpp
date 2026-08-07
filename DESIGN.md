@@ -56,6 +56,21 @@ temporal: whatever entered scope last wins.
 
 Per-case constructor signatures on DUs. **The header binds no type
 parameters** — the generic parameter lives on the constructor, not the type.
+SHIPPED 2026-08-08: the case grammar is ONE form —
+`| Name of payload [-> Result] [when C<'m> | 'a :> IFace]*`, with
+`| Name : Result` for payload-less refined cases. The arrow names the
+case's result instantiation (`| Lit of value : int -> E<int>`); function
+payloads parenthesize, exactly as F# already requires on unions. Payload
+components may be labelled (documentation, F#'s rule). Matching a case
+teaches ITS BRANCH the result equation: clauses of a GADT match run on a
+unification trail that rolls back on exit, and the clause's class-member
+uses resolve while the equations hold — `eval : E<'a> -> 'a` with
+`Pair of E<'x> * E<'y> -> E<'x * 'y>` types and runs (gate
+tests/tooling/gadtref.fpp, both backends). `when C<'m>` on a case packs a
+dictionary (existentials); `when 'a :> IFace` packs NOTHING — the value
+carries its vtable, the bound licenses dispatch in the branch, and
+constructing with a non-implementing type is a compile diagnostic.
+
 `type Expr<_>` declares arity/kind only; each case signature is its own
 closed, implicitly generalized scheme:
 
