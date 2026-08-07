@@ -84,9 +84,13 @@ SHIPPED 2026-08-07 (commit 6310352; gate tests/tooling/hkt-gate.sh runs the
 probe on BOTH backends): `class Mappable<'f<_>>` with instances at list /
 option / array works end to end, constraint-polymorphic functions stamp per
 constructor AND per element, and forwarding chains of constrained generics
-compose. v1 boundaries: no prelude container classes yet (a member name
-owns its symbol globally — `map` as a class member would capture every
-bare `map`; users declare their own classes), kind checking is arity-level,
+compose. Classes are NAMESPACES,
+exactly like modules: `Class.member` always resolves, `open Class` injects
+the members bare (temporal shadowing, module rules), and `[<AutoOpen>]`
+on the class restores implicit bare scope — the prelude's classes carry it,
+so their operators and members behave as they always did, while a library
+`Functor` deliberately does not leak `map` into scope. v1 boundaries: no
+prelude container classes yet (naming pending), kind checking is arity-level,
 aliases eta-reduce at instance heads (`instance Mappable<option>` names
 Option), and multi-arity constructor names do not split per arity through
 a constructor variable.
