@@ -36,3 +36,9 @@ let shout (xs : 'f<string>) : 'f<string> when Mappable<'f> =
     mapf (fun (s : string) -> s + "!") xs
 
 printfn "%s" (String.concat "" (shout [ "a"; "b" ]))
+
+// constraints are INFERRED: no annotation anywhere — the scheme comes out
+// as 'f<int> -> 'f<int> when Mappable<'f>, kind included
+let doubleI xs = mapf (fun x -> x * 2) xs
+printfn "%d" (List.sum (doubleI [ 4; 5 ]))
+printfn "%d" (match doubleI (Some 50) with Some v -> v | None -> 0)
