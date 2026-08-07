@@ -42,3 +42,8 @@ printfn "%s" (String.concat "" (shout [ "a"; "b" ]))
 let doubleI xs = mapf (fun x -> x * 2) xs
 printfn "%d" (List.sum (doubleI [ 4; 5 ]))
 printfn "%d" (match doubleI (Some 50) with Some v -> v | None -> 0)
+
+// the QUALIFIED spelling requires (and discharges) the same constraint
+let tripled xs = Mappable.mapf (fun x -> x * 3) xs
+printfn "%d" (List.sum (tripled [ 1; 2 ]))
+printfn "%d" (match tripled (Some 10) with Some v -> v | None -> 0)
