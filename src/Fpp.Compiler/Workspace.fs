@@ -803,7 +803,15 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
+                let ep = dictNew<int, (string * int * string * string list) list> ()
+                for off, fns in inf.ExistPack do dictSet ep off fns
+                let ecs = dictNew<string, int> ()
+                for cn, nm in inf.ExistCases do dictSet ecs cn nm
+                let em = dictNew<int, string> ()
+                for off, cn in inf.ExistMatch do dictSet em off cn
+                let du = dictNew<int, int * int> ()
+                for off, pm in inf.DictUses do dictSet du off pm
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive ep ecs em du
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (blameAt path off ("not lowerable: " + why))
@@ -836,9 +844,17 @@ type Workspace() =
         for k, v in bi.ClassPending do dictSet bcp k v
         let bot = dictNew<int, string> ()
         for k, v in bi.OpTypes do dictSet bot k v
+        let bep = dictNew<int, (string * int * string * string list) list> ()
+        for off, fns in bi.ExistPack do dictSet bep off fns
+        let becs = dictNew<string, int> ()
+        for cn, nm in bi.ExistCases do dictSet becs cn nm
+        let bem = dictNew<int, string> ()
+        for off, cn in bi.ExistMatch do dictSet bem off cn
+        let bdu = dictNew<int, int * int> ()
+        for off, pm in bi.DictUses do dictSet bdu off pm
         let blow =
             Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes bok bak bik bms bfo bcs
-                r.Members r.Fields r.Interfaces bcu bcp bot r.Aliases bi.ArbDerive
+                r.Members r.Fields r.Interfaces bcu bcp bot r.Aliases bi.ArbDerive bep becs bem bdu
         for d in blow.Decls do vecAdd allDecls d
         // one function per primitive instance member, so `Add.(+)` denotes
         // something callable even where `a + b` is a machine instruction
@@ -945,7 +961,15 @@ type Workspace() =
                 for off, t in inf.ClassPending do dictSet cp off t
                 let ot = dictNew<int, string> ()
                 for off, t in inf.OpTypes do dictSet ot off t
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
+                let ep = dictNew<int, (string * int * string * string list) list> ()
+                for off, fns in inf.ExistPack do dictSet ep off fns
+                let ecs = dictNew<string, int> ()
+                for cn, nm in inf.ExistCases do dictSet ecs cn nm
+                let em = dictNew<int, string> ()
+                for off, cn in inf.ExistMatch do dictSet em off cn
+                let du = dictNew<int, int * int> ()
+                for off, pm in inf.DictUses do dictSet du off pm
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive ep ecs em du
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -978,7 +1002,15 @@ type Workspace() =
             for off, t in inf.ClassPending do dictSet cp off t
             let ot = dictNew<int, string> ()
             for off, t in inf.OpTypes do dictSet ot off t
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive
+            let ep = dictNew<int, (string * int * string * string list) list> ()
+            for off, fns in inf.ExistPack do dictSet ep off fns
+            let ecs = dictNew<string, int> ()
+            for cn, nm in inf.ExistCases do dictSet ecs cn nm
+            let em = dictNew<int, string> ()
+            for off, cn in inf.ExistMatch do dictSet em off cn
+            let du = dictNew<int, int * int> ()
+            for off, pm in inf.DictUses do dictSet du off pm
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive ep ecs em du
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

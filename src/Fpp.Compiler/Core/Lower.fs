@@ -32,7 +32,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (classPending : Dict<int, string>)
           (opTypes : Dict<int, string>)
           (tyAliases : Dict<string, Var list * Type>)
-          (arbDerive : (string * string * int * bool * int list * (string * string list) list) list) : LowerResult =
+          (arbDerive : (string * string * int * bool * int list * (string * string list) list) list)
+          (existPack : Dict<int, (string * int * string * string list) list>)
+          (existCases : Dict<string, int>)
+          (existMatch : Dict<int, string>)
+          (dictUses : Dict<int, int * int>) : LowerResult =
 
     let notes = vecNew<int * string> ()
     let decls = vecNew<Decl> ()
@@ -42,6 +46,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// monomorphization stamps one body per element type — which is what
     /// makes the instance's own `when` context resolve per use rather than
     /// once for the whole program.
+    /// the hidden payload slot of an existential case, bound at the match
+    /// and read wherever the branch dispatches through the packed member
+    let existSlotVar (patOff : int) (i : int) : VarId =
+        { Path = path; Offset = 97000000 + patOff * 8 + i
+          Name = "$dm" + string patOff + "_" + string i }
+
     let classRef (im : Fpp.Analysis.Classes.InstMember) : Expr =
         let v = { Path = im.MPath; Offset = im.MOffset; Name = im.MName }
         let sch = mono (TCon ("?", []))
@@ -607,7 +617,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match patHeadToken head |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                      | Some d -> d.Name, schemeOf d
                      | None -> "?", mono (TCon ("?", []))
-                 PCtor (ctorName, ctorSch, args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
+                 let subs = args |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat
+                 // an EXISTENTIAL case: bind the packed member slots too,
+                 // by the deterministic names the branch's dispatch reads
+                 let subs2 =
+                     match patHeadToken head with
+                     | Some ht when (dictTryFind existMatch ht.Offset).IsSome ->
+                         (match dictTryFind existCases ctorName with
+                          | Some nm ->
+                              subs @ (List.init nm (fun i ->
+                                  PVar (existSlotVar ht.Offset i, mono (TCon ("?", [])))))
+                          | None -> subs)
+                     | _ -> subs
+                 PCtor (ctorName, ctorSch, subs2)
              | [] -> PWild)
         | TypeTestPat ->
             // a test against a GENERIC parameter carries the symbolic name
@@ -810,6 +832,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some im ->
                           let r = classRef im
                           if im.MTakesUnit then EApp (r, [ ELit LUnit ]) else r
+                      | None ->
+                     match dictTryFind dictUses t.Offset with
+                      // EXISTENTIAL dispatch: the member was packed into a
+                      // hidden payload slot the enclosing match bound
+                      | Some (po, mi) ->
+                          EVar (existSlotVar po mi, mono (TCon ("?", [])))
                       | None ->
                      match dictTryFind classPending t.Offset with
                       // not resolved yet: the operand type is a variable of
@@ -1141,8 +1169,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | Some m -> EUnknown m
                      | None ->
                      let f = lowerExpr (GNode head)
+                     // an EXISTENTIAL case constructed here: append the
+                     // chosen instance's member fns as hidden payload slots
+                     let packFns =
+                         match f, Green.tokens (GNode head) |> List.tryHead with
+                         | ECtor (_, _, []), Some ht ->
+                             (match dictTryFind existPack ht.Offset with
+                              | Some fns ->
+                                  fns |> List.map (fun (mp, mo, mn, inst) ->
+                                      let v = { Path = mp; Offset = mo; Name = mn }
+                                      if List.isEmpty inst then EVar (v, mono (TCon ("?", [])))
+                                      else EVarI (v, mono (TCon ("?", [])), inst))
+                              | None -> [])
+                         | _ -> []
                      let loweredArgs =
-                         let given = args |> List.map (fun a -> lowerExpr (GNode a))
+                         let given = (args |> List.map (fun a -> lowerExpr (GNode a))) @ packFns
                          // the call left optional parameters off; inference
                          // counted them, and each one is None
                          match dictTryFind fieldOwners (offsetOf n) with
@@ -3803,7 +3844,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 vecAdd decls (DMembers (name, vecToList ownMembers))
 
         if isEnum then vecAdd decls (DEnum (name, enumCases |> List.map (fun (c, v) -> name + "." + c, v)))
-        elif not (List.isEmpty cases) then vecAdd decls (DUnion (name, tyParams, cases))
+        elif not (List.isEmpty cases) then
+            // an existential case carries its packed members as extra slots
+            let cases2 =
+                cases |> List.map (fun ((cn : string), ar) ->
+                    match dictTryFind existCases cn with
+                    | Some nm -> cn, ar + nm
+                    | None -> cn, ar)
+            vecAdd decls (DUnion (name, tyParams, cases2))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))

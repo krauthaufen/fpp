@@ -1586,10 +1586,14 @@ let parse (src : string) : ParseResult =
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
                 vecAdd c (parseType barCol)
+                // existential constraint on the CASE:
+                // `| Many of 'm<'a> when ListLike<'m>`
+                while s.IsKw "when" do vecAdd c (parseWhen false barCol)
             elif s.IsOp ":" then
                 // GADT-style per-case signature
                 vecAdd c (s.Bump ())
                 vecAdd c (parseType barCol)
+                while s.IsKw "when" do vecAdd c (parseWhen false barCol)
             elif s.IsOp "=" then
                 // enum case: `| Leaf = 0uy`
                 vecAdd c (s.Bump ())

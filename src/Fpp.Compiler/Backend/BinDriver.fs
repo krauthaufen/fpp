@@ -1581,8 +1581,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              (match args with
               | [ one ] -> emitNode st f lv one
               | many ->
-                  err st "binary: multi-payload ctor not ported"
-                  refNull f "any")
+                  // a MULTI-payload case (an existential packs its member
+                  // fns as extra slots): the one payload slot holds a tuple
+                  let tn = "$tup" + string (List.length many)
+                  for a in many do emitNode st f lv a
+                  gcT f "struct.new" tn)
              gcT f "struct.new" "$du1"
          | Some 1 ->
              // the constructor as a VALUE (`|> Some`): a closure whose
@@ -3510,15 +3513,30 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
              ic f t
              ins f "i32.ne"
              brIf f failLbl
-             // every sub-pattern matches against the ONE payload slot,
-             // exactly as the text emitter does (Lower tuples multi-payload)
-             for sub in args do
-                 let pl = freshLocal f "$bq" "anyref"
-                 lg f slot
-                 gcT f "ref.cast" "$du1"
-                 gcTF f "struct.get" "$du1" 1
-                 ls f pl
-                 emitPat st f lv failLbl pl sub
+             // ONE sub-pattern reads the payload slot directly; several
+             // read it as the tuple the multi-payload ctor packed
+             (match args with
+              | [ _ ] | [] ->
+                  for sub in args do
+                      let pl = freshLocal f "$bq" "anyref"
+                      lg f slot
+                      gcT f "ref.cast" "$du1"
+                      gcTF f "struct.get" "$du1" 1
+                      ls f pl
+                      emitPat st f lv failLbl pl sub
+              | several ->
+                  let tn = "$tup" + string (List.length several)
+                  let mutable i = 0
+                  for sub in several do
+                      let pl = freshLocal f "$bq" "anyref"
+                      lg f slot
+                      gcT f "ref.cast" "$du1"
+                      gcTF f "struct.get" "$du1" 1
+                      gcT f "ref.cast" tn
+                      gcTF f "struct.get" tn i
+                      ls f pl
+                      emitPat st f lv failLbl pl sub
+                      i <- i + 1)
          | _ -> err st ("binary: unknown ctor in pattern " + name))
     | PTuple ps ->
         let t = "$tup" + string (List.length ps)

@@ -6,3 +6,5 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 bash "$here/cback/run.sh" "$here/hkt.fpp"
 bash "$here/cback/run.sh" "$here/hktns.fpp"
+bash "$here/cback/run.sh" "$here/hktgadt.fpp"
+bash "$here/cback/run.sh" "$here/exist.fpp"
