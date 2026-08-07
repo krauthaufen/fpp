@@ -1291,6 +1291,9 @@ struct fpp_pod_info_ {
   uint32_t elemtid;                 /* for ARRAY tids: the element's tid */
   uint32_t nrefs;                   /* ARRAY tids: elem ref-field count */
   const uint32_t *refoffs;          /* ARRAY tids: ELEM-relative offsets */
+  uint32_t unitid;                  /* STAMP pods: the uniform record tid */
+  uint32_t nslots, slotcap;         /* STAMP pods: field slot table */
+  struct fpp_pod_slot_ { uint32_t off; uint32_t aux; char kind; } *slots;
 };
 static struct fpp_pod_info_ **fpp_pods_ = NULL;
 static size_t fpp_pods_cap_ = 0;
@@ -1368,6 +1371,108 @@ void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
     elemsz, FPPRT_KIND_POD_ARRAY, nrefs, adj, name });
 }
 
+void fpp_reg_pod_uni(uint32_t podtid, uint32_t unitid) {
+  fpp_pod_ensure_(podtid)->unitid = unitid;
+}
+
+void fpp_reg_pod_slot(uint32_t podtid, uint32_t off, char kind, uint32_t aux) {
+  struct fpp_pod_info_ *p = fpp_pod_ensure_(podtid);
+  if (p->nslots == p->slotcap) {
+    p->slotcap = p->slotcap ? p->slotcap * 2 : 8;
+    p->slots = realloc(p->slots, p->slotcap * sizeof(*p->slots));
+    if (!p->slots) abort();
+  }
+  p->slots[p->nslots].off = off;
+  p->slots[p->nslots].aux = aux;
+  p->slots[p->nslots].kind = kind;
+  p->nslots++;
+}
+
+/* a flat element of a STAMP pod boxed as its UNIFORM record */
+static V fpp_pod_elem_to_uni_(V a, size_t i, struct fpp_pod_info_ *ep) {
+  uint32_t sz = ep->size;
+  FPPRT_FRAME(f, 2);
+  f_slots[0] = a;
+  f_slots[1] = fpprt_alloc(ep->unitid);
+  for (uint32_t k = 0; k < ep->nslots; k++) {
+    struct fpp_pod_slot_ *sl = &ep->slots[k];
+    const char *fp = (const char *)fpprt_elems(f_slots[0]) + i * sz + sl->off;
+    V v;
+    switch (sl->kind) {
+    case 'r': v = *(const V *)fp; break;
+    case 'f': v = fpp_box_f64(*(const double *)fp); break;
+    case 's': v = fpp_box_f64((double)*(const float *)fp); break;
+    case 'l': v = fpp_box_i64(*(const int64_t *)fp); break;
+    case 'v': v = fpp_box_i64((int64_t)*(const uint64_t *)fp); break;
+    case 'i': v = TAGI((intptr_t)*(const int32_t *)fp); break;
+    case 'w': v = TAGI((intptr_t)*(const uint32_t *)fp); break;
+    case 'm': v = TAGI((intptr_t)*(const int16_t *)fp); break;
+    case 'h': v = TAGI((intptr_t)*(const uint16_t *)fp); break;
+    case 'n': v = TAGI((intptr_t)*(const int8_t *)fp); break;
+    case 'b': v = TAGI((intptr_t)*(const uint8_t *)fp); break;
+    case 'P': {
+      v = fpprt_alloc(sl->aux);
+      /* the alloc may have MOVED the array: recompute the source */
+      fp = (const char *)fpprt_elems(f_slots[0]) + i * sz + sl->off;
+      memcpy((char *)v + FPP_POD_OFF, fp, fpp_pod_info_(sl->aux)->size);
+      break;
+    }
+    default: v = 0; break;
+    }
+    fpprt_write_ref(f_slots[1], (uint32_t)((k + 1) * sizeof(V)), v);
+    /* boxing may have moved things too; the frame keeps a/b current */
+  }
+  V r = f_slots[1];
+  FPPRT_LEAVE(f);
+  return r;
+}
+
+/* a UNIFORM record unpacked into a flat STAMP-pod element */
+static void fpp_pod_uni_to_elem_(V a, size_t i, V rec,
+                                 struct fpp_pod_info_ *ep) {
+  uint32_t sz = ep->size;
+  char *base = (char *)fpprt_elems(a) + i * sz;
+  for (uint32_t k = 0; k < ep->nslots; k++) {
+    struct fpp_pod_slot_ *sl = &ep->slots[k];
+    char *fp = base + sl->off;
+    V v = fpprt_read_ref(rec, (uint32_t)((k + 1) * sizeof(V)));
+    if (!v && sl->kind != 'r') {
+      /* a NULL slot is the ZERO value (Array.zeroCreate's seed record) */
+      switch (sl->kind) {
+      case 'f': *(double *)fp = 0; continue;
+      case 's': *(float *)fp = 0; continue;
+      case 'l': case 'v': *(int64_t *)fp = 0; continue;
+      case 'i': case 'w': *(int32_t *)fp = 0; continue;
+      case 'm': case 'h': *(int16_t *)fp = 0; continue;
+      case 'n': case 'b': *(int8_t *)fp = 0; continue;
+      case 'P': memset(fp, 0, fpp_pod_info_(sl->aux)->size); continue;
+      default: continue;
+      }
+    }
+    switch (sl->kind) {
+    case 'r':
+      *(V *)fp = v;
+      fpprt_write_ref(a, (uint32_t)(fp - (char *)a), v);  /* barrier */
+      break;
+    case 'f': *(double *)fp = fpp_as_f64_(v); break;
+    case 's': *(float *)fp = (float)fpp_as_f64_(v); break;
+    case 'l': *(int64_t *)fp = fpp_as_i64_(v); break;
+    case 'v': *(uint64_t *)fp = (uint64_t)fpp_as_i64_(v); break;
+    case 'i': *(int32_t *)fp = (int32_t)fpp_as_i64_(v); break;
+    case 'w': *(uint32_t *)fp = (uint32_t)fpp_as_i64_(v); break;
+    case 'm': *(int16_t *)fp = (int16_t)fpp_as_i64_(v); break;
+    case 'h': *(uint16_t *)fp = (uint16_t)fpp_as_i64_(v); break;
+    case 'n': *(int8_t *)fp = (int8_t)fpp_as_i64_(v); break;
+    case 'b': *(uint8_t *)fp = (uint8_t)fpp_as_i64_(v); break;
+    case 'P':
+      if (v) memcpy(fp, (const char *)v + FPP_POD_OFF,
+                    fpp_pod_info_(sl->aux)->size);
+      break;
+    default: break;
+    }
+  }
+}
+
 V fpp_pod_box(uint32_t tid, uint32_t size) {
   (void)size;
   return fpprt_alloc(tid);            /* zeroed by the allocator */
@@ -1399,7 +1504,11 @@ V fpp_pod_clone(V blob) {
 
 V fpp_pod_get(V a, size_t i, uint32_t elemtid) {
   fpp_arr_check_(a, i);
-  uint32_t sz = fpp_pod_info_(elemtid)->size;
+  struct fpp_pod_info_ *ep = fpp_pod_info_(elemtid);
+  if (ep->unitid)
+    /* STAMP element: the blob world only ever sees the UNIFORM record */
+    return fpp_pod_elem_to_uni_(a, i, ep);
+  uint32_t sz = ep->size;
   FPPRT_FRAME(f, 1);
   f_slots[0] = a;
   V b = fpprt_alloc(elemtid);
@@ -1411,6 +1520,15 @@ V fpp_pod_get(V a, size_t i, uint32_t elemtid) {
 
 void fpp_pod_set(V a, size_t i, V blob) {
   fpp_arr_check_(a, i);
+  struct fpp_pod_info_ *ap0 = fpp_pod_info_(fpprt_typeid(a));
+  if (ap0 && ap0->elemtid) {
+    struct fpp_pod_info_ *ep = fpp_pod_info_(ap0->elemtid);
+    if (ep && ep->unitid) {
+      /* STAMP element arriving as its uniform record */
+      fpp_pod_uni_to_elem_(a, i, blob, ep);
+      return;
+    }
+  }
   uint32_t sz = fpp_pod_info_(fpprt_typeid(blob))->size;
   char *dst = (char *)fpprt_elems(a) + i * sz;
   memcpy(dst, (char *)blob + FPP_POD_OFF, sz);

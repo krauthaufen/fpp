@@ -444,6 +444,12 @@ void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
 void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
                          uint32_t nrefs, const uint32_t *blobrefoffs,
                          const char *name);
+/* a STAMP pod's blob rep is the UNIFORM record `unitid`; its slot table
+ * (one entry per field, in slot order) lets the runtime convert a flat
+ * array element to/from that record. kind: prim char | 'r' ref |
+ * 'P' nested mono pod (aux = its tid). off is payload-relative. */
+void fpp_reg_pod_uni(uint32_t podtid, uint32_t unitid);
+void fpp_reg_pod_slot(uint32_t podtid, uint32_t off, char kind, uint32_t aux);
 V fpp_pod_box(uint32_t tid, uint32_t size);          /* zeroed blob */
 V fpp_pod_clone(V blob);                             /* fresh copy */
 V fpp_rec_clone(V rec);                              /* uniform shallow copy */

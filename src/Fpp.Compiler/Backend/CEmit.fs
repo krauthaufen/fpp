@@ -42,7 +42,8 @@ type CSt =
                                              // "CompareTo")
       GlobalOf : Dict<string * int, string>
       RecTid : Dict<string, int>             // record name -> tid
-      RecFields : Dict<string, string list>  // record name -> field order
+      RecFields : Dict<string, string list>
+      RecFieldTys : Dict<string, (string * string) list> // every record's (field, ty)  // record name -> field order
       CaseTid : Dict<string, int>            // union case name -> tid
       CaseArity : Dict<string, int>
       EnumVal : Dict<string, int>            // enum case name -> value
@@ -693,6 +694,23 @@ let private recFieldsOf (st : CSt) (name : string) : string list option =
         match dictTryFind st.RecFields (recBase name) with
         | Some fs when not (List.isEmpty fs) -> Some fs
         | other -> other
+
+/// a PLAIN record's pod-typed field: reading it must COPY (the .NET
+/// struct-field model). Some -> the clone call for that pod kind.
+let private podFieldClone (st : CSt) (owner : string) (fname : string)
+                          : string option =
+    if (dictTryFind st.PodTid owner).IsSome then None
+    elif (dictTryFind st.ClassOwn owner).IsSome
+         || (dictTryFind st.ClassBase owner).IsSome then None
+    else
+        match dictTryFind st.RecFieldTys owner with
+        | Some fts ->
+            (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+             | Some ty when (dictTryFind st.PodTid ty).IsSome ->
+                 if (dictTryFind st.PodStamp ty).IsSome
+                 then Some "fpp_rec_clone" else Some "fpp_pod_clone"
+             | _ -> None)
+        | None -> None
 
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     let trap (what : string) : int =
@@ -1567,6 +1585,101 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                 Some (snd (vecGet f.RawVars (-i - 1)))
             | _ -> None
         (match r with
+         | EField (hr, pf, powner) when
+               (dictTryFind st.PodTid powner).IsNone
+               && (dictTryFind st.ClassOwn powner).IsNone
+               && (dictTryFind st.ClassBase powner).IsNone
+               && (match dictTryFind st.RecFieldTys powner with
+                   | Some fts2 ->
+                       (match fts2 |> List.tryPick (fun (a2, ty2) -> if a2 = pf then Some ty2 else None) with
+                        | Some ty2 -> (dictTryFind st.PodTid ty2).IsSome
+                        | None -> false)
+                   | None -> false) ->
+             // `h.P.X <- v`: P is a mutable record field of struct type —
+             // an LVALUE — so the write lands in the record's own storage
+             // (no clone on this read)
+             let hx = emitE st f hr
+             let order2 = (recFieldsOf st powner).Value
+             let pidx = (order2 |> List.findIndex (fun a2 -> a2 = pf)) + 1
+             let b = slot f
+             stmt f (sref b + " = fpprt_read_ref(" + sref hx + ", FPPOFF(" + string pidx + "));")
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             if (dictTryFind st.PodStamp owner).IsSome then
+                 // the field's storage is the UNIFORM record: slot write
+                 (match fts |> List.tryFindIndex (fun (a2, _) -> a2 = fname) with
+                  | Some fidx ->
+                      let x = emitE st f rhs
+                      stmt f ("fpprt_write_ref(" + sref b + ", FPPOFF(" + string (fidx + 1)
+                              + "), " + sref x + ");")
+                  | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             else
+                 (match fts |> List.tryPick (fun (a2, ty) -> if a2 = fname then Some ty else None) with
+                  | Some ty ->
+                      let lv = "((P_" + string tid + " *)((char *)" + sref b + " + FPP_POD_OFF))->" + sane fname
+                      (match podPrimKind ty with
+                       | Some k ->
+                           let atom = emitRawAs st f (podRawKind k) rhs
+                           stmt f (lv + " = (" + podCTy k + ")" + atom + ";")
+                       | None when (dictTryFind st.StructFieldTys ty).IsSome
+                                   && (dictTryFind st.PodTid ty).IsSome
+                                   && recBase ty = ty
+                                   && (dictTryFind st.PodRef ty).IsNone ->
+                           let x = emitE st f rhs
+                           let stid = (dictTryFind st.PodTid ty).Value
+                           stmt f ("memcpy(&" + lv + ", (char *)" + sref x
+                                   + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                       | None when (dictTryFind st.StructFieldTys ty).IsNone
+                                   || recBase ty <> ty ->
+                           let x = emitE st f rhs
+                           stmt f ("fpprt_write_ref(" + sref b + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                   + string tid + ", " + sane fname + "), " + sref x + ");")
+                       | None ->
+                           // ref-holding nested struct: the memcpy would
+                           // skip the write barrier — not yet supported
+                           stmt f ("fpp_not_emitted(" + cstr ("nested-ref fieldset " + owner + "." + fname) + ");"))
+                  | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             unitV ()
+         | EIndex (nm, arr2, ix2) when (dictTryFind st.PodArrTid nm).IsSome ->
+             // `arr.[i].F <- v`: an array element is a VARIABLE — the
+             // field mutates in place inside the flat payload (fsi
+             // semantics). The element base is recomputed IN the store
+             // statement, after every allocation the rhs could do.
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             let av = emitE st f arr2
+             let ia = emitRawAs st f 'i' ix2
+             let elemB =
+                 "(char *)fpprt_elems(" + sref av + ") + (size_t)" + ia
+                 + " * sizeof(P_" + string tid + ")"
+             (match fts |> List.tryPick (fun (a2, ty) -> if a2 = fname then Some ty else None) with
+              | Some ty ->
+                  (match podPrimKind ty with
+                   | Some k ->
+                       let atom = emitRawAs st f (podRawKind k) rhs
+                       stmt f ("((P_" + string tid + " *)(" + elemB + "))->"
+                               + sane fname + " = (" + podCTy k + ")" + atom + ";")
+                   | None when (dictTryFind st.StructFieldTys ty).IsSome
+                               && (dictTryFind st.PodTid ty).IsSome
+                               && recBase ty = ty
+                               && (dictTryFind st.PodRef ty).IsNone ->
+                       let x = emitE st f rhs
+                       let stid = (dictTryFind st.PodTid ty).Value
+                       stmt f ("memcpy(" + elemB + " + offsetof(P_" + string tid
+                               + ", " + sane fname + "), (char *)" + sref x
+                               + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                   | None when (podPrimKind ty).IsNone
+                               && ((dictTryFind st.StructFieldTys ty).IsNone
+                                   || recBase ty <> ty) ->
+                       // a uniform REF field: barriered store at the
+                       // element's absolute offset in the array object
+                       let x = emitE st f rhs
+                       stmt f ("fpprt_write_ref(" + sref av + ", (uint32_t)(FPPOFF(2) + (size_t)"
+                               + ia + " * sizeof(P_" + string tid + ") + offsetof(P_"
+                               + string tid + ", " + sane fname + ")), " + sref x + ");")
+                   | _ ->
+                       stmt f ("fpp_not_emitted(" + cstr ("elem fieldset " + owner + "." + fname) + ");"))
+              | None ->
+                  stmt f ("fpp_not_emitted(" + cstr ("elem fieldset " + owner + "." + fname) + ");"))
+             unitV ()
          | EVar (rv, _) | EVarI (rv, _, _) when (podVarOf rv).IsSome ->
              // a STRUCT stack local mutates IN PLACE — the .NET model
              let nm = (podVarOf rv).Value
@@ -1688,6 +1801,16 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              stmt f ("for (uint32_t I = 0; I < NB; I++)")
              stmt f ("  fpprt_write_ref(" + sref d + ", FPPOFF(I + 1), fpprt_read_ref("
                      + sref src + ", FPPOFF(I + 1))); }")
+             // struct-typed fields were copied BY REFERENCE just now: give
+             // the copy its own blobs (`{ h with .. }` copies by value)
+             (order |> List.iteri (fun idx2 fn3 ->
+                 match podFieldClone st name fn3 with
+                 | Some cl ->
+                     let off = "FPPOFF(" + string (idx2 + 1) + ")"
+                     stmt f ("{ V t_ = fpprt_read_ref(" + sref d + ", " + off
+                             + "); if (t_) fpprt_write_ref(" + sref d + ", " + off
+                             + ", " + cl + "(t_)); }")
+                 | None -> ()))
              for fn2, v in fs do
                  let x = emitE st f v
                  let idx = fieldIdx order fn2
@@ -1710,6 +1833,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                              + cstr (owner + "." + fname) + ");")
                  stmt f (sref d + " = fpprt_read_ref(" + sref x + ", "
                          + ("FPPOFF(" + string (idx + 1) + ")") + ");")
+                 (match podFieldClone st owner fname with
+                  | Some cl ->
+                      // a struct-typed field READS as a copy
+                      stmt f ("if (" + sref d + ") " + sref d + " = " + cl
+                              + "(" + sref d + ");")
+                  | None -> ())
                  d
          | None -> trap ("field of " + owner + "." + fname))
     | EFieldSet (r, fname, owner, v) ->
@@ -1724,6 +1853,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  if st.Checked then
                      stmt f ("fpp_chk(" + sref x + ", " + string idx + ", "
                              + cstr (owner + "." + fname) + ");")
+                 (match podFieldClone st owner fname with
+                  | Some cl ->
+                      // struct assignment COPIES into the field's storage
+                      stmt f ("if (" + sref y + ") " + sref y + " = " + cl
+                              + "(" + sref y + ");")
+                  | None -> ())
                  stmt f ("fpprt_write_ref(" + sref x + ", "
                          + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref y + ");")
                  unitV ()
@@ -2769,6 +2904,7 @@ let emitC (decls : Decl list) : string * string list =
           GlobalOf = dictNew<string * int, string> ()
           RecTid = dictNew<string, int> ()
           RecFields = dictNew<string, string list> ()
+          RecFieldTys = dictNew<string, (string * string) list> ()
           CaseTid = dictNew<string, int> ()
           CaseArity = dictNew<string, int> ()
           EnumVal = dictNew<string, int> ()
@@ -2849,6 +2985,7 @@ let emitC (decls : Decl list) : string * string list =
                 let tid = freshTid st
                 dictSet st.RecTid n tid
                 dictSet st.RecFields n (fields |> List.map fst)
+                dictSet st.RecFieldTys n fields
         | DUnion (_, _, cases) ->
             for cn, arity in cases do
                 if not (dictTryFind st.CaseTid cn).IsSome then
@@ -2952,7 +3089,7 @@ let emitC (decls : Decl list) : string * string list =
                     dictSet st.PodTid n ptid
                     (if isStamp then dictSet st.PodStamp n true)
                     (if hasRef then dictSet st.PodRef n true)
-                    (if not isStamp then dictSet st.PodArrTid n (freshTid st))
+                    dictSet st.PodArrTid n (freshTid st)
                     true
             | _ -> false
     for d in decls do
@@ -3042,6 +3179,19 @@ let emitC (decls : Decl list) : string * string list =
             let ts = string tid
             if (dictTryFind st.PodStamp n).IsSome then
                 let unitid = string (dictTryFind st.RecTid n).Value
+                vecAdd st.Reg ("  fpp_reg_pod_uni(" + ts + ", " + unitid + ");")
+                for fn2, ty in fts do
+                    let offx = "(uint32_t)offsetof(P_" + ts + ", " + sane fn2 + ")"
+                    (match podPrimKind ty with
+                     | Some k ->
+                         vecAdd st.Reg ("  fpp_reg_pod_slot(" + ts + ", " + offx
+                                        + ", '" + string k + "', 0);")
+                     | None when nestedPod ty ->
+                         vecAdd st.Reg ("  fpp_reg_pod_slot(" + ts + ", " + offx
+                                        + ", 'P', " + string (dictTryFind st.PodTid ty).Value + ");")
+                     | None ->
+                         vecAdd st.Reg ("  fpp_reg_pod_slot(" + ts + ", " + offx
+                                        + ", 'r', 0);"))
                 let up = vecNew<string> ()
                 let pk = vecNew<string> ()
                 let refFields =

@@ -337,18 +337,28 @@ blob), and the packed P_ layout exists only on the C stack, the by-value
 raw ABI and frame pods, with emitted per-pod fpp_pack_/fpp_unpack_
 helpers at every boundary.
 
-Open leftovers, none blocking, in rough value order:
+Leftovers closed 2026-08-07 (structcorners-gate.sh pins all three
+against fsi, mmc + semi):
 
-- Flat arrays of STAMP pods: stamp elements still ride uniform ref
-  arrays. Needs the runtime uniform-conversion link (fpp_pod_get/set
-  building/consuming uniform records via the pod field tables) so
-  generic array access cannot leak a packed blob.
-- `arr.[i].F <- v` (field set through an element) still traps: needs
-  byref-to-element or a read-modify-write lowering.
-- Mono pod fields inside plain RECORDS/classes are blob refs, not
-  inline storage; reads share the blob. Correct for immutable use;
-  a mutable struct field on a class is the corner to test against fsi
-  before anyone relies on it.
+- Flat arrays of STAMP pods: per-stamp SLOT TABLES (fpp_reg_pod_uni /
+  fpp_reg_pod_slot) let fpp_pod_get/set convert a flat element to/from
+  its uniform record at the generic boundary — a packed blob still
+  never escapes. NULL slots unpack as ZERO (Array.zeroCreate's seed).
+- `arr.[i].F <- v` mutates the element in place: prim fields cast-store
+  with the element base recomputed inside the store statement (the rhs
+  may collect), ref fields go through fpprt_write_ref at the element's
+  absolute offset, no-ref nested structs memcpy.
+- Mutable struct fields in plain RECORDS are .NET statics-in-miniature:
+  `h.P.X <- v` writes the record's own storage (lvalue, no clone);
+  reads, assignment INTO the field, and `{ h with .. }` all CLONE
+  (podFieldClone; stamps clone the uniform record).
+
+Still open, none load-bearing:
+
+- Pod fields on CLASSES keep blob-sharing reads (records got the clone
+  treatment; classes need field-type info threaded from ClassOwn).
+- Ref-holding NESTED struct fields written through `h.P.Q <- v` /
+  `arr.[i].Q <- v` trap (memcpy would skip the write barrier).
 - Byref "B" classification is conservative: uses inside nested lambdas
   and `&p` forwarding disqualify. A fixpoint over call positions widens
   it if profiles ever show the fallback allocating.
