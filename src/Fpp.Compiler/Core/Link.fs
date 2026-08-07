@@ -679,10 +679,19 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                 // pattern position parses as a list pattern
                 (let parts = n.Substring(7).Split ':'
                  match parts.Length with
-                 | 3 ->
+                 | 3 | 4 ->
                      let cls = parts.[0]
                      let memberName = parts.[1]
                      let tn = substName subst parts.[2]
+                     // 4-part marker: the member's OWN element instantiation
+                     // in signature order, "@k" splicing the chosen head's
+                     // arguments — a member generic beyond the class params
+                     let elems =
+                         if parts.Length = 4 then
+                             parts.[3].Split ',' |> Array.toList
+                             |> List.map (fun e ->
+                                 if e.StartsWith "@" then e else substName subst e)
+                         else []
                      // a one-parameter class keys on one head, a homogeneous
                      // two-parameter one on the pair
                      let byOne = dictTryFind instanceFns (instanceKey cls memberName [ tn ])
@@ -735,16 +744,24 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                              | None -> (match byHead with Some _ -> byHead | None -> byPattern ())
                      (match chosen with
                       | Some (fn, takesUnit) ->
+                          // "@k" placeholders expand to the chosen head's
+                          // own arguments (empty for a ground head like
+                          // `list`), yielding the member fn's instantiation
+                          let inst =
+                              if List.isEmpty elems then hdArgs
+                              else
+                                  elems |> List.collect (fun e ->
+                                      if e.StartsWith "@" then hdArgs else [ e ])
                           // Only a template needs the instantiation; an
                           // ordinary instance member is one body and naming
                           // it with arguments would stamp copies nobody asked
                           // for.
                           let needsInst =
                               (dictTryFind layoutDependent (fn.Path, fn.Offset)) = Some true
-                              && not (List.isEmpty hdArgs)
+                              && not (List.isEmpty inst)
                           let plain = EVar (fn, mono (TCon ("?", [])))
                           let r =
-                              if needsInst then stampRef fn (mono (TCon ("?", []))) hdArgs plain
+                              if needsInst then stampRef fn (mono (TCon ("?", []))) inst plain
                               else plain
                           // a value-like member (`static mempty = ...`) lifts
                           // as a function of unit, so the NAME applies it

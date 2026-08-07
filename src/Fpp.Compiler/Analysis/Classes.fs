@@ -22,6 +22,9 @@ let builtinPath = "(builtin)"
 type ClassDef =
     { Name : string
       Params : Var list
+      /// each parameter's declared KIND as an arity: 0 = a plain type,
+      /// n = a constructor of n arguments (`'f<_>` is 1)
+      ParamKinds : int list
       /// associated type names, in declaration order
       Assoc : string list
       /// superclass context: what an instance must also satisfy, and the
