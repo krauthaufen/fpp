@@ -86,6 +86,7 @@ let rec private encTy (t : Type) : Sx =
     | TCon (n, args) -> L (A "c" :: S n :: List.map encTy args)
     | TFun (a, b) -> L [ A "f"; encTy a; encTy b ]
     | TTuple ts -> L (A "t" :: List.map encTy ts)
+    | TApp (h, args) -> L (A "a" :: encTy h :: List.map encTy args)
 
 let private encConstraint (c : Constraint) : Sx =
     L [ A "k"; S c.Class; L (List.map encTy c.Args)
@@ -224,6 +225,7 @@ let rec private decTy (x : Sx) : Type =
     | L (A "c" :: S n :: args) -> TCon (n, List.map decTy args)
     | L [ A "f"; a; b ] -> TFun (decTy a, decTy b)
     | L (A "t" :: ts) -> TTuple (List.map decTy ts)
+    | L (A "a" :: h :: args) -> TApp (decTy h, List.map decTy args)
     | _ -> TCon ("?", [])
 
 let private decConstraint (x : Sx) : Constraint option =

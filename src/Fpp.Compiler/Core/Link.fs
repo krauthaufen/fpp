@@ -142,6 +142,7 @@ let private substScheme (inst : string list) (sch : Scheme) : Scheme =
             | TCon (n, args) -> TCon (n, List.map go args)
             | TFun (a, b) -> TFun (go a, go b)
             | TTuple ts -> TTuple (List.map go ts)
+            | TApp (h, args) -> TApp (go h, List.map go args)
         { Quantified = []; Constraints = []; Body = go sch.Body }
 
 let rec private mapExpr (f : Expr -> Expr) (e : Expr) : Expr =

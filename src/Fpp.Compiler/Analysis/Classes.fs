@@ -287,6 +287,7 @@ let substInst (sub : Dict<int, Type>) (t : Type) : Type =
         | TCon (n, args) -> TCon (n, List.map go args)
         | TFun (a, b) -> TFun (go a, go b)
         | TTuple ts -> TTuple (List.map go ts)
+        | TApp (h, args) -> TApp (go h, List.map go args)
     go t
 
 /// Every constraint entailed by this one: itself, its superclasses, and

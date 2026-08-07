@@ -169,6 +169,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | TCon (n, args) -> TCon (n, List.map go args)
                 | TFun (a, b) -> TFun (go a, go b)
                 | TTuple ts -> TTuple (List.map go ts)
+                | TApp (h, args) -> TApp (go h, List.map go args)
             go sch.Body, fresh, List.map (mapConstraint go) sch.Constraints
 
     /// Instantiate an IMPORTED scheme. Every variable is freshened, not just
@@ -190,6 +191,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | TCon (c, xs) -> TCon (c, List.map go xs)
             | TFun (a, b) -> TFun (go a, go b)
             | TTuple ts -> TTuple (List.map go ts)
+            | TApp (h, xs) -> TApp (go h, List.map go xs)
         let body = go sch.Body
         let cs = List.map (mapConstraint go) sch.Constraints
         let fresh =
@@ -220,6 +222,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TCon (c, xs) -> TCon (c, List.map go xs)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
+                    | TApp (h, xs) -> TApp (go h, List.map go xs)
                 go sch.Body, List.map (mapConstraint go) sch.Constraints)
 
     /// Substitute specific vars (by id) with given types, freshening nothing else.
@@ -237,6 +240,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TCon (c, xs) -> TCon (c, List.map go xs)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
+                    | TApp (h, xs) -> TApp (go h, List.map go xs)
                 refMapSet memo p r
                 r
         go t
@@ -1106,6 +1110,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TCon (c, xs) -> TCon (c, List.map go xs)
                     | TFun (a, b) -> TFun (go a, go b)
                     | TTuple ts -> TTuple (List.map go ts)
+                    | TApp (h, xs) -> TApp (go h, List.map go xs)
                 Some (go body)
             | _ -> None
         match n.NodeKind with

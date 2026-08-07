@@ -28,6 +28,13 @@ and Type =
     | TCon of string * Type list
     | TFun of Type * Type
     | TTuple of Type list
+    /// a CONSTRUCTOR VARIABLE applied to arguments: `'f<'a>`. The head is
+    /// always a TVar node; once the head solves to a constructor, `prune`
+    /// collapses the application into the TCon — a head bound to a
+    /// PARTIAL application (`Result<'e, _>` stored as TCon("Result",['e]))
+    /// collapses by appending, which is the whole partial-application
+    /// story. No type-level lambdas: heads never solve to TFun/TTuple.
+    | TApp of Type * Type list
 
 /// A class applied to types, optionally equating its associated types:
 /// `Add<'a,'b> with Result = 'a` is
@@ -84,6 +91,14 @@ let rec prune (t : Type) : Type =
             v.Link <- Some r
             r
         | None -> t
+    | TApp (h, args) ->
+        // a solved head collapses the application; a partial binding
+        // appends its stored prefix. NOT cached on the node (there is no
+        // var to cache on) — the collapse is cheap and trial-safe.
+        (match prune h with
+         | TCon (n, pargs) -> TCon (n, pargs @ args)
+         | TApp (h2, args2) -> TApp (h2, args2 @ args)
+         | hv -> if System.Object.ReferenceEquals (hv, h) then t else TApp (hv, args))
     | _ -> t
 
 /// The name of a type AT an instantiation: `Pair<float,int>` is the distinct
@@ -96,6 +111,8 @@ let rec typeConName (t : Type) : string =
     // Pair<int, Pair<int,int>> -> Pair$<int.Pair$<int.int>>
     | TCon (n, args) -> n + "$<" + String.concat "." (List.map typeConName args) + ">"
     | TVar v -> "#" + string v.Id
+    | TApp (h, args) ->
+        typeConName h + "$<" + String.concat "." (List.map typeConName args) + ">"
     // A tuple is a UNIFORM reference — the same conclusion arrays reached,
     // where a tuple element makes the array a plain `$ref` array whatever it
     // holds. So every tuple instantiation of a generic shares one body, and
@@ -137,6 +154,7 @@ let shallowHash (t : Type) : int =
     | TCon (n, args) -> (hash n * 31 + List.length args) * 4 + 2
     | TFun (_, _) -> 3
     | TTuple ts -> List.length ts * 4
+    | TApp (_, args) -> List.length args * 4 + 3
 
 let freeVars (t : Type) : Var list =
     let seen = refSetNew<Type> shallowHash
@@ -149,6 +167,7 @@ let freeVars (t : Type) : Var list =
             | TCon (_, args) -> List.iter go args
             | TFun (a, b) -> go a; go b
             | TTuple ts -> List.iter go ts
+            | TApp (h, args) -> go h; List.iter go args
     go t
     vecToList acc
 
@@ -163,6 +182,7 @@ let private occurs (v : Var) (t : Type) : bool =
             | TCon (_, args) -> List.exists go args
             | TFun (a, b) -> go a || go b
             | TTuple ts -> List.exists go ts
+            | TApp (h, args) -> go h || List.exists go args
     go t
 
 /// Clamp levels of all vars in t to at most `level` (link-time invariant
@@ -180,6 +200,7 @@ let private adjustLevels (trial : Trial option) (level : int) (t : Type) : unit 
             | TCon (_, args) -> List.iter go args
             | TFun (a, b) -> go a; go b
             | TTuple ts -> List.iter go ts
+            | TApp (h, args) -> go h; List.iter go args
     go t
 
 /// Pretty-print with 'a, 'b, ... assigned per call in order of appearance.
@@ -209,6 +230,8 @@ let typeString (t : Type) : string =
         | TTuple ts ->
             let s = String.concat " * " (List.map (go true) ts)
             if atom then "(" + s + ")" else s
+        | TApp (h, args) ->
+            go true h + "<" + String.concat ", " (List.map (go false) args) + ">"
     go false t
 
 let constraintVars (c : Constraint) : Var list =
@@ -233,6 +256,7 @@ let schemeString (sch : Scheme) : string =
         | TCon (_, args) -> List.iter collect args
         | TFun (a, b) -> collect a; collect b
         | TTuple ts -> List.iter collect ts
+        | TApp (h, args) -> collect h; List.iter collect args
     collect sch.Body
     for c in sch.Constraints do List.iter collect (constraintVars c |> List.map TVar)
     let rec go (atom : bool) (t : Type) : string =
@@ -246,6 +270,8 @@ let schemeString (sch : Scheme) : string =
         | TTuple ts ->
             let s = String.concat " * " (List.map (go true) ts)
             if atom then "(" + s + ")" else s
+        | TApp (h, args) ->
+            go true h + "<" + String.concat ", " (List.map (go false) args) + ">"
     go false sch.Body
     + (match sch.Constraints with
        | [] -> ""
@@ -343,6 +369,32 @@ let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 :
             Some ("type mismatch: " + typeString a + " vs " + typeString b)
         else
             List.zip x y |> List.tryPick (fun (p, q) -> unify p q)
+    // SPINE unification: a constructor variable applied to arguments
+    // meets a concrete application — the head binds to the constructor's
+    // untouched PREFIX (partial application), the trailing arguments
+    // unify pairwise. `'f<'a> ~ Result<string,int>` binds
+    // 'f := Result<string,_> and 'a := int.
+    | TApp (TVar v, args), TCon (n, cargs) | TCon (n, cargs), TApp (TVar v, args) ->
+        let k = List.length args
+        let nc = List.length cargs
+        if nc < k then
+            Some ("type mismatch: " + typeString a + " vs " + typeString b)
+        elif rigid v then
+            Some ("type mismatch: " + typeString (TVar v) + " vs " + n)
+        else
+            let prefix = TCon (n, List.truncate (nc - k) cargs)
+            let suffix = List.skip (nc - k) cargs
+            if occurs v prefix then
+                Some ("the type " + typeString prefix + " would contain itself")
+            else
+                adjustLevels trial v.Level prefix
+                noteVar trial v
+                v.Link <- Some prefix
+                List.zip args suffix |> List.tryPick (fun (x, y) -> unify x y)
+    | TApp (h1, a1), TApp (h2, a2) when List.length a1 = List.length a2 ->
+        (match unify h1 h2 with
+         | Some e -> Some e
+         | None -> List.zip a1 a2 |> List.tryPick (fun (x, y) -> unify x y))
     | _ ->
         Some ("type mismatch: " + typeString a + " vs " + typeString b)
 
@@ -464,6 +516,7 @@ type TypeState() =
                         | TCon (n, args) -> TCon (n, List.map go args)
                         | TFun (a, b) -> TFun (go a, go b)
                         | TTuple ts -> TTuple (List.map go ts)
+                        | TApp (h, args) -> TApp (go h, List.map go args)
                     refMapSet memo p r
                     r
             go s.Body, List.map (mapConstraint go) s.Constraints

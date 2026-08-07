@@ -51,6 +51,7 @@ let lint (decls : Decl list) : string list =
             | TCon (c, xs) -> TCon (c, List.map go xs)
             | TFun (a, b) -> TFun (go a, go b)
             | TTuple ts -> TTuple (List.map go ts)
+            | TApp (h, xs) -> TApp (go h, List.map go xs)
         go s.Body
 
     let litType (l : Lit) : Type =
