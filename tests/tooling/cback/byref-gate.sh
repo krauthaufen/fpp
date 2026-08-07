@@ -18,7 +18,7 @@ gcc -O1 -g -I"$rt" -I"$rt/gc/api" -I"$rt/gc/src" -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     -DGC_ATTRS="\"$rt/gc/api/mmc-attrs.h\"" -DGC_EMBEDDER="\"$rt/fpprt-embedder.h\"" \
     "$out/b.c" "$rt/build/mmc/fpprt.o" "$out/fpprt-lang.o" \
     "$rt/build/mmc/libwhippet.a" -lm -lpthread -o "$out/b"
-printf '11\n13\n2\n9\n110\n105\n' > "$out/want.txt"
+printf '11\n13\n2\n9\n110\n105\n7\n103\n' > "$out/want.txt"
 "$out/b" > "$out/got.txt"
 diff -u "$out/want.txt" "$out/got.txt" && echo "BYREF ALIASING OK (mmc)"
 gcc -O1 -g -I"$rt" -I"$rt/gc/api" -I"$rt/gc/src" -DNDEBUG -DGC_PRECISE_ROOTS=1 \

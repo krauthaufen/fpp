@@ -1371,6 +1371,16 @@ void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
     elemsz, FPPRT_KIND_POD_ARRAY, nrefs, adj, name });
 }
 
+void fpp_pod_barrier(V obj, uint32_t base, uint32_t podtid) {
+  struct fpp_pod_info_ *p = fpp_pod_info_(podtid);
+  if (!p) return;
+  for (uint32_t i = 0; i < p->nfields; i++)
+    if (p->fields[i].kind == 'r') {
+      uint32_t off = base + p->fields[i].off;
+      fpprt_write_ref(obj, off, fpprt_read_ref(obj, off));
+    }
+}
+
 void fpp_reg_pod_uni(uint32_t podtid, uint32_t unitid) {
   fpp_pod_ensure_(podtid)->unitid = unitid;
 }

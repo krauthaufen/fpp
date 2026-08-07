@@ -3698,7 +3698,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if pendingStruct then
                 vecAdd structNames name
                 dictSet structCtorFields name (instanceFields |> List.map (fun (v, _) -> v.Name))
-            vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map (fun (v, _) -> v.Name, "?"), false))
+            // field TYPE names travel with the class layout so the C
+            // backend can honor struct-field value semantics; a MUTABLE
+            // let's slot holds a CELL, marked "&" — the pod value is one
+            // dereference in
+            let clsFieldTy ((v : VarId), (sch : Scheme)) : string * string =
+                let tn =
+                    match prune sch.Body with
+                    | TCon (n2, []) -> n2
+                    | TCon (_, _) ->
+                        let r2 = typeConName (prune sch.Body)
+                        if r2.Contains "#" then "?" else r2
+                    | _ -> "?"
+                let cm = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then "&" else ""
+                v.Name, cm + tn
+            vecAdd decls (DRecord (name, tyParams, instanceFields |> List.map clsFieldTy, false))
 
             // ---- the constructor ----------------------------------------
             match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with

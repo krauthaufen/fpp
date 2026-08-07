@@ -353,12 +353,21 @@ against fsi, mmc + semi):
   reads, assignment INTO the field, and `{ h with .. }` all CLONE
   (podFieldClone; stamps clone the uniform record).
 
-Still open, none load-bearing:
+All three closed same day (structcorners + byref gates extended):
 
-- Pod fields on CLASSES keep blob-sharing reads (records got the clone
-  treatment; classes need field-type info threaded from ClassOwn).
-- Ref-holding NESTED struct fields written through `h.P.Q <- v` /
-  `arr.[i].Q <- v` trap (memcpy would skip the write barrier).
-- Byref "B" classification is conservative: uses inside nested lambdas
-  and `&p` forwarding disqualify. A fixpoint over call positions widens
-  it if profiles ever show the fallback allocating.
+- CLASSES: field TYPE names now travel on the class's DRecord (rendered
+  from the let/ctor schemes; a mutable let's cell-backed slot is marked
+  "&"). Reads and assignment through `$cellget`/`$cellset` clone; the
+  member-body lvalue `p.X <- v` mutates the blob the cell holds, in
+  place. Chain lookup walks ClassBase for inherited fields.
+- Nested-ref writes: `fpp_pod_barrier(obj, base, podtid)` re-stores the
+  ref leaves of a pod payload after a memcpy (the field table is
+  leaf-flattened, so nesting is covered) — record, array-element and
+  global paths all pay it.
+- Byref "B" widened by a FIXPOINT: a param whose uses are dispatch
+  shapes OR bare forwards into positions that are themselves "B"
+  qualifies; forwards must be FULL applications of real (non-intrinsic)
+  functions, and disqualification propagates until stable. Forwarding
+  chains (`deep -> incTwice -> inc2`) now pass one fat pair end to end.
+  Only nested-LAMBDA uses still force the view object — those are
+  correct, not conservative: a closure cannot hold a stack pair.

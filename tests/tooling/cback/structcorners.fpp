@@ -55,3 +55,24 @@ printfn "%d %d" h.P.X h2.P.X
 let mutable copy = h.P
 copy.Y <- 99
 printfn "%d %d" h.P.Y copy.Y
+
+[<Struct>]
+type CV = { mutable X : int; mutable Y : string }
+
+type Box(init : CV) =
+    let mutable p = init
+    member _.P
+        with get () = p
+        and set v = p <- v
+    member _.Bump () = p.X <- p.X + 1
+    member _.Show () = printfn "%d %s" p.X p.Y
+
+let b = Box { X = 1; Y = "a" }
+b.Bump ()
+b.Show ()
+let mutable c = b.P
+c.X <- 100
+b.Show ()
+printfn "%d" c.X
+b.P <- { X = 7; Y = "z" }
+b.Show ()

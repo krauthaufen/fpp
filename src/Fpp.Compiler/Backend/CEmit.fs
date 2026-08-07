@@ -533,10 +533,12 @@ let rec private patBinders (p : Pat) (acc : Vec<string * int>) : unit =
     | _ -> ()
 
 /// a param whose EVERY use is the byref deref/assign dispatch Lower emits
-/// travels as a FAT PAIR (container, offset) on the raw ABI — the view
-/// object never needs to exist at a direct call. Uses inside nested
-/// lambdas disqualify: the lambda body cannot reach the pair.
-let private byrefParam (pv : VarId) (body : Expr) : bool =
+/// — or a bare FORWARD into another function's argument position — can
+/// travel as a FAT PAIR (container, offset) on the raw ABI. Uses inside
+/// nested lambdas disqualify: the lambda body cannot reach the pair.
+/// Returns (dispatchHits, total, insideLambdas, forwardPositions).
+let private byrefUses (pv : VarId) (body : Expr)
+                      : int * int * int * ((string * int) * int) list =
     let isP (e : Expr) =
         match e with
         | EVar (v2, _) | EVarI (v2, _, _) ->
@@ -545,6 +547,7 @@ let private byrefParam (pv : VarId) (body : Expr) : bool =
     let mutable total = 0
     let mutable hits = 0
     let mutable inLam = 0
+    let fwds = vecNew<(string * int) * int> ()
     walkE (fun e ->
         (if isP e then total <- total + 1)
         match e with
@@ -556,10 +559,17 @@ let private byrefParam (pv : VarId) (body : Expr) : bool =
                EApp (EField (b, "Set", "ByRefView"), [ _ ]),
                EFieldSet (c, "Value", "ByRefCell", _)) when isP a && isP b && isP c ->
             hits <- hits + 3
+        | EApp ((EVar (cv, _) | EVarI (cv, _, _)), args) ->
+            // the position only counts as a FORWARD when the call is a
+            // FULL application of a real (non-intrinsic) function — the
+            // fixpoint checks arity and ABI against these
+            args |> List.iteri (fun i a2 ->
+                if isP a2 then
+                    vecAdd fwds (((cv.Path, cv.Offset), i * 65536 + List.length args)))
         | ELam (_, lb) ->
             walkE (fun e2 -> if isP e2 then inLam <- inLam + 1) lb
         | _ -> ()) body
-    hits > 0 && hits = total && inLam = 0
+    hits, total, inLam, vecToList fwds
 
 /// variables a lambda BODY references that are bound OUTSIDE it
 let private freeVarsOf (ps : (VarId * Scheme) list) (body : Expr)
@@ -695,22 +705,53 @@ let private recFieldsOf (st : CSt) (name : string) : string list option =
         | Some fs when not (List.isEmpty fs) -> Some fs
         | other -> other
 
-/// a PLAIN record's pod-typed field: reading it must COPY (the .NET
-/// struct-field model). Some -> the clone call for that pod kind.
+/// a field's recorded TYPE name, walking the class base chain (a base
+/// field read through a derived owner still names its type)
+let private recFieldTyChain (st : CSt) (owner0 : string) (fname : string)
+                            : string option =
+    let mutable cur = if (dictTryFind st.RecFieldTys owner0).IsSome then owner0 else recBase owner0
+    let mutable res = None
+    let mutable steps = 0
+    while res.IsNone && cur <> "" && steps < 32 do
+        (match dictTryFind st.RecFieldTys cur with
+         | Some fts ->
+             (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+              | Some ty -> res <- Some ty
+              | None -> ())
+         | None -> ())
+        if res.IsNone then
+            (match dictTryFind st.ClassBase cur with
+             | Some b -> cur <- b
+             | None -> cur <- "")
+        steps <- steps + 1
+    res
+
+/// a record's or class's pod-typed DIRECT-slot field: reading it must
+/// COPY (the .NET struct-field model). Some -> the clone call.
 let private podFieldClone (st : CSt) (owner : string) (fname : string)
                           : string option =
     if (dictTryFind st.PodTid owner).IsSome then None
-    elif (dictTryFind st.ClassOwn owner).IsSome
-         || (dictTryFind st.ClassBase owner).IsSome then None
     else
-        match dictTryFind st.RecFieldTys owner with
-        | Some fts ->
-            (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
-             | Some ty when (dictTryFind st.PodTid ty).IsSome ->
-                 if (dictTryFind st.PodStamp ty).IsSome
-                 then Some "fpp_rec_clone" else Some "fpp_pod_clone"
-             | _ -> None)
-        | None -> None
+        match recFieldTyChain st owner fname with
+        | Some ty when not (ty.StartsWith "&") && (dictTryFind st.PodTid ty).IsSome ->
+            if (dictTryFind st.PodStamp ty).IsSome
+            then Some "fpp_rec_clone" else Some "fpp_pod_clone"
+        | _ -> None
+
+/// a class's MUTABLE pod field: the slot holds a CELL whose value is the
+/// pod. Some (podName, cloneCall).
+let private podCellOf (st : CSt) (fld : Expr) : (string * string) option =
+    match fld with
+    | EField (_, fn, owner) | EFieldSet (_, fn, owner, _) ->
+        (match recFieldTyChain st owner fn with
+         | Some ty when ty.StartsWith "&" ->
+             let t2 = ty.Substring 1
+             if (dictTryFind st.PodTid t2).IsSome then
+                 Some (t2, (if (dictTryFind st.PodStamp t2).IsSome
+                            then "fpp_rec_clone" else "fpp_pod_clone"))
+             else None
+         | _ -> None)
+    | _ -> None
 
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     let trap (what : string) : int =
@@ -885,10 +926,20 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f c
         let d = slot f
         stmt f (sref d + " = fpp_cell_get(" + sref x + ");")
+        (match podCellOf st c with
+         | Some (_, cl) ->
+             // a mutable struct field READS as a copy
+             stmt f ("if (" + sref d + ") " + sref d + " = " + cl + "(" + sref d + ");")
+         | None -> ())
         d
     | EApp (EUnknown "$cellset", [ c; v ]) ->
         let x = emitE st f c
         let y = emitE st f v
+        (match podCellOf st c with
+         | Some (_, cl) ->
+             // struct assignment COPIES into the field's storage
+             stmt f ("if (" + sref y + ") " + sref y + " = " + cl + "(" + sref y + ");")
+         | None -> ())
         stmt f ("fpp_cell_set(" + sref x + ", " + sref y + ");")
         unitV ()
     | EApp (EUnknown "refEq", [ a; b ]) ->
@@ -1585,15 +1636,50 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                 Some (snd (vecGet f.RawVars (-i - 1)))
             | _ -> None
         (match r with
+         | EApp (EUnknown "$cellget", [ fldE ]) when (podCellOf st fldE).IsSome ->
+             // `p.X <- v` inside a member: p is a mutable class field —
+             // a CELL holding the struct blob. LVALUE: mutate the blob
+             // the cell holds, in place, no clone.
+             let cx = emitE st f fldE
+             let b = slot f
+             stmt f (sref b + " = fpp_cell_get(" + sref cx + ");")
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             if (dictTryFind st.PodStamp owner).IsSome then
+                 (match fts |> List.tryFindIndex (fun (a2, _) -> a2 = fname) with
+                  | Some fidx ->
+                      let x = emitE st f rhs
+                      stmt f ("fpprt_write_ref(" + sref b + ", FPPOFF(" + string (fidx + 1)
+                              + "), " + sref x + ");")
+                  | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             else
+                 (match fts |> List.tryPick (fun (a2, ty) -> if a2 = fname then Some ty else None) with
+                  | Some ty ->
+                      let lv = "((P_" + string tid + " *)((char *)" + sref b + " + FPP_POD_OFF))->" + sane fname
+                      (match podPrimKind ty with
+                       | Some k ->
+                           let atom = emitRawAs st f (podRawKind k) rhs
+                           stmt f (lv + " = (" + podCTy k + ")" + atom + ";")
+                       | None when (dictTryFind st.StructFieldTys ty).IsSome
+                                   && (dictTryFind st.PodTid ty).IsSome
+                                   && recBase ty = ty ->
+                           let x = emitE st f rhs
+                           let stid = (dictTryFind st.PodTid ty).Value
+                           stmt f ("memcpy(&" + lv + ", (char *)" + sref x
+                                   + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                           if (dictTryFind st.PodRef ty).IsSome then
+                               stmt f ("fpp_pod_barrier(" + sref b + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                       + string tid + ", " + sane fname + "), " + string stid + ");")
+                       | None ->
+                           let x = emitE st f rhs
+                           stmt f ("fpprt_write_ref(" + sref b + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                   + string tid + ", " + sane fname + "), " + sref x + ");"))
+                  | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             unitV ()
          | EField (hr, pf, powner) when
                (dictTryFind st.PodTid powner).IsNone
-               && (dictTryFind st.ClassOwn powner).IsNone
-               && (dictTryFind st.ClassBase powner).IsNone
-               && (match dictTryFind st.RecFieldTys powner with
-                   | Some fts2 ->
-                       (match fts2 |> List.tryPick (fun (a2, ty2) -> if a2 = pf then Some ty2 else None) with
-                        | Some ty2 -> (dictTryFind st.PodTid ty2).IsSome
-                        | None -> false)
+               && (match recFieldTyChain st powner pf with
+                   | Some ty2 ->
+                       not (ty2.StartsWith "&") && (dictTryFind st.PodTid ty2).IsSome
                    | None -> false) ->
              // `h.P.X <- v`: P is a mutable record field of struct type —
              // an LVALUE — so the write lands in the record's own storage
@@ -1622,21 +1708,18 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                            stmt f (lv + " = (" + podCTy k + ")" + atom + ";")
                        | None when (dictTryFind st.StructFieldTys ty).IsSome
                                    && (dictTryFind st.PodTid ty).IsSome
-                                   && recBase ty = ty
-                                   && (dictTryFind st.PodRef ty).IsNone ->
+                                   && recBase ty = ty ->
                            let x = emitE st f rhs
                            let stid = (dictTryFind st.PodTid ty).Value
                            stmt f ("memcpy(&" + lv + ", (char *)" + sref x
                                    + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
-                       | None when (dictTryFind st.StructFieldTys ty).IsNone
-                                   || recBase ty <> ty ->
+                           if (dictTryFind st.PodRef ty).IsSome then
+                               stmt f ("fpp_pod_barrier(" + sref b + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                       + string tid + ", " + sane fname + "), " + string stid + ");")
+                       | None ->
                            let x = emitE st f rhs
                            stmt f ("fpprt_write_ref(" + sref b + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
-                                   + string tid + ", " + sane fname + "), " + sref x + ");")
-                       | None ->
-                           // ref-holding nested struct: the memcpy would
-                           // skip the write barrier — not yet supported
-                           stmt f ("fpp_not_emitted(" + cstr ("nested-ref fieldset " + owner + "." + fname) + ");"))
+                                   + string tid + ", " + sane fname + "), " + sref x + ");"))
                   | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
              unitV ()
          | EIndex (nm, arr2, ix2) when (dictTryFind st.PodArrTid nm).IsSome ->
@@ -1659,13 +1742,16 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                                + sane fname + " = (" + podCTy k + ")" + atom + ";")
                    | None when (dictTryFind st.StructFieldTys ty).IsSome
                                && (dictTryFind st.PodTid ty).IsSome
-                               && recBase ty = ty
-                               && (dictTryFind st.PodRef ty).IsNone ->
+                               && recBase ty = ty ->
                        let x = emitE st f rhs
                        let stid = (dictTryFind st.PodTid ty).Value
                        stmt f ("memcpy(" + elemB + " + offsetof(P_" + string tid
                                + ", " + sane fname + "), (char *)" + sref x
                                + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                       if (dictTryFind st.PodRef ty).IsSome then
+                           stmt f ("fpp_pod_barrier(" + sref av + ", (uint32_t)(FPPOFF(2) + (size_t)"
+                                   + ia + " * sizeof(P_" + string tid + ") + offsetof(P_" + string tid
+                                   + ", " + sane fname + ")), " + string stid + ");")
                    | None when (podPrimKind ty).IsNone
                                && ((dictTryFind st.StructFieldTys ty).IsNone
                                    || recBase ty <> ty) ->
@@ -1736,6 +1822,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                        let stid = (dictTryFind st.PodTid ty).Value
                        stmt f ("memcpy(&" + lv + ", (char *)" + sref x
                                + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                       if (dictTryFind st.PodRef ty).IsSome then
+                           stmt f ("fpp_pod_barrier(" + g + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                   + string tid + ", " + sane fname + "), " + string stid + ");")
                    | None ->
                        let x = emitE st f rhs
                        stmt f ("fpprt_write_ref(" + g + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
@@ -2699,6 +2788,11 @@ and private brArg (st : CSt) (f : CFn) (a : Expr) : string =
         // the local is cell-promoted (the Set closure mutates it): alias
         // the CELL and the view never exists
         sref (dictTryFind f.Locals (xv.Path, xv.Offset)).Value + ", FPPOFF(1)"
+    | EVar (fv, _) | EVarI (fv, _, _) when
+          (dictTryFind f.BrOff (fv.Path, fv.Offset)).IsSome ->
+        // forwarding `&p`: the pair passes straight through
+        sref (dictTryFind f.Locals (fv.Path, fv.Offset)).Value + ", "
+        + (dictTryFind f.BrOff (fv.Path, fv.Offset)).Value
     | _ -> sref (emitE st f a) + ", 1"
 
 and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
@@ -3098,13 +3192,40 @@ let emitC (decls : Decl list) : string * string list =
         | _ -> ()
     // RE-register call ABIs now that pod classification exists: struct
     // params and returns travel BY VALUE from here on
+    // byref fat-pair candidates, then a FIXPOINT: a bare forward of a
+    // candidate param into a NON-candidate position disqualifies it —
+    // repeat until nothing changes, so forwarding CHAINS qualify whole
+    let brCand = dictNew<(string * int) * int, ((string * int) * int) list> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam (ps, fbody)) ->
+            ps |> List.iteri (fun i ((pv2 : VarId), _) ->
+                let hits, total, inLam, fwds = byrefUses pv2 fbody
+                if inLam = 0 && total > 0 && total = hits + List.length fwds then
+                    dictSet brCand ((v.Path, v.Offset), i) fwds)
+        | _ -> ()
+    let mutable brChanged = true
+    while brChanged do
+        brChanged <- false
+        for key, fwds in dictPairs brCand do
+            let ok =
+                fwds |> List.forall (fun (ck, code) ->
+                    let ai = code / 65536
+                    let nargs = code % 65536
+                    (dictTryFind st.Fns ck) = Some nargs
+                    && (dictTryFind st.Intrin ck).IsNone
+                    && (dictTryFind brCand (ck, ai)).IsSome)
+            if not ok then
+                dictRemove brCand key
+                brChanged <- true
     for d in decls do
         match d with
         | DLet (_, v, sc, ELam (ps, fbody)) ->
             let pk0, rk = fnSigCompute (fun tn -> dictTryFind st.PodTid tn) ps sc
             let pk =
-                List.map2 (fun (k : string) ((pv2 : VarId), _) ->
-                    if k = "V" && byrefParam pv2 fbody then "B" else k) pk0 ps
+                List.mapi (fun i (k : string) ->
+                    if k = "V" && (dictTryFind brCand ((v.Path, v.Offset), i)).IsSome
+                    then "B" else k) pk0
             dictSet st.FnSig (v.Path, v.Offset) pk
             dictSet st.FnRet (v.Path, v.Offset) rk
         | DLet (_, v, sc, _) ->

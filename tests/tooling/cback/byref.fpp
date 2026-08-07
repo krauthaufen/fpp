@@ -27,3 +27,20 @@ let go =
     let rr = { M = 5 }
     print (readTwice &rr.M rr)
     print rr.M
+
+// FORWARDING: `&p` passed on — the fat pair travels through whole chains
+let inc2 (x : byref<int>) = x <- x + 1
+let incTwice (x : byref<int>) =
+    inc2 &x
+    inc2 &x
+let deep (x : byref<int>) =
+    incTwice &x
+    inc2 &x
+
+let go2 =
+    let mutable q = 5
+    incTwice &q
+    print q
+    let fr = { M = 100 }
+    deep &fr.M
+    print fr.M

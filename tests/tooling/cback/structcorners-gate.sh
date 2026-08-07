@@ -19,7 +19,7 @@ gcc -O1 -g -I"$rt" -I"$rt/gc/api" -I"$rt/gc/src" -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     "$out/m.c" "$rt/build/mmc/fpprt.o" "$out/fpprt-lang.o" \
     "$rt/build/mmc/libwhippet.a" -lm -lpthread -o "$out/m"
 "$out/m" > "$out/got.txt"
-printf '42 2\n55 fiftyfive\n0\ntrue\nv42 x3\nv10 changed\n42 2\n42 77\n2 99\n' > "$out/want.txt"
+printf '42 2\n55 fiftyfive\n0\ntrue\nv42 x3\nv10 changed\n42 2\n42 77\n2 99\n2 a\n2 a\n100\n7 z\n' > "$out/want.txt"
 if diff -u "$out/want.txt" "$out/got.txt"; then
     echo "STRUCT CORNERS OK (fsi-pinned, mmc)"
 else
