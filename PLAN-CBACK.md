@@ -286,6 +286,23 @@ for every struct, stack residency, in-place mutation, aliasing byrefs —
    keeps its documented divergence; the C backend is the reference
    semantics from here.
 
+   SHIPPED (differently than planned, both backends aligned): Lower's
+   `fixAddrs` now builds a ByRefView {Get;Set} closure pair over the
+   location — a TRUE ALIAS on every backend, copy-in/copy-out only for
+   property targets (where .NET copies too). On top of that the C backend
+   has the zero-alloc fast path of point 3: a param whose every use is the
+   byref dispatch gets sig kind "B" = (V container, uintptr_t off); direct
+   calls DECODE a fresh `&loc` view syntactically back to (cell, FPPOFF(1))
+   / (record, field off) / the promoted local's cell, and pass (object, 1)
+   for dynamic targets — offset 1 selects view-or-cell dispatch in
+   fpp_br_get/set. The runtime intrinsics (weak.TryGetTarget, cwt.TryGetValue)
+   write out-params through fpp_byref_set, never raw slot stores — that
+   distinction cost a day: a raw store into what is now sometimes a VIEW
+   corrupts the view and the stale local surfaces far away (the [AMap]
+   filterA vcall-on-non-object crash). Uses inside nested lambdas and
+   `&p` forwarding disqualify a param from "B" (conservative; a fixpoint
+   over call positions could widen it later).
+
 5. ARRAYS AND FIELDS OF STRUCTS ARE FLAT EVERYWHERE. Ref-holding struct
    arrays: a new fpprt array kind carrying elem size + per-element ref
    offsets (the embedder walks elements). Struct fields inside records/

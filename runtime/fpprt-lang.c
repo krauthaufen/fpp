@@ -357,6 +357,20 @@ void fpp_byref_set(V p, V v) {
   fpprt_write_ref(p, FPPOFF(1), v);
 }
 
+V fpp_byref_get(V p) {
+  if (fpp_brview_tid_ && fpp_is_tid(p, fpp_brview_tid_)) {
+    /* fields: [Get; Set] — Get at slot 1 */
+    FPPRT_FRAME(f, 2);
+    f_slots[0] = p;
+    f_slots[1] = VUNIT;
+    V getter = fpprt_read_ref(f_slots[0], FPPOFF(1));
+    V r = fpp_apply(getter, &f_slots[1], 1);
+    FPPRT_LEAVE(f);
+    return r;
+  }
+  return fpprt_read_ref(p, FPPOFF(1));
+}
+
 V fpp_append(V a, V b) {
   FPPRT_FRAME(f, 3);
   f_slots[0] = a; f_slots[1] = b; f_slots[2] = 0;

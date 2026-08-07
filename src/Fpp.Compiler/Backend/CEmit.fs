@@ -120,6 +120,7 @@ type CFn =
       PodOfRaw : Dict<string, int>           // 'S' local C name -> pod tid
       PodFrame : Vec<string * int>           // frame-pod entries: name, tid
       mutable NRaw : int
+      BrOff : Dict<string * int, string>     // fat-byref params: offset atom
       RawDecls : Vec<string> }               // C declarations for raw locals
 
 let private slot (f : CFn) : int =
@@ -524,6 +525,35 @@ let rec private patBinders (p : Pat) (acc : Vec<string * int>) : unit =
     | PCons (a, b) -> patBinders a acc; patBinders b acc
     | PAs (q, v, _) -> patBinders q acc; vecAdd acc (v.Path, v.Offset)
     | _ -> ()
+
+/// a param whose EVERY use is the byref deref/assign dispatch Lower emits
+/// travels as a FAT PAIR (container, offset) on the raw ABI — the view
+/// object never needs to exist at a direct call. Uses inside nested
+/// lambdas disqualify: the lambda body cannot reach the pair.
+let private byrefParam (pv : VarId) (body : Expr) : bool =
+    let isP (e : Expr) =
+        match e with
+        | EVar (v2, _) | EVarI (v2, _, _) ->
+            v2.Path = pv.Path && v2.Offset = pv.Offset
+        | _ -> false
+    let mutable total = 0
+    let mutable hits = 0
+    let mutable inLam = 0
+    walkE (fun e ->
+        (if isP e then total <- total + 1)
+        match e with
+        | EIf (ETypeTest ("ByRefView", a),
+               EApp (EField (b, "Get", "ByRefView"), [ ELit LUnit ]),
+               EField (c, "Value", "ByRefCell")) when isP a && isP b && isP c ->
+            hits <- hits + 3
+        | EIf (ETypeTest ("ByRefView", a),
+               EApp (EField (b, "Set", "ByRefView"), [ _ ]),
+               EFieldSet (c, "Value", "ByRefCell", _)) when isP a && isP b && isP c ->
+            hits <- hits + 3
+        | ELam (_, lb) ->
+            walkE (fun e2 -> if isP e2 then inLam <- inLam + 1) lb
+        | _ -> ()) body
+    hits > 0 && hits = total && inLam = 0
 
 /// variables a lambda BODY references that are bound OUTSIDE it
 let private freeVarsOf (ps : (VarId * Scheme) list) (body : Expr)
@@ -1028,6 +1058,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  List.map2 (fun k a ->
                      if k = "u" then (emitE st f a |> ignore; None)
                      elif k = "V" then Some (sref (emitE st f a))
+                     elif k = "B" then Some (brArg st f a)
                      elif (k : string).StartsWith "S" then
                          Some (podArg (k.Substring 1) a)
                      else Some (emitRawAs st f (charAt k 0) a)) pk args
@@ -1366,6 +1397,26 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g -> stmt f (g + " = " + sref x + ";")
              | None -> stmt f ("fpp_not_emitted(" + cstr ("assign " + v.Name) + ");"))
+        unitV ()
+    | EIf (ETypeTest ("ByRefView", (EVar (brv, _) | EVarI (brv, _, _))),
+           EApp (EField (_, "Get", "ByRefView"), [ ELit LUnit ]),
+           EField (_, "Value", "ByRefCell")) when
+          (dictTryFind f.BrOff (brv.Path, brv.Offset)).IsSome ->
+        // byref READ through a fat-pair param: no view, no dispatch
+        let ci = (dictTryFind f.Locals (brv.Path, brv.Offset)).Value
+        let o = (dictTryFind f.BrOff (brv.Path, brv.Offset)).Value
+        let d = slot f
+        stmt f (sref d + " = fpp_br_get(" + sref ci + ", " + o + ");")
+        d
+    | EIf (ETypeTest ("ByRefView", (EVar (brv, _) | EVarI (brv, _, _))),
+           EApp (EField (_, "Set", "ByRefView"), [ rv ]),
+           EFieldSet (_, "Value", "ByRefCell", _)) when
+          (dictTryFind f.BrOff (brv.Path, brv.Offset)).IsSome ->
+        // byref WRITE through a fat-pair param
+        let x = emitE st f rv
+        let ci = (dictTryFind f.Locals (brv.Path, brv.Offset)).Value
+        let o = (dictTryFind f.BrOff (brv.Path, brv.Offset)).Value
+        stmt f ("fpp_br_set(" + sref ci + ", " + o + ", " + sref x + ");")
         unitV ()
     | EIf (c, t, e2) ->
         let ck, ca = emitRaw st f c
@@ -2095,6 +2146,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
                RawVars = vecNew<char * string> (); NRaw = 0
                PodOfRaw = dictNew<string, int> ()
                PodFrame = vecNew<string * int> ()
+               BrOff = dictNew<string * int, string> ()
                RawDecls = vecNew<string> () }
     frees |> List.iteri (fun i k ->
         let l = slot lf
@@ -2163,6 +2215,7 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
         let arg (i : int) (src : string) =
             let k = List.item i pk
             if k = "V" then src
+            elif k = "B" then src + ", 1"
             elif k.StartsWith "S" then
                 "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
             else unboxExpr (charAt k 0) src
@@ -2237,6 +2290,7 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
                     let k = List.item i pk
                     let src = "args[" + string i + "]"
                     if k = "V" then src
+                    elif k = "B" then src + ", 1"
                     elif k.StartsWith "S" then
                         "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
                     else unboxExpr (charAt k 0) src)
@@ -2267,6 +2321,7 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
               RawVars = vecNew<char * string> (); NRaw = 0
               PodOfRaw = dictNew<string, int> ()
               PodFrame = vecNew<string * int> ()
+              BrOff = dictNew<string * int, string> ()
               RawDecls = vecNew<string> () }
     // the emitted ABI: registry-driven so every call site agrees
     let pk, rk =
@@ -2282,7 +2337,13 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
         |> List.map2 (fun k (pn, pv) -> pn, pv, k) pk
     for pn, pv, k in pnames do
         let isCell = (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome
-        if (k : string).StartsWith "S" && not isCell then
+        if (k : string) = "B" then
+            // fat byref: the container roots in a slot, the offset stays raw
+            let l = slot f
+            stmt f (sref l + " = " + pn + "_c;")
+            dictSet f.BrOff (pv.Path, pv.Offset) (pn + "_o")
+            dictSet f.Locals (pv.Path, pv.Offset) l
+        elif k.StartsWith "S" && not isCell then
             // a struct param arrives BY VALUE: the C parameter IS the
             // caller's copy — it becomes the stack local, and the frame
             // learns about it BEFORE anything can allocate
@@ -2325,8 +2386,12 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
         else
             pnames
             |> List.map (fun (pn, _, k) ->
-                let t = sigCTy k
-                if withNames then t + " " + pn else t)
+                if k = "B" then
+                    (if withNames then "V " + pn + "_c, uintptr_t " + pn + "_o"
+                     else "V, uintptr_t")
+                else
+                    let t = sigCTy k
+                    if withNames then t + " " + pn else t)
             |> String.concat ", "
     let rAtom =
         if rk = "V" then sref (emitE st f body)
@@ -2391,6 +2456,41 @@ and private emitIntrinFn (st : CSt) (name : string) (nps : int) (tag : string) :
 /// emit e as a RAW value when rawKindOf admits it; ('V', "F[i]") otherwise.
 /// Atoms are pure (locals, literals, casts of those) — all computation goes
 /// through statements, so sequencing matches the V emitter exactly.
+/// a `B`-kind call argument as its zero-alloc fat pair "container, offset".
+/// A fresh `&location` view is DECODED back to the location: a cell target
+/// aliases the cell, a record field aliases (receiver, field offset), a
+/// cell-promoted local aliases its cell. Anything else travels as
+/// (object, 1) — offset 1 marks dynamic view-or-cell dispatch.
+and private brArg (st : CSt) (f : CFn) (a : Expr) : string =
+    match a with
+    | ELet (false, rv, _, src,
+            ERecord ("ByRefView",
+                     [ ("Get", ELam (_, EApp (EUnknown "$cellget", [ (EVar (rv2, _) | EVarI (rv2, _, _)) ])))
+                       ("Set", _) ])) when
+          rv2.Path = rv.Path && rv2.Offset = rv.Offset ->
+        sref (emitE st f src) + ", FPPOFF(1)"
+    | ELet (false, rv, _, recv,
+            ERecord ("ByRefView",
+                     [ ("Get", ELam (_, EField ((EVar (rv2, _) | EVarI (rv2, _, _)), fname, owner)))
+                       ("Set", _) ])) when
+          rv2.Path = rv.Path && rv2.Offset = rv.Offset
+          && (dictTryFind st.PodTid owner).IsNone
+          && (match dictTryFind st.RecFields owner with
+              | Some fs -> List.contains fname fs
+              | None -> false) ->
+        let fs = (dictTryFind st.RecFields owner).Value
+        let idx = List.findIndex (fun x -> x = fname) fs
+        sref (emitE st f recv) + ", FPPOFF(" + string (1 + idx) + ")"
+    | ERecord ("ByRefView", [ ("Get", ELam (_, (EVar (xv, _) | EVarI (xv, _, _)))); ("Set", _) ]) when
+          (dictTryFind f.Cells (xv.Path, xv.Offset)).IsSome
+          && (match dictTryFind f.Locals (xv.Path, xv.Offset) with
+              | Some i -> i >= 0
+              | None -> false) ->
+        // the local is cell-promoted (the Set closure mutates it): alias
+        // the CELL and the view never exists
+        sref (dictTryFind f.Locals (xv.Path, xv.Offset)).Value + ", FPPOFF(1)"
+    | _ -> sref (emitE st f a) + ", 1"
+
 and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
     match rawKindOf st f e with
     | None -> 'V', sref (emitE st f e)
@@ -2515,6 +2615,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                 List.map2 (fun (k : string) a ->
                     if k = "u" then (emitE st f a |> ignore; None)
                     elif k = "V" then Some (sref (emitE st f a))
+                    elif k = "B" then Some (brArg st f a)
                     elif k.StartsWith "S" then
                         let x = emitE st f a
                         Some ("*(P_" + k.Substring 1 + " *)((char *)" + sref x
@@ -2763,8 +2864,11 @@ let emitC (decls : Decl list) : string * string list =
     // params and returns travel BY VALUE from here on
     for d in decls do
         match d with
-        | DLet (_, v, sc, ELam (ps, _)) ->
-            let pk, rk = fnSigCompute (fun tn -> dictTryFind st.PodTid tn) ps sc
+        | DLet (_, v, sc, ELam (ps, fbody)) ->
+            let pk0, rk = fnSigCompute (fun tn -> dictTryFind st.PodTid tn) ps sc
+            let pk =
+                List.map2 (fun (k : string) ((pv2 : VarId), _) ->
+                    if k = "V" && byrefParam pv2 fbody then "B" else k) pk0 ps
             dictSet st.FnSig (v.Path, v.Offset) pk
             dictSet st.FnRet (v.Path, v.Offset) rk
         | _ -> ()

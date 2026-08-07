@@ -226,6 +226,22 @@ V fpp_append(V a, V b);                     /* list @ list */
  * ByRefCell holds the value — the intrinsics dispatch like compiled code */
 void fpp_reg_brview(uint32_t tid);
 void fpp_byref_set(V p, V v);
+V fpp_byref_get(V p);
+
+/* the FAT-PAIR byref the compiler passes on direct calls: (container, off).
+ * off == 1 -> dynamic view-or-cell dispatch on the object; container == 0
+ * -> off is a raw pointer to a caller frame slot (C stack, never moves);
+ * else a heap object and a byte offset into it. */
+static inline V fpp_br_get(V c, uintptr_t o) {
+  if (o == 1) return fpp_byref_get(c);
+  if (!c) return *(V *)o;
+  return fpprt_read_ref(c, (uint32_t)o);
+}
+static inline void fpp_br_set(V c, uintptr_t o, V v) {
+  if (o == 1) { fpp_byref_set(c, v); return; }
+  if (!c) { *(V *)o = v; return; }   /* frame slots are roots: no barrier */
+  fpprt_write_ref(c, (uint32_t)o, v);
+}
 
 /* class inheritance: `:? Base` must accept derived and stamped tids */
 void fpp_reg_parent(uint32_t tid, uint32_t parent);
