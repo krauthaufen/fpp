@@ -80,6 +80,17 @@ type Expr<_> =
 
 ## Higher-kinded types
 
+SHIPPED 2026-08-07 (commit 6310352; gate tests/tooling/hkt-gate.sh runs the
+probe on BOTH backends): `class Mappable<'f<_>>` with instances at list /
+option / array works end to end, constraint-polymorphic functions stamp per
+constructor AND per element, and forwarding chains of constrained generics
+compose. v1 boundaries: no prelude container classes yet (a member name
+owns its symbol globally — `map` as a class member would capture every
+bare `map`; users declare their own classes), kind checking is arity-level,
+aliases eta-reduce at instance heads (`instance Mappable<option>` names
+Option), and multi-arity constructor names do not split per arity through
+a constructor variable.
+
 Kinds are declared by shape in the type-parameter list: `'m<_>` is a
 constructor of one argument, `'t<_<_>, _>` takes a constructor and a type
 (monad transformers). Kinds capped at rank ~2 in v1 for the sake of error

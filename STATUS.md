@@ -44,6 +44,16 @@ own runtime, and it is no longer the junior one:
   customer: adaptive cache eviction). Runtime groundwork is in; the
   engine is not.
 
+**Higher-kinded types shipped** (2026-08-07): `class C<'f<_>>` — the
+representation is one new `TApp` case with spine unification (a head bound
+to a PARTIAL application makes trailing `_` partial application fall out
+of prune), the class layer needed only per-param kinds and alias
+eta-reduction, and the backends needed NOTHING: a use at a known
+constructor stamps through the same machinery type arguments always used,
+with the member's own element generics carried to stamping through the
+class-use markers. Gate: tests/tooling/hkt-gate.sh (parity, both
+backends). See DESIGN.md "Higher-kinded types" for v1 boundaries.
+
 The roadmap from here, in intended order: threading (PLAN-THREADS order of
 work), the GC watch/sweep uniqueness query for adaptive, direct wasm-linear
 emission (drop the C compiler for users), then the deferred perf passes.
