@@ -114,6 +114,20 @@ on cases — no dictionary needed there, the vtable travels in the value;
 the constraint only has to license interface member resolution on the
 branch's skolem.
 
+**Dot-members shipped** (2026-08-07, gated in tests/tooling/clsmem.fpp on
+both backends): a class declares `member 'v.ScaledBy : 's -> 'v` — the
+receiver names the class parameter the call anchors on, so one class can
+anchor different members on different parameters, and `static` stays for
+the unanchored. Instances write the F#-style receiver
+(`member v.ScaledBy s = ...`) with no annotation — the head types it.
+At a use, `vec.ScaledBy k` resolves like any dot access, EXCEPT that a
+member the receiver's own type declares always wins; only then do the
+classes answer, owing the constraint exactly as a bare member use would.
+A no-argument member reads as a property (`xs.Count`). Dot-members are
+inherently receiver-scoped, so they need no `open` and cannot collide —
+and they dispatch through EXISTENTIAL slots too: `v.Count` inside a
+`Boxed of 'c when Sized<'c>` branch reads the packed witness.
+
 Kinds are declared by shape in the type-parameter list: `'m<_>` is a
 constructor of one argument, `'t<_<_>, _>` takes a constructor and a type
 (monad transformers). Kinds capped at rank ~2 in v1 for the sake of error
