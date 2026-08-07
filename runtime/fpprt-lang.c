@@ -341,6 +341,22 @@ int fpp_isa(V x, uint32_t tid) {
   return 0;
 }
 
+static uint32_t fpp_brview_tid_ = 0;
+void fpp_reg_brview(uint32_t tid) { fpp_brview_tid_ = tid; }
+
+void fpp_byref_set(V p, V v) {
+  if (fpp_brview_tid_ && fpp_is_tid(p, fpp_brview_tid_)) {
+    /* fields: [Get; Set] — Set at slot 2 */
+    FPPRT_FRAME(f, 1);
+    f_slots[0] = v;
+    V setter = fpprt_read_ref(p, FPPOFF(2));
+    fpp_apply(setter, &f_slots[0], 1);
+    FPPRT_LEAVE(f);
+    return;
+  }
+  fpprt_write_ref(p, FPPOFF(1), v);
+}
+
 V fpp_append(V a, V b) {
   FPPRT_FRAME(f, 3);
   f_slots[0] = a; f_slots[1] = b; f_slots[2] = 0;

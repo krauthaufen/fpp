@@ -222,6 +222,11 @@ void fpp_reg_eq(uint32_t tid, int slot);    /* class's Equals vt slot */
 void fpp_reg_hash(uint32_t tid, int slot);  /* class's GetHashCode vt slot */
 V fpp_append(V a, V b);                     /* list @ list */
 
+/* byref out-params: a ByRefView {Get;Set} aliases a location, a plain
+ * ByRefCell holds the value — the intrinsics dispatch like compiled code */
+void fpp_reg_brview(uint32_t tid);
+void fpp_byref_set(V p, V v);
+
 /* class inheritance: `:? Base` must accept derived and stamped tids */
 void fpp_reg_parent(uint32_t tid, uint32_t parent);
 int fpp_isa(V x, uint32_t tid);

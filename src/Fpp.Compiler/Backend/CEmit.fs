@@ -2364,7 +2364,7 @@ and private emitIntrinFn (st : CSt) (name : string) (nps : int) (tag : string) :
          + String.concat ", " (List.init nps (fun _ -> "V")) + ");")
     let body =
         if tag = "weak.TryGetTarget" then
-            "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  V t = w ? fpprt_weak_get(w) : 0;\n  if (!t) return TAGI(0);\n  fpprt_write_ref(p1, FPPOFF(1), t);\n  return TAGI(1);"
+            "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  V t = w ? fpprt_weak_get(w) : 0;\n  if (!t) return TAGI(0);\n  fpp_byref_set(p1, t);\n  return TAGI(1);"
         elif tag = "weak.Target" then
             "  V w = fpprt_read_ref(p0, FPPOFF(1));\n  return w ? fpprt_weak_get(w) : 0;"
         elif tag = "weak.IsAlive" then
@@ -2372,8 +2372,8 @@ and private emitIntrinFn (st : CSt) (name : string) (nps : int) (tag : string) :
         elif tag = "cwt.TryGetValue" then
             // two source args arrive TUPLED in p1 unless the decl untuples
             (if nps >= 3
-             then "  V t = fpp_cwt_tryget(p0, p1);\n  if (!t) return TAGI(0);\n  fpprt_write_ref(p2, FPPOFF(1), t);\n  return TAGI(1);"
-             else "  V k = fpp_tuple_get(p1, 0);\n  V o = fpp_tuple_get(p1, 1);\n  V t = fpp_cwt_tryget(p0, k);\n  if (!t) return TAGI(0);\n  fpprt_write_ref(o, FPPOFF(1), t);\n  return TAGI(1);")
+             then "  V t = fpp_cwt_tryget(p0, p1);\n  if (!t) return TAGI(0);\n  fpp_byref_set(p2, t);\n  return TAGI(1);"
+             else "  V k = fpp_tuple_get(p1, 0);\n  V o = fpp_tuple_get(p1, 1);\n  V t = fpp_cwt_tryget(p0, k);\n  if (!t) return TAGI(0);\n  fpp_byref_set(o, t);\n  return TAGI(1);")
         elif tag = "cwt.Add" then
             (if nps >= 3
              then "  fpp_cwt_add(p0, p1, p2);\n  return VUNIT;"
@@ -2408,7 +2408,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
         | EVar (v, _) | EVarI (v, _, _) ->
             let i = (dictTryFind f.Locals (v.Path, v.Offset)).Value
             let k, n = vecGet f.RawVars (-i - 1)
-            k, n
+            (k, n)
         | EPrim (op0, [ a; b ]) ->
             let op, k0 = opBase op0
             (match op with
@@ -2421,7 +2421,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                      stmt f (n + " = (int32_t)(" + aa + " " + op + " " + ab + ");")
                  else
                      stmt f (n + " = " + aa + " " + op + " " + ab + ";")
-                 rk, n
+                 (rk, n)
              | "<" | ">" | "<=" | ">=" | "=" | "<>" ->
                  let cop = if op = "=" then "==" elif op = "<>" then "!=" else op
                  let okind =
@@ -2436,12 +2436,15 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                  let ab = emitRawAs st f okind b
                  let n = rawNew f 'i'
                  stmt f (n + " = " + aa + " " + cop + " " + ab + ";")
-                 'i', n
+                 ('i', n)
              | "&&&" | "|||" | "^^^" | "<<<" | ">>>" ->
                  let cop =
-                     if op = "&&&" then "&" elif op = "|||" then "|"
-                     elif op = "^^^" then "^"
-                     elif op = "<<<" then "<<" else ">>"
+                     match op with
+                     | "&&&" -> "&"
+                     | "|||" -> "|"
+                     | "^^^" -> "^"
+                     | "<<<" -> "<<"
+                     | _ -> ">>"
                  let shift = op = "<<<" || op = ">>>"
                  let aa = emitRawAs st f rk a
                  let ab = emitRawAs st f (if shift then 'i' else rk) b
@@ -2451,24 +2454,24 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                      stmt f (n + " = " + aa + " >> " + ab + ";")
                  else
                      stmt f (n + " = " + aa + " " + cop + " " + ab + ";")
-                 rk, n
+                 (rk, n)
              | "&&" | "||" ->
                  let aa = emitRawAs st f 'i' a
                  let ab = emitRawAs st f 'i' b
                  let n = rawNew f 'i'
                  stmt f (n + " = " + aa + " " + op + " " + ab + ";")
-                 'i', n
+                 ('i', n)
              | _ -> 'V', sref (emitE st f e))
         | EPrim (op0, [ a ]) when op0.StartsWith "u~~~" ->
             let aa = emitRawAs st f rk a
             let n = rawNew f rk
             stmt f (n + " = ~" + aa + ";")
-            rk, n
+            (rk, n)
         | EPrim (op0, [ a ]) when op0.StartsWith "u-" || op0.StartsWith "~-" ->
             let aa = emitRawAs st f rk a
             let n = rawNew f rk
             stmt f (n + " = -" + aa + ";")
-            rk, n
+            (rk, n)
         | EPrim (op0, [ a ]) when (mathBase op0).IsSome ->
             let b = (mathBase op0).Value
             let cfn =
@@ -2478,7 +2481,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let aa = emitRawAs st f 'f' a
             let n = rawNew f 'f'
             stmt f (n + " = " + cfn + "(" + aa + ");")
-            'f', n
+            ('f', n)
         | EField (r, fname, owner) ->
             let tid = (dictTryFind st.PodTid owner).Value
             let podVarOf (rv : VarId) =
@@ -2504,7 +2507,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let n = rawNew f rk
             stmt f (n + " = fpp_arr_get_" + suffix + "(" + sref av
                     + ", (size_t)" + ia + ");")
-            rk, n
+            (rk, n)
         | EApp ((EVar (v, _) | EVarI (v, _, _)), args) ->
             let fn = (dictTryFind st.FnName (v.Path, v.Offset)).Value
             let pk, _ = (fnAbiOf st (v.Path, v.Offset)).Value
@@ -2520,7 +2523,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                 |> List.choose (fun x -> x)
             let n = rawNew f rk
             stmt f (n + " = " + fn + "(" + String.concat ", " atoms + ");")
-            rk, n
+            (rk, n)
         | EIf (c, t, e2) ->
             let ck, ca = emitRaw st f c
             let n = rawNew f rk
@@ -2532,7 +2535,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let ea = emitRawAs st f rk e2
             stmt f (n + " = " + ea + ";")
             stmt f ("}")
-            rk, n
+            (rk, n)
         | ESeq xs ->
             let rec go (rest : Expr list) : char * string =
                 match rest with
@@ -2554,7 +2557,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                     stmt f (sref d + " = fpp_to_i64(" + a1 + ");")
                 let n = rawNew f rk
                 stmt f (n + " = " + unboxExpr rk (sref d) + ";")
-                rk, n
+                (rk, n)
             else
                 rk, convExpr k1 rk a1
         | _ -> 'V', sref (emitE st f e)
@@ -3067,6 +3070,9 @@ let emitC (decls : Decl list) : string * string list =
      | None -> ())
     (match dictTryFind st.VSlot ("IDisposable", "Dispose") with
      | Some sl -> vecAdd vtReg ("  fpp_vt_set(FPP_TID_ENUM, " + string sl + ", fpp_enum_dispose);")
+     | None -> ())
+    (match dictTryFind st.RecTid "ByRefView" with
+     | Some vt -> vecAdd vtReg ("  fpp_reg_brview(" + string vt + ");")
      | None -> ())
     // a NULL receiver on these slots is the EMPTY SEQUENCE (null is the
     // empty list) — fpp_vcall needs the program's slot numbers to know

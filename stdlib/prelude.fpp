@@ -776,6 +776,11 @@ type Result<'t, 'e> =
 /// parameter written `byref` reads as its value, and a `ref` cell reads as
 /// itself, which is exactly how the two behave in F#.
 type ByRefCell<'a> = { mutable Value : 'a }
+/// A TRUE byref: an aliasing view over a location. `&location` builds one;
+/// reads and writes through it reach the original. A plain ByRefCell still
+/// flows wherever a byref is expected (out-params, `ref` identity), so
+/// every byref deref dispatches on which of the two arrived.
+type ByRefView<'a> = { Get : (unit -> 'a); Set : ('a -> unit) }
 type byref<'a> = ByRefCell<'a>
 type outref<'a> = ByRefCell<'a>
 type Ref<'a> = ByRefCell<'a>

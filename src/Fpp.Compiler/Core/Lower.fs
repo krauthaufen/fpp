@@ -778,15 +778,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      match tokensOf n |> List.tryHead with
                      | Some t when t.Text = "null" -> ELit LNull
                      | _ -> note (offsetOf n) "literal")
-            // a byref READ: inference marked it, and the value is what the
-            // cell holds
+            // a byref READ: a VIEW aliases the original location, a plain
+            // cell holds the value — dispatch inline on which arrived
             | IdentExpr when
                     (match tokensOf n |> List.tryHead with
                      | Some t -> (dictTryFind fieldOwners t.Offset) = Some "$deref"
                      | None -> false) ->
                 (match tokensOf n |> List.tryHead |> Option.bind (fun t -> dictTryFind useDefs t.Offset) with
                  | Some d ->
-                     EField (EVar (varIdOf d, schemeOf d), "Value", "ByRefCell")
+                     let pv = EVar (varIdOf d, schemeOf d)
+                     EIf (ETypeTest ("ByRefView", pv),
+                          EApp (EField (pv, "Get", "ByRefView"), [ ELit LUnit ]),
+                          EField (pv, "Value", "ByRefCell"))
                  | None -> note (offsetOf n) "byref read")
             | IdentExpr when
                     tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "base") ->
@@ -1459,7 +1462,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | _ -> None)
                                   | _ -> None
                           (match byrefTarget with
-                           | Some cell -> EFieldSet (cell, "Value", "ByRefCell", lowerExpr (GNode r))
+                           | Some cell ->
+                               let rv = lowerExpr (GNode r)
+                               EIf (ETypeTest ("ByRefView", cell),
+                                    EApp (EField (cell, "Set", "ByRefView"), [ rv ]),
+                                    EFieldSet (cell, "Value", "ByRefCell", rv))
                            | None ->
                           match indexSetter with
                            | Some (fn, recv, i) -> EApp (fn, [ recv; i; lowerExpr (GNode r) ])
@@ -3790,56 +3797,57 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// byref does; what it is NOT is an alias — a callee reaching the same
     /// location another way does not see the write until the call returns.
     let mutable addrSeq = 0
+    // `&location` is a TRUE ALIAS: a ByRefView { Get; Set } closure pair
+    // over the location. Reads and writes through the byref go to the
+    // ORIGINAL location, immediately visible both ways — .NET semantics.
+    // The old copy-in/copy-out survives ONLY for targets .NET itself
+    // cannot address (property results): there F# also copies.
     let rec fixAddrs (e : Expr) : Expr =
         match e with
-        | EApp (f, args) when
-                args |> List.exists (fun a ->
-                    match a with
-                    | EApp (EUnknown "$addr", [ _ ]) -> true
-                    // a .NET-style call passes a TUPLE, so the address sits
-                    // one level in
-                    | ETuple xs -> xs |> List.exists (fun x -> match x with EApp (EUnknown "$addr", [ _ ]) -> true | _ -> false)
-                    | _ -> false) ->
-            let f2 = fixAddrs f
-            let cells = vecNew<VarId * Expr> ()
+        | EApp (EUnknown "$addr", [ target0 ]) ->
+            let target = fixAddrs target0
             let anon = mono (TCon ("?", []))
-            let takeAddr (a : Expr) : Expr =
-                match a with
-                | EApp (EUnknown "$addr", [ target ]) ->
-                    addrSeq <- addrSeq + 1
-                    let v = { Path = path; Offset = 91000000 + addrSeq; Name = "_addr" + string addrSeq }
-                    vecAdd cells (v, fixAddrs target)
-                    EVar (v, anon)
-                | other -> fixAddrs other
-            let args2 =
-                args
-                |> List.map (fun a ->
-                    match a with
-                    | ETuple xs -> ETuple (List.map takeAddr xs)
-                    | other -> takeAddr other)
             addrSeq <- addrSeq + 1
-            let resV = { Path = path; Offset = 92000000 + addrSeq; Name = "_addrRes" + string addrSeq }
-            let writeBack =
-                vecToList cells
-                |> List.choose (fun (v, target) ->
-                    let read = EField (EVar (v, anon), "Value", "ByRefCell")
-                    match target with
-                    | EVar (tv, _) -> Some (EAssign (tv, read))
-                    | EField (recv, fn, owner) -> Some (EFieldSet (recv, fn, owner, read))
-                    // `&x` on class `let mutable` state: the field holds the
-                    // CELL, the write-back goes into it
-                    | EApp (EUnknown "$cellget", [ fld ]) ->
-                        Some (EApp (EUnknown "$cellset", [ fld; read ]))
-                    | _ -> None)
-            let body =
-                ELet (false, resV, anon, EApp (f2, args2),
-                      ESeq (writeBack @ [ EVar (resV, anon) ]))
-            vecToList cells
-            |> List.rev
-            |> List.fold
-                (fun acc (v, target) ->
-                    ELet (false, v, anon, ERecord ("ByRefCell", [ "Value", target ]), acc))
-                body
+            let uv = { Path = path; Offset = 93000000 + addrSeq; Name = "_bru" + string addrSeq }
+            let nv = { Path = path; Offset = 94000000 + addrSeq; Name = "_brv" + string addrSeq }
+            let view (getBody : Expr) (setBody : Expr) : Expr =
+                ERecord ("ByRefView",
+                         [ "Get", ELam ([ uv, anon ], getBody)
+                           "Set", ELam ([ nv, anon ], setBody) ])
+            (match target with
+             | EVar (tv, tsch) ->
+                 // aliasing a LOCAL: the closures capture the variable; the
+                 // backends' capture analysis turns it into a shared cell
+                 view (EVar (tv, tsch)) (EAssign (tv, EVar (nv, anon)))
+             | EField (recv, fn, owner) ->
+                 addrSeq <- addrSeq + 1
+                 let rv = { Path = path; Offset = 95000000 + addrSeq; Name = "_brr" + string addrSeq }
+                 ELet (false, rv, anon, recv,
+                       view (EField (EVar (rv, anon), fn, owner))
+                            (EFieldSet (EVar (rv, anon), fn, owner, EVar (nv, anon))))
+             | EApp (EUnknown "$cellget", [ fld ]) ->
+                 addrSeq <- addrSeq + 1
+                 let rv = { Path = path; Offset = 95000000 + addrSeq; Name = "_brr" + string addrSeq }
+                 ELet (false, rv, anon, fld,
+                       view (EApp (EUnknown "$cellget", [ EVar (rv, anon) ]))
+                            (EApp (EUnknown "$cellset", [ EVar (rv, anon); EVar (nv, anon) ])))
+             | EIndex (k, arr, ix) ->
+                 addrSeq <- addrSeq + 1
+                 let av = { Path = path; Offset = 95000000 + addrSeq; Name = "_bra" + string addrSeq }
+                 addrSeq <- addrSeq + 1
+                 let iv = { Path = path; Offset = 95000000 + addrSeq; Name = "_bri" + string addrSeq }
+                 ELet (false, av, anon, arr,
+                       ELet (false, iv, anon, ix,
+                             view (EIndex (k, EVar (av, anon), EVar (iv, anon)))
+                                  (EIndexSet (k, EVar (av, anon), EVar (iv, anon), EVar (nv, anon)))))
+             | other ->
+                 // not addressable (a property result): copy-in/copy-out,
+                 // which is what .NET does here too. The view wraps a
+                 // private mutable — writes land in the copy.
+                 addrSeq <- addrSeq + 1
+                 let cv = { Path = path; Offset = 96500000 + addrSeq; Name = "_brc" + string addrSeq }
+                 ELet (false, cv, anon, other,
+                       view (EVar (cv, anon)) (EAssign (cv, EVar (nv, anon)))))
         | EApp (f, args) -> EApp (fixAddrs f, List.map fixAddrs args)
         | ELam (ps, b) -> ELam (ps, fixAddrs b)
         | ELet (r, v, sc, rhs, b) -> ELet (r, v, sc, fixAddrs rhs, fixAddrs b)
