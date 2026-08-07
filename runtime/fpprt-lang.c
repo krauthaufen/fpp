@@ -1373,6 +1373,19 @@ V fpp_pod_box(uint32_t tid, uint32_t size) {
   return fpprt_alloc(tid);            /* zeroed by the allocator */
 }
 
+V fpp_rec_clone(V rec) {
+  uint32_t tid = fpprt_typeid(rec);
+  unsigned n = fpp_tfields_[tid];
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = rec;
+  V b = fpprt_alloc(tid);
+  for (unsigned i = 0; i < n; i++)
+    fpprt_write_ref(b, (uint32_t)((i + 1) * sizeof(V)),
+                    fpprt_read_ref(f_slots[0], (uint32_t)((i + 1) * sizeof(V))));
+  FPPRT_LEAVE(f);
+  return b;
+}
+
 V fpp_pod_clone(V blob) {
   uint32_t tid = fpprt_typeid(blob);
   uint32_t sz = fpp_pod_info_(tid)->size;

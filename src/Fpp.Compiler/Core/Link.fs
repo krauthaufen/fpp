@@ -240,15 +240,33 @@ let stampRecords (decls : Decl list) : Decl list =
                 | Some (baseName, args) when not (List.isEmpty args) ->
                     (match templates |> List.tryFind (fun (n, _) -> n = baseName) with
                      | Some (_, (ps, fs, st)) when ps.Length = args.Length ->
+                         // a field type may EMBED parameters — "KV$<int.'a>"
+                         // — so substitution walks the string, not just the
+                         // whole-variable case
+                         let substIn (t : string) : string =
+                             if not (t.Contains "'") then t
+                             else
+                                 let idc (ch : char) =
+                                     (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                                     || (ch >= '0' && ch <= '9') || ch = '_'
+                                 let out = vecNew<string> ()
+                                 let mutable k = 0
+                                 while k < strLen t do
+                                     if substr t k 1 = "'" then
+                                         let mutable j = k + 1
+                                         while j < strLen t && idc (charAt t j) do j <- j + 1
+                                         let nm = t.Substring (k + 1, j - k - 1)
+                                         (match ps |> List.tryFindIndex (fun p -> p = nm) with
+                                          | Some i -> vecAdd out (List.item i args)
+                                          | None -> vecAdd out ("'" + nm))
+                                         k <- j
+                                     else
+                                         vecAdd out (substr t k 1)
+                                         k <- k + 1
+                                 String.concat "" (vecToList out)
                          let fs2 =
                              fs
-                             |> List.map (fun (f, t) ->
-                                 if t.StartsWith "'" then
-                                     let v = t.Substring 1
-                                     match ps |> List.tryFindIndex (fun p -> p = v) with
-                                     | Some i -> f, List.item i args
-                                     | None -> f, t
-                                 else f, t)
+                             |> List.map (fun (f, t) -> f, substIn t)
                          vecAdd stamped (DRecord (name, [], fs2, st))
                      | _ -> ())
                 | _ -> ()

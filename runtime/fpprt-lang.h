@@ -446,6 +446,7 @@ void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
                          const char *name);
 V fpp_pod_box(uint32_t tid, uint32_t size);          /* zeroed blob */
 V fpp_pod_clone(V blob);                             /* fresh copy */
+V fpp_rec_clone(V rec);                              /* uniform shallow copy */
 V fpp_pod_get(V a, size_t i, uint32_t elemtid);      /* flat elem -> blob */
 void fpp_pod_set(V a, size_t i, V blob);             /* blob -> flat elem */
 int fpp_pod_eq(V a, V b);

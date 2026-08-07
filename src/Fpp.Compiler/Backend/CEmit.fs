@@ -60,7 +60,10 @@ type CSt =
       PodRef : Dict<string, bool>            // flat struct HOLDS REFS
                                              // (stack+blob only, no C ABI)
       PodArrTid : Dict<string, int>          // struct -> flat-array tid
-      PodGlobals : Dict<string * int, int>   // pod-typed globals -> pod tid
+      PodGlobals : Dict<string * int, string> // pod-typed globals -> pod name
+      PodStamp : Dict<string, bool>          // pod is a STAMP: heap rep is
+                                             // the UNIFORM record; packed
+                                             // layout exists only on stack
       Typedefs : Vec<string>                 // C typedefs for blittable structs
       FnSig : Dict<string * int, string list> // per-param storage kinds
                                              // "V"/"u"/prim char/"S<tid>"
@@ -174,9 +177,7 @@ let private boxRaw (f : CFn) (k : char) (atom : string) : int =
     if k = 'V' then stmt f (sref d + " = " + atom + ";")
     elif k = 'S' then
         let tid = (dictTryFind f.PodOfRaw atom).Value
-        stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
-        stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, &" + atom
-                + ", sizeof(P_" + string tid + "));")
+        stmt f (sref d + " = fpp_pack_" + string tid + "(&" + atom + ");")
     elif k = 'l' then stmt f (sref d + " = fpp_box_i64(" + atom + ");")
     elif k = 'v' then stmt f (sref d + " = fpp_box_i64((int64_t)" + atom + ");")
     elif k = 'f' then stmt f (sref d + " = fpp_box_f64(" + atom + ");")
@@ -287,7 +288,10 @@ let private podRawKind (k : char) : char =
 /// the pod-struct tid a CONCRETE scheme names, if any
 let private schemePodName (sc : Scheme) : string option =
     match prune sc.Body with
-    | TCon (n, _) -> Some n
+    | TCon (n, []) -> Some n
+    | TCon (_, _) ->
+        let n2 = typeConName (prune sc.Body)
+        if n2.Contains "#" then None else Some n2
     | _ -> None
 
 /// the raw kind a CONCRETE monomorphized type stores at, or None (uniform)
@@ -782,11 +786,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g ->
                  let d = slot f
-                 if (dictTryFind st.PodGlobals (v.Path, v.Offset)).IsSome then
-                     // reading a struct static COPIES it — the .NET model
-                     stmt f (sref d + " = fpp_pod_clone(" + g + ");")
-                 else
-                     stmt f (sref d + " = " + g + ";")
+                 (match dictTryFind st.PodGlobals (v.Path, v.Offset) with
+                  | Some pn ->
+                      // reading a struct static COPIES it — the .NET model
+                      if (dictTryFind st.PodStamp pn).IsSome then
+                          stmt f (sref d + " = fpp_rec_clone(" + g + ");")
+                      else stmt f (sref d + " = fpp_pod_clone(" + g + ");")
+                  | None -> stmt f (sref d + " = " + g + ";"))
                  d
              | None ->
                  match dictTryFind st.Fns (v.Path, v.Offset) with
@@ -1058,7 +1064,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                               (-(dictTryFind f.Locals (av.Path, av.Offset)).Value - 1))
                  | _ ->
                      let x = emitE st f a
-                     "*(P_" + tid + " *)((char *)" + sref x + " + FPP_POD_OFF)"
+                     "fpp_unpackv_" + tid + "(" + sref x + ")"
              let atoms =
                  List.map2 (fun k a ->
                      if k = "u" then (emitE st f a |> ignore; None)
@@ -1083,9 +1089,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  let n = podLocalNew f tid
                  stmt f (n + " = " + callx + ";")
                  let d = slot f
-                 stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
-                 stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, &" + n
-                         + ", sizeof(P_" + string tid + "));")
+                 stmt f (sref d + " = fpp_pack_" + string tid + "(&" + n + ");")
                  d
              else
                  let n = rawNew f (charAt rk 0)
@@ -1332,8 +1336,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let tid = (dictTryFind st.PodTid (schemePodName sc).Value).Value
         let x = emitE st f rhs
         let n = podLocalNew f tid
-        stmt f ("memcpy(&" + n + ", (char *)" + sref x + " + FPP_POD_OFF, sizeof(P_"
-                + string tid + "));")
+        stmt f ("fpp_unpack_" + string tid + "(" + sref x + ", &" + n + ");")
         vecAdd f.RawVars ('S', n)
         dictSet f.Locals (v.Path, v.Offset) (-(vecLen f.RawVars))
         emitE st f body
@@ -1401,9 +1404,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let x = emitE st f rhs
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g ->
-                 if (dictTryFind st.PodGlobals (v.Path, v.Offset)).IsSome then
-                     stmt f (g + " = fpp_pod_clone(" + sref x + ");")
-                 else stmt f (g + " = " + sref x + ";")
+                 (match dictTryFind st.PodGlobals (v.Path, v.Offset) with
+                  | Some pn ->
+                      if (dictTryFind st.PodStamp pn).IsSome then
+                          stmt f (g + " = fpp_rec_clone(" + sref x + ");")
+                      else stmt f (g + " = fpp_pod_clone(" + sref x + ");")
+                  | None -> stmt f (g + " = " + sref x + ";"))
              | None -> stmt f ("fpp_not_emitted(" + cstr ("assign " + v.Name) + ");"))
         unitV ()
     | EIf (ETypeTest ("ByRefView", (EVar (brv, _) | EVarI (brv, _, _))),
@@ -1475,7 +1481,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         for x in List.rev vs do
             stmt f (sref d + " = fpp_cons(" + sref x + ", " + sref d + ");")
         d
-    | ERecord (name, fs) when (dictTryFind st.PodTid name).IsSome ->
+    | ERecord (name, fs) when
+          (dictTryFind st.PodTid name).IsSome
+          && (dictTryFind st.PodStamp name).IsNone ->
         // a blittable struct VALUE: flat C payload behind a blob header
         let tid = (dictTryFind st.PodTid name).Value
         let pn = "P_" + string tid
@@ -1505,6 +1513,26 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              | None ->
                  stmt f ("fpp_not_emitted(" + cstr ("pod field " + name + "." + fn2) + ");"))
         d
+    | EField (r, fname, owner) when
+          (dictTryFind st.PodTid owner).IsSome
+          && (dictTryFind st.PodStamp owner).IsSome ->
+        // a STAMP struct read through its UNIFORM blob: fields live in
+        // V slots; a nested mono flat struct copies out (value read)
+        let fts = (dictTryFind st.StructFieldTys owner).Value
+        (match fts |> List.tryFindIndex (fun (a, _) -> a = fname) with
+         | Some idx ->
+             let ty = snd (List.item idx fts)
+             let x = emitE st f r
+             let d = slot f
+             let src = "fpprt_read_ref(" + sref x + ", FPPOFF(" + string (idx + 1) + "))"
+             if (podPrimKind ty).IsNone
+                && (dictTryFind st.StructFieldTys ty).IsSome
+                && (dictTryFind st.PodTid ty).IsSome
+                && recBase ty = ty then
+                 stmt f (sref d + " = fpp_pod_clone(" + src + ");")
+             else stmt f (sref d + " = " + src + ";")
+             d
+         | None -> trap ("pod field " + owner + "." + fname))
     | EField (r, fname, owner) when (dictTryFind st.PodTid owner).IsSome ->
         // reaching here means the field is a NESTED blittable struct
         // (primitive fields took the raw path above): copy the sub-payload
@@ -1558,6 +1586,21 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                    | None ->
                        let x = emitE st f rhs
                        stmt f (nm + "." + sane fname + " = " + sref x + ";"))
+              | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             unitV ()
+         | EVar (rv, _) | EVarI (rv, _, _) when
+               (dictTryFind st.PodGlobals (rv.Path, rv.Offset)).IsSome
+               && (dictTryFind st.GlobalOf (rv.Path, rv.Offset)).IsSome
+               && (dictTryFind st.PodStamp owner).IsSome ->
+             // a STAMP struct static: the storage is the uniform record —
+             // write the field's V slot (barriered; the blob is heap)
+             let g = (dictTryFind st.GlobalOf (rv.Path, rv.Offset)).Value
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             (match fts |> List.tryFindIndex (fun (a, _) -> a = fname) with
+              | Some idx ->
+                  let x = emitE st f rhs
+                  stmt f ("fpprt_write_ref(" + g + ", FPPOFF(" + string (idx + 1)
+                          + "), " + sref x + ");")
               | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
              unitV ()
          | EVar (rv, _) | EVarI (rv, _, _) when
@@ -2251,7 +2294,7 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
             if k = "V" then src
             elif k = "B" then src + ", 1"
             elif k.StartsWith "S" then
-                "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
+                "fpp_unpackv_" + k.Substring 1 + "(" + src + ")"
             else unboxExpr (charAt k 0) src
         let extra =
             if arity <= 1 then []
@@ -2261,9 +2304,8 @@ and private vtWrapper (st : CSt) (mv : VarId) : string =
             if rk = "V" then "  (void)args;\n  return " + callx + ";"
             elif rk.StartsWith "S" then
                 let tid = rk.Substring 1
-                "  (void)args;\n  P_" + tid + " r_ = " + callx + ";\n  V b_ = fpprt_alloc("
-                + tid + ");\n  memcpy((char *)b_ + FPP_POD_OFF, &r_, sizeof(P_" + tid
-                + "));\n  return b_;"
+                "  (void)args;\n  P_" + tid + " r_ = " + callx
+                + ";\n  return fpp_pack_" + tid + "(&r_);"
             else "  (void)args;\n  return " + boxExpr (charAt rk 0) callx + ";"
         vecAdd st.Out
             ("static V " + w + "(V self, V *args) {\n" + bodyx + "\n}")
@@ -2326,7 +2368,7 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
                     if k = "V" then src
                     elif k = "B" then src + ", 1"
                     elif k.StartsWith "S" then
-                        "*(P_" + k.Substring 1 + " *)((char *)" + src + " + FPP_POD_OFF)"
+                        "fpp_unpackv_" + k.Substring 1 + "(" + src + ")"
                     else unboxExpr (charAt k 0) src)
         let callx = fn + "(" + String.concat ", " psx + ")"
         let bodyx =
@@ -2334,8 +2376,7 @@ and private fnCloGlobal (st : CSt) (v : VarId) : string =
             elif rk.StartsWith "S" then
                 let tid = rk.Substring 1
                 "  (void)self; (void)args;\n  P_" + tid + " r_ = " + callx
-                + ";\n  V b_ = fpprt_alloc(" + tid + ");\n  memcpy((char *)b_ + FPP_POD_OFF, &r_, sizeof(P_"
-                + tid + "));\n  return b_;"
+                + ";\n  return fpp_pack_" + tid + "(&r_);"
             else "  (void)self; (void)args;\n  return " + boxExpr (charAt rk 0) callx + ";"
         vecAdd st.Out
             ("static V " + code + "(V self, V *args) {\n" + bodyx + "\n}")
@@ -2430,9 +2471,9 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
     let rAtom =
         if rk = "V" then sref (emitE st f body)
         elif rk.StartsWith "S" then
-            // return the struct BY VALUE: copy out of the result blob
+            // return the struct BY VALUE: unpack out of the result blob
             let r = emitE st f body
-            "*(P_" + rk.Substring 1 + " *)((char *)" + sref r + " + FPP_POD_OFF)"
+            "fpp_unpackv_" + rk.Substring 1 + "(" + sref r + ")"
         else emitRawAs st f (charAt rk 0) body
     vecAdd st.Fwd ("static " + retTy + " " + name + "(" + sigOf false + ");")
     let all = vecNew<string> ()
@@ -2627,6 +2668,15 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
              | EVar (rv, _) | EVarI (rv, _, _) when (podVarOf rv).IsSome ->
                  // the struct lives on the C stack: read the field directly
                  rk, (podVarOf rv).Value + "." + sane fname
+             | _ when (dictTryFind st.PodStamp owner).IsSome ->
+                 // a STAMP blob is uniform: the field is a boxed V slot
+                 let fts2 = (dictTryFind st.StructFieldTys owner).Value
+                 let idx = (fts2 |> List.findIndex (fun (a, _) -> a = fname)) + 1
+                 let x = emitE st f r
+                 let n = rawNew f rk
+                 stmt f (n + " = " + unboxExpr rk ("fpprt_read_ref(" + sref x
+                         + ", FPPOFF(" + string idx + "))") + ";")
+                 rk, n
              | _ ->
                  let x = emitE st f r
                  let n = rawNew f rk
@@ -2734,7 +2784,8 @@ let emitC (decls : Decl list) : string * string list =
           PodTid = dictNew<string, int> ()
           PodRef = dictNew<string, bool> ()
           PodArrTid = dictNew<string, int> ()
-          PodGlobals = dictNew<string * int, int> ()
+          PodGlobals = dictNew<string * int, string> ()
+          PodStamp = dictNew<string, bool> ()
           Typedefs = vecNew<string> ()
           FnSig = dictNew<string * int, string list> ()
           FnRet = dictNew<string * int, string> ()
@@ -2875,21 +2926,34 @@ let emitC (decls : Decl list) : string * string list =
     let rec podOf (n : string) : bool =
         if (dictTryFind st.PodTid n).IsSome then true
         elif (dictTryFind visiting n).IsSome then false
-        elif recBase n <> n then false
+        elif n.Contains "#" then false
         else
             match dictTryFind st.StructFieldTys n, dictTryFind st.RecTid n with
             | Some fts, Some tid ->
                 dictSet visiting n true
+                let isStamp = recBase n <> n
                 let mutable hasRef = false
+                let mutable bad = false
                 for (_ : string), ty in fts do
-                    if (podPrimKind ty).IsSome then ()
-                    elif (dictTryFind st.StructFieldTys ty).IsSome && podOf ty then
+                    if ty.Contains "#" || ty.Contains "'" then bad <- true
+                    elif (podPrimKind ty).IsSome then ()
+                    elif (dictTryFind st.StructFieldTys ty).IsSome
+                         && recBase ty = ty && podOf ty then
+                        // a nested MONOMORPHIC flat struct inlines; a
+                        // nested STAMP struct falls through to the ref
+                        // arm — its heap rep is uniform
                         (if (dictTryFind st.PodRef ty).IsSome then hasRef <- true)
                     else hasRef <- true
-                dictSet st.PodTid n tid
-                (if hasRef then dictSet st.PodRef n true)
-                dictSet st.PodArrTid n (freshTid st)
-                true
+                if bad then false
+                else
+                    // a STAMP keeps its UNIFORM tid for heap instances;
+                    // the packed layout gets a tid of its own
+                    let ptid = if isStamp then freshTid st else tid
+                    dictSet st.PodTid n ptid
+                    (if isStamp then dictSet st.PodStamp n true)
+                    (if hasRef then dictSet st.PodRef n true)
+                    (if not isStamp then dictSet st.PodArrTid n (freshTid st))
+                    true
             | _ -> false
     for d in decls do
         match d with
@@ -2911,9 +2975,8 @@ let emitC (decls : Decl list) : string * string list =
             // assignment copies, field-set mutates the storage in place
             (match schemePodName sc with
              | Some tn ->
-                 (match dictTryFind st.PodTid tn with
-                  | Some ptid -> dictSet st.PodGlobals (v.Path, v.Offset) ptid
-                  | None -> ())
+                 (if (dictTryFind st.PodTid tn).IsSome then
+                     dictSet st.PodGlobals (v.Path, v.Offset) tn)
              | None -> ())
         | _ -> ()
     // typedefs in DECLARATION order (F# forbids forward refs, so nested
@@ -2926,6 +2989,7 @@ let emitC (decls : Decl list) : string * string list =
             let nestedPod (ty : string) =
                 (dictTryFind st.StructFieldTys ty).IsSome
                 && (dictTryFind st.PodTid ty).IsSome
+                && recBase ty = ty
             let fdecl (fn2 : string, ty : string) =
                 match podPrimKind ty with
                 | Some k -> "  " + podCTy k + " " + sane fn2 + ";"
@@ -2971,6 +3035,80 @@ let emitC (decls : Decl list) : string * string list =
                 vecAdd st.Reg ("  fpp_reg_pod(" + string tid + ", (uint32_t)sizeof(P_"
                                + string tid + "), " + cstr n + ");")
             for l in vecToList fieldRegs do vecAdd st.Reg l
+            // every pod gets its blob<->stack converters. A MONO pod's blob
+            // IS the packed payload: memcpy both ways. A STAMP pod's blob
+            // is the UNIFORM record: convert field-wise, and pack roots its
+            // ref fields BEFORE any allocation can move them.
+            let ts = string tid
+            if (dictTryFind st.PodStamp n).IsSome then
+                let unitid = string (dictTryFind st.RecTid n).Value
+                let up = vecNew<string> ()
+                let pk = vecNew<string> ()
+                let refFields =
+                    fts |> List.filter (fun ((_ : string), ty) ->
+                        (podPrimKind ty).IsNone && not (nestedPod ty))
+                vecAdd pk ("static V fpp_pack_" + ts + "(const P_" + ts + " *s) {")
+                vecAdd pk ("  FPPRT_FRAME(f, " + string (List.length refFields + 1) + ");")
+                refFields |> List.iteri (fun i ((fn2 : string), _) ->
+                    vecAdd pk ("  f_slots[" + string (i + 1) + "] = s->" + sane fn2 + ";"))
+                vecAdd pk ("  f_slots[0] = fpprt_alloc(" + unitid + ");")
+                vecAdd up ("static void fpp_unpack_" + ts + "(V b, P_" + ts + " *s) {")
+                fts |> List.iteri (fun i ((fn2 : string), ty) ->
+                    let slot = "FPPOFF(" + string (i + 1) + ")"
+                    match podPrimKind ty with
+                    | Some k ->
+                        let rk = podRawKind k
+                        vecAdd up ("  s->" + sane fn2 + " = (" + podCTy k + ")"
+                                   + unboxExpr rk ("fpprt_read_ref(b, " + slot + ")") + ";")
+                        vecAdd pk ("  { V t_ = " + boxExpr rk ("s->" + sane fn2)
+                                   + "; fpprt_write_ref(f_slots[0], " + slot + ", t_); }")
+                    | None when nestedPod ty ->
+                        let ntid = string (dictTryFind st.PodTid ty).Value
+                        vecAdd up ("  fpp_unpack_" + ntid + "(fpprt_read_ref(b, " + slot
+                                   + "), &s->" + sane fn2 + ");")
+                        vecAdd pk ("  { V t_ = fpp_pack_" + ntid + "(&s->" + sane fn2
+                                   + "); fpprt_write_ref(f_slots[0], " + slot + ", t_); }")
+                    | None ->
+                        let ri = (refFields |> List.findIndex (fun (a, _) -> a = fn2)) + 1
+                        vecAdd up ("  s->" + sane fn2 + " = fpprt_read_ref(b, " + slot + ");")
+                        vecAdd pk ("  fpprt_write_ref(f_slots[0], " + slot + ", f_slots["
+                                   + string ri + "]);"))
+                vecAdd up "}"
+                vecAdd pk "  { V r_ = f_slots[0]; FPPRT_LEAVE(f); return r_; }"
+                vecAdd pk "}"
+                vecAdd st.Typedefs (String.concat "\n" (vecToList up))
+                vecAdd st.Typedefs
+                    ("static P_" + ts + " fpp_unpackv_" + ts + "(V b) { P_" + ts
+                     + " s; fpp_unpack_" + ts + "(b, &s); return s; }")
+                vecAdd st.Typedefs (String.concat "\n" (vecToList pk))
+            else
+                vecAdd st.Typedefs
+                    ("static void fpp_unpack_" + ts + "(V b, P_" + ts
+                     + " *s) { memcpy(s, (char *)b + FPP_POD_OFF, sizeof(P_" + ts + ")); }")
+                vecAdd st.Typedefs
+                    ("static P_" + ts + " fpp_unpackv_" + ts + "(V b) { P_" + ts
+                     + " s; fpp_unpack_" + ts + "(b, &s); return s; }")
+                let pk = vecNew<string> ()
+                vecAdd pk ("static V fpp_pack_" + ts + "(const P_" + ts + " *s) {")
+                if vecLen refPaths > 0 then
+                    // refs move if the alloc collects: root, alloc, memcpy,
+                    // then re-store every ref field from its slot
+                    vecAdd pk ("  FPPRT_FRAME(f, " + string (vecLen refPaths + 1) + ");")
+                    vecToList refPaths |> List.iteri (fun i pth ->
+                        vecAdd pk ("  f_slots[" + string (i + 1) + "] = *(V const *)((char const *)s + offsetof(P_"
+                                   + ts + ", " + pth + "));"))
+                    vecAdd pk ("  f_slots[0] = fpprt_alloc(" + ts + ");")
+                    vecAdd pk ("  memcpy((char *)f_slots[0] + FPP_POD_OFF, s, sizeof(P_" + ts + "));")
+                    vecToList refPaths |> List.iteri (fun i pth ->
+                        vecAdd pk ("  fpprt_write_ref(f_slots[0], FPP_POD_OFF + (uint32_t)offsetof(P_"
+                                   + ts + ", " + pth + "), f_slots[" + string (i + 1) + "]);"))
+                    vecAdd pk "  { V r_ = f_slots[0]; FPPRT_LEAVE(f); return r_; }"
+                else
+                    vecAdd pk ("  V b = fpprt_alloc(" + ts + ");")
+                    vecAdd pk ("  memcpy((char *)b + FPP_POD_OFF, s, sizeof(P_" + ts + "));")
+                    vecAdd pk "  return b;"
+                vecAdd pk "}"
+                vecAdd st.Typedefs (String.concat "\n" (vecToList pk))
             (match dictTryFind st.PodArrTid n with
              | Some atid ->
                  if vecLen refPaths > 0 then
@@ -3037,7 +3175,10 @@ let emitC (decls : Decl list) : string * string list =
         // records compare STRUCTURALLY, classes by IDENTITY — a cyclic
         // object graph (the adaptive one) must never be walked by eqv
         let tclass = if isClass then 4 else 1
-        match (if (dictTryFind st.PodTid n).IsSome then None
+        // a MONO pod owns its tid (fpp_reg_pod registers it); a STAMP
+        // pod's UNIFORM record tid still needs its record registration
+        match (if (dictTryFind st.PodTid n).IsSome
+                  && (dictTryFind st.PodStamp n).IsNone then None
                else dictTryFind st.RecTid n) with
         | Some tid ->
             vecAdd st.Reg ("  fpp_reg_struct(" + string tid + ", "
@@ -3248,7 +3389,13 @@ let emitC (decls : Decl list) : string * string list =
             vecAdd st.Globals ("static V " + gname v + ";")
             let initName = "init_" + gname v
             emitFn st None initName [] rhs
-            vecAdd st.Inits ("  " + gname v + " = " + initName + "();")
+            (match dictTryFind st.PodGlobals (v.Path, v.Offset) with
+             | Some pn when (dictTryFind st.PodStamp pn).IsSome ->
+                 vecAdd st.Inits ("  " + gname v + " = fpp_rec_clone(" + initName + "());")
+             | Some _ ->
+                 vecAdd st.Inits ("  " + gname v + " = fpp_pod_clone(" + initName + "());")
+             | None ->
+                 vecAdd st.Inits ("  " + gname v + " = " + initName + "();"))
         | _ -> ()
     let out = vecNew<string> ()
     vecAdd out "/* generated by fpp --target c */"

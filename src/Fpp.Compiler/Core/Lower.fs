@@ -3426,17 +3426,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // it is instantiated at; the backend derives the kind once the type
         // is concrete.
         let fieldKind (f : GreenNode) : string =
-            let tyNode = nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
-            match tyNode with
-            | Some tn when tn.NodeKind = VarType ->
-                (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
-                 | Some t -> "'" + t.Text
-                 | None -> "?")
-            | Some tn ->
-                (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
-                 | Some t when List.contains t.Text tyParams -> "'" + t.Text
-                 | Some t -> t.Text
-                 | None -> "?")
+            // a field at an instantiated generic renders its FULL name:
+            // `Inner : KV<int,'a>` is "KV$<int.'a>". The last-ident
+            // shorthand named the field after its final type ARGUMENT,
+            // which classified a `KV<int,int>` field as an int
+            let rec renderTy (tn : GreenNode) : string =
+                let argNodes = nodesOf tn |> List.filter (fun x -> isTypeKind x.NodeKind)
+                if tn.NodeKind = VarType then
+                    (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                     | Some t -> "'" + t.Text
+                     | None -> "?")
+                elif tn.NodeKind = AppType && not (List.isEmpty argNodes) then
+                    // head is the FIRST type child, the rest are arguments
+                    (match argNodes with
+                     | hd :: args when not (List.isEmpty args) ->
+                         (match Green.tokens (GNode hd) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          | Some t -> t.Text + "$<" + String.concat "." (List.map renderTy args) + ">"
+                          | None -> "?")
+                     | _ -> "?")
+                elif tn.NodeKind = NamedType then
+                    (match Green.tokens (GNode tn) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                     | Some t when List.contains t.Text tyParams -> "'" + t.Text
+                     | Some t -> t.Text
+                     | None -> "?")
+                else "?"     // functions, tuples, arrays: uniform REFS
+            match nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
+            | Some tn -> renderTy tn
             | None -> "?"
         let recordFields =
             nodesOf n
