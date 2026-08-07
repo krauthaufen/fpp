@@ -13,6 +13,9 @@ instance Mappable<option>
 instance Mappable<array>
     static mapf f xs = Array.map f xs
 
+// a class is a NAMESPACE: `open` injects its members like a module's
+open Mappable
+
 let double (xs : 'f<int>) : 'f<int> when Mappable<'f> =
     mapf (fun x -> x * 2) xs
 

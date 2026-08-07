@@ -75,6 +75,7 @@ let generatorTests =
                     [ "types.fpp", [ "module Types"; "type Point = { X : int; Y : int }"; "type Color = Red | Green | Blue" ]
                       "main.fpp",
                       [ "module Main"
+                        "open Described"
                         "let go ="
                         "    print (describe { Tag = 7; Label = \"seven\" })"
                         "    print (describe 3)"

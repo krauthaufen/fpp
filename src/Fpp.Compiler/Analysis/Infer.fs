@@ -1205,6 +1205,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// (`Add.(+)`) must denote a function even at a primitive instance; one
     /// written as an operator (`a + b`) emits the instruction instead.
     let pendingClassUses = vecNew<int * string * Constraint * bool * Type list> ()
+    /// which class DECLARED the member at (path, offset) — the bare name
+    /// is no longer unique across classes, so ownership keys on the def
+    let memberOwnerByDef = dictNew<string * int, string> ()
     /// operator offset -> the left operand's type, for the backend
     let opTypesRaw = vecNew<int * Type> ()
     let exprTypesRaw = vecNew<int * int * Type> ()
@@ -2166,7 +2169,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // at int is what turns `Zero` into zero-at-int
                           let owe (qfresh : Type list) (cs : Constraint list) : unit =
                               for c in cs do addWanted t.Offset c
-                              match dictTryFind classes.MemberOwner t.Text with
+                              match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
+                                     | Some cls -> Some cls
+                                     | None -> dictTryFind classes.MemberOwner t.Text) with
                               | Some cls ->
                                   (match cs |> List.tryFind (fun c -> c.Class = cls) with
                                    | Some c -> vecAdd pendingClassUses (t.Offset, t.Text, c, true, qfresh)
@@ -3840,7 +3845,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // `Num.Zero` binds to an instance member exactly as
                          // the bare `Zero` does — the qualification only says
                          // which class, never which instance
-                         match dictTryFind classes.MemberOwner d.Name with
+                         match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
+                                | Some cls -> Some cls
+                                | None -> dictTryFind classes.MemberOwner d.Name) with
                          | Some cls ->
                              (match cs |> List.tryFind (fun c -> c.Class = cls) with
                               | Some c -> vecAdd pendingClassUses (tk.Offset, d.Name, c, true, qfresh)
@@ -5088,6 +5095,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             |> List.distinctBy (fun v -> v.Id)
                         let sch = { Quantified = qs; Constraints = [ self ]; Body = ty }
                         if (dictTryFind defsAt t.Offset).IsSome then setScheme t.Offset sch
+                        dictSet memberOwnerByDef (path, t.Offset) name
                         recordDef t ty
                         Some (t.Text, sch))
             let cdef : Classes.ClassDef =

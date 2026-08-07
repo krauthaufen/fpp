@@ -1,27 +1,35 @@
+[<AutoOpen>]
 class Add<'a, 'b>
     type Result
     static (+) : 'a -> 'b -> Result
+[<AutoOpen>]
 class Sub<'a, 'b>
     type Result
     static (-) : 'a -> 'b -> Result
+[<AutoOpen>]
 class Mul<'a, 'b>
     type Result
     static (*) : 'a -> 'b -> Result
+[<AutoOpen>]
 class Div<'a, 'b>
     type Result
     static (/) : 'a -> 'b -> Result
+[<AutoOpen>]
 class Rem<'a, 'b>
     type Result
     static (%) : 'a -> 'b -> Result
+[<AutoOpen>]
 class Num<'a>
     when Add<'a, 'a> = 'a
     when Sub<'a, 'a> = 'a
     when Mul<'a, 'a> = 'a
     static Zero : 'a
     static One : 'a
+[<AutoOpen>]
 class Fractional<'a>
     when Num<'a>
     when Div<'a, 'a> = 'a
+[<AutoOpen>]
 class Integral<'a>
     when Num<'a>
     when Div<'a, 'a> = 'a
@@ -34,18 +42,24 @@ class Integral<'a>
 ///
 /// A marker: the instance carries the size, because that is the fact a
 /// caller actually wants and the one the layout already knows.
+[<AutoOpen>]
 class Unmanaged<'a>
     static byteSize : int
 
+[<AutoOpen>]
 class Ordered<'a>
     static compare : 'a -> 'a -> int
+[<AutoOpen>]
 class Neg<'a>
     static (~-) : 'a -> 'a
+[<AutoOpen>]
 class Abs<'a>
     static abs : 'a -> 'a
+[<AutoOpen>]
 class MinMax<'a>
     static min : 'a -> 'a -> 'a
     static max : 'a -> 'a -> 'a
+[<AutoOpen>]
 class Floating<'a>
     when Fractional<'a>
     static sqrt : 'a -> 'a
@@ -960,6 +974,7 @@ type Rand(seed : int) =
 /// containers: the compiler DERIVES an instance for any record or union
 /// that declares none — fields generate recursively, a union picks a case
 /// at random and generates its payload.
+[<AutoOpen>]
 class Arb<'a>
     static arbitrary : Rand -> 'a
 
@@ -4806,6 +4821,7 @@ type Reader(start : int) =
         p <- p + n
         a
 
+[<AutoOpen>]
 class Serialize<'a>
     static write : Buffer -> 'a -> unit
     static read : Reader -> 'a
@@ -5019,6 +5035,7 @@ type WorkerHandle<'w>(id : int) =
     /// the host's name for the channel
     member x.Id = id
 
+[<AutoOpen>]
 class Worker<'w>
     type Command
     type Reply

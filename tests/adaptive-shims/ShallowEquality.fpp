@@ -20,6 +20,7 @@
 // set is one instance declaration and nothing else.
 
 /// The comparison the original picks per type, picked here per instance.
+[<AutoOpen>]
 class ShallowEquality<'a>
     static shallowEquals : 'a -> 'a -> bool
     static shallowHash : 'a -> int

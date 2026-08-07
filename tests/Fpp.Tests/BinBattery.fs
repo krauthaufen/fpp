@@ -372,7 +372,7 @@ let binBattery =
         // generic function too, not only from a concrete call site
         expects "a generic instance head resolves through a generic function"
             [
-              "class Sized<'a>"
+              "[<AutoOpen>]\nclass Sized<'a>"
               "    static size : 'a -> int"
               "instance Sized<int>"
               "    static size (x : int) = 1"
@@ -392,7 +392,7 @@ let binBattery =
         // shape that silently ran the `int` body for every element type.
         expects "a generic instance dispatches per element type"
             [
-              "class Sized<'a>"
+              "[<AutoOpen>]\nclass Sized<'a>"
               "    static size : 'a -> int"
               "instance Sized<int>"
               "    static size (x : int) = 1"
@@ -415,7 +415,7 @@ let binBattery =
         // array for its length, so the instance must be stamped per element.
         expects "a generic array instance dispatches per element type"
             [
-              "class Sized<'a>"
+              "[<AutoOpen>]\nclass Sized<'a>"
               "    static size : 'a -> int"
               "instance Sized<int>"
               "    static size (x : int) = 1"
@@ -609,7 +609,7 @@ let binBattery =
             [
               "[<Struct>]"
               "type V2d = { X : float; Y : float }"
-              "class Show2<'a>"
+              "[<AutoOpen>]\nclass Show2<'a>"
               "    static show2 : 'a -> string"
               "instance Show2<int>"
               "    static show2 (x : int) = \"i\" + string x"
@@ -634,7 +634,7 @@ let binBattery =
         rejects "instances that order neither way are refused"
             [
               "type Pair<'a, 'b> = { A : 'a; B : 'b }"
-              "class P<'t>"
+              "[<AutoOpen>]\nclass P<'t>"
               "    static p : 't -> string"
               "instance P<Pair<int, 'b>>"
               "    static p (x : Pair<int, 'b>) = \"left\""
@@ -647,7 +647,7 @@ let binBattery =
         expects "overlapping heads still resolve where only one applies"
             [
               "type Pair<'a, 'b> = { A : 'a; B : 'b }"
-              "class P<'t>"
+              "[<AutoOpen>]\nclass P<'t>"
               "    static p : 't -> string"
               "instance P<Pair<int, 'b>>"
               "    static p (x : Pair<int, 'b>) = \"left\""

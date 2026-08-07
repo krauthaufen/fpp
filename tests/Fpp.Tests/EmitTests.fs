@@ -883,7 +883,7 @@ let tupleSpecializationTests =
                       "" ]))
             Expect.equal out "2\n-1\n" "tuple keys are distinct and found"
         }
-        test "class field: the members must still exist" {
+        test "[<AutoOpen>]\nclass field: the members must still exist" {
             // the regression this guards is not a wrong answer but a MISSING
             // one — the class emitted nothing and every use was unbound
             let out =
@@ -1163,7 +1163,7 @@ let inheritedSyntaxTests =
             let out =
                 runProgram (String.concat "\n" [
                     "module M"
-                    "class Sized<'a>"
+                    "[<AutoOpen>]\nclass Sized<'a>"
                     "    static size : 'a -> int"
                     "instance Sized<int>"
                     "    static size _ = 4"

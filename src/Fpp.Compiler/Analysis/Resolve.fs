@@ -1014,6 +1014,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     /// that their schemes carry a constraint.
     and walkClassDecl (env : Env) (n : GreenNode) : Env =
         let exportHere = atExportLevel
+        // a class is a NAMESPACE like a module: members always answer to
+        // `Class.member`; they enter bare scope only under [<AutoOpen>]
+        // (or an explicit `open Class` later, which injects the qualified
+        // exports the same way it does for modules)
+        let auto = pendingAutoOpen
+        pendingAutoOpen <- false
         let mutable outer = env
         // the name sits inside the head type (`class Num<'a>` parses the head
         // as an application), not as a direct token child
@@ -1040,12 +1046,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     match firstIdentToken m.Children with
                     | Some t ->
                         let d = define DefLet t
-                        outer <- Map.add t.Text d outer
+                        if auto then outer <- Map.add t.Text d outer
                         if exportHere then
-                            exportDef d
-                            // also under `Class.Member`, so every member has
-                            // a spelling that cannot be shadowed or confused
-                            // with another class' member of the same name
+                            (if auto then exportDef d)
+                            // always under `Class.Member` — the spelling
+                            // that cannot be shadowed or confused with
+                            // another class' member of the same name, and
+                            // the one `open Class` injects from
                             exportUnder (className + "." + t.Text) d
                     | None -> ()
                 for x in m.Children do

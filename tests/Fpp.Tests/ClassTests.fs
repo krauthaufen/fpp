@@ -694,7 +694,7 @@ let userClassTests =
             // member (unit-lifted, applied at the name), combine a function,
             // and the generic body stamps per instance
             let out =
-                run [ "class Monoid<'a>"
+                run [ "[<AutoOpen>]\nclass Monoid<'a>"
                       "    static mempty : 'a"
                       "    static combine : 'a -> 'a -> 'a"
                       "instance Monoid<int>"
@@ -714,7 +714,7 @@ let userClassTests =
         }
         test "an associated type decides the result at the instance" {
             let out =
-                run [ "class Norm<'v>"
+                run [ "[<AutoOpen>]\nclass Norm<'v>"
                       "    type Scalar"
                       "    static norm : 'v -> Scalar"
                       "instance Norm<float>"
@@ -734,7 +734,7 @@ let userClassTests =
             let ws = Fpp.Workspace()
             ws.SetFileText "t.fpp" (String.concat "\n" [
                 "module M"
-                "class Monoid<'a>"
+                "[<AutoOpen>]\nclass Monoid<'a>"
                 "    static mempty : 'a"
                 "    static combine : 'a -> 'a -> 'a"
                 "instance Monoid<int>"
