@@ -1503,6 +1503,16 @@ let parse (src : string) : ParseResult =
         else
             // [self .] name
             if atOperatorName () then vecAdd acc (bumpOperatorName ())
+            elif s.IsOp "'" && (s.Peek 1).Kind = Ident then
+                // a TYPECLASS member anchored on a class parameter:
+                // `member 'v.ScaledBy : 's -> 'v` — the receiver is the
+                // parameter the dot-call dispatches on
+                vecAdd acc (s.Bump ())
+                vecAdd acc (s.Bump ())
+                if s.IsOp "." && s.SameLine then
+                    vecAdd acc (s.Bump ())
+                    if s.Is Ident then vecAdd acc (s.Bump ())
+                    else s.Diag "expected a member name"
             elif s.Is Ident then
                 vecAdd acc (s.Bump ())
                 if s.IsOp "." && s.SameLine then

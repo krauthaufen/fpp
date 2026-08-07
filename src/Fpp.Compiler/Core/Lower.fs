@@ -2763,6 +2763,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | DotExpr ->
                 (match nodesOf n |> List.tryHead, Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                  | Some lhs, Some name ->
+                     // a TYPECLASS dot-member first: `xs.Count` applies the
+                     // class target to the RECEIVER — before every path
+                     // that would read the name as a value
+                     let clsDot =
+                         match dictTryFind fieldOwners name.Offset with
+                         | Some o -> o.StartsWith "$clsdot:"
+                         | None -> false
+                     if clsDot then
+                         let target =
+                             match dictTryFind classUses name.Offset with
+                             | Some im -> classRef im
+                             | None ->
+                             match dictTryFind dictUses name.Offset with
+                             | Some (po, mi) -> EVar (existSlotVar po mi, anonScheme)
+                             | None ->
+                             match dictTryFind classPending name.Offset with
+                             | Some payload -> EUnknown ("$class:" + payload)
+                             | None -> note name.Offset "unresolved class dot-member"
+                         EApp (target, [ lowerExpr (GNode lhs) ])
+                     else
                      // qualified value (resolver linked it) or field access
                      (match dictTryFind classUses name.Offset with
                       // `Num.Zero` — the class says which member, the
@@ -2810,7 +2830,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EMatch (lowerExpr (GNode lhs),
                                       [ PCtor ("Some", anon, [ PWild ]), None, whenSome
                                         PWild, None, whenNone ])
-                          if owner = "Option" && name.Text = "IsSome" then
+                          if owner.StartsWith "$clsdot:" then
+                              // a TYPECLASS dot-member (`xs.Count` through
+                              // `member 'a.Count`): apply the class target —
+                              // instance fn, packed existential slot, or the
+                              // stamping marker — to the receiver
+                              let target =
+                                  match dictTryFind classUses name.Offset with
+                                  | Some im ->
+                                      let r = classRef im
+                                      if im.MTakesUnit then EApp (r, [ ELit LUnit ]) else r
+                                  | None ->
+                                  match dictTryFind dictUses name.Offset with
+                                  | Some (po, mi) -> EVar (existSlotVar po mi, anon)
+                                  | None ->
+                                  match dictTryFind classPending name.Offset with
+                                  | Some payload -> EUnknown ("$class:" + payload)
+                                  | None -> note name.Offset "unresolved class dot-member"
+                              EApp (target, [ lowerExpr (GNode lhs) ])
+                          elif owner = "Option" && name.Text = "IsSome" then
                               optTag (ELit (LBool true)) (ELit (LBool false))
                           elif owner = "Option" && name.Text = "IsNone" then
                               optTag (ELit (LBool false)) (ELit (LBool true))

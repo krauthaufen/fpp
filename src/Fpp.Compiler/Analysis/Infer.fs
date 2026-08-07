@@ -637,7 +637,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
-    let rec tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+    let rec tryResolveDotCore (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
         // members are inherited: walk up the base chain to the type that
         // actually declares this one, and bind to THAT declaration
         // Walk to the type that declares this member, carrying the receiver's
@@ -755,7 +755,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // a variable BOUNDED by `when 'B :> IFace` dispatches its members
         // through the bound, exactly as F# types it
         | TVar v, _ when (dictTryFind subtypeBounds v.Id).IsSome ->
-            tryResolveDot force offset (TCon ((dictTryFind subtypeBounds v.Id).Value, [])) result name
+            tryResolveDotCore force offset (TCon ((dictTryFind subtypeBounds v.Id).Value, [])) result name
         // `.Length` on an array or a string is a BUILTIN: there is no
         // "array.Length" in the fields table, so without this the parked
         // path fell through to a by-name field lookup and bound the access
@@ -969,8 +969,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let tryResolveIndexer (recvTy : Type) (br : int) (idxTy : Type) (result : Type) : bool =
         match prune recvTy with
         | TCon (tn, _) when tn <> "array" && tn <> "string" ->
-            if tryResolveDot false (60000000 + br) recvTy (TFun (idxTy, result)) "Item" then
-                tryResolveDot false (70000000 + br) recvTy (TFun (idxTy, TFun (result, tUnit))) "set_Item"
+            if tryResolveDotCore false (60000000 + br) recvTy (TFun (idxTy, result)) "Item" then
+                tryResolveDotCore false (70000000 + br) recvTy (TFun (idxTy, TFun (result, tUnit))) "set_Item"
                 |> ignore
                 true
             else false
@@ -1215,6 +1215,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// (`Add.(+)`) must denote a function even at a primitive instance; one
     /// written as an operator (`a + b`) emits the instruction instead.
     let pendingClassUses = vecNew<int * string * Constraint * bool * Type list> ()
+    /// dot-callable class members: member name -> (class, anchor param NAME)
+    let dotMembers = dictNew<string, string * string> ()
+    /// INSTANCE member definitions — a dot whose last ident resolves here
+    /// is a member access, never a module qualification
+    let instMemberDefs = dictNew<string * int, bool> ()
+    /// offsets whose fieldOwner is a `$clsdot:` marker — the deferred
+    /// owner flush must not overwrite these
+    let clsDotOffsets = dictNew<int, bool> ()
     // ---- existential cases: `| Many of 'm<'a> when ListLike<'m>` --------
     // the ctor PACKS the chosen instance's members into hidden payload
     // slots; a MATCH binds them and the branch's member calls dispatch
@@ -1240,6 +1248,48 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // a case at random. Registered on demand AND eagerly for every declared
     // shape, so a stamped generic use resolves even when no ground demand
     // ever named the type. The body is synthesized by lowering.
+    /// class DOT-members: a member the receiver's own type declares wins;
+    /// when the receiver declares NO such member, the classes' anchored
+    /// members answer `xs.Count` — BEFORE the core's by-name field guess,
+    /// which would otherwise bind the access to an unrelated record
+    let classDotFallback (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+            match dictTryFind dotMembers name with
+            | Some (cls, _) ->
+                (match dictTryFind classes.Classes cls with
+                 | Some cd ->
+                     (match cd.Members |> List.tryFind (fun (mn, _) -> mn = name) with
+                      | Some (_, msch) ->
+                          let ty, fresh, cs = instantiateTracked msch
+                          (match prune ty with
+                           | TFun (r0, rest) ->
+                               if (Types.unify r0 recvTy).IsSome then false
+                               else
+                                   unifyAt offset result rest
+                                   for c in cs do addWanted offset c
+                                   (match cs |> List.tryFind (fun c -> c.Class = cls) with
+                                    | Some c -> vecAdd pendingClassUses (offset, name, c, true, fresh)
+                                    | None -> ())
+                                   vecAdd fieldOwnersRaw (offset, "$clsdot:" + name)
+                                   dictSet clsDotOffsets offset true
+                                   true
+                           | _ -> false)
+                      | None -> false)
+                 | None -> false)
+            | None -> false
+
+    let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+        let classFirst =
+            (dictTryFind dotMembers name).IsSome
+            && (match prune recvTy with
+                | TCon (tn, _) -> List.isEmpty (fieldCandidates (tn + "." + name))
+                | _ -> false)
+        if classFirst then
+            classDotFallback offset recvTy result name
+            || tryResolveDotCore force offset recvTy result name
+        else
+            tryResolveDotCore force offset recvTy result name
+            || classDotFallback offset recvTy result name
+
     /// union name -> (its parameters, cases as (name, payload components))
     let unionCasesReg = dictNew<string, Var list * (string * Type list) list> ()
     /// a GADT declares per-case signatures; deriving those would be wrong
@@ -1810,7 +1860,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             { Class = cls; Args = args; Assoc = assoc })
 
     let memberNameOf (m : GreenNode) : Token option =
-        tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
+        // `member 'v.ScaledBy` / `member v.ScaledBy` name themselves AFTER
+        // the dot; the leading ident is the receiver
+        let toks = tokensOf m
+        let rec afterDot (ts : Token list) =
+            match ts with
+            | d :: rest when d.Kind = Operator && d.Text = "." ->
+                rest |> List.tryFind (fun t -> t.Kind = Ident)
+            | _ :: rest -> afterDot rest
+            | [] -> None
+        match afterDot toks with
+        | Some t -> Some t
+        | None -> toks |> List.tryFind (fun t -> t.Kind = Ident)
+
+    /// the class parameter a `member 'v.Name` anchors on, when this decl
+    /// is the tyvar-receiver form
+    let memberAnchorOf (m : GreenNode) : string option =
+        let toks = tokensOf m
+        let rec go (ts : Token list) =
+            match ts with
+            | q :: v :: d :: _ when
+                  q.Kind = Operator && q.Text = "'" && v.Kind = Ident
+                  && d.Kind = Operator && d.Text = "." -> Some v.Text
+            | _ :: rest -> go rest
+            | [] -> None
+        go toks
 
     let isAssocDecl (m : GreenNode) : bool =
         tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "type")
@@ -3701,7 +3775,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
                     | Some tn -> typeFromNode cvars tn
                     | None -> st.Fresh ()
-            | DotExpr when (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr)) ->
+            | DotExpr when
+                  (nodesOf n |> List.exists (fun m -> m.NodeKind = ListExpr))
+                  // the ListExpr must be the INDEX, not the receiver:
+                  // `[ 9; 9 ].Count` is a member access ON a list literal
+                  && (match nodesOf n |> List.tryFind (fun m -> isExprish m.NodeKind) with
+                      | Some f -> f.NodeKind <> ListExpr
+                      | None -> false) ->
                 // index access a.[i]: element type when the receiver is known
                 let lhsTy =
                     nodesOf n
@@ -3815,7 +3895,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let qualified =
                     lastIdent
                     |> Option.bind (fun t -> dictTryFind useDefs t.Offset)
-                    |> Option.filter (fun d -> d.Kind <> Resolve.DefMember)
+                    |> Option.filter (fun d ->
+                        d.Kind <> Resolve.DefMember
+                        && not (dictTryFind instMemberDefs (d.Path, d.Offset)).IsSome)
                 // `Unchecked.defaultof<_>`: the context decides the type, and
                 // the zero value depends on it
                 let isDefaultOf =
@@ -4962,7 +5044,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let pats = nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind)
         let bodies =
             m.Children |> List.filter (fun c -> match c with GNode b -> isExprish b.NodeKind | _ -> false)
-        let paramTys = pats |> List.map (patType mvars)
+        // `member v.ScaledBy s = ...`: the RECEIVER ident is a parameter —
+        // the first one, matching the class's anchored scheme
+        let recvTok =
+            let rec go (ts : Token list) =
+                match ts with
+                | r :: d :: _ when r.Kind = Ident && d.Kind = Operator && d.Text = "." -> Some r
+                | x :: rest -> if x.Kind = Ident then None else go rest
+                | [] -> None
+            go (tokensOf m)
+        let recvTys =
+            match recvTok with
+            | Some rt ->
+                let ty = st.Fresh ()
+                setScheme rt.Offset (mono ty)
+                recordDef rt ty
+                [ ty ]
+            | None -> []
+        let paramTys = recvTys @ (pats |> List.map (patType mvars))
         let bodyTys = bodies |> List.map exprType
         let bodyTy = match List.tryLast bodyTys with Some x -> x | None -> st.Fresh ()
         st.ExitLevel ()
@@ -5161,10 +5260,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match memberNameOf m with
                     | None -> None
                     | Some t ->
-                        let ty =
+                        let ty0 =
                             match nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
                             | Some tn -> bindAssoc assocVars (typeFromNode vars tn)
                             | None -> st.Fresh ()
+                        // `member 'v.Name : T` is the function 'v -> T,
+                        // and Name becomes DOT-callable through the class
+                        let ty =
+                            match memberAnchorOf m with
+                            | Some anchor ->
+                                (match dictTryFind vars anchor with
+                                 | Some av ->
+                                     dictSet dotMembers t.Text (name, anchor)
+                                     TFun (av, ty0)
+                                 | None -> ty0)
+                            | None -> ty0
                         let qs =
                             (freeVars ty @ ps @ List.collect freeVars (List.map snd self.Assoc))
                             |> List.distinctBy (fun v -> v.Id)
@@ -5209,10 +5319,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   Params = ps; Head = args; Assoc = assoc; Context = context
                   Members =
                     bodied |> List.choose (fun m ->
+                        // a RECEIVER-form member (`member xs.Count = ...`)
+                        // takes the receiver — never the unit-lift
+                        let hasRecv =
+                            let rec go (ts : Token list) =
+                                match ts with
+                                | r :: d :: _ when r.Kind = Ident && d.Kind = Operator && d.Text = "." -> true
+                                | x :: rest -> if x.Kind = Ident then false else go rest
+                                | [] -> false
+                            go (tokensOf m)
                         let takesUnit =
-                            nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) |> List.isEmpty
+                            not hasRecv
+                            && (nodesOf m |> List.filter (fun x -> isPatKind x.NodeKind) |> List.isEmpty)
                         memberNameOf m
                         |> Option.map (fun t ->
+                            dictSet instMemberDefs (path, t.Offset) true
                             t.Text,
                             { Classes.MPath = path; MOffset = t.Offset
                               MName = t.Text; MTakesUnit = takesUnit; MInst = [] }))
@@ -5650,9 +5771,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // record literals: name the instantiation once everything is solved
     for offset, ty in vecToList pendingRecords do
         vecAdd fieldOwnersRaw (offset, instName ty)
-    // field READS the same way, for the same reason
+    // field READS the same way, for the same reason — except where a
+    // class dot-member already claimed the offset
     for offset, ty in vecToList pendingOwners do
-        vecAdd fieldOwnersRaw (offset, instName ty)
+        if not (dictTryFind clsDotOffsets offset).IsSome then
+            vecAdd fieldOwnersRaw (offset, instName ty)
     // base instantiations keep their FULL argument names — member stamping
     // maps the base's parameters positionally against them
     for offset, ty in vecToList pendingBaseInsts do
