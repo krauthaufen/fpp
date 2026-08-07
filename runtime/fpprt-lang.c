@@ -1284,14 +1284,20 @@ static struct fpp_pod_info_ *fpp_pod_ensure_(uint32_t tid) {
   return fpp_pods_[tid];
 }
 
-void fpp_reg_pod(uint32_t tid, uint32_t size, const char *name) {
+void fpp_reg_pod2(uint32_t tid, uint32_t size, uint32_t nrefs,
+                  const uint32_t *refoffs, const char *name) {
   struct fpp_pod_info_ *p = fpp_pod_ensure_(tid);
   p->size = size;
-  /* the heap blob: header pad to FPP_POD_OFF + payload, no ref fields */
+  /* the heap blob: header pad to FPP_POD_OFF + payload; ref fields (if
+   * any) are on the map at their blob-relative offsets */
   uint32_t total = FPP_POD_OFF + ((size + 7u) & ~7u);
   fpprt_register_type(tid, (struct fpprt_type){
-    total, FPPRT_KIND_STRUCT, 0, NULL, name });
+    total, FPPRT_KIND_STRUCT, nrefs, refoffs, name });
   fpp_reg_meta_(tid, FPP_TC_POD, 0);
+}
+
+void fpp_reg_pod(uint32_t tid, uint32_t size, const char *name) {
+  fpp_reg_pod2(tid, size, 0, NULL, name);
 }
 
 void fpp_reg_pod_field(uint32_t tid, uint32_t off, char kind) {
@@ -1340,6 +1346,7 @@ void fpp_pod_set(V a, size_t i, V blob) {
 
 static int fpp_pod_field_cmp_(char k, const char *pa, const char *pb) {
   switch (k) {
+  case 'r': return fpp_cmpv(*(V *)pa, *(V *)pb);
   case 'f': { double x = *(double *)pa, y = *(double *)pb;
               return x < y ? -1 : x > y ? 1 : 0; }
   case 's': { float x = *(float *)pa, y = *(float *)pb;
@@ -1367,9 +1374,14 @@ int fpp_pod_eq(V a, V b) {
   struct fpp_pod_info_ *p = fpp_pod_info_(fpprt_typeid(a));
   const char *pa = (const char *)a + FPP_POD_OFF;
   const char *pb = (const char *)b + FPP_POD_OFF;
-  for (uint32_t i = 0; i < p->nfields; i++)
-    if (fpp_pod_field_cmp_(p->fields[i].kind, pa + p->fields[i].off,
-                           pb + p->fields[i].off) != 0) return 0;
+  for (uint32_t i = 0; i < p->nfields; i++) {
+    char k = p->fields[i].kind;
+    const char *fa = pa + p->fields[i].off;
+    const char *fb = pb + p->fields[i].off;
+    if (k == 'r') {
+      if (!fpp_eqv(*(V *)fa, *(V *)fb)) return 0;
+    } else if (fpp_pod_field_cmp_(k, fa, fb) != 0) return 0;
+  }
   return 1;
 }
 
@@ -1393,6 +1405,7 @@ intptr_t fpp_pod_hash(V v) {
     const char *pf = pv + p->fields[i].off;
     intptr_t x;
     switch (p->fields[i].kind) {
+    case 'r': x = fpp_hashv(*(V *)pf); break;
     case 'f': x = (intptr_t)*(double *)pf; break;
     case 's': x = (intptr_t)*(float *)pf; break;
     case 'l': case 'v': x = (intptr_t)*(int64_t *)pf; break;

@@ -27,3 +27,26 @@ let go2 =
     print a.N
     print b.N
     print (bump (bump b)).N
+
+[<Struct>]
+type SR = { mutable Name : string; mutable K : int }
+
+let churn (n : int) : int =
+    let mutable s = 0
+    let mutable i = 0
+    while i < n do
+        let l = [ i; i + 1 ]
+        s <- s + List.length l
+        i <- i + 1
+    s
+
+let go3 =
+    let mutable r = { Name = "hello"; K = 1 }
+    let x = churn 100000
+    r.K <- r.K + x
+    print r.Name
+    print r.K
+    let q = r
+    r.Name <- "bye"
+    print q.Name
+    print r.Name

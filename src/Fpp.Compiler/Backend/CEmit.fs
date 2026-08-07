@@ -56,7 +56,9 @@ type CSt =
       ClassOwn : Dict<string, (string * VarId) list>
       StructFieldTys : Dict<string, (string * string) list>
                                              // [<Struct>] record field TYPES
-      PodTid : Dict<string, int>             // blittable struct -> its tid
+      PodTid : Dict<string, int>             // FLAT struct -> its tid
+      PodRef : Dict<string, bool>            // flat struct HOLDS REFS
+                                             // (stack+blob only, no C ABI)
       PodArrTid : Dict<string, int>          // blittable struct -> array tid
       Typedefs : Vec<string>                 // C typedefs for blittable structs
       FnSig : Dict<string * int, string list> // per-param storage kinds
@@ -116,6 +118,7 @@ type CFn =
                                              // ('S' = a POD STRUCT stack
                                              // value; tid in PodOfRaw)
       PodOfRaw : Dict<string, int>           // 'S' local C name -> pod tid
+      PodFrame : Vec<string * int>           // frame-pod entries: name, tid
       mutable NRaw : int
       RawDecls : Vec<string> }               // C declarations for raw locals
 
@@ -145,6 +148,21 @@ let private rawNew (f : CFn) (k : char) : string =
     f.NRaw <- i + 1
     let n = "R" + string i
     vecAdd f.RawDecls (rawTy k + " " + n + " = 0;")
+    n
+
+/// declare a POD stack value and register it with the frame so the
+/// collector traces (and updates) any ref fields it holds
+let private podLocalNew (f : CFn) (tid : int) : string =
+    let i = f.NRaw
+    f.NRaw <- i + 1
+    let n = "R" + string i
+    vecAdd f.RawDecls ("P_" + string tid + " " + n + ";")
+    vecAdd f.PodFrame (n, tid)
+    let idx = vecLen f.PodFrame - 1
+    stmt f ("memset(&" + n + ", 0, sizeof(P_" + string tid + "));")
+    stmt f ("FPODS_[" + string idx + "] = (struct fpprt_frame_pod){ (char *)&"
+            + n + " - FPP_POD_OFF, " + string tid + " };")
+    dictSet f.PodOfRaw n tid
     n
 
 /// box a raw value into a fresh V slot ('V' atoms are already uniform;
@@ -1023,17 +1041,15 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                  stmt f (sref d + " = " + callx + ";")
                  d
              elif rk.StartsWith "S" then
-                 // a struct RETURN arrives by value: box it at this boundary
-                 let tid = rk.Substring 1
-                 let i = f.NRaw
-                 f.NRaw <- i + 1
-                 let n = "R" + string i
-                 vecAdd f.RawDecls ("P_" + tid + " " + n + ";")
+                 // a struct RETURN arrives by value; register the temp with
+                 // the frame BEFORE the boxing allocation can move its refs
+                 let tid = int (rk.Substring 1)
+                 let n = podLocalNew f tid
                  stmt f (n + " = " + callx + ";")
                  let d = slot f
-                 stmt f (sref d + " = fpprt_alloc(" + tid + ");")
+                 stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
                  stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF, &" + n
-                         + ", sizeof(P_" + tid + "));")
+                         + ", sizeof(P_" + string tid + "));")
                  d
              else
                  let n = rawNew f (charAt rk 0)
@@ -1279,15 +1295,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         // mutated IN PLACE, copied out at uniform uses — the .NET model
         let tid = (dictTryFind st.PodTid (schemePodName sc).Value).Value
         let x = emitE st f rhs
-        let i = f.NRaw
-        f.NRaw <- i + 1
-        let n = "R" + string i
-        vecAdd f.RawDecls ("P_" + string tid + " " + n + ";")
-        stmt f ("memset(&" + n + ", 0, sizeof(P_" + string tid + "));")
+        let n = podLocalNew f tid
         stmt f ("memcpy(&" + n + ", (char *)" + sref x + " + FPP_POD_OFF, sizeof(P_"
                 + string tid + "));")
         vecAdd f.RawVars ('S', n)
-        dictSet f.PodOfRaw n tid
         dictSet f.Locals (v.Path, v.Offset) (-(vecLen f.RawVars))
         emitE st f body
     | ELet (isRec, v, _, rhs, body) ->
@@ -1420,12 +1431,18 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                       let atom = emitRawAs st f (podRawKind k) v
                       stmt f ("((" + pn + " *)((char *)" + sref d + " + FPP_POD_OFF))->"
                               + sane fn2 + " = (" + podCTy k + ")" + atom + ";")
-                  | None ->
+                  | None when (dictTryFind st.StructFieldTys ty).IsSome
+                              && (dictTryFind st.PodTid ty).IsSome ->
                       let x = emitE st f v
                       let stid = (dictTryFind st.PodTid ty).Value
                       stmt f ("memcpy((char *)" + sref d + " + FPP_POD_OFF + offsetof("
                               + pn + ", " + sane fn2 + "), (char *)" + sref x
-                              + " + FPP_POD_OFF, sizeof(P_" + string stid + "));"))
+                              + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                  | None ->
+                      // a uniform REF field of a flat struct
+                      let x = emitE st f v
+                      stmt f ("((" + pn + " *)((char *)" + sref d + " + FPP_POD_OFF))->"
+                              + sane fn2 + " = " + sref x + ";"))
              | None ->
                  stmt f ("fpp_not_emitted(" + cstr ("pod field " + name + "." + fn2) + ");"))
         d
@@ -1435,7 +1452,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let tid = (dictTryFind st.PodTid owner).Value
         let fts = (dictTryFind st.StructFieldTys owner).Value
         (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
-         | Some ty when (dictTryFind st.PodTid ty).IsSome ->
+         | Some ty when (dictTryFind st.StructFieldTys ty).IsSome
+                        && (dictTryFind st.PodTid ty).IsSome ->
              let stid = (dictTryFind st.PodTid ty).Value
              let x = emitE st f r
              let xs = slot f
@@ -1446,7 +1464,14 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                      + " + FPP_POD_OFF + offsetof(P_" + string tid + ", " + sane fname
                      + "), sizeof(P_" + string stid + "));")
              d
-         | _ -> trap ("pod field " + owner + "." + fname))
+         | Some _ ->
+             // a uniform REF field: load the V
+             let x = emitE st f r
+             let d = slot f
+             stmt f (sref d + " = ((P_" + string tid + " *)((char *)" + sref x
+                     + " + FPP_POD_OFF))->" + sane fname + ";")
+             d
+         | None -> trap ("pod field " + owner + "." + fname))
     | EFieldSet (r, fname, owner, rhs) when (dictTryFind st.PodTid owner).IsSome ->
         let tid = (dictTryFind st.PodTid owner).Value
         let podVarOf (rv : VarId) =
@@ -1465,11 +1490,15 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                    | Some k ->
                        let atom = emitRawAs st f (podRawKind k) rhs
                        stmt f (nm + "." + sane fname + " = (" + podCTy k + ")" + atom + ";")
-                   | None ->
+                   | None when (dictTryFind st.StructFieldTys ty).IsSome
+                               && (dictTryFind st.PodTid ty).IsSome ->
                        let x = emitE st f rhs
                        let stid = (dictTryFind st.PodTid ty).Value
                        stmt f ("memcpy(&" + nm + "." + sane fname + ", (char *)" + sref x
-                               + " + FPP_POD_OFF, sizeof(P_" + string stid + "));"))
+                               + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                   | None ->
+                       let x = emitE st f rhs
+                       stmt f (nm + "." + sane fname + " = " + sref x + ";"))
               | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
              unitV ()
          | _ ->
@@ -2065,6 +2094,7 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
                Locals = dictNew<string * int, int> (); Cells = f.Cells
                RawVars = vecNew<char * string> (); NRaw = 0
                PodOfRaw = dictNew<string, int> ()
+               PodFrame = vecNew<string * int> ()
                RawDecls = vecNew<string> () }
     frees |> List.iteri (fun i k ->
         let l = slot lf
@@ -2081,6 +2111,10 @@ and private emitLam (st : CSt) (f : CFn) (ps : (VarId * Scheme) list) (body : Ex
     vecAdd all ("  (void)self; (void)args;")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max lf.NSlots 1) + "); V *F = Fr_slots;")
     vecAdd all "  int *const SPF_ = fpprt_sp_flag_; (void)SPF_;"
+    if vecLen lf.PodFrame > 0 then
+        vecAdd all ("  struct fpprt_frame_pod FPODS_[" + string (vecLen lf.PodFrame)
+                    + "]; memset(FPODS_, 0, sizeof FPODS_);")
+        vecAdd all ("  Fr.npods = " + string (vecLen lf.PodFrame) + "; Fr.pods = FPODS_;")
     for line in vecToList lf.RawDecls do vecAdd all ("  " + line)
     for line in vecToList lf.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
@@ -2232,6 +2266,7 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
               Locals = dictNew<string * int, int> (); Cells = cellLocals body
               RawVars = vecNew<char * string> (); NRaw = 0
               PodOfRaw = dictNew<string, int> ()
+              PodFrame = vecNew<string * int> ()
               RawDecls = vecNew<string> () }
     // the emitted ABI: registry-driven so every call site agrees
     let pk, rk =
@@ -2249,9 +2284,15 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
         let isCell = (dictTryFind f.Cells (pv.Path, pv.Offset)).IsSome
         if (k : string).StartsWith "S" && not isCell then
             // a struct param arrives BY VALUE: the C parameter IS the
-            // caller's copy — it simply becomes the stack local
+            // caller's copy — it becomes the stack local, and the frame
+            // learns about it BEFORE anything can allocate
+            let tid = int (k.Substring 1)
             vecAdd f.RawVars ('S', pn)
-            dictSet f.PodOfRaw pn (int (k.Substring 1))
+            dictSet f.PodOfRaw pn tid
+            vecAdd f.PodFrame (pn, tid)
+            let idx = vecLen f.PodFrame - 1
+            stmt f ("FPODS_[" + string idx + "] = (struct fpprt_frame_pod){ (char *)&"
+                    + pn + " - FPP_POD_OFF, " + string tid + " };")
             dictSet f.Locals (pv.Path, pv.Offset) (-(vecLen f.RawVars))
         elif k <> "V" && not isCell then
             // arrives RAW on the direct-call ABI
@@ -2299,6 +2340,10 @@ and private emitFn (st : CSt) (key : (string * int) option) (name : string)
     vecAdd all ("static " + retTy + " " + name + "(" + sigOf true + ") {")
     vecAdd all ("  FPPRT_FRAME(Fr, " + string (max f.NSlots 1) + "); V *F = Fr_slots;")
     vecAdd all "  int *const SPF_ = fpprt_sp_flag_; (void)SPF_;"
+    if vecLen f.PodFrame > 0 then
+        vecAdd all ("  struct fpprt_frame_pod FPODS_[" + string (vecLen f.PodFrame)
+                    + "]; memset(FPODS_, 0, sizeof FPODS_);")
+        vecAdd all ("  Fr.npods = " + string (vecLen f.PodFrame) + "; Fr.pods = FPODS_;")
     for line in vecToList f.RawDecls do vecAdd all ("  " + line)
     for line in vecToList f.Body do vecAdd all line
     vecAdd all ("  FPPRT_LEAVE(Fr);")
@@ -2549,6 +2594,7 @@ let emitC (decls : Decl list) : string * string list =
           ClassOwn = dictNew<string, (string * VarId) list> ()
           StructFieldTys = dictNew<string, (string * string) list> ()
           PodTid = dictNew<string, int> ()
+          PodRef = dictNew<string, bool> ()
           PodArrTid = dictNew<string, int> ()
           Typedefs = vecNew<string> ()
           FnSig = dictNew<string * int, string list> ()
@@ -2606,8 +2652,8 @@ let emitC (decls : Decl list) : string * string list =
                     ("extern " + sigCTy rk + " " + sane v.Name + "("
                      + (if List.isEmpty ps2 then "void" else String.concat ", " ps2)
                      + ");")
-        | DRecord (n, _, fields, isS) ->
-            if isS && not (List.isEmpty fields) then
+        | DRecord (n, tps, fields, isS) ->
+            if isS && List.isEmpty tps && not (List.isEmpty fields) then
                 dictSet st.StructFieldTys n fields
             if not (dictTryFind st.RecTid n).IsSome then
                 let tid = freshTid st
@@ -2683,24 +2729,28 @@ let emitC (decls : Decl list) : string * string list =
     // fields are (recursively) primitive or blittable qualify; stamped
     // clones have empty field lists and never do.
     let visiting = dictNew<string, bool> ()
+    // a field is: a PRIM (raw storage), a NESTED flat struct (inline), or
+    // anything else — a uniform V REF ('r'). Stamped and generic struct
+    // types have no StructFieldTys entry and classify as refs, which is
+    // sound: their values are uniform objects.
     let rec podOf (n : string) : bool =
         if (dictTryFind st.PodTid n).IsSome then true
         elif (dictTryFind visiting n).IsSome then false
         elif recBase n <> n then false
-            // STAMPED clones stay uniform: generic code reaches every stamp
-            // through the base's V layout (tuple ops, recTidOf fallback) —
-            // per-stamp flat layouts need the full canonName machinery
         else
             match dictTryFind st.StructFieldTys n, dictTryFind st.RecTid n with
             | Some fts, Some tid ->
                 dictSet visiting n true
-                let ok =
-                    fts |> List.forall (fun ((_ : string), ty) ->
-                        (podPrimKind ty).IsSome || podOf ty)
-                if ok then
-                    dictSet st.PodTid n tid
-                    dictSet st.PodArrTid n (freshTid st)
-                ok
+                let mutable hasRef = false
+                for (_ : string), ty in fts do
+                    if (podPrimKind ty).IsSome then ()
+                    elif (dictTryFind st.StructFieldTys ty).IsSome && podOf ty then
+                        (if (dictTryFind st.PodRef ty).IsSome then hasRef <- true)
+                    else hasRef <- true
+                dictSet st.PodTid n tid
+                if hasRef then dictSet st.PodRef n true
+                else dictSet st.PodArrTid n (freshTid st)
+                true
             | _ -> false
     for d in decls do
         match d with
@@ -2722,30 +2772,59 @@ let emitC (decls : Decl list) : string * string list =
         | DRecord (n, _, _, true) when (dictTryFind st.PodTid n).IsSome ->
             let tid = (dictTryFind st.PodTid n).Value
             let fts = (dictTryFind st.StructFieldTys n).Value
+            let nestedPod (ty : string) =
+                (dictTryFind st.StructFieldTys ty).IsSome
+                && (dictTryFind st.PodTid ty).IsSome
             let fdecl (fn2 : string, ty : string) =
                 match podPrimKind ty with
                 | Some k -> "  " + podCTy k + " " + sane fn2 + ";"
-                | None -> "  P_" + string (dictTryFind st.PodTid ty).Value + " " + sane fn2 + ";"
+                | None when nestedPod ty ->
+                    "  P_" + string (dictTryFind st.PodTid ty).Value + " " + sane fn2 + ";"
+                | None -> "  V " + sane fn2 + ";"          // a uniform REF
             vecAdd st.Typedefs
                 ("typedef struct {\n" + String.concat "\n" (fts |> List.map fdecl)
                  + "\n} P_" + string tid + ";")
-            // registration: size and every LEAF field offset from the C compiler
-            vecAdd st.Reg ("  fpp_reg_pod(" + string tid + ", (uint32_t)sizeof(P_"
-                           + string tid + "), " + cstr n + ");")
+            // walk to the LEAVES: prim kinds, nested flats, and REF fields
+            let refPaths = vecNew<string> ()
+            let fieldRegs = vecNew<string> ()
             let rec leaves (prefix : string) (fts2 : (string * string) list) =
                 for fn2, ty in fts2 do
                     let path = if prefix = "" then sane fn2 else prefix + "." + sane fn2
                     match podPrimKind ty with
                     | Some k ->
-                        vecAdd st.Reg ("  fpp_reg_pod_field(" + string tid
-                                       + ", (uint32_t)offsetof(P_" + string tid + ", " + path
-                                       + "), '" + string k + "');")
-                    | None ->
+                        vecAdd fieldRegs ("  fpp_reg_pod_field(" + string tid
+                                          + ", (uint32_t)offsetof(P_" + string tid + ", " + path
+                                          + "), '" + string k + "');")
+                    | None when nestedPod ty ->
                         leaves path (dictTryFind st.StructFieldTys ty).Value
+                    | None ->
+                        vecAdd refPaths path
+                        vecAdd fieldRegs ("  fpp_reg_pod_field(" + string tid
+                                          + ", (uint32_t)offsetof(P_" + string tid + ", " + path
+                                          + "), 'r');")
             leaves "" fts
-            let atid = (dictTryFind st.PodArrTid n).Value
-            vecAdd st.Reg ("  fpp_reg_pod_arr(" + string atid + ", " + string tid
-                           + ", (uint32_t)sizeof(P_" + string tid + "), " + cstr (n + "[]") + ");")
+            if vecLen refPaths > 0 then
+                // ref offsets as a file-scope table: the SAME table traces
+                // heap blobs and stack locals of this struct
+                vecAdd st.Typedefs
+                    ("static const uint32_t PRF_" + string tid + "[] = { "
+                     + String.concat ", "
+                         (vecToList refPaths
+                          |> List.map (fun pth ->
+                              "FPP_POD_OFF + (uint32_t)offsetof(P_" + string tid + ", " + pth + ")"))
+                     + " };")
+                vecAdd st.Reg ("  fpp_reg_pod2(" + string tid + ", (uint32_t)sizeof(P_"
+                               + string tid + "), " + string (vecLen refPaths)
+                               + ", PRF_" + string tid + ", " + cstr n + ");")
+            else
+                vecAdd st.Reg ("  fpp_reg_pod(" + string tid + ", (uint32_t)sizeof(P_"
+                               + string tid + "), " + cstr n + ");")
+            for l in vecToList fieldRegs do vecAdd st.Reg l
+            (match dictTryFind st.PodArrTid n with
+             | Some atid ->
+                 vecAdd st.Reg ("  fpp_reg_pod_arr(" + string atid + ", " + string tid
+                                + ", (uint32_t)sizeof(P_" + string tid + "), " + cstr (n + "[]") + ");")
+             | None -> ())
         | _ -> ()
     // FINAL LAYOUTS. Three rules, applied in order:
     //   1. a stamped clone with an empty field list inherits its base

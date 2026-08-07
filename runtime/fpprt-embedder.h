@@ -134,10 +134,16 @@ static inline size_t gc_trace_object(struct gc_ref ref,
 
 /* ---- roots: the shadow stack ------------------------------------------- */
 
+struct fpprt_frame_pod_intern {
+  char *base;
+  uint32_t tid;
+};
 struct fpprt_frame_intern {
   struct fpprt_frame_intern *prev;
   uint32_t nslots;
   uintptr_t *slots;
+  uint32_t npods;
+  struct fpprt_frame_pod_intern *pods;
 };
 struct gc_mutator_roots {
   struct fpprt_frame_intern **top; /* &fpprt_top_frame */
@@ -160,10 +166,22 @@ static inline void gc_trace_mutator_roots(struct gc_mutator_roots *roots,
                                           struct gc_heap *heap,
                                           void *trace_data) {
   if (!roots) return;
-  for (struct fpprt_frame_intern *f = *roots->top; f; f = f->prev)
+  for (struct fpprt_frame_intern *f = *roots->top; f; f = f->prev) {
     for (uint32_t i = 0; i < f->nslots; i++)
       if (f->slots[i] && !(f->slots[i] & 1))
         trace_edge(gc_edge(&f->slots[i]), heap, trace_data);
+    /* stack structs: the type table's blob offsets apply to base */
+    for (uint32_t i = 0; i < f->npods; i++) {
+      if (!f->pods[i].base) continue;
+      struct fpprt_type_intern *t = &fpprt_types_[f->pods[i].tid];
+      for (uint32_t r = 0; r < t->nrefs; r++) {
+        uintptr_t *slot =
+            (uintptr_t *)(f->pods[i].base + t->refoffs[r]);
+        if (*slot && !(*slot & 1))
+          trace_edge(gc_edge(slot), heap, trace_data);
+      }
+    }
+  }
 }
 
 static inline void gc_trace_heap_roots(struct gc_heap_roots *roots,

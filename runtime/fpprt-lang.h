@@ -409,6 +409,11 @@ void fpp_lang_init(void);
 #define FPP_POD_OFF 8
 #define FPP_TC_POD 5
 void fpp_reg_pod(uint32_t tid, uint32_t size, const char *name);
+/* ref-holding flat structs: `refoffs` are BLOB-relative (FPP_POD_OFF +
+ * field) V-field offsets — the same table traces heap blobs AND stack
+ * locals (frame pods pass base = addr - FPP_POD_OFF) */
+void fpp_reg_pod2(uint32_t tid, uint32_t size, uint32_t nrefs,
+                  const uint32_t *refoffs, const char *name);
 void fpp_reg_pod_field(uint32_t tid, uint32_t off, char kind);
 void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
                      const char *name);

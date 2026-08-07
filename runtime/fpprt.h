@@ -78,10 +78,20 @@ void fpprt_init(const struct fpprt_opts *opts);
 
 /* ---- shadow-stack roots ------------------------------------------------ */
 
+/* a REF-HOLDING struct living on the C stack: `base` is the struct's
+ * address MINUS FPP_POD_OFF, so the type table's blob-relative ref
+ * offsets apply unchanged. base = NULL until the local is initialized. */
+struct fpprt_frame_pod {
+  char *base;
+  uint32_t tid;
+};
+
 struct fpprt_frame {
   struct fpprt_frame *prev;
   uint32_t nslots;
   fpprt_ref *slots;         /* points at the caller's slot array */
+  uint32_t npods;           /* stack structs with ref fields */
+  struct fpprt_frame_pod *pods;
 };
 
 extern _Thread_local struct fpprt_frame *fpprt_top_frame;
@@ -90,7 +100,8 @@ extern _Thread_local struct fpprt_frame *fpprt_top_frame;
  * Slots are refs the GC may read AND UPDATE (moving collector). */
 #define FPPRT_FRAME(f, n)                                        \
   fpprt_ref f##_slots[n] = { 0 };                                \
-  struct fpprt_frame f = { fpprt_top_frame, (n), f##_slots };    \
+  struct fpprt_frame f = { fpprt_top_frame, (n), f##_slots,      \
+                           0, 0 };                               \
   fpprt_top_frame = &f
 #define FPPRT_LEAVE(f) (fpprt_top_frame = (f).prev)
 
