@@ -95,6 +95,25 @@ aliases eta-reduce at instance heads (`instance Mappable<option>` names
 Option), and multi-arity constructor names do not split per arity through
 a constructor variable.
 
+**Existential cases shipped** (2026-08-07, commit 949a1bf, gated in
+tests/tooling/exist.fpp on both backends): `| Many of 'm<'a> when
+ListLike<'m>` binds `'m` AT THE CASE — one `Wrap<int> list` mixes
+list-backed and array-backed values. The constructor PACKS the chosen
+instance's members (stamped at the case's element types) into hidden
+payload slots; a match binds them, and the branch's member calls dispatch
+through the bound slots. Packing happens where the constructor is applied
+— the one place the constructor is still known — so the dictionary itself
+is monomorphized, and the members are interned closure singletons, which
+is what keeps structural equality meaningful (same instance = identical
+witness). This is the first non-erasable piece of the class system; every
+non-existential use still erases completely. v1 boundaries: the `of`-form
+only, one constraint per case, direct constructor applications pack
+(`xs |> Many` does not yet), and the wasm-GC backend stores multi-payload
+cases as a tuple in its one payload slot. Next: `when 'a :> ISomething`
+on cases — no dictionary needed there, the vtable travels in the value;
+the constraint only has to license interface member resolution on the
+branch's skolem.
+
 Kinds are declared by shape in the type-parameter list: `'m<_>` is a
 constructor of one argument, `'t<_<_>, _>` takes a constructor and a type
 (monad transformers). Kinds capped at rank ~2 in v1 for the sake of error
