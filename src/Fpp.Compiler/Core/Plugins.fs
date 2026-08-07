@@ -487,7 +487,10 @@ let typeDeclsOf (path : string) (root : GreenNode) : GenTypeDecl list =
                     | Some nt ->
                         Some { CName = nt.Text
                                CSig =
-                                 toks c |> List.exists (fun t -> t.Kind = Operator && t.Text = ":")
+                                 // a GADT case: an ARROW result (`of p -> T<..>`)
+                                 // or a payload-less ascription (`: T<..>`)
+                                 toks c |> List.exists (fun t ->
+                                     t.Kind = Operator && (t.Text = ":" || t.Text = "->"))
                                CArgs =
                                  nodes c
                                  |> List.filter (fun x -> isTypeNode x.NodeKind)

@@ -401,6 +401,21 @@ let rec private unifySeen (seen : RefPairSet<Type>) (trial : Trial option) (t1 :
 let unify (t1 : Type) (t2 : Type) : string option =
     unifySeen (refPairSetNew<Type> shallowHash) None t1 t2
 
+/// Unify with an AMBIENT trail: every binding is recorded so a scope can
+/// be rolled back — GADT branch refinement runs a whole clause this way.
+/// With None it is plain `unify`.
+let unifyWith (trial : Trial option) (t1 : Type) (t2 : Type) : string option =
+    unifySeen (refPairSetNew<Type> shallowHash) trial t1 t2
+
+/// Roll a trail back, newest binding first.
+let undoTrial (trial : Trial) : unit =
+    for v, link, lvl in List.rev (vecToList trial.Undo) do
+        v.Link <- link
+        v.Level <- lvl
+
+/// A fresh, open trail for scoped unification.
+let newTrial () : Trial = { Undo = vecNew<Var * Type option * int> (); Rigid = false }
+
 /// Like unifyTrial, but on success answer HOW MANY variables the fit had to
 /// bind. Overload selection uses it as an exactness measure: `IndexOf(Index)`
 /// fits an Index argument with 0 bindings where `IndexOf('T)` needs one, and

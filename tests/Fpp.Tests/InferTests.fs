@@ -99,7 +99,7 @@ let inferTests =
             Expect.isEmpty (inferSrc src).Diagnostics "no false errors from unknowns"
         }
         test "gadt per-case signature is used as the constructor type" {
-            let src = "type Expr<_> =\n  | Lit : int -> Expr<int>\nlet e = Lit 3\n"
+            let src = "type Expr<_> =\n  | Lit of int -> Expr<int>\nlet e = Lit 3\n"
             Expect.isEmpty (inferSrc src).Diagnostics "clean"
             Expect.equal (typeOf src "e") (Some "Expr<int>") "e : Expr<int>"
         }

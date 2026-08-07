@@ -390,6 +390,30 @@ let parse (src : string) : ParseResult =
             Green.node TupleType (vecToList acc)
         else first
 
+    /// a union case's payload: components may carry LABELS —
+    /// `of name : string * value : 'a` — which are documentation (F#'s
+    /// rule); the tokens stay in the tree, the types drive everything.
+    and parseCasePayload (ctx : int) : Green =
+        let labelled (acc : Vec<Green>) =
+            if s.Is Ident && (s.Peek 1).Text = ":" then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (s.Bump ())
+        let pre = vecNew<Green> ()
+        labelled pre
+        let first = parsePostfixType ctx
+        if s.IsOp "*" && not (offside ctx) then
+            let acc = vecNew<Green> ()
+            for x in vecToList pre do vecAdd acc x
+            vecAdd acc first
+            while s.IsOp "*" && not (offside ctx) do
+                vecAdd acc (s.Bump ())
+                labelled acc
+                vecAdd acc (parsePostfixType ctx)
+            Green.node TupleType (vecToList acc)
+        elif vecLen pre > 0 then
+            Green.node ParenType (vecToList pre @ [ first ])
+        else first
+
     and parsePostfixType (ctx : int) : Green =
         // `int list`, `'a option`, `int[]` — postfix applications
         let mutable t = parseAppType ctx
@@ -1584,7 +1608,7 @@ let parse (src : string) : ParseResult =
             vecAdd c (s.Bump ())
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
-                vecAdd c (parseType typeCol)
+                vecAdd c (parseCasePayload typeCol)
             vecAdd acc (Green.node UnionCase (vecToList c))
         let mutable go = true
         while go && s.IsOp "|" && (s.SameLine || s.CurCol > typeCol) do
@@ -1593,17 +1617,33 @@ let parse (src : string) : ParseResult =
             let barCol = s.CurCol
             vecAdd c (s.Bump ())
             if s.Is Ident then vecAdd c (s.Bump ()) else s.Diag "expected a union case name"
+            // the GADT form: `| Lit of value : int -> E<int>` — the
+            // constructor IS a function, and the top-level arrow names its
+            // result instantiation (function PAYLOADS parenthesize, as F#
+            // already requires). A payload-less refined case ascribes:
+            // `| Nil : E<unit>`.
+            let caseWhens () =
+                while s.IsKw "when" do
+                    if (s.Peek 1).Text = "'" && (s.Peek 3).Text = ":>" then
+                        let acc = vecNew<Green> ()
+                        vecAdd acc (s.Bump ())   // when
+                        vecAdd acc (s.Bump ())   // '
+                        vecAdd acc (s.Bump ())   // var
+                        vecAdd acc (s.Bump ())   // :>
+                        vecAdd acc (parseType barCol)
+                        vecAdd c (Green.node WhenDecl (vecToList acc))
+                    else vecAdd c (parseWhen false barCol)
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
-                vecAdd c (parseType barCol)
-                // existential constraint on the CASE:
-                // `| Many of 'm<'a> when ListLike<'m>`
-                while s.IsKw "when" do vecAdd c (parseWhen false barCol)
+                vecAdd c (parseCasePayload barCol)
+                if s.IsOp "->" then
+                    vecAdd c (s.Bump ())
+                    vecAdd c (parsePostfixType barCol)
+                caseWhens ()
             elif s.IsOp ":" then
-                // GADT-style per-case signature
                 vecAdd c (s.Bump ())
-                vecAdd c (parseType barCol)
-                while s.IsKw "when" do vecAdd c (parseWhen false barCol)
+                vecAdd c (parsePostfixType barCol)
+                caseWhens ()
             elif s.IsOp "=" then
                 // enum case: `| Leaf = 0uy`
                 vecAdd c (s.Bump ())

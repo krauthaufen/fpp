@@ -1057,7 +1057,7 @@ let deriveArbTests =
                         "instance Arb<Handled>"
                         "    static arbitrary (r : Rand) = { V = 1 }"
                         "type Tm<_> ="
-                        "    | Lit : int -> Tm<int>"
+                        "    | Lit of int -> Tm<int>"
                         "type Fine = | A | B of string"
                         "let keep = ({ V = 2 } : Handled)"
                         "print (string keep.V)" ] ]

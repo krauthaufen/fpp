@@ -28,7 +28,7 @@ let parserRoundTripTests =
         roundTrips "du" "type Color =\n    | Red\n    | Green\n    | Blue of int\n"
         roundTrips "inline du" "type Option2 = None2 | Some2 of int\n"
         roundTrips "record" "type P =\n    { X : int\n      Y : float }\n"
-        roundTrips "gadt" "type Expr<_> =\n  | Lit  : int -> Expr<int>\n  | Pair : Expr<'a> * Expr<'b> -> Expr<'a * 'b>\n"
+        roundTrips "gadt" "type Expr<_> =\n  | Lit  of int -> Expr<int>\n  | Pair of Expr<'a> * Expr<'b> -> Expr<'a * 'b>\n"
         roundTrips "nested generics" "let f (x : Expr<Expr<int>>) = x\n"
         roundTrips "module def" "module M =\n    let a = 1\n    let b = 2\nlet outside = 3\n"
         roundTrips "opens and header" "module Fpp.Thing\nopen System.Text\nlet x = 1\n"
@@ -197,11 +197,14 @@ let parserStructureTests =
             let clauses = nodesOf MatchClause "let f x =\n    match x with\n    | Some v -> v\n    | None -> 0\n"
             Expect.equal clauses.Length 2 "two match clauses"
         }
-        test "gadt cases are union cases with signatures" {
-            let cases = nodesOf UnionCase "type Expr<_> =\n  | Lit : int -> Expr<int>\n  | Neg : Expr<int> -> Expr<int>\n"
+        test "gadt cases are union cases with results" {
+            let cases = nodesOf UnionCase "type Expr<_> =\n  | Lit of int -> Expr<int>\n  | Neg of Expr<int> -> Expr<int>\n"
             Expect.equal cases.Length 2 "two cases"
-            let hasFun = nodesOf FunType "type Expr<_> =\n  | Lit : int -> Expr<int>\n"
-            Expect.isNonEmpty hasFun "GADT case signature parses as a function type"
+            // the arrow separates payload from RESULT: two type nodes per
+            // case, no FunType — the constructor's function-ness is the
+            // case itself
+            let tys = nodesOf AppType "type Expr<_> =\n  | Lit of int -> Expr<int>\n"
+            Expect.isNonEmpty tys "the result instantiation parses"
         }
         test "nested generic type closes despite >> lexing" {
             let apps = nodesOf AppType "let f (x : Expr<Expr<int>>) = x\n"

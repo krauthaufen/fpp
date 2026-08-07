@@ -149,6 +149,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         dictSet defSchemes offset sch
         dictSet shared (path + ":" + string offset) sch
 
+    /// The AMBIENT trail for GADT branch refinement: while a clause of a
+    /// GADT match types, every binding is recorded here and rolled back on
+    /// exit — `I : int -> E<int>` teaches the BRANCH that 'a = int and the
+    /// equation never leaks. Shadowing `unify` routes the whole file's
+    /// unification through it; None means plain unification.
+    let mutable gadtTrail : Types.Trial option = None
+    let unify (t1 : Type) (t2 : Type) : string option =
+        Types.unifyWith gadtTrail t1 t2
+
     /// Instantiate the scheme of a definition. Imported schemes are deep-
     /// freshened over ALL their variables (not just quantified ones), so
     /// residual free variables — value restriction, inference gaps — can
@@ -1209,6 +1218,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let mutable givens : Constraint list = []
     /// class-member use offset -> the instance member it resolved to
     let classUsesRaw = vecNew<int * Classes.InstMember> ()
+    let classPendingRaw = vecNew<int * string> ()
+    /// pendingClassUses indexes already resolved IN SCOPE (a GADT clause
+    /// resolves its own uses while the branch's refinements still hold)
+    let classUseConsumed = dictNew<int, bool> ()
     /// class-member uses parked until solving finishes: the instance is
     /// often only pinned down by a later unification
     /// (offset, member, constraint, byName). A use written as a NAME
@@ -1228,7 +1241,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // slots; a MATCH binds them and the branch's member calls dispatch
     // through the bound slots — no instance is ever chosen at the use.
     let existCtor = dictNew<string * int, string> ()      // ctor def -> case
+    /// subtype-bounded case vars: ctor def -> (quantified index, iface)
+    let existSubCtor = dictNew<string * int, (int * string) list> ()
+    let pendingSubChecks = vecNew<int * Type * string> ()
     let patGivens = vecNew<int * string * Constraint> ()  // patOff, case, con
+    let patSubs = vecNew<int * Type * string> ()          // patOff, payload ty, iface
     let skolemCases = dictNew<int, int * string> ()       // var id -> patOff, class
     let dictUsesRaw = vecNew<int * (int * int)> ()        // useOff -> patOff, memberIdx
     let packSitesRaw = vecNew<int * string * Constraint * Type list> ()
@@ -1707,6 +1724,90 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | None -> None
         | _ -> None
 
+    /// Resolve one recorded class-member use: existential skolems dispatch
+    /// through hidden slots, solved constraints bind the instance member,
+    /// and anything still symbolic becomes a stamping marker.
+    let resolveClassUse (offset : int) (name : string) (c : Constraint)
+                        (byName : bool) (qfresh : Type list) : unit =
+        // an EXISTENTIAL dispatch: the constraint's argument is a case
+        // skolem — no instance to pick, the member rides a hidden slot
+        let skolemHit =
+            match c.Args |> List.tryHead |> Option.map prune with
+            | Some (TVar v) -> dictTryFind skolemCases v.Id
+            | _ -> None
+        match skolemHit with
+        | Some (po, cls) ->
+            (match dictTryFind classes.Classes cls with
+             | Some cd ->
+                 (match cd.Members |> List.tryFindIndex (fun (mn, _) -> mn = name) with
+                  | Some mi -> vecAdd dictUsesRaw (offset, (po, mi))
+                  | None -> ())
+             | None -> ())
+        | None ->
+        match instanceMember byName c name qfresh with
+        | Some key -> vecAdd classUsesRaw (offset, key)
+        | None ->
+            // unresolved because the operand type is still a variable: name
+            // the class, the member and the variable, and let stamping
+            // finish the job in each specialized copy
+            if byName then
+                let tn =
+                    match c.Args |> List.tryHead |> Option.map prune with
+                    | Some (TCon (_, targs) as ct) when not (List.isEmpty targs) -> typeConName ct
+                    | Some (TCon (n, _)) -> n
+                    | Some (TVar v) -> "#" + string v.Id
+                    | _ -> ""
+                // a member generic BEYOND the class parameters needs its
+                // element instantiation carried to stamping: entries in the
+                // class signature's free-var order, "@k" marking where the
+                // eventually-chosen instance's own head arguments splice in
+                let elems =
+                    if List.isEmpty qfresh then ""
+                    else
+                        match dictTryFind classes.Classes c.Class with
+                        | Some cd ->
+                            (match cd.Members |> List.tryFind (fun (mn, _) -> mn = name) with
+                             | Some (_, msch) when
+                                   List.length msch.Quantified = List.length qfresh
+                                   && List.length msch.Quantified > List.length cd.Params ->
+                                 let paramIds = cd.Params |> List.map (fun v -> v.Id)
+                                 let qIds = msch.Quantified |> List.map (fun v -> v.Id)
+                                 let seen = dictNew<int, bool> ()
+                                 let out = vecNew<string> ()
+                                 let mutable bad = false
+                                 let rec go (t : Type) : unit =
+                                     match prune t with
+                                     | TVar v ->
+                                         if not (dictTryFind seen v.Id).IsSome then
+                                             dictSet seen v.Id true
+                                             (match List.tryFindIndex (fun i -> i = v.Id) paramIds with
+                                              | Some k -> vecAdd out ("@" + string k)
+                                              | None ->
+                                                  match List.tryFindIndex (fun i -> i = v.Id) qIds with
+                                                  | Some qi ->
+                                                      let e = List.item qi qfresh
+                                                      (match prune e with
+                                                       | TCon (_, ta) as ct when not (List.isEmpty ta) -> vecAdd out (instConName ct)
+                                                       | TCon (n2, _) -> vecAdd out n2
+                                                       | TVar tv -> vecAdd out ("#" + string tv.Id)
+                                                       | TTuple _ -> vecAdd out (instConName e)
+                                                       | TFun _ -> vecAdd out "$ref"
+                                                       | _ -> bad <- true)
+                                                  | None -> bad <- true)
+                                     | TCon (_, xs) -> List.iter go xs
+                                     | TFun (a2, b2) -> go a2; go b2
+                                     | TTuple ts -> List.iter go ts
+                                     | TApp (h, xs) -> go h; List.iter go xs
+                                 go msch.Body
+                                 if bad then "" else String.concat "," (vecToList out)
+                             | _ -> "")
+                        | None -> ""
+                if tn <> "" then
+                    let marker =
+                        if elems = "" then c.Class + ":" + name + ":" + tn
+                        else c.Class + ":" + name + ":" + tn + ":" + elems
+                    vecAdd classPendingRaw (offset, marker)
+
     /// The head of `class C<'a,'b>` / `instance C<int,int>`: the class name
     /// and its arguments, typed in `vars`.
     /// declared kinds of a class's parameters: `'f<_>` is 1, a plain
@@ -1969,8 +2070,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // a constructor use
                      (match dictTryFind useDefs t.Offset with
                       | Some d ->
-                          (match instantiateFor d with
-                           | Some (t2, cs) ->
+                          (match schemeOfDef d with
+                           | Some sc ->
+                               let t2, fresh, cs =
+                                   if d.Path = path then instantiateTracked sc
+                                   else instantiateImported sc
                                // existential case pattern: the constraint
                                // becomes a GIVEN for the clause body, its
                                // fresh args are the case's skolems
@@ -1979,8 +2083,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     for c in cs do
                                         vecAdd patGivens (t.Offset, cn, c)
                                 | None -> ())
+                               // a subtype-bounded case var: the branch's
+                               // skolem dispatches through the interface
+                               // the bound is applied AFTER the whole
+                               // pattern unifies — union-by-level may
+                               // re-point the var, and the bound must land
+                               // on the final representative
+                               (match dictTryFind existSubCtor (d.Path, d.Offset) with
+                                | Some entries ->
+                                    for qi, ifc in entries do
+                                        (match List.tryItem qi fresh with
+                                         | Some ft -> vecAdd patSubs (t.Offset, ft, ifc)
+                                         | None -> ())
+                                | None -> ())
                                t2
-                           | None -> st.Fresh ())
+                           | None ->
+                               match instantiateFor d with
+                               | Some (t2, _) -> t2
+                               | None -> st.Fresh ())
                       | None -> st.Fresh ())
              | None -> st.Fresh ())
         | AppPat ->
@@ -2272,6 +2392,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // at int is what turns `Zero` into zero-at-int
                           let owe (qfresh : Type list) (cs : Constraint list) : unit =
                               for c in cs do addWanted t.Offset c
+                              (match dictTryFind existSubCtor (d.Path, d.Offset) with
+                               | Some entries ->
+                                   for qi, ifc in entries do
+                                       (match List.tryItem qi qfresh with
+                                        | Some ft -> vecAdd pendingSubChecks (t.Offset, ft, ifc)
+                                        | None -> ())
+                               | None -> ())
                               (match dictTryFind existCtor (d.Path, d.Offset) with
                                | Some cninfo ->
                                    (match cs with
@@ -3624,8 +3751,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let result = st.Fresh ()
                 // `function` has no scrutinee written: it IS the function
                 let isFunctionForm = scrutTy.IsNone
+                // a GADT match refines PER BRANCH: the clause runs on a
+                // trail and rolls back on exit, so `I : int -> E<int>`
+                // teaches only its own branch that 'a = int
+                let gadtHere =
+                    match prune scrut with
+                    | TCon (un, _) -> (dictTryFind unionGadt un).IsSome
+                    | _ -> false
                 for cl in nodesOf n do
                     if cl.NodeKind = MatchClause then
+                        let savedTrail = gadtTrail
+                        let clauseTrail =
+                            if gadtHere then
+                                let tr = Types.newTrial ()
+                                gadtTrail <- Some tr
+                                Some tr
+                            else None
+                        let pcuMark = vecLen pendingClassUses
                         let barOff = match tokensOf cl |> List.tryHead with Some t -> t.Offset | None -> 0
                         // pattern nodes (before ->) unify with the scrutinee
                         let cvars = dictNew<string, Type> ()
@@ -3634,6 +3776,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             || (m.NodeKind = AsPat
                                 && (nodesOf m |> List.exists isTypeTest))
                         let pgMark = vecLen patGivens
+                        let psMark = vecLen patSubs
                         for m in nodesOf cl do
                             if isPatKind m.NodeKind then
                                 // A `:?` clause states a runtime test, not an
@@ -3651,6 +3794,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         // existential patterns in THIS clause: their
                         // constraints are givens while the body types, and
                         // their fresh args are the clause's skolems
+                        (let mutable k = psMark
+                         while k < vecLen patSubs do
+                             let _, ft, ifc = vecGet patSubs k
+                             (match prune ft with
+                              | TVar vv -> dictSet subtypeBounds vv.Id ifc
+                              | _ -> ())
+                             k <- k + 1)
                         let clauseGivens = vecNew<int * string * Constraint> ()
                         (let mutable k = pgMark
                          while k < vecLen patGivens do
@@ -3678,6 +3828,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         // file-level solving would default the skolems away
                         (if vecLen clauseGivens > 0 then solveWanted ())
                         givens <- savedGivens
+                        // a refining clause resolves its class uses NOW,
+                        // while the branch equations still hold, and rolls
+                        // the equations back
+                        (match clauseTrail with
+                         | Some tr ->
+                             (let mutable k = pcuMark
+                              while k < vecLen pendingClassUses do
+                                  let offset2, nm2, c2, bn2, qf2 = vecGet pendingClassUses k
+                                  resolveClassUse offset2 nm2 c2 bn2 qf2
+                                  dictSet classUseConsumed k true
+                                  k <- k + 1)
+                             Types.undoTrial tr
+                         | None -> ())
+                        gadtTrail <- savedTrail
                 if isFunctionForm then TFun (scrut, result) else result
             | BlockExpr ->
                 let mutable last = tUnit
@@ -4637,31 +4801,75 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> ())
             | UnionCase ->
                 let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
-                let isGadt = hasOpToken ":" m
-                let tyNode = nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+                let hasArrow = hasOpToken "->" m
+                let isGadt = hasArrow || hasOpToken ":" m
+                let tyNodes = nodesOf m |> List.filter (fun x -> isTypeKind x.NodeKind)
                 let ctorTy =
-                    match tyNode with
-                    | Some tn when isGadt ->
-                        // per-case signature is the whole constructor type;
-                        // per-case variables live in their own scope
-                        let caseVars = dictNew<string, Type> ()
-                        typeFromNode caseVars tn
-                    | Some tn -> TFun (typeFromNode vars tn, selfTy)
-                    | None -> selfTy
+                    if hasArrow then
+                        // `| Lit of value : int -> E<int>` — the arrow
+                        // names the case's result instantiation; payload
+                        // and result vars share the case's scope
+                        match tyNodes with
+                        | payload :: res :: _ ->
+                            TFun (typeFromNode vars payload, typeFromNode vars res)
+                        | [ only ] -> typeFromNode vars only
+                        | [] -> selfTy
+                    elif isGadt then
+                        // payload-less refined case: `| Nil : E<unit>`
+                        match tyNodes with
+                        | res :: _ -> typeFromNode vars res
+                        | [] -> selfTy
+                    else
+                        match tyNodes with
+                        | tn :: _ -> TFun (typeFromNode vars tn, selfTy)
+                        | [] -> selfTy
                 // an EXISTENTIAL case: `when C<'m>` on the case makes the
                 // constructor a constrained function, and marks the case
                 // for dictionary packing (of-form scope only in v1)
                 let caseCons =
-                    nodesOf m |> List.filter (fun x -> x.NodeKind = WhenDecl)
+                    nodesOf m
+                    |> List.filter (fun x ->
+                        x.NodeKind = WhenDecl
+                        && not (tokensOf x |> List.exists (fun tk ->
+                               tk.Kind = Operator && tk.Text = ":>")))
                     |> List.choose (constraintOf vars)
+                // `when 'a :> IFace` bounds a case variable by an
+                // interface — the value carries its vtable, so nothing is
+                // packed; the bound licenses dispatch in the branch
+                let subWhens =
+                    nodesOf m |> List.filter (fun x -> x.NodeKind = WhenDecl)
+                    |> List.choose (fun w ->
+                        let ts = Green.tokens (GNode w)
+                        if ts |> List.exists (fun tk -> tk.Kind = Operator && tk.Text = ":>") then
+                            let ids = ts |> List.filter (fun tk -> tk.Kind = Ident)
+                            (match ids, List.tryLast ids with
+                             | v0 :: _, Some ifc when v0.Text <> ifc.Text ->
+                                 Some (v0.Text, ifc.Text)
+                             | _ -> None)
+                        else None)
                 (match caseTok with
                  | Some t when (dictTryFind defsAt t.Offset).IsSome ->
-                     let sch = { Quantified = ctorQuantified (vecToList tyParams) ctorTy; Constraints = caseCons; Body = ctorTy }
+                     let qs = ctorQuantified (vecToList tyParams) ctorTy
+                     let sch = { Quantified = qs; Constraints = caseCons; Body = ctorTy }
                      setScheme t.Offset sch
                      (if not (List.isEmpty caseCons) then
                          match caseCons with
                          | c0 :: _ -> dictSet existCtor (path, t.Offset) (t.Text + ":" + c0.Class)
                          | [] -> ())
+                     (if not (List.isEmpty subWhens) then
+                         let entries =
+                             subWhens |> List.choose (fun (vn, ifc) ->
+                                 match dictTryFind vars vn with
+                                 | Some vt ->
+                                     (match prune vt with
+                                      | TVar vv ->
+                                          (match qs |> List.tryFindIndex (fun q -> prunedId q = prunedId vv) with
+                                           | Some qi -> Some (qi, ifc)
+                                           | None -> None)
+                                      | _ -> None)
+                                 | None -> None)
+                         if not (List.isEmpty entries) then
+                             dictSet existSubCtor (path, t.Offset) entries)
                      recordDef t ctorTy
                  | _ -> ())
                 // the case shape, for derived Arb instances
@@ -5613,86 +5821,51 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // a class-member use binds to an instance member only once solving has
     // settled; a builtin instance has no member to bind to, which is exactly
     // when the backend emits the operation itself
-    let classPendingRaw = vecNew<int * string> ()
-    for offset, name, c, byName, qfresh in vecToList pendingClassUses do
-        // an EXISTENTIAL dispatch: the constraint's argument is a case
-        // skolem — no instance to pick, the member rides a hidden slot
-        let skolemHit =
-            match c.Args |> List.tryHead |> Option.map prune with
-            | Some (TVar v) -> dictTryFind skolemCases v.Id
-            | _ -> None
-        match skolemHit with
-        | Some (po, cls) ->
-            (match dictTryFind classes.Classes cls with
-             | Some cd ->
-                 (match cd.Members |> List.tryFindIndex (fun (mn, _) -> mn = name) with
-                  | Some mi -> vecAdd dictUsesRaw (offset, (po, mi))
-                  | None -> ())
-             | None -> ())
-        | None ->
-        match instanceMember byName c name qfresh with
-        | Some key -> vecAdd classUsesRaw (offset, key)
-        | None ->
-            // unresolved because the operand type is still a variable: name
-            // the class, the member and the variable, and let stamping
-            // finish the job in each specialized copy
-            if byName then
-                let tn =
-                    match c.Args |> List.tryHead |> Option.map prune with
-                    | Some (TCon (_, targs) as ct) when not (List.isEmpty targs) -> typeConName ct
-                    | Some (TCon (n, _)) -> n
-                    | Some (TVar v) -> "#" + string v.Id
-                    | _ -> ""
-                // a member generic BEYOND the class parameters needs its
-                // element instantiation carried to stamping: entries in the
-                // class signature's free-var order, "@k" marking where the
-                // eventually-chosen instance's own head arguments splice in
-                let elems =
-                    if List.isEmpty qfresh then ""
-                    else
-                        match dictTryFind classes.Classes c.Class with
-                        | Some cd ->
-                            (match cd.Members |> List.tryFind (fun (mn, _) -> mn = name) with
-                             | Some (_, msch) when
-                                   List.length msch.Quantified = List.length qfresh
-                                   && List.length msch.Quantified > List.length cd.Params ->
-                                 let paramIds = cd.Params |> List.map (fun v -> v.Id)
-                                 let qIds = msch.Quantified |> List.map (fun v -> v.Id)
-                                 let seen = dictNew<int, bool> ()
-                                 let out = vecNew<string> ()
-                                 let mutable bad = false
-                                 let rec go (t : Type) : unit =
-                                     match prune t with
-                                     | TVar v ->
-                                         if not (dictTryFind seen v.Id).IsSome then
-                                             dictSet seen v.Id true
-                                             (match List.tryFindIndex (fun i -> i = v.Id) paramIds with
-                                              | Some k -> vecAdd out ("@" + string k)
-                                              | None ->
-                                                  match List.tryFindIndex (fun i -> i = v.Id) qIds with
-                                                  | Some qi ->
-                                                      let e = List.item qi qfresh
-                                                      (match prune e with
-                                                       | TCon (_, ta) as ct when not (List.isEmpty ta) -> vecAdd out (instConName ct)
-                                                       | TCon (n2, _) -> vecAdd out n2
-                                                       | TVar tv -> vecAdd out ("#" + string tv.Id)
-                                                       | TTuple _ -> vecAdd out (instConName e)
-                                                       | TFun _ -> vecAdd out "$ref"
-                                                       | _ -> bad <- true)
-                                                  | None -> bad <- true)
-                                     | TCon (_, xs) -> List.iter go xs
-                                     | TFun (a2, b2) -> go a2; go b2
-                                     | TTuple ts -> List.iter go ts
-                                     | TApp (h, xs) -> go h; List.iter go xs
-                                 go msch.Body
-                                 if bad then "" else String.concat "," (vecToList out)
-                             | _ -> "")
-                        | None -> ""
-                if tn <> "" then
-                    let marker =
-                        if elems = "" then c.Class + ":" + name + ":" + tn
-                        else c.Class + ":" + name + ":" + tn + ":" + elems
-                    vecAdd classPendingRaw (offset, marker)
+    for idx in 0 .. vecLen pendingClassUses - 1 do
+        if not (dictTryFind classUseConsumed idx).IsSome then
+            let offset, name, c, byName, qfresh = vecGet pendingClassUses idx
+            resolveClassUse offset name c byName qfresh
+
+    // subtype bounds on constructed cases: the packed value must
+    // implement the interface the case demands
+    for off, ty, ifc in vecToList pendingSubChecks do
+        (match prune ty with
+         | TCon (tn0, _) ->
+             let rec implements (tn : string) (depth : int) : bool =
+                 depth < 16
+                 && ((match dictTryFind impls tn with
+                      | Some ifs -> List.contains ifc ifs
+                      | None -> false)
+                     || (match dictTryFind bases tn with
+                         | Some (_, bt) ->
+                             (match prune bt with
+                              | TCon (bn, _) -> bn = ifc || implements bn (depth + 1)
+                              | _ -> false)
+                         | None -> false))
+             if tn0 <> ifc && not (implements tn0 0) then
+                 vecAdd diags (off, tn0 + " does not implement " + ifc + ", which this case requires")
+         | _ -> ())
+
+    // retry parked dot-accesses
+    // subtype bounds on constructed cases: the packed value must
+    // implement the interface the case demands
+    for off, ty, ifc in vecToList pendingSubChecks do
+        (match prune ty with
+         | TCon (tn0, _) ->
+             let rec implements (tn : string) (depth : int) : bool =
+                 depth < 16
+                 && ((match dictTryFind impls tn with
+                      | Some ifs -> List.contains ifc ifs
+                      | None -> false)
+                     || (match dictTryFind bases tn with
+                         | Some (_, bt) ->
+                             (match prune bt with
+                              | TCon (bn, _) -> bn = ifc || implements bn (depth + 1)
+                              | _ -> false)
+                         | None -> false))
+             if tn0 <> ifc && not (implements tn0 0) then
+                 vecAdd diags (off, tn0 + " does not implement " + ifc + ", which this case requires")
+         | _ -> ())
 
     // retry parked dot-accesses until nothing more can be learned: resolving
     // one can fix a variable that unblocks another
