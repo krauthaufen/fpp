@@ -438,7 +438,14 @@ void fpp_reg_pod2(uint32_t tid, uint32_t size, uint32_t nrefs,
 void fpp_reg_pod_field(uint32_t tid, uint32_t off, char kind);
 void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
                      const char *name);
+/* ref-holding elems stay FLAT: the array's type entry carries the elem's
+ * ref offsets rebased to the element start (refoffs arrive blob-relative,
+ * the same PRF_ table fpp_reg_pod2 takes) */
+void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
+                         uint32_t nrefs, const uint32_t *blobrefoffs,
+                         const char *name);
 V fpp_pod_box(uint32_t tid, uint32_t size);          /* zeroed blob */
+V fpp_pod_clone(V blob);                             /* fresh copy */
 V fpp_pod_get(V a, size_t i, uint32_t elemtid);      /* flat elem -> blob */
 void fpp_pod_set(V a, size_t i, V blob);             /* blob -> flat elem */
 int fpp_pod_eq(V a, V b);

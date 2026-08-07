@@ -59,7 +59,8 @@ type CSt =
       PodTid : Dict<string, int>             // FLAT struct -> its tid
       PodRef : Dict<string, bool>            // flat struct HOLDS REFS
                                              // (stack+blob only, no C ABI)
-      PodArrTid : Dict<string, int>          // blittable struct -> array tid
+      PodArrTid : Dict<string, int>          // struct -> flat-array tid
+      PodGlobals : Dict<string * int, int>   // pod-typed globals -> pod tid
       Typedefs : Vec<string>                 // C typedefs for blittable structs
       FnSig : Dict<string * int, string list> // per-param storage kinds
                                              // "V"/"u"/prim char/"S<tid>"
@@ -781,7 +782,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
              | Some g ->
                  let d = slot f
-                 stmt f (sref d + " = " + g + ";")
+                 if (dictTryFind st.PodGlobals (v.Path, v.Offset)).IsSome then
+                     // reading a struct static COPIES it — the .NET model
+                     stmt f (sref d + " = fpp_pod_clone(" + g + ");")
+                 else
+                     stmt f (sref d + " = " + g + ";")
                  d
              | None ->
                  match dictTryFind st.Fns (v.Path, v.Offset) with
@@ -1395,7 +1400,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | None ->
              let x = emitE st f rhs
              match dictTryFind st.GlobalOf (v.Path, v.Offset) with
-             | Some g -> stmt f (g + " = " + sref x + ";")
+             | Some g ->
+                 if (dictTryFind st.PodGlobals (v.Path, v.Offset)).IsSome then
+                     stmt f (g + " = fpp_pod_clone(" + sref x + ");")
+                 else stmt f (g + " = " + sref x + ";")
              | None -> stmt f ("fpp_not_emitted(" + cstr ("assign " + v.Name) + ");"))
         unitV ()
     | EIf (ETypeTest ("ByRefView", (EVar (brv, _) | EVarI (brv, _, _))),
@@ -1550,6 +1558,32 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                    | None ->
                        let x = emitE st f rhs
                        stmt f (nm + "." + sane fname + " = " + sref x + ";"))
+              | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
+             unitV ()
+         | EVar (rv, _) | EVarI (rv, _, _) when
+               (dictTryFind st.PodGlobals (rv.Path, rv.Offset)).IsSome
+               && (dictTryFind st.GlobalOf (rv.Path, rv.Offset)).IsSome ->
+             // a struct STATIC mutates its storage in place; the blob is
+             // heap-resident, so ref-field stores take the write barrier
+             let g = (dictTryFind st.GlobalOf (rv.Path, rv.Offset)).Value
+             let fts = (dictTryFind st.StructFieldTys owner).Value
+             (match fts |> List.tryPick (fun (a, ty) -> if a = fname then Some ty else None) with
+              | Some ty ->
+                  let lv = "((P_" + string tid + " *)((char *)" + g + " + FPP_POD_OFF))->" + sane fname
+                  (match podPrimKind ty with
+                   | Some k ->
+                       let atom = emitRawAs st f (podRawKind k) rhs
+                       stmt f (lv + " = (" + podCTy k + ")" + atom + ";")
+                   | None when (dictTryFind st.StructFieldTys ty).IsSome
+                               && (dictTryFind st.PodTid ty).IsSome ->
+                       let x = emitE st f rhs
+                       let stid = (dictTryFind st.PodTid ty).Value
+                       stmt f ("memcpy(&" + lv + ", (char *)" + sref x
+                               + " + FPP_POD_OFF, sizeof(P_" + string stid + "));")
+                   | None ->
+                       let x = emitE st f rhs
+                       stmt f ("fpprt_write_ref(" + g + ", FPP_POD_OFF + (uint32_t)offsetof(P_"
+                               + string tid + ", " + sane fname + "), " + sref x + ");"))
               | None -> stmt f ("fpp_not_emitted(" + cstr ("pod fieldset " + owner + "." + fname) + ");"))
              unitV ()
          | _ ->
@@ -2700,6 +2734,7 @@ let emitC (decls : Decl list) : string * string list =
           PodTid = dictNew<string, int> ()
           PodRef = dictNew<string, bool> ()
           PodArrTid = dictNew<string, int> ()
+          PodGlobals = dictNew<string * int, int> ()
           Typedefs = vecNew<string> ()
           FnSig = dictNew<string * int, string list> ()
           FnRet = dictNew<string * int, string> ()
@@ -2852,8 +2887,8 @@ let emitC (decls : Decl list) : string * string list =
                         (if (dictTryFind st.PodRef ty).IsSome then hasRef <- true)
                     else hasRef <- true
                 dictSet st.PodTid n tid
-                if hasRef then dictSet st.PodRef n true
-                else dictSet st.PodArrTid n (freshTid st)
+                (if hasRef then dictSet st.PodRef n true)
+                dictSet st.PodArrTid n (freshTid st)
                 true
             | _ -> false
     for d in decls do
@@ -2871,6 +2906,15 @@ let emitC (decls : Decl list) : string * string list =
                     if k = "V" && byrefParam pv2 fbody then "B" else k) pk0 ps
             dictSet st.FnSig (v.Path, v.Offset) pk
             dictSet st.FnRet (v.Path, v.Offset) rk
+        | DLet (_, v, sc, _) ->
+            // a pod-typed GLOBAL is a static struct field: reads copy,
+            // assignment copies, field-set mutates the storage in place
+            (match schemePodName sc with
+             | Some tn ->
+                 (match dictTryFind st.PodTid tn with
+                  | Some ptid -> dictSet st.PodGlobals (v.Path, v.Offset) ptid
+                  | None -> ())
+             | None -> ())
         | _ -> ()
     // typedefs in DECLARATION order (F# forbids forward refs, so nested
     // structs are declared before their containers)
@@ -2929,8 +2973,14 @@ let emitC (decls : Decl list) : string * string list =
             for l in vecToList fieldRegs do vecAdd st.Reg l
             (match dictTryFind st.PodArrTid n with
              | Some atid ->
-                 vecAdd st.Reg ("  fpp_reg_pod_arr(" + string atid + ", " + string tid
-                                + ", (uint32_t)sizeof(P_" + string tid + "), " + cstr (n + "[]") + ");")
+                 if vecLen refPaths > 0 then
+                     vecAdd st.Reg ("  fpp_reg_pod_ref_arr(" + string atid + ", " + string tid
+                                    + ", (uint32_t)sizeof(P_" + string tid + "), "
+                                    + string (vecLen refPaths) + ", PRF_" + string tid
+                                    + ", " + cstr (n + "[]") + ");")
+                 else
+                     vecAdd st.Reg ("  fpp_reg_pod_arr(" + string atid + ", " + string tid
+                                    + ", (uint32_t)sizeof(P_" + string tid + "), " + cstr (n + "[]") + ");")
              | None -> ())
         | _ -> ()
     // FINAL LAYOUTS. Three rules, applied in order:

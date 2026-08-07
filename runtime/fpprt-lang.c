@@ -1289,6 +1289,8 @@ struct fpp_pod_info_ {
   uint32_t nfields, cap;
   struct fpp_pod_field_ *fields;
   uint32_t elemtid;                 /* for ARRAY tids: the element's tid */
+  uint32_t nrefs;                   /* ARRAY tids: elem ref-field count */
+  const uint32_t *refoffs;          /* ARRAY tids: ELEM-relative offsets */
 };
 static struct fpp_pod_info_ **fpp_pods_ = NULL;
 static size_t fpp_pods_cap_ = 0;
@@ -1351,9 +1353,35 @@ void fpp_reg_pod_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
     elemsz, FPPRT_KIND_SCALAR_ARRAY, 0, NULL, name });
 }
 
+void fpp_reg_pod_ref_arr(uint32_t arrtid, uint32_t elemtid, uint32_t elemsz,
+                         uint32_t nrefs, const uint32_t *blobrefoffs,
+                         const char *name) {
+  struct fpp_pod_info_ *p = fpp_pod_ensure_(arrtid);
+  p->size = elemsz;
+  p->elemtid = elemtid;
+  p->nrefs = nrefs;
+  uint32_t *adj = malloc(nrefs * sizeof(uint32_t));
+  if (!adj) abort();
+  for (uint32_t i = 0; i < nrefs; i++) adj[i] = blobrefoffs[i] - FPP_POD_OFF;
+  p->refoffs = adj;
+  fpprt_register_type(arrtid, (struct fpprt_type){
+    elemsz, FPPRT_KIND_POD_ARRAY, nrefs, adj, name });
+}
+
 V fpp_pod_box(uint32_t tid, uint32_t size) {
   (void)size;
   return fpprt_alloc(tid);            /* zeroed by the allocator */
+}
+
+V fpp_pod_clone(V blob) {
+  uint32_t tid = fpprt_typeid(blob);
+  uint32_t sz = fpp_pod_info_(tid)->size;
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = blob;
+  V b = fpprt_alloc(tid);
+  memcpy((char *)b + FPP_POD_OFF, (char *)f_slots[0] + FPP_POD_OFF, sz);
+  FPPRT_LEAVE(f);
+  return b;
 }
 
 V fpp_pod_get(V a, size_t i, uint32_t elemtid) {
@@ -1371,7 +1399,18 @@ V fpp_pod_get(V a, size_t i, uint32_t elemtid) {
 void fpp_pod_set(V a, size_t i, V blob) {
   fpp_arr_check_(a, i);
   uint32_t sz = fpp_pod_info_(fpprt_typeid(blob))->size;
-  memcpy((char *)fpprt_elems(a) + i * sz, (char *)blob + FPP_POD_OFF, sz);
+  char *dst = (char *)fpprt_elems(a) + i * sz;
+  memcpy(dst, (char *)blob + FPP_POD_OFF, sz);
+  /* ref fields that just landed in the heap owe the collector a write
+   * barrier: re-store each through the barriered path */
+  struct fpp_pod_info_ *ap = fpp_pod_info_(fpprt_typeid(a));
+  if (ap && ap->nrefs) {
+    uint32_t base = (uint32_t)(dst - (char *)a);
+    for (uint32_t r = 0; r < ap->nrefs; r++) {
+      uint32_t off = base + ap->refoffs[r];
+      fpprt_write_ref(a, off, fpprt_read_ref(a, off));
+    }
+  }
 }
 
 static int fpp_pod_field_cmp_(char k, const char *pa, const char *pb) {

@@ -35,6 +35,7 @@ extern uint32_t fpprt_ntypes_;
 #define FPPRT_EMB_KIND_REF_ARRAY 1u
 #define FPPRT_EMB_KIND_SCALAR_ARRAY 2u
 #define FPPRT_EMB_KIND_EPHEMERON 3u
+#define FPPRT_EMB_KIND_POD_ARRAY 4u
 
 struct fpprt_header { uintptr_t tag; };
 
@@ -58,6 +59,7 @@ static inline size_t fpprt_object_size_(uintptr_t tag, void *obj) {
     return 2 * sizeof(uintptr_t)
       + ((uintptr_t *)obj)[1] * sizeof(uintptr_t);
   case FPPRT_EMB_KIND_SCALAR_ARRAY:
+  case FPPRT_EMB_KIND_POD_ARRAY:
     return fpprt_align_(2 * sizeof(uintptr_t)
                         + ((uintptr_t *)obj)[1] * (size_t)t->size);
   case FPPRT_EMB_KIND_EPHEMERON:
@@ -123,6 +125,21 @@ static inline size_t gc_trace_object(struct gc_ref ref,
   case FPPRT_EMB_KIND_SCALAR_ARRAY:
     return fpprt_align_(2 * sizeof(uintptr_t)
                         + ((uintptr_t *)obj)[1] * (size_t)t->size);
+  case FPPRT_EMB_KIND_POD_ARRAY: {
+    uintptr_t len = ((uintptr_t *)obj)[1];
+    if (visit) {
+      char *elems = (char *)obj + 2 * sizeof(uintptr_t);
+      for (uintptr_t i = 0; i < len; i++) {
+        char *e = elems + i * (size_t)t->size;
+        for (uint32_t r = 0; r < t->nrefs; r++) {
+          uintptr_t *slot = (uintptr_t *)(e + t->refoffs[r]);
+          if (*slot && !(*slot & 1))
+            visit(gc_edge(slot), heap, trace_data);
+        }
+      }
+    }
+    return fpprt_align_(2 * sizeof(uintptr_t) + len * (size_t)t->size);
+  }
   case FPPRT_EMB_KIND_EPHEMERON:
     if (visit)
       gc_trace_ephemeron((struct gc_ephemeron *)obj, visit, heap, trace_data);

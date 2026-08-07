@@ -41,7 +41,10 @@ enum fpprt_type_kind {
   FPPRT_KIND_STRUCT = 0,       /* fixed size, refoffs lists ref fields   */
   FPPRT_KIND_REF_ARRAY = 1,    /* [tag][len][ref x len]                  */
   FPPRT_KIND_SCALAR_ARRAY = 2, /* [tag][len][elem x len], size = elem sz */
-  FPPRT_KIND_EPHEMERON = 3     /* internal: gc_ephemeron payload         */
+  FPPRT_KIND_EPHEMERON = 3,    /* internal: gc_ephemeron payload         */
+  FPPRT_KIND_POD_ARRAY = 4     /* flat struct elems WITH ref fields:
+                                  size = elem bytes, refoffs = per-elem
+                                  ELEM-RELATIVE ref offsets              */
 };
 
 struct fpprt_type {
