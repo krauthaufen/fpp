@@ -1,8 +1,9 @@
 # F++
 
 F# without .NET. The syntax and semantics you know, extended with typeclasses
-and higher-kinded types, compiled ahead of time to wasm-GC — no JIT, no CLR,
-no runtime to install alongside the program.
+and higher-kinded types, compiled ahead of time — no JIT, no CLR, no runtime
+to install alongside the program. Two backends: wasm-GC, and C over fpprt
+(an owned precise moving GC) for native binaries and wasm-linear.
 
 The proof of surface: **FSharp.Data.Adaptive compiles whole and runs** — a
 100-test port of its own test suite is green under wasmtime, property
@@ -14,6 +15,8 @@ self-host fixpoint is byte-identical and gates every change.
 - **PLAN.md** — what is built, what is not, in the order it is being built
 - **DIVERGENCES.md** — every deliberate departure from F#, with its reason
 - **REPRESENTATION.md** — how values are laid out at run time
+- **PLAN-CBACK.md** — the C backend and fpprt: value model, the TRUE-structs arc
+- **PLAN-THREADS.md** — concurrency/parallelism design: virtual threads, barriers, the GC uniqueness query
 - **CLAUDE.md** — how to work in this repo: the gates, and what they cost
 - **editors/README.md** — VS Code, Rider, Visual Studio
 - **tests/tooling/README.md** — the harnesses that measure rather than assume

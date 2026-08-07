@@ -600,7 +600,7 @@ Earlier items, now done:
 - Exit: dotnet becomes optional for development
 
 ## Stage 7+ — Native backend & beyond
-- [ ] LLVM or Cranelift native backend, MMTk (Boehm to start)
+- [x] Native backend: C emission (cback) over fpprt/Whippet — native + wasm-linear (see CURRENT STATE)
 - [ ] Monomorphization/unboxing optimization pass over uniform baseline
 - [ ] Plugin (type-provider successor) declaration-IR + query endpoint API
 - [ ] Scoped given-imports iff definition-site coherence proves too tight
@@ -2592,7 +2592,28 @@ match declFn order; abs-heap ref.cast uses NEGATIVE s33 (gcAbs); wasmtime
 needs `-W gc=y` (and exceptions once the tag lands).
 
 ================================================================================
-## CURRENT STATE (2026-08-05) — the adaptive quest is DONE
+## CURRENT STATE (2026-08-07) — native backend + TRUE structs DONE
+
+Two backends, one language. The wasm-GC oracle (above) and now **cback +
+fpprt**: the whole language to C over an owned precise moving GC (vendored
+Whippet — semi/pcc/mmc), running NATIVE and as WASM-LINEAR. The adaptive
+suite is green on all three targets. The TRUE-structs arc is complete —
+stack-resident flat structs, real C interop with pinning, aliasing byrefs
+(zero-alloc on direct calls), flat ref-holding struct arrays, static
+struct fields, per-stamp generic layouts — every rung fsi-pinned because
+the oracle's structs are the workaround being replaced. Multi-mutator
+runtime groundwork (TLS, safepoints, park/unpark) is in.
+
+Stage 7's "native backend" line is thus RESOLVED via C-as-portable-
+assembler (gcc/emcc), not LLVM: the C compiler is also the struct-layout
+oracle (offsetof/sizeof). Remaining roadmap, in intended order:
+PLAN-THREADS (Monitor, pool, phase engine, barrier lift, dependence
+analysis), the GC uniqueness query (adaptive cache eviction), direct
+wasm-linear emission (prebuilt runtime.wasm, drop the C compiler for
+users), then deferred perf. PLAN-CBACK.md carries the backend's own
+history and open corners; STATUS.md the whole picture.
+
+## HISTORY (2026-08-05) — the adaptive quest is DONE
 
 FSharp.Data.Adaptive compiles whole and RUNS: 100-test suite green under
 wasmtime, property harnesses included (PORT-ADAPTIVE.md has the runner).

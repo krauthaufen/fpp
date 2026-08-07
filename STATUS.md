@@ -7,11 +7,46 @@ of it.
 Gates at the time of writing, all green (the numbers move; the shape does not):
 
 ```
-658 tests
-corpus fixpoint      77486 bytes, byte-identical
-self-host fixpoint 1783546 bytes, byte-identical
-adaptive suite     100 tests, 0 failed, 0 skipped (under wasmtime)
+663 tests
+corpus fixpoint      78159 bytes, byte-identical
+self-host fixpoint 2077227 bytes, byte-identical
+adaptive suite     100 tests, 0 failed — wasm-GC oracle, fpprt NATIVE, and wasm-linear
+cback gates        parity (4 programs), mstruct, byref, podarr, gstruct,
+                   interop (native + wasm32) — each fsi-pinned, mmc + semi
 ```
+
+## The native arc (2026-08-06/07): fpprt + the C backend
+
+Since the adaptive quest closed, the project grew a SECOND backend and its
+own runtime, and it is no longer the junior one:
+
+* **fpprt** (`runtime/`): precise moving GC over vendored Whippet (semi to
+  shake out root bugs, pcc, mmc with real pinning), shadow-stack frames,
+  ephemeron-backed weak refs and idhash, multi-mutator with safepoint
+  polls, in-place pinning, a linear-memory arena. Native and wasm-linear
+  (emcc + wasmtime) from one runtime.
+* **cback** (`Backend/CEmit.fs`): the whole language to C. Adaptive suite
+  100/100 natively and as wasm-linear. An allocation diet (raw locals,
+  scalar arrays, raw call ABI) took the vertex benchmark from 0.62s to
+  0.016s — 14x faster than the wasm-GC oracle.
+* **TRUE structs, the .NET model** — the correctness arc the oracle cannot
+  check (its structs/byrefs ARE the workaround), so every gate here is
+  pinned against dotnet fsi: stack-resident flat structs (blittable AND
+  ref-holding, frames carry pod descriptors the collector traces), C
+  interop with real pinning, by-value struct ABI, `&location` as a TRUE
+  ALIAS (with a zero-alloc fat-pair fast path on direct calls), flat
+  ref-holding struct arrays, pod globals as static struct fields, and
+  per-stamp generic-struct layouts (packed on the stack, uniform on the
+  heap). `PLAN-CBACK.md` records the arc and its open corners.
+* **PLAN-THREADS.md**: the concurrency/parallelism design — virtual
+  threads over a work-stealing pool, compiler-lifted barriers, dependence
+  analysis, and the GC uniqueness query (`GC.reuseIfUnique`; first
+  customer: adaptive cache eviction). Runtime groundwork is in; the
+  engine is not.
+
+The roadmap from here, in intended order: threading (PLAN-THREADS order of
+work), the GC watch/sweep uniqueness query for adaptive, direct wasm-linear
+emission (drop the C compiler for users), then the deferred perf passes.
 
 ## The goal, and where it landed
 

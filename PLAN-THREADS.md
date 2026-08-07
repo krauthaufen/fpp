@@ -194,6 +194,11 @@ reference could escape through between sweep and drop.
 1. Async CE + event loop (no threads; useful on every backend immediately).
 2. Runtime groundwork: TLS, safepoint polls at back-edges, real Monitor,
    the pool. Native first, gates green, then the emcc `-pthread` leg.
+   PARTIALLY DONE (2026-08-06, c8897ef): multi-mutator runtime — TLS
+   shadow stacks, attach/detach/park/unpark, thread-safe idhash, inline
+   safepoint polls at loop back-edges, `make test-threads` (6 mutators
+   under GC churn, pcc+mmc). Still open here: real Monitor, the pool,
+   the emcc `-pthread` leg.
 3. Phase engine: chunked dispatch, groups, work-stealing, barrier-as-join;
    hand-phase-split library combinators (map/fold/scan/choose) on top.
    This ships the efficient combinator library with no compiler changes.

@@ -318,3 +318,37 @@ capability split; (d) struct arrays/fields flat for ref-holding elements;
 mutable-struct/byref semantics program diffed against dotnet fsi — the
 ORACLE CANNOT CHECK THESE (its byref is the workaround), so fsi is the
 reference for this arc.
+
+## ARC COMPLETE (2026-08-07) — and what stayed open
+
+All five rungs shipped, each committed behind the full battery plus its
+own fsi-pinned gate (mstruct, byref, podarr, gstruct — every gate runs
+mmc AND the semi shakeout):
+
+(a) 7f93fa9 stack locals, in-place mutation; (b) 4c68e94 frame pods,
+ref-holding structs traced on the stack; (c) b2c6d29 + 68fe08d true-alias
+byrefs (ByRefView) with the zero-alloc fat-pair fast path; (d) f6aa860
+flat ref-holding ARRAYS (FPPRT_KIND_POD_ARRAY) + pod GLOBALS as static
+struct fields (clone on read/assign/init, in-place field set);
+(e) 820be85 per-stamp generic layouts — the design that survived is
+NOT point 5's "flat everywhere": a stamp's HEAP rep stays the uniform
+record (so ungrounded/#-name fallback code and eqv never meet a packed
+blob), and the packed P_ layout exists only on the C stack, the by-value
+raw ABI and frame pods, with emitted per-pod fpp_pack_/fpp_unpack_
+helpers at every boundary.
+
+Open leftovers, none blocking, in rough value order:
+
+- Flat arrays of STAMP pods: stamp elements still ride uniform ref
+  arrays. Needs the runtime uniform-conversion link (fpp_pod_get/set
+  building/consuming uniform records via the pod field tables) so
+  generic array access cannot leak a packed blob.
+- `arr.[i].F <- v` (field set through an element) still traps: needs
+  byref-to-element or a read-modify-write lowering.
+- Mono pod fields inside plain RECORDS/classes are blob refs, not
+  inline storage; reads share the blob. Correct for immutable use;
+  a mutable struct field on a class is the corner to test against fsi
+  before anyone relies on it.
+- Byref "B" classification is conservative: uses inside nested lambdas
+  and `&p` forwarding disqualify. A fixpoint over call positions widens
+  it if profiles ever show the fallback allocating.
