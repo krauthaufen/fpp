@@ -180,6 +180,15 @@ reference cannot escape between check and use. Under threads the query
 runs at a safepoint. Also unexposed but present in the runtime: finalizers
 and heap introspection (live bytes, per-type census).
 
+First customer (decoupled from threading — can land any time): ADAPTIVE
+cache eviction. Watch the AVAL node itself: when the sweep sees that no
+reference outside the graph/cache can PULL the aval again, its cached
+output is droppable — e.g. a vertex array already uploaded to the GPU
+loses its CPU copy. The watch-list variant fits exactly: eviction is a
+periodic sweep after commit, so answers-as-of-last-GC are safe (staleness
+only defers a drop), and the cache's own lookup path is the only door a
+reference could escape through between sweep and drop.
+
 ## Order of work
 
 1. Async CE + event loop (no threads; useful on every backend immediately).
