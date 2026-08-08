@@ -1368,6 +1368,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             && (bv.Name = "memAlloc" || bv.Name = "memSize" || bv.Name = "memCopy"
                                 || bv.Name.StartsWith "memLoad" || bv.Name.StartsWith "memStore") ->
                           EApp (EUnknown bv.Name, margs)
+                      // the JavaScript boundary: every prelude `Js` extern is
+                      // `js`-prefixed so this rule can claim the family; the
+                      // wasm backend emits real "js"-module imports, the C
+                      // backend traps them as browser-only
+                      | (EVar (bv, _) | EVarI (bv, _, _)), jargs when
+                            bv.Path = "(builtin)" && strLen bv.Name > 2
+                            && bv.Name.StartsWith "js"
+                            && System.Char.IsUpper (charAt bv.Name 2) ->
+                          EApp (EUnknown bv.Name, jargs)
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])

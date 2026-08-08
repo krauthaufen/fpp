@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fpp js interop gate</title>
+<body>
+<script type="module">
+  import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
+  window.log = [];
+  let exports;
+  try {
+    const { instance } = await WebAssembly.instantiateStreaming(
+      fetch('jsdemo.wasm'),
+      { ...jsImports(() => exports), ...wasiImports(() => exports, s => window.log.push(s.trimEnd())) });
+    exports = instance.exports;
+    exports._start();
+    // callback: two real clicks
+    document.getElementById('made').click();
+    document.getElementById('made').click();
+    // zero copy, JS -> wasm: write through the view, the array must see it
+    window.fppView[0] = 9.5;
+    window.results = {
+      log: window.log,
+      madeText: document.getElementById('made').textContent,
+      viewY1: window.fppView[3],          // wasm -> JS: 4.5 written by F++
+      clicks: exports.getClicks(0),       // 2
+      x0AfterJsWrite: exports.readX0(0),  // 95: JS wrote 9.5 into the view
+    };
+  } catch (e) {
+    window.results = { error: String(e && e.stack || e) };
+  }
+  window.ready = true;
+</script>

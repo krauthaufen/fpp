@@ -2097,6 +2097,137 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     // The pin heap is where a pinned POD array already lives, so a serializer
     // that writes here can BLIT such an array instead of walking it: one
     // memory.copy, whatever the element type.
+    // ---- the JavaScript boundary ------------------------------------------
+    // objects cross as externref (one conversion instruction each way);
+    // property keys stage as (ptr, len) UTF-8 so an access is ONE crossing
+    | EApp (EUnknown "jsGlobal", [ k ]) ->
+        emitNode st f lv k
+        callf f "$jsstage"
+        callf f "$js_global"
+        toAny f
+    | EApp (EUnknown "jsGet", [ o; k ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv k
+        callf f "$jsstage"
+        callf f "$js_get"
+        toAny f
+    | EApp (EUnknown "jsSet", [ o; k; v ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv k
+        callf f "$jsstage"
+        emitNode st f lv v
+        toExtern f
+        callf f "$js_set"
+        pushUnit f
+    | EApp (EUnknown "jsGetNum", [ o; k ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv k
+        callf f "$jsstage"
+        callf f "$js_getNum"
+        callf f "$off"
+    | EApp (EUnknown "jsSetNum", [ o; k; v ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv k
+        callf f "$jsstage"
+        emitNode st f lv v
+        callf f "$tof"
+        callf f "$js_setNum"
+        pushUnit f
+    | EApp (EUnknown "jsItem", [ o; i ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv i
+        callf f "$toi"
+        callf f "$js_item"
+        toAny f
+    | EApp (EUnknown "jsItemSet", [ o; i; v ]) ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv i
+        callf f "$toi"
+        emitNode st f lv v
+        toExtern f
+        callf f "$js_itemSet"
+        pushUnit f
+    | EApp (EUnknown cn, o :: k :: rest) when cn.StartsWith "jsCall" && strLen cn = 7 ->
+        emitNode st f lv o
+        toExtern f
+        emitNode st f lv k
+        callf f "$jsstage"
+        for a in rest do
+            emitNode st f lv a
+            toExtern f
+        callf f ("$js_call" + cn.Substring (strLen cn - 1))
+        toAny f
+    | EApp (EUnknown cn, ctor :: rest) when cn.StartsWith "jsNew" && strLen cn = 6 ->
+        emitNode st f lv ctor
+        toExtern f
+        for a in rest do
+            emitNode st f lv a
+            toExtern f
+        callf f ("$js_new" + cn.Substring (strLen cn - 1))
+        toAny f
+    | EApp (EUnknown "jsOfNum", [ a ]) ->
+        emitNode st f lv a
+        callf f "$tof"
+        callf f "$js_num"
+        toAny f
+    | EApp (EUnknown "jsToNum", [ a ]) ->
+        emitNode st f lv a
+        toExtern f
+        callf f "$js_toNum"
+        callf f "$off"
+    | EApp (EUnknown "jsToBool", [ a ]) ->
+        emitNode st f lv a
+        toExtern f
+        callf f "$js_toBool"
+        refI31 f
+    | EApp (EUnknown "jsOfString", [ a ]) ->
+        emitNode st f lv a
+        callf f "$jsstage"
+        callf f "$js_strNew"
+        toAny f
+    | EApp (EUnknown "jsToString", [ a ]) ->
+        // two crossings: byte length (the glue caches the encoding), then
+        // encodeInto the scratch; the $str is built from those bytes
+        let jh = freshLocal f "$jh" "externref"
+        let jp = freshLocal f "$jp" "i32"
+        emitNode st f lv a
+        toExtern f
+        ls f jh
+        lg f jh
+        callf f "$js_strLen"
+        callf f "$jsensure"
+        ls f jp
+        lg f jp
+        lg f jh
+        lg f jp
+        callf f "$js_strWrite"
+        callf f "$jsunstage"
+    | EApp (EUnknown "jsCallback", [ clo ]) ->
+        emitNode st f lv clo
+        callf f "$js_mkFn"
+        toAny f
+    | EApp (EUnknown "jsNull", [ _ ]) ->
+        refNull f "any"
+    | EApp (EUnknown "jsIsNull", [ a ]) ->
+        emitNode st f lv a
+        ins f "ref.is_null"
+        refI31 f
+    // zero-copy TypedArray views over the exported linear memory at a
+    // PINNED address: the JS side sees the array's real storage, both sides
+    // alias, nothing copies
+    | EApp (EUnknown vn, [ p; n ]) when vn.StartsWith "jsView" ->
+        emitNode st f lv p
+        callf f "$toi"
+        emitNode st f lv n
+        callf f "$toi"
+        callf f ("$js_view" + vn.Substring 6)
+        toAny f
     | EApp (EUnknown "memAlloc", [ n ]) ->
         emitNode st f lv n
         callf f "$toi"
@@ -4137,6 +4268,24 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         | _ -> ()
     let tupArities = ([ 2; 3 ] @ scanTupleArities decls) |> List.distinct |> List.sort
     frame m vArities tupArities
+    // the JS boundary imports — ONLY when the program touches Js.* (every
+    // declared import must be satisfied at instantiation, so an unused set
+    // would break plain wasmtime programs)
+    let jsUsed =
+        let mutable found = false
+        let rec scanJs (e : Expr) : unit =
+            (match e with
+             | EApp (EUnknown n, _) when strLen n > 2 && n.StartsWith "js"
+                                         && System.Char.IsUpper (charAt n 2) ->
+                 found <- true
+             | _ -> ())
+            podScanChildren scanJs e
+        for d in decls do
+            match d with
+            | DLet (_, _, _, e) -> scanJs e
+            | _ -> ()
+        found
+    if jsUsed then jsImports m
     // FFI imports — these occupy function indices BEFORE every declared
     // function, so they must all be registered here, right after the frame
     let abiKind (t : Fpp.Analysis.Types.Type) : string =
@@ -4217,6 +4366,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     rtTypes11 m
     rtTypes12 m
     rtTypes13 m
+    rtTypesJs m
     tyFunc m "$init_t" [] []
     rtDecls m
     rtCoreDecls2 m
@@ -4231,6 +4381,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     rtDecls11 m
     rtDecls12 m
     rtDecls13 m
+    rtDeclsJs m
     // const globals for arity-0 DU cases
     for cn, _ in dictPairs st.CaseTag do
         if (dictTryFind st.CaseArity cn) = Some 0 then
@@ -4404,6 +4555,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     declFn m "$_start" "$init_t"
     declFn m "$strinit" "$init_t"
     exportFn m "_start" "$_start"
+    exportFn m "jscall" "$jscall"
     // `[<Export>]`: one wrapper per exported function, with a REAL scalar
     // signature so the host passes numbers rather than reference values.
     // The wrapper boxes on the way in and unboxes on the way out, which is
@@ -4446,6 +4598,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     rtCore11 m
     rtCore12 m
     rtCore13 m
+    rtCoreJs m
     // ---- the shadow stack (debug builds) ---------------------------------
     // wasm gives the guest no way to look at its own call stack, so a debug
     // build keeps one: a depth counter and a ring of frame ids, maintained at

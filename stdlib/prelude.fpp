@@ -1307,6 +1307,78 @@ module Memory =
     let loadFloat (p : nativeint) : float = memLoadFloat p
     let storeFloat (p : nativeint) (v : float) : unit = memStoreFloat p v
 
+// ---- Js: the JavaScript boundary ----
+// JS values are opaque `JsObj` handles — externref at the wasm boundary,
+// ordinary values here: they live in locals, fields and collections, and
+// the two garbage collectors manage lifetime together. Every operation is
+// one boundary crossing (~11 ns); property keys travel as staged UTF-8, so
+// prefer the TYPED accessors (jsGetNum/jsSetNum) in hot paths — they halve
+// the crossings. Browser-only: the C backend traps these.
+//
+// ZERO-COPY bulk data: pin an Unmanaged array and wrap the address in a
+// TypedArray VIEW over the module's exported memory — `Js.viewF32
+// (Array.pin verts) (3 * n)` aliases the array's real storage. Hand that to
+// WebGL/WebGPU/WebSocket APIs directly; nothing copies. The view is only
+// valid while the array stays pinned.
+module Js =
+    extern let jsGlobal : string -> JsObj
+    extern let jsGet : JsObj -> string -> JsObj
+    extern let jsSet : JsObj -> string -> JsObj -> unit
+    extern let jsGetNum : JsObj -> string -> float
+    extern let jsSetNum : JsObj -> string -> float -> unit
+    extern let jsItem : JsObj -> int -> JsObj
+    extern let jsItemSet : JsObj -> int -> JsObj -> unit
+    extern let jsCall0 : JsObj -> string -> JsObj
+    extern let jsCall1 : JsObj -> string -> JsObj -> JsObj
+    extern let jsCall2 : JsObj -> string -> JsObj -> JsObj -> JsObj
+    extern let jsCall3 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsNew0 : JsObj -> JsObj
+    extern let jsNew1 : JsObj -> JsObj -> JsObj
+    extern let jsNew2 : JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsOfNum : float -> JsObj
+    extern let jsToNum : JsObj -> float
+    extern let jsToBool : JsObj -> bool
+    extern let jsOfString : string -> JsObj
+    extern let jsToString : JsObj -> string
+    extern let jsCallback : (JsObj -> unit) -> JsObj
+    extern let jsNull : unit -> JsObj
+    extern let jsIsNull : JsObj -> bool
+    extern let jsViewU8 : nativeint -> int -> JsObj
+    extern let jsViewU16 : nativeint -> int -> JsObj
+    extern let jsViewI32 : nativeint -> int -> JsObj
+    extern let jsViewF32 : nativeint -> int -> JsObj
+    extern let jsViewF64 : nativeint -> int -> JsObj
+    /// globalThis.<name>
+    let global_ (name : string) : JsObj = jsGlobal name
+    let get (o : JsObj) (k : string) : JsObj = jsGet o k
+    let set (o : JsObj) (k : string) (v : JsObj) : unit = jsSet o k v
+    let getNum (o : JsObj) (k : string) : float = jsGetNum o k
+    let setNum (o : JsObj) (k : string) (v : float) : unit = jsSetNum o k v
+    let getStr (o : JsObj) (k : string) : string = jsToString (jsGet o k)
+    let item (o : JsObj) (i : int) : JsObj = jsItem o i
+    let itemSet (o : JsObj) (i : int) (v : JsObj) : unit = jsItemSet o i v
+    let call0 (o : JsObj) (m : string) : JsObj = jsCall0 o m
+    let call1 (o : JsObj) (m : string) (a : JsObj) : JsObj = jsCall1 o m a
+    let call2 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) : JsObj = jsCall2 o m a b
+    let call3 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) : JsObj = jsCall3 o m a b c
+    let new0 (ctor : JsObj) : JsObj = jsNew0 ctor
+    let new1 (ctor : JsObj) (a : JsObj) : JsObj = jsNew1 ctor a
+    let new2 (ctor : JsObj) (a : JsObj) (b : JsObj) : JsObj = jsNew2 ctor a b
+    let ofNum (v : float) : JsObj = jsOfNum v
+    let toNum (o : JsObj) : float = jsToNum o
+    let toBool (o : JsObj) : bool = jsToBool o
+    let ofString (v : string) : JsObj = jsOfString v
+    let toString (o : JsObj) : string = jsToString o
+    /// an F++ function as a JS callback: captured state travels with it
+    let callback (fn : JsObj -> unit) : JsObj = jsCallback fn
+    let nil () : JsObj = jsNull ()
+    let isNull (o : JsObj) : bool = jsIsNull o
+    let viewU8 (p : nativeint) (elems : int) : JsObj = jsViewU8 p elems
+    let viewU16 (p : nativeint) (elems : int) : JsObj = jsViewU16 p elems
+    let viewI32 (p : nativeint) (elems : int) : JsObj = jsViewI32 p elems
+    let viewF32 (p : nativeint) (elems : int) : JsObj = jsViewF32 p elems
+    let viewF64 (p : nativeint) (elems : int) : JsObj = jsViewF64 p elems
+
 // ---- String: the F# String module ----
 module Array =
     extern let create : int -> 'a -> 'a[]

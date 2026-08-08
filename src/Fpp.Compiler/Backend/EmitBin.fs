@@ -449,6 +449,10 @@ let gcAbs (f : Fn) (name : string) (heap : string) : unit =
     gci f name
     emitS32 f.B (heapByte heap - 0x80)  // abs heap types are NEGATIVE s33
 let i31get (f : Fn) : unit = gci f "i31.get_s"
+/// anyref -> externref: a value CROSSING INTO JavaScript
+let toExtern (f : Fn) : unit = gci f "extern.convert_any"
+/// externref -> anyref: a JavaScript value ARRIVING
+let toAny (f : Fn) : unit = gci f "any.convert_extern"
 let refI31 (f : Fn) : unit =
     let at = f.B.Count
     gci f "ref.i31"
@@ -4998,3 +5002,159 @@ let rtCore4 (m : Mod) : unit =
 
 /// the plain module: no source map
 let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] = assembleWith m memPages hasTag ""
+
+
+// ---- runtime: the JavaScript boundary --------------------------------------
+// JS values cross as externref and live inside the program as anyref (one
+// conversion instruction each way, no handle table). Strings STAGE through a
+// reusable scratch region in linear memory — TextEncoder/TextDecoder glue on
+// the other side; property keys ride as (ptr, len) pairs so a get/set is ONE
+// crossing. The import set below is the whole surface; the glue is
+// stdlib/fpp-js.mjs.
+
+/// imports from module "js" — only emitted when the program touches Js.*
+/// (an unused import would still demand a host import object)
+let jsImports (m : Mod) : unit =
+    let imp n ps rs = importFn m "js" n ("$js_" + n) ps rs
+    imp "global"   [ "i32"; "i32" ] [ "externref" ]
+    imp "get"      [ "externref"; "i32"; "i32" ] [ "externref" ]
+    imp "set"      [ "externref"; "i32"; "i32"; "externref" ] []
+    imp "getNum"   [ "externref"; "i32"; "i32" ] [ "f64" ]
+    imp "setNum"   [ "externref"; "i32"; "i32"; "f64" ] []
+    imp "item"     [ "externref"; "i32" ] [ "externref" ]
+    imp "itemSet"  [ "externref"; "i32"; "externref" ] []
+    imp "call0"    [ "externref"; "i32"; "i32" ] [ "externref" ]
+    imp "call1"    [ "externref"; "i32"; "i32"; "externref" ] [ "externref" ]
+    imp "call2"    [ "externref"; "i32"; "i32"; "externref"; "externref" ] [ "externref" ]
+    imp "call3"    [ "externref"; "i32"; "i32"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "new0"     [ "externref" ] [ "externref" ]
+    imp "new1"     [ "externref"; "externref" ] [ "externref" ]
+    imp "new2"     [ "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "num"      [ "f64" ] [ "externref" ]
+    imp "toNum"    [ "externref" ] [ "f64" ]
+    imp "toBool"   [ "externref" ] [ "i32" ]
+    imp "mkFn"     [ "anyref" ] [ "externref" ]
+    imp "strNew"   [ "i32"; "i32" ] [ "externref" ]
+    imp "strLen"   [ "externref" ] [ "i32" ]
+    imp "strWrite" [ "externref"; "i32" ] [ "i32" ]
+    imp "viewU8"   [ "i32"; "i32" ] [ "externref" ]
+    imp "viewU16"  [ "i32"; "i32" ] [ "externref" ]
+    imp "viewI32"  [ "i32"; "i32" ] [ "externref" ]
+    imp "viewF32"  [ "i32"; "i32" ] [ "externref" ]
+    imp "viewF64"  [ "i32"; "i32" ] [ "externref" ]
+
+let rtTypesJs (m : Mod) : unit =
+    tyFunc m "$rt_a2ii" [ "anyref" ] [ "i32"; "i32" ]
+    tyFunc m "$rt_ii2a" [ "i32"; "i32" ] [ "anyref" ]
+    tyFunc m "$rt_i2i" [ "i32" ] [ "i32" ]
+    tyFunc m "$rt_ae2v" [ "anyref"; "externref" ] []
+
+let rtDeclsJs (m : Mod) : unit =
+    globalI32Mut m "$jsscr" 0
+    globalI32Mut m "$jsscrCap" 0
+    declFn m "$jsensure" "$rt_i2i"
+    declFn m "$jsstage" "$rt_a2ii"
+    declFn m "$jsunstage" "$rt_ii2a"
+    declFn m "$jscall" "$rt_ae2v"
+
+let rtCoreJs (m : Mod) : unit =
+    // $jsensure(n) -> scratch ptr with capacity >= n (bump-allocated, REUSED
+    // across calls: at most one staged string is live at a time)
+    let f = beginFn m [ "$n" ]
+    localsDone f
+    lg f "$n"
+    gg f "$jsscrCap"
+    ins f "i32.gt_u"
+    ifE f
+    lg f "$n"
+    callf f "$balloc"
+    gs f "$jsscr"
+    lg f "$n"
+    gs f "$jsscrCap"
+    endB f
+    gg f "$jsscr"
+    endFn f
+    // $jsstage(str) -> (ptr, len): the string's UTF-8 bytes in scratch
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$p" "i32"
+    localsDone f
+    lg f "$s"
+    gcT f "ref.cast" "$str"
+    ls f "$s"
+    lg f "$s"
+    gcT f "ref.cast" "$str"
+    gci f "array.len"
+    ls f "$n"
+    lg f "$n"
+    callf f "$jsensure"
+    ls f "$p"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$p"
+    lg f "$i"
+    ins f "i32.add"
+    lg f "$s"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    mem f "i32.store8"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$p"
+    lg f "$n"
+    endFn f
+    // $jsunstage(ptr, len) -> $str from scratch bytes
+    let f = beginFn m [ "$p"; "$n" ]
+    local f "$i" "i32"
+    local f "$r" "anyref"
+    localsDone f
+    lg f "$n"
+    gcT f "array.new_default" "$str"
+    ls f "$r"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$r"
+    gcT f "ref.cast" "$str"
+    lg f "$i"
+    lg f "$p"
+    lg f "$i"
+    ins f "i32.add"
+    mem f "i32.load8_u"
+    gcT f "array.set" "$str"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    lg f "$r"
+    endFn f
+    // $jscall(closure, arg) — the callback bridge: JS glue wraps a closure
+    // as `(...a) => exports.jscall(clo, a[0])`
+    let f = beginFn m [ "$c"; "$e" ]
+    localsDone f
+    lg f "$c"
+    lg f "$e"
+    toAny f
+    callf f "$applyc"
+    ins f "drop"
+    endFn f
+
+
+/// (this comment anchors the end of the runtime slices)

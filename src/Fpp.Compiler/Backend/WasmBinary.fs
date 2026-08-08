@@ -273,6 +273,7 @@ let gcByte (name : string) : int =
     | "array.len" -> 15 | "array.fill" -> 16 | "array.copy" -> 17
     | "ref.test" -> 20 | "ref.test_null" -> 21 | "ref.cast" -> 22 | "ref.cast_null" -> 23
     | "ref.i31" -> 28 | "i31.get_s" -> 29 | "i31.get_u" -> 30
+    | "any.convert_extern" -> 26 | "extern.convert_any" -> 27
     | _ -> -1
 
 // memory ops carry align+offset immediates
@@ -298,6 +299,7 @@ let valByte (name : string) : int =
     | "i32" -> 0x7F | "i64" -> 0x7E | "f32" -> 0x7D | "f64" -> 0x7C
     | "i8" -> 0x78 | "i16" -> 0x77
     | "anyref" -> 0x6E | "funcref" -> 0x70 | "eqref" -> 0x6D
+    | "externref" -> 0x6F
     | _ -> -1
 
 /// (ref $t) / (ref null $t) with a CONCRETE type index
