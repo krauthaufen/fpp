@@ -189,7 +189,9 @@ module private BuiltinCache =
         { Classes = copyDict t.Classes
           Instances = inst
           MemberOwner = copyDict t.MemberOwner
-          TypePaths = tps }
+          TypePaths = tps
+          LogPicks = dictNew<string, bool> ()
+          PickLog = Fpp.Prelude.vecNew<string> () }
 
     let compute () =
             let imports = dictNew<string, Analysis.Resolve.Definition> ()
@@ -240,6 +242,9 @@ type Workspace() =
     let generatedBy = dictNew<string, string> ()
     /// where each piece of the last emitted module came from
     let mutable lastPositions : (int * string * int) list = []
+    /// record instance selections for the pick checker (set BEFORE the
+    /// first check — the project check is memoized)
+    let mutable logPicks = false
     /// hand-written text, captured before any generator rewrites a file: the
     /// INPUT to generation must stay what the human wrote, or a second compile
     /// would feed a generator its own output
@@ -373,6 +378,7 @@ type Workspace() =
             // classes and instances are project-wide: the prelude declares
             // the numeric tower, every later file may extend it
             let classes = BuiltinCache.copyTables cached.Classes
+            if logPicks then dictSet classes.LogPicks "on" true
             // members are looked up by "Type.Member" across the whole
             // project, not just the file that declares them
             let members = BuiltinCache.copyDict cached.Members
@@ -470,6 +476,12 @@ type Workspace() =
             { Files = results; Schemes = schemes; Interfaces = ifaces; Bases = bases
               Members = members; Fields = fields; Classes = classes; Trees = trees
               Aliases = aliases; BuiltinInfer = binf })
+
+    /// Turn on selection recording — call before the first check.
+    member this.RecordPicks () : unit = logPicks <- true
+    /// The recorded selections, one line each (see Classes.select).
+    member this.InstancePicks : string list =
+        vecToList (this.ProjectCheck ()).Classes.PickLog
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
         match dictTryFind (this.ProjectCheck ()).Files path with

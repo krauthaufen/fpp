@@ -90,13 +90,21 @@ type Tables =
       /// orphan rule: an instance must live with its class or with a type
       /// its head mentions. Filled by Infer's arity sweep, so it is
       /// complete for a file before any of the file's instances register.
-      TypePaths : Dict<string, Vec<string>> }
+      TypePaths : Dict<string, Vec<string>>
+      /// when on, every selection over fully concrete arguments appends a
+      /// line here — class, arguments, every candidate head, verdict —
+      /// for the pick checker (tests/tooling/verify/check-picks.py),
+      /// which re-derives the winner independently and diffs
+      LogPicks : Dict<string, bool>
+      PickLog : Vec<string> }
 
 let newTables () : Tables =
     { Classes = dictNew<string, ClassDef> ()
       Instances = dictNew<string, Vec<InstanceDef>> ()
       MemberOwner = dictNew<string, string> ()
-      TypePaths = dictNew<string, Vec<string>> () }
+      TypePaths = dictNew<string, Vec<string>> ()
+      LogPicks = dictNew<string, bool> ()
+      PickLog = vecNew<string> () }
 
 let addTypePath (t : Tables) (name : string) (path : string) : unit =
     match dictTryFind t.TypePaths name with
@@ -285,7 +293,7 @@ type Selection =
 /// deferring it: a CLASS MEMBER body has no constraint-carrying scheme, so
 /// the eager commit is its only resolution — a let body defers and the
 /// constraint rides its scheme to the stamp.
-let select (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
+let private selectCore (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
     let cands = instancesOf t cls
     let exact =
         cands |> List.choose (fun i ->
@@ -352,6 +360,41 @@ let select (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc 
         | [] -> NoInstance
         | [ i ] -> Improve i
         | _ -> Deferred
+
+/// One line per selection for the pick checker: a term grammar the checker
+/// parses back — `name`, `name(a,b)`, `?7` for a variable, `tup(..)`,
+/// `fn(a,b)`, `app(h,a)`.
+let rec private dumpTy (t : Type) : string =
+    match prune t with
+    | TCon (n, []) -> n
+    | TCon (n, args) -> n + "(" + String.concat "," (List.map dumpTy args) + ")"
+    | TVar v -> "?" + string v.Id
+    | TTuple ts -> "tup(" + String.concat "," (List.map dumpTy ts) + ")"
+    | TFun (a, b) -> "fn(" + dumpTy a + "," + dumpTy b + ")"
+    | TApp (h, args) -> "app(" + dumpTy h + "," + String.concat "," (List.map dumpTy args) + ")"
+
+let select (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
+    let result = selectCore t eager cls args assoc
+    // record fully concrete selections only: those have one right answer
+    // for the checker to re-derive — an open one defers by design
+    if (dictTryFind t.LogPicks "on").IsSome && args |> List.forall (fun a -> List.isEmpty (freeVars a)) then
+        let cands = instancesOf t cls
+        let verdict, chosen =
+            match result with
+            | Solved (i, _) ->
+                "solved", (cands |> List.tryFindIndex (fun j -> System.Object.ReferenceEquals (i, j)))
+            | Improve i ->
+                "improve", (cands |> List.tryFindIndex (fun j -> System.Object.ReferenceEquals (i, j)))
+            | Deferred -> "deferred", None
+            | Ambiguous _ -> "ambiguous", None
+            | NoInstance -> "none", None
+        vecAdd t.PickLog
+            (verdict + "|" + cls + "|"
+             + String.concat ";" (List.map dumpTy args) + "|"
+             + (match chosen with Some i -> string i | None -> "-") + "|"
+             + String.concat "|" (cands |> List.map (fun i ->
+                 String.concat ";" (List.map dumpTy i.Head))))
+    result
 
 /// Substitute an instance's own variables into one of its types.
 let substInst (sub : Dict<int, Type>) (t : Type) : Type =

@@ -66,10 +66,16 @@ same type") was mishandled by the walking code while the model, which
 cannot even express the mistake, stayed green. Poking that blind spot by
 hand found and fixed it (ClassTests "a repeated variable in a head only
 matches equal arguments"). The counterpart gap earlier was `sameType`
-missing the applied-variable case. The honest next step for that side is
-not a bigger search but a comparison harness: have the compiler write
-out which instance it picked at every call in a real project, and have
-the model second-guess each pick.
+missing the applied-variable case. The answer for that side is not a
+bigger search but the comparison harness next to this file:
+`check-picks.sh` has the compiler print every selection it made over
+concrete arguments (`fpp picks <files>`), and `check-picks.py`
+re-derives each winner — its own parser, its own matcher, its own
+"accepts fewer types", none of the compiler's code — and fails on any
+disagreement. A concrete `deferred` fails outright: waiting is only for
+arguments still holding a variable, and a concrete wait was exactly the
+repeated-variable bug's shape. Corrupting a pick line flips the check
+red, so its green means something.
 
 Also deliberately outside the model: picking an instance to make
 progress on inference when only one candidate is left (file-order

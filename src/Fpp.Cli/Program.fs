@@ -23,6 +23,23 @@ let private check (files : string list) : int =
             printfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message
     if errors = 0 then 0 else 1
 
+let private picks (files : string list) : int =
+    // every instance selection over concrete arguments, one line each —
+    // input for tests/tooling/verify/check-picks.py, which re-derives the
+    // winner independently and diffs
+    let ws = Workspace()
+    ws.RecordPicks ()
+    for f in files do
+        ws.SetFileText f (readSource f)
+    let mutable errors = 0
+    for f in files do
+        for d in ws.Diagnostics f do
+            errors <- errors + 1
+            eprintfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message
+    for line in ws.InstancePicks do
+        printfn "%s" line
+    if errors = 0 then 0 else 1
+
 let private buildLib (out : string) (files : string list) : int =
     let ws = Workspace()
     for f in files do
@@ -184,6 +201,7 @@ let main argv =
          | Some (files, _) -> build out files
          | None -> 1)
     | "check" :: files when not (List.isEmpty files) -> check files
+    | "picks" :: files when not (List.isEmpty files) -> picks files
     | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build out files
     | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
     | [ "exe"; proj; "-o"; out ] when isProject proj ->
