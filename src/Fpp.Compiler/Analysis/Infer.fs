@@ -1260,7 +1260,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let opTypesRaw = vecNew<int * Type> ()
     let exprTypesRaw = vecNew<int * int * Type> ()
 
-    let addWanted (offset : int) (c : Constraint) : unit = wanted <- wanted @ [ offset, c ]
+    /// true while a CLASS MEMBER body is inferred. A member has no
+    /// constraint-carrying scheme for its class' variables, so a constraint
+    /// raised there must commit eagerly — a let body's constraint defers on
+    /// an open match and rides the scheme to the stamp instead.
+    let mutable inMemberBody = false
+    /// the offsets whose constraints were raised inside a member body
+    let eagerSeats = dictNew<int, bool> ()
+
+    let addWanted (offset : int) (c : Constraint) : unit =
+        if inMemberBody then dictSet eagerSeats offset true
+        wanted <- wanted @ [ offset, c ]
 
     // ---- derived Arb instances -------------------------------------------
     // A record or union with no written Arb instance GETS one, GENERIC in
@@ -1451,7 +1461,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     for t in ts do
                         vecAdd queue (offset, { Class = "Ordered"; Args = [ t ]; Assoc = [] })
                 | _ ->
-                match Classes.select classes c.Class c.Args c.Assoc with
+                match Classes.select classes ((dictTryFind eagerSeats offset).IsSome) c.Class c.Args c.Assoc with
                 | Classes.Solved (inst, sub) ->
                     progress <- true
                     for n, ty in c.Assoc do
@@ -1492,8 +1502,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              "overlapping instances for " + c.Class + "<"
                              + String.concat ", " (List.map typeString c.Args)
                              + ">: " + String.concat " and " (insts |> List.map (fun i ->
-                                 i.Class + "<" + String.concat ", " (List.map typeString i.Head) + ">"))
-                             + " — neither is more specific")
+                                 // render the `when` context too: two heads
+                                 // that differ only there print identically,
+                                 // and a context does not select (it is
+                                 // discharged AFTER selection) — without it
+                                 // the message reads as one instance twice
+                                 i.Class + "<" + String.concat ", " (List.map typeString i.Head) + ">"
+                                 + (if List.isEmpty i.Context then ""
+                                    else
+                                        " when "
+                                        + String.concat " and " (i.Context |> List.map (fun k ->
+                                            k.Class + "<" + String.concat ", " (List.map typeString k.Args) + ">")))))
+                             + " — neither is more specific, and a `when` context does not select")
                     else vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
                     if c.Class = "Arb"
@@ -1650,9 +1670,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// A NAMED use additionally falls back to a generated wrapper, because a
     /// name has to denote something callable even where the operator is an
     /// instruction.
-    let instanceMember (byName : bool) (c : Constraint) (memberName : string)
+    let instanceMember (eager : bool) (byName : bool) (c : Constraint) (memberName : string)
                        (qfresh : Type list) : Classes.InstMember option =
-        match Classes.select classes c.Class c.Args c.Assoc with
+        // `eager` for a member-body use (nothing to ride); a let-body OPEN
+        // use answers None here and takes the caller's stamping fallback
+        match Classes.select classes eager c.Class c.Args c.Assoc with
         | Classes.Solved (inst, sub) ->
             let nameTy (t : Type) : string =
                 match prune t with
@@ -1757,7 +1779,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   | None -> ())
              | None -> ())
         | None ->
-        match instanceMember byName c name qfresh with
+        match instanceMember ((dictTryFind eagerSeats offset).IsSome) byName c name qfresh with
         | Some key -> vecAdd classUsesRaw (offset, key)
         | None ->
             // unresolved because the operand type is still a variable: name
@@ -1946,10 +1968,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ :: rest -> scanBound rest
             | [] -> ()
          scanBound (tokensOf n))
+        // a constraint argument must be CONSTRUCTOR-headed. `Shows<'f<int>>`
+        // types fine (unify knows TApp) but the class layer neither solves
+        // nor abstracts it, so the member was left unbound and the backend
+        // stubbed the whole binding — a clean check handed over a trapping
+        // binary. Until dictionary abstraction learns the shape, reject it
+        // where it is written.
+        let rec hasApp (t : Type) : bool =
+            match prune t with
+            | TApp (_, _) -> true
+            | TCon (_, xs) -> List.exists hasApp xs
+            | TFun (a2, b2) -> hasApp a2 || hasApp b2
+            | TTuple ts -> List.exists hasApp ts
+            | TVar _ -> false
         match fsharpInlineConstraint vars n with
         | Some c -> Some c
         | None ->
-        classHead vars n
+        match classHead vars n with
+        | Some (cls, args) when List.exists hasApp args ->
+            (match tokensOf n |> List.tryHead with
+             | Some t ->
+                 vecAdd diags
+                     (t.Offset,
+                      "a constraint on an applied type variable is not supported yet — "
+                      + cls + " must be asked of the constructor itself, not of an application")
+             | None -> ())
+            None
+        | other ->
+        other
         |> Option.map (fun (cls, args) ->
             let assocName =
                     match tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -3939,7 +3985,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // object expression defaulted instead of going class-pending
                 for m in nodesOf n do
                     if m.NodeKind = MemberDecl then
+                        let wasMember = inMemberBody
+                        inMemberBody <- true
                         inferMember (synth + "." + ifaceName) ivars [] selfTy (Some ifaceTy) m
+                        inMemberBody <- wasMember
                     // a CLASS base's constructor arguments:
                     // `{ new AbstractReader<'d>(empty) with ... }` — typed
                     // like any expression, so their member accesses resolve
@@ -4843,6 +4892,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                    tokensOf m |> List.exists (fun t -> t.Kind = Operator && t.Text = "=")) then
              vecAdd unmanagedCands (name, [], []))
         // union cases become constructor schemes
+        //
+        // everything in a TYPE body — members, let fields, do blocks —
+        // resolves its constraints eagerly: there is no constraint-carrying
+        // scheme on the class' variables for a deferral to ride, and the
+        // stamp machinery re-resolves per instantiation from the eager pick
+        let wasBody = inMemberBody
+        inMemberBody <- true
         for m in nodesOf n do
             match m.NodeKind with
             | RecordRepr ->
@@ -5009,7 +5065,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      setScheme off csch
                      dictSet ctors name (prior @ [ off, csch ])
                  | None -> ())
-            | MemberDecl -> inferMember name vars (paramVarList ()) selfTy None m
+            | MemberDecl ->
+                let wasMember = inMemberBody
+                inMemberBody <- true
+                inferMember name vars (paramVarList ()) selfTy None m
+                inMemberBody <- wasMember
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
                 // are not accessible as members of the class itself
@@ -5034,7 +5094,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      dictSet impls name (inm :: prior)
                  | None -> ())
                 for x in nodesOf m do
-                    if x.NodeKind = MemberDecl then inferMember owner vars (paramVarList ()) selfTy None x
+                    if x.NodeKind = MemberDecl then
+                        let wasMember = inMemberBody
+                        inMemberBody <- true
+                        inferMember owner vars (paramVarList ()) selfTy None x
+                        inMemberBody <- wasMember
             | k when isPatKind k ->
                 // primary-ctor params — and the class becomes constructible:
                 // `State(src, toks)` gets the scheme ctorArgs -> Self
@@ -5049,6 +5113,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          dictSet ctors name (prior @ [ nameTok.Offset, sch ])
                  | _ -> ())
             | _ -> ()
+        inMemberBody <- wasBody
         // A type that declares `CompareTo` IS ordered, and knows it as soon
         // as the declaration is finished — a body typed later asks for the
         // instance, and asking is the only chance it gets.
@@ -5392,6 +5457,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some cd ->
                 let savedGivens = givens
                 givens <- givens @ context
+                // instance bodies resolve eagerly, like type bodies: their
+                // wanteds must discharge against the instance's OWN context
+                // right here — a deferral escapes to the file pool, where
+                // defaulting grounds the class variable to int
+                let wasBody = inMemberBody
+                inMemberBody <- true
                 for m in bodied do
                     match memberNameOf m with
                     | None -> ()
@@ -5420,6 +5491,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // where the context is long out of scope — and a wanted the
                 // context entails would there be ground out by defaulting.
                 solveWanted ()
+                inMemberBody <- wasBody
                 givens <- savedGivens
 
     /// Pre-register the primary-constructor scheme of an `and`-chained type,
@@ -5573,6 +5645,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   Assoc = assocNames; Supers = supers
                   Members = sigs; Path = path
                   Offset = (match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0) }
+            // one symbol, one class — enforced, not assumed. A silent
+            // overwrite left the earlier class' member unreachable and the
+            // error surfaced as `no instance <other class>` at the use.
+            for mn, _ in sigs do
+                match dictTryFind classes.MemberOwner mn with
+                | Some owner when owner <> name ->
+                    vecAdd diags
+                        (cdef.Offset,
+                         "member '" + mn + "' is already declared by class " + owner
+                         + " — a member name may belong to only one class")
+                | _ -> ()
             Classes.addClass classes cdef
 
     let inferInstanceDecl (n : GreenNode) : unit =
@@ -5654,6 +5737,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some cd ->
                 if cd.Params.Length <> args.Length then
                     vecAdd diags (offset, "class " + name + " takes " + string cd.Params.Length + " type arguments")
+                // the ORPHAN rule, enforced: an instance lives in the file
+                // of its class or of a type its head mentions. Anywhere
+                // else, which instance a use sees depends on file order —
+                // one program, one class, one type gave two answers.
+                let rec headTys (t : Type) : string list =
+                    match prune t with
+                    | TCon (tn2, xs) -> tn2 :: List.collect headTys xs
+                    | TFun (a2, b2) -> headTys a2 @ headTys b2
+                    | TTuple ts -> List.collect headTys ts
+                    | TApp (h, xs) -> headTys h @ List.collect headTys xs
+                    | TVar _ -> []
+                // a GENERATED file is exempt: a generator is a deterministic
+                // function of the project, so its instances are the
+                // project's, not a file's — and derive targets types
+                // declared wherever the user wrote them
+                if cd.Path <> path && path <> Classes.builtinPath
+                   && not (path.StartsWith "(generated)/")
+                   && not (args |> List.collect headTys
+                           |> List.exists (fun tn2 -> Classes.typeDeclaredAt classes tn2 path)) then
+                    vecAdd diags
+                        (offset,
+                         "orphan instance " + name + "<"
+                         + String.concat ", " (List.map typeString args)
+                         + ">: an instance must be declared with its class or with a type its head mentions")
                 elif not (List.isEmpty cd.ParamKinds) && cd.ParamKinds.Length = args.Length then
                     List.zip cd.ParamKinds args
                     |> List.iter (fun (k, a) ->
@@ -5751,6 +5858,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                 | Some t ->
                     arityDeclared t.Text (tyParamCount n)
+                    // where each type name is declared, for the orphan rule —
+                    // recorded in the sweep so the table is complete for a
+                    // file before any of its instances register
+                    Classes.addTypePath classes (arityName t.Text (tyParamCount n)) path
                     // per-DECLARATION arity, so a BARE use — `Inner.GetCount`
                     // has no written arguments — can still find the variant
                     // its resolved definition means
@@ -5901,7 +6012,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         wanted <- wanted |> List.filter (fun (_, c) -> isGround c || not (declLevel c))
         match wanted |> List.tryFind (fun (_, c) -> not (isGround c)) with
         | Some (offset, c) ->
-            (match Classes.select classes c.Class (c.Args |> List.map (fun _ -> tInt)) [] with
+            (match Classes.select classes true c.Class (c.Args |> List.map (fun _ -> tInt)) [] with
              | Classes.Solved _ ->
                  // a defaulting unification can FAIL (the arg is a tuple,
                  // int is not): report once and drop the constraint, or
@@ -6170,7 +6281,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       qf |> List.map nameElem |> List.filter (fun e -> e <> "")
                   let fns =
                       cd.Members |> List.choose (fun ((mn : string), _) ->
-                          match instanceMember true c mn [] with
+                          match instanceMember true true c mn [] with
                           | Some k -> Some (k.MPath, k.MOffset, k.MName, elems)
                           | None -> None)
                   (if List.length fns = List.length cd.Members then

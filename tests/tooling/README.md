@@ -4,6 +4,10 @@ These two exercise the debug build through the tools people actually use. They
 need a display, Chrome and VS Code, so they are NOT part of `dotnet test` — run
 them by hand when the debug information changes.
 
+(`verify/` is different in kind: sub-second bounded model checks of the
+class-resolution rules, with its own README. Run `verify/run.sh` whenever
+the rules in DESIGN.md or the selection code in `Classes.fs` change.)
+
 ## chrome-debug.js — breakpoints and locals in Chrome
 
 Builds nothing itself: point it at a directory holding `prog.wasm`,

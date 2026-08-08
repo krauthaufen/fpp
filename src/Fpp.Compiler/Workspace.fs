@@ -180,9 +180,16 @@ module private BuiltinCache =
             let nv = vecNew<Analysis.Classes.InstanceDef> ()
             for x in vecToList v do vecAdd nv x
             dictSet inst k nv
+        // type-path vectors grow as a project declares types — own copies too
+        let tps = dictNew<string, Fpp.Prelude.Vec<string>> ()
+        for k, v in dictPairs t.TypePaths do
+            let nv = vecNew<string> ()
+            for x in vecToList v do vecAdd nv x
+            dictSet tps k nv
         { Classes = copyDict t.Classes
           Instances = inst
-          MemberOwner = copyDict t.MemberOwner }
+          MemberOwner = copyDict t.MemberOwner
+          TypePaths = tps }
 
     let compute () =
             let imports = dictNew<string, Analysis.Resolve.Definition> ()

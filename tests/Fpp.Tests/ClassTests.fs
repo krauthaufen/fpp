@@ -1738,3 +1738,189 @@ let threadingTests =
             Expect.equal out "7\n1\n" "one thread enters every lock it asks for"
         }
     ]
+
+// The resolution rules (DESIGN.md "Typeclasses: the rules"). Each test is
+// the smallest program that VIOLATES one rule and expects the diagnostic —
+// every one of these compiled cleanly and misbehaved at runtime before the
+// rule was enforced.
+[<Tests>]
+let resolutionRuleTests =
+    let diagnosticsMulti (files : (string * string list) list) : string list =
+        let ws = Workspace()
+        for path, lines in files do ws.SetFileText path (String.concat "\n" lines + "\n")
+        files |> List.collect (fun (path, _) ->
+            ws.Diagnostics path |> List.map (fun d -> d.Message))
+    testList "classes: resolution rules" [
+        test "a member name may belong to only one class" {
+            // the second registration used to WIN silently: Alpha's `tag`
+            // became unreachable and the use errored `no instance Beta<int>`
+            // — a class the program never asked about
+            let errs =
+                diagnostics
+                    [ "class Alpha<'a>"
+                      "    static tag : 'a -> int"
+                      "class Beta<'a>"
+                      "    static tag : 'a -> int"
+                      "instance Alpha<int>"
+                      "    static tag x = 11"
+                      "let a = Alpha.tag 5" ]
+            Expect.exists errs (fun e -> e.Contains "already declared by class Alpha")
+                "the collision is reported at Beta, naming Alpha"
+        }
+        test "a constraint on an applied type variable is rejected, not dropped" {
+            // `when Shows<'f<int>>` typed fine, but the class layer neither
+            // solved nor abstracted it: the member stayed unbound, the
+            // backend stubbed the binding, and a CLEAN check trapped at run
+            let errs =
+                diagnostics
+                    [ "class Mappable<'f<_>>"
+                      "    static mapf : ('a -> 'b) -> 'f<'a> -> 'f<'b>"
+                      "instance Mappable<list>"
+                      "    static mapf f xs = List.map f xs"
+                      "class Shows<'a>"
+                      "    static shw : 'a -> string"
+                      "instance Shows<list<int>>"
+                      "    static shw xs = \"ints\""
+                      "let describe (xs : 'f<int>) : string when Shows<'f<int>> ="
+                      "    Shows.shw xs"
+                      "let a = print (describe [ 1; 2; 3 ])" ]
+            Expect.exists errs (fun e -> e.Contains "applied type variable")
+                "rejected where it is written"
+        }
+        test "an orphan instance is rejected" {
+            // legal-looking split: the class in a.fpp, a MORE SPECIFIC
+            // instance in b.fpp owning neither the class nor list. Before
+            // the rule, which instance a use saw depended on file order —
+            // A.useA answered 100 and B.useB answered 999 in one program
+            let errs =
+                diagnosticsMulti
+                    [ "a.fpp",
+                      [ "module A"
+                        "class Sized<'a>"
+                        "    static size : 'a -> int"
+                        "instance Sized<list<'a>>"
+                        "    static size xs = 100"
+                        "let useA (xs : list<int>) = Sized.size xs" ]
+                      "b.fpp",
+                      [ "module B"
+                        "open A"
+                        "instance Sized<list<int>>"
+                        "    static size xs = 999"
+                        "let useB (xs : list<int>) = Sized.size xs" ] ]
+            Expect.exists errs (fun e -> e.Contains "orphan instance Sized")
+                "the b.fpp instance owns neither Sized nor list"
+        }
+        test "an instance may live with its head type instead of its class" {
+            // the allowed direction of the same split: b.fpp declares the
+            // TYPE the head mentions, so the instance is not an orphan
+            let errs =
+                diagnosticsMulti
+                    [ "a.fpp",
+                      [ "module A"
+                        "class Sized<'a>"
+                        "    static size : 'a -> int"
+                        "instance Sized<list<'a>>"
+                        "    static size xs = 100" ]
+                      "b.fpp",
+                      [ "module B"
+                        "open A"
+                        "type Mine = { X : int }"
+                        "instance Sized<Mine>"
+                        "    static size m = 999"
+                        "let useB (m : Mine) = Sized.size m" ] ]
+            Expect.isEmpty (errs |> List.filter (fun e -> e.Contains "orphan")) "not an orphan"
+        }
+        test "identical heads that differ only in context name both contexts" {
+            // a `when` context is discharged AFTER selection, never used to
+            // select — without the contexts in the message, this printed the
+            // same instance twice and read as a compiler bug
+            let errs =
+                diagnostics
+                    [ "class Tiny<'a>"
+                      "    static tiny : 'a -> int"
+                      "class Big<'a>"
+                      "    static big : 'a -> int"
+                      "class Show2<'a>"
+                      "    static s2 : 'a -> int"
+                      "instance Tiny<int>"
+                      "    static tiny x = 0"
+                      "instance Big<string>"
+                      "    static big s = 0"
+                      "instance Show2<list<'a>> when Tiny<'a>"
+                      "    static s2 xs = 1"
+                      "instance Show2<list<'a>> when Big<'a>"
+                      "    static s2 xs = 2"
+                      "let a = Show2.s2 [ 1; 2 ]" ]
+            Expect.exists errs (fun e ->
+                e.Contains "when Tiny<'a>" && e.Contains "when Big<'a>"
+                && e.Contains "does not select")
+                "both contexts are printed"
+        }
+        test "a later file's more specific instance wins at the stamp" {
+            // rule 5: useB calls A's GENERIC constrained binding at Mine,
+            // whose Sized instance lives legally in b.fpp with its type.
+            // The open match in useA's body must defer to the stamp — an
+            // eager commit answered 1 here while the same program in one
+            // file answered 999
+            let ws = Workspace()
+            ws.SetFileText "a.fpp" (String.concat "\n" [
+                "module A"
+                "class Sized<'a>"
+                "    static size : 'a -> int"
+                "instance Sized<'a>"
+                "    static size x = 1"
+                "let useA (x : 'a) : int when Sized<'a> = Sized.size x"
+                "" ])
+            ws.SetFileText "b.fpp" (String.concat "\n" [
+                "module B"
+                "open A"
+                "type Mine = { X : int }"
+                "instance Sized<Mine>"
+                "    static size m = 999"
+                "let useB (m : Mine) = A.useA m"
+                "print (string (useB { X = 1 }))"
+                "" ])
+            let bytes, errors = ws.EmitProgramWasm ()
+            Expect.isEmpty errors "emission errors"
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
+            psi.RedirectStandardOutput <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd()
+            p.WaitForExit()
+            System.IO.File.Delete tmp
+            Expect.equal out "999\n" "the specific instance is ranked at the stamp"
+        }
+        test "a repeated variable in a head only matches equal arguments" {
+            // `P2<'a,'a>` says "both arguments the same type". The
+            // could-still-apply check used to look at each slot on its
+            // own, so at (int, string) the equal-args instance was
+            // forever "still possible", the catch-all was never
+            // committed, and the use died in the backend as a stub
+            let out =
+                run [ "class P2<'a, 'b>"
+                      "    static tag : 'a -> 'b -> int"
+                      "instance P2<'a, 'b>"
+                      "    static tag x y = 1"
+                      "instance P2<'a, 'a>"
+                      "    static tag x y = 2"
+                      "let a = print (string (P2.tag 5 6))"
+                      "let b = print (string (P2.tag 5 \"s\"))" ]
+            Expect.equal out "2\n1\n" "equal-args instance at (int,int), catch-all at (int,string)"
+        }
+        test "overlap with a unique most-specific instance still selects it" {
+            // rule 2 kept as decided: overlap is fine as long as one
+            // instance is strictly most specific at the use
+            let out =
+                run [ "class Sized<'a>"
+                      "    static size : 'a -> int"
+                      "instance Sized<list<'a>>"
+                      "    static size xs = 100"
+                      "instance Sized<list<int>>"
+                      "    static size xs = 999"
+                      "let a = print (Sized.size [ 1; 2; 3 ])"
+                      "let b = print (Sized.size [ \"x\" ])" ]
+            Expect.equal out "999\n100\n" "specific at int, general at string"
+        }
+    ]

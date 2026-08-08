@@ -193,12 +193,47 @@ inlining, whose misery is an artifact of erasure-era .NET. Monomorphization
 happens only as an optimization when the instantiation is visible. Real
 separate compilation, sane error messages.
 
-- **Coherence for free**: instances live only at the definition site of the
-  implementing type. Resolution = look at the head constructor's interface
-  list, then discharge `when` clauses. No backtracking; overlapping instances
-  are unrepresentable. No orphans. If retrofitting types you don't own hurts
-  in practice, Scala-style scoped given-imports are the *later, additive*
-  escape hatch — global orphans can never be walked back.
+- **The rules.** Nine lines, and everything the class layer does must be
+  derivable from them — a rule that cannot fit here does not go in. Each
+  was violated by a program that compiled cleanly and misbehaved before the
+  rule was enforced (`ClassTests`, "resolution rules").
+
+  1. A class is declared once; **member names are unique across all
+     classes** — a collision is an error at the declaration. (One symbol,
+     one class: `a + b` is a lookup, not a search.)
+  2. **Instances may overlap**; a use selects the unique most-specific
+     match. No unique maximum is an error naming the candidates.
+  3. Selection never commits while a strictly more specific instance could
+     still apply once the use's variables are known — it defers.
+  4. **No orphans**: an instance lives in the file of its class or of a
+     type its head mentions. (Generated files are the project's, exempt.)
+  5. Selection ranks the whole program's instances, not the file's. For a
+     GROUND argument this holds by construction: rule 4 plus
+     declare-before-use means every instance that can match is already
+     visible. An OPEN match (an instance variable bound to a type still
+     containing a variable) defers to the stamp, where the argument is
+     ground and the table is the program's — except inside a type or
+     instance body, which has no scheme for the deferral to ride and
+     commits eagerly. That corner, and `Improve` (which grounds a type by
+     the only candidate the file has seen), remain file-order-sensitive.
+  6. A constraint's argument must start with a NAMED type
+     (`Shows<list<'a>>` is fine); a type variable applied to arguments
+     (`Shows<'f<int>>`) is rejected where written until dictionary
+     passing learns the shape — never silently dropped.
+  7. A conditional instance's `when` context is discharged *after*
+     selection; it never drives it.
+  8. Superclass entailment walks a DAG; a cycle is refused, not followed.
+  9. **Open**: anything the backend must stub should be an error at
+     `check` — today three shapes reach `build` as warnings and trap.
+
+  If retrofitting types you don't own hurts in practice, Scala-style scoped
+  given-imports are the *later, additive* escape hatch — global orphans can
+  never be walked back.
+
+  The load-bearing lemmas are model-checked: `tests/tooling/verify/run.sh`
+  searches every program in a bounded universe and must find NO
+  counterexample to ground coherence (rules 4+5) and MUST find the two
+  bug witnesses that motivated them. See its README.
 - **Conditional instances**: an implementation may carry constraints and
   compiles to a dictionary-to-dictionary function:
 

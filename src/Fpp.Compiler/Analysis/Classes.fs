@@ -80,13 +80,36 @@ type Tables =
     { Classes : Dict<string, ClassDef>
       Instances : Dict<string, Vec<InstanceDef>>
       /// member name -> the class declaring it. One symbol, one class: this
-      /// is what makes `a + b` a single lookup instead of a search.
-      MemberOwner : Dict<string, string> }
+      /// is what makes `a + b` a single lookup instead of a search. The
+      /// uniqueness is ENFORCED at the class declaration (Infer reports a
+      /// collision), because a silent overwrite made the earlier class'
+      /// member unreachable and the error surfaced as `no instance` on a
+      /// class the user never named.
+      MemberOwner : Dict<string, string>
+      /// type name (decorated) -> every path that declares it, for the
+      /// orphan rule: an instance must live with its class or with a type
+      /// its head mentions. Filled by Infer's arity sweep, so it is
+      /// complete for a file before any of the file's instances register.
+      TypePaths : Dict<string, Vec<string>> }
 
 let newTables () : Tables =
     { Classes = dictNew<string, ClassDef> ()
       Instances = dictNew<string, Vec<InstanceDef>> ()
-      MemberOwner = dictNew<string, string> () }
+      MemberOwner = dictNew<string, string> ()
+      TypePaths = dictNew<string, Vec<string>> () }
+
+let addTypePath (t : Tables) (name : string) (path : string) : unit =
+    match dictTryFind t.TypePaths name with
+    | Some v -> if not (vecToList v |> List.exists (fun p -> p = path)) then vecAdd v path
+    | None ->
+        let v = vecNew<string> ()
+        vecAdd v path
+        dictSet t.TypePaths name v
+
+let typeDeclaredAt (t : Tables) (name : string) (path : string) : bool =
+    match dictTryFind t.TypePaths name with
+    | Some v -> vecToList v |> List.exists (fun p -> p = path)
+    | None -> false
 
 let addClass (t : Tables) (c : ClassDef) : unit =
     dictSet t.Classes c.Name c
@@ -166,6 +189,8 @@ let rec private sameType (a : Type) (b : Type) : bool =
         n1 = n2 && a1.Length = a2.Length && List.forall2 sameType a1 a2
     | TFun (p1, r1), TFun (p2, r2) -> sameType p1 p2 && sameType r1 r2
     | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 sameType x y
+    | TApp (h1, a1), TApp (h2, a2) ->
+        a1.Length = a2.Length && sameType h1 h2 && List.forall2 sameType a1 a2
     | _ -> false
 
 /// One-way matching: a variable of the INSTANCE may bind, a variable of the
@@ -183,20 +208,43 @@ let rec private matchTy (ps : Set<int>) (sub : Dict<int, Type>) (pat : Type) (tg
         n1 = n2 && a1.Length = a2.Length && List.forall2 (matchTy ps sub) a1 a2
     | TFun (p1, r1), TFun (p2, r2) -> matchTy ps sub p1 p2 && matchTy ps sub r1 r2
     | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 (matchTy ps sub) x y
+    | TApp (h1, a1), TApp (h2, a2) ->
+        a1.Length = a2.Length && matchTy ps sub h1 h2
+        && List.forall2 (matchTy ps sub) a1 a2
     | _ -> false
+
+/// Can these two types still turn out equal once variables are known?
+/// Fully concrete on both sides means the answer is already decided.
+let private couldEqual (a : Type) (b : Type) : bool =
+    if List.isEmpty (freeVars a) && List.isEmpty (freeVars b) then sameType a b
+    else true
 
 /// Could this instance still apply once the target's variables are known?
 /// Unlike `matchTy` a target variable stands for anything. Used only to
 /// count candidates: when exactly one survives, the choice is forced and
 /// committing to it is improvement, not guessing.
-let rec private compatible (ps : Set<int>) (pat : Type) (tgt : Type) : bool =
+///
+/// `sub` remembers what each instance variable was already paired with:
+/// without it, a REPEATED variable checked each slot on its own, so
+/// `P2<'a,'a>` counted as "still possible" at (int, string) — the winner
+/// was never committed, and the use died in the backend as an
+/// unresolvable stub.
+let rec private compatible (ps : Set<int>) (sub : Dict<int, Type>) (pat : Type) (tgt : Type) : bool =
     match prune pat, prune tgt with
-    | TVar v, _ when Set.contains v.Id ps -> true
+    | TVar v, t when Set.contains v.Id ps ->
+        (match dictTryFind sub v.Id with
+         | Some bound -> couldEqual bound t
+         | None -> dictSet sub v.Id t; true)
     | _, TVar _ -> true
     | TCon (n1, a1), TCon (n2, a2) ->
-        n1 = n2 && a1.Length = a2.Length && List.forall2 (compatible ps) a1 a2
-    | TFun (p1, r1), TFun (p2, r2) -> compatible ps p1 p2 && compatible ps r1 r2
-    | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 (compatible ps) x y
+        n1 = n2 && a1.Length = a2.Length && List.forall2 (compatible ps sub) a1 a2
+    | TFun (p1, r1), TFun (p2, r2) -> compatible ps sub p1 p2 && compatible ps sub r1 r2
+    | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 (compatible ps sub) x y
+    // an UNRESOLVED application stands for whatever its head becomes,
+    // exactly as an unresolved variable does two cases up. Without this a
+    // constraint like `Shows<'f<int>>` answered NoInstance — terminal —
+    // where more information could still pick an instance.
+    | _, TApp _ -> true
     | TVar _, _ -> false
     | _ -> false
 
@@ -233,7 +281,11 @@ type Selection =
 /// same way the arguments do — `Add<'a,'b>` whose result is known to be
 /// `int` can only be `Add<int,int>`, and that is what keeps `a + b + 1`
 /// inferring `int -> int -> int` rather than a context nobody asked for.
-let select (t : Tables) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
+/// `eager` commits an OPEN match (see openMatch below) instead of
+/// deferring it: a CLASS MEMBER body has no constraint-carrying scheme, so
+/// the eager commit is its only resolution — a let body defers and the
+/// constraint rides its scheme to the stamp.
+let select (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc : (string * Type) list) : Selection =
     let cands = instancesOf t cls
     let exact =
         cands |> List.choose (fun i ->
@@ -254,9 +306,22 @@ let select (t : Tables) (cls : string) (args : Type list) (assoc : (string * Typ
             not (System.Object.ReferenceEquals (j, chosen))
             && moreSpecific j chosen
             && (let ps = j.Params |> List.map (fun v -> v.Id) |> Set.ofList
-                j.Head.Length = args.Length && List.forall2 (compatible ps) j.Head args))
+                (let sub = dictNew<int, Type> ()
+                 j.Head.Length = args.Length && List.forall2 (compatible ps sub) j.Head args)))
+    // An OPEN match bound an instance variable to a type still containing a
+    // variable: the use has not finished asking. Committing here answers for
+    // callers this file has never seen — a strictly more specific instance,
+    // legal under the orphan rule in a LATER file, was never ranked, and one
+    // program answered 100 and 999 for the same class at the same type
+    // (tests/known-issues history: cross-module-specificity). An open match
+    // defers to the stamp, where the argument is concrete and the table is
+    // the whole program's. A GROUND match may commit: the orphan rule plus
+    // declare-before-use means every instance that could match a ground
+    // type is already visible when it is solved.
+    let openMatch (sub : Dict<int, Type>) =
+        dictPairs sub |> List.exists (fun (_, ty) -> not (List.isEmpty (freeVars ty)))
     let settle (i : InstanceDef) (sub : Dict<int, Type>) =
-        if overtakable i then Deferred else Solved (i, sub)
+        if overtakable i || (not eager && openMatch sub) then Deferred else Solved (i, sub)
     match exact with
     | [ (i, sub) ] -> settle i sub
     // OVERLAPPING instances: the most specific one wins, and it has to be
@@ -275,10 +340,13 @@ let select (t : Tables) (cls : string) (args : Type list) (assoc : (string * Typ
         let possible =
             cands |> List.filter (fun i ->
                 let ps = i.Params |> List.map (fun v -> v.Id) |> Set.ofList
-                i.Head.Length = args.Length && List.forall2 (compatible ps) i.Head args
+                // ONE memory across the whole instance: its variables mean
+                // the same thing in the head and in the associated types
+                let sub = dictNew<int, Type> ()
+                i.Head.Length = args.Length && List.forall2 (compatible ps sub) i.Head args
                 && assoc |> List.forall (fun (n, want) ->
                     match i.Assoc |> List.tryFind (fun (an, _) -> an = n) with
-                    | Some (_, has) -> compatible ps has want
+                    | Some (_, has) -> compatible ps sub has want
                     | None -> true))
         match possible with
         | [] -> NoInstance
@@ -296,10 +364,18 @@ let substInst (sub : Dict<int, Type>) (t : Type) : Type =
         | TApp (h, args) -> TApp (go h, List.map go args)
     go t
 
+/// Does the head of two constraints agree (same class, same argument types)?
+let sameHead (a : Constraint) (b : Constraint) : bool =
+    a.Class = b.Class && a.Args.Length = b.Args.Length && List.forall2 sameType a.Args b.Args
+
 /// Every constraint entailed by this one: itself, its superclasses, and
 /// theirs. Used both to discharge a wanted against a declared `when` and to
 /// drop from a context anything a superclass already implies.
-let rec entailed (t : Tables) (c : Constraint) : Constraint list =
+/// `seen` refuses a cycle in the super chain the same way the member walk's
+/// `seenOwners` does — keyed by whole head, not class name, so a diamond
+/// that reaches one class at two argument lists still visits both.
+let rec private entailedSeen (t : Tables) (seen : Constraint list) (c : Constraint) : Constraint list =
+    if seen |> List.exists (fun s -> sameHead s c) then [] else
     match dictTryFind t.Classes c.Class with
     | None -> [ c ]
     | Some cd when cd.Params.Length <> c.Args.Length -> [ c ]
@@ -308,8 +384,7 @@ let rec entailed (t : Tables) (c : Constraint) : Constraint list =
         List.iter2 (fun (p : Var) a -> dictSet sub p.Id a) cd.Params c.Args
         c :: (cd.Supers
               |> List.collect (fun s ->
-                  entailed t (mapConstraint (substInst sub) s)))
+                  entailedSeen t (c :: seen) (mapConstraint (substInst sub) s)))
 
-/// Does the head of two constraints agree (same class, same argument types)?
-let sameHead (a : Constraint) (b : Constraint) : bool =
-    a.Class = b.Class && a.Args.Length = b.Args.Length && List.forall2 sameType a.Args b.Args
+let entailed (t : Tables) (c : Constraint) : Constraint list =
+    entailedSeen t [] c
