@@ -5218,7 +5218,16 @@ let jsImports (m : Mod) : unit =
     imp "toNum"    [ "externref" ] [ "f64" ]
     imp "toBool"   [ "externref" ] [ "i32" ]
     imp "bool"     [ "i32" ] [ "externref" ]
+    imp "undef"    [] [ "externref" ]
     imp "mkFn"     [ "anyref" ] [ "externref" ]
+    // object/array literals and the HANDLE TABLE (strong refs; a
+    // FinalizationRegistry watching the WASM wrapper frees the slot)
+    imp "obj"      [] [ "externref" ]
+    imp "arr"      [] [ "externref" ]
+    imp "push"     [ "externref"; "externref" ] []
+    imp "h"        [ "i32" ] [ "externref" ]
+    imp "reg"      [ "externref" ] [ "i32" ]
+    imp "watch"    [ "anyref"; "i32" ] []
     // string crossings are the ENGINE'S js-string builtins over the i16
     // $str — inlined by V8 (instantiate with builtins: ['js-string']); the
     // UTF-8 text-codec builtins were probed unshipped 2026-08-08, but the

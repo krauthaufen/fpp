@@ -14,6 +14,11 @@
 
 export const jsImports = (getExports) => {
   const mem = () => getExports().memory.buffer;
+  // the handle table: STRONG refs, freed when the WASM wrapper dies —
+  // wasm-GC objects are JS-observable, so the registry watches THEM
+  const table = new Map();
+  let nextId = 1;
+  const registry = new FinalizationRegistry(id => table.delete(id));
   return { js: {
     // keys arrive as JS STRINGS — literals are interned wasm-side, made
     // once through strNew; nothing decodes per call
@@ -39,9 +44,16 @@ export const jsImports = (getExports) => {
     toNum: (v) => Number(v),
     toBool: (v) => (v ? 1 : 0),
     bool: (v) => !!v,
+    undef: () => undefined,
     // an F++ closure as a JS function: calls back through the exported
     // bridge; captured state lives in the closure, the GCs keep it alive
     mkFn: (clo) => (...a) => getExports().jscall(clo, a.length ? a[0] : undefined),
+    obj: () => ({}),
+    arr: () => ([]),
+    push: (a, v) => { a.push(v); },
+    h: (id) => table.get(id),
+    reg: (o) => { const id = nextId++; table.set(id, o); return id; },
+    watch: (wrapper, id) => registry.register(wrapper, id),
     // ZERO-COPY: views over the module's own memory at a pinned address.
     // Fresh per call — memory.grow would detach a cached one.
     viewU8:  (p, n) => new Uint8Array(mem(), p, n),

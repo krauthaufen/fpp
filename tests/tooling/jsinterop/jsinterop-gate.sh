@@ -12,6 +12,7 @@ fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
 "$fpp" build -o "$here/jsdemo.wasm" "$here/jsdemo.fpp"
 "$fpp" build -o "$here/webgl.wasm" "$here/webgl.fpp"
 "$fpp" build -o "$here/domdemo.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
+"$fpp" build --strict -o "$here/gpu-triangle.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgpu.fpp" "$here/gpu-triangle.fpp"
 cd "$root"
 python3 -m http.server 8734 >/dev/null 2>&1 &
 srv=$!
@@ -40,6 +41,15 @@ else
     echo "got:  $got"
     exit 1
 fi
+# the WebGPU leg: the hello-triangle sample as F++ — generated bindings,
+# record descriptors, future{} async, GPU readback asserting the pixels.
+# Skips cleanly where navigator.gpu is absent.
+got=$(node "$here/gpudrive.js")
+case "$got" in
+  *'"skip":true'*) echo "WEBGPU-TRIANGLE SKIPPED (no navigator.gpu)" ;;
+  *'"ok":1'*) echo "WEBGPU OK (hello-triangle renders, readback verified)" ;;
+  *) echo "WEBGPU MISMATCH"; echo "got: $got"; exit 1 ;;
+esac
 # the WebGL leg: pinned verts -> view -> bufferData -> draw -> readPixels
 # into a pinned struct -> F++ checks the color. Zero copies end to end.
 got=$(node "$here/gldrive.js")

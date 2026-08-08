@@ -2285,6 +2285,38 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         toExtern f
         jsStrBack st f
+    | EApp (EUnknown "jsUndefined", [ _ ]) ->
+        callf f "$js_undef"
+        toAny f
+    | EApp (EUnknown "jsNewObj", [ _ ]) ->
+        callf f "$js_obj"
+        toAny f
+    | EApp (EUnknown "jsNewArr", [ _ ]) ->
+        callf f "$js_arr"
+        toAny f
+    | EApp (EUnknown "jsPush", [ a; v ]) ->
+        emitNode st f lv a
+        toExtern f
+        emitNode st f lv v
+        toExtern f
+        callf f "$js_push"
+        pushUnit f
+    | EApp (EUnknown "jsHandle", [ i ]) ->
+        emitNode st f lv i
+        callf f "$toi"
+        callf f "$js_h"
+        toAny f
+    | EApp (EUnknown "jsRegister", [ o ]) ->
+        emitNode st f lv o
+        toExtern f
+        callf f "$js_reg"
+        callf f "$ofi"
+    | EApp (EUnknown "jsWatch", [ w; i ]) ->
+        emitNode st f lv w
+        emitNode st f lv i
+        callf f "$toi"
+        callf f "$js_watch"
+        pushUnit f
     | EApp (EUnknown "jsCallback", [ clo ]) ->
         emitNode st f lv clo
         callf f "$js_mkFn"

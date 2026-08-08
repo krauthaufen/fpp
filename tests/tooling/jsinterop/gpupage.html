@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fpp webgpu gate</title>
+<body>
+<script type="module">
+  import { instantiate } from '/stdlib/fpp-js.mjs';
+  window.log = [];
+  window.results = null;
+  try {
+    if (!navigator.gpu) {
+      window.results = { skip: true };
+    } else {
+      const exports = await instantiate('gpu-triangle.wasm', {
+        sink: s => window.log.push(s.trimEnd()) });
+      exports._start();
+      // the verdict arrives ASYNC (adapter/device/mapAsync futures)
+      const t0 = performance.now();
+      while (performance.now() - t0 < 15000) {
+        const j = window.log.join('|');
+        if (j.includes('pass') || j.includes('fail') || j.includes('no webgpu')) break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      window.results = { skip: false, log: window.log.filter(x => x !== ''), ok: exports.ok(0) };
+    }
+  } catch (e) {
+    window.results = { error: String(e && e.stack || e) };
+  }
+  window.ready = true;
+</script>

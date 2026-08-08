@@ -1381,6 +1381,16 @@ type FutureBuilder() =
     member b.Return (v : 'a) : Future<'a> = Future.Resolved v
     member b.ReturnFrom (f : Future<'a>) : Future<'a> = f
     member b.Zero () : Future<unit> = Future.Resolved ()
+    member b.Delay (f : unit -> Future<'a>) : Future<'a> = f ()
+    member b.Yield (v : unit) : Future<unit> = Future.Resolved ()
+    member b.Combine (a : Future<unit>, rest : Future<'b>) : Future<'b> =
+        let r = Future<'b> ()
+        a.OnComplete (fun () ->
+            if a.IsFailed then r.Fail "future failed"
+            else rest.OnComplete (fun () ->
+                if rest.IsFailed then r.Fail "future failed"
+                else r.Resolve rest.Result))
+        r
     member b.Bind (f : Future<'a>, k : 'a -> Future<'b>) : Future<'b> =
         let r = Future<'b> ()
         f.OnComplete (fun () ->
@@ -1433,6 +1443,13 @@ module Js =
     extern let jsOfString : string -> JsObj
     extern let jsToString : JsObj -> string
     extern let jsCallback : (JsObj -> unit) -> JsObj
+    extern let jsUndefined : unit -> JsObj
+    extern let jsNewObj : unit -> JsObj
+    extern let jsNewArr : unit -> JsObj
+    extern let jsPush : JsObj -> JsObj -> unit
+    extern let jsHandle : int -> JsObj
+    extern let jsRegister : JsObj -> int
+    extern let jsWatch : obj -> int -> unit
     extern let jsNull : unit -> JsObj
     extern let jsIsNull : JsObj -> bool
     extern let jsViewU8 : nativeint -> int -> JsObj
@@ -1468,6 +1485,17 @@ module Js =
     let toString (o : JsObj) : string = jsToString o
     /// an F++ function as a JS callback: captured state travels with it
     let callback (fn : JsObj -> unit) : JsObj = jsCallback fn
+    /// JS `undefined` — what an OMITTED optional argument means (null is
+    /// NOT the same thing to WebIDL: a null size maps zero bytes)
+    let undefined () : JsObj = jsUndefined ()
+    let newObj () : JsObj = jsNewObj ()
+    let newArr () : JsObj = jsNewArr ()
+    let push (a : JsObj) (v : JsObj) : unit = jsPush a v
+    /// the HANDLE TABLE: GPU-world objects live JS-side under small ints;
+    /// the registry frees a slot when its wasm wrapper is collected
+    let handle (id : int) : JsObj = jsHandle id
+    let register (o : JsObj) : int = jsRegister o
+    let watch (wrapper : obj) (id : int) : unit = jsWatch wrapper id
     /// a JS Promise as a Future: then/catch resolve it through the bridge
     let futureOf (p : JsObj) : Future<JsObj> =
         let f = Future<JsObj> ()

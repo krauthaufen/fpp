@@ -3121,15 +3121,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              (match dictTryFind useDefs ht.Offset with
                               | Some d -> dictTryFind fields ("$sig:" + d.Path + ":" + string d.Offset)
                               | None ->
-                                  // a CROSS-FILE member has no local def to key
-                                  // by, but the dot-demand already recorded the
-                                  // OWNER type at the member token — the
-                                  // project-wide field table has the rest
-                                  match vecToList memberSitesRaw |> List.rev
+                                  // a CROSS-FILE member has no local def to
+                                  // key by; the dot-demand recorded the OWNER
+                                  // at the member token — accept only a sig
+                                  // whose owner MATCHES that record
+                                  match vecToList memberSitesRaw
                                         |> List.tryPick (fun (o, tn) ->
                                             if o = ht.Offset && not (tn.StartsWith "$") && not (tn.StartsWith "#")
                                             then Some tn else None) with
-                                  | Some tn -> dictTryFind fields (tn + "." + ht.Text)
+                                  | Some tn ->
+                                      (match dictTryFind fields (tn + "." + ht.Text) with
+                                       | Some fi when fi.TypeName = tn -> Some fi
+                                       | _ -> None)
                                   | None -> None)
                          | None -> None
                      let omittable = match calleeSig with Some fi -> fi.Optionals | None -> 0
@@ -3759,10 +3762,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | many, _ -> List.last many
             | TupleExpr ->
                 let want = expected
-                let elems =
+                // an expected TUPLE hands each element its own expectation —
+                // this is what lets `f ({ ... }, { ... })` disambiguate the
+                // record literals by the parameter types
+                let elemWants =
+                    match want with
+                    | Some w ->
+                        (match prune w with
+                         | TTuple ws -> ws |> List.map Some
+                         | _ -> [])
+                    | None -> []
+                let elemNodes =
                     n.Children
                     |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
-                    |> List.map exprType
+                let elems =
+                    elemNodes
+                    |> List.mapi (fun i m ->
+                        exprExpect <-
+                            (if List.length elemWants = List.length elemNodes
+                             then List.item i elemWants
+                             else None)
+                        let t = exprType m
+                        exprExpect <- None
+                        t)
                 (match want with
                  | Some w ->
                      (match prune w with
@@ -4491,13 +4513,75 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // determine the record type from ALL labels (F# semantics):
                 // among candidate owners, the first whose field set covers
                 // every written label wins
+                // the EXPECTED type wins when it names a record covering
+                // every written label — the F# rule, and what lets a
+                // {Module; EntryPoint} literal mean GPUVertexState rather
+                // than whichever base dictionary declares those two first
+                let expectOwner =
+                    match expected, fieldNames with
+                    | Some et, first :: _ ->
+                        (match prune et with
+                         | TCon (en, _) when fieldNames |> List.forall (fun m -> (dictTryFind fields (en + "." + m)).IsSome) ->
+                             dictTryFind fields (en + "." + first)
+                         | _ -> None)
+                    | _ -> None
                 let owner =
-                    fieldNames
-                    |> List.tryPick (fun n ->
-                        match dictTryFind fields n with
-                        | Some info when fieldNames |> List.forall (fun m -> (dictTryFind fields (info.TypeName + "." + m)).IsSome) ->
-                            Some info
-                        | _ -> None)
+                    match expectOwner with
+                    | Some i -> Some i
+                    | None ->
+                        // candidates: every RECORD (member entries carry a
+                        // DefKey and are not literal targets) whose declared
+                        // fields cover the written labels. The LAST-declared
+                        // wins, as F# reads shadowing — except when another
+                        // candidate's fields are a STRICT SUBSET of the
+                        // winner's: a flattened derived dictionary covers its
+                        // base's labels too, and a literal writing only base
+                        // labels means the BASE.
+                        let first = List.head fieldNames
+                        let recFieldsOf (tn : string) =
+                            dictPairs fields
+                            |> List.choose (fun (k, fi) ->
+                                if fi.TypeName = tn && k.StartsWith (tn + ".")
+                                   && not (k.Contains "$") && fi.DefKey.IsNone && not fi.IsStatic
+                                   && not ((k.Substring (tn.Length + 1)).Contains ".")
+                                   && not ((k.Substring (tn.Length + 1)).Contains "#")
+                                then Some (k.Substring (tn.Length + 1)) else None)
+                        let cands =
+                            dictPairs fields
+                            |> List.choose (fun (k, fi) ->
+                                if k = fi.TypeName + "." + first && not (k.Contains "$")
+                                   && fi.DefKey.IsNone && not fi.IsStatic
+                                then Some fi else None)
+                            |> List.filter (fun fi ->
+                                let fs = recFieldsOf fi.TypeName
+                                (fieldNames |> List.forall (fun m -> List.contains m fs))
+                                // and every REQUIRED field is written — a
+                                // literal missing GPUTextureDescriptor's
+                                // Format cannot mean that type
+                                && (fs |> List.forall (fun f2 ->
+                                        (dictTryFind fields (fi.TypeName + "." + f2 + "$opt")).IsSome
+                                        || List.contains f2 fieldNames)))
+                        (match List.tryLast cands with
+                         | Some pick0 ->
+                             let mutable best = pick0
+                             let mutable bestFields = recFieldsOf best.TypeName
+                             for c in cands do
+                                 if c.TypeName <> best.TypeName then
+                                     let cf = recFieldsOf c.TypeName
+                                     if List.length cf < List.length bestFields
+                                        && cf |> List.forall (fun f2 -> List.contains f2 bestFields) then
+                                         best <- c
+                                         bestFields <- cf
+                             Some best
+                         | None ->
+                             // no record candidate: the OLD bare-name rule
+                             // (class members with settable fields etc.)
+                             fieldNames
+                             |> List.tryPick (fun n ->
+                                 match dictTryFind fields n with
+                                 | Some info when fieldNames |> List.forall (fun m -> (dictTryFind fields (info.TypeName + "." + m)).IsSome) ->
+                                     Some info
+                                 | _ -> None))
                 (match owner with
                  | Some info ->
                      let subst = dictNew<int, Type> ()
@@ -4515,9 +4599,28 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None -> ())
                      for f in fieldNodes do
                          let nameTok = recordFieldLabel f
+                         // the declared field type flows into the value as
+                         // its expectation (optionals expect the INNER type)
+                         let saved = exprExpect
+                         (match nameTok with
+                          | Some t0 ->
+                              (match dictTryFind fields (info.TypeName + "." + t0.Text) with
+                               | Some fi0 ->
+                                   let d0 = substVars subst fi0.FieldType
+                                   let isOpt0 = (dictTryFind fields (info.TypeName + "." + t0.Text + "$opt")).IsSome
+                                   let q0 = tokensOf f |> List.exists (fun tk -> tk.Kind = Operator && tk.Text = "?")
+                                   exprExpect <-
+                                       (if isOpt0 && not q0 then
+                                            match prune d0 with
+                                            | TCon ("Option", [ inner0 ]) -> Some inner0
+                                            | _ -> Some d0
+                                        else Some d0)
+                               | None -> ())
+                          | None -> ())
                          let valTy =
                              nodesOf f |> List.filter (fun m -> isExprish m.NodeKind)
                              |> List.map (fun m -> exprType (GNode m))
+                         exprExpect <- saved
                          (match nameTok, List.tryLast valTy with
                           | Some t, Some vt ->
                               (match dictTryFind fields (info.TypeName + "." + t.Text) with
@@ -4548,10 +4651,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      st.Fresh ())
             | ArrayExpr ->
                 let elem = st.Fresh ()
+                // an expected array type hands its ELEMENT expectation to
+                // every entry — nested record literals disambiguate by it
+                let savedA = exprExpect
+                let elemExpect =
+                    match expected with
+                    | Some et ->
+                        (match prune et with
+                         | TCon ("array", [ e ]) -> Some e
+                         | _ -> None)
+                    | None -> None
                 for m in nodesOf n do
                     if isExprish m.NodeKind then
+                        exprExpect <- elemExpect
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
                         unifyAt off (exprType (GNode m)) elem
+                exprExpect <- savedA
                 (match Green.tokens (GNode n) |> List.tryHead with
                  | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("array", [ elem ]))
                  | None -> ())
@@ -4633,6 +4748,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // cleared before generalization.
             let rigidHere = setRigid vars true
             let bodyTys =
+                // the ASCRIPTION is the body's expectation — it is what lets
+                // `let x : GPUTexelCopyTextureInfo = { Texture = t }` pick
+                // the annotated record over a flattened derived one
+                (match ascription, paramTys with
+                 | Some at, [] -> exprExpect <- Some at
+                 | _ -> ())
                 try vecToList after |> List.map exprType
                 finally
                     // cleared HERE, not at the end of the branch: a rigid
