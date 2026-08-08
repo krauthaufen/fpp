@@ -7,3 +7,5 @@ double c_sum2(long long p, int n) {
 }
 
 int c_first(long long p) { return ((unsigned char *)p)[0]; }
+
+void c_bump(long long p) { ((V2 *)p)->x += 10.0; }

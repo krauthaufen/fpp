@@ -947,6 +947,63 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | None -> ())
         stmt f ("fpp_cell_set(" + sref x + ", " + sref y + ");")
         unitV ()
+    | EApp (EUnknown "$fixaddr", [ tgt ]) ->
+        // `fixed &target`: the location's address. Heap containers pin in
+        // place (LIVE aliasing); a stack struct bounces via a pinned heap
+        // blob — copy-back happens in $fixfree. Addresses are int32 (the
+        // heap maps low); C stack addresses do not fit, hence the bounce.
+        let podVarOf (rv : VarId) =
+            match dictTryFind f.Locals (rv.Path, rv.Offset) with
+            | Some i when i < 0 && fst (vecGet f.RawVars (-i - 1)) = 'S' ->
+                Some (snd (vecGet f.RawVars (-i - 1)))
+            | _ -> None
+        (match tgt with
+         | (EVar (tv, _) | EVarI (tv, _, _)) when (podVarOf tv).IsSome ->
+             let nm = (podVarOf tv).Value
+             let tid = (dictTryFind f.PodOfRaw nm).Value
+             let b = slot f
+             stmt f (sref b + " = fpp_pack_" + string tid + "(&" + nm + ");")
+             stmt f ("fpprt_pin(" + sref b + ");")
+             let d = slot f
+             stmt f (sref d + " = TAGI((intptr_t)((char *)" + sref b + " + FPP_POD_OFF));")
+             d
+         | EIndex (nm2, arr2, ix2) when (dictTryFind st.PodArrTid nm2).IsSome ->
+             let tid = (dictTryFind st.PodTid nm2).Value
+             let av = emitE st f arr2
+             let ia = emitRawAs st f 'i' ix2
+             let d = slot f
+             stmt f (sref d + " = TAGI((intptr_t)fpp_arr_pin(" + sref av
+                     + ") + (intptr_t)" + ia + " * (intptr_t)sizeof(P_" + string tid + "));")
+             d
+         | EIndex (nm2, arr2, ix2) when (elemInfo nm2).IsSome ->
+             let _, _, k = (elemInfo nm2).Value
+             let av = emitE st f arr2
+             let ia = emitRawAs st f 'i' ix2
+             let d = slot f
+             stmt f (sref d + " = TAGI((intptr_t)fpp_arr_pin(" + sref av
+                     + ") + (intptr_t)" + ia + " * (intptr_t)sizeof(" + podCTy k + "));")
+             d
+         | _ -> trap "fixed & target (only struct locals and array elements pin)")
+    | EApp (EUnknown "$fixfree", [ tgt; pe ]) ->
+        let podVarOf (rv : VarId) =
+            match dictTryFind f.Locals (rv.Path, rv.Offset) with
+            | Some i when i < 0 && fst (vecGet f.RawVars (-i - 1)) = 'S' ->
+                Some (snd (vecGet f.RawVars (-i - 1)))
+            | _ -> None
+        (match tgt with
+         | (EVar (tv, _) | EVarI (tv, _, _)) when (podVarOf tv).IsSome ->
+             // copy the C-side writes BACK into the stack struct; the
+             // pinned blob is garbage after and collects in place
+             let nm = (podVarOf tv).Value
+             let tid = (dictTryFind f.PodOfRaw nm).Value
+             let x = emitE st f pe
+             stmt f ("fpp_unpack_" + string tid + "((V)((intptr_t)UNTAGI(" + sref x
+                     + ") - FPP_POD_OFF), &" + nm + ");")
+         | EIndex (_, arr2, _) ->
+             let av = emitE st f arr2
+             stmt f ("fpp_arr_unpin(" + sref av + ");")
+         | _ -> ())
+        unitV ()
     | EApp (EUnknown "refEq", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b

@@ -2480,6 +2480,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | [ h; x ] ->
                      let off = (tokensOf h |> List.head).Offset
+                     // `fixed &target` — an INTRINSIC: the target must own
+                     // its layout (Unmanaged), and the address comes from
+                     // pinning the location itself, no Pinnable involved
+                     let isAddr =
+                         x.NodeKind = PrefixExpr
+                         && (tokensOf x |> List.exists (fun t -> t.Kind = Operator && t.Text = "&"))
+                     if isAddr then
+                         (match nodesOf x |> List.filter (fun m -> isExprish m.NodeKind) with
+                          | [ tgt ] ->
+                              let tt = exprType (GNode tgt)
+                              addWanted off { Class = "Unmanaged"; Args = [ tt ]; Assoc = [] }
+                          | _ -> ())
+                         tInt
+                     else
                      let xt = exprType (GNode x)
                      let pTy = st.Fresh ()
                      if not (tryResolveDot false (85000000 + off) xt pTy "Pin") then

@@ -3137,6 +3137,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // `use p = fixed x`: pin through Pinnable for the
                     // binding's scope, unpin on every exit path
                     (match rhs with
+                     | EApp (EUnknown "fixed", [ EApp (EUnknown "$addr", [ tgt ]) ]) ->
+                         // `use p = fixed &target`: address the LOCATION —
+                         // heap containers pin in place (live aliasing), a
+                         // stack struct bounces via a pinned heap temp with
+                         // copy-back at scope exit
+                         let tail2 =
+                             match cont, rest with
+                             | Some c, [] -> c
+                             | Some c, _ -> ESeq [ c; lowerBlock rest ]
+                             | None, _ -> lowerBlock rest
+                         ELet (isRec, v, sch, EApp (EUnknown "$fixaddr", [ tgt ]),
+                               tryFinally (offsetOf item) tail2
+                                   (EApp (EUnknown "$fixfree", [ tgt; EVar (v, sch) ])))
                      | EApp (EUnknown "fixed", [ xe ]) ->
                          let fixedOff =
                              Green.tokens (GNode item)
