@@ -3120,7 +3120,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some ht ->
                              (match dictTryFind useDefs ht.Offset with
                               | Some d -> dictTryFind fields ("$sig:" + d.Path + ":" + string d.Offset)
-                              | None -> None)
+                              | None ->
+                                  // a CROSS-FILE member has no local def to key
+                                  // by, but the dot-demand already recorded the
+                                  // OWNER type at the member token — the
+                                  // project-wide field table has the rest
+                                  match vecToList memberSitesRaw |> List.rev
+                                        |> List.tryPick (fun (o, tn) ->
+                                            if o = ht.Offset && not (tn.StartsWith "$") && not (tn.StartsWith "#")
+                                            then Some tn else None) with
+                                  | Some tn -> dictTryFind fields (tn + "." + ht.Text)
+                                  | None -> None)
                          | None -> None
                      let omittable = match calleeSig with Some fi -> fi.Optionals | None -> 0
                      // The elements a call actually wrote, whether or not

@@ -238,8 +238,36 @@ let unescape (raw : string) : byte[] =
             else
                 vecAdd units (int c)
                 i <- i + 1
+    // The CLI reads source as LATIN-1 (offsets are byte offsets), so a
+    // UTF-8 é arrives as the two chars C3 A9 — fold valid UTF-8 runs back
+    // into code points. Chars over 255 (an LSP host hands REAL strings)
+    // are already decoded and pass through; so does anything that does not
+    // shape up as UTF-8 (a `\xE9` escape followed by ASCII stays itself).
+    let folded = vecNew<int> ()
+    let raw = vecToList units |> List.toArray
+    let cont (k : int) = k < raw.Length && raw.[k] >= 0x80 && raw.[k] < 0xC0
+    let mutable i = 0
+    while i < raw.Length do
+        let u = raw.[i]
+        if u >= 0xC2 && u < 0xE0 && cont (i + 1) then
+            vecAdd folded (((u - 0xC0) * 64) + (raw.[i + 1] - 0x80))
+            i <- i + 2
+        elif u >= 0xE0 && u < 0xF0 && cont (i + 1) && cont (i + 2) then
+            vecAdd folded (((u - 0xE0) * 4096) + ((raw.[i + 1] - 0x80) * 64)
+                           + (raw.[i + 2] - 0x80))
+            i <- i + 3
+        elif u >= 0xF0 && u < 0xF5 && cont (i + 1) && cont (i + 2) && cont (i + 3) then
+            let cp = ((u - 0xF0) * 262144) + ((raw.[i + 1] - 0x80) * 4096)
+                     + ((raw.[i + 2] - 0x80) * 64) + (raw.[i + 3] - 0x80)
+            let v = cp - 0x10000
+            vecAdd folded (0xD800 ||| (v / 1024))
+            vecAdd folded (0xDC00 ||| (v % 1024))
+            i <- i + 4
+        else
+            vecAdd folded u
+            i <- i + 1
     let out = vecNew<byte> ()
-    for u in vecToList units do
+    for u in vecToList folded do
         vecAdd out (byte (u % 256))
         vecAdd out (byte ((u / 256) % 256))
     vecToArray out
@@ -251,7 +279,7 @@ let charCode (raw : string) : int =
     if strLen inner > 1 && charAt inner 0 = '\\' then fst (escapeAt inner 0)
     else
         let bs = unescape raw
-        if bs.Length > 0 then int bs.[0] else 0
+        if bs.Length > 1 then int bs.[0] + 256 * int bs.[1] else 0
 
 /// "12" -> Some 12; anything with a non-digit (or empty) -> None. Spelled
 /// out because the compiler compiles ITSELF: System.Int32.TryParse is not in
@@ -2240,6 +2268,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         toExtern f
         callf f "$js_toNum"
         callf f "$off"
+    | EApp (EUnknown "jsOfBool", [ a ]) ->
+        emitNode st f lv a
+        callf f "$toi"
+        callf f "$js_bool"
+        toAny f
     | EApp (EUnknown "jsToBool", [ a ]) ->
         emitNode st f lv a
         toExtern f

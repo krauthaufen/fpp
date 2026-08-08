@@ -38,6 +38,7 @@ export const jsImports = (getExports) => {
     num: (v) => v,
     toNum: (v) => Number(v),
     toBool: (v) => (v ? 1 : 0),
+    bool: (v) => !!v,
     // an F++ closure as a JS function: calls back through the exported
     // bridge; captured state lives in the closure, the GCs keep it alive
     mkFn: (clo) => (...a) => getExports().jscall(clo, a.length ? a[0] : undefined),

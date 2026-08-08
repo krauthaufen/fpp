@@ -1345,6 +1345,7 @@ module Js =
     extern let jsOfNum : float -> JsObj
     extern let jsToNum : JsObj -> float
     extern let jsToBool : JsObj -> bool
+    extern let jsOfBool : bool -> JsObj
     extern let jsOfString : string -> JsObj
     extern let jsToString : JsObj -> string
     extern let jsCallback : (JsObj -> unit) -> JsObj
@@ -1378,6 +1379,7 @@ module Js =
     let ofNum (v : float) : JsObj = jsOfNum v
     let toNum (o : JsObj) : float = jsToNum o
     let toBool (o : JsObj) : bool = jsToBool o
+    let ofBool (v : bool) : JsObj = jsOfBool v
     let ofString (v : string) : JsObj = jsOfString v
     let toString (o : JsObj) : string = jsToString o
     /// an F++ function as a JS callback: captured state travels with it

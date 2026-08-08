@@ -5217,6 +5217,7 @@ let jsImports (m : Mod) : unit =
     imp "num"      [ "f64" ] [ "externref" ]
     imp "toNum"    [ "externref" ] [ "f64" ]
     imp "toBool"   [ "externref" ] [ "i32" ]
+    imp "bool"     [ "i32" ] [ "externref" ]
     imp "mkFn"     [ "anyref" ] [ "externref" ]
     // string crossings are the ENGINE'S js-string builtins over the i16
     // $str — inlined by V8 (instantiate with builtins: ['js-string']); the

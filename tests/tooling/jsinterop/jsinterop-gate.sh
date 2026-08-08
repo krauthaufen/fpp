@@ -11,6 +11,7 @@ command -v node >/dev/null || { echo "JSINTEROP SKIPPED (no node)"; exit 0; }
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
 "$fpp" build -o "$here/jsdemo.wasm" "$here/jsdemo.fpp"
 "$fpp" build -o "$here/webgl.wasm" "$here/webgl.fpp"
+"$fpp" build -o "$here/domdemo.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
 cd "$root"
 python3 -m http.server 8734 >/dev/null 2>&1 &
 srv=$!
@@ -22,6 +23,19 @@ if [ "$got" = "$want" ]; then
     echo "JS INTEROP OK (dom, callbacks, strings, zero-copy views)"
 else
     echo "JS INTEROP MISMATCH"
+    echo "want: $want"
+    echo "got:  $got"
+    exit 1
+fi
+# the typed-DOM leg: the curated hierarchy, properties, optionals, and
+# DYNAMIC-type wrapping (`:? HTMLCanvasElement` / `:? MouseEvent` answer
+# what the browser knows)
+got=$(node "$here/domdrive.js")
+want='{"log":["typed","hello typed café","t€xt","5","123px","BUTTON","hello typed café","big","BUTTON","4","canvas 32","span SPAN","dom-ready"],"text":"hello typed café","cls":"big","width":"123px","clicks":2,"lastX":77}'
+if [ "$got" = "$want" ]; then
+    echo "DOM OK (typed hierarchy, dynamic type tests, optionals)"
+else
+    echo "DOM MISMATCH"
     echo "want: $want"
     echo "got:  $got"
     exit 1
