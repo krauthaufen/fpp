@@ -562,6 +562,16 @@ let globalI32 (m : Mod) (name : string) (init : int) : unit =
     emitU32 m.GlobalBody init
     emitByte m.GlobalBody opEnd
 
+/// (global $name (mut externref) (ref.null extern))
+let globalExternref (m : Mod) (name : string) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitByte m.GlobalBody (valByte "externref")
+    emitByte m.GlobalBody 1
+    emitByte m.GlobalBody (opByte "ref.null")
+    emitByte m.GlobalBody (heapByte "extern")
+    emitByte m.GlobalBody opEnd
+
 /// (global $name (mut anyref) (ref.null any))
 let globalAnyref (m : Mod) (name : string) : unit =
     dictSet m.GlobalIdx name m.GlobalCount
@@ -5016,17 +5026,21 @@ let assemble (m : Mod) (memPages : int) (hasTag : bool) : byte[] = assembleWith 
 /// (an unused import would still demand a host import object)
 let jsImports (m : Mod) : unit =
     let imp n ps rs = importFn m "js" n ("$js_" + n) ps rs
-    imp "global"   [ "i32"; "i32" ] [ "externref" ]
-    imp "get"      [ "externref"; "i32"; "i32" ] [ "externref" ]
-    imp "set"      [ "externref"; "i32"; "i32"; "externref" ] []
-    imp "getNum"   [ "externref"; "i32"; "i32" ] [ "f64" ]
-    imp "setNum"   [ "externref"; "i32"; "i32"; "f64" ] []
+    imp "global"   [ "externref" ] [ "externref" ]
+    imp "get"      [ "externref"; "externref" ] [ "externref" ]
+    imp "set"      [ "externref"; "externref"; "externref" ] []
+    imp "getNum"   [ "externref"; "externref" ] [ "f64" ]
+    imp "setNum"   [ "externref"; "externref"; "f64" ] []
     imp "item"     [ "externref"; "i32" ] [ "externref" ]
     imp "itemSet"  [ "externref"; "i32"; "externref" ] []
-    imp "call0"    [ "externref"; "i32"; "i32" ] [ "externref" ]
-    imp "call1"    [ "externref"; "i32"; "i32"; "externref" ] [ "externref" ]
-    imp "call2"    [ "externref"; "i32"; "i32"; "externref"; "externref" ] [ "externref" ]
-    imp "call3"    [ "externref"; "i32"; "i32"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call0"    [ "externref"; "externref" ] [ "externref" ]
+    imp "call1"    [ "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call2"    [ "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call3"    [ "externref"; "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call4"    [ "externref"; "externref"; "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call5"    [ "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call6"    [ "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
+    imp "call7"    [ "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref"; "externref" ] [ "externref" ]
     imp "new0"     [ "externref" ] [ "externref" ]
     imp "new1"     [ "externref"; "externref" ] [ "externref" ]
     imp "new2"     [ "externref"; "externref"; "externref" ] [ "externref" ]

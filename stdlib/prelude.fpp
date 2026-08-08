@@ -1332,6 +1332,10 @@ module Js =
     extern let jsCall1 : JsObj -> string -> JsObj -> JsObj
     extern let jsCall2 : JsObj -> string -> JsObj -> JsObj -> JsObj
     extern let jsCall3 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsCall4 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsCall5 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsCall6 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj
+    extern let jsCall7 : JsObj -> string -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj -> JsObj
     extern let jsNew0 : JsObj -> JsObj
     extern let jsNew1 : JsObj -> JsObj -> JsObj
     extern let jsNew2 : JsObj -> JsObj -> JsObj -> JsObj
@@ -1361,6 +1365,10 @@ module Js =
     let call1 (o : JsObj) (m : string) (a : JsObj) : JsObj = jsCall1 o m a
     let call2 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) : JsObj = jsCall2 o m a b
     let call3 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) : JsObj = jsCall3 o m a b c
+    let call4 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) (d : JsObj) : JsObj = jsCall4 o m a b c d
+    let call5 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) (d : JsObj) (e : JsObj) : JsObj = jsCall5 o m a b c d e
+    let call6 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) (d : JsObj) (e : JsObj) (g : JsObj) : JsObj = jsCall6 o m a b c d e g
+    let call7 (o : JsObj) (m : string) (a : JsObj) (b : JsObj) (c : JsObj) (d : JsObj) (e : JsObj) (g : JsObj) (h : JsObj) : JsObj = jsCall7 o m a b c d e g h
     let new0 (ctor : JsObj) : JsObj = jsNew0 ctor
     let new1 (ctor : JsObj) (a : JsObj) : JsObj = jsNew1 ctor a
     let new2 (ctor : JsObj) (a : JsObj) (b : JsObj) : JsObj = jsNew2 ctor a b

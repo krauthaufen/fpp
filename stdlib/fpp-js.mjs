@@ -1,8 +1,10 @@
 // The JavaScript side of F++'s `Js` module — the import object for module
 // "js". One function per operation, kept MONOMORPHIC so engine inline
 // caches stay warm. Property keys arrive as (ptr, len) UTF-8 in the
-// module's exported linear memory; objects cross as externref (no handle
-// table, no copies); TypedArray views alias wasm memory directly.
+// module's exported linear memory ONLY when dynamic — literal keys are
+// interned wasm-side as externref globals and arrive as ready JS strings;
+// objects cross as externref (no handle table, no copies); TypedArray
+// views alias wasm memory directly.
 //
 // Usage:
 //   import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
@@ -20,17 +22,23 @@ export const jsImports = (getExports) => {
   const key = (p, n) => dec.decode(new Uint8Array(mem(), p, n));
   let pending = null; // bytes measured by strLen, written by the next strWrite
   return { js: {
-    global: (p, n) => globalThis[key(p, n)],
-    get: (o, p, n) => o[key(p, n)],
-    set: (o, p, n, v) => { o[key(p, n)] = v; },
-    getNum: (o, p, n) => Number(o[key(p, n)]),
-    setNum: (o, p, n, v) => { o[key(p, n)] = v; },
+    // keys arrive as JS STRINGS — literals are interned wasm-side, made
+    // once through strNew; nothing decodes per call
+    global: (k) => globalThis[k],
+    get: (o, k) => o[k],
+    set: (o, k, v) => { o[k] = v; },
+    getNum: (o, k) => Number(o[k]),
+    setNum: (o, k, v) => { o[k] = v; },
     item: (o, i) => o[i],
     itemSet: (o, i, v) => { o[i] = v; },
-    call0: (o, p, n) => o[key(p, n)](),
-    call1: (o, p, n, a) => o[key(p, n)](a),
-    call2: (o, p, n, a, b) => o[key(p, n)](a, b),
-    call3: (o, p, n, a, b, c) => o[key(p, n)](a, b, c),
+    call0: (o, k) => o[k](),
+    call1: (o, k, a) => o[k](a),
+    call2: (o, k, a, b) => o[k](a, b),
+    call3: (o, k, a, b, c) => o[k](a, b, c),
+    call4: (o, k, a, b, c, d) => o[k](a, b, c, d),
+    call5: (o, k, a, b, c, d, e) => o[k](a, b, c, d, e),
+    call6: (o, k, a, b, c, d, e, f) => o[k](a, b, c, d, e, f),
+    call7: (o, k, a, b, c, d, e, f, g) => o[k](a, b, c, d, e, f, g),
     new0: (C) => new C(),
     new1: (C, a) => new C(a),
     new2: (C, a, b) => new C(a, b),

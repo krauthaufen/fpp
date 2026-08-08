@@ -18,6 +18,8 @@ open Fpp.Backend.EmitBin
 type St =
     { M : Mod
       Errors : Vec<string>
+      /// js property-key literals -> the externref global interning them
+      JsKeys : Dict<string, string>
       CaseTag : Dict<string, int>
       CaseArity : Dict<string, int>
       EnumConst : Dict<string, int>
@@ -1195,6 +1197,37 @@ and private podHoistLoop (st : St) (f : Fn) (parts : Expr list) : string list =
             vecAdd out g
         vecToList out
 
+/// a JS property KEY as an externref string. A LITERAL is interned: the JS
+/// string is made once, parked in an externref global, and every later use
+/// is a null-check away from free — per-call staging measured 46x -> 35x on
+/// the property loop, and this removes the decode entirely. A dynamic key
+/// stages and crosses through strNew.
+and private jsKeyE (st : St) (f : Fn) (lv : Dict<string * int, string>) (k : Expr) : unit =
+    match k with
+    | ELit (LString lit) ->
+        let g =
+            match dictTryFind st.JsKeys lit with
+            | Some g -> g
+            | None ->
+                let g = "$jsk" + string (List.length (dictPairs st.JsKeys))
+                dictSet st.JsKeys lit g
+                g
+        // bodies replay: declare the global only once
+        if (dictTryFind st.M.GlobalIdx g).IsNone then globalExternref st.M g
+        gg f g
+        ins f "ref.is_null"
+        ifE f
+        emitNode st f lv k
+        callf f "$jsstage"
+        callf f "$js_strNew"
+        gs f g
+        endB f
+        gg f g
+    | _ ->
+        emitNode st f lv k
+        callf f "$jsstage"
+        callf f "$js_strNew"
+
 and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
     | ELit (LInt s) when not (s.EndsWith "L") ->
@@ -2101,22 +2134,19 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     // objects cross as externref (one conversion instruction each way);
     // property keys stage as (ptr, len) UTF-8 so an access is ONE crossing
     | EApp (EUnknown "jsGlobal", [ k ]) ->
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         callf f "$js_global"
         toAny f
     | EApp (EUnknown "jsGet", [ o; k ]) ->
         emitNode st f lv o
         toExtern f
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         callf f "$js_get"
         toAny f
     | EApp (EUnknown "jsSet", [ o; k; v ]) ->
         emitNode st f lv o
         toExtern f
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         emitNode st f lv v
         toExtern f
         callf f "$js_set"
@@ -2124,15 +2154,13 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EApp (EUnknown "jsGetNum", [ o; k ]) ->
         emitNode st f lv o
         toExtern f
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         callf f "$js_getNum"
         callf f "$off"
     | EApp (EUnknown "jsSetNum", [ o; k; v ]) ->
         emitNode st f lv o
         toExtern f
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         emitNode st f lv v
         callf f "$tof"
         callf f "$js_setNum"
@@ -2156,8 +2184,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
     | EApp (EUnknown cn, o :: k :: rest) when cn.StartsWith "jsCall" && strLen cn = 7 ->
         emitNode st f lv o
         toExtern f
-        emitNode st f lv k
-        callf f "$jsstage"
+        jsKeyE st f lv k
         for a in rest do
             emitNode st f lv a
             toExtern f
@@ -3998,7 +4025,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     let debugBuild = mapUrl <> ""
     let m = modNew ()
     let st =
-        { M = m; Errors = vecNew (); CaseTag = dictNew (); CaseArity = dictNew ()
+        { M = m; Errors = vecNew (); JsKeys = dictNew (); CaseTag = dictNew (); CaseArity = dictNew ()
           EnumConst = dictNew (); GlobalOf = dictNew (); FnOf = dictNew ()
           ArityOf = dictNew (); Warnings = vecNew ()
           Wrappers = dictNew ()

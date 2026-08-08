@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fpp webgl gate</title>
+<body>
+<script type="module">
+  import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
+  window.log = [];
+  let exports;
+  try {
+    const { instance } = await WebAssembly.instantiateStreaming(
+      fetch('webgl.wasm'),
+      { ...jsImports(() => exports), ...wasiImports(() => exports, s => window.log.push(s.trimEnd())) });
+    exports = instance.exports;
+    exports._start();
+    window.results = { log: window.log.filter(x => x !== '') };
+  } catch (e) {
+    window.results = { error: String(e && e.stack || e) };
+  }
+  window.ready = true;
+</script>
