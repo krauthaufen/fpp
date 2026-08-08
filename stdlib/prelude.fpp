@@ -1310,6 +1310,90 @@ module Memory =
     let loadFloat (p : nativeint) : float = memLoadFloat p
     let storeFloat (p : nativeint) (v : float) : unit = memStoreFloat p v
 
+// ---- Future: single-threaded completion, the browser's own model ----
+// Continuations run REENTRANTLY on completion (the event-loop semantics a
+// wasm module actually lives in); errors ride the exception machinery and
+// re-raise at the observation point. `future { let! x = ... }` chains.
+type Future<'a>() =
+    let mutable state = 0        // 0 pending, 1 resolved, 2 failed
+    let mutable value : option<'a> = None
+    let mutable error = ""
+    // registration-order continuations, dependency-free (the collections
+    // are declared LATER in this file — order is semantic here)
+    let mutable conts : list<unit -> unit> = []
+    member f.IsCompleted : bool = state <> 0
+    member f.IsFailed : bool = state = 2
+    member f.Result : 'a =
+        if state = 2 then failwith error else
+        match value with
+        | Some v -> v
+        | None -> failwith "future is pending"
+    member f.OnComplete (k : unit -> unit) : unit =
+        if state <> 0 then k ()
+        else conts <- k :: conts
+    member private f.RunConts () : unit =
+        // manual reverse: module List is declared later in this file
+        let mutable ks : list<unit -> unit> = []
+        let mutable src = conts
+        let mutable rv = true
+        while rv do
+            match src with
+            | k :: rest ->
+                ks <- k :: ks
+                src <- rest
+            | [] -> rv <- false
+        conts <- []
+        let mutable go = true
+        while go do
+            match ks with
+            | k :: rest ->
+                k ()
+                ks <- rest
+            | [] -> go <- false
+    member f.Resolve (v : 'a) : unit =
+        if state = 0 then
+            value <- Some v
+            state <- 1
+            f.RunConts ()
+    member f.Fail (message : string) : unit =
+        if state = 0 then
+            error <- message
+            state <- 2
+            f.RunConts ()
+
+    static member Resolved (v : 'a) : Future<'a> =
+        let f = Future<'a> ()
+        f.Resolve v
+        f
+    static member Failed (message : string) : Future<'a> =
+        let f = Future<'a> ()
+        f.Fail message
+        f
+
+/// TaskCompletionSource, spelled for this world
+type FutureSource<'a>() =
+    let f : Future<'a> = Future<'a> ()
+    member s.Future : Future<'a> = f
+    member s.SetResult (v : 'a) : unit = f.Resolve v
+    member s.SetError (message : string) : unit = f.Fail message
+
+type FutureBuilder() =
+    member b.Return (v : 'a) : Future<'a> = Future.Resolved v
+    member b.ReturnFrom (f : Future<'a>) : Future<'a> = f
+    member b.Zero () : Future<unit> = Future.Resolved ()
+    member b.Bind (f : Future<'a>, k : 'a -> Future<'b>) : Future<'b> =
+        let r = Future<'b> ()
+        f.OnComplete (fun () ->
+            if f.IsFailed then r.Fail "future failed"
+            else
+                let inner = k f.Result
+                inner.OnComplete (fun () ->
+                    if inner.IsFailed then r.Fail "future failed"
+                    else r.Resolve inner.Result))
+        r
+
+let future = FutureBuilder ()
+
 // ---- Js: the JavaScript boundary ----
 // JS values are opaque `JsObj` handles — externref at the wasm boundary,
 // ordinary values here: they live in locals, fields and collections, and
@@ -1384,6 +1468,12 @@ module Js =
     let toString (o : JsObj) : string = jsToString o
     /// an F++ function as a JS callback: captured state travels with it
     let callback (fn : JsObj -> unit) : JsObj = jsCallback fn
+    /// a JS Promise as a Future: then/catch resolve it through the bridge
+    let futureOf (p : JsObj) : Future<JsObj> =
+        let f = Future<JsObj> ()
+        jsCall1 p "then" (jsCallback (fun v -> f.Resolve v)) |> ignore
+        jsCall1 p "catch" (jsCallback (fun e -> f.Fail (jsToString (jsGet e "message")))) |> ignore
+        f
     let nil () : JsObj = jsNull ()
     let isNull (o : JsObj) : bool = jsIsNull o
     let viewU8 (p : nativeint) (elems : int) : JsObj = jsViewU8 p elems
