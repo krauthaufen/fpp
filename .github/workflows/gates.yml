@@ -8,12 +8,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  # number formatting must match the oracle everywhere: runner ICU data
-  # prints infinity as "∞" where the invariant tables say "Infinity",
-  # and the suite diffs program output byte for byte
-  DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: 1
-
 jobs:
   gates:
     runs-on: ubuntu-latest

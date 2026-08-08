@@ -42,9 +42,15 @@ let private fsiRun (src : string) : string =
         |> Array.filter (fun l -> l.Trim() <> "module M")
         |> String.concat "\n"
     let prelude =
+        // The oracle's culture is PINNED, not inherited: F++ prints
+        // infinity as ∞ (a fixed choice, EmitBin's $ftoa), and .NET only
+        // agrees under a real ICU culture — a C/invariant environment
+        // (CI runners, LANG=C shells) says "Infinity" and the diff blames
+        // the wrong side. en-US is what the suite was developed against.
+        "System.Globalization.CultureInfo.DefaultThreadCurrentCulture <- System.Globalization.CultureInfo.GetCultureInfo \"en-US\"\n"
         // IEqualityComparer lives in the builtin prelude on the F++ side
         // Char.* lives in System for F#; F++ has it in the prelude
-        "open System\n"
+        + "open System\n"
         + "open System.Collections.Generic\n"
         + "let print (x : obj) =\n"
         + "    match x with\n"
