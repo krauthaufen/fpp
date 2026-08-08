@@ -7,19 +7,15 @@
 // views alias wasm memory directly.
 //
 // Usage:
-//   import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
-//   let exports;
-//   const { instance } = await WebAssembly.instantiateStreaming(
-//     fetch('prog.wasm'),
-//     { ...jsImports(() => exports), ...wasiImports(() => exports, console.log) });
-//   exports = instance.exports;
+//   import { instantiate } from '/stdlib/fpp-js.mjs';
+//   const exports = await instantiate('prog.wasm', { sink: console.log,
+//     jsx: { now: () => performance.now() } });   // [<JsImport>] externs
 //   exports._start();
 
 export const jsImports = (getExports) => {
   const dec = new TextDecoder();
   const enc = new TextEncoder();
   const mem = () => getExports().memory.buffer;
-  const key = (p, n) => dec.decode(new Uint8Array(mem(), p, n));
   let pending = null; // bytes measured by strLen, written by the next strWrite
   return { js: {
     // keys arrive as JS STRINGS — literals are interned wasm-side, made
@@ -64,6 +60,19 @@ export const jsImports = (getExports) => {
     viewF32: (p, n) => new Float32Array(mem(), p, n),
     viewF64: (p, n) => new Float64Array(mem(), p, n),
   } };
+};
+
+/// Instantiate an F++ module with the whole boundary wired: the "js"
+/// primitives, the engine string builtins, wasi print into `sink`, and any
+/// app-supplied typed imports as { jsx: { name: fn } }.
+export const instantiate = async (url, { jsx = {}, sink = null } = {}) => {
+  let exports;
+  const { instance } = await WebAssembly.instantiateStreaming(
+    fetch(url),
+    { ...jsImports(() => exports), ...wasiImports(() => exports, sink), jsx },
+    { builtins: ['text-decoder', 'text-encoder'] });
+  exports = instance.exports;
+  return exports;
 };
 
 // `print` lowers to wasi fd_write; drain the iovecs into `sink`

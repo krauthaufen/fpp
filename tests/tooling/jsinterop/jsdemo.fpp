@@ -7,6 +7,11 @@ module JsDemo
 type P2 = { mutable X : float32; mutable Y : float32 }
 
 let pts = [| { X = 1.5f; Y = 2.5f }; { X = 3.5f; Y = 4.5f } |]
+
+// a TYPED per-operation import: one dedicated wasm import, the app
+// supplies the JS side at instantiation ({ jsx: { mix: ... } })
+[<JsImport>]
+extern let mix : float -> int -> float
 let mutable clicks = 0
 
 [<Export>]
@@ -38,4 +43,5 @@ let go =
     // `new Date(0).getUTCFullYear()` — construction across the boundary
     let date = Js.new1 (Js.global_ "Date") (Js.ofNum 0.0)
     print (int (Js.toNum (Js.call0 date "getUTCFullYear")))
+    print (int (mix 4.0 7))
     print "ready"

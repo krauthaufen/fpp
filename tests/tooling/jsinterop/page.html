@@ -3,14 +3,12 @@
 <title>fpp js interop gate</title>
 <body>
 <script type="module">
-  import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
+  import { instantiate } from '/stdlib/fpp-js.mjs';
   window.log = [];
-  let exports;
   try {
-    const { instance } = await WebAssembly.instantiateStreaming(
-      fetch('jsdemo.wasm'),
-      { ...jsImports(() => exports), ...wasiImports(() => exports, s => window.log.push(s.trimEnd())) });
-    exports = instance.exports;
+    const exports = await instantiate('jsdemo.wasm', {
+      sink: s => window.log.push(s.trimEnd()),
+      jsx: { mix: (a, b) => a * 100 + b } });
     exports._start();
     // callback: two real clicks
     document.getElementById('made').click();

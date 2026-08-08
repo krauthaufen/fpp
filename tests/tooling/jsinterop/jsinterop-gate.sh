@@ -17,7 +17,7 @@ srv=$!
 trap 'kill $srv 2>/dev/null || true' EXIT
 sleep 1
 got=$(node "$here/drive.js")
-want='{"log":["7","","made","","1","9","7","0","","ready",""],"madeText":"hello from F++","viewY1":4.5,"clicks":2,"x0AfterJsWrite":95}'
+want='{"log":["7","","made","","1","9","7","0","","4","0","7","","ready",""],"madeText":"hello from F++","viewY1":4.5,"clicks":2,"x0AfterJsWrite":95}'
 if [ "$got" = "$want" ]; then
     echo "JS INTEROP OK (dom, callbacks, strings, zero-copy views)"
 else

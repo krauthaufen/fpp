@@ -83,7 +83,8 @@ let private tyAdd (m : Mod) (name : string) : unit =
 // $name resolves through the type table.
 
 let emitVal (m : Mod) (b : Bytes) (t : string) : unit =
-    if strLen t > 0 && charAt t 0 = '$' then emitRefType b true (tyIdx m t)
+    if t = "(ref extern)" then emitRefAbs b false "extern"
+    elif strLen t > 0 && charAt t 0 = '$' then emitRefType b true (tyIdx m t)
     else
         let v = valByte t
         emitByte b v
@@ -5048,6 +5049,10 @@ let jsImports (m : Mod) : unit =
     imp "toNum"    [ "externref" ] [ "f64" ]
     imp "toBool"   [ "externref" ] [ "i32" ]
     imp "mkFn"     [ "anyref" ] [ "externref" ]
+    // string crossings STAGE through scratch linear memory. The engine
+    // text-codec builtins (wasm:text-decoder/-encoder) would make these
+    // near-free, but Chrome accepts the names without absorbing the
+    // imports yet (probed 2026-08-08) — revisit when V8 ships them.
     imp "strNew"   [ "i32"; "i32" ] [ "externref" ]
     imp "strLen"   [ "externref" ] [ "i32" ]
     imp "strWrite" [ "externref"; "i32" ] [ "i32" ]
@@ -5169,6 +5174,5 @@ let rtCoreJs (m : Mod) : unit =
     callf f "$applyc"
     ins f "drop"
     endFn f
-
 
 /// (this comment anchors the end of the runtime slices)

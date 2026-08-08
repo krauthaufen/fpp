@@ -59,6 +59,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let mutable pendingStruct = false
     let mutable pendingExport = false
+    let mutable pendingJsImport = false
     // Set while lowering the loop of a list comprehension: the loop's BODY
     // is the yielded element, so it accumulates instead of being evaluated
     // for effect. Consumed on entry to the body, so a nested loop inside it
@@ -4082,9 +4083,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.tryPick (fun m -> if m.NodeKind = IdentPat then tokensOf m |> List.tryFind (fun t -> t.Kind = Ident) else None) with
                  | Some t ->
                      (match dictTryFind defsAt t.Offset with
-                      | Some d -> vecAdd decls (DExtern (varIdOf d, schemeOf d))
+                      | Some d ->
+                          vecAdd decls (DExtern (varIdOf d, schemeOf d))
+                          // `[<JsImport>]`: this extern imports from module
+                          // "jsx" with a TYPED per-operation ABI — the marker
+                          // rides a DExport so the IR needs no new case
+                          if pendingJsImport then vecAdd decls (DExport (varIdOf d, "$jsimport"))
                       | None -> vecAdd notes (offsetOf n, "extern name unresolved"))
                  | None -> vecAdd notes (offsetOf n, "extern shape"))
+                pendingJsImport <- false
             | LetDecl ->
                 (match lowerLetParts n with
                  | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
@@ -4109,6 +4116,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     pendingStruct <- true
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Export") then
                     pendingExport <- true
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "JsImport") then
+                    pendingJsImport <- true
             | ModuleHeader | OpenDecl -> ()
             | k when isExprish k ->
                 vecAdd decls (DLet (false, { Path = path; Offset = offsetOf n; Name = "_it" }, mono tUnit, lowerExpr g))

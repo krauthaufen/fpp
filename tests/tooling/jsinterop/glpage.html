@@ -3,14 +3,11 @@
 <title>fpp webgl gate</title>
 <body>
 <script type="module">
-  import { jsImports, wasiImports } from '/stdlib/fpp-js.mjs';
+  import { instantiate } from '/stdlib/fpp-js.mjs';
   window.log = [];
-  let exports;
   try {
-    const { instance } = await WebAssembly.instantiateStreaming(
-      fetch('webgl.wasm'),
-      { ...jsImports(() => exports), ...wasiImports(() => exports, s => window.log.push(s.trimEnd())) });
-    exports = instance.exports;
+    const exports = await instantiate('webgl.wasm', {
+      sink: s => window.log.push(s.trimEnd()) });
     exports._start();
     window.results = { log: window.log.filter(x => x !== '') };
   } catch (e) {

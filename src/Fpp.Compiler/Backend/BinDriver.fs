@@ -1217,16 +1217,34 @@ and private jsKeyE (st : St) (f : Fn) (lv : Dict<string * int, string>) (k : Exp
         gg f g
         ins f "ref.is_null"
         ifE f
-        emitNode st f lv k
-        callf f "$jsstage"
-        callf f "$js_strNew"
+        jsStrE st f lv k
         gs f g
         endB f
         gg f g
-    | _ ->
-        emitNode st f lv k
-        callf f "$jsstage"
-        callf f "$js_strNew"
+    | _ -> jsStrE st f lv k
+
+/// an F++ string expression as a JS string (externref) — staged through
+/// scratch, decoded by the glue's TextDecoder
+and private jsStrE (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
+    emitNode st f lv e
+    callf f "$jsstage"
+    callf f "$js_strNew"
+
+/// a JS string (externref, ON THE STACK) back to an F++ $str — the glue
+/// encodes into scratch, $jsunstage rebuilds the array
+and private jsStrBack (st : St) (f : Fn) : unit =
+    let jh = freshLocal f "$jh" "externref"
+    let jp = freshLocal f "$jp" "i32"
+    ls f jh
+    lg f jh
+    callf f "$js_strLen"
+    callf f "$jsensure"
+    ls f jp
+    lg f jp
+    lg f jh
+    lg f jp
+    callf f "$js_strWrite"
+    callf f "$jsunstage"
 
 and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
@@ -2214,27 +2232,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$js_toBool"
         refI31 f
     | EApp (EUnknown "jsOfString", [ a ]) ->
-        emitNode st f lv a
-        callf f "$jsstage"
-        callf f "$js_strNew"
+        jsStrE st f lv a
         toAny f
     | EApp (EUnknown "jsToString", [ a ]) ->
-        // two crossings: byte length (the glue caches the encoding), then
-        // encodeInto the scratch; the $str is built from those bytes
-        let jh = freshLocal f "$jh" "externref"
-        let jp = freshLocal f "$jp" "i32"
         emitNode st f lv a
         toExtern f
-        ls f jh
-        lg f jh
-        callf f "$js_strLen"
-        callf f "$jsensure"
-        ls f jp
-        lg f jp
-        lg f jh
-        lg f jp
-        callf f "$js_strWrite"
-        callf f "$jsunstage"
+        jsStrBack st f
     | EApp (EUnknown "jsCallback", [ clo ]) ->
         emitNode st f lv clo
         callf f "$js_mkFn"
@@ -3094,6 +3097,25 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
         let fn = (dictTryFind st.FnOf (v.Path, v.Offset)).Value
         (match dictTryFind st.Externs (v.Path, v.Offset) with
+         | Some (pks, rk) when rk.StartsWith "$jsx:" ->
+             // the typed "jsx" ABI: each kind converts at the boundary
+             for k, a in List.zip pks args do
+                 if k = "u" then emitNode st f lv a; dropU f
+                 elif k = "s" then jsStrE st f lv a
+                 else
+                     emitNode st f lv a
+                     (match k with
+                      | "e" -> toExtern f
+                      | "d" -> callf f "$tof"
+                      | _ -> callf f "$toi")
+             callf f fn
+             (match rk.Substring 5 with
+              | "u" -> pushUnit f
+              | "e" -> toAny f
+              | "d" -> callf f "$off"
+              | "s" -> jsStrBack st f
+              | "b" -> refI31 f
+              | _ -> callf f "$ofi")
          | Some (pks, rk) ->
              // FFI boundary: ints cross as raw i32, references pass opaque
              for k, a in List.zip pks args do
@@ -4298,6 +4320,11 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // the JS boundary imports — ONLY when the program touches Js.* (every
     // declared import must be satisfied at instantiation, so an unused set
     // would break plain wasmtime programs)
+    let jsExterns = dictNew<string * int, bool> ()
+    for d in decls do
+        match d with
+        | DExport (v, "$jsimport") -> dictSet jsExterns (v.Path, v.Offset) true
+        | _ -> ()
     let jsUsed =
         let mutable found = false
         let rec scanJs (e : Expr) : unit =
@@ -4311,7 +4338,9 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             match d with
             | DLet (_, _, _, e) -> scanJs e
             | _ -> ()
-        found
+        // a typed [<JsImport>] extern with string params rides the same
+        // builtin string machinery, so the "js" import set comes along
+        found || not (List.isEmpty (dictPairs jsExterns))
     if jsUsed then jsImports m
     // FFI imports — these occupy function indices BEFORE every declared
     // function, so they must all be registered here, right after the frame
@@ -4328,6 +4357,36 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
         | r -> [], abiKind r
     for d in decls do
         match d with
+        | DExtern (v, sch) when (dictTryFind jsExterns (v.Path, v.Offset)).IsSome ->
+            // [<JsImport>]: one DEDICATED import from module "jsx" with a
+            // typed ABI — the mode that measured FASTER than hand-written
+            // JS on DOM building. The app supplies { jsx: { name: fn } }.
+            let jsKind (t : Fpp.Analysis.Types.Type) : string =
+                match Fpp.Analysis.Types.prune t with
+                | Fpp.Analysis.Types.TCon ("JsObj", []) -> "e"
+                | Fpp.Analysis.Types.TCon (("float" | "float32"), []) -> "d"
+                | Fpp.Analysis.Types.TCon ("string", []) -> "s"
+                | Fpp.Analysis.Types.TCon ("bool", []) -> "b"
+                | Fpp.Analysis.Types.TCon ("unit", []) -> "u"
+                | _ -> "i"
+            let rec peel (t : Fpp.Analysis.Types.Type) : string list * string =
+                match Fpp.Analysis.Types.prune t with
+                | Fpp.Analysis.Types.TFun (a, b) ->
+                    let ps, r = peel b
+                    jsKind a :: ps, r
+                | r -> [], jsKind r
+            let pks, rk = peel sch.Body
+            let vt k = match k with
+                       | "e" | "s" -> "externref"
+                       | "d" -> "f64"
+                       | _ -> "i32"
+            let fn = mangle v
+            importFn m "jsx" v.Name fn
+                (pks |> List.filter (fun k -> k <> "u") |> List.map vt)
+                (if rk = "u" then [] else [ vt rk ])
+            dictSet st.FnOf (v.Path, v.Offset) fn
+            dictSet st.ArityOf (v.Path, v.Offset) (List.length pks)
+            dictSet st.Externs (v.Path, v.Offset) (pks, "$jsx:" + rk)
         | DExtern (v, sch) ->
             let pks, rk = abiSig sch.Body
             let fn = mangle v
@@ -4590,6 +4649,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     let exports =
         decls |> List.choose (fun d ->
             match d with
+            | DExport (_, "$jsimport") -> None
             | DExport (v, n) ->
                 (match dictTryFind st.FnOf (v.Path, v.Offset), dictTryFind st.ArityOf (v.Path, v.Offset) with
                  | Some fn, Some 1 ->
