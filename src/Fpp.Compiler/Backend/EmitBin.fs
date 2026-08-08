@@ -140,6 +140,15 @@ let tyArray (m : Mod) (name : string) (elem : string) : unit =
     emitFieldT m m.TypeBody (fld true elem)
     tyAdd m name
 
+/// (type $name (sub (array (mut ty)))) — an OPEN subtype: same shape as a
+/// final array but a DISTINCT type, so ref.test can tell them apart
+let tyArrayOpen (m : Mod) (name : string) (elem : string) : unit =
+    emitByte m.TypeBody 0x50
+    emitU32 m.TypeBody 0
+    emitArrayHead m.TypeBody
+    emitFieldT m m.TypeBody (fld true elem)
+    tyAdd m name
+
 /// (type $name (array funcref)) — immutable funcref array (vtables)
 let tyArrayFuncref (m : Mod) (name : string) : unit =
     emitArrayHead m.TypeBody
@@ -973,64 +982,39 @@ let rtCore (m : Mod) : unit =
     endB f
     lg f "$s"
     endFn f
-    // $prints — CHUNKED through linear memory: one fd_write per 32KB, not
-    // one per byte (printing the 1.4MB self-compile answer was over a
-    // million host calls)
+    // $prints — UTF-16 units ENCODED to UTF-8 through linear memory,
+    // flushed by fd_write when the 32KB staging window fills (printing the
+    // 1.4MB self-compile answer must not be a host call per character)
     let f = beginFn m [ "$s" ]
     local f "$i" "i32"
     local f "$n" "i32"
-    local f "$chunk" "i32"
-    local f "$j" "i32"
+    local f "$u" "i32"
+    local f "$u2" "i32"
+    local f "$o" "i32"
     localsDone f
     lg f "$s"
     gci f "array.len"
     ls f "$n"
+    ic f 1024
+    ls f "$o"
     blockE f "$done"
     loopE f "$go"
     lg f "$i"
     lg f "$n"
     ins f "i32.ge_u"
     brIf f "$done"
-    lg f "$n"
-    lg f "$i"
-    ins f "i32.sub"
-    ls f "$chunk"
-    lg f "$chunk"
-    ic f 32768
-    ins f "i32.gt_u"
-    ifE f
-    ic f 32768
-    ls f "$chunk"
-    endB f
-    ic f 0
-    ls f "$j"
-    blockE f "$cd"
-    loopE f "$cg"
-    lg f "$j"
-    lg f "$chunk"
+    // window nearly full (4-byte headroom): flush and rewind
+    lg f "$o"
+    ic f 33700
     ins f "i32.ge_u"
-    brIf f "$cd"
-    ic f 1024
-    lg f "$j"
-    ins f "i32.add"
-    lg f "$s"
-    lg f "$i"
-    lg f "$j"
-    ins f "i32.add"
-    gcT f "array.get_u" "$str"
-    mem f "i32.store8"
-    lg f "$j"
-    ic f 1
-    ins f "i32.add"
-    ls f "$j"
-    br f "$cg"
-    endB f
-    endB f
+    ifE f
     ic f 8
     ic f 1024
     mem f "i32.store"
     ic f 12
-    lg f "$chunk"
+    lg f "$o"
+    ic f 1024
+    ins f "i32.sub"
     mem f "i32.store"
     ic f 1
     ic f 8
@@ -1038,12 +1022,201 @@ let rtCore (m : Mod) : unit =
     ic f 16
     callf f "$fd_write"
     ins f "drop"
+    ic f 1024
+    ls f "$o"
+    endB f
+    lg f "$s"
     lg f "$i"
-    lg f "$chunk"
+    gcT f "array.get_u" "$str"
+    ls f "$u"
+    lg f "$i"
+    ic f 1
     ins f "i32.add"
     ls f "$i"
+    // ASCII fast path
+    lg f "$u"
+    ic f 128
+    ins f "i32.lt_u"
+    ifE f
+    lg f "$o"
+    lg f "$u"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 1
+    ins f "i32.add"
+    ls f "$o"
     br f "$go"
     endB f
+    // two bytes: 0080..07FF
+    lg f "$u"
+    ic f 2048
+    ins f "i32.lt_u"
+    ifE f
+    lg f "$o"
+    lg f "$u"
+    ic f 6
+    ins f "i32.shr_u"
+    ic f 192
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 1
+    ins f "i32.add"
+    lg f "$u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 2
+    ins f "i32.add"
+    ls f "$o"
+    br f "$go"
+    endB f
+    // a HIGH surrogate with its partner: one 4-byte code point
+    lg f "$u"
+    ic f 0xF800
+    ins f "i32.and"
+    ic f 0xD800
+    ins f "i32.eq"
+    ifE f
+    lg f "$u"
+    ic f 0xDC00
+    ins f "i32.lt_u"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.lt_u"
+    ins f "i32.and"
+    ifE f
+    lg f "$s"
+    lg f "$i"
+    gcT f "array.get_u" "$str"
+    ls f "$u2"
+    lg f "$u2"
+    ic f 0xFC00
+    ins f "i32.and"
+    ic f 0xDC00
+    ins f "i32.eq"
+    ifE f
+    // cp = 0x10000 + ((u - D800) << 10) + (u2 - DC00)
+    lg f "$u"
+    ic f 0xD800
+    ins f "i32.sub"
+    ic f 10
+    ins f "i32.shl"
+    lg f "$u2"
+    ic f 0xDC00
+    ins f "i32.sub"
+    ins f "i32.add"
+    ic f 0x10000
+    ins f "i32.add"
+    ls f "$u"
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    lg f "$o"
+    lg f "$u"
+    ic f 18
+    ins f "i32.shr_u"
+    ic f 240
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 1
+    ins f "i32.add"
+    lg f "$u"
+    ic f 12
+    ins f "i32.shr_u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 2
+    ins f "i32.add"
+    lg f "$u"
+    ic f 6
+    ins f "i32.shr_u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 3
+    ins f "i32.add"
+    lg f "$u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 4
+    ins f "i32.add"
+    ls f "$o"
+    br f "$go"
+    endB f
+    endB f
+    endB f
+    // three bytes: everything else (lone surrogates encode as themselves,
+    // which is what .NET's WTF-8-ish lenient encoders do on output)
+    lg f "$o"
+    lg f "$u"
+    ic f 12
+    ins f "i32.shr_u"
+    ic f 224
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 1
+    ins f "i32.add"
+    lg f "$u"
+    ic f 6
+    ins f "i32.shr_u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 2
+    ins f "i32.add"
+    lg f "$u"
+    ic f 63
+    ins f "i32.and"
+    ic f 128
+    ins f "i32.or"
+    mem f "i32.store8"
+    lg f "$o"
+    ic f 3
+    ins f "i32.add"
+    ls f "$o"
+    br f "$go"
+    endB f
+    endB f
+    // final flush of whatever accumulated
+    lg f "$o"
+    ic f 1024
+    ins f "i32.gt_u"
+    ifE f
+    ic f 8
+    ic f 1024
+    mem f "i32.store"
+    ic f 12
+    lg f "$o"
+    ic f 1024
+    ins f "i32.sub"
+    mem f "i32.store"
+    ic f 1
+    ic f 8
+    ic f 1
+    ic f 16
+    callf f "$fd_write"
+    ins f "drop"
     endB f
     endFn f
 
@@ -1086,7 +1259,13 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyStruct m "$clo" [ fld false "i32"; fld false "anyref" ]
     tyStruct m "$cell" [ fld true "anyref" ]
     tyStruct m "$cons" [ fld true "anyref"; fld true "anyref" ]
-    tyArray m "$str" "i8"
+    // UTF-16: a string is .NET's string — s.[i] and Length mean CODE UNITS,
+    // cback's fpp_str_units is already uint16_t*, and the shipped js-string
+    // builtins read i16 arrays. Output (fd_write) encodes to UTF-8.
+    // $str stays the CANONICAL final (array (mut i16)) — the js-string
+    // builtins accept nothing else — and the i16 SCALAR arrays below are
+    // the open subtypes instead, so `:? string` still tells them apart.
+    tyArray m "$str" "i16"
     tyStruct m "$boxf" [ fld false "f64" ]
     tyStruct m "$boxi" [ fld true "i32" ]
     tyArray m "$arr" "anyref"
@@ -1094,7 +1273,7 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyArray m "$parr_f" "f64"
     tyArray m "$parr_s" "f32"
     tyArray m "$parr_l" "i64"
-    tyArray m "$parr_h" "i16"
+    tyArrayOpen m "$parr_h" "i16"
     tyStruct m "$iter" [ fld false "i32"; fld true "anyref"; fld true "anyref"; fld true "i32" ]
     // The POD backing store, one per ALIGNMENT. A struct's size is always a
     // multiple of its alignment, so an element is a whole number of these
@@ -1103,7 +1282,7 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     // storage is therefore `anyref`: every use site knows the struct, and so
     // knows which of these to cast to.
     tyArray m "$pb" "i8"
-    tyArray m "$ph" "i16"
+    tyArrayOpen m "$ph" "i16"
     tyArray m "$pk" "i32"
     tyArray m "$pl" "i64"
     tyArray m "$pf32" "f32"
@@ -2435,17 +2614,7 @@ let rtCore6 (m : Mod) : unit =
     ifE f
     lg f "$s"
     lg f "$p"
-    ic f 226
-    callf f "$sput"
-    ls f "$p"
-    lg f "$s"
-    lg f "$p"
-    ic f 136
-    callf f "$sput"
-    ls f "$p"
-    lg f "$s"
-    lg f "$p"
-    ic f 158
+    ic f 0x221E
     callf f "$sput"
     ls f "$p"
     lg f "$s"
@@ -5049,13 +5218,16 @@ let jsImports (m : Mod) : unit =
     imp "toNum"    [ "externref" ] [ "f64" ]
     imp "toBool"   [ "externref" ] [ "i32" ]
     imp "mkFn"     [ "anyref" ] [ "externref" ]
-    // string crossings STAGE through scratch linear memory. The engine
-    // text-codec builtins (wasm:text-decoder/-encoder) would make these
-    // near-free, but Chrome accepts the names without absorbing the
-    // imports yet (probed 2026-08-08) — revisit when V8 ships them.
-    imp "strNew"   [ "i32"; "i32" ] [ "externref" ]
-    imp "strLen"   [ "externref" ] [ "i32" ]
-    imp "strWrite" [ "externref"; "i32" ] [ "i32" ]
+    // string crossings are the ENGINE'S js-string builtins over the i16
+    // $str — inlined by V8 (instantiate with builtins: ['js-string']); the
+    // UTF-8 text-codec builtins were probed unshipped 2026-08-08, but the
+    // UTF-16 ones are exactly what a .NET string wants anyway
+    importFn m "wasm:js-string" "fromCharCodeArray" "$js_fromCCA"
+        [ "$str"; "i32"; "i32" ] [ "(ref extern)" ]
+    importFn m "wasm:js-string" "intoCharCodeArray" "$js_intoCCA"
+        [ "externref"; "$str"; "i32" ] [ "i32" ]
+    importFn m "wasm:js-string" "length" "$js_strlen"
+        [ "externref" ] [ "i32" ]
     imp "viewU8"   [ "i32"; "i32" ] [ "externref" ]
     imp "viewU16"  [ "i32"; "i32" ] [ "externref" ]
     imp "viewI32"  [ "i32"; "i32" ] [ "externref" ]
@@ -5063,107 +5235,13 @@ let jsImports (m : Mod) : unit =
     imp "viewF64"  [ "i32"; "i32" ] [ "externref" ]
 
 let rtTypesJs (m : Mod) : unit =
-    tyFunc m "$rt_a2ii" [ "anyref" ] [ "i32"; "i32" ]
-    tyFunc m "$rt_ii2a" [ "i32"; "i32" ] [ "anyref" ]
-    tyFunc m "$rt_i2i" [ "i32" ] [ "i32" ]
     tyFunc m "$rt_ae2v" [ "anyref"; "externref" ] []
 
 let rtDeclsJs (m : Mod) : unit =
-    globalI32Mut m "$jsscr" 0
-    globalI32Mut m "$jsscrCap" 0
-    declFn m "$jsensure" "$rt_i2i"
-    declFn m "$jsstage" "$rt_a2ii"
-    declFn m "$jsunstage" "$rt_ii2a"
     declFn m "$jscall" "$rt_ae2v"
+    declFn m "$printraw" "$rt_s2v"
 
 let rtCoreJs (m : Mod) : unit =
-    // $jsensure(n) -> scratch ptr with capacity >= n (bump-allocated, REUSED
-    // across calls: at most one staged string is live at a time)
-    let f = beginFn m [ "$n" ]
-    localsDone f
-    lg f "$n"
-    gg f "$jsscrCap"
-    ins f "i32.gt_u"
-    ifE f
-    lg f "$n"
-    callf f "$balloc"
-    gs f "$jsscr"
-    lg f "$n"
-    gs f "$jsscrCap"
-    endB f
-    gg f "$jsscr"
-    endFn f
-    // $jsstage(str) -> (ptr, len): the string's UTF-8 bytes in scratch
-    let f = beginFn m [ "$s" ]
-    local f "$i" "i32"
-    local f "$n" "i32"
-    local f "$p" "i32"
-    localsDone f
-    lg f "$s"
-    gcT f "ref.cast" "$str"
-    ls f "$s"
-    lg f "$s"
-    gcT f "ref.cast" "$str"
-    gci f "array.len"
-    ls f "$n"
-    lg f "$n"
-    callf f "$jsensure"
-    ls f "$p"
-    blockE f "$done"
-    loopE f "$go"
-    lg f "$i"
-    lg f "$n"
-    ins f "i32.ge_u"
-    brIf f "$done"
-    lg f "$p"
-    lg f "$i"
-    ins f "i32.add"
-    lg f "$s"
-    gcT f "ref.cast" "$str"
-    lg f "$i"
-    gcT f "array.get_u" "$str"
-    mem f "i32.store8"
-    lg f "$i"
-    ic f 1
-    ins f "i32.add"
-    ls f "$i"
-    br f "$go"
-    endB f
-    endB f
-    lg f "$p"
-    lg f "$n"
-    endFn f
-    // $jsunstage(ptr, len) -> $str from scratch bytes
-    let f = beginFn m [ "$p"; "$n" ]
-    local f "$i" "i32"
-    local f "$r" "anyref"
-    localsDone f
-    lg f "$n"
-    gcT f "array.new_default" "$str"
-    ls f "$r"
-    blockE f "$done"
-    loopE f "$go"
-    lg f "$i"
-    lg f "$n"
-    ins f "i32.ge_u"
-    brIf f "$done"
-    lg f "$r"
-    gcT f "ref.cast" "$str"
-    lg f "$i"
-    lg f "$p"
-    lg f "$i"
-    ins f "i32.add"
-    mem f "i32.load8_u"
-    gcT f "array.set" "$str"
-    lg f "$i"
-    ic f 1
-    ins f "i32.add"
-    ls f "$i"
-    br f "$go"
-    endB f
-    endB f
-    lg f "$r"
-    endFn f
     // $jscall(closure, arg) — the callback bridge: JS glue wraps a closure
     // as `(...a) => exports.jscall(clo, a[0])`
     let f = beginFn m [ "$c"; "$e" ]
@@ -5173,6 +5251,79 @@ let rtCoreJs (m : Mod) : unit =
     toAny f
     callf f "$applyc"
     ins f "drop"
+    endFn f
+    // $printraw — each UNIT becomes ONE byte (the Latin-1 inverse): the
+    // binary channel the self-host pipeline prints its .wasm through. Text
+    // wants $prints' UTF-8; bytes-as-a-string wants exactly this.
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$chunk" "i32"
+    local f "$j" "i32"
+    localsDone f
+    lg f "$s"
+    gci f "array.len"
+    ls f "$n"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$n"
+    lg f "$i"
+    ins f "i32.sub"
+    ls f "$chunk"
+    lg f "$chunk"
+    ic f 32768
+    ins f "i32.gt_u"
+    ifE f
+    ic f 32768
+    ls f "$chunk"
+    endB f
+    ic f 0
+    ls f "$j"
+    blockE f "$cd"
+    loopE f "$cg"
+    lg f "$j"
+    lg f "$chunk"
+    ins f "i32.ge_u"
+    brIf f "$cd"
+    ic f 1024
+    lg f "$j"
+    ins f "i32.add"
+    lg f "$s"
+    lg f "$i"
+    lg f "$j"
+    ins f "i32.add"
+    gcT f "array.get_u" "$str"
+    mem f "i32.store8"
+    lg f "$j"
+    ic f 1
+    ins f "i32.add"
+    ls f "$j"
+    br f "$cg"
+    endB f
+    endB f
+    ic f 8
+    ic f 1024
+    mem f "i32.store"
+    ic f 12
+    lg f "$chunk"
+    mem f "i32.store"
+    ic f 1
+    ic f 8
+    ic f 1
+    ic f 16
+    callf f "$fd_write"
+    ins f "drop"
+    lg f "$i"
+    lg f "$chunk"
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
     endFn f
 
 /// (this comment anchors the end of the runtime slices)

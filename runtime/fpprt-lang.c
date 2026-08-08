@@ -113,6 +113,15 @@ int fpp_str_cmp(V a, V b) {
   return la < lb ? -1 : la > lb ? 1 : 0;
 }
 
+V fpp_str_c16(const char *b, size_t units) {
+  V s = fpprt_alloc_array(FPP_TID_STR, units);
+  uint16_t *u = fpp_str_units(s);
+  for (size_t i = 0; i < units; i++)
+    u[i] = (uint16_t)((unsigned char)b[2 * i]
+                      | ((unsigned char)b[2 * i + 1] << 8));
+  return s;
+}
+
 void fpp_prints(V s) {
   uint16_t *u = fpp_str_units(s);
   size_t n = fpp_str_len(s);

@@ -32,8 +32,10 @@ let go =
     // numbers, typed accessors (one crossing each way)
     Js.setNum btn "tabIndex" 7.0
     print (int (Js.getNum btn "tabIndex"))
-    // strings: out and back
+    // strings: out and back — INCLUDING non-ASCII through the builtins
     print (Js.getStr btn "id")
+    Js.set btn "title" (Js.ofString "caf\u00e9 \u20ac")
+    print (Js.getStr btn "title")
     // a callback with CAPTURED state
     let onClick = Js.callback (fun _e -> clicks <- clicks + 1)
     Js.call2 btn "addEventListener" (Js.ofString "click") onClick |> ignore

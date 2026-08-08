@@ -40,5 +40,5 @@ let bytes = fst result
 let errs = snd result
 
 let report =
-    if List.isEmpty errs then print (bytesString bytes)
+    if List.isEmpty errs then printRaw (bytesString bytes)
     else print ("ERRORS " + string (List.length errs) + " " + String.concat " | " errs)

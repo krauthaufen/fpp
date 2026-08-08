@@ -1378,6 +1378,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             && bv.Name.StartsWith "js"
                             && System.Char.IsUpper (charAt bv.Name 2) ->
                           EApp (EUnknown bv.Name, jargs)
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ ra ] when bv.Name = "printRaw" && bv.Path = "(builtin)" ->
+                          // the BYTE channel: units out as single bytes
+                          EApp (EUnknown "printraw", [ ra ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ss; sst; sln ] when bv.Name = "strsub" && bv.Path = "(builtin)" ->
                           // the string slice: a primitive, not an FFI import
                           EApp (EUnknown "strsub", [ ss; sst; sln ])

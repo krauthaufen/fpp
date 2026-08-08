@@ -151,8 +151,8 @@ let private internStr (st : St) (bytes : byte[]) : string * int =
         dataSeg st.M name bytes
         // hoisted: one (ref $str) global per distinct literal
         globalStrLit st.M ("$sl:" + name)
-        dictSet st.StrSegs key (name, bytes.Length)
-        name, bytes.Length
+        dictSet st.StrSegs key (name, bytes.Length / 2)
+        name, bytes.Length / 2
 
 // unescape for string literals — the full three-spelling logic, ported from
 // the retired text emitter: triple-quoted is literal, verbatim folds `""`,
@@ -195,25 +195,31 @@ let private escapeAt (s : string) (i : int) : int * int =
     | c -> int c, 2
 
 let unescape (raw : string) : byte[] =
+    // UTF-16 UNITS, serialized little-endian for the data segment (the
+    // array.new_data COUNT is in ELEMENTS — internStr halves the length).
+    // Each source char IS one unit (charAt walks the lexer's UTF-16 string,
+    // surrogate pairs arrive as two chars and stay two units); `\u` names
+    // one unit, `\U` beyond the BMP becomes a surrogate pair, and
+    // `\xHH`/`\DDD` name one unit under 256.
     let raw = if strLen raw > 1 && charAt raw (strLen raw - 1) = 'B' then substr raw 0 (strLen raw - 1) else raw
     let isTriple =
         strLen raw >= 6 && charAt raw 0 = '"' && charAt raw 1 = '"' && charAt raw 2 = '"'
     let isVerbatim = strLen raw >= 3 && charAt raw 0 = '@'
-    let out = vecNew<byte> ()
+    let units = vecNew<int> ()
     if isTriple then
         // no escape processing at all: the text IS the value
         let inner = substr raw 3 (strLen raw - 6)
-        for k in 0 .. strLen inner - 1 do vecAdd out (byte (charAt inner k))
+        for k in 0 .. strLen inner - 1 do vecAdd units (int (charAt inner k))
     elif isVerbatim then
         // `""` is the only escape a verbatim string has
         let inner = substr raw 2 (strLen raw - 3)
         let mutable i = 0
         while i < strLen inner do
             if charAt inner i = '"' && i + 1 < strLen inner && charAt inner (i + 1) = '"' then
-                vecAdd out (byte 34)
+                vecAdd units 34
                 i <- i + 2
             else
-                vecAdd out (byte (charAt inner i))
+                vecAdd units (int (charAt inner i))
                 i <- i + 1
     else
         let inner = if strLen raw >= 2 then substr raw 1 (strLen raw - 2) else raw
@@ -222,22 +228,20 @@ let unescape (raw : string) : byte[] =
             let c = charAt inner i
             if c = '\\' && i + 1 < strLen inner then
                 let code, width = escapeAt inner i
-                // above ASCII a `\u` escape is UTF-8 (a string IS bytes);
-                // `\DDD`/`\xHH` name ONE byte, kept under 256 by escapeAt
-                if code < 128 then vecAdd out (byte code)
-                elif width > 2 && (charAt inner (i + 1) = 'u' || charAt inner (i + 1) = 'U') then
-                    if code < 2048 then
-                        vecAdd out (byte (192 ||| (code / 64)))
-                        vecAdd out (byte (128 ||| (code % 64)))
-                    else
-                        vecAdd out (byte (224 ||| (code / 4096)))
-                        vecAdd out (byte (128 ||| ((code / 64) % 64)))
-                        vecAdd out (byte (128 ||| (code % 64)))
-                else vecAdd out (byte (code % 256))
+                if code > 0xFFFF then
+                    // beyond the BMP: the pair, exactly as .NET stores it
+                    let v = code - 0x10000
+                    vecAdd units (0xD800 ||| (v / 1024))
+                    vecAdd units (0xDC00 ||| (v % 1024))
+                else vecAdd units code
                 i <- i + width
             else
-                vecAdd out (byte c)
+                vecAdd units (int c)
                 i <- i + 1
+    let out = vecNew<byte> ()
+    for u in vecToList units do
+        vecAdd out (byte (u % 256))
+        vecAdd out (byte ((u / 256) % 256))
     vecToArray out
 
 /// a char literal is ONE code point; reading it out of the unescaped BYTES
@@ -1223,28 +1227,38 @@ and private jsKeyE (st : St) (f : Fn) (lv : Dict<string * int, string>) (k : Exp
         gg f g
     | _ -> jsStrE st f lv k
 
-/// an F++ string expression as a JS string (externref) — staged through
-/// scratch, decoded by the glue's TextDecoder
+/// an F++ string expression as a JS string (externref) — ONE call to the
+/// engine's fromCharCodeArray builtin over the i16 $str, nothing staged
 and private jsStrE (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
+    let a = freshLocal f "$jsa" "$str"
     emitNode st f lv e
-    callf f "$jsstage"
-    callf f "$js_strNew"
+    gcT f "ref.cast" "$str"
+    ls f a
+    lg f a
+    ic f 0
+    lg f a
+    gci f "array.len"
+    callf f "$js_fromCCA"
 
-/// a JS string (externref, ON THE STACK) back to an F++ $str — the glue
-/// encodes into scratch, $jsunstage rebuilds the array
+/// a JS string (externref, ON THE STACK) back to an F++ $str — length,
+/// allocate, intoCharCodeArray; all engine builtins
 and private jsStrBack (st : St) (f : Fn) : unit =
     let jh = freshLocal f "$jh" "externref"
-    let jp = freshLocal f "$jp" "i32"
+    let jn = freshLocal f "$jn" "i32"
+    let ja = freshLocal f "$ja" "$str"
     ls f jh
     lg f jh
-    callf f "$js_strLen"
-    callf f "$jsensure"
-    ls f jp
-    lg f jp
+    callf f "$js_strlen"
+    ls f jn
+    lg f jn
+    gcT f "array.new_default" "$str"
+    ls f ja
     lg f jh
-    lg f jp
-    callf f "$js_strWrite"
-    callf f "$jsunstage"
+    lg f ja
+    ic f 0
+    callf f "$js_intoCCA"
+    ins f "drop"
+    lg f ja
 
 and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : Expr) : unit =
     match e with
@@ -2626,6 +2640,11 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         gcT f "ref.cast" "$str"
         callf f "$prints"
+        pushUnit f
+    | EApp (EUnknown "printraw", [ a ]) ->
+        emitNode st f lv a
+        gcT f "ref.cast" "$str"
+        callf f "$printraw"
         pushUnit f
     | EPrim ("+", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
         // both sides statically int: skip $addv's runtime dispatch — and on

@@ -841,9 +841,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         d
     | ELit (LString s) ->
         let d = slot f
+        // unescape yields UTF-16LE bytes; the units go in RAW
         let bs = Fpp.Backend.BinDriver.unescape s
         let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
-        stmt f (sref d + " = fpp_str_c(" + cstr txt + ", " + string bs.Length + ");")
+        stmt f (sref d + " = fpp_str_c16(" + cstr txt + ", " + string (bs.Length / 2) + ");")
         d
     | EVar (v, _) | EVarI (v, _, _) ->
         (match dictTryFind f.Locals (v.Path, v.Offset) with
@@ -2423,7 +2424,7 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
         let lit = slot f
         let bs = Fpp.Backend.BinDriver.unescape s
         let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
-        stmt f (sref lit + " = fpp_str_c(" + cstr txt + ", " + string bs.Length + ");")
+        stmt f (sref lit + " = fpp_str_c16(" + cstr txt + ", " + string (bs.Length / 2) + ");")
         stmt f ("if (!fpp_eqv(" + sref sv + ", " + sref lit + ")) " + sref ok + " = TAGI(0);")
     | PLit (LFloat s) ->
         let t0 = if s.EndsWith "f" then s.Substring (0, strLen s - 1) else s

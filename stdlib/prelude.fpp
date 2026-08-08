@@ -889,6 +889,9 @@ let ignore (_ : 'a) : unit = ()
 // at runtime, so both of these lower to their argument. `obj` is the top
 // type the subtyping check already knows.
 extern let box : 'a -> obj
+/// write a string's UNITS as single BYTES (the Latin-1 inverse) — the
+/// binary output channel; `print` encodes text as UTF-8 instead
+extern let printRaw : string -> unit
 /// A half's 16 BITS, as an int. The runtime representation of float16 IS
 /// that bit pattern, so this is the identity — it exists to give source a
 /// way to name the pattern rather than the number.

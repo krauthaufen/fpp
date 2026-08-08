@@ -13,10 +13,7 @@
 //   exports._start();
 
 export const jsImports = (getExports) => {
-  const dec = new TextDecoder();
-  const enc = new TextEncoder();
   const mem = () => getExports().memory.buffer;
-  let pending = null; // bytes measured by strLen, written by the next strWrite
   return { js: {
     // keys arrive as JS STRINGS — literals are interned wasm-side, made
     // once through strNew; nothing decodes per call
@@ -44,14 +41,6 @@ export const jsImports = (getExports) => {
     // an F++ closure as a JS function: calls back through the exported
     // bridge; captured state lives in the closure, the GCs keep it alive
     mkFn: (clo) => (...a) => getExports().jscall(clo, a.length ? a[0] : undefined),
-    strNew: (p, n) => dec.decode(new Uint8Array(mem(), p, n)),
-    strLen: (s) => { pending = enc.encode(String(s)); return pending.length; },
-    strWrite: (s, p) => {
-      const b = pending !== null ? pending : enc.encode(String(s));
-      pending = null;
-      new Uint8Array(mem(), p, b.length).set(b);
-      return b.length;
-    },
     // ZERO-COPY: views over the module's own memory at a pinned address.
     // Fresh per call — memory.grow would detach a cached one.
     viewU8:  (p, n) => new Uint8Array(mem(), p, n),
@@ -70,7 +59,7 @@ export const instantiate = async (url, { jsx = {}, sink = null } = {}) => {
   const { instance } = await WebAssembly.instantiateStreaming(
     fetch(url),
     { ...jsImports(() => exports), ...wasiImports(() => exports, sink), jsx },
-    { builtins: ['text-decoder', 'text-encoder'] });
+    { builtins: ['js-string'] });
   exports = instance.exports;
   return exports;
 };

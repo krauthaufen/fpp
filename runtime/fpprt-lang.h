@@ -108,6 +108,9 @@ static inline size_t fpp_str_len(V s) { return fpprt_array_len(s); }
 
 V fpp_str_utf8(const char *bytes, size_t len);   /* decode UTF-8 -> UTF-16 */
 #define fpp_str_c fpp_str_utf8
+/* raw UTF-16LE units — the compiler's literal ctor: exact .NET semantics,
+ * lone surrogates and all (fpp_str_c decodes UTF-8 instead) */
+V fpp_str_c16(const char *b, size_t units);
 
 V fpp_str_concat(V a, V b);
 V fpp_str_method(const char *m, V recv, V *args, size_t nargs);

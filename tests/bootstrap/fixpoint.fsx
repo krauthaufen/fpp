@@ -96,11 +96,13 @@ let generateHost (files : (string * string) list) : string =
     let sb = System.Text.StringBuilder()
     let app (s : string) = sb.Append(s).Append('\n') |> ignore
     app "(module"
-    app "  (type $str (array (mut i8)))"
+    app "  (type $str (array (mut i16)))"
     files |> List.iteri (fun i (p, c) ->
-        app (sprintf "  (data $p%d \"%s\")" i (escape (System.Text.Encoding.UTF8.GetBytes p)))
-        app (sprintf "  (data $c%d \"%s\")" i (escape (System.Text.Encoding.Latin1.GetBytes c))))
-    app (sprintf "  (data $prelude \"%s\")" (escape (System.Text.Encoding.Latin1.GetBytes preludeText)))
+        // UTF-16LE: the program's $str is an i16 array now, and the host
+        // module shares it STRUCTURALLY — the data must be units
+        app (sprintf "  (data $p%d \"%s\")" i (escape (System.Text.Encoding.Unicode.GetBytes p)))
+        app (sprintf "  (data $c%d \"%s\")" i (escape (System.Text.Encoding.Unicode.GetBytes c))))
+    app (sprintf "  (data $prelude \"%s\")" (escape (System.Text.Encoding.Unicode.GetBytes preludeText)))
     app "  (func $eq (param $a (ref $str)) (param $b (ref $str)) (result i32)"
     app "    (local $i i32)"
     app "    (if (i32.ne (array.len (local.get $a)) (array.len (local.get $b))) (then (return (i32.const 0))))"
@@ -117,7 +119,7 @@ let generateHost (files : (string * string) list) : string =
     app "    (if (i32.eqz (ref.test (ref $str) (local.get $p))) (then (return (i32.const -1))))"
     app "    (local.set $s (ref.cast (ref $str) (local.get $p)))"
     files |> List.iteri (fun i (p, _) ->
-        let n = System.Text.Encoding.UTF8.GetByteCount p
+        let n = p.Length
         app (sprintf "    (if (call $eq (ref.cast (ref $str) (local.get $s)) (array.new_data $str $p%d (i32.const 0) (i32.const %d)))" i n)
         app (sprintf "      (then (return (i32.const %d))))" i))
     app "    (i32.const -1))"
@@ -125,7 +127,7 @@ let generateHost (files : (string * string) list) : string =
     app "    (local $k i32)"
     app "    (local.set $k (call $which (local.get $p)))"
     files |> List.iteri (fun i (_, c) ->
-        let n = System.Text.Encoding.Latin1.GetByteCount c
+        let n = c.Length
         app (sprintf "    (if (i32.eq (local.get $k) (i32.const %d))" i)
         app (sprintf "      (then (return (array.new_data $str $c%d (i32.const 0) (i32.const %d)))))" i n))
     app "    (ref.null any))"
@@ -138,7 +140,7 @@ let generateHost (files : (string * string) list) : string =
     // comparable rather than merely similar
     app "  (func (export \"preludeSourceRaw\") (param $p anyref) (result anyref)"
     app (sprintf "    (array.new_data $str $prelude (i32.const 0) (i32.const %d)))"
-                 (System.Text.Encoding.Latin1.GetByteCount preludeText))
+                 preludeText.Length)
     app ")"
     sb.ToString ()
 

@@ -331,8 +331,9 @@ let binaryWriter =
             declFn m "$main" "$main_t"
             exportFn m "_start" "$main"
             globalVt m "$duEq" [ "$eq_du_default"; "$eq_du_default" ]
-            dataSeg m "$dA" [| byte 104; byte 105 |]  // "hi"
-            dataSeg m "$dB" [| byte 104; byte 105 |]  // "hi" again
+            // UTF-16LE units: $str is an i16 array
+            dataSeg m "$dA" [| byte 104; byte 0; byte 105; byte 0 |]  // "hi"
+            dataSeg m "$dB" [| byte 104; byte 0; byte 105; byte 0 |]  // "hi" again
             rtCore m
             rtCore2 m
             rtCore3 m [ 2 ] true
