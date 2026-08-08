@@ -4815,6 +4815,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | GNode w when w.NodeKind = WhenDecl -> constraintOf vars w
                         | _ -> None))
         let typeCons = declaredTypeCons @ inlineTypeCons
+        // an ENUM (every case an `= literal`) is a bare integer at run
+        // time: Unmanaged, derived like a fieldless struct
+        (let cases2 = nodesOf n |> List.filter (fun m -> m.NodeKind = UnionCase)
+         if not (List.isEmpty cases2)
+            && cases2 |> List.forall (fun m ->
+                   tokensOf m |> List.exists (fun t -> t.Kind = Operator && t.Text = "=")) then
+             vecAdd unmanagedCands (name, [], []))
         // union cases become constructor schemes
         for m in nodesOf n do
             match m.NodeKind with

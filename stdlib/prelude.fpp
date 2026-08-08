@@ -2695,6 +2695,8 @@ module List =
 // terms of Array.init, Array.length and List.init, and a module only sees
 // what precedes it.
 module String =
+    extern let pin : string -> int
+    extern let unpin : string -> int
     extern let strsub : string -> int -> int -> string
     /// `sub s start count` — the slice, copied. A primitive because building
     /// it out of concatenation is quadratic, and the lexer lives on it.
@@ -2834,6 +2836,13 @@ module String =
             for c in toArray s do
                 if not (c = ' ' || c = '\t' || c = '\n' || c = '\r') then ws <- false
             ws
+
+/// a string pins like a byte array: the address is the UTF-8 payload
+instance Pinnable<string>
+    member s.Pin = String.pin s
+    member s.Unpin =
+        String.unpin s |> ignore
+
 module Seq =
     let map (f : 'a -> 'b) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with

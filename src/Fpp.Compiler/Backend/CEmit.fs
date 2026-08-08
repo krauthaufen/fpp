@@ -755,6 +755,11 @@ let private podCellOf (st : CSt) (fld : Expr) : (string * string) option =
 
 let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     let trap (what : string) : int =
+        // an UNRESOLVED field or member compiled to a runtime trap is the
+        // silent-forward-reference bug: say so at BUILD time, the way the
+        // wasm-GC emitter's "stubbed" warnings do
+        if what.StartsWith "field" then
+            eprintfn "warn: cback compiles a trap for %s — unresolved; is its declaration ABOVE this use?" what
         let d = slot f
         stmt f (sref d + " = fpp_not_emitted(" + cstr what + ");")
         d

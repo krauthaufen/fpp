@@ -16,7 +16,7 @@ gcc -O1 -g -I"$rt" -I"$rt/gc/api" -DNDEBUG -DGC_PRECISE_ROOTS=1 \
     "$out/p.c" "$here/pinnable-native.c" "$rt/fpprt.c" "$rt/fpprt-lang.c" \
     "$rt/build/mmc/libwhippet.a" -lm -lpthread -o "$out/p"
 "$out/p" > "$out/got.txt"
-printf '10\nok\n' > "$out/want.txt"
+printf '10\n72\nok\n' > "$out/want.txt"
 diff -u "$out/want.txt" "$out/got.txt"
 # the SEALS: ref elements refuse to pin, instances refuse to be written
 printf 'let a = [| "x" |]\nlet go =\n    use p = fixed a\n    print p\n' > "$out/bad1.fpp"
