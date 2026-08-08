@@ -2,9 +2,9 @@ module PinTest
 [<Struct>]
 type V2 = { X : float; Y : float }
 
-extern let c_sum2 : int -> int -> float
-extern let c_first : int -> int
-extern let c_bump : int -> unit
+extern let c_sum2 : nativeint -> int -> float
+extern let c_first : nativeint -> int
+extern let c_bump : nativeint -> unit
 
 let go =
     let a = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 } |]
@@ -15,8 +15,8 @@ let go =
     let s = "Hi"
     use ps = fixed s
     print (c_first ps)
-    // `fixed &target`: stack structs bounce with copy-back, array
-    // elements pin with LIVE aliasing
+    // `fixed &target`: pointer-wide addresses — a stack struct is
+    // addressed DIRECTLY (no bounce), array elements pin in place
     let mutable v = { X = 1.0; Y = 2.0 }
     (use bp = fixed &v
      c_bump bp)

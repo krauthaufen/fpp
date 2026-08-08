@@ -93,7 +93,7 @@ instance Worker<Geometry>
 let theWorker : Geometry = create ()
 let selfHandle : WorkerHandle<Geometry> = WorkerHandle 0
 [<Export>]
-let dispatch (p : int) : int = Worker.serve selfHandle theWorker p
+let dispatch (p : nativeint) : nativeint = Worker.serve selfHandle theWorker p
 
 // the host side
 let h : WorkerHandle<Geometry> = WorkerHandle 1
@@ -109,7 +109,7 @@ let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 }; { X = 10.0; Y = 20.0 } 
 /// address. The points are a POD struct array, so the command carries their
 /// image rather than a per-element encoding.
 [<Export>]
-let makeSum (n : int) : int =
+let makeSum (n : int) : nativeint =
     let pts : V2d[] = Array.zeroCreate n
     let mutable i = 0
     while i < n do
@@ -119,7 +119,7 @@ let makeSum (n : int) : int =
 
 /// Host: build a `Scale` command over `n` points.
 [<Export>]
-let makeScale (n : int) : int =
+let makeScale (n : int) : nativeint =
     let pts : V2d[] = Array.zeroCreate n
     let mutable i = 0
     while i < n do
@@ -129,16 +129,16 @@ let makeScale (n : int) : int =
 
 /// How many bytes at that address belong to the message.
 [<Export>]
-let msgLength (p : int) : int = Worker.messageLength p
+let msgLength (p : nativeint) : int = Worker.messageLength p
 
 /// Room for an incoming message.
 [<Export>]
-let reserve (n : int) : int = Memory.alloc n
+let reserve (n : int) : nativeint = Memory.alloc n
 
 /// Host: read a reply and report it as an integer a test can check —
 /// x + y for a total, and the scaled count times the last x for an array.
 [<Export>]
-let readAnswer (p : int) : int =
+let readAnswer (p : nativeint) : int =
     let a : Answer = Worker.decodeReply h p
     match a with
     | Total v -> int (v.X + v.Y)

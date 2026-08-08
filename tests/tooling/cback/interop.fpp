@@ -18,10 +18,10 @@ type Ray = { O : V2d; D : V2d }
 // the C side: sizes checked against sizeof there; sums/mutations through
 // pinned pointers prove the bytes are the wire format
 extern let c_check_sizes : int -> int -> int -> int -> int -> int
-extern let c_sum_v2d : int -> int -> float
-extern let c_scale_v2d : int -> int -> float -> unit
-extern let c_sum_i32 : int -> int -> int
-extern let c_ray_len : int -> float
+extern let c_sum_v2d : nativeint -> int -> float
+extern let c_scale_v2d : nativeint -> int -> float -> unit
+extern let c_sum_i32 : nativeint -> int -> int
+extern let c_ray_len : nativeint -> float
 
 let go =
     // strides, F++ side (byteSize / count = C stride)

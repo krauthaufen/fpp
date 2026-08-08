@@ -1656,15 +1656,13 @@ static void fpp_mem_init_(void) {
   if (m == MAP_FAILED) abort();
   fpp_mem_ = (char *)m;
 #endif
-  if ((uintptr_t)fpp_mem_ + fpp_mem_cap_ > 0x7fffffffu) {
-    fprintf(stderr, "fpp: Memory arena outside the 32-bit address range\n");
-    abort();
-  }
+  /* addresses are pointer-wide nativeints now — any placement works; the
+   * MAP_32BIT attempt above just keeps them small where the OS obliges */
 }
 
 char *fpp_mem_base(void) { return NULL; }
 
-int32_t fpp_mem_alloc(int32_t n) {
+intptr_t fpp_mem_alloc(int32_t n) {
   fpp_mem_init_();
   size_t off = (fpp_mem_top_ + 7) & ~(size_t)7;
   if (off + (size_t)n > fpp_mem_cap_) {
@@ -1672,14 +1670,13 @@ int32_t fpp_mem_alloc(int32_t n) {
     abort();
   }
   fpp_mem_top_ = off + (size_t)n;
-  return (int32_t)(uintptr_t)(fpp_mem_ + off);
+  return (intptr_t)(fpp_mem_ + off);
 }
 
 int32_t fpp_mem_size(void) { fpp_mem_init_(); return (int32_t)fpp_mem_cap_; }
 
-void fpp_mem_copy(int32_t dst, int32_t src, int32_t n) {
-  memmove((char *)(uintptr_t)(uint32_t)dst, (char *)(uintptr_t)(uint32_t)src,
-          (size_t)n);
+void fpp_mem_copy(intptr_t dst, intptr_t src, int32_t n) {
+  memmove((char *)dst, (char *)src, (size_t)n);
 }
 
 int32_t fpp_arr_bytesize(V a) {
@@ -1701,18 +1698,13 @@ int32_t fpp_arr_bytesize(V a) {
  * pinned array stays reachable through the program's own references;
  * foreign writes are visible through the array IMMEDIATELY, .NET `fixed`
  * semantics. Unpin is a no-op: mmc pins are for the object's lifetime. */
-int32_t fpp_arr_pin(V a) {
+intptr_t fpp_arr_pin(V a) {
   if (!fpprt_can_pin()) {
     fprintf(stderr, "fpp: Array.pin needs the pinning collector (mmc)\n");
     abort();
   }
   fpprt_pin(a);
-  uintptr_t addr = (uintptr_t)fpprt_elems(a);
-  if (addr > 0x7fffffffu) {
-    fprintf(stderr, "fpp: pinned address outside the 32-bit range\n");
-    abort();
-  }
-  return (int32_t)addr;
+  return (intptr_t)fpprt_elems(a);
 }
 
 void fpp_arr_unpin(V a) { (void)a; }

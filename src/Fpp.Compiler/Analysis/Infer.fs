@@ -2492,7 +2492,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let tt = exprType (GNode tgt)
                               addWanted off { Class = "Unmanaged"; Args = [ tt ]; Assoc = [] }
                           | _ -> ())
-                         tInt
+                         TCon ("nativeint", [])
                      else
                      let xt = exprType (GNode x)
                      let pTy = st.Fresh ()
@@ -2511,7 +2511,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match head.NodeKind, args with
                       | IdentExpr, [ onlyArg ] when
                             (match tokensOf head |> List.tryHead with
-                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
+                             | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
                            | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
@@ -2611,6 +2611,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (TCon ("int64", []))
+                              // the ADDRESS integer: pointer-wide, rides the
+                              // tagged rail (64-bit tags carry full width; the
+                              // 32-bit spill boxes cover the rest)
+                              | Some t when t.Text = "nativeint" && (dictTryFind useDefs t.Offset).IsNone ->
+                                  exprType (GNode onlyArg) |> ignore
+                                  Some (TCon ("nativeint", []))
                               | Some t when (t.Text = "int" || t.Text = "uint32" || t.Text = "int16" || t.Text = "uint16")
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
@@ -6081,6 +6087,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | TCon ("int64", []) -> "l"
         | TCon ("uint32", []) -> "w"
         | TCon ("uint64", []) -> "v"
+        | TCon ("nativeint", []) -> "p"
         | TCon ("string", []) -> "t"
         // conversions and print need these; operator suffixes filter them
         | TCon ("bool", []) -> "b"

@@ -917,7 +917,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | None -> "?"
                 let zeroFor (tn : string) : Expr =
                     match tn with
-                    | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" | "uint32" -> ELit (LInt "0")
+                    | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" | "uint32" | "nativeint" -> ELit (LInt "0")
                     | "int64" | "uint64" -> ELit (LInt "0L")
                     | "float" | "float32" | "float16" -> ELit (LFloat "0.0")
                     | _ -> ELit LNull
@@ -988,7 +988,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte" ]
+                          List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | _ -> false) ->
@@ -1381,7 +1381,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           if core <> "" && List.contains core (vecToList structNames) then
                               let zeroOf (t : Fpp.Analysis.Types.Type) : Expr =
                                   match Fpp.Analysis.Types.prune t with
-                                  | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool"), _) -> ELit (LInt "0")
+                                  | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool" | "nativeint"), _) -> ELit (LInt "0")
                                   | Fpp.Analysis.Types.TCon (("int64" | "uint64"), _) -> ELit (LInt "0L")
                                   | Fpp.Analysis.Types.TCon ("float", _) -> ELit (LFloat "0.0")
                                   | Fpp.Analysis.Types.TCon (("float32" | "float16"), _) -> ELit (LFloat "0.0f")
@@ -2700,7 +2700,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // a null here lands in slots the instantiation unboxes
                  | Some sym when sym.StartsWith "#" -> EUnknown ("$zero:" + sym)
                  | Some "int" | Some "bool" | Some "char" | Some "uint32"
-                 | Some "int16" | Some "uint16" -> ELit (LInt "0")
+                 | Some "int16" | Some "uint16" | Some "nativeint" -> ELit (LInt "0")
                  | Some "uint64" -> ELit (LInt "0L")
                  | Some "int64" -> ELit (LInt "0L")
                  | Some "float" -> ELit (LFloat "0.0")
@@ -2713,7 +2713,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let sn = tn.Substring 8
                      let zeroOf (t : Fpp.Analysis.Types.Type) : Expr =
                          match Fpp.Analysis.Types.prune t with
-                         | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool"), _) -> ELit (LInt "0")
+                         | Fpp.Analysis.Types.TCon (("int" | "int16" | "uint16" | "uint32" | "byte" | "sbyte" | "char" | "bool" | "nativeint"), _) -> ELit (LInt "0")
                          | Fpp.Analysis.Types.TCon (("int64" | "uint64"), _) -> ELit (LInt "0L")
                          | Fpp.Analysis.Types.TCon ("float", _) -> ELit (LFloat "0.0")
                          | Fpp.Analysis.Types.TCon (("float32" | "float16"), _) -> ELit (LFloat "0.0f")
@@ -3811,7 +3811,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some cp, Some tyDef when List.isEmpty newCtorNodes ->
                  let zeroFor (tn : string) : Expr =
                      match tn with
-                     | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" -> ELit (LInt "0")
+                     | "int" | "int16" | "uint16" | "byte" | "sbyte" | "char" | "bool" | "nativeint" -> ELit (LInt "0")
                      | "uint32" -> ELit (LInt "0")
                      | "int64" | "uint64" -> ELit (LInt "0L")
                      | "float" | "float32" | "float16" -> ELit (LFloat "0.0")

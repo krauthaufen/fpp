@@ -468,9 +468,9 @@ intptr_t fpp_pod_hash(V v);
  * growable arena, addresses are int OFFSETS into it. `fpp_mem_base()` is
  * exported so foreign C code can turn an offset into a pointer. */
 char *fpp_mem_base(void);
-int32_t fpp_mem_alloc(int32_t n);
+intptr_t fpp_mem_alloc(int32_t n);
 int32_t fpp_mem_size(void);
-void fpp_mem_copy(int32_t dst, int32_t src, int32_t n);
+void fpp_mem_copy(intptr_t dst, intptr_t src, int32_t n);
 int32_t fpp_arr_bytesize(V a);
-int32_t fpp_arr_pin(V a);       /* copy INTO the arena, remember */
-void fpp_arr_unpin(V a);        /* copy BACK, forget */
+intptr_t fpp_arr_pin(V a);      /* pin IN PLACE, hand out the address */
+void fpp_arr_unpin(V a);        /* release the pin */

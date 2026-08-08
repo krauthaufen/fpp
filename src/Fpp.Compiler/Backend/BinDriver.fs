@@ -581,7 +581,9 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
     | EPrim (op, _) when
         op.Length > 1 && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
         let k = op.Substring (op.Length - 1)
-        if k = "f" || k = "s" || k = "l" then k else "u"
+        if k = "f" || k = "s" || k = "l" then k
+        elif k = "p" then "i"
+        else "u"
     | EPrim (("-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"), _) -> "i"
     | EPrim ("u-f", _) -> "f"
     | EPrim ("u-s", _) -> "s"
@@ -1272,7 +1274,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             match tn with
             | "byte" | "sbyte" | "bool" -> 1
             | "char" | "int16" | "uint16" | "float16" -> 2
-            | "int" | "uint32" | "float32" -> 4
+            // the oracle's pointers ARE linear-memory offsets: 4 bytes
+            | "int" | "uint32" | "float32" | "nativeint" | "unativeint" -> 4
             | "int64" | "uint64" | "float" -> 8
             | _ ->
                 match dictTryFind st.Pod tn with
@@ -2261,9 +2264,15 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$cmpv"
         callf f "$ofi"
     | EApp (EUnknown n, [ a ]) when n.Contains "#" && not (n.StartsWith "pad") ->
-        // conversions whose source kind inference resolved: target#srckind
-        let target = n.Substring (0, n.IndexOf "#")
-        let src = n.Substring (n.IndexOf "#" + 1)
+        // conversions whose source kind inference resolved: target#srckind.
+        // nativeint IS int here — the oracle's addresses are i32 offsets —
+        // so both the target and the source kind collapse onto the int rail
+        let target =
+            let t = n.Substring (0, n.IndexOf "#")
+            if t = "nativeint" then "int" else t
+        let src =
+            let k = n.Substring (n.IndexOf "#" + 1)
+            if k = "p" then "" else k
         let emitA () = emitNode st f lv a
         let strA () = emitA (); gcT f "ref.cast" "$str"
         let mask8 () = ic f 255; ins f "i32.and"
@@ -2586,7 +2595,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
              refI31 f)
     | EPrim (op, [ a; b ]) when
         op.Length > 1
-        && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l" || op.EndsWith "i")
+        && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l" || op.EndsWith "i"
+            || op.EndsWith "p")
         && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let baseOp = op.Substring (0, op.Length - 1)
         let kind = op.Substring (op.Length - 1)
@@ -2595,7 +2605,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             | "f" -> "$tof", "$off", "f64", true
             | "s" -> "$tos", "$oss", "f32", true
             | "l" -> "$tol", "$ofl", "i64", false
-            | _ -> "$toi", "$ofi", "i32", false
+            | _ -> "$toi", "$ofi", "i32", false    // "i" and "p" share the rail
         if baseOp = "%" && flt then
             err st "binary: float remainder unsupported"
             refNull f "any"
@@ -2664,6 +2674,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                | "&&&" -> "i64.and" | "|||" -> "i64.or" | "^^^" -> "i64.xor"
                | "<<<" -> "i64.shl" | _ -> "i64.shr_u")
         if cmp then refI31 f else callf f "$ofl"
+    | EPrim (op, [ a; b ]) when
+        op.Length > 1 && op.EndsWith "p"
+        && List.contains (op.Substring (0, op.Length - 1))
+            [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>"; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
+        // nativeint bit ops: the i32 rail, like the ints they are here
+        emitNode st f lv (EPrim (op.Substring (0, op.Length - 1), [ a; b ]))
     | EPrim (op, [ a; b ]) when
         op.Length > 1 && op.EndsWith "l"
         && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^"; "<<<"; ">>>" ] ->
@@ -2744,6 +2760,8 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$tos"
         ins f "f32.neg"
         callf f "$oss"
+    | EPrim ("u-p", [ a ]) -> emitNode st f lv (EPrim ("u-", [ a ]))
+    | EPrim ("u~~~p", [ a ]) -> emitNode st f lv (EPrim ("u~~~", [ a ]))
     | EPrim ("u-l", [ a ]) ->
         lc f 0L
         emitNode st f lv a

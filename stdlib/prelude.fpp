@@ -193,6 +193,31 @@ instance MinMax<uint64>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
 
+// ---- nativeint: the ADDRESS integer — pointer-wide, on the tagged rail.
+// `Array.pin`, `String.pin`, `fixed` and `Memory` all speak it. HOMOGENEOUS
+// like F#: an int offset converts at the call (`p + nativeint n`) — a mixed
+// Add<nativeint, int> instance would make constraint improvement ambiguous
+// for every generic `+` whose right operand is int.
+instance Add<nativeint, nativeint>
+    type Result = nativeint
+instance Sub<nativeint, nativeint>
+    type Result = nativeint
+instance Mul<nativeint, nativeint>
+    type Result = nativeint
+instance Div<nativeint, nativeint>
+    type Result = nativeint
+instance Rem<nativeint, nativeint>
+    type Result = nativeint
+instance Num<nativeint>
+    static Zero = nativeint 0
+    static One = nativeint 1
+instance Integral<nativeint>
+instance Ordered<nativeint>
+instance Neg<nativeint>
+instance MinMax<nativeint>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
+
 // ---- int16 and uint16: int-SHAPED, so the operators are the integer ones
 // and only the WIDTH (and, for int16, the sign extension) differs
 instance Add<int16, int16>
@@ -1254,39 +1279,39 @@ let snd (t : 'a * 'b) : 'b = match t with (_, b) -> b
 // a `memory.copy` rather than a walk over its elements: the bytes are
 // already the wire format.
 module Memory =
-    extern let memAlloc : int -> int
+    extern let memAlloc : int -> nativeint
     extern let memSize : unit -> int
-    extern let memCopy : int -> int -> int -> unit
-    extern let memLoadByte : int -> int
-    extern let memStoreByte : int -> int -> unit
-    extern let memLoadInt : int -> int
-    extern let memStoreInt : int -> int -> unit
-    extern let memLoadInt64 : int -> int64
-    extern let memStoreInt64 : int -> int64 -> unit
-    extern let memLoadFloat : int -> float
-    extern let memStoreFloat : int -> float -> unit
+    extern let memCopy : nativeint -> nativeint -> int -> unit
+    extern let memLoadByte : nativeint -> int
+    extern let memStoreByte : nativeint -> int -> unit
+    extern let memLoadInt : nativeint -> int
+    extern let memStoreInt : nativeint -> int -> unit
+    extern let memLoadInt64 : nativeint -> int64
+    extern let memStoreInt64 : nativeint -> int64 -> unit
+    extern let memLoadFloat : nativeint -> float
+    extern let memStoreFloat : nativeint -> float -> unit
     /// Bump-allocate `n` bytes, 8-aligned. This heap is never freed: it holds
     /// pinned arrays and message buffers, both of which outlive the call that
     /// made them and are handed to foreign code by address.
-    let alloc (n : int) : int = memAlloc n
+    let alloc (n : int) : nativeint = memAlloc n
     /// Total linear memory, in bytes.
     let size () : int = memSize ()
     /// `copy dst src n` — one wasm memory.copy instruction.
-    let copy (dst : int) (src : int) (n : int) : unit = memCopy dst src n
-    let loadByte (p : int) : int = memLoadByte p
-    let storeByte (p : int) (v : int) : unit = memStoreByte p v
-    let loadInt (p : int) : int = memLoadInt p
-    let storeInt (p : int) (v : int) : unit = memStoreInt p v
-    let loadInt64 (p : int) : int64 = memLoadInt64 p
-    let storeInt64 (p : int) (v : int64) : unit = memStoreInt64 p v
-    let loadFloat (p : int) : float = memLoadFloat p
-    let storeFloat (p : int) (v : float) : unit = memStoreFloat p v
+    let copy (dst : nativeint) (src : nativeint) (n : int) : unit = memCopy dst src n
+    let loadByte (p : nativeint) : int = memLoadByte p
+    let storeByte (p : nativeint) (v : int) : unit = memStoreByte p v
+    let loadInt (p : nativeint) : int = memLoadInt p
+    let storeInt (p : nativeint) (v : int) : unit = memStoreInt p v
+    let loadInt64 (p : nativeint) : int64 = memLoadInt64 p
+    let storeInt64 (p : nativeint) (v : int64) : unit = memStoreInt64 p v
+    let loadFloat (p : nativeint) : float = memLoadFloat p
+    let storeFloat (p : nativeint) (v : float) : unit = memStoreFloat p v
 
 // ---- String: the F# String module ----
 module Array =
     extern let create : int -> 'a -> 'a[]
     extern let zeroCreate : int -> 'a[]
-    extern let pin : 'a[] -> int
+    extern let pin : 'a[] -> nativeint
     extern let unpin : 'a[] -> int
     /// The bytes a pinned POD struct array occupies — what a blit has to
     /// move. Not `Length * sizeof`: an element is padded out to whole words,
@@ -2014,7 +2039,7 @@ module Array =
 /// array instance demands unmanaged elements, so a ref-holding array
 /// cannot be handed to C at all.
 class Pinnable<'p>
-    member 'p.Pin : int
+    member 'p.Pin : nativeint
     member 'p.Unpin : unit
 
 instance Pinnable<'t[]> when Unmanaged<'t>
@@ -2695,7 +2720,7 @@ module List =
 // terms of Array.init, Array.length and List.init, and a module only sees
 // what precedes it.
 module String =
-    extern let pin : string -> int
+    extern let pin : string -> nativeint
     extern let unpin : string -> int
     extern let strsub : string -> int -> int -> string
     /// `sub s start count` — the slice, copied. A primitive because building
@@ -4781,7 +4806,7 @@ type Buffer(initial : int) =
     let mutable ptr = Memory.alloc (if initial < 16 then 16 else initial)
     let mutable pos = 0
     /// where the bytes are — hand this to foreign code
-    member x.Pointer = ptr
+    member x.Pointer : nativeint = ptr
     /// how many bytes have been written
     member x.Length = pos
     member x.Reset () : unit = pos <- 0
@@ -4798,52 +4823,52 @@ type Buffer(initial : int) =
             cap <- nc
     member x.WriteByte (v : int) : unit =
         x.Reserve 1
-        Memory.storeByte (ptr + pos) v
+        Memory.storeByte (ptr + nativeint pos) v
         pos <- pos + 1
     member x.WriteInt (v : int) : unit =
         x.Reserve 4
-        Memory.storeInt (ptr + pos) v
+        Memory.storeInt (ptr + nativeint pos) v
         pos <- pos + 4
     member x.WriteInt64 (v : int64) : unit =
         x.Reserve 8
-        Memory.storeInt64 (ptr + pos) v
+        Memory.storeInt64 (ptr + nativeint pos) v
         pos <- pos + 8
     member x.WriteFloat (v : float) : unit =
         x.Reserve 8
-        Memory.storeFloat (ptr + pos) v
+        Memory.storeFloat (ptr + nativeint pos) v
         pos <- pos + 8
     /// THE BLIT: `n` bytes straight from `src`, one memory.copy instruction,
     /// whatever they mean.
-    member x.WriteBlock (src : int) (n : int) : unit =
+    member x.WriteBlock (src : nativeint) (n : int) : unit =
         x.Reserve n
-        Memory.copy (ptr + pos) src n
+        Memory.copy (ptr + nativeint pos) src n
         pos <- pos + n
 
-type Reader(start : int) =
+type Reader(start : nativeint) =
     let mutable p = start
     member x.Position = p
-    member x.Skip (n : int) : unit = p <- p + n
+    member x.Skip (n : int) : unit = p <- p + nativeint n
     member x.ReadByte () : int =
         let v = Memory.loadByte p
-        p <- p + 1
+        p <- p + nativeint 1
         v
     member x.ReadInt () : int =
         let v = Memory.loadInt p
-        p <- p + 4
+        p <- p + nativeint 4
         v
     member x.ReadInt64 () : int64 =
         let v = Memory.loadInt64 p
-        p <- p + 8
+        p <- p + nativeint 8
         v
     member x.ReadFloat () : float =
         let v = Memory.loadFloat p
-        p <- p + 8
+        p <- p + nativeint 8
         v
     /// the address of the next `n` bytes, consumed WITHOUT copying them —
     /// the read side of `WriteBlock`
-    member x.Block (n : int) : int =
+    member x.Block (n : int) : nativeint =
         let a = p
-        p <- p + n
+        p <- p + nativeint n
         a
 
 [<AutoOpen>]
@@ -5038,7 +5063,7 @@ module Serialize =
         write b v
         b
     /// Read one value back from an address.
-    let ofPointer (p : int) : 'a = read (Reader p)
+    let ofPointer (p : nativeint) : 'a = read (Reader p)
 
 // ---- Worker: a typed message loop on the far side of a channel ----
 // The channel itself is bytes — a worker has its own heap and cannot be
@@ -5087,18 +5112,18 @@ module Worker =
         b
 
     /// Host side: the reply that came back at `p`.
-    let decodeReply (h : WorkerHandle<'w>) (p : int) : 'r
+    let decodeReply (h : WorkerHandle<'w>) (p : nativeint) : 'r
         when Worker<'w> with Reply = 'r =
-        readReply h (Reader (p + 4))
+        readReply h (Reader (p + nativeint 4))
 
     /// WORKER side: the whole loop for one message. Decode the command at
     /// `p`, run it, encode the reply, and answer with its address. Export a
     /// one-line wrapper around this and the worker is done:
     ///
     ///     [<Export>]
-    ///     let dispatch (p : int) : int = Worker.serve theWorker p
-    let serve (self : WorkerHandle<'w>) (w : 'w) (p : int) : int when Worker<'w> =
-        let cmd = readCommand self (Reader (p + 4))
+    ///     let dispatch (p : nativeint) : nativeint = Worker.serve theWorker p
+    let serve (self : WorkerHandle<'w>) (w : 'w) (p : nativeint) : nativeint when Worker<'w> =
+        let cmd = readCommand self (Reader (p + nativeint 4))
         let reply = handle w cmd
         let b = Buffer 64
         b.WriteInt 0
@@ -5107,7 +5132,7 @@ module Worker =
         b.Pointer
 
     /// How many bytes the message at `p` occupies, header included.
-    let messageLength (p : int) : int = Memory.loadInt p + 4
+    let messageLength (p : nativeint) : int = Memory.loadInt p + 4
 
 // ==== System.Collections.Generic and System.Text ==========================
 //

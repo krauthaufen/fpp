@@ -143,6 +143,7 @@ let private sref (i : int) : string = "F[" + string i + "]"
 
 let private rawTy (k : char) : string =
     if k = 'l' then "int64_t"
+    elif k = 'p' then "intptr_t"
     elif k = 'v' then "uint64_t"
     elif k = 'w' then "uint32_t"
     elif k = 'f' then "double"
@@ -199,6 +200,7 @@ let private unboxExpr (k : char) (vatom : string) : string =
     if k = 'l' then "fpp_unbox_i64(" + vatom + ")"
     elif k = 'v' then "(uint64_t)fpp_unbox_i64(" + vatom + ")"
     elif k = 'w' then "(uint32_t)UNTAGI(" + vatom + ")"
+    elif k = 'p' then "UNTAGI(" + vatom + ")"
     elif k = 'f' then "fpp_unbox_f64(" + vatom + ")"
     elif k = 's' then "(float)fpp_unbox_f64(" + vatom + ")"
     else "(int32_t)UNTAGI(" + vatom + ")"
@@ -220,7 +222,8 @@ let private opBase (op0 : string) : string * char =
             || head = "^^^" || head = "<<<" || head = ">>>"
         if known && (last = 'i' || last = 'b' || last = 'c' || last = 'f'
                      || last = 'l' || last = 's' || last = 'u' || last = 't'
-                     || last = 'o' || last = 'w' || last = 'v' || last = 'h') then head, last
+                     || last = 'o' || last = 'w' || last = 'v' || last = 'h'
+                     || last = 'p') then head, last
         else op0, '?'
     else op0, '?'
 
@@ -236,7 +239,7 @@ let private mathBase (op0 : string) : string option =
     elif strLen op0 > 1 then
         let c = charAt op0 (strLen op0 - 1)
         if c = 'i' || c = 'f' || c = 'l' || c = 's' || c = 'h'
-           || c = 'w' || c = 'v' || c = 'b' || c = 'c' then
+           || c = 'w' || c = 'v' || c = 'b' || c = 'c' || c = 'p' then
             let b = op0.Substring (0, strLen op0 - 1)
             if mathSet b then Some b else None
         else None
@@ -263,6 +266,7 @@ let private podPrimKind (ty : string) : char option =
     | "int64" -> Some 'l'
     | "uint64" -> Some 'v'
     | "int" | "enum" -> Some 'i'
+    | "nativeint" -> Some 'p'
     | "uint32" -> Some 'w'
     | "int16" -> Some 'm'
     | "uint16" | "char" -> Some 'h'
@@ -275,6 +279,7 @@ let private podCTy (k : char) : string =
     elif k = 's' then "float"
     elif k = 'l' then "int64_t"
     elif k = 'v' then "uint64_t"
+    elif k = 'p' then "intptr_t"
     elif k = 'i' then "int32_t"
     elif k = 'w' then "uint32_t"
     elif k = 'm' then "int16_t"
@@ -284,7 +289,8 @@ let private podCTy (k : char) : string =
 
 /// the RAW-value-layer storage kind for a pod field kind
 let private podRawKind (k : char) : char =
-    if k = 'f' || k = 's' || k = 'l' || k = 'v' || k = 'w' then k else 'i'
+    if k = 'f' || k = 's' || k = 'l' || k = 'v' || k = 'w' || k = 'p' then k
+    else 'i'
 
 /// the pod-struct tid a CONCRETE scheme names, if any
 let private schemePodName (sc : Scheme) : string option =
@@ -304,6 +310,7 @@ let private schemeRawKind (sc : Scheme) : char option =
     | TCon ("uint32", []) -> Some 'w'
     | TCon ("int64", []) -> Some 'l'
     | TCon ("uint64", []) -> Some 'v'
+    | TCon ("nativeint", []) -> Some 'p'
     | TCon ("float", []) -> Some 'f'
     | TCon ("float32", []) -> Some 's'
     | _ -> None
@@ -392,6 +399,7 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
             elif k = 'l' then Some 'l'
             elif k = 'v' then Some 'v'
             elif k = 'w' then Some 'w'
+            elif k = 'p' then Some 'p'
             elif k = 'i' || k = 'b' || k = 'c' then Some 'i'
             else None
         (match op with
@@ -419,6 +427,7 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
              if k = 'l' then Some 'l'
              elif k = 'v' then Some 'v'
              elif k = 'w' then Some 'w'
+             elif k = 'p' then Some 'p'
              elif k = 'i' || k = 'b' then Some 'i'
              elif k = '?' && not (op = "<<<" || op = ">>>") then
                  (match rawKindOf st f a, rawKindOf st f b with
@@ -435,6 +444,7 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
         if k = 'f' then Some 'f'
         elif k = 's' || k = 'h' then Some 's'
         elif k = 'l' || k = 'v' then Some 'l'
+        elif k = 'p' then Some 'p'
         elif k = 'i' || k = 'b' || k = 'c' || k = 'w' then Some 'i'
         elif k = '?' then
             (match rawKindOf st f a with Some 'i' -> Some 'i' | _ -> None)
@@ -485,6 +495,7 @@ let rec private rawKindOf (st : CSt) (f : CFn) (e : Expr) : char option =
     | EApp (EUnknown n, [ _ ]) when n.StartsWith "float" -> Some 'f'
     | EApp (EUnknown n, [ _ ]) when n.StartsWith "int64" || n.StartsWith "uint64" ->
         Some 'l'
+    | EApp (EUnknown n, [ _ ]) when n.StartsWith "nativeint" -> Some 'p'
     | _ -> None
 
 // ---- free variables and captured-mutable discovery ------------------------
@@ -948,10 +959,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("fpp_cell_set(" + sref x + ", " + sref y + ");")
         unitV ()
     | EApp (EUnknown "$fixaddr", [ tgt ]) ->
-        // `fixed &target`: the location's address. Heap containers pin in
-        // place (LIVE aliasing); a stack struct bounces via a pinned heap
-        // blob — copy-back happens in $fixfree. Addresses are int32 (the
-        // heap maps low); C stack addresses do not fit, hence the bounce.
+        // `fixed &target`: the location's address as a nativeint. Addresses
+        // are pointer-wide on the tagged rail (a 64-bit tag carries the full
+        // width; 32-bit targets spill into i64 boxes), so a stack struct is
+        // just ITS OWN address — no pinning, no bounce, C writes land
+        // directly. Heap array elements still pin (the GC moves arrays).
         let podVarOf (rv : VarId) =
             match dictTryFind f.Locals (rv.Path, rv.Offset) with
             | Some i when i < 0 && fst (vecGet f.RawVars (-i - 1)) = 'S' ->
@@ -960,12 +972,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         (match tgt with
          | (EVar (tv, _) | EVarI (tv, _, _)) when (podVarOf tv).IsSome ->
              let nm = (podVarOf tv).Value
-             let tid = (dictTryFind f.PodOfRaw nm).Value
-             let b = slot f
-             stmt f (sref b + " = fpp_pack_" + string tid + "(&" + nm + ");")
-             stmt f ("fpprt_pin(" + sref b + ");")
              let d = slot f
-             stmt f (sref d + " = TAGI((intptr_t)((char *)" + sref b + " + FPP_POD_OFF));")
+             stmt f (sref d + " = TAGI((intptr_t)&" + nm + ");")
              d
          | EIndex (nm2, arr2, ix2) when (dictTryFind st.PodArrTid nm2).IsSome ->
              let tid = (dictTryFind st.PodTid nm2).Value
@@ -992,13 +1000,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             | _ -> None
         (match tgt with
          | (EVar (tv, _) | EVarI (tv, _, _)) when (podVarOf tv).IsSome ->
-             // copy the C-side writes BACK into the stack struct; the
-             // pinned blob is garbage after and collects in place
-             let nm = (podVarOf tv).Value
-             let tid = (dictTryFind f.PodOfRaw nm).Value
-             let x = emitE st f pe
-             stmt f ("fpp_unpack_" + string tid + "((V)((intptr_t)UNTAGI(" + sref x
-                     + ") - FPP_POD_OFF), &" + nm + ");")
+             // a stack struct was addressed directly — nothing to release
+             ignore pe
          | EIndex (_, arr2, _) ->
              let av = emitE st f arr2
              stmt f ("fpp_arr_unpin(" + sref av + ");")
@@ -1057,7 +1060,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         let y = emitE st f b
         let z = emitE st f c
-        stmt f ("fpp_mem_copy((int32_t)UNTAGI(" + sref x + "), (int32_t)UNTAGI("
+        stmt f ("fpp_mem_copy(UNTAGI(" + sref x + "), UNTAGI("
                 + sref y + "), (int32_t)UNTAGI(" + sref z + "));")
         unitV ()
     | EApp (EUnknown "memLoadByte", [ a ]) ->
@@ -1139,7 +1142,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             else "(intptr_t)(uint32_t)"
         stmt f (sref d + " = TAGI(" + mask + "UNTAGI(fpp_to_int(" + sref x + ")));")
         d
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int" ->
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int" || n.StartsWith "nativeint" ->
         let x = emitE st f a
         let d = slot f
         stmt f (sref d + " = fpp_to_int(" + sref x + ");")
@@ -1333,6 +1336,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
             elif k = 'w' then
                 stmt f (sref d + " = TAGI((intptr_t)(uint32_t)((uint32_t)UNTAGI("
                         + sref x + ") " + cop + " (uint32_t)UNTAGI(" + sref y + ")));")
+            elif k = 'p' then
+                // nativeint: pointer-wide, no truncation
+                stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
+                        + " UNTAGI(" + sref y + "));")
             else
                 stmt f (sref d + " = TAGI((intptr_t)(int32_t)((int32_t)UNTAGI(" + sref x + ") " + cop
                         + " (int32_t)UNTAGI(" + sref y + ")));")
@@ -1386,6 +1393,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              elif k = 'w' then
                  stmt f (sref d + " = TAGI((intptr_t)(uint32_t)((uint32_t)UNTAGI("
                          + sref x + ") " + cop + " (uint32_t)UNTAGI(" + sref y + ")));")
+             elif k = 'p' then
+                 stmt f (sref d + " = TAGI(UNTAGI(" + sref x + ") " + cop
+                         + " UNTAGI(" + sref y + "));")
              elif op = ">>>" && k = '?' then
                  // bare shift right on int32 stays ARITHMETIC in .NET
                  stmt f (sref d + " = TAGI((intptr_t)((int32_t)UNTAGI(" + sref x
@@ -1430,6 +1440,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | 'l' -> stmt f (sref d + " = fpp_box_i64(~fpp_unbox_i64(" + sref x + "));")
          | 'v' -> stmt f (sref d + " = fpp_box_i64((int64_t)~(uint64_t)fpp_unbox_i64(" + sref x + "));")
          | 'w' -> stmt f (sref d + " = TAGI((intptr_t)(uint32_t)~(uint32_t)UNTAGI(" + sref x + "));")
+         | 'p' -> stmt f (sref d + " = TAGI(~UNTAGI(" + sref x + "));")
          | _ -> stmt f (sref d + " = TAGI((intptr_t)(int32_t)~(int32_t)UNTAGI(" + sref x + "));"))
         d
     | EPrim (op0, [ a ]) when op0.StartsWith "u-" ->
@@ -1441,7 +1452,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              stmt f (sref d + " = fpp_box_f64(-fpp_unbox_f64(" + sref x + "));")
          | 'l' | 'v' ->
              stmt f (sref d + " = fpp_box_i64(-fpp_unbox_i64(" + sref x + "));")
-         | 'i' | 'b' | 'c' | 'w' ->
+         | 'i' | 'b' | 'c' | 'w' | 'p' ->
              stmt f (sref d + " = TAGI(-UNTAGI(" + sref x + "));")
          | _ ->
              stmt f (sref d + " = fpp_negv(" + sref x + ");"))
@@ -2154,7 +2165,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let zk =
                  match nm with
                  | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
-                 | "uint16" | "uint32" | "enum" -> "1"
+                 | "uint16" | "uint32" | "enum" | "nativeint" -> "1"
                  | "float" | "float32" | "double" | "single" -> "2"
                  | "int64" | "uint64" -> "3"
                  | _ -> "0"
@@ -2231,8 +2242,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f (sref d + " = TAGI((intptr_t)fpp_arr_bytesize(" + sref av + "));")
         d
     | EArrayPin (_, a) ->
-        // the pinned image in the arena IS the C layout; the address is an
-        // arena OFFSET (what the wasm oracle's linear memory means by it)
+        // pin IN PLACE: the address is the element storage itself, handed
+        // out as a pointer-wide nativeint on the tagged rail
         let av = emitE st f a
         let d = slot f
         stmt f (sref d + " = TAGI((intptr_t)fpp_arr_pin(" + sref av + "));")
@@ -2302,7 +2313,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         (match tn with
          | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
-         | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
+         | "uint16" | "uint32" | "nativeint" -> stmt f (sref d + " = TAGI(0);")
          | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
          | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
          | _ ->
@@ -2316,12 +2327,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let tn = n.Substring 8
         let size =
             match tn with
-            | "byte" | "sbyte" | "bool" -> 1
-            | "char" | "int16" | "uint16" | "float16" -> 2
-            | "int" | "uint32" | "float32" -> 4
-            | _ -> 8
+            | "byte" | "sbyte" | "bool" -> "1"
+            | "char" | "int16" | "uint16" | "float16" -> "2"
+            | "int" | "uint32" | "float32" -> "4"
+            | "nativeint" | "unativeint" -> "sizeof(intptr_t)"
+            | _ -> "8"
         let d = slot f
-        stmt f (sref d + " = TAGI(" + string size + ");")
+        stmt f (sref d + " = TAGI(" + size + ");")
         d
     | EUnknown "$zero" ->
         let d = slot f
@@ -2340,7 +2352,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         (match tn with
          | "int" | "bool" | "char" | "byte" | "sbyte" | "int16"
-         | "uint16" | "uint32" -> stmt f (sref d + " = TAGI(0);")
+         | "uint16" | "uint32" | "nativeint" -> stmt f (sref d + " = TAGI(0);")
          | "float" | "float32" | "float16" -> stmt f (sref d + " = fpp_box_f64(0.0);")
          | "int64" | "uint64" -> stmt f (sref d + " = fpp_box_i64(0);")
          | _ ->
@@ -2354,12 +2366,13 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let tn = n.Substring 8
         let size =
             match tn with
-            | "byte" | "sbyte" | "bool" -> 1
-            | "char" | "int16" | "uint16" | "float16" -> 2
-            | "int" | "uint32" | "float32" -> 4
-            | _ -> 8
+            | "byte" | "sbyte" | "bool" -> "1"
+            | "char" | "int16" | "uint16" | "float16" -> "2"
+            | "int" | "uint32" | "float32" -> "4"
+            | "nativeint" | "unativeint" -> "sizeof(intptr_t)"
+            | _ -> "8"
         let d = slot f
-        stmt f (sref d + " = TAGI(" + string size + ");")
+        stmt f (sref d + " = TAGI(" + size + ");")
         d
     | EUnknown n -> trap ("builtin " + n)
     | other ->
@@ -3029,6 +3042,8 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
                 let d = slot f
                 if rk = 'f' || rk = 's' then
                     stmt f (sref d + " = fpp_to_f64(" + a1 + ");")
+                elif rk = 'p' then
+                    stmt f (sref d + " = fpp_to_int(" + a1 + ");")
                 else
                     stmt f (sref d + " = fpp_to_i64(" + a1 + ");")
                 let n = rawNew f rk

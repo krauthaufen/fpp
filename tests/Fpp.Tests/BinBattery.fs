@@ -493,8 +493,8 @@ let binBattery =
               // pinned, the bytes sit at stride 3 with nothing between them
               "    let p = Array.pin c3"
               "    print (Memory.loadByte p)"
-              "    print (Memory.loadByte (p + 3))"
-              "    print (Memory.loadByte (p + 5))"
+              "    print (Memory.loadByte (p + nativeint 3))"
+              "    print (Memory.loadByte (p + nativeint 5))"
               "    print (int c3.[0].G)" ]
             "6\n4\n32\n250\n252\n2.5\n9\n1\n250\n252\n2\n"
 
@@ -588,7 +588,7 @@ let binBattery =
               "let theWorker : Geometry = create ()"
               "let selfHandle : WorkerHandle<Geometry> = WorkerHandle 0"
               "[<Export>]"
-              "let dispatch (p : int) : int = Worker.serve selfHandle theWorker p"
+              "let dispatch (p : nativeint) : nativeint = Worker.serve selfHandle theWorker p"
               "let h : WorkerHandle<Geometry> = WorkerHandle 1"
               "let go ="
               "    let pts = [| { X = 1.0; Y = 2.0 }; { X = 3.0; Y = 4.0 }; { X = 10.0; Y = 20.0 } |]"
@@ -668,18 +668,18 @@ let binBattery =
               "let go ="
               "    let p = Memory.alloc 64"
               "    Memory.storeInt p 42"
-              "    Memory.storeFloat (p + 8) 3.5"
-              "    Memory.storeByte (p + 16) 200"
-              "    Memory.storeInt64 (p + 24) 1234567890123L"
+              "    Memory.storeFloat (p + nativeint 8) 3.5"
+              "    Memory.storeByte (p + nativeint 16) 200"
+              "    Memory.storeInt64 (p + nativeint 24) 1234567890123L"
               "    print (Memory.loadInt p)"
-              "    print (Memory.loadFloat (p + 8))"
-              "    print (Memory.loadByte (p + 16))"
-              "    print (Memory.loadInt64 (p + 24))"
+              "    print (Memory.loadFloat (p + nativeint 8))"
+              "    print (Memory.loadByte (p + nativeint 16))"
+              "    print (Memory.loadInt64 (p + nativeint 24))"
               "    let pts = [| { X = 1.5; Y = 2.25 }; { X = 10.0; Y = 0.5 } |]"
               "    let dst = Memory.alloc 32"
               "    Memory.copy dst (Array.pin pts) 32"
               "    print (Memory.loadFloat dst)"
-              "    print (Memory.loadFloat (dst + 24))" ]
+              "    print (Memory.loadFloat (dst + nativeint 24))" ]
             "42\n3.5\n200\n1234567890123\n1.5\n0.5\n"
 
         // a lambda INSIDE a function's own parameter lambda is a real closure,
