@@ -2013,6 +2013,32 @@ let declarationCheckTests =
                       "let a = print (string (f 5))" ]
             Expect.equal out "11\n" "the promise resolves through the superclass"
         }
+        test "a stub is visible on the workspace, for --strict to refuse" {
+            // the one clean-check shape still standing: a qualified class
+            // member used without its `open` resolves to nothing, the
+            // function is stubbed, and the binary traps if it is reached.
+            // check stays silent by design (resolution skips unresolved
+            // names so the empty-prelude dogfooding gate can demand zero
+            // diagnostics); the emit warnings are what `fpp build
+            // --strict` turns into a refusal
+            let ws = Workspace()
+            ws.SetFileText "a.fpp" (String.concat "\n" [
+                "module A"
+                "class Sized<'a>"
+                "    static size : 'a -> int"
+                "instance Sized<list<'a>>"
+                "    static size xs = 100"
+                "" ])
+            ws.SetFileText "b.fpp" (String.concat "\n" [
+                "module B"
+                "let useB (xs : list<int>) = Sized.size xs"
+                "print (string (useB [ 1 ]))"
+                "" ])
+            let _bytes, errors = ws.EmitProgramWasm ()
+            Expect.isEmpty errors "no hard errors — that is the point"
+            Expect.exists ws.EmitWarnings (fun w -> w.StartsWith "stubbed ")
+                "the stub is on record for --strict"
+        }
         test "an abbreviation applied at the wrong argument count says so" {
             // it used to fall through and invent a type named after the
             // abbreviation; the error then blamed code far away

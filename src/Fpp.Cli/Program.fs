@@ -52,7 +52,7 @@ let private buildLib (out : string) (files : string list) : int =
         System.IO.File.WriteAllText(out, lib)
         0
 
-let private build (out : string) (files : string list) : int =
+let private build (strict : bool) (out : string) (files : string list) : int =
     let ws = Workspace()
     let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
@@ -60,6 +60,19 @@ let private build (out : string) (files : string list) : int =
         ws.AddLibrary l (readSource l)
     for f in srcs do
         ws.SetFileText f (readSource f)
+    // --strict: a stub is a function that TRAPS if reached. Warning and
+    // handing over the binary anyway is right for the porting workflow
+    // (unreached surface stubs are routine there) and wrong for a program
+    // someone intends to ship — this flag draws that line.
+    let failOnStubs (bytes : byte[]) : int =
+        let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
+        if strict && not (List.isEmpty stubs) then
+            for s in stubs do eprintfn "error (strict): %s" s
+            eprintfn "error (strict): %d function(s) would trap if reached" (List.length stubs)
+            1
+        else
+            System.IO.File.WriteAllBytes(out, bytes)
+            0
     // an `-o something.c` selects the C backend (fpprt runtime); anything
     // else is the wasm-GC module
     if out.EndsWith ".c" then
@@ -75,9 +88,7 @@ let private build (out : string) (files : string list) : int =
         if not (List.isEmpty errors) then
             for e in errors do eprintfn "error: %s" e
             1
-        else
-            System.IO.File.WriteAllBytes(out, bytes)
-            0
+        else failOnStubs bytes
 
 // `fpp exe` — a platform executable. The module is compiled to machine code at
 // BUILD time and linked into a launcher that embeds wasmtime, so the result
@@ -187,22 +198,24 @@ let private isProject (f : string) = f.EndsWith Project.extension
 
 [<EntryPoint>]
 let main argv =
-    match List.ofArray argv with
+    let argl0 = List.ofArray argv
+    let strict = argl0 |> List.exists (fun a -> a = "--strict")
+    match argl0 |> List.filter (fun a -> a <> "--strict") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _) -> check files
          | None -> 1)
     | [ "build"; proj ] when isProject proj ->
         (match openProject proj with
-         | Some (files, out) -> build out files
+         | Some (files, out) -> build strict out files
          | None -> 1)
     | [ "build"; proj; "-o"; out ] when isProject proj ->
         (match openProject proj with
-         | Some (files, _) -> build out files
+         | Some (files, _) -> build strict out files
          | None -> 1)
     | "check" :: files when not (List.isEmpty files) -> check files
     | "picks" :: files when not (List.isEmpty files) -> picks files
-    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build out files
+    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict out files
     | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
     | [ "exe"; proj; "-o"; out ] when isProject proj ->
         (match openProject proj with
@@ -212,7 +225,8 @@ let main argv =
     | _ ->
         eprintfn "usage:"
         eprintfn "  fpp check <project.fppproj> | fpp check <file>..."
-        eprintfn "  fpp build <project.fppproj> [-o out.wasm] | fpp build -o out.wasm <file>..."
+        eprintfn "  fpp build [--strict] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
+        eprintfn "      --strict: fail when any function had to be stubbed (would trap if reached)"
         eprintfn "  fpp lib -o out.fppir <file>..."
         eprintfn "  fpp exe -o app <file>... | fpp exe <project.fppproj> -o app"
         2

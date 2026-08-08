@@ -245,6 +245,11 @@ type Workspace() =
     /// record instance selections for the pick checker (set BEFORE the
     /// first check — the project check is memoized)
     let mutable logPicks = false
+    /// the backend warnings of the last emit — a stub here means a
+    /// function that will TRAP if reached; `fpp build --strict` fails on
+    /// them instead of warning, since a clean check that hands over a
+    /// trapping binary was this project's most repeated bug shape
+    let mutable lastWarnings : string list = []
     /// hand-written text, captured before any generator rewrites a file: the
     /// INPUT to generation must stay what the human wrote, or a second compile
     /// would feed a generator its own output
@@ -479,6 +484,9 @@ type Workspace() =
 
     /// Turn on selection recording — call before the first check.
     member this.RecordPicks () : unit = logPicks <- true
+    /// The backend warnings of the last emit (each stub names its function
+    /// and why it could not be compiled).
+    member this.EmitWarnings : string list = lastWarnings
     /// The recorded selections, one line each (see Classes.select).
     member this.InstancePicks : string list =
         vecToList (this.ProjectCheck ()).Classes.PickLog
@@ -920,6 +928,7 @@ type Workspace() =
             let bytes, berrs, warns, positions =
                 Fpp.Backend.BinDriver.emitBinaryWithPositions mapUrl linked
             for w in warns do ewarn ("warn: " + w)
+            lastWarnings <- warns
             lastPositions <- positions
             bytes, berrs
 

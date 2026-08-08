@@ -225,8 +225,14 @@ separate compilation, sane error messages.
   7. A conditional instance's `when` context is discharged *after*
      selection; it never drives it.
   8. Superclass entailment walks a DAG; a cycle is refused, not followed.
-  9. **Open**: anything the backend must stub should be an error at
-     `check` — today three shapes reach `build` as warnings and trap.
+  9. A function the backend cannot compile is STUBBED — it traps if
+     reached. The default build warns and hands the binary over, which
+     is right for porting (unreached stubs are routine there) and wrong
+     for shipping: `fpp build --strict` refuses instead, naming each
+     stub. **Open**: `check` itself stays silent about them, because
+     resolution deliberately skips unresolved names (the empty-prelude
+     dogfooding gate demands zero diagnostics on the compiler's own
+     sources).
 
   If retrofitting types you don't own hurts in practice, Scala-style scoped
   given-imports are the *later, additive* escape hatch — global orphans can
