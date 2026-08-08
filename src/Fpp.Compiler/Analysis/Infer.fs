@@ -1089,12 +1089,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | None -> d.Name
 
     /// every declared variant of a name, for a use that does not write its
-    /// type arguments (a bare constructor call chooses by ARGUMENT fit)
+    /// type arguments (a bare constructor call chooses by ARGUMENT fit).
+    /// The variants are read off the recorded markers, not probed against
+    /// a guessed range — a probe capped at eight silently lost any wider
+    /// declaration.
     let arityVariants (name : string) : string list =
+        let prefix = "$arity:" + name + ":"
         name
-        :: (List.init 9 (fun i -> i)
-            |> List.filter (fun i -> (dictTryFind aliases ("$arity:" + name + ":" + string i)).IsSome)
-            |> List.map (fun i -> name + "`" + string i))
+        :: (dictPairs aliases
+            |> List.filter (fun (k, _) -> k.StartsWith prefix)
+            |> List.map (fun (k, _) -> name + "`" + k.Substring prefix.Length))
 
     /// A constructor's quantified variables, DECLARED parameters first.
     /// `H<'S, 'D>(x : voption<W<'D>>, ...)` writes 'D before 'S in its
@@ -4779,11 +4783,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `HashMap`, and re-registered the alias under it — after which
         // every `HashMap<K, V>` in the project expanded with a HashSet
         // wrapped around its value type.
+        // ONE structure test for the whole declaration: the alias remap
+        // below and the abbreviation registration further down must agree
+        // on what an abbreviation is, and two spellings of the same
+        // predicate is how they would quietly stop agreeing
+        let hasStructure =
+            nodesOf n
+            |> List.exists (fun m ->
+                m.NodeKind = UnionCase || m.NodeKind = RecordRepr
+                || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
         let isAbbreviation =
-            not (nodesOf n
-                 |> List.exists (fun m ->
-                     m.NodeKind = UnionCase || m.NodeKind = RecordRepr
-                     || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl))
+            not hasStructure
             && (nodesOf n |> List.exists (fun m -> isTypeKind m.NodeKind))
         let plain =
             if isAbbreviation then written
@@ -4869,11 +4879,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  | None -> 0
                          t.Text, arity)))
         // type abbreviation: register for same-file expansion
-        let hasStructure =
-            nodesOf n
-            |> List.exists (fun m ->
-                m.NodeKind = UnionCase || m.NodeKind = RecordRepr
-                || m.NodeKind = MemberDecl || m.NodeKind = InterfaceImpl)
         if not hasStructure then
             match nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind) with
             | Some repr ->

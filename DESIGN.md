@@ -228,11 +228,11 @@ separate compilation, sane error messages.
   9. A function the backend cannot compile is STUBBED — it traps if
      reached. The default build warns and hands the binary over, which
      is right for porting (unreached stubs are routine there) and wrong
-     for shipping: `fpp build --strict` refuses instead, naming each
-     stub. **Open**: `check` itself stays silent about them, because
-     resolution deliberately skips unresolved names (the empty-prelude
-     dogfooding gate demands zero diagnostics on the compiler's own
-     sources).
+     for shipping: `fpp check --strict` and `fpp build --strict` refuse
+     instead, naming each stub. The default `check` stays silent about
+     them, because resolution deliberately skips unresolved names (the
+     empty-prelude dogfooding gate demands zero diagnostics on the
+     compiler's own sources).
 
   If retrofitting types you don't own hurts in practice, Scala-style scoped
   given-imports are the *later, additive* escape hatch — global orphans can

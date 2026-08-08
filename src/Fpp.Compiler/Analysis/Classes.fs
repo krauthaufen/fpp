@@ -123,9 +123,35 @@ let addClass (t : Tables) (c : ClassDef) : unit =
     dictSet t.Classes c.Name c
     for m, _ in c.Members do dictSet t.MemberOwner m c.Name
 
+let rec private sameType (a : Type) (b : Type) : bool =
+    match prune a, prune b with
+    | TVar v, TVar w -> v.Id = w.Id
+    | TCon (n1, a1), TCon (n2, a2) ->
+        n1 = n2 && a1.Length = a2.Length && List.forall2 sameType a1 a2
+    | TFun (p1, r1), TFun (p2, r2) -> sameType p1 p2 && sameType r1 r2
+    | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 sameType x y
+    | TApp (h1, a1), TApp (h2, a2) ->
+        a1.Length = a2.Length && sameType h1 h2 && List.forall2 sameType a1 a2
+    | _ -> false
+
 let addInstance (t : Tables) (i : InstanceDef) : unit =
     match dictTryFind t.Instances i.Class with
-    | Some v -> vecAdd v i
+    | Some v ->
+        // the same DECLARATION registered twice (a re-inference, a table
+        // reseed) must not become two candidates: selection excludes the
+        // chosen instance from its own competition by reference, so a
+        // twin of it would read as an equally-specific rival and turn a
+        // clean pick into a phantom ambiguity
+        // same site AND same head: derived instances share a synthetic
+        // site (Unmanaged registers at offset 0), so the site alone would
+        // drop legitimate neighbours
+        let dup =
+            vecToList v
+            |> List.exists (fun j ->
+                j.Path = i.Path && j.Offset = i.Offset
+                && j.Head.Length = i.Head.Length
+                && List.forall2 sameType j.Head i.Head)
+        if not dup then vecAdd v i
     | None ->
         let v = vecNew<InstanceDef> ()
         vecAdd v i
@@ -190,16 +216,6 @@ let wrapperMember (i : InstanceDef) (index : int) (memberName : string) : InstMe
 
 // ---- matching -------------------------------------------------------------
 
-let rec private sameType (a : Type) (b : Type) : bool =
-    match prune a, prune b with
-    | TVar v, TVar w -> v.Id = w.Id
-    | TCon (n1, a1), TCon (n2, a2) ->
-        n1 = n2 && a1.Length = a2.Length && List.forall2 sameType a1 a2
-    | TFun (p1, r1), TFun (p2, r2) -> sameType p1 p2 && sameType r1 r2
-    | TTuple x, TTuple y -> x.Length = y.Length && List.forall2 sameType x y
-    | TApp (h1, a1), TApp (h2, a2) ->
-        a1.Length = a2.Length && sameType h1 h2 && List.forall2 sameType a1 a2
-    | _ -> false
 
 /// One-way matching: a variable of the INSTANCE may bind, a variable of the
 /// target may not. That asymmetry is what makes selection sound — an

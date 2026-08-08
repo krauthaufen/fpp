@@ -11,7 +11,7 @@ let private readSource (path : string) : string =
 // `fpp check <files>` — batch diagnostics. Deliberately a second thin client
 // of the same Workspace the LSP server uses.
 
-let private check (files : string list) : int =
+let private check (strict : bool) (files : string list) : int =
     let ws = Workspace()
     // argument order is the compile order — exports flow forward
     for f in files do
@@ -21,7 +21,18 @@ let private check (files : string list) : int =
         for d in ws.Diagnostics f do
             errors <- errors + 1
             printfn "%s:%d:%d: error: %s" d.Path (d.Line + 1) (d.Col + 1) d.Message
-    if errors = 0 then 0 else 1
+    if errors > 0 then 1
+    elif not strict then 0
+    else
+        // --strict: also emit (to memory) and refuse stubs — a function
+        // the backend cannot compile traps if reached, and a clean check
+        // that hands over a trapping binary was this project's most
+        // repeated bug shape
+        let _bytes, eerrs = ws.EmitProgramWasm ()
+        for e in eerrs do eprintfn "error: %s" e
+        let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
+        for st in stubs do eprintfn "error (strict): %s" st
+        if List.isEmpty eerrs && List.isEmpty stubs then 0 else 1
 
 let private picks (files : string list) : int =
     // every instance selection over concrete arguments, one line each —
@@ -203,7 +214,7 @@ let main argv =
     match argl0 |> List.filter (fun a -> a <> "--strict") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
-         | Some (files, _) -> check files
+         | Some (files, _) -> check strict files
          | None -> 1)
     | [ "build"; proj ] when isProject proj ->
         (match openProject proj with
@@ -213,7 +224,7 @@ let main argv =
         (match openProject proj with
          | Some (files, _) -> build strict out files
          | None -> 1)
-    | "check" :: files when not (List.isEmpty files) -> check files
+    | "check" :: files when not (List.isEmpty files) -> check strict files
     | "picks" :: files when not (List.isEmpty files) -> picks files
     | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict out files
     | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
@@ -224,7 +235,7 @@ let main argv =
     | "exe" :: "-o" :: out :: files when not (List.isEmpty files) -> buildExe out files
     | _ ->
         eprintfn "usage:"
-        eprintfn "  fpp check <project.fppproj> | fpp check <file>..."
+        eprintfn "  fpp check [--strict] <project.fppproj> | fpp check [--strict] <file>..."
         eprintfn "  fpp build [--strict] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
         eprintfn "      --strict: fail when any function had to be stubbed (would trap if reached)"
         eprintfn "  fpp lib -o out.fppir <file>..."
