@@ -8,6 +8,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # number formatting must match the oracle everywhere: runner ICU data
+  # prints infinity as "∞" where the invariant tables say "Infinity",
+  # and the suite diffs program output byte for byte
+  DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: 1
+
 jobs:
   gates:
     runs-on: ubuntu-latest
@@ -23,6 +29,11 @@ jobs:
         run: |
           curl https://wasmtime.dev/install.sh -sSf | bash
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: install wasm-tools
+        run: |
+          curl -sL https://github.com/bytecodealliance/wasm-tools/releases/download/v1.240.0/wasm-tools-1.240.0-x86_64-linux.tar.gz | tar xz
+          sudo mv wasm-tools-1.240.0-x86_64-linux/wasm-tools /usr/local/bin/
 
       - name: install clingo
         run: |
