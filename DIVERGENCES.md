@@ -566,3 +566,14 @@ with tuple FIELDS work: the field's components are what derivation walks.
 against a class of higher-order-application inference gaps that used to
 leave the result element unpinned (since fixed — see STATUS.md), kept
 because it states nothing false and costs nothing.
+
+## Optional record fields (F++ extension)
+
+`type Desc = { Label : string; ?Count : int }` declares `Count` as
+`option<int>` with the optional-ARGUMENT conventions applied to literals: an
+omitted field is `None`, a bare value wraps in `Some`, and `?Count = e`
+passes the option itself. F# has repeatedly declined this feature; a
+JS-interop surface (WebGPU descriptors are dictionaries of mostly-optional
+members) is exactly the world it is for. `[<Struct>]` records refuse
+optional fields (an option is a reference). Sources using `?fields` are NOT
+compilable by fsc — keep them out of dual-compiled files.

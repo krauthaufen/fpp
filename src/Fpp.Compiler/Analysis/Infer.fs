@@ -4521,7 +4521,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          (match nameTok, List.tryLast valTy with
                           | Some t, Some vt ->
                               (match dictTryFind fields (info.TypeName + "." + t.Text) with
-                               | Some fi -> unifyAt t.Offset vt (substVars subst fi.FieldType)
+                               | Some fi ->
+                                   let declared = substVars subst fi.FieldType
+                                   let isOpt = (dictTryFind fields (info.TypeName + "." + t.Text + "$opt")).IsSome
+                                   let qSpelled = tokensOf f |> List.exists (fun tk -> tk.Kind = Operator && tk.Text = "?")
+                                   if isOpt && not qSpelled then
+                                       // a bare value wraps in Some — mark
+                                       // the site so lowering builds it
+                                       (match prune declared with
+                                        | TCon ("Option", [ inner ]) ->
+                                            unifyAt t.Offset vt inner
+                                            vecAdd fieldOwnersRaw (t.Offset, "$somewrap")
+                                        | _ -> unifyAt t.Offset vt declared)
+                                   else unifyAt t.Offset vt declared
                                | None -> ())
                           | _ -> ())
                      recTy
@@ -4953,7 +4965,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let tyNode = nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
                         (match nameTok, tyNode with
                          | Some t, Some tn ->
-                             let ft = typeFromNode vars tn
+                             // `?F : T` — an OPTIONAL field: the stored type
+                             // is option<T>, a literal may omit it (None), a
+                             // bare value wraps in Some, `?F = e` passes the
+                             // option — the optional-ARGUMENT conventions
+                             let isOpt = tokensOf f |> List.exists (fun tk -> tk.Kind = Operator && tk.Text = "?")
+                             let ft0 = typeFromNode vars tn
+                             let ft = if isOpt then TCon ("Option", [ ft0 ]) else ft0
+                             if isOpt && (dictTryFind structTypes name).IsSome then
+                                 vecAdd diags (t.Offset, "a [<Struct>] record cannot have optional fields")
                              recordDef t ft
                              let info =
                                  { TypeName = name; Params = paramVarList (); Quantified = []
@@ -4962,6 +4982,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              // qualified key: dot-access on a known record type
                              dictSet fields t.Text info
                              dictSet fields (name + "." + t.Text) info
+                             if isOpt then dictSet fields (name + "." + t.Text + "$opt") info
                          | _ -> ())
             | UnionCase ->
                 let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)

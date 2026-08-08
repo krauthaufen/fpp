@@ -2393,6 +2393,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      structLetElems bs tn rhs (match cont with Some c -> c | None -> ELit LUnit)
                  | None -> note (offsetOf n) "let shape")
             | RecordExpr ->
+                let anonOpt = mono (TCon ("Option", [ TCon ("?", []) ]))
                 let fields =
                     nodesOf n
                     |> List.filter (fun m -> m.NodeKind = RecordExprField)
@@ -2400,7 +2401,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let name = recordFieldLabel f
                         let value = nodesOf f |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast
                         match name, value with
-                        | Some t, Some v -> Some (t.Text, lowerExpr (GNode v))
+                        | Some t, Some v ->
+                            let lv = lowerExpr (GNode v)
+                            // a bare value for an OPTIONAL field wraps in Some
+                            let lv2 =
+                                if dictTryFind fieldOwners t.Offset = Some "$somewrap"
+                                then ECtor ("Some", anonOpt, [ lv ])
+                                else lv
+                            Some (t.Text, lv2)
                         | _ -> None)
                 let owner =
                     match dictTryFind fieldOwners (offsetOf n) with
@@ -2417,7 +2425,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         |> List.tryHead
                 (match baseExpr with
                  | Some b -> ERecordExt (owner, lowerExpr (GNode b), fields)
-                 | None -> ERecord (owner, fields))
+                 | None ->
+                     // an omitted OPTIONAL field IS None — fill it, so the
+                     // backends still see every declared field
+                     let written = fields |> List.map (fun (fn, _) -> fn)
+                     let fills =
+                         dictPairs fieldsTable
+                         |> List.choose (fun (k, fi) ->
+                             if fi.TypeName = owner && k.StartsWith (owner + ".") && k.EndsWith "$opt" then
+                                 let fn = k.Substring (owner.Length + 1, k.Length - owner.Length - 1 - 4)
+                                 if List.contains fn written then None
+                                 else Some (fn, ECtor ("None", anonOpt, []))
+                             else None)
+                     ERecord (owner, fields @ fills))
             | ArrayExpr ->
                 let elemName =
                     match dictTryFind arrKinds (offsetOf n) with

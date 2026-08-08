@@ -1103,9 +1103,12 @@ let parse (src : string) : ParseResult =
         while go && not s.AtEof && not (s.Is RBrace) do
             let mark = s.Mark
             if s.Is Semicolon then vecAdd acc (s.Bump ())
-            elif s.Is Ident then
+            elif s.Is Ident || (s.IsOp "?" && (s.Peek 1).Kind = Ident) then
                 let f = vecNew<Green> ()
                 let fieldCol = s.CurCol
+                // `?Name = e` hands the OPTION itself to an optional field,
+                // exactly as `?x = e` does for an optional argument
+                if s.IsOp "?" then vecAdd f (s.Bump ())
                 vecAdd f (s.Bump ())
                 while s.IsOp "." && s.SameLine && (s.Peek 1).Kind = Ident do
                     vecAdd f (s.Bump ())
@@ -1668,9 +1671,12 @@ let parse (src : string) : ParseResult =
         while go && not s.AtEof && not (s.Is RBrace) do
             let mark = s.Mark
             if s.Is Semicolon then vecAdd acc (s.Bump ())
-            elif s.IsKw "mutable" || s.Is Ident then
+            elif s.IsKw "mutable" || s.Is Ident || (s.IsOp "?" && (s.Peek 1).Kind = Ident) then
                 let f = vecNew<Green> ()
                 if s.IsKw "mutable" then vecAdd f (s.Bump ())
+                // `?Name : T` — an OPTIONAL field: the type becomes
+                // option<T> and a literal may leave it out (None)
+                if s.IsOp "?" then vecAdd f (s.Bump ())
                 if s.Is Ident then vecAdd f (s.Bump ())
                 if s.IsOp ":" then
                     vecAdd f (s.Bump ())
