@@ -12,3 +12,4 @@ editors/vscode/node_modules/
 editors/vscode/out/
 editors/vscode/*.vsix
 playground/playground.wat
+__pycache__/

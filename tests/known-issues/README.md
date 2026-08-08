@@ -36,17 +36,11 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
-* `member-body-early-pick/` — needs two files, so it is a directory:
-  `fpp build a.fpp b.fpp`. A class MEMBER body that needs an instance at
-  the class's own type variable picks from the instances visible in its
-  own file, and the pick is baked into every later copy of the class —
-  so `Box<Mine>.Same` answers 1 where B's `SE<Mine>` says 999. The same
-  program with `Box` replaced by a plain generic `let` answers 999,
-  because a let's requirement rides its type to each use. This is the
-  corner DESIGN.md rule 5 documents; the fix is giving member bodies the
-  same ride.
-
 Fixed and removed (see git history for the repros):
+`member-body-early-pick` (a class member body froze its instance pick to
+its own file's best candidate — a named use whose constraint still holds
+a variable now rides the stamp marker and is resolved per copy against
+the whole program's instances),
 `cross-module-specificity` (a generic let binding in an earlier file
 committed its constraint to the general instance before a later file's
 more specific one existed — an OPEN instance match in a let body now

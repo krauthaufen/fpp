@@ -1767,25 +1767,41 @@ let resolutionRuleTests =
             Expect.exists errs (fun e -> e.Contains "already declared by class Alpha")
                 "the collision is reported at Beta, naming Alpha"
         }
-        test "a constraint on an applied type variable is rejected, not dropped" {
-            // `when Shows<'f<int>>` typed fine, but the class layer neither
-            // solved nor abstracted it: the member stayed unbound, the
-            // backend stubbed the binding, and a CLEAN check trapped at run
+        test "a constraint on an applied type variable resolves at each use" {
+            // `when Shows<'f<int>>`: the requirement's argument starts with
+            // a type VARIABLE, so nothing can be picked at the definition —
+            // it travels to each use, where 'f is known. The marker spells
+            // the argument `#7$<int>`, and the stamp substitutes the head
+            // (`list$<int>`) into the grammar the resolver already speaks.
+            // Before that spelling existed the member was silently left
+            // unbound and a CLEAN check trapped at run.
+            let out =
+                run [ "class Shows<'a>"
+                      "    static shw : 'a -> string"
+                      "instance Shows<list<int>>"
+                      "    static shw xs = \"ints\""
+                      "instance Shows<option<int>>"
+                      "    static shw x = \"maybe\""
+                      "let describe (xs : 'f<int>) : string when Shows<'f<int>> ="
+                      "    Shows.shw xs"
+                      "let describe2 (xs : 'f<int>) : string when Shows<'f<int>> ="
+                      "    describe xs"
+                      "let a = print (describe2 [ 1; 2; 3 ])"
+                      "let b = print (describe2 (Some 1))" ]
+            Expect.equal out "ints\nmaybe\n" "one generic body, two containers, chained"
+        }
+        test "a missing instance for an applied-variable constraint still errors" {
             let errs =
                 diagnostics
-                    [ "class Mappable<'f<_>>"
-                      "    static mapf : ('a -> 'b) -> 'f<'a> -> 'f<'b>"
-                      "instance Mappable<list>"
-                      "    static mapf f xs = List.map f xs"
-                      "class Shows<'a>"
+                    [ "class Shows<'a>"
                       "    static shw : 'a -> string"
                       "instance Shows<list<int>>"
                       "    static shw xs = \"ints\""
                       "let describe (xs : 'f<int>) : string when Shows<'f<int>> ="
                       "    Shows.shw xs"
-                      "let a = print (describe [ 1; 2; 3 ])" ]
-            Expect.exists errs (fun e -> e.Contains "applied type variable")
-                "rejected where it is written"
+                      "let a = print (describe (Some 1))" ]
+            Expect.exists errs (fun e -> e.Contains "no instance Shows<Option<int>>")
+                "the use site reports the missing instance"
         }
         test "an orphan instance is rejected" {
             // legal-looking split: the class in a.fpp, a MORE SPECIFIC
@@ -1909,6 +1925,42 @@ let resolutionRuleTests =
                       "let b = print (string (P2.tag 5 \"s\"))" ]
             Expect.equal out "2\n1\n" "equal-args instance at (int,int), catch-all at (int,string)"
         }
+        test "a class member body also sees a later file's instance" {
+            // the member-body sibling of the stamp test above: Box<Mine>
+            // is copied per instantiation, and the copy — not the file
+            // that declared Box — decides which SE runs. Freezing the pick
+            // at declaration answered 1 here
+            let ws = Workspace()
+            ws.SetFileText "a.fpp" (String.concat "\n" [
+                "module A"
+                "class SE<'a>"
+                "    static eq : 'a -> 'a -> int"
+                "instance SE<'a>"
+                "    static eq a b = 1"
+                "type Box<'t>(v : 't) ="
+                "    member x.Same (o : 't) : int = SE.eq v o"
+                "" ])
+            ws.SetFileText "b.fpp" (String.concat "\n" [
+                "module B"
+                "open A"
+                "type Mine = { X : int }"
+                "instance SE<Mine>"
+                "    static eq a b = 999"
+                "let b = Box { X = 1 }"
+                "print (string (b.Same { X = 2 }))"
+                "" ])
+            let bytes, errors = ws.EmitProgramWasm ()
+            Expect.isEmpty errors "emission errors"
+            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
+            System.IO.File.WriteAllBytes(tmp, bytes)
+            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
+            psi.RedirectStandardOutput <- true
+            use p = System.Diagnostics.Process.Start psi
+            let out = p.StandardOutput.ReadToEnd()
+            p.WaitForExit()
+            System.IO.File.Delete tmp
+            Expect.equal out "999\n" "the copy at Mine runs Mine's instance"
+        }
         test "overlap with a unique most-specific instance still selects it" {
             // rule 2 kept as decided: overlap is fine as long as one
             // instance is strictly most specific at the use
@@ -1922,5 +1974,54 @@ let resolutionRuleTests =
                       "let a = print (Sized.size [ 1; 2; 3 ])"
                       "let b = print (Sized.size [ \"x\" ])" ]
             Expect.equal out "999\n100\n" "specific at int, general at string"
+        }
+    ]
+
+// Diagnostics that stop a clean check from handing over a broken binary —
+// each of these compiled silently and misbehaved before its check existed.
+[<Tests>]
+let declarationCheckTests =
+    testList "declaration checks" [
+        test "an instance must honor its class' when-promise" {
+            // `class Aa when Bb<'a>` says every Aa is a Bb; an Aa<int>
+            // without Bb<int> compiled clean and trapped at the first use
+            // of Bb through the promise
+            let errs =
+                diagnostics
+                    [ "class Bb<'a>"
+                      "    static fb : 'a -> int"
+                      "class Aa<'a>"
+                      "    when Bb<'a>"
+                      "    static fa : 'a -> int"
+                      "instance Aa<int>"
+                      "    static fa x = 10" ]
+            Expect.exists errs (fun e -> e.Contains "promises Bb<int>")
+                "the missing superclass instance is reported at the instance"
+        }
+        test "a when-promise satisfied in the same file is quiet" {
+            let out =
+                run [ "class Bb<'a>"
+                      "    static fb : 'a -> int"
+                      "class Aa<'a>"
+                      "    when Bb<'a>"
+                      "    static fa : 'a -> int"
+                      "instance Bb<int>"
+                      "    static fb x = 1"
+                      "instance Aa<int>"
+                      "    static fa x = 10"
+                      "let f (x : 'a) : int when Aa<'a> = Aa.fa x + Bb.fb x"
+                      "let a = print (string (f 5))" ]
+            Expect.equal out "11\n" "the promise resolves through the superclass"
+        }
+        test "an abbreviation applied at the wrong argument count says so" {
+            // it used to fall through and invent a type named after the
+            // abbreviation; the error then blamed code far away
+            let errs =
+                diagnostics
+                    [ "type Pair<'k, 'v> = { Key : 'k; Val : 'v }"
+                      "type MyMap<'k, 'v> = list<Pair<'k, 'v>>"
+                      "let f (m : MyMap<int>) = List.length m" ]
+            Expect.exists errs (fun e -> e.Contains "abbreviation MyMap takes 2 type arguments, not 1")
+                "reported at the annotation, naming the counts"
         }
     ]

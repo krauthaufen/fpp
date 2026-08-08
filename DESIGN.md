@@ -208,18 +208,20 @@ separate compilation, sane error messages.
   4. **No orphans**: an instance lives in the file of its class or of a
      type its head mentions. (Generated files are the project's, exempt.)
   5. Selection ranks the whole program's instances, not the file's. For a
-     GROUND argument this holds by construction: rule 4 plus
+     fully concrete argument this holds by construction: rule 4 plus
      declare-before-use means every instance that can match is already
-     visible. An OPEN match (an instance variable bound to a type still
-     containing a variable) defers to the stamp, where the argument is
-     ground and the table is the program's — except inside a type or
-     instance body, which has no scheme for the deferral to ride and
-     commits eagerly. That corner, and `Improve` (which grounds a type by
-     the only candidate the file has seen), remain file-order-sensitive.
-  6. A constraint's argument must start with a NAMED type
-     (`Shows<list<'a>>` is fine); a type variable applied to arguments
-     (`Shows<'f<int>>`) is rejected where written until dictionary
-     passing learns the shape — never silently dropped.
+     visible. A match that still involves a variable never binds CODE at
+     the definition — let bodies carry the requirement on their type,
+     member and instance bodies ride the stamp marker — and the copy is
+     resolved where the argument is concrete and the table is the whole
+     program's. What remains file-order-sensitive is `Improve` (grounding
+     a type by the only candidate the file has seen — deliberate, like
+     the left-to-right inference it serves) and the TYPE-level side of a
+     member body's requirement, which is still settled eagerly.
+  6. A constraint's argument may start with a type variable applied to
+     arguments (`Shows<'f<int>>`): nothing is picked at the definition —
+     the requirement travels to each use, where `'f` is known. What a
+     constraint may never be is silently dropped.
   7. A conditional instance's `when` context is discharged *after*
      selection; it never drives it.
   8. Superclass entailment walks a DAG; a cycle is refused, not followed.

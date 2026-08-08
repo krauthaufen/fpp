@@ -1160,7 +1160,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | None -> "?"
                       (match expandAlias name args with
                        | Some t -> t
-                       | None -> TCon (arityName name args.Length, args))
+                       | None ->
+                           // an abbreviation applied at the WRONG argument
+                           // count used to fall through silently and invent
+                           // a type named after itself — the error then
+                           // surfaced far away, against a type that does
+                           // not exist. Only when no REAL type of this name
+                           // exists at this count: that one is legitimate.
+                           (match dictTryFind aliases name with
+                            | Some (ps, _) when
+                                  not (List.isEmpty args)
+                                  && ps.Length <> args.Length
+                                  && arityName name args.Length = name ->
+                                (match tokensOf h |> List.tryHead with
+                                 | Some ht ->
+                                     vecAdd diags
+                                         (ht.Offset,
+                                          "the abbreviation " + name + " takes "
+                                          + string ps.Length + " type argument"
+                                          + (if ps.Length = 1 then "" else "s")
+                                          + ", not " + string args.Length)
+                                 | None -> ())
+                            | _ -> ())
+                           TCon (arityName name args.Length, args))
                   | _ ->
                       match typeFromNode vars head with
                       | TCon (name, []) -> TCon (name, args)
@@ -1271,6 +1293,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let addWanted (offset : int) (c : Constraint) : unit =
         if inMemberBody then dictSet eagerSeats offset true
         wanted <- wanted @ [ offset, c ]
+
+    /// superclass requirements of this file's instances, verified once the
+    /// whole file has registered its declarations
+    let pendingSuperChecks = vecNew<int * string * Constraint> ()
 
     // ---- derived Arb instances -------------------------------------------
     // A record or union with no written Arb instance GETS one, GENERIC in
@@ -1686,6 +1712,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | TVar tv -> "#" + string tv.Id
                 | TTuple _ -> instConName t
                 | TFun _ -> "$ref"
+                // an applied variable: `#7$<int>`, substituted at the stamp
+                | TApp (_, _) -> typeConName t
                 | _ -> ""
             // What the instance's own variables were matched to HERE. A
             // generic instance body is a template like any other generic
@@ -1779,7 +1807,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   | None -> ())
              | None -> ())
         | None ->
-        match instanceMember ((dictTryFind eagerSeats offset).IsSome) byName c name qfresh with
+        // A named use whose constraint still CONTAINS a variable never binds
+        // its code here, member body or not: it takes the marker below, and
+        // the stamp resolves it against the WHOLE program's instances. The
+        // solver still discharges such a constraint eagerly in a member
+        // body (there is no scheme to carry it, and leaving it pooled lets
+        // defaulting eat it) — but that settles the TYPES; which instance's
+        // code runs is decided per copy, where a later file's more specific
+        // instance is on the table. Committing code here instead is what
+        // froze Box<Mine>.Same to the catch-all its own file could see.
+        let openArgs =
+            byName && c.Args |> List.exists (fun a -> not (List.isEmpty (freeVars a)))
+        match (if openArgs then None
+               else instanceMember ((dictTryFind eagerSeats offset).IsSome) byName c name qfresh) with
         | Some key -> vecAdd classUsesRaw (offset, key)
         | None ->
             // unresolved because the operand type is still a variable: name
@@ -1791,6 +1831,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some (TCon (_, targs) as ct) when not (List.isEmpty targs) -> typeConName ct
                     | Some (TCon (n, _)) -> n
                     | Some (TVar v) -> "#" + string v.Id
+                    // an APPLIED variable (`Shows<'f<int>>`) names itself
+                    // `#7$<int>`: substName rewrites the `#7` inside it at
+                    // the stamp, yielding `list$<int>` — the instantiation
+                    // grammar the $class resolver already speaks
+                    | Some (TApp (_, _) as at) -> typeConName at
                     | _ -> ""
                 // a member generic BEYOND the class parameters needs its
                 // element instantiation carried to stamping: entries in the
@@ -1968,34 +2013,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ :: rest -> scanBound rest
             | [] -> ()
          scanBound (tokensOf n))
-        // a constraint argument must be CONSTRUCTOR-headed. `Shows<'f<int>>`
-        // types fine (unify knows TApp) but the class layer neither solves
-        // nor abstracts it, so the member was left unbound and the backend
-        // stubbed the whole binding — a clean check handed over a trapping
-        // binary. Until dictionary abstraction learns the shape, reject it
-        // where it is written.
-        let rec hasApp (t : Type) : bool =
-            match prune t with
-            | TApp (_, _) -> true
-            | TCon (_, xs) -> List.exists hasApp xs
-            | TFun (a2, b2) -> hasApp a2 || hasApp b2
-            | TTuple ts -> List.exists hasApp ts
-            | TVar _ -> false
         match fsharpInlineConstraint vars n with
         | Some c -> Some c
         | None ->
-        match classHead vars n with
-        | Some (cls, args) when List.exists hasApp args ->
-            (match tokensOf n |> List.tryHead with
-             | Some t ->
-                 vecAdd diags
-                     (t.Offset,
-                      "a constraint on an applied type variable is not supported yet — "
-                      + cls + " must be asked of the constructor itself, not of an application")
-             | None -> ())
-            None
-        | other ->
-        other
+        classHead vars n
         |> Option.map (fun (cls, args) ->
             let assocName =
                     match tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
@@ -5737,6 +5758,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some cd ->
                 if cd.Params.Length <> args.Length then
                     vecAdd diags (offset, "class " + name + " takes " + string cd.Params.Length + " type arguments")
+                // the SUPERCLASS promise, enforced: `class Aa when Bb<'a>`
+                // says every Aa is a Bb, so `instance Aa<int>` must be able
+                // to point at Bb<int>. Unchecked, code that used Bb through
+                // the promise compiled clean and trapped. Checked at end of
+                // file, once every instance the file declares is registered;
+                // a requirement still holding a variable (a conditional
+                // instance's) is discharged by that instance's own context
+                // at its uses, not here.
+                (if cd.Params.Length = args.Length then
+                    let ssub = dictNew<int, Type> ()
+                    List.iter2 (fun (p : Var) a -> dictSet ssub p.Id a) cd.Params args
+                    for s in cd.Supers do
+                        vecAdd pendingSuperChecks
+                            (offset, name, mapConstraint (Classes.substInst ssub) s))
                 // the ORPHAN rule, enforced: an instance lives in the file
                 // of its class or of a type its head mentions. Anywhere
                 // else, which instance a use sees depends on file order —
@@ -5965,6 +6000,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // never written (the class is sealed); a generic struct derives with
     // Unmanaged contexts on its parameters, and a nested struct field
     // gates through its OWN derived instance at solve time
+    // superclass requirements of this file's instances: a fully concrete
+    // one must have an instance NOW (everything that could provide it is
+    // declared by the end of this file — the same reasoning as the orphan
+    // rule's). One still holding a variable belongs to a conditional
+    // instance and is discharged at its uses instead.
+    for soff, sname, sc in vecToList pendingSuperChecks do
+        if sc.Args |> List.forall (fun a -> List.isEmpty (freeVars a)) then
+            match Classes.select classes true sc.Class sc.Args sc.Assoc with
+            | Classes.NoInstance ->
+                vecAdd diags
+                    (soff,
+                     "this " + sname + " instance promises " + sc.Class + "<"
+                     + String.concat ", " (List.map typeString sc.Args)
+                     + "> (a `when` of the class), and no such instance exists")
+            | _ -> ()
+
     for tn, ps, fts in vecToList unmanagedCands do
         let prims =
             [ "int"; "uint32"; "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
