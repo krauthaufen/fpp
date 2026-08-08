@@ -56,5 +56,10 @@ check l1-ground-coherent.lp   UNSAT
 check l2-orphans-needed.lp    SAT
 check l3-eager-commit.lp      SAT
 check l4-specificity-order.lp UNSAT
+# How names become keys (scope-free: three declarations cover the shapes)
+scope=""
+check k1-arity-keys-distinct.lp UNSAT
+check k2-order-picks-name.lp    SAT
+check k3-same-arity-merges.lp   SAT
 rm -f "$here/.last.out"
 exit $fail

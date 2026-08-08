@@ -1,0 +1,48 @@
+# The gates, exactly as CLAUDE.md lists them, plus the two verification
+# harnesses. A change that passes review but not these is wrong — each
+# gate has caught bugs the others missed (the self-build most of all).
+name: gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: install wasmtime
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: install clingo
+        run: |
+          python3 -m venv "$HOME/.venvs/clingo"
+          "$HOME/.venvs/clingo/bin/pip" install --quiet clingo
+
+      - name: build
+        run: dotnet build -c Release
+
+      - name: unit tests (includes the oracle battery and the ported suites)
+        run: dotnet run -c Release --no-build --project tests/Fpp.Tests
+
+      - name: corpus fixpoint (byte-identical recompile of the corpus)
+        run: dotnet fsi tests/bootstrap/fixpoint.fsx
+
+      - name: self-host fixpoint (the compiler compiles itself, byte for byte)
+        run: dotnet fsi tests/bootstrap/fixpoint.fsx self
+
+      - name: rule model checks (clingo, 15 verdicts pinned)
+        run: ./tests/tooling/verify/run.sh
+
+      - name: pick comparison (every instance selection re-derived)
+        run: ./tests/tooling/verify/check-picks.sh

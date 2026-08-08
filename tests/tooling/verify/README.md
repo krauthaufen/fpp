@@ -35,6 +35,28 @@ expected outcome of each is part of the gate:
   the model's own encoding: if a later edit makes "more specific" stop
   meaning "accepts fewer", it fails loudly.)
 
+## How names become keys
+
+The other family of past bugs was NAMING: types are stored under their
+bare name, with a suffix (`` Foo`2 ``) separating same-named types that
+take a different number of arguments. Three more checks pin those rules
+(`keys.lp` + `k1`/`k2`/`k3`):
+
+* **k1 — must find nothing.** Same name, different argument count,
+  never the same key, whatever the file order. This is what the suffix
+  exists for — before it, two same-named types shared a memory layout
+  and a five-line program died with `missing field`.
+* **k2 — must find an example.** The UNsuffixed key goes to whichever
+  count appears first, and "first" is file order — so reordering files
+  renames a type in the compiled output. Known and tolerated; the check
+  keeps it visible instead of forgotten, and the self-build comparison
+  cannot see it (both stages read files in the same order).
+* **k3 — must find an example.** Two separate declarations — same name,
+  same argument count — share one key. Deliberate (a user type merges
+  with its prelude namesake) and simultaneously the residual hazard
+  (two unrelated private types merge the same way, silently). If that
+  hazard is ever closed, this check flips and says so.
+
 ## Why a size limit is not a blank spot
 
 "Nothing found" is only exhaustive up to the limit. Two things carry it
