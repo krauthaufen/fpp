@@ -11,8 +11,10 @@ let private readSource (path : string) : string =
 // `fpp check <files>` — batch diagnostics. Deliberately a second thin client
 // of the same Workspace the LSP server uses.
 
-let private check (strict : bool) (files : string list) : int =
+let private check (strict : bool) (defines : string list) (files : string list) : int =
     let ws = Workspace()
+    // `check` sees the ORACLE's view of conditional code
+    ws.Defines <- "WASM" :: defines
     // argument order is the compile order — exports flow forward
     for f in files do
         ws.SetFileText f (readSource f)
@@ -63,8 +65,11 @@ let private buildLib (out : string) (files : string list) : int =
         System.IO.File.WriteAllText(out, lib)
         0
 
-let private build (strict : bool) (out : string) (files : string list) : int =
+let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
     let ws = Workspace()
+    // the target IS the configuration: `#if WASM` code exists only in wasm
+    // builds, `#if NATIVE` only in C builds — nothing compiles to a trap
+    ws.Defines <- (if out.EndsWith ".c" then "NATIVE" else "WASM") :: defines
     let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
     for l in libs do
@@ -157,6 +162,7 @@ let private buildExe (out : string) (files : string list) : int =
         1
     else
     let ws = Workspace()
+    ws.Defines <- [ "WASM" ]
     let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
     for l in libs do ws.AddLibrary l (readSource l)
@@ -195,7 +201,7 @@ let private buildExe (out : string) (files : string list) : int =
 /// A project names its sources in compile order and its output, so `check`
 /// and `build` take one argument instead of a hand-ordered file list.
 /// Returns None once it has reported a bad manifest.
-let private openProject (proj : string) : (string list * string) option =
+let private openProject (proj : string) : (string list * string * string list) option =
     let r = Project.read proj
     if not (List.isEmpty r.Errors) then
         for line, msg in r.Errors do eprintfn "%s:%d: error: %s" proj line msg
@@ -203,7 +209,7 @@ let private openProject (proj : string) : (string list * string) option =
     else
         let dir = System.IO.Path.GetDirectoryName r.Loaded.Path
         let out = System.IO.Path.Combine (dir, r.Loaded.Out)
-        Some (r.Loaded.Libs @ r.Loaded.Sources, out)
+        Some (r.Loaded.Libs @ r.Loaded.Sources, out, r.Loaded.Defines)
 
 let private isProject (f : string) = f.EndsWith Project.extension
 
@@ -214,23 +220,23 @@ let main argv =
     match argl0 |> List.filter (fun a -> a <> "--strict") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
-         | Some (files, _) -> check strict files
+         | Some (files, _, defs) -> check strict defs files
          | None -> 1)
     | [ "build"; proj ] when isProject proj ->
         (match openProject proj with
-         | Some (files, out) -> build strict out files
+         | Some (files, out, defs) -> build strict defs out files
          | None -> 1)
     | [ "build"; proj; "-o"; out ] when isProject proj ->
         (match openProject proj with
-         | Some (files, _) -> build strict out files
+         | Some (files, _, defs) -> build strict defs out files
          | None -> 1)
-    | "check" :: files when not (List.isEmpty files) -> check strict files
+    | "check" :: files when not (List.isEmpty files) -> check strict [] files
     | "picks" :: files when not (List.isEmpty files) -> picks files
-    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict out files
+    | "build" :: "-o" :: out :: files when not (List.isEmpty files) -> build strict [] out files
     | "lib" :: "-o" :: out :: files when not (List.isEmpty files) -> buildLib out files
     | [ "exe"; proj; "-o"; out ] when isProject proj ->
         (match openProject proj with
-         | Some (files, _) -> buildExe out files
+         | Some (files, _, _) -> buildExe out files
          | None -> 1)
     | "exe" :: "-o" :: out :: files when not (List.isEmpty files) -> buildExe out files
     | _ ->

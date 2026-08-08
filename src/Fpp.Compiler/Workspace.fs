@@ -231,6 +231,9 @@ module private BuiltinCache =
 
 type Workspace() =
     let db = Db()
+    // the ORACLE's view by default — the LSP and the tests see #if WASM
+    // code; the CLI overrides per build target
+    let mutable defines : string list = [ "WASM" ]
     do db.SetInput "project" "" (box ([] : string list))
     do db.SetInput "libs" "" (box ([] : (string * string) list))
     let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
@@ -317,6 +320,10 @@ type Workspace() =
     /// Returns the project and any errors in the manifest itself.
     member this.LoadProject (projectPath : string) : Project.Project * (int * string) list =
         let r = Project.read projectPath
+        // the manifest's `define` symbols join whatever the target already set
+        for d in r.Loaded.Defines do
+            if not (List.contains d this.Defines) then
+                this.Defines <- this.Defines @ [ d ]
         let open_ = this.ProjectFiles |> Set.ofList
         for l in r.Loaded.Libs do
             match hostReadText l with
@@ -326,15 +333,25 @@ type Workspace() =
         for s in r.Loaded.Sources do
             if not (Set.contains s open_) then
                 let text = match hostReadText s with Some t -> t | None -> ""
-                db.SetInput "text" s (box text)
+                let text2, _ = Fpp.Project.preprocess this.Defines text
+                db.SetInput "text" s (box text2)
         r.Loaded, r.Errors
+
+    /// conditional-compilation symbols; the CLI sets WASM or NATIVE from
+    /// the build target before feeding sources
+    member _.Defines
+        with get () : string list = defines
+        and set (v : string list) = defines <- v
 
     member this.SetFileText (path : string) (text : string) : unit =
         // unknown files join the project in arrival order (LSP didOpen)
         let files = this.ProjectFiles
         if not (List.contains path files) then
             db.SetInput "project" "" (box (files @ [ path ]))
-        db.SetInput "text" path (box text)
+        // `#if` regions are resolved HERE, before the lexer: blanked to
+        // spaces, so every byte offset survives untouched
+        let text2, _ = Fpp.Project.preprocess this.Defines text
+        db.SetInput "text" path (box text2)
 
     member _.FileText (path : string) : string =
         unbox<string> (db.GetInput "text" path)
