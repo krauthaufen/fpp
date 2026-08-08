@@ -25,6 +25,9 @@ type ClassDef =
       /// each parameter's declared KIND as an arity: 0 = a plain type,
       /// n = a constructor of n arguments (`'f<_>` is 1)
       ParamKinds : int list
+      /// members declared DOT-form (`member 'a.Pin : int`) — resolvable on
+      /// a receiver in ANY file, so the names ride the shared table
+      DotMembers : string list
       /// associated type names, in declaration order
       Assoc : string list
       /// superclass context: what an instance must also satisfy, and the

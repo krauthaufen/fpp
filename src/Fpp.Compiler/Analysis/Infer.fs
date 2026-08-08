@@ -1241,6 +1241,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // slots; a MATCH binds them and the branch's member calls dispatch
     // through the bound slots — no instance is ever chosen at the use.
     let existCtor = dictNew<string * int, string> ()      // ctor def -> case
+    /// [<Struct>] decls and enums, for the compiler-derived Unmanaged
+    /// instances: (name, params, field types); enums carry no fields
+    let unmanagedCands = vecNew<string * Var list * Type list> ()
     /// subtype-bounded case vars: ctor def -> (quantified index, iface)
     let existSubCtor = dictNew<string * int, (int * string) list> ()
     let pendingSubChecks = vecNew<int * Type * string> ()
@@ -1269,8 +1272,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// when the receiver declares NO such member, the classes' anchored
     /// members answer `xs.Count` — BEFORE the core's by-name field guess,
     /// which would otherwise bind the access to an unrelated record
+    let dotMemberOwner (name : string) : (string * string) option =
+        match dictTryFind dotMembers name with
+        | Some x -> Some x
+        | None ->
+            // a class declared in ANOTHER file: the shared table carries
+            // its dot-member names
+            dictPairs classes.Classes
+            |> List.tryPick (fun ((_ : string), cd) ->
+                if List.contains name cd.DotMembers then Some (cd.Name, "") else None)
+
     let classDotFallback (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
-            match dictTryFind dotMembers name with
+            match dotMemberOwner name with
             | Some (cls, _) ->
                 (match dictTryFind classes.Classes cls with
                  | Some cd ->
@@ -1296,7 +1309,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let tryResolveDot (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
         let classFirst =
-            (dictTryFind dotMembers name).IsSome
+            (dotMemberOwner name).IsSome
             && (match prune recvTy with
                 | TCon (tn, _) -> List.isEmpty (fieldCandidates (tn + "." + name))
                 | _ -> false)
@@ -2455,6 +2468,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                | None -> st.Fresh ())
                       | None -> st.Fresh ())
                  | _ -> st.Fresh ())   // quote-ident type variable
+            | AppExpr when
+                  (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                   | [ h; _ ] when h.NodeKind = IdentExpr ->
+                       (match tokensOf h |> List.tryHead with
+                        | Some t -> t.Text = "fixed" && (dictTryFind useDefs t.Offset).IsNone
+                        | None -> false)
+                   | _ -> false) ->
+                // `fixed x` pins through Pinnable: Pin gives the binding's
+                // value, Unpin is parked for the scope's exit paths
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ h; x ] ->
+                     let off = (tokensOf h |> List.head).Offset
+                     let xt = exprType (GNode x)
+                     let pTy = st.Fresh ()
+                     if not (tryResolveDot false (85000000 + off) xt pTy "Pin") then
+                         vecAdd pendingDots (85000000 + off, xt, pTy, "Pin")
+                     let uTy = st.Fresh ()
+                     if not (tryResolveDot false (86000000 + off) xt uTy "Unpin") then
+                         vecAdd pendingDots (86000000 + off, xt, uTy, "Unpin")
+                     pTy
+                 | _ -> st.Fresh ())
             | AppExpr ->
                 (match nodesOf n with
                  | head :: args ->
@@ -2547,6 +2581,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    | [ ta ] ->
                                        let ty = typeFromNode tyScope ta
                                        vecAdd fieldOwnersRaw (ht.Offset, "$sizeof:" + instName ty)
+                                       // sizeof is Unmanaged's one member:
+                                       // only layout-owning types have one
+                                       addWanted ht.Offset { Class = "Unmanaged"; Args = [ ty ]; Assoc = [] }
                                        true
                                    | _ -> false)
                               | _ -> false)
@@ -4783,6 +4820,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match m.NodeKind with
             | RecordRepr ->
                 dictSet recordsReg name true
+                (if (dictTryFind structTypes name).IsSome then
+                    let fts =
+                        nodesOf m
+                        |> List.filter (fun f -> f.NodeKind = RecordField)
+                        |> List.choose (fun f ->
+                            nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
+                            |> Option.map (typeFromNode vars))
+                    vecAdd unmanagedCands (name, paramVarList (), fts))
                 for f in nodesOf m do
                     if f.NodeKind = RecordField then
                         let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
@@ -5494,6 +5539,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let cdef : Classes.ClassDef =
                 { Name = name
                   Params = ps; ParamKinds = classParamKinds n
+                  DotMembers =
+                    members
+                    |> List.filter (fun m -> (memberAnchorOf m).IsSome)
+                    |> List.choose memberNameOf |> List.map (fun t -> t.Text)
                   Assoc = assocNames; Supers = supers
                   Members = sigs; Path = path
                   Offset = (match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0) }
@@ -5571,6 +5620,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _ -> ())
                  | _ -> ())
             Classes.addInstance classes inst
+            (if name = "Unmanaged" && path <> Classes.builtinPath then
+                vecAdd diags (offset, "Unmanaged is solved by the compiler from a type's layout; instances cannot be written"))
             match dictTryFind classes.Classes name with
             | None -> vecAdd diags (offset, "unknown class " + name)
             | Some cd ->
@@ -5771,6 +5822,30 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     predeclareAndGroups root.Children
     for c in root.Children do inferDecl c
+
+    // every [<Struct>] whose fields are unmanaged IS Unmanaged — derived,
+    // never written (the class is sealed); a generic struct derives with
+    // Unmanaged contexts on its parameters, and a nested struct field
+    // gates through its OWN derived instance at solve time
+    for tn, ps, fts in vecToList unmanagedCands do
+        let prims =
+            [ "int"; "uint32"; "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
+              "char"; "bool"; "float"; "float32"; "float16"; "double"; "single"
+              "nativeint"; "unativeint" ]
+        let rec um (t : Type) : bool =
+            match prune t with
+            | TCon (p, []) -> List.contains p prims || (dictTryFind structTypes p).IsSome
+            | TCon (p, args) -> (dictTryFind structTypes p).IsSome && List.forall um args
+            | TVar v -> ps |> List.exists (fun q -> prunedId q = prunedId v)
+            | _ -> false
+        if fts |> List.forall um then
+            Classes.addInstance classes
+                { Class = "Unmanaged"; Params = ps
+                  Head = [ TCon (tn, ps |> List.map TVar) ]
+                  Assoc = []
+                  Context = ps |> List.map (fun q -> { Class = "Unmanaged"; Args = [ TVar q ]; Assoc = [] })
+                  Members = []; Builtin = true; Path = path
+                  Offset = 0 }
 
     // Every record and union answers Arb unless it wrote its own instance:
     // a stamped GENERIC use may demand one that no ground use ever named,

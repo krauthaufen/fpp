@@ -157,6 +157,8 @@ let parse (src : string) : ParseResult =
 
     let canStartAtom () =
         s.Is Ident || isLiteral () || isLiteralKw ()
+        // `fixed expr` — the Pinnable pin operator
+        || s.IsKw "fixed"
         // a quotation is an atom: `f <@ x @>` applies f to quoted code
         || (s.Is Operator && s.IsText "<@")
         || isSpliceHere ()
@@ -823,7 +825,14 @@ let parse (src : string) : ParseResult =
         scan 1 1
 
     and parseAtom (ctx : int) : Green =
-        if s.Is Operator && s.Cur.Text = "<@" then
+        if s.IsKw "fixed" then
+            // `fixed expr` — the keyword acts as the Pinnable pin operator;
+            // the token rides in an IdentExpr so the pipeline treats it
+            // like the (unresolvable) name it dispatches on
+            let kw = s.Bump ()
+            let t = match kw with GToken tk -> GToken { tk with Kind = Ident } | g -> g
+            Green.node IdentExpr [ t ]
+        elif s.Is Operator && s.Cur.Text = "<@" then
             // the quoted body is parsed as ORDINARY syntax — that is what
             // makes it resolve, type check and hover like real code
             let acc = vecNew<Green> ()

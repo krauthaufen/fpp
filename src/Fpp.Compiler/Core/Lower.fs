@@ -414,6 +414,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// owner is an interface and as a lifted function otherwise.
     let synthCall (base_ : int) (fo : int) (name : string) (recv : Expr) (withUnit : bool) : Expr option =
         let t = { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + fo }
+        // a TYPECLASS dot-member resolved at the synthetic offset: apply
+        // the class target to the receiver (`fixed` rides Pinnable.Pin
+        // exactly the way `use` rides Dispose)
+        match dictTryFind classUses t.Offset with
+        | Some im -> Some (EApp (classRef im, [ recv ]))
+        | None ->
+        match dictTryFind classPending t.Offset with
+        | Some payload -> Some (EApp (EUnknown ("$class:" + payload), [ recv ]))
+        | None ->
         match memberAt t with
         | None -> None
         | Some (owner, d) ->
@@ -3125,8 +3134,35 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | Some c, [] -> c
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
-                    let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
-                    ELet (isRec, v, sch, rhs, disposeOf v sch tail)
+                    // `use p = fixed x`: pin through Pinnable for the
+                    // binding's scope, unpin on every exit path
+                    (match rhs with
+                     | EApp (EUnknown "fixed", [ xe ]) ->
+                         let fixedOff =
+                             Green.tokens (GNode item)
+                             |> List.tryFind (fun t -> t.Kind = Ident && t.Text = "fixed")
+                             |> Option.map (fun t -> t.Offset)
+                         (match fixedOff with
+                          | Some fo ->
+                              let fxv = { Path = path; Offset = 87000000 + fo; Name = "$fx" }
+                              let recvE = EVar (fxv, anonScheme)
+                              let pinE =
+                                  match synthCall 85000000 fo "Pin" recvE false with
+                                  | Some e -> e
+                                  | None -> note fo "fixed: no Pinnable instance"
+                              let unpinE =
+                                  match synthCall 86000000 fo "Unpin" recvE false with
+                                  | Some e -> e
+                                  | None -> ELit LUnit
+                              ELet (false, fxv, anonScheme, xe,
+                                    ELet (isRec, v, sch, pinE,
+                                          tryFinally (offsetOf item) tail unpinE))
+                          | None ->
+                              let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
+                              ELet (isRec, v, sch, rhs, disposeOf v sch tail))
+                     | _ ->
+                         let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
+                         ELet (isRec, v, sch, rhs, disposeOf v sch tail))
                 | Some (DestructureLet (pat, rhs, cont)) ->
                     let tail =
                         match cont, rest with

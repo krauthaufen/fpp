@@ -265,6 +265,9 @@ instance Unmanaged<float32>
     static byteSize = 4
 instance Unmanaged<float16>
     static byteSize = 2
+instance Unmanaged<nativeint>
+    static byteSize = 8
+
 instance Unmanaged<byte>
     static byteSize = 1
 instance Unmanaged<sbyte>
@@ -2005,6 +2008,19 @@ module Array =
         elif length a < length b then 0 - 1
         elif length a > length b then 1
         else 0
+
+/// Scoped pinning: `use p = fixed arr` pins for the binding's scope and
+/// unpins on every exit path. Instances decide what pinning MEANS; the
+/// array instance demands unmanaged elements, so a ref-holding array
+/// cannot be handed to C at all.
+class Pinnable<'p>
+    member 'p.Pin : int
+    member 'p.Unpin : unit
+
+instance Pinnable<'t[]> when Unmanaged<'t>
+    member xs.Pin = Array.pin xs
+    member xs.Unpin = Array.unpin xs
+
 module List =
     let length (xs : 'a list) =
         let mutable n = 0
