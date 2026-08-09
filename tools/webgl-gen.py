@@ -156,7 +156,7 @@ def emit_gl(model):
                     sig2 = ', '.join(
                         ('%s : %s' % (n, "'a[]") if n == rn else '%s : %s' % (n, t))
                         for n, t, _ in args)
-                    a('    member x.%s (%s) : unit =' % (mname, sig2))
+                    a('    member x.%s (%s) : unit when Unmanaged<\'a> =' % (mname, sig2))
                     a('        let %s_p = Array.pin %s' % (rn, rn))
                     for n, t, k in args:
                         if n == rn:

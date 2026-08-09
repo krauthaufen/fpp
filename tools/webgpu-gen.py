@@ -313,7 +313,7 @@ def emit(model):
             body_wrap(a, model, rk, call, rt)
             if iname == 'GPUQueue' and me['name'] == 'writeBuffer':
                 # the generic sibling: any pinnable array, pin scoped
-                a('    member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : \'a[]) : unit =')
+                a('    member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : \'a[]) : unit when Unmanaged<\'a> =')
                 a('        let p = Array.pin data')
                 a('        let v = Js.viewU8 p (Array.byteSize data)')
                 a('        Js.call5 (Js.handle h) "writeBuffer" (Js.handle (buffer).H) (Js.ofNum (bufferOffset)) v (Js.undefined ()) (Js.undefined ()) |> ignore')

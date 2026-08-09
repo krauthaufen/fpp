@@ -2750,6 +2750,22 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             i31get f
             ins f "i32.eqz"
             refI31 f)
+    | EPrim (op, [ a; b ]) when
+        (let i = op.IndexOf "@" in
+         i > 0 && op.Contains "#"
+         && List.contains (op.Substring (0, i)) [ "<"; ">"; "<="; ">=" ]) ->
+        // an ORDERED comparison in an unstamped template: the operand type
+        // is a variable canonical (all-reference) code never substitutes.
+        // The structural $cmpv is the comparison at the uniform
+        // representation — the same fallback `compare` takes.
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f "$cmpv"
+        ic f 0
+        ins f
+            (match op.Substring (0, op.IndexOf "@") with
+             | "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | _ -> "i32.ge_s")
+        refI31 f
     | EPrim ("=", [ a; b ]) when kindOfLite st a = "i" && kindOfLite st b = "i" ->
         emitNode st f lv a
         callf f "$toi"
@@ -3723,6 +3739,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         for a in args do
             emitNode st f lv a
             callf f "$applyc"
+    | EPrim (op, _) when op.Contains "@#" ->
+        // a class OPERATOR whose operand is a type variable in an unstamped
+        // template. The scalar classes have no reference-type instance, so
+        // canonical (all-reference) code cannot reach here — every real use
+        // is stamped, where the suffix is a concrete kind. A trap, not a
+        // stub: the surrounding function is otherwise portable, and warning
+        // here failed --strict on every program once members carried
+        // constraints (RangeOps.Seq is member-demanded in EVERY binary).
+        ins f "unreachable"
+        refNull f "any"
     | other ->
         let tag =
             match other with

@@ -1093,7 +1093,7 @@ and WebGLRenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib1fv" index_j values_j |> ignore
-    member x.VertexAttrib1fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib1fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1103,7 +1103,7 @@ and WebGLRenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib2fv" index_j values_j |> ignore
-    member x.VertexAttrib2fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib2fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1113,7 +1113,7 @@ and WebGLRenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib3fv" index_j values_j |> ignore
-    member x.VertexAttrib3fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib3fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1123,7 +1123,7 @@ and WebGLRenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib4fv" index_j values_j |> ignore
-    member x.VertexAttrib4fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib4fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1148,7 +1148,7 @@ and WebGLRenderingContext(h : int) =
         let data_j = data
         let usage_j = Js.ofNum (float (int (usage)))
         Js.call3 (Js.handle h) "bufferData" target_j data_j usage_j |> ignore
-    member x.BufferData (target : GLenum, data : 'a[], usage : GLenum) : unit =
+    member x.BufferData (target : GLenum, data : 'a[], usage : GLenum) : unit when Unmanaged<'a> =
         let data_p = Array.pin data
         let target_j = Js.ofNum (float (int (target)))
         let data_j = Js.viewU8 data_p (Array.byteSize data)
@@ -1165,7 +1165,7 @@ and WebGLRenderingContext(h : int) =
         let offset_j = Js.ofNum (offset)
         let data_j = data
         Js.call3 (Js.handle h) "bufferSubData" target_j offset_j data_j |> ignore
-    member x.BufferSubData (target : GLenum, offset : float, data : 'a[]) : unit =
+    member x.BufferSubData (target : GLenum, offset : float, data : 'a[]) : unit when Unmanaged<'a> =
         let data_p = Array.pin data
         let target_j = Js.ofNum (float (int (target)))
         let offset_j = Js.ofNum (offset)
@@ -1181,7 +1181,7 @@ and WebGLRenderingContext(h : int) =
         let border_j = Js.ofNum (float (border))
         let data_j = data
         Js.call7 (Js.handle h) "compressedTexImage2D" target_j level_j internalformat_j width_j height_j border_j data_j |> ignore
-    member x.CompressedTexImage2D (target : GLenum, level : int, internalformat : GLenum, width : int, height : int, border : int, data : 'a[]) : unit =
+    member x.CompressedTexImage2D (target : GLenum, level : int, internalformat : GLenum, width : int, height : int, border : int, data : 'a[]) : unit when Unmanaged<'a> =
         let data_p = Array.pin data
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -1202,7 +1202,7 @@ and WebGLRenderingContext(h : int) =
         let format_j = Js.ofNum (float (int (format)))
         let data_j = data
         Js.call8 (Js.handle h) "compressedTexSubImage2D" target_j level_j xoffset_j yoffset_j width_j height_j format_j data_j |> ignore
-    member x.CompressedTexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, data : 'a[]) : unit =
+    member x.CompressedTexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, data : 'a[]) : unit when Unmanaged<'a> =
         let data_p = Array.pin data
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -1223,7 +1223,7 @@ and WebGLRenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let pixels_j = pixels
         Js.call7 (Js.handle h) "readPixels" x_j y_j width_j height_j format_j type'_j pixels_j |> ignore
-    member x.ReadPixels (x : int, y : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit =
+    member x.ReadPixels (x : int, y : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit when Unmanaged<'a> =
         let pixels_p = Array.pin pixels
         let x_j = Js.ofNum (float (x))
         let y_j = Js.ofNum (float (y))
@@ -1245,7 +1245,7 @@ and WebGLRenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let pixels_j = pixels
         Js.call9 (Js.handle h) "texImage2D" target_j level_j internalformat_j width_j height_j border_j format_j type'_j pixels_j |> ignore
-    member x.TexImage2D (target : GLenum, level : int, internalformat : int, width : int, height : int, border : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit =
+    member x.TexImage2D (target : GLenum, level : int, internalformat : int, width : int, height : int, border : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit when Unmanaged<'a> =
         let pixels_p = Array.pin pixels
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -1277,7 +1277,7 @@ and WebGLRenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let pixels_j = pixels
         Js.call9 (Js.handle h) "texSubImage2D" target_j level_j xoffset_j yoffset_j width_j height_j format_j type'_j pixels_j |> ignore
-    member x.TexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit =
+    member x.TexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit when Unmanaged<'a> =
         let pixels_p = Array.pin pixels
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -1303,7 +1303,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform1fv" location_j v_j |> ignore
-    member x.Uniform1fv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform1fv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1313,7 +1313,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform2fv" location_j v_j |> ignore
-    member x.Uniform2fv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform2fv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1323,7 +1323,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform3fv" location_j v_j |> ignore
-    member x.Uniform3fv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform3fv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1333,7 +1333,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform4fv" location_j v_j |> ignore
-    member x.Uniform4fv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform4fv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1343,7 +1343,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform1iv" location_j v_j |> ignore
-    member x.Uniform1iv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform1iv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1353,7 +1353,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform2iv" location_j v_j |> ignore
-    member x.Uniform2iv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform2iv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1363,7 +1363,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform3iv" location_j v_j |> ignore
-    member x.Uniform3iv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform3iv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1373,7 +1373,7 @@ and WebGLRenderingContext(h : int) =
         let location_j = Js.handle (location).H
         let v_j = v
         Js.call2 (Js.handle h) "uniform4iv" location_j v_j |> ignore
-    member x.Uniform4iv (location : WebGLUniformLocation, v : 'a[]) : unit =
+    member x.Uniform4iv (location : WebGLUniformLocation, v : 'a[]) : unit when Unmanaged<'a> =
         let v_p = Array.pin v
         let location_j = Js.handle (location).H
         let v_j = Js.viewU8 v_p (Array.byteSize v)
@@ -1384,7 +1384,7 @@ and WebGLRenderingContext(h : int) =
         let transpose_j = Js.ofBool (transpose)
         let value_j = value
         Js.call3 (Js.handle h) "uniformMatrix2fv" location_j transpose_j value_j |> ignore
-    member x.UniformMatrix2fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit =
+    member x.UniformMatrix2fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit when Unmanaged<'a> =
         let value_p = Array.pin value
         let location_j = Js.handle (location).H
         let transpose_j = Js.ofBool (transpose)
@@ -1396,7 +1396,7 @@ and WebGLRenderingContext(h : int) =
         let transpose_j = Js.ofBool (transpose)
         let value_j = value
         Js.call3 (Js.handle h) "uniformMatrix3fv" location_j transpose_j value_j |> ignore
-    member x.UniformMatrix3fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit =
+    member x.UniformMatrix3fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit when Unmanaged<'a> =
         let value_p = Array.pin value
         let location_j = Js.handle (location).H
         let transpose_j = Js.ofBool (transpose)
@@ -1408,7 +1408,7 @@ and WebGLRenderingContext(h : int) =
         let transpose_j = Js.ofBool (transpose)
         let value_j = value
         Js.call3 (Js.handle h) "uniformMatrix4fv" location_j transpose_j value_j |> ignore
-    member x.UniformMatrix4fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit =
+    member x.UniformMatrix4fv (location : WebGLUniformLocation, transpose : bool, value : 'a[]) : unit when Unmanaged<'a> =
         let value_p = Array.pin value
         let location_j = Js.handle (location).H
         let transpose_j = Js.ofBool (transpose)
@@ -1902,7 +1902,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib1fv" index_j values_j |> ignore
-    member x.VertexAttrib1fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib1fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1912,7 +1912,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib2fv" index_j values_j |> ignore
-    member x.VertexAttrib2fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib2fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1922,7 +1922,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib3fv" index_j values_j |> ignore
-    member x.VertexAttrib3fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib3fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1932,7 +1932,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttrib4fv" index_j values_j |> ignore
-    member x.VertexAttrib4fv (index : int, values : 'a[]) : unit =
+    member x.VertexAttrib4fv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -1989,7 +1989,7 @@ and WebGL2RenderingContext(h : int) =
         let target_j = Js.ofNum (float (int (target)))
         let attachments_j = attachments
         Js.call2 (Js.handle h) "invalidateFramebuffer" target_j attachments_j |> ignore
-    member x.InvalidateFramebuffer (target : GLenum, attachments : 'a[]) : unit =
+    member x.InvalidateFramebuffer (target : GLenum, attachments : 'a[]) : unit when Unmanaged<'a> =
         let attachments_p = Array.pin attachments
         let target_j = Js.ofNum (float (int (target)))
         let attachments_j = Js.viewU8 attachments_p (Array.byteSize attachments)
@@ -2003,7 +2003,7 @@ and WebGL2RenderingContext(h : int) =
         let width_j = Js.ofNum (float (width))
         let height_j = Js.ofNum (float (height))
         Js.call6 (Js.handle h) "invalidateSubFramebuffer" target_j attachments_j x_j y_j width_j height_j |> ignore
-    member x.InvalidateSubFramebuffer (target : GLenum, attachments : 'a[], x : int, y : int, width : int, height : int) : unit =
+    member x.InvalidateSubFramebuffer (target : GLenum, attachments : 'a[], x : int, y : int, width : int, height : int) : unit when Unmanaged<'a> =
         let attachments_p = Array.pin attachments
         let target_j = Js.ofNum (float (int (target)))
         let attachments_j = Js.viewU8 attachments_p (Array.byteSize attachments)
@@ -2055,7 +2055,7 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let source_j = source
         Js.call10 (Js.handle h) "texImage3D" target_j level_j internalformat_j width_j height_j depth_j border_j format_j type'_j source_j |> ignore
-    member x.TexImage3D (target : GLenum, level : int, internalformat : int, width : int, height : int, depth : int, border : int, format : GLenum, type' : GLenum, source : 'a[]) : unit =
+    member x.TexImage3D (target : GLenum, level : int, internalformat : int, width : int, height : int, depth : int, border : int, format : GLenum, type' : GLenum, source : 'a[]) : unit when Unmanaged<'a> =
         let source_p = Array.pin source
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -2119,7 +2119,7 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let source_j = source
         Js.call11 (Js.handle h) "texSubImage3D" target_j level_j xoffset_j yoffset_j zoffset_j width_j height_j depth_j format_j type'_j source_j |> ignore
-    member x.TexSubImage3D (target : GLenum, level : int, xoffset : int, yoffset : int, zoffset : int, width : int, height : int, depth : int, format : GLenum, type' : GLenum, source : 'a[]) : unit =
+    member x.TexSubImage3D (target : GLenum, level : int, xoffset : int, yoffset : int, zoffset : int, width : int, height : int, depth : int, format : GLenum, type' : GLenum, source : 'a[]) : unit when Unmanaged<'a> =
         let source_p = Array.pin source
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -2325,7 +2325,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttribI4iv" index_j values_j |> ignore
-    member x.VertexAttribI4iv (index : int, values : 'a[]) : unit =
+    member x.VertexAttribI4iv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -2342,7 +2342,7 @@ and WebGL2RenderingContext(h : int) =
         let index_j = Js.ofNum (float (index))
         let values_j = values
         Js.call2 (Js.handle h) "vertexAttribI4uiv" index_j values_j |> ignore
-    member x.VertexAttribI4uiv (index : int, values : 'a[]) : unit =
+    member x.VertexAttribI4uiv (index : int, values : 'a[]) : unit when Unmanaged<'a> =
         let values_p = Array.pin values
         let index_j = Js.ofNum (float (index))
         let values_j = Js.viewU8 values_p (Array.byteSize values)
@@ -2383,7 +2383,7 @@ and WebGL2RenderingContext(h : int) =
     member x.DrawBuffers (buffers : JsObj) : unit =
         let buffers_j = buffers
         Js.call1 (Js.handle h) "drawBuffers" buffers_j |> ignore
-    member x.DrawBuffers (buffers : 'a[]) : unit =
+    member x.DrawBuffers (buffers : 'a[]) : unit when Unmanaged<'a> =
         let buffers_p = Array.pin buffers
         let buffers_j = Js.viewU8 buffers_p (Array.byteSize buffers)
         Js.call1 (Js.handle h) "drawBuffers" buffers_j |> ignore
@@ -2522,7 +2522,7 @@ and WebGL2RenderingContext(h : int) =
         let varyings_j = varyings
         let bufferMode_j = Js.ofNum (float (int (bufferMode)))
         Js.call3 (Js.handle h) "transformFeedbackVaryings" program_j varyings_j bufferMode_j |> ignore
-    member x.TransformFeedbackVaryings (program : WebGLProgram, varyings : 'a[], bufferMode : GLenum) : unit =
+    member x.TransformFeedbackVaryings (program : WebGLProgram, varyings : 'a[], bufferMode : GLenum) : unit when Unmanaged<'a> =
         let varyings_p = Array.pin varyings
         let program_j = Js.handle (program).H
         let varyings_j = Js.viewU8 varyings_p (Array.byteSize varyings)
@@ -2602,7 +2602,7 @@ and WebGL2RenderingContext(h : int) =
         let srcData_j = srcData
         let usage_j = Js.ofNum (float (int (usage)))
         Js.call3 (Js.handle h) "bufferData" target_j srcData_j usage_j |> ignore
-    member x.BufferData (target : GLenum, srcData : 'a[], usage : GLenum) : unit =
+    member x.BufferData (target : GLenum, srcData : 'a[], usage : GLenum) : unit when Unmanaged<'a> =
         let srcData_p = Array.pin srcData
         let target_j = Js.ofNum (float (int (target)))
         let srcData_j = Js.viewU8 srcData_p (Array.byteSize srcData)
@@ -2626,7 +2626,7 @@ and WebGL2RenderingContext(h : int) =
         let dstByteOffset_j = Js.ofNum (dstByteOffset)
         let srcData_j = srcData
         Js.call3 (Js.handle h) "bufferSubData" target_j dstByteOffset_j srcData_j |> ignore
-    member x.BufferSubData (target : GLenum, dstByteOffset : float, srcData : 'a[]) : unit =
+    member x.BufferSubData (target : GLenum, dstByteOffset : float, srcData : 'a[]) : unit when Unmanaged<'a> =
         let srcData_p = Array.pin srcData
         let target_j = Js.ofNum (float (int (target)))
         let dstByteOffset_j = Js.ofNum (dstByteOffset)
@@ -2651,7 +2651,7 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let pixels_j = pixels
         Js.call9 (Js.handle h) "texImage2D" target_j level_j internalformat_j width_j height_j border_j format_j type'_j pixels_j |> ignore
-    member x.TexImage2D (target : GLenum, level : int, internalformat : int, width : int, height : int, border : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit =
+    member x.TexImage2D (target : GLenum, level : int, internalformat : int, width : int, height : int, border : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit when Unmanaged<'a> =
         let pixels_p = Array.pin pixels
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -2717,7 +2717,7 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let pixels_j = pixels
         Js.call9 (Js.handle h) "texSubImage2D" target_j level_j xoffset_j yoffset_j width_j height_j format_j type'_j pixels_j |> ignore
-    member x.TexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit =
+    member x.TexSubImage2D (target : GLenum, level : int, xoffset : int, yoffset : int, width : int, height : int, format : GLenum, type' : GLenum, pixels : 'a[]) : unit when Unmanaged<'a> =
         let pixels_p = Array.pin pixels
         let target_j = Js.ofNum (float (int (target)))
         let level_j = Js.ofNum (float (level))
@@ -2895,7 +2895,7 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let dstData_j = dstData
         Js.call7 (Js.handle h) "readPixels" x_j y_j width_j height_j format_j type'_j dstData_j |> ignore
-    member x.ReadPixels (x : int, y : int, width : int, height : int, format : GLenum, type' : GLenum, dstData : 'a[]) : unit =
+    member x.ReadPixels (x : int, y : int, width : int, height : int, format : GLenum, type' : GLenum, dstData : 'a[]) : unit when Unmanaged<'a> =
         let dstData_p = Array.pin dstData
         let x_j = Js.ofNum (float (x))
         let y_j = Js.ofNum (float (y))

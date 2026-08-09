@@ -445,6 +445,19 @@ let unifyTrial (rigid : bool) (t1 : Type) (t2 : Type) : string option =
         v.Level <- lvl
     r
 
+/// Like unifyTrial, but on SUCCESS runs `k` while the trial's bindings are
+/// still applied, and answers its result. A candidate's `when` context can
+/// only be judged against the shapes the fit would give its variables —
+/// after the undo those shapes are gone. Undone either way.
+let unifyTrialUnder (rigid : bool) (t1 : Type) (t2 : Type) (k : unit -> 'r) : 'r option =
+    let trial = { Undo = vecNew<Var * Type option * int> (); Rigid = rigid }
+    let r = unifySeen (refPairSetNew<Type> shallowHash) (Some trial) t1 t2
+    let out = match r with None -> Some (k ()) | Some _ -> None
+    for v, link, lvl in List.rev (vecToList trial.Undo) do
+        v.Link <- link
+        v.Level <- lvl
+    out
+
 /// Variable supply and level tracking for one inference run.
 type TypeState() =
     // the id supply is PROCESS-WIDE: schemes from a cached prelude live

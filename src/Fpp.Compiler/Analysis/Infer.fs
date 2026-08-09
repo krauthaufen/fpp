@@ -97,7 +97,13 @@ type FieldInfo =
       Optionals : int
       /// the parameters' names in declaration order, "" where the parameter
       /// is not a plain identifier. What lets a CALL name its arguments.
-      ParamNames : string list }
+      ParamNames : string list
+      /// the member's declared `when` context, over Params/Quantified —
+      /// instantiated with the same substitution as FieldType at a use,
+      /// then demanded there. Also what ranks an overload set: a candidate
+      /// whose context cannot hold is rejected, a strictly stronger
+      /// context wins.
+      Constraints : Constraint list }
 
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
@@ -432,6 +438,35 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `when 'B :> IFace` — the subtype bound, by the variable's id: member
     /// access on the bounded variable resolves through the interface
     let subtypeBounds = dictNew<int, string> ()
+
+    // ---- the class layer's POOL — ahead of dot resolution, which feeds it.
+    // Wanted constraints accumulate as inference proceeds and are solved to
+    // fixpoint. Anything still unsolved when a binding generalizes becomes
+    // part of its scheme — the caller inherits the obligation.
+    let mutable wanted : (int * Constraint) list = []
+    /// constraints the enclosing binding DECLARED (`when Num<'a>`); a wanted
+    /// entailed by one of these is already discharged
+    let mutable givens : Constraint list = []
+    /// true while a CLASS MEMBER body is inferred. A member has no
+    /// constraint-carrying scheme for its class' variables, so a constraint
+    /// raised there must commit eagerly — a let body's constraint defers on
+    /// an open match and rides the scheme to the stamp instead.
+    let mutable inMemberBody = false
+    /// the offsets whose constraints were raised inside a member body
+    let eagerSeats = dictNew<int, bool> ()
+
+    let addWanted (offset : int) (c : Constraint) : unit =
+        if inMemberBody then dictSet eagerSeats offset true
+        wanted <- wanted @ [ offset, c ]
+
+    let isGround (c : Constraint) : bool = List.isEmpty (List.collect freeVars c.Args)
+
+    /// Discharge a wanted against the declared context, if the context
+    /// entails it. Returns the associated-type bindings the given fixes.
+    let byGiven (c : Constraint) : (string * Type) list option =
+        givens
+        |> List.collect (Classes.entailed classes)
+        |> List.tryPick (fun g -> if Classes.sameHead g c then Some g.Assoc else None)
     /// computation-expression offset -> the builder expression's type. Only
     /// the PROBE pass fills this: by the time the rewrite has run there is
     /// no CompExpr left to see.
@@ -500,7 +535,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if (dictTryFind fields "string.Substring").IsNone then
             let m (ty : Type) =
                 { TypeName = "string"; Params = []; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
             let strArr = TCon ("array", [ tString ])
             let charArr = TCon ("array", [ tChar ])
             // the 1-arg form first: ordinal order IS declaration order
@@ -549,7 +584,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "Option"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
             registerField "Option.IsSome" (m tBool)
             registerField "Option.IsNone" (m tBool)
             registerField "Option.Value" (m (TVar elem))
@@ -564,7 +599,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "list"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
             registerField "list.IsEmpty" (m tBool)
             registerField "list.Length" (m tInt)
             registerField "list.Head" (m (TVar elem))
@@ -758,7 +793,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         else dictTryFind shared (dp + ":" + string doff)) with
                  | Some sch ->
                      (match (if dp = path then instantiateTracked sch else instantiateImported sch) with
-                      | TFun (selfT, memT), fresh, _ ->
+                      | TFun (selfT, memT), fresh, cs ->
                           (match prune selfT with
                            | TCon (sn, sargs) when sn = tn && sargs.Length = args.Length ->
                                List.iter2 (unifyAt offset) sargs args
@@ -808,6 +843,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                unifyMemberAt offset result2 memT
                                if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
                                vecAdd memberSitesRaw (offset, ownerTag)
+                               // the member's declared context becomes this
+                               // use's obligation — instantiated alongside
+                               // the type, demanded here
+                               for c in cs do addWanted offset c
                                true
                            | _ -> false)
                       | _ -> false)
@@ -906,7 +945,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // the use's fresh result either way), and a still
                          // unconstrained argument scores every candidate the
                          // same, which leaves the tie to declaration order.
-                         let score (c : FieldInfo) : int option =
+                         // judge a candidate's `when` context while the fit's
+                         // bindings are LIVE: satisfiable? its entailment
+                         // closure (the specificity order)? ground enough to
+                         // compare at all?
+                         let judgeCons (cs2 : Constraint list) : bool * string list * bool =
+                             let mutable ok = true
+                             let mutable ground = true
+                             let keys = vecNew<string> ()
+                             for c2 in cs2 do
+                                 let c3 = mapConstraint prune c2
+                                 if c3.Args |> List.exists (fun a2 -> not (List.isEmpty (freeVars a2))) then
+                                     ground <- false
+                                 (match byGiven c3 with
+                                  | Some _ -> ()
+                                  | None ->
+                                      (match Classes.select classes false c3.Class c3.Args c3.Assoc with
+                                       | Classes.NoInstance -> ok <- false
+                                       | _ -> ()))
+                                 for g in Classes.entailed classes c3 do
+                                     vecAdd keys
+                                         (g.Class + "<"
+                                          + String.concat "," (g.Args |> List.map (fun a2 -> typeString (prune a2)))
+                                          + ">")
+                             ok, (vecToList keys |> List.distinct), ground
+                         let score (c : FieldInfo) : (int * (bool * string list * bool)) option =
                              let subst = dictNew<int, Type> ()
                              for pv in c.Params do dictSet subst (prunedId pv) (st.Fresh ())
                              for qv in c.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
@@ -946,23 +1009,82 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              match Types.unifyTrialScore true ft demanded with
                              | None -> None
                              | Some _ ->
+                                 let coninfo =
+                                     if List.isEmpty c.Constraints then (true, [], true)
+                                     else
+                                         let cs2 = c.Constraints |> List.map (mapConstraint (substVars subst))
+                                         match Types.unifyTrialUnder true ft demanded (fun () -> judgeCons cs2) with
+                                         | Some r -> r
+                                         | None -> (true, [], true)
                                  match prune ft, prune demanded with
                                  | TFun (p1, _), TFun (p2, _) ->
                                      (match Types.unifyTrialScore true p1 p2 with
-                                      | Some n -> Some n
-                                      | None -> Some 1000000)
-                                 | _ -> Some 0
+                                      | Some n -> Some (n, coninfo)
+                                      | None -> Some (1000000, coninfo))
+                                 | _ -> Some (0, coninfo)
                          let scored =
-                             many |> List.choose (fun (o, c) -> score c |> Option.map (fun n -> n, (o, c)))
-                         (match scored with
+                             many |> List.choose (fun (o, c) -> score c |> Option.map (fun (n, ci) -> n, ci, (o, c)))
+                         // a candidate whose declared context CANNOT hold is
+                         // out — unless that empties the set, where binding
+                         // one keeps the error at this very use
+                         let viable =
+                             match scored |> List.filter (fun (_, (ok, _, _), _) -> ok) with
+                             | [] -> scored
+                             | v -> v
+                         (match viable with
                           | _ :: _ ->
                               // an EXACT fit (zero parameter bindings)
                               // outranks declaration order; anything less
                               // exact keeps the old first-fit rule, which
                               // matters when arguments are still variables
-                              (match scored |> List.tryPick (fun (n, pc) -> if n = 0 then Some pc else None) with
-                               | Some pc -> pc
-                               | None -> snd (List.head scored))
+                              let grp =
+                                  match viable |> List.filter (fun (n, _, _) -> n = 0) with
+                                  | [] -> viable
+                                  | ex -> ex
+                              // among equal fits the declared contexts rank:
+                              // a strictly STRONGER context (entailment
+                              // closure a strict superset) is more specific —
+                              // Fractional beats Num at float, two unrelated
+                              // constraints beat one. Only GROUND contexts
+                              // compare; equal ones keep declaration order;
+                              // incomparable ones are a real ambiguity and
+                              // say so instead of picking silently.
+                              let keysOf (x : int * (bool * string list * bool) * (int * FieldInfo)) =
+                                  let _, (_, ks, _), _ = x in ks
+                              let supset (a : string list) (b : string list) =
+                                  b |> List.forall (fun k -> List.contains k a)
+                              let sameKeys a b = supset a b && supset b a
+                              let pick =
+                                  match grp with
+                                  | [ only ] -> only
+                                  | first :: rest ->
+                                      let allGround =
+                                          grp |> List.forall (fun (_, (_, _, g), _) -> g)
+                                      if not allGround
+                                         || rest |> List.forall (fun x -> sameKeys (keysOf first) (keysOf x)) then first
+                                      else
+                                          let maximal =
+                                              grp |> List.filter (fun x ->
+                                                  not (grp |> List.exists (fun y ->
+                                                      supset (keysOf y) (keysOf x)
+                                                      && not (supset (keysOf x) (keysOf y)))))
+                                          (match maximal with
+                                           | [ one ] -> one
+                                           | m1 :: mrest ->
+                                               if mrest |> List.forall (fun x -> sameKeys (keysOf m1) (keysOf x)) then m1
+                                               else
+                                                   vecAdd diags
+                                                       (offset,
+                                                        "ambiguous overload " + name
+                                                        + ": the constraint contexts order neither way — "
+                                                        + String.concat " vs " (maximal |> List.map (fun x ->
+                                                            match keysOf x with
+                                                            | [] -> "(none)"
+                                                            | ks -> String.concat " and " ks)))
+                                                   m1
+                                           | [] -> first)
+                                  | [] -> List.head viable
+                              (let _, _, pc = pick in pc)
                           | [] ->
                               // Nothing fits EXACTLY. Widening is the one
                               // rule plain unification does not model —
@@ -1016,6 +1138,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let result2 = optJoinDemand chosen demanded2 appOff2 result
                      unifyMemberAt offset result2 chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
+                     // the declared context, under the same substitution the
+                     // type took — this use owes it
+                     for c in fi.Constraints do
+                         addWanted offset (mapConstraint (substVars subst) c)
                      if fi.DefKey.IsNone then
                          // named AFTER solving, like a record literal: at
                          // this moment the receiver's arguments may still be
@@ -1032,9 +1158,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // path emitted a bare EVar — and the template it named
                      // had been removed by stamping
                      (match fi.DefKey with
-                      | Some (dp, doff) when dp = path ->
-                          (match dictTryFind defSchemes doff with
-                           | Some sch when not (List.isEmpty sch.Quantified) ->
+                      | Some (dp, doff) ->
+                          // ANOTHER FILE's member records the demand too:
+                          // a layout-dependent static (a `when Pinnable`
+                          // body) called cross-file otherwise ran the
+                          // unstamped template
+                          (match (if dp = path then dictTryFind defSchemes doff
+                                  else dictTryFind shared (dp + ":" + string doff)) with
+                           | Some sch when not (List.isEmpty sch.Quantified) && dp = path ->
                                let inst =
                                    sch.Quantified
                                    |> List.map (fun qv ->
@@ -1042,6 +1173,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | Some t -> t
                                        | None -> st.Fresh ())
                                vecAdd instRaw (offset, inst)
+                           | Some sch when not (List.isEmpty sch.Quantified) ->
+                               // an IMPORTED scheme's variables are not the
+                               // FieldInfo's, so the subst cannot name them:
+                               // instantiate it and TIE the copy to this
+                               // use's declaration by unification — the
+                               // fresh list then prunes concrete for the
+                               // stamper
+                               let ty, fresh, _ = instantiateImported sch
+                               let memT =
+                                   if not fi.IsStatic then
+                                       (match prune ty with TFun (_, r) -> r | _ -> ty)
+                                   elif (Types.unifyTrial false ty declared).IsNone then ty
+                                   else (match prune ty with TFun (_, r) -> r | _ -> ty)
+                               unifyAt offset memT declared
+                               vecAdd instRaw (offset, fresh)
                            | _ -> ())
                       | _ -> ())
                      true
@@ -1325,10 +1471,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // fixpoint. Anything still unsolved when a binding generalizes becomes
     // part of its scheme — the caller inherits the obligation.
 
-    let mutable wanted : (int * Constraint) list = []
-    /// constraints the enclosing binding DECLARED (`when Num<'a>`); a wanted
-    /// entailed by one of these is already discharged
-    let mutable givens : Constraint list = []
     /// class-member use offset -> the instance member it resolved to
     let classUsesRaw = vecNew<int * Classes.InstMember> ()
     let classPendingRaw = vecNew<int * string> ()
@@ -1399,18 +1541,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// operator offset -> the left operand's type, for the backend
     let opTypesRaw = vecNew<int * Type> ()
     let exprTypesRaw = vecNew<int * int * Type> ()
-
-    /// true while a CLASS MEMBER body is inferred. A member has no
-    /// constraint-carrying scheme for its class' variables, so a constraint
-    /// raised there must commit eagerly — a let body's constraint defers on
-    /// an open match and rides the scheme to the stamp instead.
-    let mutable inMemberBody = false
-    /// the offsets whose constraints were raised inside a member body
-    let eagerSeats = dictNew<int, bool> ()
-
-    let addWanted (offset : int) (c : Constraint) : unit =
-        if inMemberBody then dictSet eagerSeats offset true
-        wanted <- wanted @ [ offset, c ]
 
     /// superclass requirements of this file's instances, verified once the
     /// whole file has registered its declarations
@@ -1558,15 +1688,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               Members = [ "arbitrary", { MPath = path; MOffset = off; MName = name2; MTakesUnit = false; MInst = [] } ]
                               Builtin = false; Path = path; Offset = off }
                         true
-
-    let isGround (c : Constraint) : bool = List.isEmpty (List.collect freeVars c.Args)
-
-    /// Discharge a wanted against the declared context, if the context
-    /// entails it. Returns the associated-type bindings the given fixes.
-    let byGiven (c : Constraint) : (string * Type) list option =
-        givens
-        |> List.collect (Classes.entailed classes)
-        |> List.tryPick (fun g -> if Classes.sameHead g c then Some g.Assoc else None)
 
     /// One solving pass. Returns whether anything changed, and the wanteds
     /// that survive.
@@ -4436,8 +4557,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
                          for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
                          vecAdd memberSitesRaw (name.Offset, tn)
-                         // a same-file static member of a generic type is a
-                         // generic function once lifted, so this use is a
+                         let declared = substVars subst fi.FieldType
+                         // the declared `when` context is this use's
+                         // obligation, under the same substitution
+                         for c in fi.Constraints do
+                             addWanted name.Offset (mapConstraint (substVars subst) c)
+                         // a static member of a generic type is a generic
+                         // function once lifted, so this use is a
                          // specialization demand — recorded in the definition
                          // scheme's own variable order so the stamper's zip
                          // lines up. Without it a layout-dependent static
@@ -4455,8 +4581,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                            | None -> st.Fresh ())
                                    vecAdd instRaw (name.Offset, inst)
                                | _ -> ())
+                          | Some (dp, doff) ->
+                              // ANOTHER FILE's static: the imported scheme's
+                              // variables are not the FieldInfo's, so TIE an
+                              // instantiated copy to this use by unification
+                              // — the fresh list then prunes concrete for
+                              // the stamper
+                              (match dictTryFind shared (dp + ":" + string doff) with
+                               | Some sch when not (List.isEmpty sch.Quantified) ->
+                                   let ty, fresh, _ = instantiateImported sch
+                                   let memT =
+                                       if not fi.IsStatic then
+                                           (match prune ty with TFun (_, r) -> r | _ -> ty)
+                                       elif (Types.unifyTrial false ty declared).IsNone then ty
+                                       else (match prune ty with TFun (_, r) -> r | _ -> ty)
+                                   unifyAt name.Offset memT declared
+                                   vecAdd instRaw (name.Offset, fresh)
+                               | _ -> ())
                           | _ -> ())
-                         substVars subst fi.FieldType
+                         declared
                      | (_, first) :: _ ->
                          // STATIC overloads park like instance ones: at this
                          // moment the application has not been typed, so
@@ -5257,7 +5400,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              recordDef t ft
                              let info =
                                  { TypeName = name; Params = paramVarList (); Quantified = []
-                                   FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
+                                   FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
                              // bare name: last declaration wins (F# shadowing);
                              // qualified key: dot-access on a known record type
                              dictSet fields t.Text info
@@ -5370,7 +5513,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      recordDef nameTok ft
                      let info =
                          { TypeName = name; Params = paramVarList (); Quantified = []
-                           FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = [] }
+                           FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
                      dictSet fields nameTok.Text info
                      dictSet fields (name + "." + nameTok.Text) info
                  | _ -> ())
@@ -5586,7 +5729,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                { TypeName = tyName; Params = classParams
                                  Quantified = []
                                  FieldType = setTy
-                                 DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = [] }
+                                 DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
                        | None -> ())
                   | _ -> ())
              | None -> ())
@@ -5605,11 +5748,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            |> List.filter (fun v -> not (Set.contains v.Id classIds))
                        FieldType = propTy
                        DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
-                       IsStatic = false; Optionals = 0; ParamNames = [] }
+                       IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
              | None -> ())
         else
 
         let paramTys = vecToList pats |> List.map (patType mvars)
+        // a declared `when C<'a>` — after the parameters, so the variables
+        // it names are already in scope. Givens inside the body, carried on
+        // the scheme, demanded at every use — a member is a constrained
+        // function the way a let is.
+        let memberCons =
+            nodesOf n
+            |> List.filter (fun m -> m.NodeKind = WhenDecl)
+            |> List.choose (constraintOf mvars)
         // an OVERRIDE's parameters take the ABSTRACT's declared types,
         // exactly as F# types them: the body dispatches members on them
         // (`o.Tag` on an IAdaptiveObject), and typing them fresh left the
@@ -5675,8 +5826,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   pin paramTys declared
               | None -> ())
          | _ -> ())
-        // body typed only after parameters are bound
+        // body typed only after parameters are bound. The declared context
+        // is a GIVEN while it types, and wanteds it entails are solved
+        // while the givens are still in scope — the let path's rule.
+        let savedGivens = givens
+        givens <- givens @ memberCons
         let bodyTys = vecToList bodies |> List.map exprType
+        (if not (List.isEmpty memberCons) then solveWanted ())
+        givens <- savedGivens
         let bodyTy =
             match List.tryLast bodyTys with
             | Some t -> t
@@ -5704,7 +5861,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // quantify explicitly: the class' own type parameters live at
                 // the type-declaration level, which level-based
                 // generalization would refuse to close over
-                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
+                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = memberCons; Body = defTy })
             let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
             let quantified =
                 freeVars memberTy
@@ -5714,7 +5871,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 { TypeName = tyName; Params = classParams; Quantified = quantified
                   FieldType = memberTy
                   DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
-                  IsStatic = isStatic; Optionals = optionalArity n; ParamNames = paramNames n }
+                  IsStatic = isStatic; Optionals = optionalArity n; ParamNames = paramNames n
+                  Constraints = memberCons }
         | None -> ()
 
     /// An instance member is an ordinary function; the only extra work is

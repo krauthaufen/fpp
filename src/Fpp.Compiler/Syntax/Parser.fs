@@ -1563,11 +1563,22 @@ let parse (src : string) : ParseResult =
             if s.IsOp ":" then
                 vecAdd acc (s.Bump ())
                 vecAdd acc (parseType mcol)
-                // trailing constraints: `... -> 't<'m, 'a> when 'm : Monad`
-                if s.IsKw "when" then
-                    vecAdd acc (s.Bump ())
-                    while not s.AtEof && not (s.IsOp "=") && (s.SameLine || s.CurCol > mcol) do
-                        vecAdd acc (s.Bump ())
+                // trailing constraints: `... : int when Pinnable<'a>` — the
+                // same WhenDecl a let signature carries, so the member's
+                // walk can skip the node and constraintOf can read it. Left
+                // as bare tokens, `Pinnable` and `'a` land among the
+                // pre-`=` identifiers and the member loses its NAME.
+                while s.IsKw "when" && (s.SameLine || s.CurCol > mcol) do
+                    if (s.Peek 1).Kind = Ident then vecAdd acc (parseWhen false mcol)
+                    else
+                        // F#-style variable constraint (`when 'm : Monad`):
+                        // its tokens, in their own node
+                        let cons = vecNew<Green> ()
+                        vecAdd cons (s.Bump ())
+                        while not s.AtEof && not (s.IsOp "=") && not (s.IsKw "when")
+                              && (s.SameLine || s.CurCol > mcol) do
+                            vecAdd cons (s.Bump ())
+                        vecAdd acc (Green.node WhenDecl (vecToList cons))
             if s.IsKw "with"
                && (let p = s.Peek 1 in
                    p.Text = "get" || p.Text = "set" || p.Text = "inline"
