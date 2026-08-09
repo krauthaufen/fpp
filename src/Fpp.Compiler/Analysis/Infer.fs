@@ -1321,8 +1321,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// written arguments say which type of this name is intended
     let arityNameOfDef (d : Resolve.Definition) : string =
         match dictTryFind aliases ("$adecl:" + d.Path + ":" + string d.Offset) with
+        // the seat carries the DECORATED name when this declaration lost a
+        // same-name-same-arity collision
+        | Some (_, TCon (dn, _)) when dn <> d.Name && dn <> "" -> dn
         | Some (ps, _) -> arityName d.Name ps.Length
         | None -> d.Name
+
+    /// the name THIS declaration's type goes by — its own seat's decorated
+    /// name when a collision renamed it, the arity variant otherwise
+    let declaredTypeName (path0 : string) (tok : Token) (n : int) : string =
+        match dictTryFind aliases ("$adecl:" + path0 + ":" + string tok.Offset) with
+        | Some (_, TCon (dn, _)) when dn <> tok.Text && dn <> "" -> dn
+        | _ -> arityName tok.Text n
 
     /// every declared variant of a name, for a use that does not write its
     /// type arguments (a bare constructor call chooses by ARGUMENT fit).
@@ -1349,6 +1359,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         @ (freeVars ctorTy
            |> List.distinctBy (fun v -> v.Id)
            |> List.filter (fun v -> not (Set.contains v.Id declIds)))
+
+    /// the type a WRITTEN name at this argument count denotes: when the
+    /// resolver bound the token to a declaration of exactly this arity,
+    /// that declaration's (possibly collision-decorated) name wins; the
+    /// count-based arity variant otherwise
+    let writtenTypeName (tok : Token) (argc : int) : string =
+        match dictTryFind useDefs tok.Offset with
+        | Some d when d.Kind = Resolve.DefType ->
+            (match dictTryFind aliases ("$adecl:" + d.Path + ":" + string d.Offset) with
+             | Some (ps, TCon (dn, _)) when ps.Length = argc && dn <> "" -> dn
+             | _ -> arityName tok.Text argc)
+        | _ -> arityName tok.Text argc
 
     let rec typeFromNode (vars : Dict<string, Type>) (n : GreenNode) : Type =
         let namedVar (name : string) : Type =
@@ -1379,13 +1401,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | None -> st.Fresh ())
         | AnonType -> st.Fresh ()
         | NamedType ->
-            let name =
-                match tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
-                | Some t -> t.Text
-                | None -> "?"
+            let nameTok =
+                tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+            let name = match nameTok with Some t -> t.Text | None -> "?"
             (match expandAlias name [] with
              | Some t -> t
-             | None -> TCon (name, []))
+             | None ->
+                 TCon ((match nameTok with
+                        | Some t -> writtenTypeName t 0
+                        | None -> name), []))
         | AppType ->
             (match nodesOf n with
              | head :: _ ->
@@ -1394,8 +1418,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      |> List.map (typeFromNode vars)
                  (match nodesOf n |> List.tryHead with
                   | Some h when h.NodeKind = NamedType ->
+                      let nameTok =
+                          tokensOf h |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
                       let name =
-                          match tokensOf h |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          match nameTok with
                           | Some t -> t.Text
                           | None -> "?"
                       (match expandAlias name args with
@@ -1422,7 +1448,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                           + ", not " + string args.Length)
                                  | None -> ())
                             | _ -> ())
-                           TCon (arityName name args.Length, args))
+                           TCon ((match nameTok with
+                                  | Some t -> writtenTypeName t args.Length
+                                  | None -> arityName name args.Length), args))
                   | _ ->
                       match typeFromNode vars head with
                       | TCon (name, []) -> TCon (name, args)
@@ -1443,7 +1471,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  let arg = typeFromNode vars inner
                  (match expandAlias t.Text [ arg ] with
                   | Some ty -> ty
-                  | None -> TCon (arityName t.Text 1, [ arg ]))
+                  | None -> TCon (writtenTypeName t 1, [ arg ]))
              | [ inner ], _ -> TCon ("array", [ typeFromNode vars inner ])   // int[]
              | _ -> st.Fresh ())
         | FunType ->
@@ -5257,9 +5285,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | TCon (target, _) -> target
                      | _ -> written)
                 | None -> written
-        // a name redeclared at a DIFFERENT arity is a DIFFERENT type — the
-        // pre-sweep recorded every arity, so the decoration is known here
-        let name = arityName plain (vecToList tyParams |> List.length)
+        // a name redeclared at a DIFFERENT arity — or at the SAME arity in
+        // another module — is a DIFFERENT type; the pre-sweep recorded the
+        // decoration per declaration, so it is known here
+        // `plain` may be the ALIAS-REMAPPED target (`type List<'T> with`
+        // extends ResizeArray) — the decorated per-declaration name only
+        // takes over when a collision actually renamed THIS declaration
+        let name =
+            match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+            | Some t ->
+                let dn = declaredTypeName path t (vecToList tyParams |> List.length)
+                if dn <> t.Text then dn
+                else arityName plain (vecToList tyParams |> List.length)
+            | None -> arityName plain (vecToList tyParams |> List.length)
         if name <> plain then
             (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
              | Some t -> vecAdd fieldOwnersRaw (t.Offset, "$tyname:" + name)
@@ -6016,7 +6054,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
         | Some nameTok when (dictTryFind defsAt nameTok.Offset).IsSome ->
             // the same Name`N key the declaration itself will take
-            let selfTy = TCon (arityName nameTok.Text (vecToList tyParams |> List.length), vecToList tyParams)
+            let selfTy = TCon (declaredTypeName path nameTok (vecToList tyParams |> List.length), vecToList tyParams)
             // a struct-block type's only constructors are `new(...)` MEMBERS
             // — predeclare those too, or an earlier member of the and-group
             // calling `new MapExtEnumerator<_,_>(root)` finds nothing and
@@ -6377,19 +6415,60 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
                 | Some t ->
                     arityDeclared t.Text (tyParamCount n)
+                    // A SECOND declaration of the same name at the SAME
+                    // arity is its own type: it gets a decorated identity
+                    // (Name@2), or two modules' unrelated records share one
+                    // layout and the loser stubs "missing field". Exempt:
+                    // an EXTENSION (`type X with` adds members to the one
+                    // type), and a redeclaration of a PRELUDE name (the
+                    // deliberate merge that lets user code extend HashSet).
+                    let identity = path + ":" + string t.Offset
+                    let isExtension =
+                        tokensOf n |> List.exists (fun k -> k.Kind = Keyword && k.Text = "with")
+                        && not (tokensOf n |> List.exists (fun k -> k.Kind = Operator && k.Text = "="))
+                    let dupKey = "$aritydup:" + t.Text + ":" + string (tyParamCount n)
+                    // the base name already carries the ARITY decoration
+                    // (Pair`1) — the collision ordinal composes on top
+                    let baseName = arityName t.Text (tyParamCount n)
+                    let decorated =
+                        if isExtension then baseName
+                        else
+                            match dictTryFind aliases dupKey with
+                            | None ->
+                                dictSet aliases dupKey ([], TCon (identity, []))
+                                baseName
+                            | Some (_, TCon (firstId, _)) when firstId = identity ->
+                                baseName   // the sweep re-ran over this file
+                            | Some (_, TCon (firstId, _)) when firstId.StartsWith (Classes.builtinPath + ":") ->
+                                baseName   // prelude merge, by design
+                            | _ ->
+                                let cKey = "$aritydupc:" + t.Text + ":" + string (tyParamCount n)
+                                let nth =
+                                    match dictTryFind aliases (cKey + ":" + identity) with
+                                    | Some (_, TCon (o, _)) -> o
+                                    | _ ->
+                                        let o =
+                                            match dictTryFind aliases cKey with
+                                            | Some (_, TCon (c, _)) -> string (int c + 1)
+                                            | _ -> "2"
+                                        dictSet aliases cKey ([], TCon (o, []))
+                                        dictSet aliases (cKey + ":" + identity) ([], TCon (o, []))
+                                        o
+                                baseName + "@" + nth
                     // where each type name is declared, for the orphan rule —
                     // recorded in the sweep so the table is complete for a
                     // file before any of its instances register
-                    Classes.addTypePath classes (arityName t.Text (tyParamCount n)) path
+                    Classes.addTypePath classes decorated path
                     // per-DECLARATION arity, so a BARE use — `Inner.GetCount`
                     // has no written arguments — can still find the variant
-                    // its resolved definition means
+                    // its resolved definition means. The TCon slot carries
+                    // the DECORATED name; plain when nothing collided.
                     let seat = "$adecl:" + path + ":" + string t.Offset
-                    if (dictTryFind aliases seat).IsNone then
+                    if (dictTryFind aliases seat).IsNone || decorated <> t.Text then
                         let vs =
                             List.init (tyParamCount n) (fun _ -> st.Fresh ())
                             |> List.choose (fun x -> match prune x with TVar v -> Some v | _ -> None)
-                        dictSet aliases seat (vs, TCon (t.Text, []))
+                        dictSet aliases seat (vs, TCon (decorated, []))
                 | None -> ()
             elif n.NodeKind = ModuleDef then n.Children |> List.iter aritySweep
     root.Children |> List.iter aritySweep
@@ -6430,7 +6509,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 (match prune body with TCon (t, _) -> t | _ -> nm)
                             | None -> nm)
                     if not (List.isEmpty names) then
-                        let key = arityName nameTok.Text (tyParamCount n)
+                        let key = declaredTypeName path nameTok (tyParamCount n)
                         let prior = match dictTryFind impls key with Some l -> l | None -> []
                         dictSet impls key (prior @ names)
                         // the DECLARED instantiation, typed at the class's
