@@ -2,19 +2,20 @@
 
 ## Why
 
-F# is a language worth keeping. But every way of shipping it means
-shipping .NET — and that is true of AOT too. NativeAOT does not remove
-the runtime, it links it in: the binary still carries the CLR's GC, its
-metadata, and the semantics IL demands, because it must run anything the
-CLR could. On the web that story is heavier still — a .NET wasm app is
-the runtime compiled to wasm with your program riding along, megabytes
-before the first frame, and every call into the browser marshaled through
-it. AOT changes when the runtime's price is paid, not whether.
+I set out to write F++ after many years of F#, because .NET's claim of
+platform independence no longer holds — and mostly never did. In 2005,
+when platform independence meant Windows, Linux and macOS, the runtime
+couldn't keep up. In 2026 it means Android, iOS and the web, and it still
+can't: iOS demands an AOT build, taking away the very things the runtime
+existed for in the first place; the web is the same story, unless you are
+happy with Texas-Instruments-calculator performance on number-crunching
+tasks. The platform the runtime promised to abstract over has moved out
+from under it, twice.
 
-F++ pays it never: F# rebuilt as its own language, the way OCaml is its
-own language. The compiler knows the whole program, so the output contains
-the program — a small wasm module or a native binary over a GC built for
-it, starting immediately, talking to the browser directly. And with the
+F++ takes all of that away. It takes the language — the one worth keeping
+— and makes it live natively in the environments the work actually
+happens in: a small wasm module that starts immediately and talks to the
+browser directly, or a native binary over a GC built for it. And with the
 CLR gone, its ceiling on the type system goes too: typeclasses,
 higher-kinded types, GADTs — the features F# wanted and IL could not
 carry.
