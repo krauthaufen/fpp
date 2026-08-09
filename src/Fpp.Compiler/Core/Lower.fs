@@ -1196,7 +1196,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          let given = (args |> List.map (fun a -> lowerExpr (GNode a))) @ packFns
                          // the call left optional parameters off; inference
                          // counted them, and each one is None
-                         match dictTryFind fieldOwners (offsetOf n) with
+                         let optMarker =
+                             match dictTryFind fieldOwners (offsetOf n) with
+                             | Some m when m.StartsWith "$call:" || m.StartsWith "$optargs:" -> Some m
+                             | _ ->
+                                 // a DEFERRED member resolution keys the
+                                 // marker at the MEMBER token instead
+                                 match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                                 | Some mt ->
+                                     (match dictTryFind fieldOwners mt.Offset with
+                                      | Some m when m.StartsWith "$optargs:" -> Some m
+                                      | _ -> None)
+                                 | None -> None
+                         match optMarker with
                          | Some m when m.StartsWith "$call:" ->
                              // inference put the arguments in DECLARATION
                              // order and said, per slot, which written element

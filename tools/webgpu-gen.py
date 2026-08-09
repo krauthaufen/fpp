@@ -272,7 +272,12 @@ def emit(model):
             else:
                 conv = of_js(model, k, get)
                 if conv: a('    member x.%s : %s = %s' % (pascal(at['name']), t, conv))
+        seen_methods = set()
         for me in iface['methods']:
+            # same-name IDL overloads: keep the FIRST form (same-name F++
+            # member overloads trip selection crosstalk)
+            if me['name'] in seen_methods: continue
+            seen_methods.add(me['name'])
             rt, rk = fpp_type(model, me['ret'])
             # dict/seq RETURNS have no reverse marshal (v1): raw JsObj
             if rk[0] in ('dict', 'seq'): rt, rk = 'JsObj', ('raw',)

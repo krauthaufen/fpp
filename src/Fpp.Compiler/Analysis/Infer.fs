@@ -618,7 +618,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// separates `d.TryGetValue v` from `d.TryGetValue (k, &v)` when v's
     /// type is still a variable: one written element means the out-parameter
     /// VIEW, the full count means the .NET signature — exactly F#'s rule.
-    let mutable dotDemand : (int * Type * int) option = None
+    let mutable dotDemand : (int * Type * int * int) option = None
 
     /// The TUPLE VIEW of a member whose last parameter is an out. F#
     /// synthesizes one for every such method — `d.TryGetValue k` returns
@@ -698,6 +698,54 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // inherited member the declared self is the base, and unifying it
         // with the receiver would demand a subtyping the unifier has no
         // notion of. Type arguments are unified, never the nominal head.
+    /// OPTIONAL-JOIN at a member demand: the written tuple may be SHORTER
+        /// than the parameters — trailing Option parameters absorb the
+        /// difference, exactly as the local-sig join does; Lower reads the same
+        /// "$optargs" marker at the application offset.
+        let optJoinDemand (memT : Type) (demanded : Type) (appOff : int option) (result : Type) : Type =
+            match prune memT, prune demanded, appOff with
+            | TFun (pt, _), TFun (dArg, dRes), Some ao ->
+                (match prune pt with
+                 | TTuple ps ->
+                     let supplied =
+                         match prune dArg with
+                         | TTuple ys -> ys
+                         | TCon ("unit", []) -> []
+                         | one -> [ one ]
+                     let have = List.length supplied
+                     let need = List.length ps
+                     let omit =
+                         ps |> List.rev
+                         |> List.takeWhile (fun p2 ->
+                             match prune p2 with
+                             | TCon ("Option", _) -> true
+                             | _ -> false)
+                         |> List.length
+                     if have < need && need - have <= omit then
+                         let firstOpt = need - omit
+                         let wraps =
+                             supplied
+                             |> List.mapi (fun i x -> i, x)
+                             |> List.filter (fun (i, x) ->
+                                 i >= firstOpt
+                                 && (match prune (List.item i ps) with
+                                     | TCon ("Option", [ inner ]) ->
+                                         not ((Types.unifyTrial false (List.item i ps) x).IsSome
+                                              && (Types.unifyTrial false inner x).IsNone)
+                                     | _ -> false))
+                             |> List.map fst
+                         let filled =
+                             supplied
+                             |> List.mapi (fun i x ->
+                                 if List.contains i wraps then List.item i ps else x)
+                         vecAdd fieldOwnersRaw
+                             (ao, "$optargs:" + string (need - have) + ":"
+                                  + String.concat "," (List.map (fun i -> string i) wraps))
+                         TFun (TTuple (filled @ List.skip have ps), dRes)
+                     else result
+                 | _ -> result)
+            | _ -> result
+
         let tracked (ownerTag : string) (tn : string) (args : Type list) (fi : FieldInfo) : bool =
             match fi.DefKey with
             | Some (dp, doff) when not fi.IsStatic && fi.TypeName = tn ->
@@ -716,10 +764,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                List.iter2 (unifyAt offset) sargs args
                                // the same out-parameter view the general path
                                // takes; a member of THIS file arrives here
-                               let demanded, argc =
+                               let demanded, argc, appOff =
                                    match dotDemand with
-                                   | Some (off, want, c) when off = offset -> want, Some c
-                                   | _ -> result, None
+                                   | Some (off, want, c, ao) when off = offset -> want, Some c, Some ao
+                                   // DEFERRED (retry-loop) resolution: the
+                                   // demand is gone but result carries the
+                                   // written shape; the member token keys
+                                   // the marker (Lower checks it too)
+                                   | _ -> result, None, Some offset
                                // the WRITTEN element count decides between the
                                // .NET byref signature and its tuple view — a
                                // still-variable argument fits both, and the
@@ -752,7 +804,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                            vecAdd fieldOwnersRaw (offset, "$out:" + outName)
                                            v
                                        | _ -> memT
-                               unifyMemberAt offset result memT
+                               let result2 = optJoinDemand memT demanded appOff result
+                               unifyMemberAt offset result2 memT
                                if not (List.isEmpty fresh) then vecAdd instRaw (offset, fresh)
                                vecAdd memberSitesRaw (offset, ownerTag)
                                true
@@ -819,7 +872,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // breaks genuine ties in declaration order.
                  let demanded =
                      match dotDemand with
-                     | Some (off, want, _) when off = offset -> want
+                     | Some (off, want, _, _) when off = offset -> want
                      | _ -> result
                  let informative =
                      match prune demanded with
@@ -861,6 +914,35 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  if (dictTryFind subst (prunedId fv)).IsNone then
                                      dictSet subst (prunedId fv) (st.Fresh ())
                              let ft = substVars subst c.FieldType
+                             // a call may leave TRAILING Option parameters
+                             // off — pad the demand before judging the fit
+                             let demanded =
+                                 match Types.unifyTrialScore true ft demanded with
+                                 | Some _ -> demanded
+                                 | None ->
+                                     match prune ft, prune demanded with
+                                     | TFun (pt, _), TFun (dArg, dRes) ->
+                                         (match prune pt with
+                                          | TTuple ps ->
+                                              let sup =
+                                                  match prune dArg with
+                                                  | TTuple ys -> ys
+                                                  | TCon ("unit", []) -> []
+                                                  | one -> [ one ]
+                                              let omit =
+                                                  ps |> List.rev
+                                                  |> List.takeWhile (fun p2 ->
+                                                      match prune p2 with
+                                                      | TCon ("Option", _) -> true
+                                                      | _ -> false)
+                                                  |> List.length
+                                              let have = List.length sup
+                                              let need = List.length ps
+                                              if have < need && need - have <= omit
+                                              then TFun (TTuple (sup @ List.skip have ps), dRes)
+                                              else demanded
+                                          | _ -> demanded)
+                                     | _ -> demanded
                              match Types.unifyTrialScore true ft demanded with
                              | None -> None
                              | Some _ ->
@@ -927,7 +1009,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  vecAdd fieldOwnersRaw (offset, "$out:" + outName)
                                  v
                              | _ -> declared
-                     unifyMemberAt offset result chosen
+                     let demanded2, appOff2 =
+                         match dotDemand with
+                         | Some (off, want, _, ao) when off = offset -> want, Some ao
+                         | _ -> result, Some offset
+                     let result2 = optJoinDemand chosen demanded2 appOff2 result
+                     unifyMemberAt offset result2 chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
                      if fi.DefKey.IsNone then
                          // named AFTER solving, like a record literal: at
@@ -3047,7 +3134,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | [ t ] -> counted t
                                   | xs -> List.length xs
                               else counted only
-                          dotDemand <- Some (mt.Offset, TFun (argTy, st.Fresh ()), argc)
+                          dotDemand <-
+                              (let ao = match Green.tokens (GNode n) |> List.tryHead with Some t0 -> t0.Offset | None -> mt.Offset
+                               Some (mt.Offset, TFun (argTy, st.Fresh ()), argc, ao))
                       | _ -> ())
                      let want = expected
                      let mutable funTy = exprType (GNode head)
@@ -3118,8 +3207,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let calleeSig =
                          match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                          | Some ht ->
-                             (match dictTryFind useDefs ht.Offset with
-                              | Some d -> dictTryFind fields ("$sig:" + d.Path + ":" + string d.Offset)
+                             let bySig =
+                                 match dictTryFind useDefs ht.Offset with
+                                 | Some d -> dictTryFind fields ("$sig:" + d.Path + ":" + string d.Offset)
+                                 | None -> None
+                             (match bySig with
+                              | Some s -> Some s
                               | None ->
                                   // a CROSS-FILE member has no local def to
                                   // key by; the dot-demand recorded the OWNER
@@ -3135,7 +3228,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | _ -> None)
                                   | None -> None)
                          | None -> None
-                     let omittable = match calleeSig with Some fi -> fi.Optionals | None -> 0
+                     let omittable =
+                         match calleeSig with
+                         | Some fi -> fi.Optionals
+                         | None ->
+                             // no signature record (a cross-file member seen
+                             // through the demand): the demanded type itself
+                             // says how many TRAILING Option parameters the
+                             // call may leave off — F# optionals ARE options
+                             match prune funTy with
+                             | TFun (pt, _) ->
+                                 (match prune pt with
+                                  | TTuple ps ->
+                                      ps |> List.rev
+                                      |> List.takeWhile (fun p2 ->
+                                          match prune p2 with
+                                          | TCon ("Option", _) -> true
+                                          | _ -> false)
+                                      |> List.length
+                                  | _ -> 0)
+                             | _ -> 0
                      // The elements a call actually wrote, whether or not
                      // they came wrapped in a paren and a tuple.
                      let suppliedNodes =
@@ -3280,14 +3392,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       match prune argTy with
                                       | TTuple ys -> ys
                                       | one -> [ one ]
+                                  // the sig record may be unavailable for a
+                                  // cross-file member; the parameter tuple
+                                  // itself names the trailing optionals
+                                  let omitHere =
+                                      if omittable > 0 then omittable
+                                      else
+                                          match prune pt with
+                                          | TTuple ps2 ->
+                                              ps2 |> List.rev
+                                              |> List.takeWhile (fun p2 ->
+                                                  match prune p2 with
+                                                  | TCon ("Option", _) -> true
+                                                  | _ -> false)
+                                              |> List.length
+                                          | _ -> 0
                                   (match prune pt with
                                    | TTuple ps when
-                                          omittable > 0
+                                          omitHere > 0
                                           && List.length supplied <= List.length ps
-                                          && List.length ps - List.length supplied <= omittable ->
+                                          && List.length ps - List.length supplied <= omitHere ->
                                        let have = List.length supplied
                                        let need = List.length ps
-                                       let firstOpt = need - omittable
+                                       let firstOpt = need - omitHere
                                        // an optional parameter may be given
                                        // its VALUE rather than an option, and
                                        // F# wraps it — but `?x = e` passes the
@@ -3686,19 +3813,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 hole
             | ParenExpr ->
                 let vars = dictNew<string, Type> ()
+                // the ascription is read FIRST: `({ ... } : T)` hands T to
+                // the inner expression as its expectation, which is what
+                // lets an annotated record literal pick the annotated type
+                let ascribed =
+                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
+                    |> Option.map (typeFromNode vars)
                 let inner =
                     n.Children
                     |> List.filter (fun c -> match c with GNode m -> isExprish m.NodeKind | _ -> false)
                     // parentheses pass the expectation through: `(a, b)` as
                     // an argument is a ParenExpr wrapping the tuple
                     |> List.map (fun m ->
-                        exprExpect <- expected
+                        exprExpect <- (match ascribed with Some a -> Some a | None -> expected)
                         let t = exprType m
                         exprExpect <- None
                         t)
-                let ascribed =
-                    nodesOf n |> List.tryFind (fun m -> isTypeKind m.NodeKind)
-                    |> Option.map (typeFromNode vars)
                 match inner, ascribed with
                 | [], _ when (tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text <> ":")) ->
                     // an operator SECTION `(+)`: the operator as a function.

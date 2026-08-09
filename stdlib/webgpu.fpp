@@ -800,13 +800,6 @@ and GPUCommandEncoder(h : int) =
         let destination_j = Js.handle (destination).H
         let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
         Js.call3 (Js.handle h) "copyBufferToBuffer" source_j destination_j size_j |> ignore
-    member x.CopyBufferToBuffer (source : GPUBuffer, sourceOffset : float, destination : GPUBuffer, destinationOffset : float, ?size : float) : unit =
-        let source_j = Js.handle (source).H
-        let sourceOffset_j = Js.ofNum (sourceOffset)
-        let destination_j = Js.handle (destination).H
-        let destinationOffset_j = Js.ofNum (destinationOffset)
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call5 (Js.handle h) "copyBufferToBuffer" source_j sourceOffset_j destination_j destinationOffset_j size_j |> ignore
     member x.CopyBufferToTexture (source : GPUTexelCopyBufferInfo, destination : GPUTexelCopyTextureInfo, copySize : GPUExtent3DDict) : unit =
         let source_j = Marshal.GPUTexelCopyBufferInfoJs (source)
         let destination_j = Marshal.GPUTexelCopyTextureInfoJs (destination)
@@ -884,13 +877,6 @@ and GPUComputePassEncoder(h : int) =
         let bindGroup_j = Js.handle (bindGroup).H
         let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
         Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
-    member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, dynamicOffsetsData : JsObj, dynamicOffsetsDataStart : float, dynamicOffsetsDataLength : int) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsetsData_j = dynamicOffsetsData
-        let dynamicOffsetsDataStart_j = Js.ofNum (dynamicOffsetsDataStart)
-        let dynamicOffsetsDataLength_j = Js.ofNum (float (dynamicOffsetsDataLength))
-        Js.call5 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsetsData_j dynamicOffsetsDataStart_j dynamicOffsetsDataLength_j |> ignore
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         let rangeOffset_j = Js.ofNum (float (rangeOffset))
         let data_j = data
@@ -944,13 +930,6 @@ and GPURenderPassEncoder(h : int) =
         let bindGroup_j = Js.handle (bindGroup).H
         let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
         Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
-    member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, dynamicOffsetsData : JsObj, dynamicOffsetsDataStart : float, dynamicOffsetsDataLength : int) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsetsData_j = dynamicOffsetsData
-        let dynamicOffsetsDataStart_j = Js.ofNum (dynamicOffsetsDataStart)
-        let dynamicOffsetsDataLength_j = Js.ofNum (float (dynamicOffsetsDataLength))
-        Js.call5 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsetsData_j dynamicOffsetsDataStart_j dynamicOffsetsDataLength_j |> ignore
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         let rangeOffset_j = Js.ofNum (float (rangeOffset))
         let data_j = data
@@ -1025,13 +1004,6 @@ and GPURenderBundleEncoder(h : int) =
         let bindGroup_j = Js.handle (bindGroup).H
         let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
         Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
-    member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, dynamicOffsetsData : JsObj, dynamicOffsetsDataStart : float, dynamicOffsetsDataLength : int) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsetsData_j = dynamicOffsetsData
-        let dynamicOffsetsDataStart_j = Js.ofNum (dynamicOffsetsDataStart)
-        let dynamicOffsetsDataLength_j = Js.ofNum (float (dynamicOffsetsDataLength))
-        Js.call5 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsetsData_j dynamicOffsetsDataStart_j dynamicOffsetsDataLength_j |> ignore
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         let rangeOffset_j = Js.ofNum (float (rangeOffset))
         let data_j = data
