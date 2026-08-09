@@ -1469,12 +1469,15 @@ and GPUError(h : int) =
 
 and GPUValidationError(h : int) =
     member x.H : int = h
+    member x.Message : string = Js.toString (Js.get (Js.handle h) "message")
 
 and GPUOutOfMemoryError(h : int) =
     member x.H : int = h
+    member x.Message : string = Js.toString (Js.get (Js.handle h) "message")
 
 and GPUInternalError(h : int) =
     member x.H : int = h
+    member x.Message : string = Js.toString (Js.get (Js.handle h) "message")
 
 and GPUUncapturedErrorEvent(h : int) =
     member x.H : int = h

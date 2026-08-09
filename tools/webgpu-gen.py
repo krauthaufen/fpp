@@ -323,6 +323,21 @@ def emit(model):
                 model['interfaces'][target][lst] = \
                     model['interfaces'][target][lst] + model['interfaces'][mixin][lst]
     model['mixins'] = mixin_names
+    # interface INHERITANCE flattens like dict inheritance: a subclass
+    # answers its base's members (GPUValidationError.message lives on
+    # GPUError). Snapshot first so a multi-level chain cannot double-fold.
+    orig = {n: (list(i['attrs']), list(i['methods']), list(i['consts']))
+            for n, i in model['interfaces'].items()}
+    for iname, iface in model['interfaces'].items():
+        cur, depth = iface.get('base'), 0
+        while cur and cur in orig and depth < 8:
+            battrs, bmethods, bconsts = orig[cur]
+            have = {a['name'] for a in iface['attrs']}
+            iface['attrs'] = iface['attrs'] + [a for a in battrs if a['name'] not in have]
+            have = {m['name'] for m in iface['methods']}
+            iface['methods'] = iface['methods'] + [m for m in bmethods if m['name'] not in have]
+            iface['consts'] = iface['consts'] + bconsts
+            cur, depth = model['interfaces'][cur].get('base'), depth + 1
     ops, opidx = collect_ops(model)
     model['ops'] = ops
     L = []
