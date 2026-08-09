@@ -37,6 +37,9 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   record of a shape to avoid, not a live defect.
 
 Fixed and removed (see git history for the repros):
+`use-new-in-match-arm` (a match-arm body starting with `use` fell out of
+the clause — the arm-body gate now accepts every statement keyword a block
+does; regression lives in `tests/tooling/usearm.fpp`),
 `member-body-early-pick` (a class member body froze its instance pick to
 its own file's best candidate — a named use whose constraint still holds
 a variable now rides the stamp marker and is resolved per copy against

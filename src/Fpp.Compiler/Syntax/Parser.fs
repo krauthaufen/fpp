@@ -1209,9 +1209,13 @@ let parse (src : string) : ParseResult =
                 vecAdd c (s.Bump ())
                 vecAdd c (parseExpr barCol)
             if s.IsOp "->" then vecAdd c (s.Bump ()) else s.Diag "expected '->' in match clause"
-            // the clause's own bar column guards anything nested in its body
+            // the clause's own bar column guards anything nested in its body.
+            // Every statement keyword a BLOCK accepts must be accepted here
+            // too — `use` was missing, and an arm body starting with
+            // `use x = new T(...)` fell out of the clause entirely
             guardCols <- barCol :: guardCols
-            if canStartExpr () || s.IsKw "let" || s.IsKw "yield" || s.IsKw "return" then
+            if canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
+               || s.IsKw "yield" || s.IsKw "return" then
                 vecAdd c (parseBlock barCol)
             guardCols <- List.tail guardCols
             vecAdd acc (Green.node MatchClause (vecToList c))

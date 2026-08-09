@@ -35,6 +35,10 @@ type Resolution =
 
 type BindResult =
     { Definitions : Definition list
+      /// unbound VALUE names that exist in a module the file never opened:
+      /// (use offset, message). Silently inferring fresh for these hid a
+      /// missing `open` behind an emission-time "unbound variable".
+      Missing : (int * string) list
       Resolutions : Resolution list
       /// full dotted path -> definition, for later files to import
       Exports : (string * Definition) list
@@ -171,6 +175,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | Some d -> record t d
         | None -> ()
 
+    let unresolvedValues = vecNew<Token> ()
+
     let tryRecord (env : Env) (t : Token) : unit =
         // A bare name in expression position is a value or a constructor,
         // never a module: if a module shadows a type of the same name, the
@@ -185,7 +191,20 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | None -> findQualified t.Text
         match picked with
         | Some d -> record t d
-        | None -> ()
+        | None ->
+            // a lowercase bare name is a VALUE use; remember the miss and
+            // judge it after the walk, when every export is known. The
+            // BACKEND-OWNED names are never in the value environment: the
+            // conversions (`string v`, `int x` — Lower's list) and the
+            // structural primitives the emitters answer by name
+            if strLen t.Text > 0 && charAt t.Text 0 >= 'a' && charAt t.Text 0 <= 'z'
+               && not (List.contains t.Text
+                           [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
+                             "float"; "float32"; "float16"; "string"; "char"; "byte"
+                             "sbyte"; "nativeint"; "enum"
+                             "hash"; "compare"; "refEq"; "isNull"; "box"; "unbox"
+                             "sizeof"; "typeof"; "nameof" ]) then
+                vecAdd unresolvedValues t
 
     let firstIdentToken (children : Green list) : Token option =
         children
@@ -1183,7 +1202,36 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         env <- walkDecl env c
         rootIdx <- rootIdx + 1
 
+    // the misses, judged against the FINAL export tables: a value that a
+    // known module does export is a real error with a real fix; a name
+    // found nowhere stays silent (an empty-prelude check, a member bound
+    // later by its receiver's type, a builtin the backend owns)
+    let missing = vecNew<int * string> ()
+    (if vecLen unresolvedValues > 0 then
+        let owners = dictNew<string, string list> ()
+        let note (full : string) (d : Definition) =
+            if d.Kind = DefLet then
+                match full.LastIndexOf '.' with
+                | i when i > 0 ->
+                    let bare = full.Substring (i + 1)
+                    let m = full.Substring (0, i)
+                    let prev = match dictTryFind owners bare with Some x -> x | None -> []
+                    if not (List.contains m prev) then dictSet owners bare (m :: prev)
+                | _ -> ()
+        for full, d in dictPairs imports do note full d
+        for full, d in vecToList exports do note full d
+        for t in vecToList unresolvedValues do
+            match dictTryFind owners t.Text with
+            | Some (m :: rest) ->
+                vecAdd missing
+                    (t.Offset,
+                     "unbound value '" + t.Text + "' — module " + m + " exports it"
+                     + (if List.isEmpty rest then "" else " (so do " + String.concat ", " rest + ")")
+                     + "; open " + m + " or write " + m + "." + t.Text)
+            | _ -> ())
+
     { Definitions = vecToList defs
+      Missing = vecToList missing
       Resolutions = vecToList uses
       Exports = vecToList exports
       Members = dictPairs memberDefs }

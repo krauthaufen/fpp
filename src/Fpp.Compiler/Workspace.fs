@@ -527,6 +527,15 @@ type Workspace() =
                   EndLine = line; EndCol = col + 1; Message = msg }
             (r.Diagnostics |> List.map (fun d -> at d.Offset d.Message))
             @ (t.Diagnostics |> List.map (fun (off, msg) -> at off msg))
+            // resolver misses with a known fix — a value some module
+            // exports but this file never opened — CONFIRMED against
+            // inference: only a use that really bottomed out at a fresh
+            // variable errors, so a name a later stage owns (a builtin, a
+            // class member) never false-positives
+            @ (let fresh = Set.ofList t.FreshIdents
+               (this.Resolve path).Missing
+               |> List.filter (fun (off, _) -> Set.contains off fresh)
+               |> List.map (fun (off, msg) -> at off msg))
             // by (Line, Col), spelled out: `Ordered` has no instance at a
             // TUPLE type, so a tuple key cannot drive `sortBy` (see PLAN.md)
             |> List.sortWith (fun a b ->

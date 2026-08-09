@@ -12,6 +12,20 @@ let workspaceTests =
             ws.SetFileText "a.fpp" "let x = 1\n"
             Expect.isEmpty (ws.Diagnostics "a.fpp") "no diagnostics"
         }
+        test "a missing open is an error naming the module" {
+            let ws = Workspace()
+            ws.SetProjectFiles [ "a.fpp"; "b.fpp" ]
+            ws.SetFileText "a.fpp" "module LibA\nlet helper (x : int) : int = x + 1\n"
+            ws.SetFileText "b.fpp" "module LibB\nlet v = helper 41\n"
+            match ws.Diagnostics "b.fpp" with
+            | [ d ] ->
+                Expect.stringContains d.Message "unbound value 'helper'" "names the value"
+                Expect.stringContains d.Message "open LibA" "offers the fix"
+            | ds -> failtestf "expected one diagnostic, got %A" ds
+            // with the open, silence
+            ws.SetFileText "b.fpp" "module LibB\nopen LibA\nlet v = helper 41\n"
+            Expect.isEmpty (ws.Diagnostics "b.fpp") "open fixes it"
+        }
         test "diagnostic carries line and column" {
             let ws = Workspace()
             // `1` is a legal parameter pattern, so the missing '=' is

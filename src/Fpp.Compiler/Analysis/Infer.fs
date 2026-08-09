@@ -17,6 +17,9 @@ open Fpp.Analysis.Types
 
 type InferResult =
     { Diagnostics : (int * string) list
+      /// bare-ident uses that bottomed out at a FRESH type variable — the
+      /// resolver's missing-open candidates are confirmed against these
+      FreshIdents : int list
       /// definition offset, length, pretty-printed type
       DefTypes : (int * int * string) list
       /// operator token offset -> resolved kind: "f"=float "s"=float32
@@ -1545,6 +1548,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// superclass requirements of this file's instances, verified once the
     /// whole file has registered its declarations
     let pendingSuperChecks = vecNew<int * string * Constraint> ()
+    /// bare idents whose whole resolution chain bottomed out at fresh
+    let freshIdentsRaw = vecNew<int> ()
 
     // ---- derived Arb instances -------------------------------------------
     // A record or union with no written Arb instance GETS one, GENERIC in
@@ -2772,7 +2777,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         inner
                                     | _ -> ty)
                                | None -> st.Fresh ())
-                      | None -> st.Fresh ())
+                      | None ->
+                          // truly unbound: nothing resolved it, nothing
+                          // will — remembered so the resolver's
+                          // missing-open candidates can become errors
+                          vecAdd freshIdentsRaw t.Offset
+                          st.Fresh ())
                  | _ -> st.Fresh ())   // quote-ident type variable
             | AppExpr when
                   (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
@@ -6714,6 +6724,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | _ -> ""
 
     { Diagnostics = vecToList diags
+      FreshIdents = vecToList freshIdentsRaw
       DefTypes =
         vecToList defTypes
         |> List.map (fun (off, len, ty) -> off, len, typeString ty)
