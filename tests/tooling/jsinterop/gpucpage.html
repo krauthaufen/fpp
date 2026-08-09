@@ -4,6 +4,7 @@
 <body>
 <script type="module">
   import { instantiate } from '/stdlib/fpp-js.mjs';
+  import { gpuVm } from '/stdlib/webgpu-vm.mjs';
   window.log = [];
   window.results = null;
   try {
@@ -11,7 +12,7 @@
       window.results = { skip: true };
     } else {
       const exports = await instantiate('gpu-compute.wasm', {
-        sink: s => window.log.push(s.trimEnd()) });
+        sink: s => window.log.push(s.trimEnd()), vms: [gpuVm] });
       exports._start();
       // the verdict arrives ASYNC (adapter/device/mapAsync futures)
       const t0 = performance.now();

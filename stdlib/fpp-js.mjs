@@ -66,17 +66,31 @@ export const jsImports = (getExports) => {
     viewI32: (p, n) => new Int32Array(mem(), p, n),
     viewF32: (p, n) => new Float32Array(mem(), p, n),
     viewF64: (p, n) => new Float64Array(mem(), p, n),
+  },
+  // for VM plugins (generated decoder modules): the SAME handle table and
+  // memory the js primitives use — a decoded command must resolve handles
+  // exactly as Js.handle does
+  internals: {
+    mem,
+    h: (id) => table.get(id),
+    reg: (o) => { const id = nextId++; table.set(id, o); return id; },
+    watch: (wrapper, id) => registry.register(wrapper, id),
   } };
 };
 
 /// Instantiate an F++ module with the whole boundary wired: the "js"
-/// primitives, the engine string builtins, wasi print into `sink`, and any
-/// app-supplied typed imports as { jsx: { name: fn } }.
-export const instantiate = async (url, { jsx = {}, sink = null } = {}) => {
+/// primitives, the engine string builtins, wasi print into `sink`, any
+/// app-supplied typed imports as { jsx: { name: fn } }, and any generated
+/// VM plugins as { vms: [gpuVm] } — each is called with the internals and
+/// contributes its jsx entries.
+export const instantiate = async (url, { jsx = {}, sink = null, vms = [] } = {}) => {
   let exports;
+  const { js, internals } = jsImports(() => exports);
+  const jsxAll = { ...jsx };
+  for (const mk of vms) Object.assign(jsxAll, mk(internals));
   const { instance } = await WebAssembly.instantiateStreaming(
     fetch(url),
-    { ...jsImports(() => exports), ...wasiImports(() => exports, sink), jsx },
+    { js, ...wasiImports(() => exports, sink), jsx: jsxAll },
     { builtins: ['js-string'] });
   exports = instance.exports;
   return exports;

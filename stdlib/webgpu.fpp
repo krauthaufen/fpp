@@ -385,6 +385,48 @@ module GPUColorWrite =
     let Alpha : int = 8
     let All : int = 15
 
+[<JsImport>]
+extern let gpuRun : int -> int -> JsObj -> float
+
+module GpuVm =
+    [<Struct>]
+    type Slot = { mutable V : float }
+    let mutable buf : Slot[] = Array.zeroCreate 1024
+    let mutable count = 0
+    let mutable strs : JsObj = Js.undefined ()
+    let mutable strCount = 0
+    let F (v : float) : unit =
+        (if count >= Array.length buf then
+            let nb : Slot[] = Array.zeroCreate (Array.length buf * 2)
+            for i in 0 .. count - 1 do nb.[i] <- buf.[i]
+            buf <- nb)
+        buf.[count] <- { V = v }
+        count <- count + 1
+    let S (s : string) : unit =
+        (if strCount = 0 then strs <- Js.newArr ())
+        Js.push strs (Js.ofString s)
+        F (float strCount)
+        strCount <- strCount + 1
+    let O (o : JsObj) : unit =
+        (if strCount = 0 then strs <- Js.newArr ())
+        Js.push strs o
+        F (float strCount)
+        strCount <- strCount + 1
+    /// send the stream: pending batched ops run first, the LAST
+    /// op's result comes back. One boundary crossing.
+    let Call () : float =
+        let p = Array.pin buf
+        let r = gpuRun (int p) count strs
+        Array.unpin buf |> ignore
+        count <- 0
+        strCount <- 0
+        strs <- Js.undefined ()
+        r
+    /// order fence for DIRECT calls: whatever is recorded must run
+    /// before the direct call observes encoder state
+    let Barrier () : unit =
+        if count > 0 then Call () |> ignore
+
 type GPUSupportedLimits(h : int) =
     member x.H : int = h
     member x.MaxTextureDimension1D : int = int (Js.toNum (Js.get (Js.handle h) "maxTextureDimension1D"))
@@ -441,6 +483,7 @@ and GPU(h : int) =
     member x.H : int = h
     member x.WgslLanguageFeatures : JsObj = Js.get (Js.handle h) "wgslLanguageFeatures"
     member x.RequestAdapter () : Future<GPUAdapter> =
+        GpuVm.Barrier ()
         future {
             let! p = Js.futureOf (Js.call0 (Js.handle h) "requestAdapter")
             let r = Js.register p
@@ -449,6 +492,7 @@ and GPU(h : int) =
             return w
         }
     member x.RequestAdapterWith (options : GPURequestAdapterOptions) : Future<GPUAdapter> =
+        GpuVm.Barrier ()
         let options_j = Marshal.GPURequestAdapterOptionsJs (options)
         future {
             let! p = Js.futureOf (Js.call1 (Js.handle h) "requestAdapter" options_j)
@@ -458,6 +502,7 @@ and GPU(h : int) =
             return w
         }
     member x.GetPreferredCanvasFormat () : GPUTextureFormat =
+        GpuVm.Barrier ()
         Marshal.GPUTextureFormatOfJs (Js.toString (Js.call0 (Js.handle h) "getPreferredCanvasFormat"))
 
 and GPUAdapter(h : int) =
@@ -478,6 +523,7 @@ and GPUAdapter(h : int) =
         Js.watch (box w) r
         w
     member x.RequestDevice () : Future<GPUDevice> =
+        GpuVm.Barrier ()
         future {
             let! p = Js.futureOf (Js.call0 (Js.handle h) "requestDevice")
             let r = Js.register p
@@ -486,6 +532,7 @@ and GPUAdapter(h : int) =
             return w
         }
     member x.RequestDeviceWith (descriptor : GPUDeviceDescriptor) : Future<GPUDevice> =
+        GpuVm.Barrier ()
         let descriptor_j = Marshal.GPUDeviceDescriptorJs (descriptor)
         future {
             let! p = Js.futureOf (Js.call1 (Js.handle h) "requestDevice" descriptor_j)
@@ -528,73 +575,100 @@ and GPUDevice(h : int) =
     member x.Onuncapturederror : JsObj = Js.get (Js.handle h) "onuncapturederror"
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.Destroy () : unit =
-        Js.call0 (Js.handle h) "destroy" |> ignore
+        GpuVm.F 0.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
     member x.CreateBuffer (descriptor : GPUBufferDescriptor) : GPUBuffer =
-        let descriptor_j = Marshal.GPUBufferDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createBuffer" descriptor_j)
+        GpuVm.F 1.0
+        GpuVm.F (float h)
+        Marshal.GPUBufferDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUBuffer r
         Js.watch (box w) r
         w
     member x.CreateTexture (descriptor : GPUTextureDescriptor) : GPUTexture =
-        let descriptor_j = Marshal.GPUTextureDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createTexture" descriptor_j)
+        GpuVm.F 2.0
+        GpuVm.F (float h)
+        Marshal.GPUTextureDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUTexture r
         Js.watch (box w) r
         w
     member x.CreateSampler () : GPUSampler =
-        let r = Js.register (Js.call0 (Js.handle h) "createSampler")
+        GpuVm.F 3.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPUSampler r
         Js.watch (box w) r
         w
     member x.CreateSamplerWith (descriptor : GPUSamplerDescriptor) : GPUSampler =
-        let descriptor_j = Marshal.GPUSamplerDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createSampler" descriptor_j)
+        GpuVm.F 3.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPUSamplerDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUSampler r
         Js.watch (box w) r
         w
     member x.ImportExternalTexture (descriptor : GPUExternalTextureDescriptor) : GPUExternalTexture =
-        let descriptor_j = Marshal.GPUExternalTextureDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "importExternalTexture" descriptor_j)
+        GpuVm.F 4.0
+        GpuVm.F (float h)
+        Marshal.GPUExternalTextureDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUExternalTexture r
         Js.watch (box w) r
         w
     member x.CreateBindGroupLayout (descriptor : GPUBindGroupLayoutDescriptor) : GPUBindGroupLayout =
-        let descriptor_j = Marshal.GPUBindGroupLayoutDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createBindGroupLayout" descriptor_j)
+        GpuVm.F 5.0
+        GpuVm.F (float h)
+        Marshal.GPUBindGroupLayoutDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUBindGroupLayout r
         Js.watch (box w) r
         w
     member x.CreatePipelineLayout (descriptor : GPUPipelineLayoutDescriptor) : GPUPipelineLayout =
-        let descriptor_j = Marshal.GPUPipelineLayoutDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createPipelineLayout" descriptor_j)
+        GpuVm.F 6.0
+        GpuVm.F (float h)
+        Marshal.GPUPipelineLayoutDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUPipelineLayout r
         Js.watch (box w) r
         w
     member x.CreateBindGroup (descriptor : GPUBindGroupDescriptor) : GPUBindGroup =
-        let descriptor_j = Marshal.GPUBindGroupDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createBindGroup" descriptor_j)
+        GpuVm.F 7.0
+        GpuVm.F (float h)
+        Marshal.GPUBindGroupDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUBindGroup r
         Js.watch (box w) r
         w
     member x.CreateShaderModule (descriptor : GPUShaderModuleDescriptor) : GPUShaderModule =
-        let descriptor_j = Marshal.GPUShaderModuleDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createShaderModule" descriptor_j)
+        GpuVm.F 8.0
+        GpuVm.F (float h)
+        Marshal.GPUShaderModuleDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUShaderModule r
         Js.watch (box w) r
         w
     member x.CreateComputePipeline (descriptor : GPUComputePipelineDescriptor) : GPUComputePipeline =
-        let descriptor_j = Marshal.GPUComputePipelineDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createComputePipeline" descriptor_j)
+        GpuVm.F 9.0
+        GpuVm.F (float h)
+        Marshal.GPUComputePipelineDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUComputePipeline r
         Js.watch (box w) r
         w
     member x.CreateRenderPipeline (descriptor : GPURenderPipelineDescriptor) : GPURenderPipeline =
-        let descriptor_j = Marshal.GPURenderPipelineDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createRenderPipeline" descriptor_j)
+        GpuVm.F 10.0
+        GpuVm.F (float h)
+        Marshal.GPURenderPipelineDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPURenderPipeline r
         Js.watch (box w) r
         w
     member x.CreateComputePipelineAsync (descriptor : GPUComputePipelineDescriptor) : Future<GPUComputePipeline> =
+        GpuVm.Barrier ()
         let descriptor_j = Marshal.GPUComputePipelineDescriptorJs (descriptor)
         future {
             let! p = Js.futureOf (Js.call1 (Js.handle h) "createComputePipelineAsync" descriptor_j)
@@ -604,6 +678,7 @@ and GPUDevice(h : int) =
             return w
         }
     member x.CreateRenderPipelineAsync (descriptor : GPURenderPipelineDescriptor) : Future<GPURenderPipeline> =
+        GpuVm.Barrier ()
         let descriptor_j = Marshal.GPURenderPipelineDescriptorJs (descriptor)
         future {
             let! p = Js.futureOf (Js.call1 (Js.handle h) "createRenderPipelineAsync" descriptor_j)
@@ -613,32 +688,45 @@ and GPUDevice(h : int) =
             return w
         }
     member x.CreateCommandEncoder () : GPUCommandEncoder =
-        let r = Js.register (Js.call0 (Js.handle h) "createCommandEncoder")
+        GpuVm.F 11.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPUCommandEncoder r
         Js.watch (box w) r
         w
     member x.CreateCommandEncoderWith (descriptor : GPUCommandEncoderDescriptor) : GPUCommandEncoder =
-        let descriptor_j = Marshal.GPUCommandEncoderDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createCommandEncoder" descriptor_j)
+        GpuVm.F 11.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPUCommandEncoderDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUCommandEncoder r
         Js.watch (box w) r
         w
     member x.CreateRenderBundleEncoder (descriptor : GPURenderBundleEncoderDescriptor) : GPURenderBundleEncoder =
-        let descriptor_j = Marshal.GPURenderBundleEncoderDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createRenderBundleEncoder" descriptor_j)
+        GpuVm.F 12.0
+        GpuVm.F (float h)
+        Marshal.GPURenderBundleEncoderDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPURenderBundleEncoder r
         Js.watch (box w) r
         w
     member x.CreateQuerySet (descriptor : GPUQuerySetDescriptor) : GPUQuerySet =
-        let descriptor_j = Marshal.GPUQuerySetDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createQuerySet" descriptor_j)
+        GpuVm.F 13.0
+        GpuVm.F (float h)
+        Marshal.GPUQuerySetDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUQuerySet r
         Js.watch (box w) r
         w
     member x.PushErrorScope (filter : GPUErrorFilter) : unit =
-        let filter_j = Marshal.GPUErrorFilterJs (filter)
-        Js.call1 (Js.handle h) "pushErrorScope" filter_j |> ignore
+        GpuVm.F 14.0
+        GpuVm.F (float h)
+        GpuVm.F (float (int (filter)))
+        GpuVm.Call () |> ignore
     member x.PopErrorScope () : Future<GPUError> =
+        GpuVm.Barrier ()
         future {
             let! p = Js.futureOf (Js.call0 (Js.handle h) "popErrorScope")
             let r = Js.register p
@@ -654,6 +742,7 @@ and GPUBuffer(h : int) =
     member x.MapState : GPUBufferMapState = Marshal.GPUBufferMapStateOfJs (Js.toString (Js.get (Js.handle h) "mapState"))
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.MapAsync (mode : int, ?offset : float, ?size : float) : Future<unit> =
+        GpuVm.Barrier ()
         let mode_j = Js.ofNum (float (mode))
         let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
         let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
@@ -662,15 +751,21 @@ and GPUBuffer(h : int) =
             return (let _u = p in ())
         }
     member x.GetMappedRange () : JsObj =
+        GpuVm.Barrier ()
         Js.call0 (Js.handle h) "getMappedRange"
     member x.GetMappedRangeWith (offset : float, size : float) : JsObj =
+        GpuVm.Barrier ()
         let offset_j = Js.ofNum (offset)
         let size_j = Js.ofNum (size)
         Js.call2 (Js.handle h) "getMappedRange" offset_j size_j
     member x.Unmap () : unit =
-        Js.call0 (Js.handle h) "unmap" |> ignore
+        GpuVm.F 15.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
     member x.Destroy () : unit =
-        Js.call0 (Js.handle h) "destroy" |> ignore
+        GpuVm.F 16.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
 
 and GPUTexture(h : int) =
     member x.H : int = h
@@ -685,18 +780,26 @@ and GPUTexture(h : int) =
     member x.TextureBindingViewDimension : GPUTextureViewDimension = Marshal.GPUTextureViewDimensionOfJs (Js.toString (Js.get (Js.handle h) "textureBindingViewDimension"))
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.CreateView () : GPUTextureView =
-        let r = Js.register (Js.call0 (Js.handle h) "createView")
+        GpuVm.F 17.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPUTextureView r
         Js.watch (box w) r
         w
     member x.CreateViewWith (descriptor : GPUTextureViewDescriptor) : GPUTextureView =
-        let descriptor_j = Marshal.GPUTextureViewDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "createView" descriptor_j)
+        GpuVm.F 17.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPUTextureViewDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUTextureView r
         Js.watch (box w) r
         w
     member x.Destroy () : unit =
-        Js.call0 (Js.handle h) "destroy" |> ignore
+        GpuVm.F 18.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
 
 and GPUTextureView(h : int) =
     member x.H : int = h
@@ -726,6 +829,7 @@ and GPUShaderModule(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.GetCompilationInfo () : Future<GPUCompilationInfo> =
+        GpuVm.Barrier ()
         future {
             let! p = Js.futureOf (Js.call0 (Js.handle h) "getCompilationInfo")
             let r = Js.register p
@@ -755,8 +859,10 @@ and GPUComputePipeline(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.GetBindGroupLayout (index : int) : GPUBindGroupLayout =
-        let index_j = Js.ofNum (float (index))
-        let r = Js.register (Js.call1 (Js.handle h) "getBindGroupLayout" index_j)
+        GpuVm.F 19.0
+        GpuVm.F (float h)
+        GpuVm.F (float (index))
+        let r = int (GpuVm.Call ())
         let w = GPUBindGroupLayout r
         Js.watch (box w) r
         w
@@ -765,8 +871,10 @@ and GPURenderPipeline(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.GetBindGroupLayout (index : int) : GPUBindGroupLayout =
-        let index_j = Js.ofNum (float (index))
-        let r = Js.register (Js.call1 (Js.handle h) "getBindGroupLayout" index_j)
+        GpuVm.F 20.0
+        GpuVm.F (float h)
+        GpuVm.F (float (index))
+        let r = int (GpuVm.Call ())
         let w = GPUBindGroupLayout r
         Js.watch (box w) r
         w
@@ -779,199 +887,348 @@ and GPUCommandEncoder(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.BeginRenderPass (descriptor : GPURenderPassDescriptor) : GPURenderPassEncoder =
-        let descriptor_j = Marshal.GPURenderPassDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "beginRenderPass" descriptor_j)
+        GpuVm.F 21.0
+        GpuVm.F (float h)
+        Marshal.GPURenderPassDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPURenderPassEncoder r
         Js.watch (box w) r
         w
     member x.BeginComputePass () : GPUComputePassEncoder =
-        let r = Js.register (Js.call0 (Js.handle h) "beginComputePass")
+        GpuVm.F 22.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPUComputePassEncoder r
         Js.watch (box w) r
         w
     member x.BeginComputePassWith (descriptor : GPUComputePassDescriptor) : GPUComputePassEncoder =
-        let descriptor_j = Marshal.GPUComputePassDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "beginComputePass" descriptor_j)
+        GpuVm.F 22.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPUComputePassDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUComputePassEncoder r
         Js.watch (box w) r
         w
     member x.CopyBufferToBuffer (source : GPUBuffer, destination : GPUBuffer, ?size : float) : unit =
-        let source_j = Js.handle (source).H
-        let destination_j = Js.handle (destination).H
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "copyBufferToBuffer" source_j destination_j size_j |> ignore
+        GpuVm.F 23.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((source).H))
+        GpuVm.F (float ((destination).H))
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.CopyBufferToTexture (source : GPUTexelCopyBufferInfo, destination : GPUTexelCopyTextureInfo, copySize : GPUExtent3DDict) : unit =
-        let source_j = Marshal.GPUTexelCopyBufferInfoJs (source)
-        let destination_j = Marshal.GPUTexelCopyTextureInfoJs (destination)
-        let copySize_j = Marshal.GPUExtent3DDictJs (copySize)
-        Js.call3 (Js.handle h) "copyBufferToTexture" source_j destination_j copySize_j |> ignore
+        GpuVm.F 24.0
+        GpuVm.F (float h)
+        Marshal.GPUTexelCopyBufferInfoBin (source)
+        Marshal.GPUTexelCopyTextureInfoBin (destination)
+        Marshal.GPUExtent3DDictBin (copySize)
     member x.CopyTextureToBuffer (source : GPUTexelCopyTextureInfo, destination : GPUTexelCopyBufferInfo, copySize : GPUExtent3DDict) : unit =
-        let source_j = Marshal.GPUTexelCopyTextureInfoJs (source)
-        let destination_j = Marshal.GPUTexelCopyBufferInfoJs (destination)
-        let copySize_j = Marshal.GPUExtent3DDictJs (copySize)
-        Js.call3 (Js.handle h) "copyTextureToBuffer" source_j destination_j copySize_j |> ignore
+        GpuVm.F 25.0
+        GpuVm.F (float h)
+        Marshal.GPUTexelCopyTextureInfoBin (source)
+        Marshal.GPUTexelCopyBufferInfoBin (destination)
+        Marshal.GPUExtent3DDictBin (copySize)
     member x.CopyTextureToTexture (source : GPUTexelCopyTextureInfo, destination : GPUTexelCopyTextureInfo, copySize : GPUExtent3DDict) : unit =
-        let source_j = Marshal.GPUTexelCopyTextureInfoJs (source)
-        let destination_j = Marshal.GPUTexelCopyTextureInfoJs (destination)
-        let copySize_j = Marshal.GPUExtent3DDictJs (copySize)
-        Js.call3 (Js.handle h) "copyTextureToTexture" source_j destination_j copySize_j |> ignore
+        GpuVm.F 26.0
+        GpuVm.F (float h)
+        Marshal.GPUTexelCopyTextureInfoBin (source)
+        Marshal.GPUTexelCopyTextureInfoBin (destination)
+        Marshal.GPUExtent3DDictBin (copySize)
     member x.ClearBuffer (buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
-        let buffer_j = Js.handle (buffer).H
-        let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "clearBuffer" buffer_j offset_j size_j |> ignore
+        GpuVm.F 27.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((buffer).H))
+        (match offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.ResolveQuerySet (querySet : GPUQuerySet, firstQuery : int, queryCount : int, destination : GPUBuffer, destinationOffset : float) : unit =
-        let querySet_j = Js.handle (querySet).H
-        let firstQuery_j = Js.ofNum (float (firstQuery))
-        let queryCount_j = Js.ofNum (float (queryCount))
-        let destination_j = Js.handle (destination).H
-        let destinationOffset_j = Js.ofNum (destinationOffset)
-        Js.call5 (Js.handle h) "resolveQuerySet" querySet_j firstQuery_j queryCount_j destination_j destinationOffset_j |> ignore
+        GpuVm.F 28.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((querySet).H))
+        GpuVm.F (float (firstQuery))
+        GpuVm.F (float (queryCount))
+        GpuVm.F (float ((destination).H))
+        GpuVm.F (destinationOffset)
     member x.Finish () : GPUCommandBuffer =
-        let r = Js.register (Js.call0 (Js.handle h) "finish")
+        GpuVm.F 29.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPUCommandBuffer r
         Js.watch (box w) r
         w
     member x.FinishWith (descriptor : GPUCommandBufferDescriptor) : GPUCommandBuffer =
-        let descriptor_j = Marshal.GPUCommandBufferDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "finish" descriptor_j)
+        GpuVm.F 29.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPUCommandBufferDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPUCommandBuffer r
         Js.watch (box w) r
         w
     member x.PushDebugGroup (groupLabel : string) : unit =
-        let groupLabel_j = Js.ofString (groupLabel)
-        Js.call1 (Js.handle h) "pushDebugGroup" groupLabel_j |> ignore
+        GpuVm.F 30.0
+        GpuVm.F (float h)
+        GpuVm.S (groupLabel)
     member x.PopDebugGroup () : unit =
-        Js.call0 (Js.handle h) "popDebugGroup" |> ignore
+        GpuVm.F 31.0
+        GpuVm.F (float h)
     member x.InsertDebugMarker (markerLabel : string) : unit =
-        let markerLabel_j = Js.ofString (markerLabel)
-        Js.call1 (Js.handle h) "insertDebugMarker" markerLabel_j |> ignore
+        GpuVm.F 32.0
+        GpuVm.F (float h)
+        GpuVm.S (markerLabel)
 
 and GPUComputePassEncoder(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.SetPipeline (pipeline : GPUComputePipeline) : unit =
-        let pipeline_j = Js.handle (pipeline).H
-        Js.call1 (Js.handle h) "setPipeline" pipeline_j |> ignore
+        GpuVm.F 33.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((pipeline).H))
     member x.DispatchWorkgroups (workgroupCountX : int, ?workgroupCountY : int, ?workgroupCountZ : int) : unit =
-        let workgroupCountX_j = Js.ofNum (float (workgroupCountX))
-        let workgroupCountY_j = (match workgroupCountY with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let workgroupCountZ_j = (match workgroupCountZ with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "dispatchWorkgroups" workgroupCountX_j workgroupCountY_j workgroupCountZ_j |> ignore
+        GpuVm.F 34.0
+        GpuVm.F (float h)
+        GpuVm.F (float (workgroupCountX))
+        (match workgroupCountY with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match workgroupCountZ with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
     member x.DispatchWorkgroupsIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
-        let indirectBuffer_j = Js.handle (indirectBuffer).H
-        let indirectOffset_j = Js.ofNum (indirectOffset)
-        Js.call2 (Js.handle h) "dispatchWorkgroupsIndirect" indirectBuffer_j indirectOffset_j |> ignore
+        GpuVm.F 35.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((indirectBuffer).H))
+        GpuVm.F (indirectOffset)
     member x.End () : unit =
-        Js.call0 (Js.handle h) "end" |> ignore
+        GpuVm.F 36.0
+        GpuVm.F (float h)
     member x.PushDebugGroup (groupLabel : string) : unit =
-        let groupLabel_j = Js.ofString (groupLabel)
-        Js.call1 (Js.handle h) "pushDebugGroup" groupLabel_j |> ignore
+        GpuVm.F 37.0
+        GpuVm.F (float h)
+        GpuVm.S (groupLabel)
     member x.PopDebugGroup () : unit =
-        Js.call0 (Js.handle h) "popDebugGroup" |> ignore
+        GpuVm.F 38.0
+        GpuVm.F (float h)
     member x.InsertDebugMarker (markerLabel : string) : unit =
-        let markerLabel_j = Js.ofString (markerLabel)
-        Js.call1 (Js.handle h) "insertDebugMarker" markerLabel_j |> ignore
+        GpuVm.F 39.0
+        GpuVm.F (float h)
+        GpuVm.S (markerLabel)
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
+        GpuVm.F 40.0
+        GpuVm.F (float h)
+        GpuVm.F (float (index))
+        GpuVm.F (float ((bindGroup).H))
+        (match dynamicOffsets with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (bs0.[bi0]))
+         | None -> GpuVm.F 0.0)
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
-        let rangeOffset_j = Js.ofNum (float (rangeOffset))
-        let data_j = data
-        let dataOffset_j = (match dataOffset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let dataSize_j = (match dataSize with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setImmediates" rangeOffset_j data_j dataOffset_j dataSize_j |> ignore
+        GpuVm.F 41.0
+        GpuVm.F (float h)
+        GpuVm.F (float (rangeOffset))
+        GpuVm.O (data)
+        (match dataOffset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match dataSize with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
 
 and GPURenderPassEncoder(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.SetViewport (x : float, y : float, width : float, height : float, minDepth : float, maxDepth : float) : unit =
-        let x_j = Js.ofNum (x)
-        let y_j = Js.ofNum (y)
-        let width_j = Js.ofNum (width)
-        let height_j = Js.ofNum (height)
-        let minDepth_j = Js.ofNum (minDepth)
-        let maxDepth_j = Js.ofNum (maxDepth)
-        Js.call6 (Js.handle h) "setViewport" x_j y_j width_j height_j minDepth_j maxDepth_j |> ignore
+        GpuVm.F 42.0
+        GpuVm.F (float h)
+        GpuVm.F (x)
+        GpuVm.F (y)
+        GpuVm.F (width)
+        GpuVm.F (height)
+        GpuVm.F (minDepth)
+        GpuVm.F (maxDepth)
     member x.SetScissorRect (x : int, y : int, width : int, height : int) : unit =
-        let x_j = Js.ofNum (float (x))
-        let y_j = Js.ofNum (float (y))
-        let width_j = Js.ofNum (float (width))
-        let height_j = Js.ofNum (float (height))
-        Js.call4 (Js.handle h) "setScissorRect" x_j y_j width_j height_j |> ignore
+        GpuVm.F 43.0
+        GpuVm.F (float h)
+        GpuVm.F (float (x))
+        GpuVm.F (float (y))
+        GpuVm.F (float (width))
+        GpuVm.F (float (height))
     member x.SetBlendConstant (color : GPUColorDict) : unit =
-        let color_j = Marshal.GPUColorDictJs (color)
-        Js.call1 (Js.handle h) "setBlendConstant" color_j |> ignore
+        GpuVm.F 44.0
+        GpuVm.F (float h)
+        Marshal.GPUColorDictBin (color)
     member x.SetStencilReference (reference : int) : unit =
-        let reference_j = Js.ofNum (float (reference))
-        Js.call1 (Js.handle h) "setStencilReference" reference_j |> ignore
+        GpuVm.F 45.0
+        GpuVm.F (float h)
+        GpuVm.F (float (reference))
     member x.BeginOcclusionQuery (queryIndex : int) : unit =
-        let queryIndex_j = Js.ofNum (float (queryIndex))
-        Js.call1 (Js.handle h) "beginOcclusionQuery" queryIndex_j |> ignore
+        GpuVm.F 46.0
+        GpuVm.F (float h)
+        GpuVm.F (float (queryIndex))
     member x.EndOcclusionQuery () : unit =
-        Js.call0 (Js.handle h) "endOcclusionQuery" |> ignore
+        GpuVm.F 47.0
+        GpuVm.F (float h)
     member x.ExecuteBundles (bundles : GPURenderBundle[]) : unit =
-        let bundles_j = Marshal.SeqJs (fun x -> Js.handle (x).H) (bundles)
-        Js.call1 (Js.handle h) "executeBundles" bundles_j |> ignore
+        GpuVm.F 48.0
+        GpuVm.F (float h)
+        let bs0 = bundles
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            GpuVm.F (float ((bs0.[bi0]).H))
     member x.End () : unit =
-        Js.call0 (Js.handle h) "end" |> ignore
+        GpuVm.F 49.0
+        GpuVm.F (float h)
     member x.PushDebugGroup (groupLabel : string) : unit =
-        let groupLabel_j = Js.ofString (groupLabel)
-        Js.call1 (Js.handle h) "pushDebugGroup" groupLabel_j |> ignore
+        GpuVm.F 50.0
+        GpuVm.F (float h)
+        GpuVm.S (groupLabel)
     member x.PopDebugGroup () : unit =
-        Js.call0 (Js.handle h) "popDebugGroup" |> ignore
+        GpuVm.F 51.0
+        GpuVm.F (float h)
     member x.InsertDebugMarker (markerLabel : string) : unit =
-        let markerLabel_j = Js.ofString (markerLabel)
-        Js.call1 (Js.handle h) "insertDebugMarker" markerLabel_j |> ignore
+        GpuVm.F 52.0
+        GpuVm.F (float h)
+        GpuVm.S (markerLabel)
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
+        GpuVm.F 53.0
+        GpuVm.F (float h)
+        GpuVm.F (float (index))
+        GpuVm.F (float ((bindGroup).H))
+        (match dynamicOffsets with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (bs0.[bi0]))
+         | None -> GpuVm.F 0.0)
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
-        let rangeOffset_j = Js.ofNum (float (rangeOffset))
-        let data_j = data
-        let dataOffset_j = (match dataOffset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let dataSize_j = (match dataSize with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setImmediates" rangeOffset_j data_j dataOffset_j dataSize_j |> ignore
+        GpuVm.F 54.0
+        GpuVm.F (float h)
+        GpuVm.F (float (rangeOffset))
+        GpuVm.O (data)
+        (match dataOffset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match dataSize with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.SetPipeline (pipeline : GPURenderPipeline) : unit =
-        let pipeline_j = Js.handle (pipeline).H
-        Js.call1 (Js.handle h) "setPipeline" pipeline_j |> ignore
+        GpuVm.F 55.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((pipeline).H))
     member x.SetIndexBuffer (buffer : GPUBuffer, indexFormat : GPUIndexFormat, ?offset : float, ?size : float) : unit =
-        let buffer_j = Js.handle (buffer).H
-        let indexFormat_j = Marshal.GPUIndexFormatJs (indexFormat)
-        let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setIndexBuffer" buffer_j indexFormat_j offset_j size_j |> ignore
+        GpuVm.F 56.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((buffer).H))
+        GpuVm.F (float (int (indexFormat)))
+        (match offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.SetVertexBuffer (slot : int, buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
-        let slot_j = Js.ofNum (float (slot))
-        let buffer_j = Js.handle (buffer).H
-        let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setVertexBuffer" slot_j buffer_j offset_j size_j |> ignore
+        GpuVm.F 57.0
+        GpuVm.F (float h)
+        GpuVm.F (float (slot))
+        GpuVm.F (float ((buffer).H))
+        (match offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.Draw (vertexCount : int, ?instanceCount : int, ?firstVertex : int, ?firstInstance : int) : unit =
-        let vertexCount_j = Js.ofNum (float (vertexCount))
-        let instanceCount_j = (match instanceCount with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstVertex_j = (match firstVertex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstInstance_j = (match firstInstance with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "draw" vertexCount_j instanceCount_j firstVertex_j firstInstance_j |> ignore
+        GpuVm.F 58.0
+        GpuVm.F (float h)
+        GpuVm.F (float (vertexCount))
+        (match instanceCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstVertex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstInstance with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
     member x.DrawIndexed (indexCount : int, ?instanceCount : int, ?firstIndex : int, ?baseVertex : int, ?firstInstance : int) : unit =
-        let indexCount_j = Js.ofNum (float (indexCount))
-        let instanceCount_j = (match instanceCount with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstIndex_j = (match firstIndex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let baseVertex_j = (match baseVertex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstInstance_j = (match firstInstance with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        Js.call5 (Js.handle h) "drawIndexed" indexCount_j instanceCount_j firstIndex_j baseVertex_j firstInstance_j |> ignore
+        GpuVm.F 59.0
+        GpuVm.F (float h)
+        GpuVm.F (float (indexCount))
+        (match instanceCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match baseVertex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstInstance with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
     member x.DrawIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
-        let indirectBuffer_j = Js.handle (indirectBuffer).H
-        let indirectOffset_j = Js.ofNum (indirectOffset)
-        Js.call2 (Js.handle h) "drawIndirect" indirectBuffer_j indirectOffset_j |> ignore
+        GpuVm.F 60.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((indirectBuffer).H))
+        GpuVm.F (indirectOffset)
     member x.DrawIndexedIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
-        let indirectBuffer_j = Js.handle (indirectBuffer).H
-        let indirectOffset_j = Js.ofNum (indirectOffset)
-        Js.call2 (Js.handle h) "drawIndexedIndirect" indirectBuffer_j indirectOffset_j |> ignore
+        GpuVm.F 61.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((indirectBuffer).H))
+        GpuVm.F (indirectOffset)
 
 and GPURenderBundle(h : int) =
     member x.H : int = h
@@ -981,106 +1238,204 @@ and GPURenderBundleEncoder(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.Finish () : GPURenderBundle =
-        let r = Js.register (Js.call0 (Js.handle h) "finish")
+        GpuVm.F 62.0
+        GpuVm.F (float h)
+        GpuVm.F 0.0
+        let r = int (GpuVm.Call ())
         let w = GPURenderBundle r
         Js.watch (box w) r
         w
     member x.FinishWith (descriptor : GPURenderBundleDescriptor) : GPURenderBundle =
-        let descriptor_j = Marshal.GPURenderBundleDescriptorJs (descriptor)
-        let r = Js.register (Js.call1 (Js.handle h) "finish" descriptor_j)
+        GpuVm.F 62.0
+        GpuVm.F (float h)
+        GpuVm.F 1.0
+        Marshal.GPURenderBundleDescriptorBin (descriptor)
+        let r = int (GpuVm.Call ())
         let w = GPURenderBundle r
         Js.watch (box w) r
         w
     member x.PushDebugGroup (groupLabel : string) : unit =
-        let groupLabel_j = Js.ofString (groupLabel)
-        Js.call1 (Js.handle h) "pushDebugGroup" groupLabel_j |> ignore
+        GpuVm.F 63.0
+        GpuVm.F (float h)
+        GpuVm.S (groupLabel)
     member x.PopDebugGroup () : unit =
-        Js.call0 (Js.handle h) "popDebugGroup" |> ignore
+        GpuVm.F 64.0
+        GpuVm.F (float h)
     member x.InsertDebugMarker (markerLabel : string) : unit =
-        let markerLabel_j = Js.ofString (markerLabel)
-        Js.call1 (Js.handle h) "insertDebugMarker" markerLabel_j |> ignore
+        GpuVm.F 65.0
+        GpuVm.F (float h)
+        GpuVm.S (markerLabel)
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
-        let index_j = Js.ofNum (float (index))
-        let bindGroup_j = Js.handle (bindGroup).H
-        let dynamicOffsets_j = (match dynamicOffsets with Some v -> Marshal.SeqJs (fun x -> Js.ofNum (float (x))) (v) | None -> Js.undefined ())
-        Js.call3 (Js.handle h) "setBindGroup" index_j bindGroup_j dynamicOffsets_j |> ignore
+        GpuVm.F 66.0
+        GpuVm.F (float h)
+        GpuVm.F (float (index))
+        GpuVm.F (float ((bindGroup).H))
+        (match dynamicOffsets with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (bs0.[bi0]))
+         | None -> GpuVm.F 0.0)
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
-        let rangeOffset_j = Js.ofNum (float (rangeOffset))
-        let data_j = data
-        let dataOffset_j = (match dataOffset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let dataSize_j = (match dataSize with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setImmediates" rangeOffset_j data_j dataOffset_j dataSize_j |> ignore
+        GpuVm.F 67.0
+        GpuVm.F (float h)
+        GpuVm.F (float (rangeOffset))
+        GpuVm.O (data)
+        (match dataOffset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match dataSize with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.SetPipeline (pipeline : GPURenderPipeline) : unit =
-        let pipeline_j = Js.handle (pipeline).H
-        Js.call1 (Js.handle h) "setPipeline" pipeline_j |> ignore
+        GpuVm.F 68.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((pipeline).H))
     member x.SetIndexBuffer (buffer : GPUBuffer, indexFormat : GPUIndexFormat, ?offset : float, ?size : float) : unit =
-        let buffer_j = Js.handle (buffer).H
-        let indexFormat_j = Marshal.GPUIndexFormatJs (indexFormat)
-        let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setIndexBuffer" buffer_j indexFormat_j offset_j size_j |> ignore
+        GpuVm.F 69.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((buffer).H))
+        GpuVm.F (float (int (indexFormat)))
+        (match offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.SetVertexBuffer (slot : int, buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
-        let slot_j = Js.ofNum (float (slot))
-        let buffer_j = Js.handle (buffer).H
-        let offset_j = (match offset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "setVertexBuffer" slot_j buffer_j offset_j size_j |> ignore
+        GpuVm.F 70.0
+        GpuVm.F (float h)
+        GpuVm.F (float (slot))
+        GpuVm.F (float ((buffer).H))
+        (match offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
     member x.Draw (vertexCount : int, ?instanceCount : int, ?firstVertex : int, ?firstInstance : int) : unit =
-        let vertexCount_j = Js.ofNum (float (vertexCount))
-        let instanceCount_j = (match instanceCount with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstVertex_j = (match firstVertex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstInstance_j = (match firstInstance with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        Js.call4 (Js.handle h) "draw" vertexCount_j instanceCount_j firstVertex_j firstInstance_j |> ignore
+        GpuVm.F 71.0
+        GpuVm.F (float h)
+        GpuVm.F (float (vertexCount))
+        (match instanceCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstVertex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstInstance with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
     member x.DrawIndexed (indexCount : int, ?instanceCount : int, ?firstIndex : int, ?baseVertex : int, ?firstInstance : int) : unit =
-        let indexCount_j = Js.ofNum (float (indexCount))
-        let instanceCount_j = (match instanceCount with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstIndex_j = (match firstIndex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let baseVertex_j = (match baseVertex with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        let firstInstance_j = (match firstInstance with Some v -> Js.ofNum (float (v)) | None -> Js.undefined ())
-        Js.call5 (Js.handle h) "drawIndexed" indexCount_j instanceCount_j firstIndex_j baseVertex_j firstInstance_j |> ignore
+        GpuVm.F 72.0
+        GpuVm.F (float h)
+        GpuVm.F (float (indexCount))
+        (match instanceCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match baseVertex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match firstInstance with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
     member x.DrawIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
-        let indirectBuffer_j = Js.handle (indirectBuffer).H
-        let indirectOffset_j = Js.ofNum (indirectOffset)
-        Js.call2 (Js.handle h) "drawIndirect" indirectBuffer_j indirectOffset_j |> ignore
+        GpuVm.F 73.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((indirectBuffer).H))
+        GpuVm.F (indirectOffset)
     member x.DrawIndexedIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
-        let indirectBuffer_j = Js.handle (indirectBuffer).H
-        let indirectOffset_j = Js.ofNum (indirectOffset)
-        Js.call2 (Js.handle h) "drawIndexedIndirect" indirectBuffer_j indirectOffset_j |> ignore
+        GpuVm.F 74.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((indirectBuffer).H))
+        GpuVm.F (indirectOffset)
 
 and GPUQueue(h : int) =
     member x.H : int = h
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.Submit (commandBuffers : GPUCommandBuffer[]) : unit =
-        let commandBuffers_j = Marshal.SeqJs (fun x -> Js.handle (x).H) (commandBuffers)
-        Js.call1 (Js.handle h) "submit" commandBuffers_j |> ignore
+        GpuVm.F 75.0
+        GpuVm.F (float h)
+        let bs0 = commandBuffers
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            GpuVm.F (float ((bs0.[bi0]).H))
+        GpuVm.Call () |> ignore
     member x.OnSubmittedWorkDone () : Future<unit> =
+        GpuVm.Barrier ()
         future {
             let! p = Js.futureOf (Js.call0 (Js.handle h) "onSubmittedWorkDone")
             return (let _u = p in ())
         }
     member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : JsObj, ?dataOffset : float, ?size : float) : unit =
-        let buffer_j = Js.handle (buffer).H
-        let bufferOffset_j = Js.ofNum (bufferOffset)
-        let data_j = data
-        let dataOffset_j = (match dataOffset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
-        Js.call5 (Js.handle h) "writeBuffer" buffer_j bufferOffset_j data_j dataOffset_j size_j |> ignore
+        GpuVm.F 76.0
+        GpuVm.F (float h)
+        GpuVm.F (float ((buffer).H))
+        GpuVm.F (bufferOffset)
+        GpuVm.O (data)
+        (match dataOffset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.Call () |> ignore
     member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : 'a[]) : unit when Unmanaged<'a> =
+        GpuVm.Barrier ()
         let p = Array.pin data
         let v = Js.viewU8 p (Array.byteSize data)
         Js.call5 (Js.handle h) "writeBuffer" (Js.handle (buffer).H) (Js.ofNum (bufferOffset)) v (Js.undefined ()) (Js.undefined ()) |> ignore
         Array.unpin data |> ignore
     member x.WriteTexture (destination : GPUTexelCopyTextureInfo, data : JsObj, dataLayout : GPUTexelCopyBufferLayout, size : GPUExtent3DDict) : unit =
-        let destination_j = Marshal.GPUTexelCopyTextureInfoJs (destination)
-        let data_j = data
-        let dataLayout_j = Marshal.GPUTexelCopyBufferLayoutJs (dataLayout)
-        let size_j = Marshal.GPUExtent3DDictJs (size)
-        Js.call4 (Js.handle h) "writeTexture" destination_j data_j dataLayout_j size_j |> ignore
+        GpuVm.F 77.0
+        GpuVm.F (float h)
+        Marshal.GPUTexelCopyTextureInfoBin (destination)
+        GpuVm.O (data)
+        Marshal.GPUTexelCopyBufferLayoutBin (dataLayout)
+        Marshal.GPUExtent3DDictBin (size)
+        GpuVm.Call () |> ignore
     member x.CopyExternalImageToTexture (source : GPUCopyExternalImageSourceInfo, destination : GPUCopyExternalImageDestInfo, copySize : GPUExtent3DDict) : unit =
-        let source_j = Marshal.GPUCopyExternalImageSourceInfoJs (source)
-        let destination_j = Marshal.GPUCopyExternalImageDestInfoJs (destination)
-        let copySize_j = Marshal.GPUExtent3DDictJs (copySize)
-        Js.call3 (Js.handle h) "copyExternalImageToTexture" source_j destination_j copySize_j |> ignore
+        GpuVm.F 78.0
+        GpuVm.F (float h)
+        Marshal.GPUCopyExternalImageSourceInfoBin (source)
+        Marshal.GPUCopyExternalImageDestInfoBin (destination)
+        Marshal.GPUExtent3DDictBin (copySize)
+        GpuVm.Call () |> ignore
 
 and GPUQuerySet(h : int) =
     member x.H : int = h
@@ -1088,20 +1443,29 @@ and GPUQuerySet(h : int) =
     member x.Count : int = int (Js.toNum (Js.get (Js.handle h) "count"))
     member x.Label : string = Js.toString (Js.get (Js.handle h) "label")
     member x.Destroy () : unit =
-        Js.call0 (Js.handle h) "destroy" |> ignore
+        GpuVm.F 79.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
 
 and GPUCanvasContext(h : int) =
     member x.H : int = h
     member x.Canvas : JsObj = Js.get (Js.handle h) "canvas"
     member x.Configure (configuration : GPUCanvasConfiguration) : unit =
-        let configuration_j = Marshal.GPUCanvasConfigurationJs (configuration)
-        Js.call1 (Js.handle h) "configure" configuration_j |> ignore
+        GpuVm.F 80.0
+        GpuVm.F (float h)
+        Marshal.GPUCanvasConfigurationBin (configuration)
+        GpuVm.Call () |> ignore
     member x.Unconfigure () : unit =
-        Js.call0 (Js.handle h) "unconfigure" |> ignore
+        GpuVm.F 81.0
+        GpuVm.F (float h)
+        GpuVm.Call () |> ignore
     member x.GetConfiguration () : JsObj =
+        GpuVm.Barrier ()
         Js.call0 (Js.handle h) "getConfiguration"
     member x.GetCurrentTexture () : GPUTexture =
-        let r = Js.register (Js.call0 (Js.handle h) "getCurrentTexture")
+        GpuVm.F 82.0
+        GpuVm.F (float h)
+        let r = int (GpuVm.Call ())
         let w = GPUTexture r
         Js.watch (box w) r
         w
@@ -3060,6 +3424,1008 @@ and Marshal =
          | Some v -> Js.set o "depthOrArrayLayers" (Js.ofNum (float (v)))
          | None -> ())
         o
+    static member GPUObjectDescriptorBaseBin (r : GPUObjectDescriptorBase) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPURequestAdapterOptionsBin (r : GPURequestAdapterOptions) : unit =
+        (match r.FeatureLevel with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.PowerPreference with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.ForceFallbackAdapter with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+        (match r.XrCompatible with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUDeviceDescriptorBin (r : GPUDeviceDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.RequiredFeatures with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (int (bs0.[bi0])))
+         | None -> GpuVm.F 0.0)
+        (match r.RequiredLimits with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+        (match r.DefaultQueue with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUQueueDescriptorBin (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUBufferDescriptorBin (r : GPUBufferDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (r.Size)
+        GpuVm.F (float (r.Usage))
+        (match r.MappedAtCreation with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUTextureDescriptorBin (r : GPUTextureDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        Marshal.GPUExtent3DDictBin (r.Size)
+        (match r.MipLevelCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.SampleCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Dimension with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Format)))
+        GpuVm.F (float (r.Usage))
+        (match r.ViewFormats with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (int (bs0.[bi0])))
+         | None -> GpuVm.F 0.0)
+        (match r.TextureBindingViewDimension with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUTextureViewDescriptorBin (r : GPUTextureViewDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Format with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.Dimension with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.Usage with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Aspect with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.BaseMipLevel with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.MipLevelCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.BaseArrayLayer with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.ArrayLayerCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Swizzle with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUExternalTextureDescriptorBin (r : GPUExternalTextureDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.O (r.Source)
+        (match r.ColorSpace with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUSamplerDescriptorBin (r : GPUSamplerDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.AddressModeU with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.AddressModeV with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.AddressModeW with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.MagFilter with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.MinFilter with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.MipmapFilter with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.LodMinClamp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.LodMaxClamp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Compare with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.MaxAnisotropy with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUBindGroupLayoutDescriptorBin (r : GPUBindGroupLayoutDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.Entries
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            Marshal.GPUBindGroupLayoutEntryBin (bs0.[bi0])
+    static member GPUBindGroupLayoutEntryBin (r : GPUBindGroupLayoutEntry) : unit =
+        GpuVm.F (float (r.Binding))
+        GpuVm.F (float (r.Visibility))
+        (match r.Buffer with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUBufferBindingLayoutBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Sampler with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUSamplerBindingLayoutBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Texture with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUTextureBindingLayoutBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.StorageTexture with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUStorageTextureBindingLayoutBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.ExternalTexture with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUExternalTextureBindingLayoutBin (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUBufferBindingLayoutBin (r : GPUBufferBindingLayout) : unit =
+        (match r.Type with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.HasDynamicOffset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+        (match r.MinBindingSize with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUSamplerBindingLayoutBin (r : GPUSamplerBindingLayout) : unit =
+        (match r.Type with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUTextureBindingLayoutBin (r : GPUTextureBindingLayout) : unit =
+        (match r.SampleType with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.ViewDimension with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.Multisampled with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUStorageTextureBindingLayoutBin (r : GPUStorageTextureBindingLayout) : unit =
+        (match r.Access with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Format)))
+        (match r.ViewDimension with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUExternalTextureBindingLayoutBin (r : GPUExternalTextureBindingLayout) : unit =
+        ()
+    static member GPUBindGroupDescriptorBin (r : GPUBindGroupDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float ((r.Layout).H))
+        let bs0 = r.Entries
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            Marshal.GPUBindGroupEntryBin (bs0.[bi0])
+    static member GPUBindGroupEntryBin (r : GPUBindGroupEntry) : unit =
+        GpuVm.F (float (r.Binding))
+        GpuVm.O (r.Resource)
+    static member GPUBufferBindingBin (r : GPUBufferBinding) : unit =
+        GpuVm.F (float ((r.Buffer).H))
+        (match r.Offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Size with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUPipelineLayoutDescriptorBin (r : GPUPipelineLayoutDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.BindGroupLayouts
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            GpuVm.F (float ((bs0.[bi0]).H))
+        (match r.ImmediateSize with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUShaderModuleDescriptorBin (r : GPUShaderModuleDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.S (r.Code)
+        (match r.CompilationHints with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 Marshal.GPUShaderModuleCompilationHintBin (bs0.[bi0])
+         | None -> GpuVm.F 0.0)
+    static member GPUShaderModuleCompilationHintBin (r : GPUShaderModuleCompilationHint) : unit =
+        GpuVm.S (r.EntryPoint)
+        (match r.Layout with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUPipelineErrorInitBin (r : GPUPipelineErrorInit) : unit =
+        GpuVm.F (float (int (r.Reason)))
+    static member GPUPipelineDescriptorBaseBin (r : GPUPipelineDescriptorBase) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Layout)))
+    static member GPUProgrammableStageBin (r : GPUProgrammableStage) : unit =
+        GpuVm.F (float ((r.Module).H))
+        (match r.EntryPoint with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Constants with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUComputePipelineDescriptorBin (r : GPUComputePipelineDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Layout)))
+        Marshal.GPUProgrammableStageBin (r.Compute)
+    static member GPURenderPipelineDescriptorBin (r : GPURenderPipelineDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Layout)))
+        Marshal.GPUVertexStateBin (r.Vertex)
+        (match r.Primitive with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUPrimitiveStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.DepthStencil with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUDepthStencilStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Multisample with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUMultisampleStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Fragment with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUFragmentStateBin (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUPrimitiveStateBin (r : GPUPrimitiveState) : unit =
+        (match r.Topology with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.StripIndexFormat with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.FrontFace with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.CullMode with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.UnclippedDepth with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUMultisampleStateBin (r : GPUMultisampleState) : unit =
+        (match r.Count with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Mask with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.AlphaToCoverageEnabled with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUFragmentStateBin (r : GPUFragmentState) : unit =
+        GpuVm.F (float ((r.Module).H))
+        (match r.EntryPoint with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Constants with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.Targets
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            Marshal.GPUColorTargetStateBin (bs0.[bi0])
+    static member GPUColorTargetStateBin (r : GPUColorTargetState) : unit =
+        GpuVm.F (float (int (r.Format)))
+        (match r.Blend with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUBlendStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.WriteMask with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUBlendStateBin (r : GPUBlendState) : unit =
+        Marshal.GPUBlendComponentBin (r.Color)
+        Marshal.GPUBlendComponentBin (r.Alpha)
+    static member GPUBlendComponentBin (r : GPUBlendComponent) : unit =
+        (match r.Operation with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.SrcFactor with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.DstFactor with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUDepthStencilStateBin (r : GPUDepthStencilState) : unit =
+        GpuVm.F (float (int (r.Format)))
+        (match r.DepthWriteEnabled with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+        (match r.DepthCompare with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.StencilFront with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUStencilFaceStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.StencilBack with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUStencilFaceStateBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.StencilReadMask with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.StencilWriteMask with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthBias with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthBiasSlopeScale with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.DepthBiasClamp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUStencilFaceStateBin (r : GPUStencilFaceState) : unit =
+        (match r.Compare with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.FailOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthFailOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.PassOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUVertexStateBin (r : GPUVertexState) : unit =
+        GpuVm.F (float ((r.Module).H))
+        (match r.EntryPoint with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Constants with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Buffers with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 Marshal.GPUVertexBufferLayoutBin (bs0.[bi0])
+         | None -> GpuVm.F 0.0)
+    static member GPUVertexBufferLayoutBin (r : GPUVertexBufferLayout) : unit =
+        GpuVm.F (r.ArrayStride)
+        (match r.StepMode with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.Attributes
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            Marshal.GPUVertexAttributeBin (bs0.[bi0])
+    static member GPUVertexAttributeBin (r : GPUVertexAttribute) : unit =
+        GpuVm.F (float (int (r.Format)))
+        GpuVm.F (r.Offset)
+        GpuVm.F (float (r.ShaderLocation))
+    static member GPUTexelCopyBufferLayoutBin (r : GPUTexelCopyBufferLayout) : unit =
+        (match r.Offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.BytesPerRow with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.RowsPerImage with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUTexelCopyBufferInfoBin (r : GPUTexelCopyBufferInfo) : unit =
+        (match r.Offset with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.BytesPerRow with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.RowsPerImage with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float ((r.Buffer).H))
+    static member GPUTexelCopyTextureInfoBin (r : GPUTexelCopyTextureInfo) : unit =
+        GpuVm.F (float ((r.Texture).H))
+        (match r.MipLevel with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Origin with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUOrigin3DDictBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Aspect with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUCopyExternalImageDestInfoBin (r : GPUCopyExternalImageDestInfo) : unit =
+        GpuVm.F (float ((r.Texture).H))
+        (match r.MipLevel with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Origin with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUOrigin3DDictBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.Aspect with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.ColorSpace with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+        (match r.PremultipliedAlpha with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUCopyExternalImageSourceInfoBin (r : GPUCopyExternalImageSourceInfo) : unit =
+        GpuVm.O (r.Source)
+        (match r.Origin with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUOrigin2DDictBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.FlipY with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUCommandBufferDescriptorBin (r : GPUCommandBufferDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUCommandEncoderDescriptorBin (r : GPUCommandEncoderDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUComputePassTimestampWritesBin (r : GPUComputePassTimestampWrites) : unit =
+        GpuVm.F (float ((r.QuerySet).H))
+        (match r.BeginningOfPassWriteIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.EndOfPassWriteIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUComputePassDescriptorBin (r : GPUComputePassDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        (match r.TimestampWrites with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUComputePassTimestampWritesBin (v)
+         | None -> GpuVm.F 0.0)
+    static member GPURenderPassTimestampWritesBin (r : GPURenderPassTimestampWrites) : unit =
+        GpuVm.F (float ((r.QuerySet).H))
+        (match r.BeginningOfPassWriteIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.EndOfPassWriteIndex with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPURenderPassDescriptorBin (r : GPURenderPassDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.ColorAttachments
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            Marshal.GPURenderPassColorAttachmentBin (bs0.[bi0])
+        (match r.DepthStencilAttachment with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPURenderPassDepthStencilAttachmentBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.OcclusionQuerySet with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float ((v).H))
+         | None -> GpuVm.F 0.0)
+        (match r.TimestampWrites with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPURenderPassTimestampWritesBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.MaxDrawCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+    static member GPURenderPassColorAttachmentBin (r : GPURenderPassColorAttachment) : unit =
+        GpuVm.F (float ((r.View).H))
+        (match r.DepthSlice with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.ResolveTarget with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float ((v).H))
+         | None -> GpuVm.F 0.0)
+        (match r.ClearValue with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUColorDictBin (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.LoadOp)))
+        GpuVm.F (float (int (r.StoreOp)))
+    static member GPURenderPassDepthStencilAttachmentBin (r : GPURenderPassDepthStencilAttachment) : unit =
+        GpuVm.F (float ((r.View).H))
+        (match r.DepthClearValue with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (v)
+         | None -> GpuVm.F 0.0)
+        (match r.DepthLoadOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthStoreOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthReadOnly with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+        (match r.StencilClearValue with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.StencilLoadOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.StencilStoreOp with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.StencilReadOnly with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPURenderPassLayoutBin (r : GPURenderPassLayout) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.ColorFormats
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            GpuVm.F (float (int (bs0.[bi0])))
+        (match r.DepthStencilFormat with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.SampleCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPURenderBundleDescriptorBin (r : GPURenderBundleDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPURenderBundleEncoderDescriptorBin (r : GPURenderBundleEncoderDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        let bs0 = r.ColorFormats
+        GpuVm.F (float (Array.length bs0))
+        for bi0 in 0 .. Array.length bs0 - 1 do
+            GpuVm.F (float (int (bs0.[bi0])))
+        (match r.DepthStencilFormat with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+        (match r.SampleCount with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthReadOnly with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+        (match r.StencilReadOnly with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (if v then 1.0 else 0.0)
+         | None -> GpuVm.F 0.0)
+    static member GPUQueueDescriptorBin (r : GPUQueueDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+    static member GPUQuerySetDescriptorBin (r : GPUQuerySetDescriptor) : unit =
+        (match r.Label with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.S (v)
+         | None -> GpuVm.F 0.0)
+        GpuVm.F (float (int (r.Type)))
+        GpuVm.F (float (r.Count))
+    static member GPUCanvasToneMappingBin (r : GPUCanvasToneMapping) : unit =
+        (match r.Mode with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUCanvasConfigurationBin (r : GPUCanvasConfiguration) : unit =
+        GpuVm.F (float ((r.Device).H))
+        GpuVm.F (float (int (r.Format)))
+        (match r.Usage with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.ViewFormats with
+         | Some v ->
+             GpuVm.F 1.0
+             let bs0 = v
+             GpuVm.F (float (Array.length bs0))
+             for bi0 in 0 .. Array.length bs0 - 1 do
+                 GpuVm.F (float (int (bs0.[bi0])))
+         | None -> GpuVm.F 0.0)
+        (match r.ColorSpace with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.O (v)
+         | None -> GpuVm.F 0.0)
+        (match r.ToneMapping with
+         | Some v ->
+             GpuVm.F 1.0
+             Marshal.GPUCanvasToneMappingBin (v)
+         | None -> GpuVm.F 0.0)
+        (match r.AlphaMode with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (int (v)))
+         | None -> GpuVm.F 0.0)
+    static member GPUUncapturedErrorEventInitBin (r : GPUUncapturedErrorEventInit) : unit =
+        GpuVm.F (float ((r.Error).H))
+    static member GPUColorDictBin (r : GPUColorDict) : unit =
+        GpuVm.F (r.R)
+        GpuVm.F (r.G)
+        GpuVm.F (r.B)
+        GpuVm.F (r.A)
+    static member GPUOrigin2DDictBin (r : GPUOrigin2DDict) : unit =
+        (match r.X with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Y with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUOrigin3DDictBin (r : GPUOrigin3DDict) : unit =
+        (match r.X with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Y with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.Z with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+    static member GPUExtent3DDictBin (r : GPUExtent3DDict) : unit =
+        GpuVm.F (float (r.Width))
+        (match r.Height with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
+        (match r.DepthOrArrayLayers with
+         | Some v ->
+             GpuVm.F 1.0
+             GpuVm.F (float (v))
+         | None -> GpuVm.F 0.0)
 
 let WrapGPUSupportedLimits (h : int) : GPUSupportedLimits = GPUSupportedLimits h
 let WrapGPUSupportedFeatures (h : int) : GPUSupportedFeatures = GPUSupportedFeatures h
