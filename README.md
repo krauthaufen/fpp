@@ -1,9 +1,36 @@
 # F++
 
-F# without .NET. The syntax and semantics you know, extended with typeclasses
-and higher-kinded types, compiled ahead of time — no JIT, no CLR, no runtime
-to install alongside the program. Two backends: wasm-GC, and C over fpprt
-(an owned precise moving GC) for native binaries and wasm-linear.
+## Why
+
+F# is a language worth keeping — the offside rule, unions and records,
+pattern matching, computation expressions, a type system that stays out of
+the way. But it is chained to a runtime that decides where it can go. A
+web page carrying a .NET program starts by downloading and booting a
+runtime; a command-line tool ships one or trusts the machine to have it;
+startup pays for a JIT before the first line of user code runs. For the
+places this project cares about — real-time graphics in the browser, small
+native tools, wasm modules that start now — the runtime costs more than
+the program.
+
+F++ is F# rebuilt as its own language, the way OCaml is its own language:
+compiled ahead of time to wasm and native, no CLR, no JIT, nothing to
+install beside the binary. Cutting the tether also removes .NET's ceiling
+on the type system — F++ adds typeclasses (`when Num<'a>`), higher-kinded
+types, and GADTs, the features F# wanted and the CLR could not carry.
+
+The browser is a first-class target, not a port: zero-copy `ArrayBuffer`
+views over pinned arrays, UTF-16 strings on the engine's own `js-string`
+builtins, a typed DOM, complete generated WebGPU and WebGL bindings
+(extensions included), and a binary command stream that crosses the
+wasm↔JS boundary once per render pass — a recorded GPU command costs
+~30 ns of machinery, against ~95 ns for a call-per-crossing FFI.
+
+## What
+
+The syntax and semantics you know, extended with typeclasses and
+higher-kinded types, compiled ahead of time. Two backends: wasm-GC, and C
+over fpprt (an owned precise moving GC) for native binaries and
+wasm-linear.
 
 The proof of surface: **FSharp.Data.Adaptive compiles whole and runs** — a
 100-test port of its own test suite is green under wasmtime, property
@@ -48,7 +75,7 @@ curl https://wasmtime.dev/install.sh -sSf | bash
 git clone git@github.com:krauthaufen/fpp.git
 cd fpp
 dotnet build -c Release
-dotnet test  -c Release          # 658 tests; exits non-zero if any fail
+dotnet test  -c Release          # 677 tests; exits non-zero if any fail
 ```
 
 The suite includes the oracle gate: every program in it is also valid F#, so
@@ -116,3 +143,7 @@ editors/vscode     the VS Code extension
 The LSP server and the CLI are deliberately thin clients of one `Workspace`
 type, so an editor and a build can never disagree about what the program
 means.
+
+## License
+
+MIT — see `LICENSE`.
