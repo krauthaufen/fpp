@@ -32,6 +32,7 @@
     <Compile Include="Backend/CEmit.fs" />
     <Compile Include="Backend/SourceMap.fs" />
     <Compile Include="Query.fs" />
+    <Compile Include="Pkg.fs" />
     <Compile Include="Project.fs" />
     <Compile Include="Workspace.fs" />
   </ItemGroup>

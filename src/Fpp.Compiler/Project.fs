@@ -30,7 +30,14 @@ type Project =
       Sources : string list
       /// conditional-compilation symbols (`define WEBDEBUG`); the build
       /// target adds WASM or NATIVE by itself
-      Defines : string list }
+      Defines : string list
+      /// this project's own version (`version 1.2.3`) — what `fpp pack`
+      /// stamps on the package; "" when unversioned
+      Version : string
+      /// package dependencies: name and range text (`package foo ^1.2`)
+      Packages : (string * string) list
+      /// package registries, URLs or directories, in lookup order
+      Registries : string list }
 
 type LoadResult =
     { Loaded : Project
@@ -55,6 +62,9 @@ let parse (projectPath : string) (text : string) : LoadResult =
     let mutable name = pathFileNameWithoutExtension projectPath
     let mutable out = ""
     let defines = vecNew<string> ()
+    let mutable version = ""
+    let packages = vecNew<string * string> ()
+    let registries = vecNew<string> ()
     let lines = text.Replace("\r\n", "\n").Split '\n'
     for i in 0 .. lines.Length - 1 do
         let line = lines.[i].Trim()
@@ -74,6 +84,20 @@ let parse (projectPath : string) (text : string) : LoadResult =
             | "lib" -> vecAdd libs (combine dir arg)
             | "src" -> vecAdd sources (combine dir arg)
             | "define" -> vecAdd defines arg
+            | "version" ->
+                (match Fpp.Pkg.parseVersion arg with
+                 | Some _ -> version <- arg
+                 | None -> vecAdd errors (i + 1, "bad version: " + arg))
+            | "package" ->
+                // `package foo ^1.2` — the range defaults to * when only
+                // the name is written
+                let psp = arg.IndexOf ' '
+                let pn = if psp < 0 then arg else arg.Substring (0, psp)
+                let pr = if psp < 0 then "*" else arg.Substring(psp + 1).Trim()
+                (match Fpp.Pkg.parseRange pr with
+                 | Some _ -> vecAdd packages (pn, pr)
+                 | None -> vecAdd errors (i + 1, "bad range on package " + pn + ": " + pr))
+            | "registry" -> vecAdd registries arg
             | other -> vecAdd errors (i + 1, "unknown directive '" + other + "'")
             if arg = "" && directive <> "name" then
                 vecAdd errors (i + 1, directive + " needs an argument")
@@ -84,7 +108,10 @@ let parse (projectPath : string) (text : string) : LoadResult =
           Out = (if out = "" then name + ".wasm" else out)
           Libs = vecToList libs
           Sources = vecToList sources
-          Defines = vecToList defines }
+          Defines = vecToList defines
+          Version = version
+          Packages = vecToList packages
+          Registries = vecToList registries }
       Errors = vecToList errors }
 
 /// A project that is not there is not an exception: the caller reports the
@@ -93,7 +120,8 @@ let read (projectPath : string) : LoadResult =
     match hostReadText projectPath with
     | Some text -> parse projectPath text
     | None ->
-        { Loaded = { Path = projectPath; Name = ""; Out = ""; Libs = []; Sources = []; Defines = [] }
+        { Loaded = { Path = projectPath; Name = ""; Out = ""; Libs = []; Sources = []; Defines = []
+                     Version = ""; Packages = []; Registries = [] }
           Errors = [ 0, "cannot read project file " + projectPath ] }
 
 /// The project a source file belongs to: the nearest `*.fppproj` at or above

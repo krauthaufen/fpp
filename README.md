@@ -37,6 +37,7 @@ self-host fixpoint is byte-identical and gates every change.
 - **PLAN.md** - what is built, what is not, in the order it is being built
 - **DIVERGENCES.md** - every deliberate departure from F#, with its reason
 - **REPRESENTATION.md** - how values are laid out at run time
+- **PACKAGES.md** - publishing and consuming libraries: fpkg archives, registries, the solver
 - **PLAN-CBACK.md** - the C backend and fpprt: value model, the TRUE-structs arc
 - **PLAN-THREADS.md** - concurrency/parallelism design: virtual threads, barriers, the GC uniqueness query
 - **CLAUDE.md** - how to work in this repo: the gates, and what they cost
