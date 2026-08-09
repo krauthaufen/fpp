@@ -1357,6 +1357,33 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// [<Struct>] decls and enums, for the compiler-derived Unmanaged
     /// instances: (name, params, field types); enums carry no fields
     let unmanagedCands = vecNew<string * Var list * Type list> ()
+
+    let unmanagedDerived = dictNew<string, bool> ()
+    /// derive `instance Unmanaged<T>` for a [<Struct>] whose fields qualify.
+    /// Runs EAGERLY at the declaration — an eager solveWanted inside a later
+    /// binding (an arithmetic operator solves greedily) must find it — and
+    /// again at end-of-file for structs whose field types come later.
+    let deriveUnmanaged (tn : string) (ps : Var list) (fts : Type list) : unit =
+        if (dictTryFind unmanagedDerived tn).IsNone then
+            let prims =
+                [ "int"; "uint32"; "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
+                  "char"; "bool"; "float"; "float32"; "float16"; "double"; "single"
+                  "nativeint"; "unativeint" ]
+            let rec um (t : Type) : bool =
+                match prune t with
+                | TCon (p, []) -> List.contains p prims || (dictTryFind structTypes p).IsSome
+                | TCon (p, args) -> (dictTryFind structTypes p).IsSome && List.forall um args
+                | TVar v -> ps |> List.exists (fun q -> prunedId q = prunedId v)
+                | _ -> false
+            if fts |> List.forall um then
+                dictSet unmanagedDerived tn true
+                Classes.addInstance classes
+                    { Class = "Unmanaged"; Params = ps
+                      Head = [ TCon (tn, ps |> List.map TVar) ]
+                      Assoc = []
+                      Context = ps |> List.map (fun q -> { Class = "Unmanaged"; Args = [ TVar q ]; Assoc = [] })
+                      Members = []; Builtin = true; Path = path
+                      Offset = 0 }
     /// subtype-bounded case vars: ctor def -> (quantified index, iface)
     let existSubCtor = dictNew<string * int, (int * string) list> ()
     let pendingSubChecks = vecNew<int * Type * string> ()
@@ -5189,7 +5216,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
          if not (List.isEmpty cases2)
             && cases2 |> List.forall (fun m ->
                    tokensOf m |> List.exists (fun t -> t.Kind = Operator && t.Text = "=")) then
-             vecAdd unmanagedCands (name, [], []))
+             vecAdd unmanagedCands (name, [], [])
+             deriveUnmanaged name [] [])
         // union cases become constructor schemes
         //
         // everything in a TYPE body — members, let fields, do blocks —
@@ -5209,7 +5237,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         |> List.choose (fun f ->
                             nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind)
                             |> Option.map (typeFromNode vars))
-                    vecAdd unmanagedCands (name, paramVarList (), fts))
+                    vecAdd unmanagedCands (name, paramVarList (), fts)
+                    deriveUnmanaged name (paramVarList ()) fts)
                 for f in nodesOf m do
                     if f.NodeKind = RecordField then
                         let nameTok = tokensOf f |> List.tryFind (fun t -> t.Kind = Ident)
@@ -6304,24 +6333,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | _ -> ()
 
     for tn, ps, fts in vecToList unmanagedCands do
-        let prims =
-            [ "int"; "uint32"; "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
-              "char"; "bool"; "float"; "float32"; "float16"; "double"; "single"
-              "nativeint"; "unativeint" ]
-        let rec um (t : Type) : bool =
-            match prune t with
-            | TCon (p, []) -> List.contains p prims || (dictTryFind structTypes p).IsSome
-            | TCon (p, args) -> (dictTryFind structTypes p).IsSome && List.forall um args
-            | TVar v -> ps |> List.exists (fun q -> prunedId q = prunedId v)
-            | _ -> false
-        if fts |> List.forall um then
-            Classes.addInstance classes
-                { Class = "Unmanaged"; Params = ps
-                  Head = [ TCon (tn, ps |> List.map TVar) ]
-                  Assoc = []
-                  Context = ps |> List.map (fun q -> { Class = "Unmanaged"; Args = [ TVar q ]; Assoc = [] })
-                  Members = []; Builtin = true; Path = path
-                  Offset = 0 }
+        deriveUnmanaged tn ps fts
 
     // Every record and union answers Arb unless it wrote its own instance:
     // a stamped GENERIC use may demand one that no ground use ever named,
