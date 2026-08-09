@@ -601,7 +601,7 @@ export const gpuVm = ({ mem, h: H, reg: REG }) => {
     /* 82 GPUCanvasContext.getCurrentTexture */ (c) => REG(H(c.a[c.i++]).getCurrentTexture()),
   ];
   return { gpuRun: (p, n, s) => {
-    const c = { a: new Float64Array(mem(), p, n), i: 0, s };
+    const c = { a: new Float64Array(mem(), p >>> 0, n), i: 0, s };
     let r = 0;
     while (c.i < n) r = M[c.a[c.i++]](c);
     return typeof r === 'number' ? r : (r ? 1 : 0);

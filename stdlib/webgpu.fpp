@@ -392,6 +392,11 @@ module GpuVm =
     [<Struct>]
     type Slot = { mutable V : float }
     let mutable buf : Slot[] = Array.zeroCreate 1024
+    // pinned ONCE and kept pinned: writes to a pinned POD array land
+    // in linear memory directly, so a flush passes the address with
+    // no copy — and no per-flush balloc (the bump allocator never
+    // frees, and pinning per call leaked the buffer each crossing)
+    let mutable addr : nativeint = Array.pin buf
     let mutable count = 0
     let mutable strs : JsObj = Js.undefined ()
     let mutable strCount = 0
@@ -399,7 +404,10 @@ module GpuVm =
         (if count >= Array.length buf then
             let nb : Slot[] = Array.zeroCreate (Array.length buf * 2)
             for i in 0 .. count - 1 do nb.[i] <- buf.[i]
-            buf <- nb)
+            let na = Array.pin nb
+            Array.unpin buf |> ignore
+            buf <- nb
+            addr <- na)
         buf.[count] <- { V = v }
         count <- count + 1
     let S (s : string) : unit =
@@ -415,9 +423,7 @@ module GpuVm =
     /// send the stream: pending batched ops run first, the LAST
     /// op's result comes back. One boundary crossing.
     let Call () : float =
-        let p = Array.pin buf
-        let r = gpuRun (int p) count strs
-        Array.unpin buf |> ignore
+        let r = gpuRun (int addr) count strs
         count <- 0
         strCount <- 0
         strs <- Js.undefined ()

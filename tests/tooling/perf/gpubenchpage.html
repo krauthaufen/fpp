@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fpp gpu boundary bench</title>
+<body>
+<script type="module">
+  import { instantiate } from '/stdlib/fpp-js.mjs';
+  import { gpuVm } from '/stdlib/webgpu-vm.mjs';
+  // the NOP WebGPU: every measured nanosecond is call machinery
+  // each nop mutates a counter so V8 cannot eliminate the calls; the
+  // create nop touches the descriptor so building it stays live too
+  window.nops = {
+    pass:   { c: 0, setStencilReference(v) { this.c += v|0; }, setBindGroup(i, g) { this.c += i|0; }, draw(v) { this.c += v|0; } },
+    device: { c: 0, createBindGroup(d) { this.c += d.entries.length; return { c: this.c }; } },
+    buffer: { c: 0, unmap() { this.c++; } },
+    bg: {}, layout: {},
+  };
+  const N = { stencil: 200000, bindDraw: 100000, unmap: 20000, create: 20000 };
+  const t = () => performance.now();
+  const jsBench = {
+    stencil: (n) => { const p = window.nops.pass; const t0 = t();
+      for (let i = 0; i < n; i++) p.setStencilReference(i); return (t() - t0) * 1000; },
+    bindDraw: (n) => { const p = window.nops.pass, bg = window.nops.bg; const t0 = t();
+      for (let i = 0; i < n; i++) { p.setBindGroup(0, bg); p.draw(3); } return (t() - t0) * 1000; },
+    unmap: (n) => { const b = window.nops.buffer; const t0 = t();
+      for (let i = 0; i < n; i++) b.unmap(); return (t() - t0) * 1000; },
+    create: (n) => { const d = window.nops.device, buf = window.nops.buffer, lay = window.nops.layout; const t0 = t();
+      for (let i = 0; i < n; i++)
+        d.createBindGroup({ layout: lay, entries: [{ binding: 0, resource: { buffer: buf } }] });
+      return (t() - t0) * 1000; },
+  };
+  try {
+    const exports = await instantiate('/tests/tooling/perf/gpubench.wasm',
+      { sink: () => {}, vms: [gpuVm] });
+    exports._start();
+    exports.setup(0);
+    // warm every leg once, then measure best-of-three
+    const best = (f) => { f(); let m = Infinity; for (let r = 0; r < 3; r++) m = Math.min(m, f()); return m; };
+    const out = {};
+    for (const [leg, n] of Object.entries(N)) {
+      const cap = leg[0].toUpperCase() + leg.slice(1);
+      const vmName = { stencil: 'vmStencil', bindDraw: 'vmBindDraw', unmap: 'vmUnmap', create: 'vmCreateBindGroup' }[leg];
+      const dirName = { stencil: 'directStencil', bindDraw: 'directBindDraw', unmap: 'directUnmap', create: 'directCreateBindGroup' }[leg];
+      out[leg] = {
+        n,
+        js: Math.round(best(() => jsBench[leg](n))),
+        vm: Math.round(best(() => exports[vmName](n))),
+        direct: Math.round(best(() => exports[dirName](n))),
+      };
+    }
+    window.results = out;
+  } catch (e) {
+    window.results = { error: String(e && e.stack || e) };
+  }
+  window.ready = true;
+</script>
