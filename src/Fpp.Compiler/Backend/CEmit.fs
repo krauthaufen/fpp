@@ -1047,6 +1047,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | None ->
              stmt f ("fpp_raise(" + sref x + ");"))
         unitV ()
+    | EApp (EUnknown "monoms", [ a ]) ->
+        emitE st f a |> ignore
+        let d = slot f
+        stmt f (sref d + " = fpp_box_f64(fpp_mono_ms());")
+        d
     | EApp (EUnknown "memAlloc", [ a ]) ->
         let x = emitE st f a
         let d = slot f

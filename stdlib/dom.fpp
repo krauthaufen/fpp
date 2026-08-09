@@ -191,3 +191,26 @@ and Wrap =
 /// the browser's globals, as familiar as they can be spelled here
 let Window () : Window = Window (Js.global_ "window")
 let Document () : Document = Document (Js.global_ "document")
+
+/// The browser driver for the async layer: the main thread must never
+/// block, so a computation is STARTED and the event loop is PUMPED from
+/// the host's own loop — a zero-delay timeout per step while work remains,
+/// timers included (the host wakes us; monoMs decides what is due).
+module BrowserLoop =
+    let mutable private pumping = false
+    let rec private pump (_e : JsObj) : unit =
+        if EventLoop.hasWork () then
+            EventLoop.step ()
+            Js.call2 (Js.global_ "globalThis") "setTimeout" (Js.callback pump) (Js.ofNum 0.0) |> ignore
+        else pumping <- false
+    let private ensure () : unit =
+        if not pumping then
+            pumping <- true
+            Js.call2 (Js.global_ "globalThis") "setTimeout" (Js.callback pump) (Js.ofNum 0.0) |> ignore
+    /// start `a` on the loop and take its result as a Future the browser
+    /// can await
+    let run (ct : CancellationToken) (a : Async<'a>) : Future<'a> =
+        let src = FutureSource<'a> ()
+        EventLoop.post (fun () -> a.RunWith ct (fun v -> src.SetResult v))
+        ensure ()
+        src.Future

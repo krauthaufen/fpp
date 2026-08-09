@@ -1293,6 +1293,8 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
     tyFunc m "$exntag" [ "anyref" ] []
     importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write"
         [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+    importFn m "wasi_snapshot_preview1" "clock_time_get" "$clock_time_get"
+        [ "i32"; "i64"; "i32" ] [ "i32" ]
     exportMem m "memory"
     tyArrayFuncref m "$vt"
     tyStruct m "$desc" [ fld false "i32"; fldRef false "$vt" ]
@@ -4588,9 +4590,11 @@ let rtTypes13 (m : Mod) : unit =
     tyFunc m "$rt_ais2v" [ "anyref"; "i32"; "f32" ] []
     tyFunc m "$rt_ai2f2" [ "anyref"; "i32" ] [ "f64" ]
     tyFunc m "$rt_aif2v" [ "anyref"; "i32"; "f64" ] []
+    tyFunc m "$rt_2f" [] [ "f64" ]
 
 let rtDecls13 (m : Mod) : unit =
     declFn m "$balloc" "$rt_i2i"
+    declFn m "$monoms" "$rt_2f"
     for w, fk in podWidths do
         let _, vt, _, _, _ = podRtK w fk
         let sfx = podSfx w fk
@@ -4648,6 +4652,34 @@ let rtCore13 (m : Mod) : unit =
     lg f "$end"
     gs f "$heap"
     lg f "$p"
+    endFn f
+    // $monoms: the monotonic clock in MILLISECONDS as f64 — WASI
+    // clock_time_get(monotonic) into an 8-byte balloc'd scratch slot,
+    // allocated once
+    let f = beginFn m []
+    local f "$p" "i32"
+    localsDone f
+    gg f "$tscratch"
+    ls f "$p"
+    lg f "$p"
+    ins f "i32.eqz"
+    ifE f
+    ic f 8
+    callf f "$balloc"
+    ls f "$p"
+    lg f "$p"
+    gs f "$tscratch"
+    endB f
+    ic f 1
+    lc f 1000000L
+    lg f "$p"
+    callf f "$clock_time_get"
+    ins f "drop"
+    lg f "$p"
+    mem f "i64.load"
+    ins f "f64.convert_i64_s"
+    fc f 4696837146684686336L
+    ins f "f64.div"
     endFn f
     // The POD accessors, once per backing width. Everything here is the same
     // shape; only the word type and the memory op differ.

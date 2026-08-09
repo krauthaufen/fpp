@@ -2708,6 +2708,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "ref.cast" "$str"
         callf f "$prints"
         pushUnit f
+    | EApp (EUnknown "monoms", [ u ]) ->
+        // the monotonic clock, milliseconds as f64 — WASI on this backend
+        emitNode st f lv u
+        dropU f
+        callf f "$monoms"
+        callf f "$off"
     | EApp (EUnknown "printraw", [ a ]) ->
         emitNode st f lv a
         gcT f "ref.cast" "$str"
@@ -4653,6 +4659,7 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
     // member fns those vtables reference are all declared by now
     globalI32Mut m "$nextid" 0
     globalI32Mut m "$heap" 65536
+    globalI32Mut m "$tscratch" 0
     let identityAdapters = vecNew<string * int * string> ()
     for rn in objRecordNames do
         declFn m ("$eq_" + rn) "$u1"

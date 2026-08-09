@@ -113,6 +113,11 @@ export const wasiImports = (getExports, sink) => ({
       view.setUint32(written, total, true);
       return 0;
     },
+    clock_time_get: (id, prec, ptr) => {
+      const v = new DataView(getExports().memory.buffer);
+      v.setBigUint64(ptr, BigInt(Math.round(performance.now() * 1e6)), true);
+      return 0;
+    },
     fd_close: () => 0,
     fd_seek: () => 0,
     proc_exit: () => {},

@@ -6,6 +6,7 @@
  * references it. Non-trivial bodies live in fpprt-lang.c.
  */
 #ifndef FPPRT_LANG_H
+double fpp_mono_ms(void);
 #define FPPRT_LANG_H
 
 #include <inttypes.h>

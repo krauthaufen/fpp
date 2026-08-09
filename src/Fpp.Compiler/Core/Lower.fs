@@ -1390,6 +1390,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             && bv.Name.StartsWith "js"
                             && System.Char.IsUpper (charAt bv.Name 2) ->
                           EApp (EUnknown bv.Name, jargs)
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ ua ] when bv.Name = "monoMs" && bv.Path = "(builtin)" ->
+                          // the monotonic clock: milliseconds since an
+                          // arbitrary origin, as float
+                          EApp (EUnknown "monoms", [ ua ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ra ] when bv.Name = "printRaw" && bv.Path = "(builtin)" ->
                           // the BYTE channel: units out as single bytes
                           EApp (EUnknown "printraw", [ ra ])

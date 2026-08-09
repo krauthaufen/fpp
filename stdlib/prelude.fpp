@@ -892,6 +892,9 @@ extern let box : 'a -> obj
 /// write a string's UNITS as single BYTES (the Latin-1 inverse) — the
 /// binary output channel; `print` encodes text as UTF-8 instead
 extern let printRaw : string -> unit
+/// The monotonic clock: milliseconds since an arbitrary origin. The async
+/// layer's timers ride on it; wall-clock time is deliberately absent.
+extern let monoMs : unit -> float
 /// A half's 16 BITS, as an int. The runtime representation of float16 IS
 /// that bit pattern, so this is the identity — it exists to give source a
 /// way to name the pattern rather than the number.
@@ -5853,3 +5856,143 @@ type StringBuilder() =
         total <- 0
         x
     override x.ToString () : string = String.concat "" (chunks.ToArray () :> seq<string>)
+
+// ---- Async: cold, structured concurrency on an event loop ----------------
+// `async` is COLD (nothing runs until started), cancellation is a TREE
+// (child scopes cannot outlive their parent), and the scheduler is an
+// event loop on the CURRENT thread — no OS threads implied, so this layer
+// works identically on every backend. Timers ride monoMs. Communication
+// is channels; a future is the one-shot degenerate case.
+
+type CancellationToken(parent : option<CancellationToken>) =
+    let mutable cancelled = false
+    member t.Cancel () : unit = cancelled <- true
+    member t.IsCancelled : bool =
+        cancelled || (match parent with Some p -> p.IsCancelled | None -> false)
+    member t.Child () : CancellationToken = CancellationToken (Some t)
+
+module EventLoop =
+    // the ready queue and the timer list; both REVERSED (append = cons),
+    // turned around when consumed so the discipline stays FIFO
+    let mutable ready : list<unit -> unit> = []
+    let mutable timers : list<float * (unit -> unit)> = []
+    let post (f : unit -> unit) : unit = ready <- f :: ready
+    let postAfter (ms : float) (f : unit -> unit) : unit =
+        timers <- (monoMs () + ms, f) :: timers
+    let hasWork () : bool =
+        not (List.isEmpty ready) || not (List.isEmpty timers)
+    /// one scheduler step: drain the ready queue in arrival order; when it
+    /// is empty, fire every timer that is due (arrival order among equals)
+    let step () : unit =
+        if not (List.isEmpty ready) then
+            let batch = List.rev ready
+            ready <- []
+            for f in batch do f ()
+        else
+            let now = monoMs ()
+            let due = timers |> List.filter (fun (t, _) -> t <= now) |> List.rev
+            if List.isEmpty due then ()
+            else
+                timers <- timers |> List.filter (fun (t, _) -> t > now)
+                for _t, f in due do f ()
+    /// drive until nothing is queued and no timer is pending
+    let runUntilIdle () : unit =
+        while hasWork () do step ()
+
+type Async<'a>(body : CancellationToken -> ('a -> unit) -> unit) =
+    /// run under `ct`, delivering the result to `k`. A cancelled scope
+    /// neither starts nor resumes; the computation simply stops at its
+    /// next suspension.
+    member x.RunWith (ct : CancellationToken) (k : 'a -> unit) : unit =
+        if not ct.IsCancelled then body ct k
+
+type AsyncBuilder() =
+    member b.Return (v : 'a) : Async<'a> = Async (fun _ct k -> k v)
+    member b.ReturnFrom (a : Async<'a>) : Async<'a> = a
+    member b.Zero () : Async<unit> = Async (fun _ct k -> k ())
+    /// a bare statement inside the CE (`ch.Send v` on its own line)
+    member b.Yield (_u : unit) : Async<unit> = Async (fun _ct k -> k ())
+    member b.Bind (a : Async<'x>, f : 'x -> Async<'y>) : Async<'y> =
+        Async (fun ct k ->
+            a.RunWith ct (fun v ->
+                if not ct.IsCancelled then (f v).RunWith ct k))
+    member b.Delay (f : unit -> Async<'a>) : Async<'a> =
+        Async (fun ct k -> (f ()).RunWith ct k)
+    member b.Combine (a : Async<unit>, rest : Async<'a>) : Async<'a> =
+        b.Bind (a, fun _u -> rest)
+    member b.While (cond : unit -> bool, bodyA : Async<unit>) : Async<unit> =
+        Async (fun ct k ->
+            let rec loop (_u : unit) : unit =
+                if ct.IsCancelled then ()
+                elif cond () then bodyA.RunWith ct loop
+                else k ()
+            loop ())
+    member b.For (xs : list<'x>, f : 'x -> Async<unit>) : Async<unit> =
+        Async (fun ct k ->
+            let rec go (rest : list<'x>) : unit =
+                if ct.IsCancelled then ()
+                else
+                    match rest with
+                    | [] -> k ()
+                    | h :: t -> (f h).RunWith ct (fun _u -> go t)
+            go xs)
+
+let async = AsyncBuilder ()
+
+/// A multi-consumer FIFO channel. Send never blocks (the buffer grows);
+/// Receive suspends until a value arrives. Single-threaded: the loop
+/// interleaves producers and consumers, nothing races.
+type Channel<'a>() =
+    let mutable buffer : list<'a> = []            // reversed
+    let mutable waiters : list<'a -> unit> = []   // reversed
+    member c.Send (v : 'a) : unit =
+        match List.rev waiters with
+        | w :: rest ->
+            waiters <- List.rev rest
+            EventLoop.post (fun () -> w v)
+        | [] -> buffer <- v :: buffer
+    member c.Receive : Async<'a> =
+        Async (fun ct k ->
+            match List.rev buffer with
+            | v :: rest ->
+                buffer <- List.rev rest
+                k v
+            | [] -> waiters <- (fun v -> if not ct.IsCancelled then k v) :: waiters)
+
+module Async =
+    /// queue a computation on the loop; it runs when the loop next turns
+    let start (ct : CancellationToken) (a : Async<'a>) : unit =
+        EventLoop.post (fun () -> a.RunWith ct (fun _v -> ()))
+    /// suspend for at least `ms` milliseconds of loop time
+    let sleep (ms : float) : Async<unit> =
+        Async (fun ct k ->
+            EventLoop.postAfter ms (fun () -> if not ct.IsCancelled then k ()))
+    /// yield the loop to whatever else is queued, then continue
+    let switch : Async<unit> =
+        Async (fun ct k -> EventLoop.post (fun () -> if not ct.IsCancelled then k ()))
+    /// drive the loop until the computation completes. The blocking entry
+    /// point — natural on native and under wasmtime; a browser main
+    /// thread should `start` and let the host loop run instead.
+    let runSynchronously (a : Async<'a>) : 'a =
+        let root = CancellationToken None
+        let mutable result : option<'a> = None
+        a.RunWith root (fun v -> result <- Some v)
+        while result.IsNone && EventLoop.hasWork () do EventLoop.step ()
+        match result with
+        | Some v -> v
+        | None -> failwith "async did not complete: the loop went idle"
+    /// run every computation, collecting results in ORDER; they interleave
+    /// at suspension points on the one loop
+    let all (xs : list<Async<'a>>) : Async<list<'a>> =
+        Async (fun ct k ->
+            let n = List.length xs
+            if n = 0 then k []
+            else
+                let results = Array.zeroCreate n
+                let mutable remaining = n
+                xs |> List.iteri (fun i a ->
+                    EventLoop.post (fun () ->
+                        a.RunWith ct (fun v ->
+                            results.[i] <- v
+                            remaining <- remaining - 1
+                            if remaining = 0 then k (Array.toList results)))))

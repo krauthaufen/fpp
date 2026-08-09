@@ -1,5 +1,13 @@
 /* fpprt-lang: the non-inline bodies. See fpprt-lang.h. */
 #include "fpprt-lang.h"
+#include <time.h>
+/* the monotonic clock in milliseconds — the async layer's one host need */
+double fpp_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 #if !defined(__wasm__)
 #include <sys/mman.h>
 #endif
