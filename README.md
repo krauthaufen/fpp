@@ -2,28 +2,22 @@
 
 ## Why
 
-F# is a language worth keeping — the offside rule, unions and records,
-pattern matching, computation expressions, a type system that stays out of
-the way. But it is chained to a runtime that decides where it can go. A
-web page carrying a .NET program starts by downloading and booting a
-runtime; a command-line tool ships one or trusts the machine to have it;
-startup pays for a JIT before the first line of user code runs. For the
-places this project cares about — real-time graphics in the browser, small
-native tools, wasm modules that start now — the runtime costs more than
-the program.
+F# is a language worth keeping. But every way of shipping it means
+shipping .NET — and that is true of AOT too. NativeAOT does not remove
+the runtime, it links it in: the binary still carries the CLR's GC, its
+metadata, and the semantics IL demands, because it must run anything the
+CLR could. On the web that story is heavier still — a .NET wasm app is
+the runtime compiled to wasm with your program riding along, megabytes
+before the first frame, and every call into the browser marshaled through
+it. AOT changes when the runtime's price is paid, not whether.
 
-F++ is F# rebuilt as its own language, the way OCaml is its own language:
-compiled ahead of time to wasm and native, no CLR, no JIT, nothing to
-install beside the binary. Cutting the tether also removes .NET's ceiling
-on the type system — F++ adds typeclasses (`when Num<'a>`), higher-kinded
-types, and GADTs, the features F# wanted and the CLR could not carry.
-
-The browser is a first-class target, not a port: zero-copy `ArrayBuffer`
-views over pinned arrays, UTF-16 strings on the engine's own `js-string`
-builtins, a typed DOM, complete generated WebGPU and WebGL bindings
-(extensions included), and a binary command stream that crosses the
-wasm↔JS boundary once per render pass — a recorded GPU command costs
-~30 ns of machinery, against ~95 ns for a call-per-crossing FFI.
+F++ pays it never: F# rebuilt as its own language, the way OCaml is its
+own language. The compiler knows the whole program, so the output contains
+the program — a small wasm module or a native binary over a GC built for
+it, starting immediately, talking to the browser directly. And with the
+CLR gone, its ceiling on the type system goes too: typeclasses,
+higher-kinded types, GADTs — the features F# wanted and IL could not
+carry.
 
 ## What
 
