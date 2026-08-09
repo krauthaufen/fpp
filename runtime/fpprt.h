@@ -179,6 +179,11 @@ void fpprt_thread_detach(void);
 void fpprt_thread_park(void);
 void fpprt_thread_unpark(void);
 
+/* the worker pool: one dense index range per dispatch, chunk-grabbed */
+typedef void (*fpp_pool_kernel)(void *env, int lo, int hi);
+int  fpp_pool_size(void);
+void fpp_pool_dispatch(int n, int chunk, fpp_pool_kernel kernel, void *env);
+
 void fpprt_collect(void);            /* full collection, for tests        */
 void fpprt_safepoint(void);          /* poll: park if a GC wants the world */
 /* the collector's stop-request flag for THIS thread — emitted loops test

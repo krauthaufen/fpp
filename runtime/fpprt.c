@@ -390,3 +390,105 @@ void fpprt_thread_detach(void) {
 void fpprt_thread_park(void) { gc_deactivate(mut_); }
 void fpprt_thread_unpark(void) { gc_reactivate(mut_); }
 size_t fpprt_allocated_bytes(void) { return gc_allocation_counter(heap_); }
+
+/* ---- the worker pool ---------------------------------------------------
+ * Fixed, sized to the hardware, created at first dispatch. The unit of
+ * work is a CHUNK [lo,hi) of a dense index range; workers grab chunks off
+ * one atomic cursor (deques arrive with the phase engine — one cursor is
+ * enough while every dispatch is a single phase). The caller participates
+ * and PARKS while waiting, so collection never stalls on a joining
+ * thread; workers park between dispatches for the same reason. */
+
+#include <unistd.h>
+
+#define FPP_POOL_MAX 16
+
+typedef struct {
+  fpp_pool_kernel kernel;
+  void *env;
+  int n;
+  int chunk;
+} fpp_dispatch;
+
+static pthread_t pool_threads_[FPP_POOL_MAX];
+static int pool_size_ = 0;               /* workers, excluding the caller */
+static int pool_started_ = 0;
+static pthread_mutex_t pool_mu_ = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_go_ = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t pool_done_ = PTHREAD_COND_INITIALIZER;
+static fpp_dispatch pool_job_;
+static unsigned long pool_gen_ = 0;      /* bumps per dispatch            */
+static int pool_cursor_ = 0;             /* next chunk start              */
+static int pool_active_ = 0;             /* threads still in the dispatch */
+
+static void pool_work_(void) {
+  for (;;) {
+    int lo;
+    pthread_mutex_lock(&pool_mu_);
+    lo = pool_cursor_;
+    pool_cursor_ += pool_job_.chunk;
+    pthread_mutex_unlock(&pool_mu_);
+    if (lo >= pool_job_.n) return;
+    int hi = lo + pool_job_.chunk;
+    if (hi > pool_job_.n) hi = pool_job_.n;
+    pool_job_.kernel(pool_job_.env, lo, hi);
+    fpprt_safepoint();
+  }
+}
+
+static void *pool_main_(void *arg) {
+  (void)arg;
+  fpprt_thread_attach();
+  unsigned long seen = 0;
+  for (;;) {
+    fpprt_thread_park();
+    pthread_mutex_lock(&pool_mu_);
+    while (pool_gen_ == seen) pthread_cond_wait(&pool_go_, &pool_mu_);
+    seen = pool_gen_;
+    pthread_mutex_unlock(&pool_mu_);
+    fpprt_thread_unpark();
+    pool_work_();
+    pthread_mutex_lock(&pool_mu_);
+    pool_active_--;
+    if (pool_active_ == 0) pthread_cond_signal(&pool_done_);
+    pthread_mutex_unlock(&pool_mu_);
+  }
+  return NULL;
+}
+
+int fpp_pool_size(void) {
+  long c = sysconf(_SC_NPROCESSORS_ONLN);
+  int p = (int)c - 1;
+  if (p < 1) p = 1;
+  if (p > FPP_POOL_MAX) p = FPP_POOL_MAX;
+  return p;
+}
+
+void fpp_pool_dispatch(int n, int chunk, fpp_pool_kernel kernel, void *env) {
+  if (n <= 0) return;
+  if (chunk <= 0) chunk = 1;
+  if (!pool_started_) {
+    pool_started_ = 1;
+    pool_size_ = fpp_pool_size();
+    for (int i = 0; i < pool_size_; i++)
+      pthread_create(&pool_threads_[i], NULL, pool_main_, NULL);
+  }
+  pthread_mutex_lock(&pool_mu_);
+  pool_job_.kernel = kernel;
+  pool_job_.env = env;
+  pool_job_.n = n;
+  pool_job_.chunk = chunk;
+  pool_cursor_ = 0;
+  pool_active_ = pool_size_ + 1;
+  pool_gen_++;
+  pthread_cond_broadcast(&pool_go_);
+  pthread_mutex_unlock(&pool_mu_);
+  pool_work_();
+  pthread_mutex_lock(&pool_mu_);
+  pool_active_--;
+  if (pool_active_ == 0) pthread_cond_signal(&pool_done_);
+  fpprt_thread_park();
+  while (pool_active_ != 0) pthread_cond_wait(&pool_done_, &pool_mu_);
+  pthread_mutex_unlock(&pool_mu_);
+  fpprt_thread_unpark();
+}

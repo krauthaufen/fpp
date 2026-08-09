@@ -1,6 +1,7 @@
 /* fpprt-lang: the non-inline bodies. See fpprt-lang.h. */
 #include "fpprt-lang.h"
 #include <time.h>
+#include <pthread.h>
 /* the monotonic clock in milliseconds — the async layer's one host need */
 double fpp_mono_ms(void) {
     struct timespec ts;
@@ -1763,3 +1764,84 @@ void fpp_arr_set(V a, size_t i, V v) {
   }
 }
 
+
+/* ---- monitors: per-object recursive locks, keyed by IDENTITY HASH ------
+ * Objects move under the GC, so the table keys on fpprt_idhash (stable).
+ * Entries are allocated on first Enter and never freed — bounded by the
+ * number of DISTINCT objects ever locked, which is how lock objects are
+ * used. A blocked Enter PARKS its mutator so collection never waits on a
+ * lock queue. */
+
+typedef struct fpp_mon {
+    uintptr_t key;
+    pthread_mutex_t mu;
+    pthread_t owner;
+    int depth;
+    struct fpp_mon *next;
+} fpp_mon;
+
+#define FPP_MON_BUCKETS 251
+static fpp_mon *mon_table_[FPP_MON_BUCKETS];
+static pthread_mutex_t mon_table_lock_ = PTHREAD_MUTEX_INITIALIZER;
+
+static fpp_mon *mon_of_(V o) {
+    uintptr_t key = fpprt_idhash((fpprt_ref)o);
+    unsigned b = (unsigned)(key % FPP_MON_BUCKETS);
+    pthread_mutex_lock(&mon_table_lock_);
+    fpp_mon *m = mon_table_[b];
+    while (m && m->key != key) m = m->next;
+    if (!m) {
+        m = (fpp_mon *)malloc(sizeof(fpp_mon));
+        m->key = key;
+        pthread_mutex_init(&m->mu, NULL);
+        m->owner = (pthread_t)0;
+        m->depth = 0;
+        m->next = mon_table_[b];
+        mon_table_[b] = m;
+    }
+    pthread_mutex_unlock(&mon_table_lock_);
+    return m;
+}
+
+void fpp_monitor_enter(V o) {
+    fpp_mon *m = mon_of_(o);
+    if (m->depth > 0 && pthread_equal(m->owner, pthread_self())) {
+        m->depth++;
+        return;
+    }
+    fpprt_thread_park();
+    pthread_mutex_lock(&m->mu);
+    fpprt_thread_unpark();
+    m->owner = pthread_self();
+    m->depth = 1;
+}
+
+int fpp_monitor_try_enter(V o) {
+    fpp_mon *m = mon_of_(o);
+    if (m->depth > 0 && pthread_equal(m->owner, pthread_self())) {
+        m->depth++;
+        return 1;
+    }
+    if (pthread_mutex_trylock(&m->mu) == 0) {
+        m->owner = pthread_self();
+        m->depth = 1;
+        return 1;
+    }
+    return 0;
+}
+
+void fpp_monitor_exit(V o) {
+    fpp_mon *m = mon_of_(o);
+    if (m->depth > 0 && pthread_equal(m->owner, pthread_self())) {
+        m->depth--;
+        if (m->depth == 0) {
+            m->owner = (pthread_t)0;
+            pthread_mutex_unlock(&m->mu);
+        }
+    }
+}
+
+int fpp_monitor_is_entered(V o) {
+    fpp_mon *m = mon_of_(o);
+    return m->depth > 0 && pthread_equal(m->owner, pthread_self());
+}

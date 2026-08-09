@@ -193,7 +193,7 @@ module private BuiltinCache =
           LogPicks = dictNew<string, bool> ()
           PickLog = Fpp.Prelude.vecNew<string> () }
 
-    let compute () =
+    let compute (defines : string list) =
             let imports = dictNew<string, Analysis.Resolve.Definition> ()
             let schemes = dictNew<string, Analysis.Types.Scheme> ()
             let aliases = dictNew<string, Analysis.Types.Var list * Analysis.Types.Type> ()
@@ -206,7 +206,10 @@ module private BuiltinCache =
             let ctors = dictNew<string, (int * Analysis.Types.Scheme) list> ()
             let classes = Analysis.Classes.newTables ()
             let members = dictNew<string, Analysis.Resolve.Definition> ()
-            let bp = Parser.parse Builtin.source
+            // the prelude preprocesses like any other source: `#if NATIVE`
+            // is how it gives the fpprt leg real monitors while the
+            // single-threaded oracle keeps the no-op truth
+            let bp = Parser.parse (fst (Fpp.Project.preprocess defines Builtin.source))
             let bb = Analysis.Resolve.resolve Builtin.path imports bp.Root
             for full, d in bb.Exports do dictSet imports full d
             for k, d in bb.Members do dictSet members k d
@@ -220,13 +223,17 @@ module private BuiltinCache =
     // Memoized by hand rather than with `lazy`: one cell, computed on first
     // use. F#'s `lazy` adds thread safety this single-threaded cache does
     // not need, and it is not part of the subset the compiler compiles.
-    let mutable cell : Cached option = None
-    let force () : Cached =
-        match cell with
-        | Some c -> c
+    // keyed by the DEFINE SET: the prelude preprocesses per target, so a
+    // NATIVE workspace and a WASM one see different prelude text in the
+    // same process (the test suite makes both)
+    let mutable cells : (string * Cached) list = []
+    let force (defines : string list) : Cached =
+        let key = String.concat ";" (List.sort defines)
+        match cells |> List.tryFind (fun (k, _) -> k = key) with
+        | Some (_, c) -> c
         | None ->
-            let c = compute ()
-            cell <- Some c
+            let c = compute defines
+            cells <- (key, c) :: cells
             c
 
 type Workspace() =
@@ -386,7 +393,7 @@ type Workspace() =
     member this.ProjectCheck () : ProjectResults =
         db.MemoT "projectCheck" "" (fun () ->
             // seed from the prelude cache: COPIES, since the project mutates
-            let cached = BuiltinCache.force ()
+            let cached = BuiltinCache.force defines
             let imports = BuiltinCache.copyDict cached.Imports
             let schemes = BuiltinCache.copyDict cached.Schemes
             let aliases = BuiltinCache.copyDict cached.Aliases
@@ -873,7 +880,7 @@ type Workspace() =
             for d in this.Diagnostics path do
                 vecAdd errs (blame path d.Line d.Col d.Message)
         // builtin decls (Option etc.) come first — from the process cache
-        let cached = BuiltinCache.force ()
+        let cached = BuiltinCache.force defines
         let bp = cached.Parse
         let bb = cached.Bind
         // the prelude is source like any other file: its own bodies call the
@@ -1102,7 +1109,7 @@ type Workspace() =
                 vecAdd out (label, Analysis.Resolve.kindLabel d.Kind, typeOf d, full)
         // the prelude first, so the numeric classes and their members are
         // offered in a project that has not opened anything
-        let bb = (BuiltinCache.force ()).Bind
+        let bb = (BuiltinCache.force defines).Bind
         for full, d in bb.Exports do offer d.Name full d
         for _, (b : Analysis.Resolve.BindResult, _) in dictPairs r.Files do
             for full, d in b.Exports do offer d.Name full d

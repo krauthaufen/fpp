@@ -1390,6 +1390,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             && bv.Name.StartsWith "js"
                             && System.Char.IsUpper (charAt bv.Name 2) ->
                           EApp (EUnknown bv.Name, jargs)
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ ma ] when
+                            (bv.Name = "monitorEnter" || bv.Name = "monitorExit"
+                             || bv.Name = "monitorTryEnter" || bv.Name = "monitorIsEntered")
+                            && bv.Path = "(builtin)" ->
+                          // spelled out — the self-host seam has no
+                          // ToLowerInvariant, and a stringly shortcut here
+                          // stubbed the whole of `lower` under stage-1
+                          let nm =
+                              match bv.Name with
+                              | "monitorEnter" -> "monitorenter"
+                              | "monitorExit" -> "monitorexit"
+                              | "monitorTryEnter" -> "monitortryenter"
+                              | _ -> "monitorisentered"
+                          EApp (EUnknown nm, [ ma ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ua ] when bv.Name = "monoMs" && bv.Path = "(builtin)" ->
                           // the monotonic clock: milliseconds since an
                           // arbitrary origin, as float

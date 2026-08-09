@@ -6,7 +6,6 @@
  * references it. Non-trivial bodies live in fpprt-lang.c.
  */
 #ifndef FPPRT_LANG_H
-double fpp_mono_ms(void);
 #define FPPRT_LANG_H
 
 #include <inttypes.h>
@@ -18,6 +17,13 @@ double fpp_mono_ms(void);
 #include "fpprt.h"
 
 typedef fpprt_ref V;
+
+/* the async layer's clock, and per-object recursive monitors */
+double fpp_mono_ms(void);
+void fpp_monitor_enter(V o);
+int  fpp_monitor_try_enter(V o);
+void fpp_monitor_exit(V o);
+int  fpp_monitor_is_entered(V o);
 
 #if UINTPTR_MAX > 0xffffffffu
 #define TAGI(x)   ((V)((((intptr_t)(x)) << 1) | 1))

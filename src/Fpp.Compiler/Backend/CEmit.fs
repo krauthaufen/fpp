@@ -1047,6 +1047,24 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
          | None ->
              stmt f ("fpp_raise(" + sref x + ");"))
         unitV ()
+    | EApp (EUnknown "monitorenter", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_monitor_enter(" + sref x + ");")
+        unitV ()
+    | EApp (EUnknown "monitorexit", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_monitor_exit(" + sref x + ");")
+        unitV ()
+    | EApp (EUnknown "monitortryenter", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_monitor_try_enter(" + sref x + "));")
+        d
+    | EApp (EUnknown "monitorisentered", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_monitor_is_entered(" + sref x + "));")
+        d
     | EApp (EUnknown "monoms", [ a ]) ->
         emitE st f a |> ignore
         let d = slot f

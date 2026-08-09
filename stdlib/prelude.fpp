@@ -5722,6 +5722,27 @@ type MutableHashSet<'a>() =
 /// what .NET's does, under the assumption the platform enforces. What is
 /// absent is any way to BLOCK: `Monitor.Enter` on a lock someone else holds
 /// cannot happen, so there is nothing to wait for.
+#if NATIVE
+extern let monitorEnter : obj -> unit
+extern let monitorExit : obj -> unit
+extern let monitorTryEnter : obj -> bool
+extern let monitorIsEntered : obj -> bool
+/// REAL locks on the fpprt leg: per-object recursive monitors keyed by
+/// identity hash; a blocked Enter parks its mutator so collection never
+/// waits on a lock queue.
+type Monitor =
+    static member Enter (o : obj) : unit = monitorEnter o
+    static member Exit (o : obj) : unit = monitorExit o
+    static member IsEntered (o : obj) : bool = monitorIsEntered o
+    static member TryEnter (o : obj) : bool = monitorTryEnter o
+
+/// F#'s `lock`: enter, run, exit — exception-safe once TryFinally lands.
+let lock (o : 'a) (f : unit -> 'b) : 'b =
+    Monitor.Enter (box o)
+    let r = f ()
+    Monitor.Exit (box o)
+    r
+#else
 type Monitor =
     static member Enter (o : obj) : unit = ()
     static member Exit (o : obj) : unit = ()
@@ -5730,6 +5751,7 @@ type Monitor =
 
 /// F#'s `lock`: run the body, which is the whole of it here.
 let lock (o : 'a) (f : unit -> 'b) : 'b = f ()
+#endif
 
 /// System.Threading.Interlocked. Every one takes the location by REFERENCE,
 /// as .NET's does, and returns what .NET returns — `Increment` the NEW

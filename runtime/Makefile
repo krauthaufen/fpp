@@ -25,6 +25,9 @@ build/$(GC_COLLECTOR)/test_grow: test/test_grow.c build/$(GC_COLLECTOR)/fpprt.o 
 build/$(GC_COLLECTOR)/test_threads: test/test_threads.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
 	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
 
+build/$(GC_COLLECTOR)/test_pool: test/test_pool.c fpprt-lang.c build/$(GC_COLLECTOR)/fpprt.o $(GC_OBJDIR)libwhippet.a
+	$(GC_CC) $(CFLAGS) $(GC_CPPFLAGS) $(GC_EMBEDDER_CPPFLAGS) -o $@ $^ $(GC_LIBS)
+
 .PHONY: test test-all test-threads clean
 test: build/$(GC_COLLECTOR)/test_rt build/$(GC_COLLECTOR)/test_grow
 	./build/$(GC_COLLECTOR)/test_rt
@@ -37,6 +40,10 @@ test-threads:
 	./build/pcc/test_threads
 	$(MAKE) GC_COLLECTOR=mmc build/mmc/test_threads
 	./build/mmc/test_threads
+	$(MAKE) GC_COLLECTOR=pcc build/pcc/test_pool
+	./build/pcc/test_pool
+	$(MAKE) GC_COLLECTOR=mmc build/mmc/test_pool
+	./build/mmc/test_pool
 
 test-all:
 	$(MAKE) GC_COLLECTOR=semi test
