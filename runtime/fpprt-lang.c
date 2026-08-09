@@ -1845,3 +1845,36 @@ int fpp_monitor_is_entered(V o) {
     fpp_mon *m = mon_of_(o);
     return m->depth > 0 && pthread_equal(m->owner, pthread_self());
 }
+
+/* ---- the parallel-for bridge -------------------------------------------
+ * A worker runs an F++ CLOSURE over a chunk of a dense index range. The
+ * closure lives in a shadow-frame slot for the whole chunk (the moving
+ * collector may relocate it between calls); the index argument is a
+ * tagged int and roots nothing. */
+
+static void fpp_pfor_kernel_(void *env0, int lo, int hi) {
+    /* env0 points at the CALLER's traced frame slot: the tracer updates
+     * it on a move, every thread is at a safepoint while that happens,
+     * so reading it at chunk start always sees the live address */
+    FPPRT_FRAME(f, 1);
+    for (int i = lo; i < hi; i++) {
+        f_slots[0] = *(V *)env0;
+        V arg = TAGI(i);
+        fpp_apply(f_slots[0], &arg, 1);
+    }
+    FPPRT_LEAVE(f);
+}
+
+void fpp_parallel_for(int n, int chunk, V clo) {
+    if (n <= 0) return;
+    if (chunk <= 0) {
+        chunk = n / (fpp_pool_size() * 8) + 1;
+        if (chunk < 1) chunk = 1;
+    }
+    /* the closure lives in the CALLER's frame for the whole dispatch —
+     * the tracer keeps the slot current, workers read through it */
+    FPPRT_FRAME(g, 1);
+    g_slots[0] = clo;
+    fpp_pool_dispatch(n, chunk, fpp_pfor_kernel_, &g_slots[0]);
+    FPPRT_LEAVE(g);
+}

@@ -1404,6 +1404,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | "monitorTryEnter" -> "monitortryenter"
                               | _ -> "monitorisentered"
                           EApp (EUnknown nm, [ ma ])
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ pn; pc; pf ] when bv.Name = "parallelFor" && bv.Path = "(builtin)" ->
+                          EApp (EUnknown "parallelfor", [ pn; pc; pf ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ua ] when bv.Name = "monoMs" && bv.Path = "(builtin)" ->
                           // the monotonic clock: milliseconds since an
                           // arbitrary origin, as float

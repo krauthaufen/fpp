@@ -6018,3 +6018,116 @@ module Async =
                             results.[i] <- v
                             remaining <- remaining - 1
                             if remaining = 0 then k (Array.toList results)))))
+
+// ---- Parallel: data parallelism over dense index ranges ------------------
+// Chunked dispatches on the worker pool where threads exist (the fpprt
+// leg); the SAME phases run sequentially where they do not (wasm-GC) —
+// one program, one meaning. Chunking is a pure function of n, never of
+// the machine, so results are identical everywhere by construction.
+#if NATIVE
+extern let parallelFor : int -> int -> (int -> unit) -> unit
+#endif
+
+module Parallel =
+#if NATIVE
+    /// run f over [0, n) across the pool; the degenerate sequential
+    /// schedule and this one are the same program
+    let iter (n : int) (f : int -> unit) : unit = parallelFor n 0 f
+    let private iterChunks (chunks : int) (f : int -> unit) : unit = parallelFor chunks 1 f
+#else
+    let iter (n : int) (f : int -> unit) : unit =
+        for i in 0 .. n - 1 do f i
+    let private iterChunks (chunks : int) (f : int -> unit) : unit =
+        for c in 0 .. chunks - 1 do f c
+#endif
+    /// machine-independent chunking: 64-way regardless of pool size
+    let private chunkOf (n : int) : int = n / 64 + 1
+    let init (n : int) (f : int -> 'a) : 'a[] =
+        let out = Array.zeroCreate n
+        iter n (fun i -> out.[i] <- f i)
+        out
+    let map (f : 'a -> 'b) (xs : 'a[]) : 'b[] =
+        init (Array.length xs) (fun i -> f xs.[i])
+    /// chunk-local fold, then partials combined IN CHUNK ORDER — the
+    /// result is a pure function of (folder, state, combine, xs)
+    let fold (folder : 's -> 'a -> 's) (state : 's) (combine : 's -> 's -> 's) (xs : 'a[]) : 's =
+        let n = Array.length xs
+        if n = 0 then state
+        else
+            let chunk = chunkOf n
+            let chunks = (n + chunk - 1) / chunk
+            let partials : 's[] = Array.zeroCreate chunks
+            iterChunks chunks (fun c ->
+                let lo = c * chunk
+                let hi = (if lo + chunk < n then lo + chunk else n)
+                let mutable s = state
+                for i in lo .. hi - 1 do s <- folder s xs.[i]
+                partials.[c] <- s)
+            let mutable acc = partials.[0]
+            for c in 1 .. chunks - 1 do acc <- combine acc partials.[c]
+            acc
+    /// inclusive scan, Blelloch-shaped: chunk-local scans, a tiny scan of
+    /// chunk totals, then the carry added back — two dispatches
+    let scan (add : 'a -> 'a -> 'a) (xs : 'a[]) : 'a[] =
+        let n = Array.length xs
+        let out : 'a[] = Array.zeroCreate n
+        if n = 0 then out
+        else
+            let chunk = chunkOf n
+            let chunks = (n + chunk - 1) / chunk
+            let totals : 'a[] = Array.zeroCreate chunks
+            iterChunks chunks (fun c ->
+                let lo = c * chunk
+                let hi = (if lo + chunk < n then lo + chunk else n)
+                let mutable s = xs.[lo]
+                out.[lo] <- s
+                for i in lo + 1 .. hi - 1 do
+                    s <- add s xs.[i]
+                    out.[i] <- s
+                totals.[c] <- s)
+            // exclusive scan of the totals, sequential and tiny
+            let carry : 'a[] = Array.zeroCreate chunks
+            for c in 1 .. chunks - 1 do
+                carry.[c] <- (if c = 1 then totals.[0] else add carry.[c - 1] totals.[c - 1])
+            iterChunks chunks (fun c ->
+                if c > 0 then
+                    let lo = c * chunk
+                    let hi = (if lo + chunk < n then lo + chunk else n)
+                    for i in lo .. hi - 1 do out.[i] <- add carry.[c] out.[i])
+            out
+    /// keep the elements the predicate takes, order preserved: local
+    /// counts, exact offsets from their scan, then a scatter — no
+    /// compaction pass, no over-allocation
+    let choose (f : 'a -> option<'b>) (xs : 'a[]) : 'b[] =
+        let n = Array.length xs
+        if n = 0 then Array.zeroCreate 0
+        else
+            let chunk = chunkOf n
+            let chunks = (n + chunk - 1) / chunk
+            let counts : int[] = Array.zeroCreate chunks
+            iterChunks chunks (fun c ->
+                let lo = c * chunk
+                let hi = (if lo + chunk < n then lo + chunk else n)
+                let mutable k = 0
+                for i in lo .. hi - 1 do
+                    match f xs.[i] with
+                    | Some _ -> k <- k + 1
+                    | None -> ()
+                counts.[c] <- k)
+            let offsets : int[] = Array.zeroCreate chunks
+            let mutable total = 0
+            for c in 0 .. chunks - 1 do
+                offsets.[c] <- total
+                total <- total + counts.[c]
+            let out : 'b[] = Array.zeroCreate total
+            iterChunks chunks (fun c ->
+                let lo = c * chunk
+                let hi = (if lo + chunk < n then lo + chunk else n)
+                let mutable w = offsets.[c]
+                for i in lo .. hi - 1 do
+                    match f xs.[i] with
+                    | Some v ->
+                        out.[w] <- v
+                        w <- w + 1
+                    | None -> ())
+            out

@@ -221,6 +221,8 @@ static inline V fpp_clo_new(uint32_t tid, fpp_code_t code, size_t arity,
 /* full curried semantics: under-application makes a PAP, over-application
  * calls then applies the rest */
 V fpp_apply(V clo, V *args, size_t n);
+/* run closure(i) for every i in [0,n) across the pool; chunk 0 = auto */
+void fpp_parallel_for(int n, int chunk, V clo);
 
 /* ---- interface dispatch: [typeid][slot] -> uniform member wrapper ------- */
 

@@ -1065,6 +1065,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = TAGI(fpp_monitor_is_entered(" + sref x + "));")
         d
+    | EApp (EUnknown "parallelfor", [ n; c; clo ]) ->
+        let xn = emitE st f n
+        let xc = emitE st f c
+        let xf = emitE st f clo
+        stmt f ("fpp_parallel_for((int)UNTAGI(" + sref xn + "), (int)UNTAGI(" + sref xc + "), " + sref xf + ");")
+        unitV ()
     | EApp (EUnknown "monoms", [ a ]) ->
         emitE st f a |> ignore
         let d = slot f
