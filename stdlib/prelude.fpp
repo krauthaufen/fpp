@@ -2254,10 +2254,12 @@ module Array =
 class Pinnable<'p>
     member 'p.Pin : nativeint
     member 'p.Unpin : unit
+    member 'p.ByteSize : int
 
 instance Pinnable<'t[]> when Unmanaged<'t>
     member xs.Pin = Array.pin xs
     member xs.Unpin = Array.unpin xs
+    member xs.ByteSize = Array.byteSize xs
 
 module List =
     let length (xs : 'a list) =
@@ -3078,6 +3080,7 @@ module String =
 /// a string pins like a byte array: the address is the UTF-8 payload
 instance Pinnable<string>
     member s.Pin = String.pin s
+    member s.ByteSize = 2 * String.length s
     member s.Unpin =
         String.unpin s |> ignore
 

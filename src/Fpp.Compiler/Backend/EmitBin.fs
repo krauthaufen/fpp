@@ -5254,6 +5254,9 @@ let rtTypesJs (m : Mod) : unit =
 
 let rtDeclsJs (m : Mod) : unit =
     declFn m "$jscall" "$rt_ae2v"
+    declFn m "$pinany" "$rt_a2i"
+    declFn m "$unpinany" "$rt_a2i"
+    declFn m "$sizeany" "$rt_a2i"
     declFn m "$printraw" "$rt_s2v"
 
 let rtCoreJs (m : Mod) : unit =
@@ -5267,6 +5270,37 @@ let rtCoreJs (m : Mod) : unit =
     callf f "$applyc"
     ins f "drop"
     endFn f
+    // $pinany / $unpinany / $sizeany — a GENERIC template's Array.pin has a
+    // symbolic element; the pod HANDLE's backing array names the width at
+    // runtime, so dispatch there (six ref.tests, then the typed helper)
+    let disp (opname : string) (per : string -> Fn -> unit) =
+        let f = beginFn m [ "$a" ]
+        local f "$b" "anyref"
+        localsDone f
+        lg f "$a"
+        gcT f "ref.cast" "$hnd"
+        gcTF f "struct.get" "$hnd" 0
+        ls f "$b"
+        for bt, sfx in [ "$pb", "1"; "$ph", "2"; "$pk", "4"; "$pl", "8"; "$pf32", "s"; "$pf64", "f" ] do
+            lg f "$b"
+            gcT f "ref.test" bt
+            ifE f
+            per sfx f
+            ret f
+            endB f
+        ic f 0
+        endFn f
+    disp "pin" (fun sfx f ->
+        lg f "$a"
+        callf f ("$pinh" + sfx))
+    disp "unpin" (fun sfx f ->
+        lg f "$a"
+        callf f ("$unpinh" + sfx))
+    disp "size" (fun sfx f ->
+        lg f "$a"
+        callf f ("$hlen" + sfx)
+        ic f (match sfx with "1" -> 1 | "2" -> 2 | "4" | "s" -> 4 | _ -> 8)
+        ins f "i32.mul")
     // $printraw — each UNIT becomes ONE byte (the Latin-1 inverse): the
     // binary channel the self-host pipeline prints its .wasm through. Text
     // wants $prints' UTF-8; bytes-as-a-string wants exactly this.

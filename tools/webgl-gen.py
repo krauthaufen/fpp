@@ -148,6 +148,23 @@ def emit_gl(model):
                 call = 'Js.call%d (Js.handle h) "%s"%s' % (
                     len(args), me['name'], ''.join(' %s_j' % n for n, _, _ in args))
                 ret_out(a, rt, rk, call, rt)
+                # a GENERIC sibling for the data-carrying form: pass any
+                # pinnable array directly — pin scoped around the call
+                raws = [n for n, t, k in args if k == 'raw']
+                if len(raws) == 1 and rk == 'unit' and mname == pascal(me['name']):
+                    rn = raws[0]
+                    sig2 = ', '.join(
+                        ('%s : %s' % (n, "'a[]") if n == rn else '%s : %s' % (n, t))
+                        for n, t, _ in args)
+                    a('    member x.%s (%s) : unit =' % (mname, sig2))
+                    a('        let %s_p = Array.pin %s' % (rn, rn))
+                    for n, t, k in args:
+                        if n == rn:
+                            a('        let %s_j = Js.viewU8 %s_p (Array.byteSize %s)' % (n, n, n))
+                        else:
+                            a('        let %s_j = %s' % (n, arg_in(t, k, n)))
+                    a('        %s |> ignore' % call)
+                    a('        Array.unpin %s |> ignore' % rn)
         a('')
     a('and Marshal =')
     a('    static member GLenumOf (v : int) : GLenum = unbox (box v)')

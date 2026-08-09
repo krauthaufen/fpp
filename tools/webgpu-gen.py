@@ -311,6 +311,13 @@ def emit(model):
             call = 'Js.call%d (Js.handle h) "%s"%s' % (
                 len(args), me['name'], ''.join(' %s_j' % n for n, _, _, _ in args))
             body_wrap(a, model, rk, call, rt)
+            if iname == 'GPUQueue' and me['name'] == 'writeBuffer':
+                # the generic sibling: any pinnable array, pin scoped
+                a('    member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : \'a[]) : unit =')
+                a('        let p = Array.pin data')
+                a('        let v = Js.viewU8 p (Array.byteSize data)')
+                a('        Js.call5 (Js.handle h) "writeBuffer" (Js.handle (buffer).H) (Js.ofNum (bufferOffset)) v (Js.undefined ()) (Js.undefined ()) |> ignore')
+                a('        Array.unpin data |> ignore')
         a('')
     for dname, d in model['dicts'].items():
         # flatten inheritance: base members join the record

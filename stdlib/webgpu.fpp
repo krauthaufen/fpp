@@ -1065,6 +1065,11 @@ and GPUQueue(h : int) =
         let dataOffset_j = (match dataOffset with Some v -> Js.ofNum (v) | None -> Js.undefined ())
         let size_j = (match size with Some v -> Js.ofNum (v) | None -> Js.undefined ())
         Js.call5 (Js.handle h) "writeBuffer" buffer_j bufferOffset_j data_j dataOffset_j size_j |> ignore
+    member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : 'a[]) : unit =
+        let p = Array.pin data
+        let v = Js.viewU8 p (Array.byteSize data)
+        Js.call5 (Js.handle h) "writeBuffer" (Js.handle (buffer).H) (Js.ofNum (bufferOffset)) v (Js.undefined ()) (Js.undefined ()) |> ignore
+        Array.unpin data |> ignore
     member x.WriteTexture (destination : GPUTexelCopyTextureInfo, data : JsObj, dataLayout : GPUTexelCopyBufferLayout, size : GPUExtent3DDict) : unit =
         let destination_j = Marshal.GPUTexelCopyTextureInfoJs (destination)
         let data_j = data

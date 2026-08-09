@@ -3525,16 +3525,20 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             callf f ("$pinh" + podSfxOf st nm)
             callf f "$ofi"
          else
-            err st "binary: Array.pin requires a POD struct array"
-            refNull f "any")
+            // symbolic element (a generic TEMPLATE): dispatch on the
+            // handle's backing store at runtime
+            emitNode st f lv a
+            callf f "$pinany"
+            callf f "$ofi")
     | EArrayUnpin (nm, a) ->
         (if (dictTryFind st.Pod nm).IsSome then
             emitNode st f lv a
             callf f ("$unpinh" + podSfxOf st nm)
             callf f "$ofi"
          else
-            err st "binary: Array.unpin requires a POD struct array"
-            refNull f "any")
+            emitNode st f lv a
+            callf f "$unpinany"
+            callf f "$ofi")
     // the word count times the word width — the image's real size, which is
     // what a blit has to move and what no caller can work out for itself
     | EArrayBytes (nm, a) ->
@@ -3545,8 +3549,9 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             ins f "i32.mul"
             callf f "$ofi"
          else
-            err st "binary: Array.byteSize requires a POD struct array"
-            refNull f "any")
+            emitNode st f lv a
+            callf f "$sizeany"
+            callf f "$ofi")
     | EArray (nm, xs) when parrK nm <> "" ->
         // packed primitive array: unboxed elements, no per-element GC object
         let k = parrK nm

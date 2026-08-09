@@ -39,7 +39,7 @@ let go =
                 { Size = 32.0
                   Usage = GPUBufferUsage.Storage ||| GPUBufferUsage.CopyDst ||| GPUBufferUsage.CopySrc }
         // ZERO-COPY upload: the view aliases the pinned array's real storage
-        device.Queue.WriteBuffer (storage, 0.0, Js.viewF32 (Array.pin input) 8)
+        device.Queue.WriteBuffer (storage, 0.0, input)
         let module_ = device.CreateShaderModule { Code = shaderCode }
         let pipeline =
             device.CreateComputePipeline

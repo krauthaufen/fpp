@@ -33,13 +33,12 @@ let go =
     gl.UseProgram prog
     let buf = gl.CreateBuffer ()
     gl.BindBuffer (GLenum.ArrayBuffer, buf)
-    gl.BufferData (GLenum.ArrayBuffer, Js.viewF32 (Array.pin verts) 6, GLenum.StaticDraw)
+    gl.BufferData (GLenum.ArrayBuffer, verts, GLenum.StaticDraw)
     let loc = gl.GetAttribLocation (prog, "p")
     gl.EnableVertexAttribArray loc
     gl.VertexAttribPointer (loc, 2, GLenum.Float, false, 0, 0.0)
     gl.DrawArrays (GLenum.Triangles, 0, 3)
-    let pv = Js.viewU8 (Array.pin pixel) 4
-    gl.ReadPixels (32, 32, 1, 1, GLenum.Rgba, GLenum.UnsignedByte, pv)
+    gl.ReadPixels (32, 32, 1, 1, GLenum.Rgba, GLenum.UnsignedByte, pixel)
     print (int pixel.[0].R)
     print (int pixel.[0].G)
     print (int pixel.[0].B)
