@@ -522,6 +522,23 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                     Name = mangled }, substScheme i sch)
         | None -> fallback
 
+    // members of a CLASS: a call at a concrete NON-UNIFORM instantiation
+    // must reach the constructor family's stamp, never the canonical
+    // template — the template pairs with canonically-built objects, and an
+    // object built by the stamped ctor family carries packed fields (the
+    // known-issue Enumerator shape: GetEnumerator itself is not
+    // layout-dependent, but the BoxEn it constructs is)
+    let classMemberDef = dictNew<string * int, bool> ()
+    for d in decls do
+        match d with
+        | DClass (_, _, own, impls) ->
+            for _, v in own do dictSet classMemberDef (v.Path, v.Offset) true
+            for _, ms in impls do
+                for _, v in ms do dictSet classMemberDef (v.Path, v.Offset) true
+        | DMembers (_, own) ->
+            for _, v in own do dictSet classMemberDef (v.Path, v.Offset) true
+        | _ -> ()
+
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
@@ -592,7 +609,14 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                         elif inst |> List.exists (fun t -> t.Contains "#") then
                             Unclassifiable "element layout is not statically known here"
                         else Stamp inst
-                    else classify isStructName inst
+                    else
+                        match classify isStructName inst with
+                        | Canon when
+                              (dictTryFind classMemberDef (v.Path, v.Offset)).IsSome
+                              && inst |> List.forall (fun t -> t <> "" && not (t.Contains "#"))
+                              && inst |> List.exists (fun t -> t <> "obj" && t <> "$ref") ->
+                            Stamp inst
+                        | other -> other
                 (match cls with
                  | Canon -> EVar (v, sch)
                  | Unclassifiable why ->
