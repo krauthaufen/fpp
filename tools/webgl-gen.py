@@ -15,7 +15,19 @@ exec(_helpers)                                             # pascal/resolve/fpp_
 
 def parse_all():
     idl = open('tools/webgl1.idl').read() + '\n' + open('tools/webgl2.idl').read()
-    return parse(idl)
+    model = parse(idl)
+    # the EXTENSION registry (tools/webgl-ext.idl, vendored from Khronos):
+    # each `// EXT <name>` header names one extension object reachable via
+    # getExtension(name); other interfaces in the file are handle classes
+    ext_src = open('tools/webgl-ext.idl').read()
+    ext_names = re.findall(r'^// EXT (\S+)', ext_src, re.M)
+    ext_model = parse(ext_src)
+    model['typedefs'].update(ext_model['typedefs'])
+    for n, i in ext_model['interfaces'].items():
+        if n not in model['interfaces']:
+            model['interfaces'][n] = i
+    model['extensions'] = [n for n in ext_names if n in ext_model['interfaces']]
+    return model
 
 GLPRIM = {
     'GLenum': ('GLenum', 'enum'), 'GLboolean': ('bool', 'bool'),
@@ -41,6 +53,11 @@ def gl_type(model, handles, ty):
     if ty in handles: return (ty, 'iface')
     m = re.match(r'sequence<(.+)>$', ty)
     if m:
+        # a sequence of scalars/enums crosses as a typed ARRAY, marshaled
+        # into a JS array element by element; anything richer stays raw
+        it, ik = gl_type(model, handles, m.group(1))
+        if ik in ('enum', 'int', 'num', 'bool', 'string'):
+            return ('%s[]' % it, 'seq:' + ik)
         return ('JsObj', 'raw')
     return ('JsObj', 'raw')
 
@@ -66,6 +83,53 @@ def ret_out(a, t, k, call, wrapname):
     elif k == 'num': a('        Js.toNum (%s)' % call)
     elif k == 'string': a('        Js.toString (%s)' % call)
     else: a('        %s' % call)
+
+def emit_method(a, model, handles, mname, me):
+    args = []
+    for ar in me['args']:
+        t, k = gl_type(model, handles, ar['type'])
+        an = ar['name']
+        if an in ('type', 'end', 'begin', 'to', 'done', 'val', 'ref'):
+            an = an + "'"
+        args.append((an, t, k))
+    rt, rk = gl_type(model, handles, me['ret'])
+    if rk.startswith('seq:'):
+        # typed sequences are an ARGUMENT convenience; a returned one has
+        # no reverse marshal and crosses raw
+        rt, rk = 'JsObj', 'raw'
+    sig = ', '.join('%s : %s' % (n, t) for n, t, _ in args)
+    a('    member x.%s (%s) : %s =' % (mname, sig, rt))
+    for n, t, k in args:
+        if k.startswith('seq:'):
+            a('        let %s_j = Js.newArr ()' % n)
+            a('        for si in 0 .. Array.length %s - 1 do Js.push %s_j (%s)'
+              % (n, n, arg_in('', k[4:], '%s.[si]' % n)))
+        else:
+            a('        let %s_j = %s' % (n, arg_in(t, k, n)))
+    call = 'Js.call%d (Js.handle h) "%s"%s' % (
+        len(args), me['name'], ''.join(' %s_j' % n for n, _, _ in args))
+    ret_out(a, rt, rk, call, rt)
+    # a GENERIC sibling for the data-carrying form: pass any pinnable
+    # array directly — pin scoped around the call
+    raws = [n for n, t, k in args if k == 'raw']
+    if len(raws) == 1 and rk == 'unit' and mname == pascal(me['name']):
+        rn = raws[0]
+        sig2 = ', '.join(
+            ('%s : %s' % (n, "'a[]") if n == rn else '%s : %s' % (n, t))
+            for n, t, _ in args)
+        a('    member x.%s (%s) : unit when Unmanaged<\'a> =' % (mname, sig2))
+        a('        let %s_p = Array.pin %s' % (rn, rn))
+        for n, t, k in args:
+            if n == rn:
+                a('        let %s_j = Js.viewU8 %s_p (Array.byteSize %s)' % (n, n, n))
+            elif k.startswith('seq:'):
+                a('        let %s_j = Js.newArr ()' % n)
+                a('        for si in 0 .. Array.length %s - 1 do Js.push %s_j (%s)'
+                  % (n, n, arg_in('', k[4:], '%s.[si]' % n)))
+            else:
+                a('        let %s_j = %s' % (n, arg_in(t, k, n)))
+        a('        %s |> ignore' % call)
+        a('        Array.unpin %s |> ignore' % rn)
 
 def emit_gl(model):
     handles = set(n for n in model['interfaces']
@@ -132,39 +196,26 @@ def emit_gl(model):
             if True:
                 if mname in emitted: continue
                 emitted.add(mname)
-                args = []
-                skip = False
-                for ar in me['args']:
-                    t, k = gl_type(model, handles, ar['type'])
-                    an = ar['name']
-                    if an in ('type', 'end', 'begin', 'to', 'done', 'val', 'ref'):
-                        an = an + "'"
-                    args.append((an, t, k))
-                rt, rk = gl_type(model, handles, me['ret'])
-                sig = ', '.join('%s : %s' % (n, t) for n, t, _ in args)
-                a('    member x.%s (%s) : %s =' % (mname, sig, rt))
-                for n, t, k in args:
-                    a('        let %s_j = %s' % (n, arg_in(t, k, n)))
-                call = 'Js.call%d (Js.handle h) "%s"%s' % (
-                    len(args), me['name'], ''.join(' %s_j' % n for n, _, _ in args))
-                ret_out(a, rt, rk, call, rt)
-                # a GENERIC sibling for the data-carrying form: pass any
-                # pinnable array directly — pin scoped around the call
-                raws = [n for n, t, k in args if k == 'raw']
-                if len(raws) == 1 and rk == 'unit' and mname == pascal(me['name']):
-                    rn = raws[0]
-                    sig2 = ', '.join(
-                        ('%s : %s' % (n, "'a[]") if n == rn else '%s : %s' % (n, t))
-                        for n, t, _ in args)
-                    a('    member x.%s (%s) : unit when Unmanaged<\'a> =' % (mname, sig2))
-                    a('        let %s_p = Array.pin %s' % (rn, rn))
-                    for n, t, k in args:
-                        if n == rn:
-                            a('        let %s_j = Js.viewU8 %s_p (Array.byteSize %s)' % (n, n, n))
-                        else:
-                            a('        let %s_j = %s' % (n, arg_in(t, k, n)))
-                    a('        %s |> ignore' % call)
-                    a('        Array.unpin %s |> ignore' % rn)
+                emit_method(a, model, handles, mname, me)
+        # typed extension accessors: getExtension by its registry name,
+        # null (unsupported) as None
+        for en in model['extensions']:
+            a('    member x.Get%s () : option<%s> =' % (en, en))
+            a('        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "%s")' % en)
+            a('        if Js.toBool e then')
+            a('            let r = Js.register e')
+            a('            let w = %s r' % en)
+            a('            Js.watch (box w) r')
+            a('            Some w')
+            a('        else None')
+        a('')
+    # extension objects: one class each, methods verbatim from the registry
+    for en in model['extensions']:
+        iface = model['interfaces'][en]
+        a(hdr(en, '(h : int) ='))
+        a('    member x.H : int = h')
+        for me in iface['methods']:
+            emit_method(a, model, handles, pascal(me['name']), me)
         a('')
     a('and Marshal =')
     a('    static member GLenumOf (v : int) : GLenum = unbox (box v)')

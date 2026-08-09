@@ -561,6 +561,176 @@ type GLenum =
     | MaxElementIndex = 36203
     | TextureImmutableLevels = 33503
     | MaxClientWaitTimeoutWebgl = 37447
+    | VertexAttribArrayDivisorAngle = 35070
+    | MinExt = 32775
+    | MaxExt = 32776
+    | LowerLeftExt = 36001
+    | UpperLeftExt = 36002
+    | NegativeOneToOneExt = 37726
+    | ZeroToOneExt = 37727
+    | ClipOriginExt = 37724
+    | ClipDepthModeExt = 37725
+    | Rgba16fExt = 34842
+    | Rgb16fExt = 34843
+    | FramebufferAttachmentComponentTypeExt = 33297
+    | UnsignedNormalizedExt = 35863
+    | DepthClampExt = 34383
+    | QueryCounterBitsExt = 34916
+    | CurrentQueryExt = 34917
+    | QueryResultExt = 34918
+    | QueryResultAvailableExt = 34919
+    | TimeElapsedExt = 35007
+    | TimestampExt = 36392
+    | GpuDisjointExt = 36795
+    | PolygonOffsetClampExt = 36379
+    | SrgbExt = 35904
+    | SrgbAlphaExt = 35906
+    | Srgb8Alpha8Ext = 35907
+    | FramebufferAttachmentColorEncodingExt = 33296
+    | CompressedRgbaBptcUnormExt = 36492
+    | CompressedSrgbAlphaBptcUnormExt = 36493
+    | CompressedRgbBptcSignedFloatExt = 36494
+    | CompressedRgbBptcUnsignedFloatExt = 36495
+    | CompressedRedRgtc1Ext = 36283
+    | CompressedSignedRedRgtc1Ext = 36284
+    | CompressedRedGreenRgtc2Ext = 36285
+    | CompressedSignedRedGreenRgtc2Ext = 36286
+    | TextureMaxAnisotropyExt = 34046
+    | MaxTextureMaxAnisotropyExt = 34047
+    | MirrorClampToEdgeExt = 34627
+    | R16Ext = 33322
+    | Rg16Ext = 33324
+    | Rgb16Ext = 32852
+    | Rgba16Ext = 32859
+    | R16SnormExt = 36760
+    | Rg16SnormExt = 36761
+    | Rgb16SnormExt = 36762
+    | Rgba16SnormExt = 36763
+    | CompletionStatusKhr = 37297
+    | MinFragmentInterpolationOffsetOes = 36443
+    | MaxFragmentInterpolationOffsetOes = 36444
+    | FragmentInterpolationOffsetBitsOes = 36445
+    | FragmentShaderDerivativeHintOes = 35723
+    | HalfFloatOes = 36193
+    | VertexArrayBindingOes = 34229
+    | FramebufferAttachmentTextureNumViewsOvr = 38448
+    | FramebufferAttachmentTextureBaseViewIndexOvr = 38450
+    | MaxViewsOvr = 38449
+    | FramebufferIncompleteViewTargetsOvr = 38451
+    | Src1ColorWebgl = 35065
+    | Src1AlphaWebgl = 34185
+    | OneMinusSrc1ColorWebgl = 35066
+    | OneMinusSrc1AlphaWebgl = 35067
+    | MaxDualSourceDrawBuffersWebgl = 35068
+    | MaxClipDistancesWebgl = 3378
+    | MaxCullDistancesWebgl = 33529
+    | MaxCombinedClipAndCullDistancesWebgl = 33530
+    | ClipDistance0Webgl = 12288
+    | ClipDistance1Webgl = 12289
+    | ClipDistance2Webgl = 12290
+    | ClipDistance3Webgl = 12291
+    | ClipDistance4Webgl = 12292
+    | ClipDistance5Webgl = 12293
+    | ClipDistance6Webgl = 12294
+    | ClipDistance7Webgl = 12295
+    | Rgba32fExt = 34836
+    | CompressedRgbaAstc4x4Khr = 37808
+    | CompressedRgbaAstc5x4Khr = 37809
+    | CompressedRgbaAstc5x5Khr = 37810
+    | CompressedRgbaAstc6x5Khr = 37811
+    | CompressedRgbaAstc6x6Khr = 37812
+    | CompressedRgbaAstc8x5Khr = 37813
+    | CompressedRgbaAstc8x6Khr = 37814
+    | CompressedRgbaAstc8x8Khr = 37815
+    | CompressedRgbaAstc10x5Khr = 37816
+    | CompressedRgbaAstc10x6Khr = 37817
+    | CompressedRgbaAstc10x8Khr = 37818
+    | CompressedRgbaAstc10x10Khr = 37819
+    | CompressedRgbaAstc12x10Khr = 37820
+    | CompressedRgbaAstc12x12Khr = 37821
+    | CompressedSrgb8Alpha8Astc4x4Khr = 37840
+    | CompressedSrgb8Alpha8Astc5x4Khr = 37841
+    | CompressedSrgb8Alpha8Astc5x5Khr = 37842
+    | CompressedSrgb8Alpha8Astc6x5Khr = 37843
+    | CompressedSrgb8Alpha8Astc6x6Khr = 37844
+    | CompressedSrgb8Alpha8Astc8x5Khr = 37845
+    | CompressedSrgb8Alpha8Astc8x6Khr = 37846
+    | CompressedSrgb8Alpha8Astc8x8Khr = 37847
+    | CompressedSrgb8Alpha8Astc10x5Khr = 37848
+    | CompressedSrgb8Alpha8Astc10x6Khr = 37849
+    | CompressedSrgb8Alpha8Astc10x8Khr = 37850
+    | CompressedSrgb8Alpha8Astc10x10Khr = 37851
+    | CompressedSrgb8Alpha8Astc12x10Khr = 37852
+    | CompressedSrgb8Alpha8Astc12x12Khr = 37853
+    | CompressedR11Eac = 37488
+    | CompressedSignedR11Eac = 37489
+    | CompressedRg11Eac = 37490
+    | CompressedSignedRg11Eac = 37491
+    | CompressedRgb8Etc2 = 37492
+    | CompressedSrgb8Etc2 = 37493
+    | CompressedRgb8PunchthroughAlpha1Etc2 = 37494
+    | CompressedSrgb8PunchthroughAlpha1Etc2 = 37495
+    | CompressedRgba8Etc2Eac = 37496
+    | CompressedSrgb8Alpha8Etc2Eac = 37497
+    | CompressedRgbEtc1Webgl = 36196
+    | CompressedRgbPvrtc4bppv1Img = 35840
+    | CompressedRgbPvrtc2bppv1Img = 35841
+    | CompressedRgbaPvrtc4bppv1Img = 35842
+    | CompressedRgbaPvrtc2bppv1Img = 35843
+    | CompressedRgbS3tcDxt1Ext = 33776
+    | CompressedRgbaS3tcDxt1Ext = 33777
+    | CompressedRgbaS3tcDxt3Ext = 33778
+    | CompressedRgbaS3tcDxt5Ext = 33779
+    | CompressedSrgbS3tcDxt1Ext = 35916
+    | CompressedSrgbAlphaS3tcDxt1Ext = 35917
+    | CompressedSrgbAlphaS3tcDxt3Ext = 35918
+    | CompressedSrgbAlphaS3tcDxt5Ext = 35919
+    | UnmaskedVendorWebgl = 37445
+    | UnmaskedRendererWebgl = 37446
+    | UnsignedInt248Webgl = 34042
+    | ColorAttachment0Webgl = 36064
+    | ColorAttachment1Webgl = 36065
+    | ColorAttachment2Webgl = 36066
+    | ColorAttachment3Webgl = 36067
+    | ColorAttachment4Webgl = 36068
+    | ColorAttachment5Webgl = 36069
+    | ColorAttachment6Webgl = 36070
+    | ColorAttachment7Webgl = 36071
+    | ColorAttachment8Webgl = 36072
+    | ColorAttachment9Webgl = 36073
+    | ColorAttachment10Webgl = 36074
+    | ColorAttachment11Webgl = 36075
+    | ColorAttachment12Webgl = 36076
+    | ColorAttachment13Webgl = 36077
+    | ColorAttachment14Webgl = 36078
+    | ColorAttachment15Webgl = 36079
+    | DrawBuffer0Webgl = 34853
+    | DrawBuffer1Webgl = 34854
+    | DrawBuffer2Webgl = 34855
+    | DrawBuffer3Webgl = 34856
+    | DrawBuffer4Webgl = 34857
+    | DrawBuffer5Webgl = 34858
+    | DrawBuffer6Webgl = 34859
+    | DrawBuffer7Webgl = 34860
+    | DrawBuffer8Webgl = 34861
+    | DrawBuffer9Webgl = 34862
+    | DrawBuffer10Webgl = 34863
+    | DrawBuffer11Webgl = 34864
+    | DrawBuffer12Webgl = 34865
+    | DrawBuffer13Webgl = 34866
+    | DrawBuffer14Webgl = 34867
+    | DrawBuffer15Webgl = 34868
+    | MaxColorAttachmentsWebgl = 36063
+    | MaxDrawBuffersWebgl = 34852
+    | PolygonModeWebgl = 2880
+    | PolygonOffsetLineWebgl = 10754
+    | LineWebgl = 6913
+    | FillWebgl = 6914
+    | FirstVertexConventionWebgl = 36429
+    | LastVertexConventionWebgl = 36430
+    | ProvokingVertexWebgl = 36431
+    | DepthStencilTextureModeWebgl = 37098
+    | StencilIndexWebgl = 6401
 
 type WebGLActiveInfo(h : int) =
     member x.H : int = h
@@ -598,6 +768,9 @@ and WebGLSync(h : int) =
 and WebGLTexture(h : int) =
     member x.H : int = h
 
+and WebGLTimerQueryEXT(h : int) =
+    member x.H : int = h
+
 and WebGLTransformFeedback(h : int) =
     member x.H : int = h
 
@@ -605,6 +778,9 @@ and WebGLUniformLocation(h : int) =
     member x.H : int = h
 
 and WebGLVertexArrayObject(h : int) =
+    member x.H : int = h
+
+and WebGLVertexArrayObjectOES(h : int) =
     member x.H : int = h
 
 and WebGLRenderingContext(h : int) =
@@ -1415,6 +1591,430 @@ and WebGLRenderingContext(h : int) =
         let value_j = Js.viewU8 value_p (Array.byteSize value)
         Js.call3 (Js.handle h) "uniformMatrix4fv" location_j transpose_j value_j |> ignore
         Array.unpin value |> ignore
+    member x.GetANGLE_instanced_arrays () : option<ANGLE_instanced_arrays> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "ANGLE_instanced_arrays")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = ANGLE_instanced_arrays r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_blend_minmax () : option<EXT_blend_minmax> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_blend_minmax")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_blend_minmax r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_clip_control () : option<EXT_clip_control> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_clip_control")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_clip_control r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_color_buffer_float () : option<EXT_color_buffer_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_color_buffer_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_color_buffer_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_color_buffer_half_float () : option<EXT_color_buffer_half_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_color_buffer_half_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_color_buffer_half_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_conservative_depth () : option<EXT_conservative_depth> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_conservative_depth")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_conservative_depth r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_depth_clamp () : option<EXT_depth_clamp> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_depth_clamp")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_depth_clamp r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_disjoint_timer_query () : option<EXT_disjoint_timer_query> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_disjoint_timer_query")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_disjoint_timer_query r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_disjoint_timer_query_webgl2 () : option<EXT_disjoint_timer_query_webgl2> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_disjoint_timer_query_webgl2")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_disjoint_timer_query_webgl2 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_float_blend () : option<EXT_float_blend> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_float_blend")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_float_blend r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_frag_depth () : option<EXT_frag_depth> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_frag_depth")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_frag_depth r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_polygon_offset_clamp () : option<EXT_polygon_offset_clamp> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_polygon_offset_clamp")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_polygon_offset_clamp r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_render_snorm () : option<EXT_render_snorm> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_render_snorm")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_render_snorm r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_sRGB () : option<EXT_sRGB> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_sRGB")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_sRGB r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_shader_texture_lod () : option<EXT_shader_texture_lod> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_shader_texture_lod")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_shader_texture_lod r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_compression_bptc () : option<EXT_texture_compression_bptc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_compression_bptc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_compression_bptc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_compression_rgtc () : option<EXT_texture_compression_rgtc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_compression_rgtc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_compression_rgtc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_filter_anisotropic () : option<EXT_texture_filter_anisotropic> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_filter_anisotropic")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_filter_anisotropic r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_mirror_clamp_to_edge () : option<EXT_texture_mirror_clamp_to_edge> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_mirror_clamp_to_edge")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_mirror_clamp_to_edge r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_norm16 () : option<EXT_texture_norm16> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_norm16")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_norm16 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetKHR_parallel_shader_compile () : option<KHR_parallel_shader_compile> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "KHR_parallel_shader_compile")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = KHR_parallel_shader_compile r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetNV_shader_noperspective_interpolation () : option<NV_shader_noperspective_interpolation> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "NV_shader_noperspective_interpolation")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = NV_shader_noperspective_interpolation r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_draw_buffers_indexed () : option<OES_draw_buffers_indexed> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_draw_buffers_indexed")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_draw_buffers_indexed r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_element_index_uint () : option<OES_element_index_uint> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_element_index_uint")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_element_index_uint r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_fbo_render_mipmap () : option<OES_fbo_render_mipmap> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_fbo_render_mipmap")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_fbo_render_mipmap r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_sample_variables () : option<OES_sample_variables> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_sample_variables")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_sample_variables r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_shader_multisample_interpolation () : option<OES_shader_multisample_interpolation> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_shader_multisample_interpolation")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_shader_multisample_interpolation r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_standard_derivatives () : option<OES_standard_derivatives> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_standard_derivatives")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_standard_derivatives r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_float () : option<OES_texture_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_float_linear () : option<OES_texture_float_linear> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_float_linear")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_float_linear r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_half_float () : option<OES_texture_half_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_half_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_half_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_half_float_linear () : option<OES_texture_half_float_linear> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_half_float_linear")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_half_float_linear r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_vertex_array_object () : option<OES_vertex_array_object> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_vertex_array_object")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_vertex_array_object r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOVR_multiview2 () : option<OVR_multiview2> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OVR_multiview2")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OVR_multiview2 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_blend_func_extended () : option<WEBGL_blend_func_extended> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_blend_func_extended")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_blend_func_extended r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_clip_cull_distance () : option<WEBGL_clip_cull_distance> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_clip_cull_distance")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_clip_cull_distance r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_color_buffer_float () : option<WEBGL_color_buffer_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_color_buffer_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_color_buffer_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_astc () : option<WEBGL_compressed_texture_astc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_astc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_astc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_etc () : option<WEBGL_compressed_texture_etc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_etc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_etc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_etc1 () : option<WEBGL_compressed_texture_etc1> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_etc1")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_etc1 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_pvrtc () : option<WEBGL_compressed_texture_pvrtc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_pvrtc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_pvrtc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_s3tc () : option<WEBGL_compressed_texture_s3tc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_s3tc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_s3tc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_s3tc_srgb () : option<WEBGL_compressed_texture_s3tc_srgb> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_s3tc_srgb")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_s3tc_srgb r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_debug_renderer_info () : option<WEBGL_debug_renderer_info> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_debug_renderer_info")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_debug_renderer_info r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_debug_shaders () : option<WEBGL_debug_shaders> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_debug_shaders")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_debug_shaders r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_depth_texture () : option<WEBGL_depth_texture> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_depth_texture")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_depth_texture r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_draw_buffers () : option<WEBGL_draw_buffers> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_draw_buffers")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_draw_buffers r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_lose_context () : option<WEBGL_lose_context> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_lose_context")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_lose_context r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_multi_draw () : option<WEBGL_multi_draw> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_multi_draw")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_multi_draw r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_polygon_mode () : option<WEBGL_polygon_mode> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_polygon_mode")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_polygon_mode r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_provoking_vertex () : option<WEBGL_provoking_vertex> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_provoking_vertex")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_provoking_vertex r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_render_shared_exponent () : option<WEBGL_render_shared_exponent> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_render_shared_exponent")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_render_shared_exponent r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_stencil_texturing () : option<WEBGL_stencil_texturing> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_stencil_texturing")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_stencil_texturing r
+            Js.watch (box w) r
+            Some w
+        else None
 
 and WebGL2RenderingContext(h : int) =
     member x.H : int = h
@@ -1985,34 +2585,20 @@ and WebGL2RenderingContext(h : int) =
         let level_j = Js.ofNum (float (level))
         let layer_j = Js.ofNum (float (layer))
         Js.call5 (Js.handle h) "framebufferTextureLayer" target_j attachment_j texture_j level_j layer_j |> ignore
-    member x.InvalidateFramebuffer (target : GLenum, attachments : JsObj) : unit =
+    member x.InvalidateFramebuffer (target : GLenum, attachments : GLenum[]) : unit =
         let target_j = Js.ofNum (float (int (target)))
-        let attachments_j = attachments
+        let attachments_j = Js.newArr ()
+        for si in 0 .. Array.length attachments - 1 do Js.push attachments_j (Js.ofNum (float (int (attachments.[si]))))
         Js.call2 (Js.handle h) "invalidateFramebuffer" target_j attachments_j |> ignore
-    member x.InvalidateFramebuffer (target : GLenum, attachments : 'a[]) : unit when Unmanaged<'a> =
-        let attachments_p = Array.pin attachments
+    member x.InvalidateSubFramebuffer (target : GLenum, attachments : GLenum[], x : int, y : int, width : int, height : int) : unit =
         let target_j = Js.ofNum (float (int (target)))
-        let attachments_j = Js.viewU8 attachments_p (Array.byteSize attachments)
-        Js.call2 (Js.handle h) "invalidateFramebuffer" target_j attachments_j |> ignore
-        Array.unpin attachments |> ignore
-    member x.InvalidateSubFramebuffer (target : GLenum, attachments : JsObj, x : int, y : int, width : int, height : int) : unit =
-        let target_j = Js.ofNum (float (int (target)))
-        let attachments_j = attachments
+        let attachments_j = Js.newArr ()
+        for si in 0 .. Array.length attachments - 1 do Js.push attachments_j (Js.ofNum (float (int (attachments.[si]))))
         let x_j = Js.ofNum (float (x))
         let y_j = Js.ofNum (float (y))
         let width_j = Js.ofNum (float (width))
         let height_j = Js.ofNum (float (height))
         Js.call6 (Js.handle h) "invalidateSubFramebuffer" target_j attachments_j x_j y_j width_j height_j |> ignore
-    member x.InvalidateSubFramebuffer (target : GLenum, attachments : 'a[], x : int, y : int, width : int, height : int) : unit when Unmanaged<'a> =
-        let attachments_p = Array.pin attachments
-        let target_j = Js.ofNum (float (int (target)))
-        let attachments_j = Js.viewU8 attachments_p (Array.byteSize attachments)
-        let x_j = Js.ofNum (float (x))
-        let y_j = Js.ofNum (float (y))
-        let width_j = Js.ofNum (float (width))
-        let height_j = Js.ofNum (float (height))
-        Js.call6 (Js.handle h) "invalidateSubFramebuffer" target_j attachments_j x_j y_j width_j height_j |> ignore
-        Array.unpin attachments |> ignore
     member x.ReadBuffer (src : GLenum) : unit =
         let src_j = Js.ofNum (float (int (src)))
         Js.call1 (Js.handle h) "readBuffer" src_j |> ignore
@@ -2380,14 +2966,10 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let offset_j = Js.ofNum (offset)
         Js.call6 (Js.handle h) "drawRangeElements" mode_j start_j end'_j count_j type'_j offset_j |> ignore
-    member x.DrawBuffers (buffers : JsObj) : unit =
-        let buffers_j = buffers
+    member x.DrawBuffers (buffers : GLenum[]) : unit =
+        let buffers_j = Js.newArr ()
+        for si in 0 .. Array.length buffers - 1 do Js.push buffers_j (Js.ofNum (float (int (buffers.[si]))))
         Js.call1 (Js.handle h) "drawBuffers" buffers_j |> ignore
-    member x.DrawBuffers (buffers : 'a[]) : unit when Unmanaged<'a> =
-        let buffers_p = Array.pin buffers
-        let buffers_j = Js.viewU8 buffers_p (Array.byteSize buffers)
-        Js.call1 (Js.handle h) "drawBuffers" buffers_j |> ignore
-        Array.unpin buffers |> ignore
     member x.ClearBufferfv (buffer : GLenum, drawbuffer : int, values : JsObj, srcOffset : JsObj) : unit =
         let buffer_j = Js.ofNum (float (int (buffer)))
         let drawbuffer_j = Js.ofNum (float (drawbuffer))
@@ -2517,18 +3099,12 @@ and WebGL2RenderingContext(h : int) =
         Js.call1 (Js.handle h) "beginTransformFeedback" primitiveMode_j |> ignore
     member x.EndTransformFeedback () : unit =
         Js.call0 (Js.handle h) "endTransformFeedback" |> ignore
-    member x.TransformFeedbackVaryings (program : WebGLProgram, varyings : JsObj, bufferMode : GLenum) : unit =
+    member x.TransformFeedbackVaryings (program : WebGLProgram, varyings : string[], bufferMode : GLenum) : unit =
         let program_j = Js.handle (program).H
-        let varyings_j = varyings
+        let varyings_j = Js.newArr ()
+        for si in 0 .. Array.length varyings - 1 do Js.push varyings_j (Js.ofString (varyings.[si]))
         let bufferMode_j = Js.ofNum (float (int (bufferMode)))
         Js.call3 (Js.handle h) "transformFeedbackVaryings" program_j varyings_j bufferMode_j |> ignore
-    member x.TransformFeedbackVaryings (program : WebGLProgram, varyings : 'a[], bufferMode : GLenum) : unit when Unmanaged<'a> =
-        let varyings_p = Array.pin varyings
-        let program_j = Js.handle (program).H
-        let varyings_j = Js.viewU8 varyings_p (Array.byteSize varyings)
-        let bufferMode_j = Js.ofNum (float (int (bufferMode)))
-        Js.call3 (Js.handle h) "transformFeedbackVaryings" program_j varyings_j bufferMode_j |> ignore
-        Array.unpin varyings |> ignore
     member x.GetTransformFeedbackVarying (program : WebGLProgram, index : int) : WebGLActiveInfo =
         let program_j = Js.handle (program).H
         let index_j = Js.ofNum (float (index))
@@ -2556,13 +3132,15 @@ and WebGL2RenderingContext(h : int) =
         let target_j = Js.ofNum (float (int (target)))
         let index_j = Js.ofNum (float (index))
         Js.call2 (Js.handle h) "getIndexedParameter" target_j index_j
-    member x.GetUniformIndices (program : WebGLProgram, uniformNames : JsObj) : JsObj =
+    member x.GetUniformIndices (program : WebGLProgram, uniformNames : string[]) : JsObj =
         let program_j = Js.handle (program).H
-        let uniformNames_j = uniformNames
+        let uniformNames_j = Js.newArr ()
+        for si in 0 .. Array.length uniformNames - 1 do Js.push uniformNames_j (Js.ofString (uniformNames.[si]))
         Js.call2 (Js.handle h) "getUniformIndices" program_j uniformNames_j
-    member x.GetActiveUniforms (program : WebGLProgram, uniformIndices : JsObj, pname : GLenum) : JsObj =
+    member x.GetActiveUniforms (program : WebGLProgram, uniformIndices : int[], pname : GLenum) : JsObj =
         let program_j = Js.handle (program).H
-        let uniformIndices_j = uniformIndices
+        let uniformIndices_j = Js.newArr ()
+        for si in 0 .. Array.length uniformIndices - 1 do Js.push uniformIndices_j (Js.ofNum (float (uniformIndices.[si])))
         let pname_j = Js.ofNum (float (int (pname)))
         Js.call3 (Js.handle h) "getActiveUniforms" program_j uniformIndices_j pname_j
     member x.GetUniformBlockIndex (program : WebGLProgram, uniformBlockName : string) : int =
@@ -2925,6 +3503,765 @@ and WebGL2RenderingContext(h : int) =
         let type'_j = Js.ofNum (float (int (type')))
         let offset_j = Js.ofNum (offset)
         Js.call7 (Js.handle h) "readPixels" x_j y_j width_j height_j format_j type'_j offset_j |> ignore
+    member x.GetANGLE_instanced_arrays () : option<ANGLE_instanced_arrays> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "ANGLE_instanced_arrays")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = ANGLE_instanced_arrays r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_blend_minmax () : option<EXT_blend_minmax> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_blend_minmax")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_blend_minmax r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_clip_control () : option<EXT_clip_control> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_clip_control")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_clip_control r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_color_buffer_float () : option<EXT_color_buffer_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_color_buffer_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_color_buffer_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_color_buffer_half_float () : option<EXT_color_buffer_half_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_color_buffer_half_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_color_buffer_half_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_conservative_depth () : option<EXT_conservative_depth> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_conservative_depth")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_conservative_depth r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_depth_clamp () : option<EXT_depth_clamp> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_depth_clamp")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_depth_clamp r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_disjoint_timer_query () : option<EXT_disjoint_timer_query> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_disjoint_timer_query")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_disjoint_timer_query r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_disjoint_timer_query_webgl2 () : option<EXT_disjoint_timer_query_webgl2> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_disjoint_timer_query_webgl2")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_disjoint_timer_query_webgl2 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_float_blend () : option<EXT_float_blend> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_float_blend")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_float_blend r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_frag_depth () : option<EXT_frag_depth> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_frag_depth")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_frag_depth r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_polygon_offset_clamp () : option<EXT_polygon_offset_clamp> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_polygon_offset_clamp")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_polygon_offset_clamp r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_render_snorm () : option<EXT_render_snorm> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_render_snorm")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_render_snorm r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_sRGB () : option<EXT_sRGB> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_sRGB")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_sRGB r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_shader_texture_lod () : option<EXT_shader_texture_lod> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_shader_texture_lod")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_shader_texture_lod r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_compression_bptc () : option<EXT_texture_compression_bptc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_compression_bptc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_compression_bptc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_compression_rgtc () : option<EXT_texture_compression_rgtc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_compression_rgtc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_compression_rgtc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_filter_anisotropic () : option<EXT_texture_filter_anisotropic> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_filter_anisotropic")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_filter_anisotropic r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_mirror_clamp_to_edge () : option<EXT_texture_mirror_clamp_to_edge> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_mirror_clamp_to_edge")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_mirror_clamp_to_edge r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetEXT_texture_norm16 () : option<EXT_texture_norm16> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "EXT_texture_norm16")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = EXT_texture_norm16 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetKHR_parallel_shader_compile () : option<KHR_parallel_shader_compile> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "KHR_parallel_shader_compile")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = KHR_parallel_shader_compile r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetNV_shader_noperspective_interpolation () : option<NV_shader_noperspective_interpolation> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "NV_shader_noperspective_interpolation")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = NV_shader_noperspective_interpolation r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_draw_buffers_indexed () : option<OES_draw_buffers_indexed> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_draw_buffers_indexed")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_draw_buffers_indexed r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_element_index_uint () : option<OES_element_index_uint> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_element_index_uint")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_element_index_uint r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_fbo_render_mipmap () : option<OES_fbo_render_mipmap> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_fbo_render_mipmap")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_fbo_render_mipmap r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_sample_variables () : option<OES_sample_variables> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_sample_variables")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_sample_variables r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_shader_multisample_interpolation () : option<OES_shader_multisample_interpolation> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_shader_multisample_interpolation")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_shader_multisample_interpolation r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_standard_derivatives () : option<OES_standard_derivatives> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_standard_derivatives")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_standard_derivatives r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_float () : option<OES_texture_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_float_linear () : option<OES_texture_float_linear> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_float_linear")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_float_linear r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_half_float () : option<OES_texture_half_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_half_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_half_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_texture_half_float_linear () : option<OES_texture_half_float_linear> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_texture_half_float_linear")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_texture_half_float_linear r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOES_vertex_array_object () : option<OES_vertex_array_object> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OES_vertex_array_object")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OES_vertex_array_object r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetOVR_multiview2 () : option<OVR_multiview2> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "OVR_multiview2")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = OVR_multiview2 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_blend_func_extended () : option<WEBGL_blend_func_extended> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_blend_func_extended")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_blend_func_extended r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_clip_cull_distance () : option<WEBGL_clip_cull_distance> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_clip_cull_distance")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_clip_cull_distance r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_color_buffer_float () : option<WEBGL_color_buffer_float> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_color_buffer_float")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_color_buffer_float r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_astc () : option<WEBGL_compressed_texture_astc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_astc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_astc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_etc () : option<WEBGL_compressed_texture_etc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_etc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_etc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_etc1 () : option<WEBGL_compressed_texture_etc1> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_etc1")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_etc1 r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_pvrtc () : option<WEBGL_compressed_texture_pvrtc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_pvrtc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_pvrtc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_s3tc () : option<WEBGL_compressed_texture_s3tc> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_s3tc")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_s3tc r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_compressed_texture_s3tc_srgb () : option<WEBGL_compressed_texture_s3tc_srgb> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_compressed_texture_s3tc_srgb")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_compressed_texture_s3tc_srgb r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_debug_renderer_info () : option<WEBGL_debug_renderer_info> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_debug_renderer_info")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_debug_renderer_info r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_debug_shaders () : option<WEBGL_debug_shaders> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_debug_shaders")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_debug_shaders r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_depth_texture () : option<WEBGL_depth_texture> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_depth_texture")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_depth_texture r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_draw_buffers () : option<WEBGL_draw_buffers> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_draw_buffers")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_draw_buffers r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_lose_context () : option<WEBGL_lose_context> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_lose_context")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_lose_context r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_multi_draw () : option<WEBGL_multi_draw> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_multi_draw")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_multi_draw r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_polygon_mode () : option<WEBGL_polygon_mode> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_polygon_mode")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_polygon_mode r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_provoking_vertex () : option<WEBGL_provoking_vertex> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_provoking_vertex")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_provoking_vertex r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_render_shared_exponent () : option<WEBGL_render_shared_exponent> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_render_shared_exponent")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_render_shared_exponent r
+            Js.watch (box w) r
+            Some w
+        else None
+    member x.GetWEBGL_stencil_texturing () : option<WEBGL_stencil_texturing> =
+        let e = Js.call1 (Js.handle h) "getExtension" (Js.ofString "WEBGL_stencil_texturing")
+        if Js.toBool e then
+            let r = Js.register e
+            let w = WEBGL_stencil_texturing r
+            Js.watch (box w) r
+            Some w
+        else None
+
+and ANGLE_instanced_arrays(h : int) =
+    member x.H : int = h
+    member x.DrawArraysInstancedANGLE (mode : GLenum, first : int, count : int, primcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let first_j = Js.ofNum (float (first))
+        let count_j = Js.ofNum (float (count))
+        let primcount_j = Js.ofNum (float (primcount))
+        Js.call4 (Js.handle h) "drawArraysInstancedANGLE" mode_j first_j count_j primcount_j |> ignore
+    member x.DrawElementsInstancedANGLE (mode : GLenum, count : int, type' : GLenum, offset : float, primcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let count_j = Js.ofNum (float (count))
+        let type'_j = Js.ofNum (float (int (type')))
+        let offset_j = Js.ofNum (offset)
+        let primcount_j = Js.ofNum (float (primcount))
+        Js.call5 (Js.handle h) "drawElementsInstancedANGLE" mode_j count_j type'_j offset_j primcount_j |> ignore
+    member x.VertexAttribDivisorANGLE (index : int, divisor : int) : unit =
+        let index_j = Js.ofNum (float (index))
+        let divisor_j = Js.ofNum (float (divisor))
+        Js.call2 (Js.handle h) "vertexAttribDivisorANGLE" index_j divisor_j |> ignore
+
+and EXT_blend_minmax(h : int) =
+    member x.H : int = h
+
+and EXT_clip_control(h : int) =
+    member x.H : int = h
+    member x.ClipControlEXT (origin : GLenum, depth : GLenum) : unit =
+        let origin_j = Js.ofNum (float (int (origin)))
+        let depth_j = Js.ofNum (float (int (depth)))
+        Js.call2 (Js.handle h) "clipControlEXT" origin_j depth_j |> ignore
+
+and EXT_color_buffer_float(h : int) =
+    member x.H : int = h
+
+and EXT_color_buffer_half_float(h : int) =
+    member x.H : int = h
+
+and EXT_conservative_depth(h : int) =
+    member x.H : int = h
+
+and EXT_depth_clamp(h : int) =
+    member x.H : int = h
+
+and EXT_disjoint_timer_query(h : int) =
+    member x.H : int = h
+    member x.CreateQueryEXT () : WebGLTimerQueryEXT =
+        let r = Js.register (Js.call0 (Js.handle h) "createQueryEXT")
+        let w = WebGLTimerQueryEXT r
+        Js.watch (box w) r
+        w
+    member x.DeleteQueryEXT (query : WebGLTimerQueryEXT) : unit =
+        let query_j = Js.handle (query).H
+        Js.call1 (Js.handle h) "deleteQueryEXT" query_j |> ignore
+    member x.IsQueryEXT (query : WebGLTimerQueryEXT) : bool =
+        let query_j = Js.handle (query).H
+        Js.toBool (Js.call1 (Js.handle h) "isQueryEXT" query_j)
+    member x.BeginQueryEXT (target : GLenum, query : WebGLTimerQueryEXT) : unit =
+        let target_j = Js.ofNum (float (int (target)))
+        let query_j = Js.handle (query).H
+        Js.call2 (Js.handle h) "beginQueryEXT" target_j query_j |> ignore
+    member x.EndQueryEXT (target : GLenum) : unit =
+        let target_j = Js.ofNum (float (int (target)))
+        Js.call1 (Js.handle h) "endQueryEXT" target_j |> ignore
+    member x.QueryCounterEXT (query : WebGLTimerQueryEXT, target : GLenum) : unit =
+        let query_j = Js.handle (query).H
+        let target_j = Js.ofNum (float (int (target)))
+        Js.call2 (Js.handle h) "queryCounterEXT" query_j target_j |> ignore
+    member x.GetQueryEXT (target : GLenum, pname : GLenum) : JsObj =
+        let target_j = Js.ofNum (float (int (target)))
+        let pname_j = Js.ofNum (float (int (pname)))
+        Js.call2 (Js.handle h) "getQueryEXT" target_j pname_j
+    member x.GetQueryObjectEXT (query : WebGLTimerQueryEXT, pname : GLenum) : JsObj =
+        let query_j = Js.handle (query).H
+        let pname_j = Js.ofNum (float (int (pname)))
+        Js.call2 (Js.handle h) "getQueryObjectEXT" query_j pname_j
+
+and EXT_disjoint_timer_query_webgl2(h : int) =
+    member x.H : int = h
+    member x.QueryCounterEXT (query : WebGLQuery, target : GLenum) : unit =
+        let query_j = Js.handle (query).H
+        let target_j = Js.ofNum (float (int (target)))
+        Js.call2 (Js.handle h) "queryCounterEXT" query_j target_j |> ignore
+
+and EXT_float_blend(h : int) =
+    member x.H : int = h
+
+and EXT_frag_depth(h : int) =
+    member x.H : int = h
+
+and EXT_polygon_offset_clamp(h : int) =
+    member x.H : int = h
+    member x.PolygonOffsetClampEXT (factor : float, units : float, clamp : float) : unit =
+        let factor_j = Js.ofNum (factor)
+        let units_j = Js.ofNum (units)
+        let clamp_j = Js.ofNum (clamp)
+        Js.call3 (Js.handle h) "polygonOffsetClampEXT" factor_j units_j clamp_j |> ignore
+
+and EXT_render_snorm(h : int) =
+    member x.H : int = h
+
+and EXT_sRGB(h : int) =
+    member x.H : int = h
+
+and EXT_shader_texture_lod(h : int) =
+    member x.H : int = h
+
+and EXT_texture_compression_bptc(h : int) =
+    member x.H : int = h
+
+and EXT_texture_compression_rgtc(h : int) =
+    member x.H : int = h
+
+and EXT_texture_filter_anisotropic(h : int) =
+    member x.H : int = h
+
+and EXT_texture_mirror_clamp_to_edge(h : int) =
+    member x.H : int = h
+
+and EXT_texture_norm16(h : int) =
+    member x.H : int = h
+
+and KHR_parallel_shader_compile(h : int) =
+    member x.H : int = h
+
+and NV_shader_noperspective_interpolation(h : int) =
+    member x.H : int = h
+
+and OES_draw_buffers_indexed(h : int) =
+    member x.H : int = h
+    member x.EnableiOES (target : GLenum, index : int) : unit =
+        let target_j = Js.ofNum (float (int (target)))
+        let index_j = Js.ofNum (float (index))
+        Js.call2 (Js.handle h) "enableiOES" target_j index_j |> ignore
+    member x.DisableiOES (target : GLenum, index : int) : unit =
+        let target_j = Js.ofNum (float (int (target)))
+        let index_j = Js.ofNum (float (index))
+        Js.call2 (Js.handle h) "disableiOES" target_j index_j |> ignore
+    member x.BlendEquationiOES (buf : int, mode : GLenum) : unit =
+        let buf_j = Js.ofNum (float (buf))
+        let mode_j = Js.ofNum (float (int (mode)))
+        Js.call2 (Js.handle h) "blendEquationiOES" buf_j mode_j |> ignore
+    member x.BlendEquationSeparateiOES (buf : int, modeRGB : GLenum, modeAlpha : GLenum) : unit =
+        let buf_j = Js.ofNum (float (buf))
+        let modeRGB_j = Js.ofNum (float (int (modeRGB)))
+        let modeAlpha_j = Js.ofNum (float (int (modeAlpha)))
+        Js.call3 (Js.handle h) "blendEquationSeparateiOES" buf_j modeRGB_j modeAlpha_j |> ignore
+    member x.BlendFunciOES (buf : int, src : GLenum, dst : GLenum) : unit =
+        let buf_j = Js.ofNum (float (buf))
+        let src_j = Js.ofNum (float (int (src)))
+        let dst_j = Js.ofNum (float (int (dst)))
+        Js.call3 (Js.handle h) "blendFunciOES" buf_j src_j dst_j |> ignore
+    member x.BlendFuncSeparateiOES (buf : int, srcRGB : GLenum, dstRGB : GLenum, srcAlpha : GLenum, dstAlpha : GLenum) : unit =
+        let buf_j = Js.ofNum (float (buf))
+        let srcRGB_j = Js.ofNum (float (int (srcRGB)))
+        let dstRGB_j = Js.ofNum (float (int (dstRGB)))
+        let srcAlpha_j = Js.ofNum (float (int (srcAlpha)))
+        let dstAlpha_j = Js.ofNum (float (int (dstAlpha)))
+        Js.call5 (Js.handle h) "blendFuncSeparateiOES" buf_j srcRGB_j dstRGB_j srcAlpha_j dstAlpha_j |> ignore
+    member x.ColorMaskiOES (buf : int, r : bool, g : bool, b : bool, a : bool) : unit =
+        let buf_j = Js.ofNum (float (buf))
+        let r_j = Js.ofBool (r)
+        let g_j = Js.ofBool (g)
+        let b_j = Js.ofBool (b)
+        let a_j = Js.ofBool (a)
+        Js.call5 (Js.handle h) "colorMaskiOES" buf_j r_j g_j b_j a_j |> ignore
+
+and OES_element_index_uint(h : int) =
+    member x.H : int = h
+
+and OES_fbo_render_mipmap(h : int) =
+    member x.H : int = h
+
+and OES_sample_variables(h : int) =
+    member x.H : int = h
+
+and OES_shader_multisample_interpolation(h : int) =
+    member x.H : int = h
+
+and OES_standard_derivatives(h : int) =
+    member x.H : int = h
+
+and OES_texture_float(h : int) =
+    member x.H : int = h
+
+and OES_texture_float_linear(h : int) =
+    member x.H : int = h
+
+and OES_texture_half_float(h : int) =
+    member x.H : int = h
+
+and OES_texture_half_float_linear(h : int) =
+    member x.H : int = h
+
+and OES_vertex_array_object(h : int) =
+    member x.H : int = h
+    member x.CreateVertexArrayOES () : WebGLVertexArrayObjectOES =
+        let r = Js.register (Js.call0 (Js.handle h) "createVertexArrayOES")
+        let w = WebGLVertexArrayObjectOES r
+        Js.watch (box w) r
+        w
+    member x.DeleteVertexArrayOES (arrayObject : WebGLVertexArrayObjectOES) : unit =
+        let arrayObject_j = Js.handle (arrayObject).H
+        Js.call1 (Js.handle h) "deleteVertexArrayOES" arrayObject_j |> ignore
+    member x.IsVertexArrayOES (arrayObject : WebGLVertexArrayObjectOES) : bool =
+        let arrayObject_j = Js.handle (arrayObject).H
+        Js.toBool (Js.call1 (Js.handle h) "isVertexArrayOES" arrayObject_j)
+    member x.BindVertexArrayOES (arrayObject : WebGLVertexArrayObjectOES) : unit =
+        let arrayObject_j = Js.handle (arrayObject).H
+        Js.call1 (Js.handle h) "bindVertexArrayOES" arrayObject_j |> ignore
+
+and OVR_multiview2(h : int) =
+    member x.H : int = h
+    member x.FramebufferTextureMultiviewOVR (target : GLenum, attachment : GLenum, texture : WebGLTexture, level : int, baseViewIndex : int, numViews : int) : unit =
+        let target_j = Js.ofNum (float (int (target)))
+        let attachment_j = Js.ofNum (float (int (attachment)))
+        let texture_j = Js.handle (texture).H
+        let level_j = Js.ofNum (float (level))
+        let baseViewIndex_j = Js.ofNum (float (baseViewIndex))
+        let numViews_j = Js.ofNum (float (numViews))
+        Js.call6 (Js.handle h) "framebufferTextureMultiviewOVR" target_j attachment_j texture_j level_j baseViewIndex_j numViews_j |> ignore
+
+and WEBGL_blend_func_extended(h : int) =
+    member x.H : int = h
+
+and WEBGL_clip_cull_distance(h : int) =
+    member x.H : int = h
+
+and WEBGL_color_buffer_float(h : int) =
+    member x.H : int = h
+
+and WEBGL_compressed_texture_astc(h : int) =
+    member x.H : int = h
+    member x.GetSupportedProfiles () : JsObj =
+        Js.call0 (Js.handle h) "getSupportedProfiles"
+
+and WEBGL_compressed_texture_etc(h : int) =
+    member x.H : int = h
+
+and WEBGL_compressed_texture_etc1(h : int) =
+    member x.H : int = h
+
+and WEBGL_compressed_texture_pvrtc(h : int) =
+    member x.H : int = h
+
+and WEBGL_compressed_texture_s3tc(h : int) =
+    member x.H : int = h
+
+and WEBGL_compressed_texture_s3tc_srgb(h : int) =
+    member x.H : int = h
+
+and WEBGL_debug_renderer_info(h : int) =
+    member x.H : int = h
+
+and WEBGL_debug_shaders(h : int) =
+    member x.H : int = h
+    member x.GetTranslatedShaderSource (shader : WebGLShader) : string =
+        let shader_j = Js.handle (shader).H
+        Js.toString (Js.call1 (Js.handle h) "getTranslatedShaderSource" shader_j)
+
+and WEBGL_depth_texture(h : int) =
+    member x.H : int = h
+
+and WEBGL_draw_buffers(h : int) =
+    member x.H : int = h
+    member x.DrawBuffersWEBGL (buffers : GLenum[]) : unit =
+        let buffers_j = Js.newArr ()
+        for si in 0 .. Array.length buffers - 1 do Js.push buffers_j (Js.ofNum (float (int (buffers.[si]))))
+        Js.call1 (Js.handle h) "drawBuffersWEBGL" buffers_j |> ignore
+
+and WEBGL_lose_context(h : int) =
+    member x.H : int = h
+    member x.LoseContext () : unit =
+        Js.call0 (Js.handle h) "loseContext" |> ignore
+    member x.RestoreContext () : unit =
+        Js.call0 (Js.handle h) "restoreContext" |> ignore
+
+and WEBGL_multi_draw(h : int) =
+    member x.H : int = h
+    member x.MultiDrawArraysWEBGL (mode : GLenum, firstsList : JsObj, firstsOffset : JsObj, countsList : JsObj, countsOffset : JsObj, drawcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let firstsList_j = firstsList
+        let firstsOffset_j = firstsOffset
+        let countsList_j = countsList
+        let countsOffset_j = countsOffset
+        let drawcount_j = Js.ofNum (float (drawcount))
+        Js.call6 (Js.handle h) "multiDrawArraysWEBGL" mode_j firstsList_j firstsOffset_j countsList_j countsOffset_j drawcount_j |> ignore
+    member x.MultiDrawElementsWEBGL (mode : GLenum, countsList : JsObj, countsOffset : JsObj, type' : GLenum, offsetsList : JsObj, offsetsOffset : JsObj, drawcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let countsList_j = countsList
+        let countsOffset_j = countsOffset
+        let type'_j = Js.ofNum (float (int (type')))
+        let offsetsList_j = offsetsList
+        let offsetsOffset_j = offsetsOffset
+        let drawcount_j = Js.ofNum (float (drawcount))
+        Js.call7 (Js.handle h) "multiDrawElementsWEBGL" mode_j countsList_j countsOffset_j type'_j offsetsList_j offsetsOffset_j drawcount_j |> ignore
+    member x.MultiDrawArraysInstancedWEBGL (mode : GLenum, firstsList : JsObj, firstsOffset : JsObj, countsList : JsObj, countsOffset : JsObj, instanceCountsList : JsObj, instanceCountsOffset : JsObj, drawcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let firstsList_j = firstsList
+        let firstsOffset_j = firstsOffset
+        let countsList_j = countsList
+        let countsOffset_j = countsOffset
+        let instanceCountsList_j = instanceCountsList
+        let instanceCountsOffset_j = instanceCountsOffset
+        let drawcount_j = Js.ofNum (float (drawcount))
+        Js.call8 (Js.handle h) "multiDrawArraysInstancedWEBGL" mode_j firstsList_j firstsOffset_j countsList_j countsOffset_j instanceCountsList_j instanceCountsOffset_j drawcount_j |> ignore
+    member x.MultiDrawElementsInstancedWEBGL (mode : GLenum, countsList : JsObj, countsOffset : JsObj, type' : GLenum, offsetsList : JsObj, offsetsOffset : JsObj, instanceCountsList : JsObj, instanceCountsOffset : JsObj, drawcount : int) : unit =
+        let mode_j = Js.ofNum (float (int (mode)))
+        let countsList_j = countsList
+        let countsOffset_j = countsOffset
+        let type'_j = Js.ofNum (float (int (type')))
+        let offsetsList_j = offsetsList
+        let offsetsOffset_j = offsetsOffset
+        let instanceCountsList_j = instanceCountsList
+        let instanceCountsOffset_j = instanceCountsOffset
+        let drawcount_j = Js.ofNum (float (drawcount))
+        Js.call9 (Js.handle h) "multiDrawElementsInstancedWEBGL" mode_j countsList_j countsOffset_j type'_j offsetsList_j offsetsOffset_j instanceCountsList_j instanceCountsOffset_j drawcount_j |> ignore
+
+and WEBGL_polygon_mode(h : int) =
+    member x.H : int = h
+    member x.PolygonModeWEBGL (face : GLenum, mode : GLenum) : unit =
+        let face_j = Js.ofNum (float (int (face)))
+        let mode_j = Js.ofNum (float (int (mode)))
+        Js.call2 (Js.handle h) "polygonModeWEBGL" face_j mode_j |> ignore
+
+and WEBGL_provoking_vertex(h : int) =
+    member x.H : int = h
+    member x.ProvokingVertexWEBGL (provokeMode : GLenum) : unit =
+        let provokeMode_j = Js.ofNum (float (int (provokeMode)))
+        Js.call1 (Js.handle h) "provokingVertexWEBGL" provokeMode_j |> ignore
+
+and WEBGL_render_shared_exponent(h : int) =
+    member x.H : int = h
+
+and WEBGL_stencil_texturing(h : int) =
+    member x.H : int = h
 
 and Marshal =
     static member GLenumOf (v : int) : GLenum = unbox (box v)
@@ -2941,8 +4278,10 @@ let WrapWebGLShader (hh : int) : WebGLShader = WebGLShader hh
 let WrapWebGLShaderPrecisionFormat (hh : int) : WebGLShaderPrecisionFormat = WebGLShaderPrecisionFormat hh
 let WrapWebGLSync (hh : int) : WebGLSync = WebGLSync hh
 let WrapWebGLTexture (hh : int) : WebGLTexture = WebGLTexture hh
+let WrapWebGLTimerQueryEXT (hh : int) : WebGLTimerQueryEXT = WebGLTimerQueryEXT hh
 let WrapWebGLTransformFeedback (hh : int) : WebGLTransformFeedback = WebGLTransformFeedback hh
 let WrapWebGLUniformLocation (hh : int) : WebGLUniformLocation = WebGLUniformLocation hh
 let WrapWebGLVertexArrayObject (hh : int) : WebGLVertexArrayObject = WebGLVertexArrayObject hh
+let WrapWebGLVertexArrayObjectOES (hh : int) : WebGLVertexArrayObjectOES = WebGLVertexArrayObjectOES hh
 let WrapWebGLRenderingContext (hh : int) : WebGLRenderingContext = WebGLRenderingContext hh
 let WrapWebGL2RenderingContext (hh : int) : WebGL2RenderingContext = WebGL2RenderingContext hh

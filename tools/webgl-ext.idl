@@ -1,0 +1,549 @@
+// WebGL extension IDLs, vendored from the Khronos registry
+// (github.com/KhronosGroup/WebGL, extensions/*/extension.xml).
+// Ratified and community-approved only; drafts excluded.
+// Regenerate by re-scraping; parsed by tools/webgl-gen.py.
+
+// EXT ANGLE_instanced_arrays
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface ANGLE_instanced_arrays {
+    const GLenum VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE = 0x88FE;
+    undefined drawArraysInstancedANGLE(GLenum mode, GLint first, GLsizei count, GLsizei primcount);
+    undefined drawElementsInstancedANGLE(GLenum mode, GLsizei count, GLenum type, GLintptr offset, GLsizei primcount);
+    undefined vertexAttribDivisorANGLE(GLuint index, GLuint divisor); 
+};
+
+// EXT EXT_blend_minmax
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_blend_minmax {
+  const GLenum MIN_EXT = 0x8007;
+  const GLenum MAX_EXT = 0x8008;
+};
+
+// EXT EXT_clip_control
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_clip_control {
+    const GLenum LOWER_LEFT_EXT = 0x8CA1;
+    const GLenum UPPER_LEFT_EXT = 0x8CA2;
+
+    const GLenum NEGATIVE_ONE_TO_ONE_EXT = 0x935E;
+    const GLenum ZERO_TO_ONE_EXT         = 0x935F;
+
+    const GLenum CLIP_ORIGIN_EXT     = 0x935C;
+    const GLenum CLIP_DEPTH_MODE_EXT = 0x935D;
+
+    undefined clipControlEXT(GLenum origin, GLenum depth);
+};
+
+// EXT EXT_color_buffer_float
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_color_buffer_float {
+}; // interface EXT_color_buffer_float
+
+// EXT EXT_color_buffer_half_float
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_color_buffer_half_float {
+  const GLenum RGBA16F_EXT = 0x881A;
+  const GLenum RGB16F_EXT = 0x881B;
+  const GLenum FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT = 0x8211;
+  const GLenum UNSIGNED_NORMALIZED_EXT = 0x8C17;
+}; // interface EXT_color_buffer_half_float
+
+// EXT EXT_conservative_depth
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_conservative_depth {
+};
+
+// EXT EXT_depth_clamp
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_depth_clamp {
+    const GLenum DEPTH_CLAMP_EXT = 0x864F;
+};
+
+// EXT EXT_disjoint_timer_query
+typedef unsigned long long GLuint64EXT;
+
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WebGLTimerQueryEXT : WebGLObject {
+};
+
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_disjoint_timer_query {
+  const GLenum QUERY_COUNTER_BITS_EXT      = 0x8864;
+  const GLenum CURRENT_QUERY_EXT           = 0x8865;
+  const GLenum QUERY_RESULT_EXT            = 0x8866;
+  const GLenum QUERY_RESULT_AVAILABLE_EXT  = 0x8867;
+  const GLenum TIME_ELAPSED_EXT            = 0x88BF;
+  const GLenum TIMESTAMP_EXT               = 0x8E28;
+  const GLenum GPU_DISJOINT_EXT            = 0x8FBB;
+
+  WebGLTimerQueryEXT createQueryEXT();
+  undefined deleteQueryEXT(WebGLTimerQueryEXT? query);
+  [WebGLHandlesContextLoss] boolean isQueryEXT(WebGLTimerQueryEXT? query);
+  undefined beginQueryEXT(GLenum target, WebGLTimerQueryEXT query);
+  undefined endQueryEXT(GLenum target);
+  undefined queryCounterEXT(WebGLTimerQueryEXT query, GLenum target);
+  any getQueryEXT(GLenum target, GLenum pname);
+  any getQueryObjectEXT(WebGLTimerQueryEXT query, GLenum pname);
+};
+
+// EXT EXT_disjoint_timer_query_webgl2
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_disjoint_timer_query_webgl2 {
+  const GLenum QUERY_COUNTER_BITS_EXT      = 0x8864;
+  const GLenum TIME_ELAPSED_EXT            = 0x88BF;
+  const GLenum TIMESTAMP_EXT               = 0x8E28;
+  const GLenum GPU_DISJOINT_EXT            = 0x8FBB;
+
+  undefined queryCounterEXT(WebGLQuery query, GLenum target);
+};
+
+// EXT EXT_float_blend
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_float_blend {
+}; // interface EXT_float_blend
+
+// EXT EXT_frag_depth
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+    interface EXT_frag_depth {
+    };
+
+// EXT EXT_polygon_offset_clamp
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_polygon_offset_clamp {
+    const GLenum POLYGON_OFFSET_CLAMP_EXT = 0x8E1B;
+
+    undefined polygonOffsetClampEXT(GLfloat factor, GLfloat units, GLfloat clamp);
+};
+
+// EXT EXT_render_snorm
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_render_snorm {
+};
+
+// EXT EXT_sRGB
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+    interface EXT_sRGB {
+      const GLenum SRGB_EXT                                     = 0x8C40;
+      const GLenum SRGB_ALPHA_EXT                               = 0x8C42;
+      const GLenum SRGB8_ALPHA8_EXT                             = 0x8C43;
+      const GLenum FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING_EXT    = 0x8210;
+    };
+
+// EXT EXT_shader_texture_lod
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+    interface EXT_shader_texture_lod {
+    };
+
+// EXT EXT_texture_compression_bptc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_texture_compression_bptc {
+    const GLenum COMPRESSED_RGBA_BPTC_UNORM_EXT = 0x8E8C;
+    const GLenum COMPRESSED_SRGB_ALPHA_BPTC_UNORM_EXT = 0x8E8D;
+    const GLenum COMPRESSED_RGB_BPTC_SIGNED_FLOAT_EXT = 0x8E8E;
+    const GLenum COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT_EXT = 0x8E8F;
+};
+
+// EXT EXT_texture_compression_rgtc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_texture_compression_rgtc {
+    const GLenum COMPRESSED_RED_RGTC1_EXT = 0x8DBB;
+    const GLenum COMPRESSED_SIGNED_RED_RGTC1_EXT = 0x8DBC;
+    const GLenum COMPRESSED_RED_GREEN_RGTC2_EXT = 0x8DBD;
+    const GLenum COMPRESSED_SIGNED_RED_GREEN_RGTC2_EXT = 0x8DBE;
+};
+
+// EXT EXT_texture_filter_anisotropic
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_texture_filter_anisotropic {
+  const GLenum TEXTURE_MAX_ANISOTROPY_EXT       = 0x84FE;
+  const GLenum MAX_TEXTURE_MAX_ANISOTROPY_EXT   = 0x84FF;
+};
+
+// EXT EXT_texture_mirror_clamp_to_edge
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_texture_mirror_clamp_to_edge {
+    const GLenum MIRROR_CLAMP_TO_EDGE_EXT = 0x8743;
+};
+
+// EXT EXT_texture_norm16
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface EXT_texture_norm16 {
+  const GLenum R16_EXT = 0x822A;
+  const GLenum RG16_EXT = 0x822C;
+  const GLenum RGB16_EXT = 0x8054;
+  const GLenum RGBA16_EXT = 0x805B;
+  const GLenum R16_SNORM_EXT = 0x8F98;
+  const GLenum RG16_SNORM_EXT = 0x8F99;
+  const GLenum RGB16_SNORM_EXT = 0x8F9A;
+  const GLenum RGBA16_SNORM_EXT = 0x8F9B;
+};
+
+// EXT KHR_parallel_shader_compile
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+    interface KHR_parallel_shader_compile {
+      const GLenum COMPLETION_STATUS_KHR                = 0x91B1;
+    };
+
+// EXT NV_shader_noperspective_interpolation
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface NV_shader_noperspective_interpolation {
+};
+
+// EXT OES_draw_buffers_indexed
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_draw_buffers_indexed {
+  undefined enableiOES(GLenum target, GLuint index);
+
+  undefined disableiOES(GLenum target, GLuint index);
+
+  undefined blendEquationiOES(GLuint buf, GLenum mode);
+
+  undefined blendEquationSeparateiOES(GLuint buf,
+                                 GLenum modeRGB, GLenum modeAlpha);
+
+  undefined blendFunciOES(GLuint buf,
+                     GLenum src, GLenum dst);
+
+  undefined blendFuncSeparateiOES(GLuint buf,
+                             GLenum srcRGB, GLenum dstRGB,
+                             GLenum srcAlpha, GLenum dstAlpha);
+
+  undefined colorMaskiOES(GLuint buf,
+                     GLboolean r, GLboolean g, GLboolean b, GLboolean a);
+};
+
+// EXT OES_element_index_uint
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_element_index_uint {
+};
+
+// EXT OES_fbo_render_mipmap
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_fbo_render_mipmap {
+};
+
+// EXT OES_sample_variables
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_sample_variables {
+};
+
+// EXT OES_shader_multisample_interpolation
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_shader_multisample_interpolation {
+    const GLenum MIN_FRAGMENT_INTERPOLATION_OFFSET_OES  = 0x8E5B;
+    const GLenum MAX_FRAGMENT_INTERPOLATION_OFFSET_OES  = 0x8E5C;
+    const GLenum FRAGMENT_INTERPOLATION_OFFSET_BITS_OES = 0x8E5D;
+};
+
+// EXT OES_standard_derivatives
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_standard_derivatives {
+    const GLenum FRAGMENT_SHADER_DERIVATIVE_HINT_OES = 0x8B8B;
+};
+
+// EXT OES_texture_float
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_texture_float { };
+
+// EXT OES_texture_float_linear
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_texture_float_linear { };
+
+// EXT OES_texture_half_float
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_texture_half_float {
+  const GLenum HALF_FLOAT_OES = 0x8D61;
+};
+
+// EXT OES_texture_half_float_linear
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_texture_half_float_linear { };
+
+// EXT OES_vertex_array_object
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WebGLVertexArrayObjectOES : WebGLObject {
+};
+
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OES_vertex_array_object {
+    const GLenum VERTEX_ARRAY_BINDING_OES = 0x85B5;
+
+    WebGLVertexArrayObjectOES createVertexArrayOES();
+    undefined deleteVertexArrayOES(WebGLVertexArrayObjectOES? arrayObject);
+    [WebGLHandlesContextLoss] GLboolean isVertexArrayOES(WebGLVertexArrayObjectOES? arrayObject);
+    undefined bindVertexArrayOES(WebGLVertexArrayObjectOES? arrayObject);
+};
+
+// EXT OVR_multiview2
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface OVR_multiview2 {
+    const GLenum FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR = 0x9630;
+    const GLenum FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR = 0x9632;
+    const GLenum MAX_VIEWS_OVR = 0x9631;
+    const GLenum FRAMEBUFFER_INCOMPLETE_VIEW_TARGETS_OVR = 0x9633;
+
+    undefined framebufferTextureMultiviewOVR(GLenum target, GLenum attachment, WebGLTexture? texture, GLint level, GLint baseViewIndex, GLsizei numViews);
+};
+
+// EXT WEBGL_blend_func_extended
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_blend_func_extended {
+    const GLenum SRC1_COLOR_WEBGL                   = 0x88F9;
+    const GLenum SRC1_ALPHA_WEBGL                   = 0x8589;
+    const GLenum ONE_MINUS_SRC1_COLOR_WEBGL         = 0x88FA;
+    const GLenum ONE_MINUS_SRC1_ALPHA_WEBGL         = 0x88FB;
+    const GLenum MAX_DUAL_SOURCE_DRAW_BUFFERS_WEBGL = 0x88FC;
+};
+
+// EXT WEBGL_clip_cull_distance
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+    interface WEBGL_clip_cull_distance {
+      const GLenum MAX_CLIP_DISTANCES_WEBGL                   = 0x0D32;
+      const GLenum MAX_CULL_DISTANCES_WEBGL                   = 0x82F9;
+      const GLenum MAX_COMBINED_CLIP_AND_CULL_DISTANCES_WEBGL = 0x82FA;
+
+      const GLenum CLIP_DISTANCE0_WEBGL                       = 0x3000;
+      const GLenum CLIP_DISTANCE1_WEBGL                       = 0x3001;
+      const GLenum CLIP_DISTANCE2_WEBGL                       = 0x3002;
+      const GLenum CLIP_DISTANCE3_WEBGL                       = 0x3003;
+      const GLenum CLIP_DISTANCE4_WEBGL                       = 0x3004;
+      const GLenum CLIP_DISTANCE5_WEBGL                       = 0x3005;
+      const GLenum CLIP_DISTANCE6_WEBGL                       = 0x3006;
+      const GLenum CLIP_DISTANCE7_WEBGL                       = 0x3007;
+    };
+
+// EXT WEBGL_color_buffer_float
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_color_buffer_float {
+  const GLenum RGBA32F_EXT = 0x8814;
+  const GLenum FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE_EXT = 0x8211;
+  const GLenum UNSIGNED_NORMALIZED_EXT = 0x8C17;
+}; // interface WEBGL_color_buffer_float
+
+// EXT WEBGL_compressed_texture_astc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_astc {
+    /* Compressed Texture Format */
+    const GLenum COMPRESSED_RGBA_ASTC_4x4_KHR = 0x93B0;
+    const GLenum COMPRESSED_RGBA_ASTC_5x4_KHR = 0x93B1;
+    const GLenum COMPRESSED_RGBA_ASTC_5x5_KHR = 0x93B2;
+    const GLenum COMPRESSED_RGBA_ASTC_6x5_KHR = 0x93B3;
+    const GLenum COMPRESSED_RGBA_ASTC_6x6_KHR = 0x93B4;
+    const GLenum COMPRESSED_RGBA_ASTC_8x5_KHR = 0x93B5;
+    const GLenum COMPRESSED_RGBA_ASTC_8x6_KHR = 0x93B6;
+    const GLenum COMPRESSED_RGBA_ASTC_8x8_KHR = 0x93B7;
+    const GLenum COMPRESSED_RGBA_ASTC_10x5_KHR = 0x93B8;
+    const GLenum COMPRESSED_RGBA_ASTC_10x6_KHR = 0x93B9;
+    const GLenum COMPRESSED_RGBA_ASTC_10x8_KHR = 0x93BA;
+    const GLenum COMPRESSED_RGBA_ASTC_10x10_KHR = 0x93BB;
+    const GLenum COMPRESSED_RGBA_ASTC_12x10_KHR = 0x93BC;
+    const GLenum COMPRESSED_RGBA_ASTC_12x12_KHR = 0x93BD;
+
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR = 0x93D0;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_5x4_KHR = 0x93D1;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_5x5_KHR = 0x93D2;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_6x5_KHR = 0x93D3;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_6x6_KHR = 0x93D4;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_8x5_KHR = 0x93D5;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_8x6_KHR = 0x93D6;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_8x8_KHR = 0x93D7;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_10x5_KHR = 0x93D8;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_10x6_KHR = 0x93D9;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_10x8_KHR = 0x93DA;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_10x10_KHR = 0x93DB;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_12x10_KHR = 0x93DC;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ASTC_12x12_KHR = 0x93DD;
+
+    // Profile query support.
+    sequence<DOMString> getSupportedProfiles();
+};
+
+// EXT WEBGL_compressed_texture_etc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_etc {
+    /* Compressed Texture Formats */
+    const GLenum COMPRESSED_R11_EAC                        = 0x9270;
+    const GLenum COMPRESSED_SIGNED_R11_EAC                 = 0x9271;
+    const GLenum COMPRESSED_RG11_EAC                       = 0x9272;
+    const GLenum COMPRESSED_SIGNED_RG11_EAC                = 0x9273;
+    const GLenum COMPRESSED_RGB8_ETC2                      = 0x9274;
+    const GLenum COMPRESSED_SRGB8_ETC2                     = 0x9275;
+    const GLenum COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2  = 0x9276;
+    const GLenum COMPRESSED_SRGB8_PUNCHTHROUGH_ALPHA1_ETC2 = 0x9277;
+    const GLenum COMPRESSED_RGBA8_ETC2_EAC                 = 0x9278;
+    const GLenum COMPRESSED_SRGB8_ALPHA8_ETC2_EAC          = 0x9279;
+};
+
+// EXT WEBGL_compressed_texture_etc1
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_etc1 {
+    /* Compressed Texture Format */
+    const GLenum COMPRESSED_RGB_ETC1_WEBGL = 0x8D64; 
+};
+
+// EXT WEBGL_compressed_texture_pvrtc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_pvrtc {
+    /* Compressed Texture Formats */
+    const GLenum COMPRESSED_RGB_PVRTC_4BPPV1_IMG      = 0x8C00;
+    const GLenum COMPRESSED_RGB_PVRTC_2BPPV1_IMG      = 0x8C01;
+    const GLenum COMPRESSED_RGBA_PVRTC_4BPPV1_IMG     = 0x8C02;
+    const GLenum COMPRESSED_RGBA_PVRTC_2BPPV1_IMG     = 0x8C03;
+};
+
+// EXT WEBGL_compressed_texture_s3tc
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_s3tc {
+    /* Compressed Texture Formats */
+    const GLenum COMPRESSED_RGB_S3TC_DXT1_EXT        = 0x83F0;
+    const GLenum COMPRESSED_RGBA_S3TC_DXT1_EXT       = 0x83F1;
+    const GLenum COMPRESSED_RGBA_S3TC_DXT3_EXT       = 0x83F2;
+    const GLenum COMPRESSED_RGBA_S3TC_DXT5_EXT       = 0x83F3;
+};
+
+// EXT WEBGL_compressed_texture_s3tc_srgb
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_compressed_texture_s3tc_srgb {
+    /* Compressed Texture Formats */
+    const GLenum COMPRESSED_SRGB_S3TC_DXT1_EXT        = 0x8C4C;
+    const GLenum COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT  = 0x8C4D;
+    const GLenum COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT  = 0x8C4E;
+    const GLenum COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT  = 0x8C4F;
+};
+
+// EXT WEBGL_debug_renderer_info
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_debug_renderer_info {
+
+      const GLenum UNMASKED_VENDOR_WEBGL            = 0x9245;
+      const GLenum UNMASKED_RENDERER_WEBGL          = 0x9246;
+
+};
+
+// EXT WEBGL_debug_shaders
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_debug_shaders {
+
+      DOMString getTranslatedShaderSource(WebGLShader shader);
+
+};
+
+// EXT WEBGL_depth_texture
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_depth_texture {
+  const GLenum UNSIGNED_INT_24_8_WEBGL = 0x84FA;
+};
+
+// EXT WEBGL_draw_buffers
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_draw_buffers {
+    const GLenum COLOR_ATTACHMENT0_WEBGL     = 0x8CE0;
+    const GLenum COLOR_ATTACHMENT1_WEBGL     = 0x8CE1;
+    const GLenum COLOR_ATTACHMENT2_WEBGL     = 0x8CE2;
+    const GLenum COLOR_ATTACHMENT3_WEBGL     = 0x8CE3;
+    const GLenum COLOR_ATTACHMENT4_WEBGL     = 0x8CE4;
+    const GLenum COLOR_ATTACHMENT5_WEBGL     = 0x8CE5;
+    const GLenum COLOR_ATTACHMENT6_WEBGL     = 0x8CE6;
+    const GLenum COLOR_ATTACHMENT7_WEBGL     = 0x8CE7;
+    const GLenum COLOR_ATTACHMENT8_WEBGL     = 0x8CE8;
+    const GLenum COLOR_ATTACHMENT9_WEBGL     = 0x8CE9;
+    const GLenum COLOR_ATTACHMENT10_WEBGL    = 0x8CEA;
+    const GLenum COLOR_ATTACHMENT11_WEBGL    = 0x8CEB;
+    const GLenum COLOR_ATTACHMENT12_WEBGL    = 0x8CEC;
+    const GLenum COLOR_ATTACHMENT13_WEBGL    = 0x8CED;
+    const GLenum COLOR_ATTACHMENT14_WEBGL    = 0x8CEE;
+    const GLenum COLOR_ATTACHMENT15_WEBGL    = 0x8CEF;
+
+    const GLenum DRAW_BUFFER0_WEBGL          = 0x8825;
+    const GLenum DRAW_BUFFER1_WEBGL          = 0x8826;
+    const GLenum DRAW_BUFFER2_WEBGL          = 0x8827;
+    const GLenum DRAW_BUFFER3_WEBGL          = 0x8828;
+    const GLenum DRAW_BUFFER4_WEBGL          = 0x8829;
+    const GLenum DRAW_BUFFER5_WEBGL          = 0x882A;
+    const GLenum DRAW_BUFFER6_WEBGL          = 0x882B;
+    const GLenum DRAW_BUFFER7_WEBGL          = 0x882C;
+    const GLenum DRAW_BUFFER8_WEBGL          = 0x882D;
+    const GLenum DRAW_BUFFER9_WEBGL          = 0x882E;
+    const GLenum DRAW_BUFFER10_WEBGL         = 0x882F;
+    const GLenum DRAW_BUFFER11_WEBGL         = 0x8830;
+    const GLenum DRAW_BUFFER12_WEBGL         = 0x8831;
+    const GLenum DRAW_BUFFER13_WEBGL         = 0x8832;
+    const GLenum DRAW_BUFFER14_WEBGL         = 0x8833;
+    const GLenum DRAW_BUFFER15_WEBGL         = 0x8834;
+
+    const GLenum MAX_COLOR_ATTACHMENTS_WEBGL = 0x8CDF;
+    const GLenum MAX_DRAW_BUFFERS_WEBGL      = 0x8824;
+
+    undefined drawBuffersWEBGL(sequence<GLenum> buffers);
+};
+
+// EXT WEBGL_lose_context
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_lose_context {
+      undefined loseContext();
+      undefined restoreContext();
+};
+
+// EXT WEBGL_multi_draw
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_multi_draw {
+  undefined multiDrawArraysWEBGL(
+      GLenum mode,
+      ([AllowShared] Int32Array or sequence<GLint>) firstsList, unsigned long long firstsOffset,
+      ([AllowShared] Int32Array or sequence<GLsizei>) countsList, unsigned long long countsOffset,
+      GLsizei drawcount);
+  undefined multiDrawElementsWEBGL(
+      GLenum mode,
+      ([AllowShared] Int32Array or sequence<GLsizei>) countsList, unsigned long long countsOffset,
+      GLenum type,
+      ([AllowShared] Int32Array or sequence<GLsizei>) offsetsList, unsigned long long offsetsOffset,
+      GLsizei drawcount);
+  undefined multiDrawArraysInstancedWEBGL(
+      GLenum mode,
+      ([AllowShared] Int32Array or sequence<GLint>) firstsList, unsigned long long firstsOffset,
+      ([AllowShared] Int32Array or sequence<GLsizei>) countsList, unsigned long long countsOffset,
+      ([AllowShared] Int32Array or sequence<GLsizei>) instanceCountsList, unsigned long long instanceCountsOffset,
+      GLsizei drawcount);
+  undefined multiDrawElementsInstancedWEBGL(
+      GLenum mode,
+      ([AllowShared] Int32Array or sequence<GLsizei>) countsList, unsigned long long countsOffset,
+      GLenum type,
+      ([AllowShared] Int32Array or sequence<GLsizei>) offsetsList, unsigned long long offsetsOffset,
+      ([AllowShared] Int32Array or sequence<GLsizei>) instanceCountsList, unsigned long long instanceCountsOffset,
+      GLsizei drawcount);
+};
+
+// EXT WEBGL_polygon_mode
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_polygon_mode {
+    const GLenum POLYGON_MODE_WEBGL = 0x0B40;
+
+    const GLenum POLYGON_OFFSET_LINE_WEBGL = 0x2A02;
+
+    const GLenum LINE_WEBGL = 0x1B01;
+    const GLenum FILL_WEBGL = 0x1B02;
+
+    undefined polygonModeWEBGL(GLenum face, GLenum mode);
+};
+
+// EXT WEBGL_provoking_vertex
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_provoking_vertex {
+    const GLenum FIRST_VERTEX_CONVENTION_WEBGL = 0x8E4D;
+    const GLenum LAST_VERTEX_CONVENTION_WEBGL  = 0x8E4E; // default
+    const GLenum PROVOKING_VERTEX_WEBGL        = 0x8E4F;
+
+    undefined provokingVertexWEBGL(GLenum provokeMode);
+};
+
+// EXT WEBGL_render_shared_exponent
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_render_shared_exponent {
+};
+
+// EXT WEBGL_stencil_texturing
+[Exposed=(Window,Worker), LegacyNoInterfaceObject]
+interface WEBGL_stencil_texturing {
+    const GLenum DEPTH_STENCIL_TEXTURE_MODE_WEBGL = 0x90EA;
+    const GLenum STENCIL_INDEX_WEBGL              = 0x1901;
+};

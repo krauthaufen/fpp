@@ -68,7 +68,7 @@ if [ "$got" = "$want" ]; then
 fi
 # the TYPED WebGL leg: same triangle through the generated surface
 got=$(node "$here/gltdrive.js")
-want='{"log":["2","5","5","1","2","7","0","gl-typed-done"]}'
+want='{"log":["2","5","5","1","2","7","0","ext-lose-context","2","5","5","gl-typed-done"]}'
 if [ "$got" = "$want" ]; then
     echo "WEBGL-TYPED OK (generated GLenum surface renders)"
 else

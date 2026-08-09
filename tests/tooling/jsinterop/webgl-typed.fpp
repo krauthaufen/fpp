@@ -42,4 +42,15 @@ let go =
     print (int pixel.[0].R)
     print (int pixel.[0].G)
     print (int pixel.[0].B)
+    // typed extension registry: universally-present ones answer Some, and
+    // instancing draws through the extension object
+    (match gl.GetWEBGL_lose_context () with
+     | Some _ -> print "ext-lose-context"
+     | None -> print "ext-missing")
+    (match gl.GetANGLE_instanced_arrays () with
+     | Some ia ->
+         ia.DrawArraysInstancedANGLE (GLenum.Triangles, 0, 3, 2)
+         gl.ReadPixels (32, 32, 1, 1, GLenum.Rgba, GLenum.UnsignedByte, pixel)
+         print (int pixel.[0].R)
+     | None -> print "ext-missing")
     print "gl-typed-done"
