@@ -517,95 +517,181 @@ export const gpuVm = ({ mem, h: H, reg: REG }) => {
     if (A[I++]) o.depthOrArrayLayers = A[I++];
     return o;
   };
-  const M = [
-    /* 0 GPUDevice.destroy */ () => H(A[I++]).destroy(),
-    /* 1 GPUDevice.createBuffer */ () => REG(H(A[I++]).createBuffer(D_GPUBufferDescriptor())),
-    /* 2 GPUDevice.createTexture */ () => REG(H(A[I++]).createTexture(D_GPUTextureDescriptor())),
-    /* 3 GPUDevice.createSampler */ () => REG(H(A[I++]).createSampler((A[I++] ? D_GPUSamplerDescriptor() : undefined))),
-    /* 4 GPUDevice.importExternalTexture */ () => REG(H(A[I++]).importExternalTexture(D_GPUExternalTextureDescriptor())),
-    /* 5 GPUDevice.createBindGroupLayout */ () => REG(H(A[I++]).createBindGroupLayout(D_GPUBindGroupLayoutDescriptor())),
-    /* 6 GPUDevice.createPipelineLayout */ () => REG(H(A[I++]).createPipelineLayout(D_GPUPipelineLayoutDescriptor())),
-    /* 7 GPUDevice.createBindGroup */ () => REG(H(A[I++]).createBindGroup(D_GPUBindGroupDescriptor())),
-    /* 8 GPUDevice.createShaderModule */ () => REG(H(A[I++]).createShaderModule(D_GPUShaderModuleDescriptor())),
-    /* 9 GPUDevice.createComputePipeline */ () => REG(H(A[I++]).createComputePipeline(D_GPUComputePipelineDescriptor())),
-    /* 10 GPUDevice.createRenderPipeline */ () => REG(H(A[I++]).createRenderPipeline(D_GPURenderPipelineDescriptor())),
-    /* 11 GPUDevice.createCommandEncoder */ () => REG(H(A[I++]).createCommandEncoder((A[I++] ? D_GPUCommandEncoderDescriptor() : undefined))),
-    /* 12 GPUDevice.createRenderBundleEncoder */ () => REG(H(A[I++]).createRenderBundleEncoder(D_GPURenderBundleEncoderDescriptor())),
-    /* 13 GPUDevice.createQuerySet */ () => REG(H(A[I++]).createQuerySet(D_GPUQuerySetDescriptor())),
-    /* 14 GPUDevice.pushErrorScope */ () => H(A[I++]).pushErrorScope(E_GPUErrorFilter[A[I++]]),
-    /* 15 GPUBuffer.unmap */ () => H(A[I++]).unmap(),
-    /* 16 GPUBuffer.destroy */ () => H(A[I++]).destroy(),
-    /* 17 GPUTexture.createView */ () => REG(H(A[I++]).createView((A[I++] ? D_GPUTextureViewDescriptor() : undefined))),
-    /* 18 GPUTexture.destroy */ () => H(A[I++]).destroy(),
-    /* 19 GPUComputePipeline.getBindGroupLayout */ () => REG(H(A[I++]).getBindGroupLayout(A[I++])),
-    /* 20 GPURenderPipeline.getBindGroupLayout */ () => REG(H(A[I++]).getBindGroupLayout(A[I++])),
-    /* 21 GPUCommandEncoder.beginRenderPass */ () => REG(H(A[I++]).beginRenderPass(D_GPURenderPassDescriptor())),
-    /* 22 GPUCommandEncoder.beginComputePass */ () => REG(H(A[I++]).beginComputePass((A[I++] ? D_GPUComputePassDescriptor() : undefined))),
-    /* 23 GPUCommandEncoder.copyBufferToBuffer */ () => H(A[I++]).copyBufferToBuffer(H(A[I++]), H(A[I++]), (A[I++] ? A[I++] : undefined)),
-    /* 24 GPUCommandEncoder.copyBufferToTexture */ () => H(A[I++]).copyBufferToTexture(D_GPUTexelCopyBufferInfo(), D_GPUTexelCopyTextureInfo(), D_GPUExtent3DDict()),
-    /* 25 GPUCommandEncoder.copyTextureToBuffer */ () => H(A[I++]).copyTextureToBuffer(D_GPUTexelCopyTextureInfo(), D_GPUTexelCopyBufferInfo(), D_GPUExtent3DDict()),
-    /* 26 GPUCommandEncoder.copyTextureToTexture */ () => H(A[I++]).copyTextureToTexture(D_GPUTexelCopyTextureInfo(), D_GPUTexelCopyTextureInfo(), D_GPUExtent3DDict()),
-    /* 27 GPUCommandEncoder.clearBuffer */ () => H(A[I++]).clearBuffer(H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 28 GPUCommandEncoder.resolveQuerySet */ () => H(A[I++]).resolveQuerySet(H(A[I++]), A[I++], A[I++], H(A[I++]), A[I++]),
-    /* 29 GPUCommandEncoder.finish */ () => REG(H(A[I++]).finish((A[I++] ? D_GPUCommandBufferDescriptor() : undefined))),
-    /* 30 GPUCommandEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
-    /* 31 GPUCommandEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
-    /* 32 GPUCommandEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
-    /* 33 GPUComputePassEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
-    /* 34 GPUComputePassEncoder.dispatchWorkgroups */ () => H(A[I++]).dispatchWorkgroups(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 35 GPUComputePassEncoder.dispatchWorkgroupsIndirect */ () => H(A[I++]).dispatchWorkgroupsIndirect(H(A[I++]), A[I++]),
-    /* 36 GPUComputePassEncoder.end */ () => H(A[I++]).end(),
-    /* 37 GPUComputePassEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
-    /* 38 GPUComputePassEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
-    /* 39 GPUComputePassEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
-    /* 40 GPUComputePassEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
-    /* 41 GPUComputePassEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 42 GPURenderPassEncoder.setViewport */ () => H(A[I++]).setViewport(A[I++], A[I++], A[I++], A[I++], A[I++], A[I++]),
-    /* 43 GPURenderPassEncoder.setScissorRect */ () => H(A[I++]).setScissorRect(A[I++], A[I++], A[I++], A[I++]),
-    /* 44 GPURenderPassEncoder.setBlendConstant */ () => H(A[I++]).setBlendConstant(D_GPUColorDict()),
-    /* 45 GPURenderPassEncoder.setStencilReference */ () => H(A[I++]).setStencilReference(A[I++]),
-    /* 46 GPURenderPassEncoder.beginOcclusionQuery */ () => H(A[I++]).beginOcclusionQuery(A[I++]),
-    /* 47 GPURenderPassEncoder.endOcclusionQuery */ () => H(A[I++]).endOcclusionQuery(),
-    /* 48 GPURenderPassEncoder.executeBundles */ () => H(A[I++]).executeBundles((() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })()),
-    /* 49 GPURenderPassEncoder.end */ () => H(A[I++]).end(),
-    /* 50 GPURenderPassEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
-    /* 51 GPURenderPassEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
-    /* 52 GPURenderPassEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
-    /* 53 GPURenderPassEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
-    /* 54 GPURenderPassEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 55 GPURenderPassEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
-    /* 56 GPURenderPassEncoder.setIndexBuffer */ () => H(A[I++]).setIndexBuffer(H(A[I++]), E_GPUIndexFormat[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 57 GPURenderPassEncoder.setVertexBuffer */ () => H(A[I++]).setVertexBuffer(A[I++], H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 58 GPURenderPassEncoder.draw */ () => H(A[I++]).draw(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 59 GPURenderPassEncoder.drawIndexed */ () => H(A[I++]).drawIndexed(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 60 GPURenderPassEncoder.drawIndirect */ () => H(A[I++]).drawIndirect(H(A[I++]), A[I++]),
-    /* 61 GPURenderPassEncoder.drawIndexedIndirect */ () => H(A[I++]).drawIndexedIndirect(H(A[I++]), A[I++]),
-    /* 62 GPURenderBundleEncoder.finish */ () => REG(H(A[I++]).finish((A[I++] ? D_GPURenderBundleDescriptor() : undefined))),
-    /* 63 GPURenderBundleEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
-    /* 64 GPURenderBundleEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
-    /* 65 GPURenderBundleEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
-    /* 66 GPURenderBundleEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
-    /* 67 GPURenderBundleEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 68 GPURenderBundleEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
-    /* 69 GPURenderBundleEncoder.setIndexBuffer */ () => H(A[I++]).setIndexBuffer(H(A[I++]), E_GPUIndexFormat[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 70 GPURenderBundleEncoder.setVertexBuffer */ () => H(A[I++]).setVertexBuffer(A[I++], H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 71 GPURenderBundleEncoder.draw */ () => H(A[I++]).draw(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 72 GPURenderBundleEncoder.drawIndexed */ () => H(A[I++]).drawIndexed(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 73 GPURenderBundleEncoder.drawIndirect */ () => H(A[I++]).drawIndirect(H(A[I++]), A[I++]),
-    /* 74 GPURenderBundleEncoder.drawIndexedIndirect */ () => H(A[I++]).drawIndexedIndirect(H(A[I++]), A[I++]),
-    /* 75 GPUQueue.submit */ () => H(A[I++]).submit((() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })()),
-    /* 76 GPUQueue.writeBuffer */ () => H(A[I++]).writeBuffer(H(A[I++]), A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
-    /* 77 GPUQueue.writeTexture */ () => H(A[I++]).writeTexture(D_GPUTexelCopyTextureInfo(), S[A[I++]], D_GPUTexelCopyBufferLayout(), D_GPUExtent3DDict()),
-    /* 78 GPUQueue.copyExternalImageToTexture */ () => H(A[I++]).copyExternalImageToTexture(D_GPUCopyExternalImageSourceInfo(), D_GPUCopyExternalImageDestInfo(), D_GPUExtent3DDict()),
-    /* 79 GPUQuerySet.destroy */ () => H(A[I++]).destroy(),
-    /* 80 GPUCanvasContext.configure */ () => H(A[I++]).configure(D_GPUCanvasConfiguration()),
-    /* 81 GPUCanvasContext.unconfigure */ () => H(A[I++]).unconfigure(),
-    /* 82 GPUCanvasContext.getCurrentTexture */ () => REG(H(A[I++]).getCurrentTexture()),
-  ];
+  let T;
   return { gpuRun: (p, n, s) => {
-    A = new Float64Array(mem(), p >>> 0, n); I = 0; S = s;
-    let r = 0;
-    while (I < n) r = M[A[I++]]();
+    const a = new Float64Array(mem(), p >>> 0, n);
+    let i = 0, r = 0, m = 0;
+    A = a; S = s;
+    while (i < n) {
+      switch (a[i++] | 0) {
+      /* GPUDevice.destroy */
+      case 0: { const o = H(a[i++]); o.destroy(); } break;
+      /* GPUDevice.createBuffer */
+      case 1: { const o = H(a[i++]); r = REG(o.createBuffer((I = i, T = D_GPUBufferDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createTexture */
+      case 2: { const o = H(a[i++]); r = REG(o.createTexture((I = i, T = D_GPUTextureDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createSampler */
+      case 3: { const o = H(a[i++]); m = a[i++]; r = REG(o.createSampler(((m & 1) ? (I = i, T = D_GPUSamplerDescriptor(), i = I, T) : undefined))); } break;
+      /* GPUDevice.importExternalTexture */
+      case 4: { const o = H(a[i++]); r = REG(o.importExternalTexture((I = i, T = D_GPUExternalTextureDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createBindGroupLayout */
+      case 5: { const o = H(a[i++]); r = REG(o.createBindGroupLayout((I = i, T = D_GPUBindGroupLayoutDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createPipelineLayout */
+      case 6: { const o = H(a[i++]); r = REG(o.createPipelineLayout((I = i, T = D_GPUPipelineLayoutDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createBindGroup */
+      case 7: { const o = H(a[i++]); r = REG(o.createBindGroup((I = i, T = D_GPUBindGroupDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createShaderModule */
+      case 8: { const o = H(a[i++]); r = REG(o.createShaderModule((I = i, T = D_GPUShaderModuleDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createComputePipeline */
+      case 9: { const o = H(a[i++]); r = REG(o.createComputePipeline((I = i, T = D_GPUComputePipelineDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createRenderPipeline */
+      case 10: { const o = H(a[i++]); r = REG(o.createRenderPipeline((I = i, T = D_GPURenderPipelineDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createCommandEncoder */
+      case 11: { const o = H(a[i++]); m = a[i++]; r = REG(o.createCommandEncoder(((m & 1) ? (I = i, T = D_GPUCommandEncoderDescriptor(), i = I, T) : undefined))); } break;
+      /* GPUDevice.createRenderBundleEncoder */
+      case 12: { const o = H(a[i++]); r = REG(o.createRenderBundleEncoder((I = i, T = D_GPURenderBundleEncoderDescriptor(), i = I, T))); } break;
+      /* GPUDevice.createQuerySet */
+      case 13: { const o = H(a[i++]); r = REG(o.createQuerySet((I = i, T = D_GPUQuerySetDescriptor(), i = I, T))); } break;
+      /* GPUDevice.pushErrorScope */
+      case 14: { const o = H(a[i++]); o.pushErrorScope(E_GPUErrorFilter[a[i++]]); } break;
+      /* GPUBuffer.unmap */
+      case 15: { const o = H(a[i++]); o.unmap(); } break;
+      /* GPUBuffer.destroy */
+      case 16: { const o = H(a[i++]); o.destroy(); } break;
+      /* GPUTexture.createView */
+      case 17: { const o = H(a[i++]); m = a[i++]; r = REG(o.createView(((m & 1) ? (I = i, T = D_GPUTextureViewDescriptor(), i = I, T) : undefined))); } break;
+      /* GPUTexture.destroy */
+      case 18: { const o = H(a[i++]); o.destroy(); } break;
+      /* GPUComputePipeline.getBindGroupLayout */
+      case 19: { const o = H(a[i++]); r = REG(o.getBindGroupLayout(a[i++])); } break;
+      /* GPURenderPipeline.getBindGroupLayout */
+      case 20: { const o = H(a[i++]); r = REG(o.getBindGroupLayout(a[i++])); } break;
+      /* GPUCommandEncoder.beginRenderPass */
+      case 21: { const o = H(a[i++]); r = REG(o.beginRenderPass((I = i, T = D_GPURenderPassDescriptor(), i = I, T))); } break;
+      /* GPUCommandEncoder.beginComputePass */
+      case 22: { const o = H(a[i++]); m = a[i++]; r = REG(o.beginComputePass(((m & 1) ? (I = i, T = D_GPUComputePassDescriptor(), i = I, T) : undefined))); } break;
+      /* GPUCommandEncoder.copyBufferToBuffer */
+      case 23: { const o = H(a[i++]); m = a[i++]; o.copyBufferToBuffer(H(a[i++]), H(a[i++]), ((m & 1) ? a[i++] : undefined)); } break;
+      /* GPUCommandEncoder.copyBufferToTexture */
+      case 24: { const o = H(a[i++]); o.copyBufferToTexture((I = i, T = D_GPUTexelCopyBufferInfo(), i = I, T), (I = i, T = D_GPUTexelCopyTextureInfo(), i = I, T), (I = i, T = D_GPUExtent3DDict(), i = I, T)); } break;
+      /* GPUCommandEncoder.copyTextureToBuffer */
+      case 25: { const o = H(a[i++]); o.copyTextureToBuffer((I = i, T = D_GPUTexelCopyTextureInfo(), i = I, T), (I = i, T = D_GPUTexelCopyBufferInfo(), i = I, T), (I = i, T = D_GPUExtent3DDict(), i = I, T)); } break;
+      /* GPUCommandEncoder.copyTextureToTexture */
+      case 26: { const o = H(a[i++]); o.copyTextureToTexture((I = i, T = D_GPUTexelCopyTextureInfo(), i = I, T), (I = i, T = D_GPUTexelCopyTextureInfo(), i = I, T), (I = i, T = D_GPUExtent3DDict(), i = I, T)); } break;
+      /* GPUCommandEncoder.clearBuffer */
+      case 27: { const o = H(a[i++]); m = a[i++]; o.clearBuffer(H(a[i++]), ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPUCommandEncoder.resolveQuerySet */
+      case 28: { const o = H(a[i++]); o.resolveQuerySet(H(a[i++]), a[i++], a[i++], H(a[i++]), a[i++]); } break;
+      /* GPUCommandEncoder.finish */
+      case 29: { const o = H(a[i++]); m = a[i++]; r = REG(o.finish(((m & 1) ? (I = i, T = D_GPUCommandBufferDescriptor(), i = I, T) : undefined))); } break;
+      /* GPUCommandEncoder.pushDebugGroup */
+      case 30: { const o = H(a[i++]); o.pushDebugGroup(s[a[i++]]); } break;
+      /* GPUCommandEncoder.popDebugGroup */
+      case 31: { const o = H(a[i++]); o.popDebugGroup(); } break;
+      /* GPUCommandEncoder.insertDebugMarker */
+      case 32: { const o = H(a[i++]); o.insertDebugMarker(s[a[i++]]); } break;
+      /* GPUComputePassEncoder.setPipeline */
+      case 33: { const o = H(a[i++]); o.setPipeline(H(a[i++])); } break;
+      /* GPUComputePassEncoder.dispatchWorkgroups */
+      case 34: { const o = H(a[i++]); m = a[i++]; o.dispatchWorkgroups(a[i++], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPUComputePassEncoder.dispatchWorkgroupsIndirect */
+      case 35: { const o = H(a[i++]); o.dispatchWorkgroupsIndirect(H(a[i++]), a[i++]); } break;
+      /* GPUComputePassEncoder.end */
+      case 36: { const o = H(a[i++]); o.end(); } break;
+      /* GPUComputePassEncoder.pushDebugGroup */
+      case 37: { const o = H(a[i++]); o.pushDebugGroup(s[a[i++]]); } break;
+      /* GPUComputePassEncoder.popDebugGroup */
+      case 38: { const o = H(a[i++]); o.popDebugGroup(); } break;
+      /* GPUComputePassEncoder.insertDebugMarker */
+      case 39: { const o = H(a[i++]); o.insertDebugMarker(s[a[i++]]); } break;
+      /* GPUComputePassEncoder.setBindGroup */
+      case 40: { const o = H(a[i++]); m = a[i++]; o.setBindGroup(a[i++], H(a[i++]), ((m & 1) ? (I = i, T = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })(), i = I, T) : undefined)); } break;
+      /* GPUComputePassEncoder.setImmediates */
+      case 41: { const o = H(a[i++]); m = a[i++]; o.setImmediates(a[i++], s[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.setViewport */
+      case 42: { const o = H(a[i++]); o.setViewport(a[i++], a[i++], a[i++], a[i++], a[i++], a[i++]); } break;
+      /* GPURenderPassEncoder.setScissorRect */
+      case 43: { const o = H(a[i++]); o.setScissorRect(a[i++], a[i++], a[i++], a[i++]); } break;
+      /* GPURenderPassEncoder.setBlendConstant */
+      case 44: { const o = H(a[i++]); o.setBlendConstant((I = i, T = D_GPUColorDict(), i = I, T)); } break;
+      /* GPURenderPassEncoder.setStencilReference */
+      case 45: { const o = H(a[i++]); o.setStencilReference(a[i++]); } break;
+      /* GPURenderPassEncoder.beginOcclusionQuery */
+      case 46: { const o = H(a[i++]); o.beginOcclusionQuery(a[i++]); } break;
+      /* GPURenderPassEncoder.endOcclusionQuery */
+      case 47: { const o = H(a[i++]); o.endOcclusionQuery(); } break;
+      /* GPURenderPassEncoder.executeBundles */
+      case 48: { const o = H(a[i++]); o.executeBundles((I = i, T = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })(), i = I, T)); } break;
+      /* GPURenderPassEncoder.end */
+      case 49: { const o = H(a[i++]); o.end(); } break;
+      /* GPURenderPassEncoder.pushDebugGroup */
+      case 50: { const o = H(a[i++]); o.pushDebugGroup(s[a[i++]]); } break;
+      /* GPURenderPassEncoder.popDebugGroup */
+      case 51: { const o = H(a[i++]); o.popDebugGroup(); } break;
+      /* GPURenderPassEncoder.insertDebugMarker */
+      case 52: { const o = H(a[i++]); o.insertDebugMarker(s[a[i++]]); } break;
+      /* GPURenderPassEncoder.setBindGroup */
+      case 53: { const o = H(a[i++]); m = a[i++]; o.setBindGroup(a[i++], H(a[i++]), ((m & 1) ? (I = i, T = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })(), i = I, T) : undefined)); } break;
+      /* GPURenderPassEncoder.setImmediates */
+      case 54: { const o = H(a[i++]); m = a[i++]; o.setImmediates(a[i++], s[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.setPipeline */
+      case 55: { const o = H(a[i++]); o.setPipeline(H(a[i++])); } break;
+      /* GPURenderPassEncoder.setIndexBuffer */
+      case 56: { const o = H(a[i++]); m = a[i++]; o.setIndexBuffer(H(a[i++]), E_GPUIndexFormat[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.setVertexBuffer */
+      case 57: { const o = H(a[i++]); m = a[i++]; o.setVertexBuffer(a[i++], H(a[i++]), ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.draw */
+      case 58: { const o = H(a[i++]); m = a[i++]; o.draw(a[i++], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined), ((m & 4) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.drawIndexed */
+      case 59: { const o = H(a[i++]); m = a[i++]; o.drawIndexed(a[i++], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined), ((m & 4) ? a[i++] : undefined), ((m & 8) ? a[i++] : undefined)); } break;
+      /* GPURenderPassEncoder.drawIndirect */
+      case 60: { const o = H(a[i++]); o.drawIndirect(H(a[i++]), a[i++]); } break;
+      /* GPURenderPassEncoder.drawIndexedIndirect */
+      case 61: { const o = H(a[i++]); o.drawIndexedIndirect(H(a[i++]), a[i++]); } break;
+      /* GPURenderBundleEncoder.finish */
+      case 62: { const o = H(a[i++]); m = a[i++]; r = REG(o.finish(((m & 1) ? (I = i, T = D_GPURenderBundleDescriptor(), i = I, T) : undefined))); } break;
+      /* GPURenderBundleEncoder.pushDebugGroup */
+      case 63: { const o = H(a[i++]); o.pushDebugGroup(s[a[i++]]); } break;
+      /* GPURenderBundleEncoder.popDebugGroup */
+      case 64: { const o = H(a[i++]); o.popDebugGroup(); } break;
+      /* GPURenderBundleEncoder.insertDebugMarker */
+      case 65: { const o = H(a[i++]); o.insertDebugMarker(s[a[i++]]); } break;
+      /* GPURenderBundleEncoder.setBindGroup */
+      case 66: { const o = H(a[i++]); m = a[i++]; o.setBindGroup(a[i++], H(a[i++]), ((m & 1) ? (I = i, T = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })(), i = I, T) : undefined)); } break;
+      /* GPURenderBundleEncoder.setImmediates */
+      case 67: { const o = H(a[i++]); m = a[i++]; o.setImmediates(a[i++], s[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderBundleEncoder.setPipeline */
+      case 68: { const o = H(a[i++]); o.setPipeline(H(a[i++])); } break;
+      /* GPURenderBundleEncoder.setIndexBuffer */
+      case 69: { const o = H(a[i++]); m = a[i++]; o.setIndexBuffer(H(a[i++]), E_GPUIndexFormat[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderBundleEncoder.setVertexBuffer */
+      case 70: { const o = H(a[i++]); m = a[i++]; o.setVertexBuffer(a[i++], H(a[i++]), ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPURenderBundleEncoder.draw */
+      case 71: { const o = H(a[i++]); m = a[i++]; o.draw(a[i++], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined), ((m & 4) ? a[i++] : undefined)); } break;
+      /* GPURenderBundleEncoder.drawIndexed */
+      case 72: { const o = H(a[i++]); m = a[i++]; o.drawIndexed(a[i++], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined), ((m & 4) ? a[i++] : undefined), ((m & 8) ? a[i++] : undefined)); } break;
+      /* GPURenderBundleEncoder.drawIndirect */
+      case 73: { const o = H(a[i++]); o.drawIndirect(H(a[i++]), a[i++]); } break;
+      /* GPURenderBundleEncoder.drawIndexedIndirect */
+      case 74: { const o = H(a[i++]); o.drawIndexedIndirect(H(a[i++]), a[i++]); } break;
+      /* GPUQueue.submit */
+      case 75: { const o = H(a[i++]); o.submit((I = i, T = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })(), i = I, T)); } break;
+      /* GPUQueue.writeBuffer */
+      case 76: { const o = H(a[i++]); m = a[i++]; o.writeBuffer(H(a[i++]), a[i++], s[a[i++]], ((m & 1) ? a[i++] : undefined), ((m & 2) ? a[i++] : undefined)); } break;
+      /* GPUQueue.writeTexture */
+      case 77: { const o = H(a[i++]); o.writeTexture((I = i, T = D_GPUTexelCopyTextureInfo(), i = I, T), s[a[i++]], (I = i, T = D_GPUTexelCopyBufferLayout(), i = I, T), (I = i, T = D_GPUExtent3DDict(), i = I, T)); } break;
+      /* GPUQueue.copyExternalImageToTexture */
+      case 78: { const o = H(a[i++]); o.copyExternalImageToTexture((I = i, T = D_GPUCopyExternalImageSourceInfo(), i = I, T), (I = i, T = D_GPUCopyExternalImageDestInfo(), i = I, T), (I = i, T = D_GPUExtent3DDict(), i = I, T)); } break;
+      /* GPUQuerySet.destroy */
+      case 79: { const o = H(a[i++]); o.destroy(); } break;
+      /* GPUCanvasContext.configure */
+      case 80: { const o = H(a[i++]); o.configure((I = i, T = D_GPUCanvasConfiguration(), i = I, T)); } break;
+      /* GPUCanvasContext.unconfigure */
+      case 81: { const o = H(a[i++]); o.unconfigure(); } break;
+      /* GPUCanvasContext.getCurrentTexture */
+      case 82: { const o = H(a[i++]); r = REG(o.getCurrentTexture()); } break;
+      }
+    }
     A = null; S = null;
     return typeof r === 'number' ? r : (r ? 1 : 0);
   } };

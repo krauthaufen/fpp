@@ -922,13 +922,13 @@ and GPUCommandEncoder(h : int) =
     member x.CopyBufferToBuffer (source : GPUBuffer, destination : GPUBuffer, ?size : float) : unit =
         GpuVm.F 23.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match size with Some _ -> 1 | None -> 0)))
         GpuVm.F (float ((source).H))
         GpuVm.F (float ((destination).H))
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.CopyBufferToTexture (source : GPUTexelCopyBufferInfo, destination : GPUTexelCopyTextureInfo, copySize : GPUExtent3DDict) : unit =
         GpuVm.F 24.0
         GpuVm.F (float h)
@@ -950,17 +950,16 @@ and GPUCommandEncoder(h : int) =
     member x.ClearBuffer (buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
         GpuVm.F 27.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match offset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float ((buffer).H))
         (match offset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.ResolveQuerySet (querySet : GPUQuerySet, firstQuery : int, queryCount : int, destination : GPUBuffer, destinationOffset : float) : unit =
         GpuVm.F 28.0
         GpuVm.F (float h)
@@ -1008,17 +1007,16 @@ and GPUComputePassEncoder(h : int) =
     member x.DispatchWorkgroups (workgroupCountX : int, ?workgroupCountY : int, ?workgroupCountZ : int) : unit =
         GpuVm.F 34.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match workgroupCountY with Some _ -> 1 | None -> 0) + (match workgroupCountZ with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (workgroupCountX))
         (match workgroupCountY with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match workgroupCountZ with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.DispatchWorkgroupsIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
         GpuVm.F 35.0
         GpuVm.F (float h)
@@ -1041,31 +1039,30 @@ and GPUComputePassEncoder(h : int) =
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
         GpuVm.F 40.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dynamicOffsets with Some _ -> 1 | None -> 0)))
         GpuVm.F (float (index))
         GpuVm.F (float ((bindGroup).H))
         (match dynamicOffsets with
          | Some v ->
-             GpuVm.F 1.0
              let bs0 = v
              GpuVm.F (float (Array.length bs0))
              for bi0 in 0 .. Array.length bs0 - 1 do
                  GpuVm.F (float (bs0.[bi0]))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         GpuVm.F 41.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dataOffset with Some _ -> 1 | None -> 0) + (match dataSize with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (rangeOffset))
         GpuVm.O (data)
         (match dataOffset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match dataSize with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
 
 and GPURenderPassEncoder(h : int) =
     member x.H : int = h
@@ -1125,31 +1122,30 @@ and GPURenderPassEncoder(h : int) =
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
         GpuVm.F 53.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dynamicOffsets with Some _ -> 1 | None -> 0)))
         GpuVm.F (float (index))
         GpuVm.F (float ((bindGroup).H))
         (match dynamicOffsets with
          | Some v ->
-             GpuVm.F 1.0
              let bs0 = v
              GpuVm.F (float (Array.length bs0))
              for bi0 in 0 .. Array.length bs0 - 1 do
                  GpuVm.F (float (bs0.[bi0]))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         GpuVm.F 54.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dataOffset with Some _ -> 1 | None -> 0) + (match dataSize with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (rangeOffset))
         GpuVm.O (data)
         (match dataOffset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match dataSize with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetPipeline (pipeline : GPURenderPipeline) : unit =
         GpuVm.F 55.0
         GpuVm.F (float h)
@@ -1157,76 +1153,69 @@ and GPURenderPassEncoder(h : int) =
     member x.SetIndexBuffer (buffer : GPUBuffer, indexFormat : GPUIndexFormat, ?offset : float, ?size : float) : unit =
         GpuVm.F 56.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match offset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float ((buffer).H))
         GpuVm.F (float (int (indexFormat)))
         (match offset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetVertexBuffer (slot : int, buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
         GpuVm.F 57.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match offset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (slot))
         GpuVm.F (float ((buffer).H))
         (match offset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.Draw (vertexCount : int, ?instanceCount : int, ?firstVertex : int, ?firstInstance : int) : unit =
         GpuVm.F 58.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match instanceCount with Some _ -> 1 | None -> 0) + (match firstVertex with Some _ -> 2 | None -> 0) + (match firstInstance with Some _ -> 4 | None -> 0)))
         GpuVm.F (float (vertexCount))
         (match instanceCount with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstVertex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstInstance with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.DrawIndexed (indexCount : int, ?instanceCount : int, ?firstIndex : int, ?baseVertex : int, ?firstInstance : int) : unit =
         GpuVm.F 59.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match instanceCount with Some _ -> 1 | None -> 0) + (match firstIndex with Some _ -> 2 | None -> 0) + (match baseVertex with Some _ -> 4 | None -> 0) + (match firstInstance with Some _ -> 8 | None -> 0)))
         GpuVm.F (float (indexCount))
         (match instanceCount with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstIndex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match baseVertex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstInstance with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.DrawIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
         GpuVm.F 60.0
         GpuVm.F (float h)
@@ -1276,31 +1265,30 @@ and GPURenderBundleEncoder(h : int) =
     member x.SetBindGroup (index : int, bindGroup : GPUBindGroup, ?dynamicOffsets : int[]) : unit =
         GpuVm.F 66.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dynamicOffsets with Some _ -> 1 | None -> 0)))
         GpuVm.F (float (index))
         GpuVm.F (float ((bindGroup).H))
         (match dynamicOffsets with
          | Some v ->
-             GpuVm.F 1.0
              let bs0 = v
              GpuVm.F (float (Array.length bs0))
              for bi0 in 0 .. Array.length bs0 - 1 do
                  GpuVm.F (float (bs0.[bi0]))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetImmediates (rangeOffset : int, data : JsObj, ?dataOffset : float, ?dataSize : float) : unit =
         GpuVm.F 67.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dataOffset with Some _ -> 1 | None -> 0) + (match dataSize with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (rangeOffset))
         GpuVm.O (data)
         (match dataOffset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match dataSize with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetPipeline (pipeline : GPURenderPipeline) : unit =
         GpuVm.F 68.0
         GpuVm.F (float h)
@@ -1308,76 +1296,69 @@ and GPURenderBundleEncoder(h : int) =
     member x.SetIndexBuffer (buffer : GPUBuffer, indexFormat : GPUIndexFormat, ?offset : float, ?size : float) : unit =
         GpuVm.F 69.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match offset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float ((buffer).H))
         GpuVm.F (float (int (indexFormat)))
         (match offset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.SetVertexBuffer (slot : int, buffer : GPUBuffer, ?offset : float, ?size : float) : unit =
         GpuVm.F 70.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match offset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float (slot))
         GpuVm.F (float ((buffer).H))
         (match offset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.Draw (vertexCount : int, ?instanceCount : int, ?firstVertex : int, ?firstInstance : int) : unit =
         GpuVm.F 71.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match instanceCount with Some _ -> 1 | None -> 0) + (match firstVertex with Some _ -> 2 | None -> 0) + (match firstInstance with Some _ -> 4 | None -> 0)))
         GpuVm.F (float (vertexCount))
         (match instanceCount with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstVertex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstInstance with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.DrawIndexed (indexCount : int, ?instanceCount : int, ?firstIndex : int, ?baseVertex : int, ?firstInstance : int) : unit =
         GpuVm.F 72.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match instanceCount with Some _ -> 1 | None -> 0) + (match firstIndex with Some _ -> 2 | None -> 0) + (match baseVertex with Some _ -> 4 | None -> 0) + (match firstInstance with Some _ -> 8 | None -> 0)))
         GpuVm.F (float (indexCount))
         (match instanceCount with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstIndex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match baseVertex with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match firstInstance with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (float (v))
-         | None -> GpuVm.F 0.0)
+         | None -> ())
     member x.DrawIndirect (indirectBuffer : GPUBuffer, indirectOffset : float) : unit =
         GpuVm.F 73.0
         GpuVm.F (float h)
@@ -1409,19 +1390,18 @@ and GPUQueue(h : int) =
     member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : JsObj, ?dataOffset : float, ?size : float) : unit =
         GpuVm.F 76.0
         GpuVm.F (float h)
+        GpuVm.F (float ((match dataOffset with Some _ -> 1 | None -> 0) + (match size with Some _ -> 2 | None -> 0)))
         GpuVm.F (float ((buffer).H))
         GpuVm.F (bufferOffset)
         GpuVm.O (data)
         (match dataOffset with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         (match size with
          | Some v ->
-             GpuVm.F 1.0
              GpuVm.F (v)
-         | None -> GpuVm.F 0.0)
+         | None -> ())
         GpuVm.Call () |> ignore
     member x.WriteBuffer (buffer : GPUBuffer, bufferOffset : float, data : 'a[]) : unit when Unmanaged<'a> =
         GpuVm.Barrier ()

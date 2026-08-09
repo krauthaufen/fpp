@@ -449,28 +449,36 @@ def emit(model):
             orig_args = list(args)   # (name, t, kind, optional) as declared
 
             def bin_body(present):
-                # opcode, receiver, then each DECLARED arg: required args
-                # encode plainly, optional ones tag-first. `present` is the
-                # local naming: None = the bare all-optional form (every
-                # tag 0), 'self' = args are locals by their own names.
+                # opcode, receiver, ONE presence bitmask when the method has
+                # optionals, then each DECLARED arg in order — an optional
+                # writes its value only when its bit is set. `present` is the
+                # local naming: None = the bare all-optional form (mask 0),
+                # 'self' = args are locals by their own names.
                 _, _, brk, bargs, batched = ops[op]
                 a('        GpuVm.F %d.0' % op)
                 a('        GpuVm.F (float h)')
+                optixs = [j for j, (_, _, o2) in enumerate(bargs) if o2]
+                if optixs:
+                    if present is None:
+                        a('        GpuVm.F 0.0')
+                    elif all_opt:
+                        a('        GpuVm.F %d.0' % ((1 << len(optixs)) - 1))
+                    else:
+                        bits = ' + '.join(
+                            '(match %s with Some _ -> %d | None -> 0)'
+                            % (bargs[j][0], 1 << bi) for bi, j in enumerate(optixs))
+                        a('        GpuVm.F (float (%s))' % bits)
                 for n2, k2, opt2 in bargs:
                     if present is None:
-                        # bare form: everything absent
-                        if opt2: a('        GpuVm.F 0.0')
-                        else: raise Exception('bare form with required arg')
+                        pass   # bare form: nothing written beyond the mask
                     elif opt2 and not all_opt:
                         a('        (match %s with' % n2)
                         a('         | Some v ->')
-                        a('             GpuVm.F 1.0')
                         emit_bin(a, 13, model, k2, 'v')
-                        a('         | None -> GpuVm.F 0.0)')
+                        a('         | None -> ())')
                     else:
                         # required — or the With form, where every declared
                         # optional is written present
-                        if opt2: a('        GpuVm.F 1.0')
                         emit_bin(a, 8, model, k2, n2)
                 if batched: return
                 if brk[0] == 'unit':
@@ -680,23 +688,48 @@ def emit_vm(model):
                 a('    if (A[I++]) o.%s = %s;' % (mm['name'], js_read(model, k)))
         a('    return o;')
         a('  };')
-    a('  const M = [')
-    for i, (iname, jsname, rk, args, batched) in enumerate(ops):
-        reads = []
-        for n2, k2, opt2 in args:
-            r = js_read(model, k2)
-            if opt2: r = '(A[I++] ? %s : undefined)' % r
-            reads.append(r)
-        call = 'H(A[I++]).%s(%s)' % (jsname, ', '.join(reads))
-        if rk[0] == 'iface': body = 'REG(%s)' % call
-        elif rk[0] == 'bool': body = '(%s ? 1 : 0)' % call
-        else: body = call
-        a('    /* %d %s.%s */ () => %s,' % (i, iname, jsname, body))
-    a('  ];')
+    # the interpreter: ONE function, ONE switch, the cursor in true LOCALS
+    # (a module-scope let read from a closure is a context slot; a local is
+    # a register). Scalar args read the local cursor inline; a dict/seq arg
+    # BOUNCES through the module cursor so the shared decoders stay usable.
+    def local_read(kind):
+        k = kind[0]
+        if k in ('num', 'int'): return 'a[i++]'
+        if k == 'bool': return '!!a[i++]'
+        if k == 'enum': return 'E_%s[a[i++]]' % kind[1]
+        if k == 'iface': return 'H(a[i++])'
+        if k in ('string', 'raw'): return 's[a[i++]]'
+        # dict / seq: hand the local position to the module cursor, run the
+        # shared decoder, take the position back
+        return '(I = i, T = %s, i = I, T)' % js_read(model, kind)
+    a('  let T;')
     a('  return { gpuRun: (p, n, s) => {')
-    a('    A = new Float64Array(mem(), p >>> 0, n); I = 0; S = s;')
-    a('    let r = 0;')
-    a('    while (I < n) r = M[A[I++]]();')
+    a('    const a = new Float64Array(mem(), p >>> 0, n);')
+    a('    let i = 0, r = 0, m = 0;')
+    a('    A = a; S = s;')
+    a('    while (i < n) {')
+    a('      switch (a[i++] | 0) {')
+    for idx, (iname, jsname, rk, args, batched) in enumerate(ops):
+        reads = []
+        bi = 0
+        has_opt = any(o2 for _, _, o2 in args)
+        for n2, k2, opt2 in args:
+            r = local_read(k2)
+            if opt2:
+                r = '((m & %d) ? %s : undefined)' % (1 << bi, r)
+                bi += 1
+            reads.append(r)
+        recv = 'H(a[i++])'
+        pre = 'm = a[i++]; ' if has_opt else ''
+        call = 'o.%s(%s)' % (jsname, ', '.join(reads))
+        if rk[0] == 'iface': body = 'r = REG(%s);' % call
+        elif rk[0] == 'bool': body = 'r = %s ? 1 : 0;' % call
+        elif rk[0] == 'unit': body = '%s;' % call
+        else: body = 'r = %s;' % call
+        a('      /* %s.%s */' % (iname, jsname))
+        a('      case %d: { const o = %s; %s%s } break;' % (idx, recv, pre, body))
+    a('      }')
+    a('    }')
     a('    A = null; S = null;')
     a("    return typeof r === 'number' ? r : (r ? 1 : 0);")
     a('  } };')
