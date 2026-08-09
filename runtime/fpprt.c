@@ -400,6 +400,7 @@ size_t fpprt_allocated_bytes(void) { return gc_allocation_counter(heap_); }
  * thread; workers park between dispatches for the same reason. */
 
 #include <unistd.h>
+#include <sched.h>
 
 #define FPP_POOL_MAX 16
 
@@ -491,4 +492,135 @@ void fpp_pool_dispatch(int n, int chunk, fpp_pool_kernel kernel, void *env) {
   while (pool_active_ != 0) pthread_cond_wait(&pool_done_, &pool_mu_);
   pthread_mutex_unlock(&pool_mu_);
   fpprt_thread_unpark();
+}
+
+/* ---- phased dispatch: groups × phases, barrier-as-retirement -----------
+ * The index range splits into GROUPS (dense, equal slices); each group
+ * runs PHASES in order, and a group's phase p+1 becomes runnable the
+ * moment the last chunk of ITS phase p retires — group barriers never
+ * join the world, so independent groups pipeline like GPU workgroups.
+ * Workers never block at a barrier: they scan for any runnable chunk
+ * (starting at a home group for locality — crude stealing) and park only
+ * when nothing anywhere is runnable. */
+
+typedef struct {
+  int lo, hi;          /* the group's slice of [0, n)      */
+  int phase;           /* current phase                    */
+  int cursor;          /* next chunk start within the slice */
+  int live;            /* chunks not yet retired this phase */
+} fpp_group;
+
+#define FPP_GROUP_MAX 256
+
+static fpp_group phased_groups_[FPP_GROUP_MAX];
+static int phased_ngroups_ = 0;
+static int phased_phases_ = 0;
+static int phased_chunk_ = 0;
+static int phased_done_ = 0;         /* groups fully finished */
+static fpp_phase_kernel phased_kernel_;
+static void *phased_env_;
+
+static int phased_chunks_of_(fpp_group *g) {
+  int len = g->hi - g->lo;
+  return (len + phased_chunk_ - 1) / phased_chunk_;
+}
+
+/* grab one runnable chunk; returns phase/lo/hi through the pointers.
+ * 0 = nothing runnable ANYWHERE right now, -1 = the whole dispatch is
+ * finished. Caller holds pool_mu_. */
+static int phased_grab_(int home, int *phase, int *lo, int *hi) {
+  if (phased_done_ == phased_ngroups_) return -1;
+  for (int k = 0; k < phased_ngroups_; k++) {
+    fpp_group *g = &phased_groups_[(home + k) % phased_ngroups_];
+    if (g->phase >= phased_phases_) continue;
+    if (g->cursor < g->hi) {
+      *phase = g->phase;
+      *lo = g->cursor;
+      *hi = g->cursor + phased_chunk_;
+      if (*hi > g->hi) *hi = g->hi;
+      g->cursor = *hi;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void phased_retire_(int home) {
+  fpp_group *g = &phased_groups_[home];
+  g->live--;
+  if (g->live == 0) {
+    g->phase++;
+    if (g->phase >= phased_phases_) phased_done_++;
+    else {
+      g->cursor = g->lo;
+      g->live = phased_chunks_of_(g);
+    }
+  }
+}
+
+static void phased_work_(int home) {
+  for (;;) {
+    int phase, lo, hi, r;
+    pthread_mutex_lock(&pool_mu_);
+    r = phased_grab_(home, &phase, &lo, &hi);
+    pthread_mutex_unlock(&pool_mu_);
+    if (r == -1) return;
+    if (r == 0) {
+      /* nothing runnable: another group's phase must retire first.
+       * Yield rather than spin hot; the retirement that unblocks us is
+       * chunks away, not milliseconds. */
+      fpprt_safepoint();
+      sched_yield();
+      continue;
+    }
+    phased_kernel_(phased_env_, phase, lo, hi);
+    fpprt_safepoint();
+    pthread_mutex_lock(&pool_mu_);
+    /* which group did [lo,hi) belong to — recompute from lo */
+    for (int gi = 0; gi < phased_ngroups_; gi++)
+      if (lo >= phased_groups_[gi].lo && lo < phased_groups_[gi].hi) {
+        phased_retire_(gi);
+        break;
+      }
+    pthread_mutex_unlock(&pool_mu_);
+  }
+}
+
+/* the pool's generic job hook: a phased dispatch rides the same workers */
+static void phased_pool_kernel_(void *env, int lo, int hi) {
+  (void)env; (void)hi;
+  phased_work_(lo);   /* lo doubles as the worker's home group */
+}
+
+void fpp_pool_dispatch_phased(int n, int chunk, int groups, int phases,
+                              fpp_phase_kernel kernel, void *env) {
+  if (n <= 0 || phases <= 0) return;
+  if (groups <= 0) groups = 1;
+  if (groups > FPP_GROUP_MAX) groups = FPP_GROUP_MAX;
+  if (groups > n) groups = n;
+  if (chunk <= 0) {
+    chunk = n / (groups * 8) + 1;
+    if (chunk < 1) chunk = 1;
+  }
+  phased_kernel_ = kernel;
+  phased_env_ = env;
+  phased_chunk_ = chunk;
+  phased_ngroups_ = groups;
+  phased_phases_ = phases;
+  phased_done_ = 0;
+  int base = n / groups, rem = n % groups, at = 0;
+  for (int g = 0; g < groups; g++) {
+    int len = base + (g < rem ? 1 : 0);
+    phased_groups_[g].lo = at;
+    phased_groups_[g].hi = at + len;
+    phased_groups_[g].phase = 0;
+    phased_groups_[g].cursor = at;
+    phased_groups_[g].live = phased_chunks_of_(&phased_groups_[g]);
+    at += len;
+  }
+  /* every pool thread (plus the caller) becomes a phased worker with a
+   * distinct home group; the plain dispatch machinery provides the fan
+   * out and the join */
+  int workers = pool_started_ ? pool_size_ + 1 : fpp_pool_size() + 1;
+  fpp_pool_dispatch(workers, 1, phased_pool_kernel_, NULL);
 }

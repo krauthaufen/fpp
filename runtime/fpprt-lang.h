@@ -223,6 +223,7 @@ static inline V fpp_clo_new(uint32_t tid, fpp_code_t code, size_t arity,
 V fpp_apply(V clo, V *args, size_t n);
 /* run closure(i) for every i in [0,n) across the pool; chunk 0 = auto */
 void fpp_parallel_for(int n, int chunk, V clo);
+void fpp_parallel_phased(int n, int chunk, int groups, int phases, V clo);
 
 /* ---- interface dispatch: [typeid][slot] -> uniform member wrapper ------- */
 

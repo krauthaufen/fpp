@@ -6026,6 +6026,7 @@ module Async =
 // the machine, so results are identical everywhere by construction.
 #if NATIVE
 extern let parallelFor : int -> int -> (int -> unit) -> unit
+extern let parallelPhased : int -> int -> int -> int -> (int -> int -> unit) -> unit
 #endif
 
 module Parallel =
@@ -6039,6 +6040,19 @@ module Parallel =
         for i in 0 .. n - 1 do f i
     let private iterChunks (chunks : int) (f : int -> unit) : unit =
         for c in 0 .. chunks - 1 do f c
+#endif
+    /// `phases` group-barriered passes over [0, n) in `groups` groups:
+    /// the kernel sees (phase, index); a group's phase p+1 starts when
+    /// ITS phase p is complete, and independent groups pipeline. The
+    /// sequential schedule below is one valid schedule of the same
+    /// program — a correctly synchronized kernel cannot tell them apart.
+#if NATIVE
+    let dispatchPhased (n : int) (groups : int) (phases : int) (kernel : int -> int -> unit) : unit =
+        parallelPhased n 0 groups phases kernel
+#else
+    let dispatchPhased (n : int) (groups : int) (phases : int) (kernel : int -> int -> unit) : unit =
+        for p in 0 .. phases - 1 do
+            for i in 0 .. n - 1 do kernel p i
 #endif
     /// machine-independent chunking: 64-way regardless of pool size
     let private chunkOf (n : int) : int = n / 64 + 1

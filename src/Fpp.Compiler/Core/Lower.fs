@@ -1406,6 +1406,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           EApp (EUnknown nm, [ ma ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ pn; pc; pf ] when bv.Name = "parallelFor" && bv.Path = "(builtin)" ->
                           EApp (EUnknown "parallelfor", [ pn; pc; pf ])
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ pn; pc; pg; pp; pf ] when bv.Name = "parallelPhased" && bv.Path = "(builtin)" ->
+                          EApp (EUnknown "parallelphased", [ pn; pc; pg; pp; pf ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ ua ] when bv.Name = "monoMs" && bv.Path = "(builtin)" ->
                           // the monotonic clock: milliseconds since an
                           // arbitrary origin, as float

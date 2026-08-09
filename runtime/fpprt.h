@@ -183,6 +183,11 @@ void fpprt_thread_unpark(void);
 typedef void (*fpp_pool_kernel)(void *env, int lo, int hi);
 int  fpp_pool_size(void);
 void fpp_pool_dispatch(int n, int chunk, fpp_pool_kernel kernel, void *env);
+/* groups × phases: group-local barriers as retirement counts, groups
+ * pipeline independently; kernel(env, phase, lo, hi) */
+typedef void (*fpp_phase_kernel)(void *env, int phase, int lo, int hi);
+void fpp_pool_dispatch_phased(int n, int chunk, int groups, int phases,
+                              fpp_phase_kernel kernel, void *env);
 
 void fpprt_collect(void);            /* full collection, for tests        */
 void fpprt_safepoint(void);          /* poll: park if a GC wants the world */

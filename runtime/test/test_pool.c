@@ -29,6 +29,41 @@ static void mon_kernel(void *env, int lo, int hi) {
   }
 }
 
+
+/* ---- phased-dispatch tests ---------------------------------------------- */
+enum { PH_N = 50000 };
+static long ph_a[PH_N], ph_b[PH_N], ph_c[PH_N];
+
+static void ph_stencil(void *env, int phase, int lo, int hi) {
+  (void)env;
+  if (phase == 0)
+    for (int i = lo; i < hi; i++) ph_a[i] = ph_a[i] * 2;
+  else
+    for (int i = lo; i < hi; i++)
+      ph_b[i] = ph_a[i] + (i > 0 ? ph_a[i - 1] : 0);
+}
+
+static void ph_acc(void *env, int phase, int lo, int hi) {
+  (void)env;
+  for (int i = lo; i < hi; i++) ph_c[i] += phase + 1;
+}
+
+static void phased_tests(void) {
+  for (int i = 0; i < PH_N; i++) ph_a[i] = i % 17;
+  fpp_pool_dispatch_phased(PH_N, 700, 1, 2, ph_stencil, NULL);
+  long got = 0, expect = 0;
+  for (int i = 0; i < PH_N; i++) got += ph_b[i];
+  for (int i = 0; i < PH_N; i++) {
+    long ai = (i % 17) * 2, al = i > 0 ? ((i - 1) % 17) * 2 : 0;
+    expect += ai + al;
+  }
+  printf("phased %s\n", got == expect ? "ok" : "WRONG");
+  fpp_pool_dispatch_phased(PH_N, 300, 16, 3, ph_acc, NULL);
+  long g2 = 0;
+  for (int i = 0; i < PH_N; i++) g2 += ph_c[i];
+  printf("groups %s\n", g2 == (long)PH_N * 6 ? "ok" : "WRONG");
+}
+
 int main(void) {
   fpprt_init(NULL);
   fpprt_thread_attach();
@@ -48,5 +83,9 @@ int main(void) {
   fpprt_collect();
   fpp_pool_dispatch(64000, 1000, sum_kernel, NULL);
   printf("again ok\n");
+  /* phased tests use TOP-LEVEL kernels: emcc is clang, and clang has no
+   * GCC nested functions (the first version died silently in the
+   * wasm-linear leg) */
+  phased_tests();
   return 0;
 }

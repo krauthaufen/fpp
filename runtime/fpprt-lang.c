@@ -1878,3 +1878,25 @@ void fpp_parallel_for(int n, int chunk, V clo) {
     fpp_pool_dispatch(n, chunk, fpp_pfor_kernel_, &g_slots[0]);
     FPPRT_LEAVE(g);
 }
+
+/* the phased bridge: closure(phase, i) over group-barriered phases */
+static void fpp_pphased_kernel_(void *env0, int phase, int lo, int hi) {
+    FPPRT_FRAME(f, 1);
+    for (int i = lo; i < hi; i++) {
+        f_slots[0] = *(V *)env0;
+        V args[2];
+        args[0] = TAGI(phase);
+        args[1] = TAGI(i);
+        fpp_apply(f_slots[0], args, 2);
+    }
+    FPPRT_LEAVE(f);
+}
+
+void fpp_parallel_phased(int n, int chunk, int groups, int phases, V clo) {
+    if (n <= 0 || phases <= 0) return;
+    FPPRT_FRAME(g, 1);
+    g_slots[0] = clo;
+    fpp_pool_dispatch_phased(n, chunk, groups, phases,
+                             fpp_pphased_kernel_, &g_slots[0]);
+    FPPRT_LEAVE(g);
+}

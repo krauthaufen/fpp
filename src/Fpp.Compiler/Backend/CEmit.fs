@@ -1071,6 +1071,15 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let xf = emitE st f clo
         stmt f ("fpp_parallel_for((int)UNTAGI(" + sref xn + "), (int)UNTAGI(" + sref xc + "), " + sref xf + ");")
         unitV ()
+    | EApp (EUnknown "parallelphased", [ n; c; g; p; clo ]) ->
+        let xn = emitE st f n
+        let xc = emitE st f c
+        let xg = emitE st f g
+        let xp = emitE st f p
+        let xf = emitE st f clo
+        stmt f ("fpp_parallel_phased((int)UNTAGI(" + sref xn + "), (int)UNTAGI(" + sref xc
+                + "), (int)UNTAGI(" + sref xg + "), (int)UNTAGI(" + sref xp + "), " + sref xf + ");")
+        unitV ()
     | EApp (EUnknown "monoms", [ a ]) ->
         emitE st f a |> ignore
         let d = slot f

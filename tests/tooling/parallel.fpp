@@ -13,3 +13,17 @@ let r2 = printfn "%d" sums.[n - 1]
 let r3 = printfn "%d" (Array.length odds)
 let r4 = printfn "%d" odds.[0]
 let r5 = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun a b -> a + b) odds)
+
+// phased: the ×2-then-add-left-neighbour stencil, one group = a global
+// barrier; every cross-index read needs phase 0 complete first
+let st = Parallel.init n (fun i -> i % 17)
+let stOut : int[] = Array.zeroCreate n
+let r6 =
+    Parallel.dispatchPhased n 1 2 (fun phase i ->
+        if phase = 0 then st.[i] <- st.[i] * 2
+        else stOut.[i] <- st.[i] + (if i > 0 then st.[i - 1] else 0))
+let r7 = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun a b -> a + b) stOut)
+// sixteen groups, three phases of group-local accumulation, pipelining
+let acc : int[] = Array.zeroCreate n
+let r8 = Parallel.dispatchPhased n 16 3 (fun phase i -> acc.[i] <- acc.[i] + phase + 1)
+let r9 = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun a b -> a + b) acc)
