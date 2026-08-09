@@ -268,16 +268,18 @@ def emit_bin(a, ind, model, kind, expr, depth=0):
         raise Exception('unencodable kind ' + k)
 
 def js_read(model, kind):
-    """JS decode EXPRESSION for one value of `kind` (cursor c)."""
+    """JS decode EXPRESSION for one value of `kind` — reads the
+    module-scope cursor (A/I/S), which V8 keeps in registers where a
+    cursor OBJECT cost a property read-modify-write per slot."""
     k = kind[0]
-    if k in ('num', 'int'): return 'c.a[c.i++]'
-    if k == 'bool': return '!!c.a[c.i++]'
-    if k == 'enum': return 'E_%s[c.a[c.i++]]' % kind[1]
-    if k == 'iface': return 'H(c.a[c.i++])'
-    if k in ('string', 'raw'): return 'c.s[c.a[c.i++]]'
-    if k == 'dict': return 'D_%s(c)' % kind[1]
+    if k in ('num', 'int'): return 'A[I++]'
+    if k == 'bool': return '!!A[I++]'
+    if k == 'enum': return 'E_%s[A[I++]]' % kind[1]
+    if k == 'iface': return 'H(A[I++])'
+    if k in ('string', 'raw'): return 'S[A[I++]]'
+    if k == 'dict': return 'D_%s()' % kind[1]
     if k == 'seq':
-        return ('(() => { const m = c.a[c.i++], r = new Array(m); '
+        return ('(() => { const m = A[I++], r = new Array(m); '
                 'for (let j = 0; j < m; j++) r[j] = %s; return r; })()'
                 % js_read(model, kind[1]))
     raise Exception('undecodable kind ' + k)
@@ -367,12 +369,14 @@ def emit(model):
     a('    let F (v : float) : unit =')
     a('        (if count >= Array.length buf then')
     a('            let nb : Slot[] = Array.zeroCreate (Array.length buf * 2)')
-    a('            for i in 0 .. count - 1 do nb.[i] <- buf.[i]')
     a('            let na = Array.pin nb')
+    a('            Memory.copy na addr (count * 8)')
     a('            Array.unpin buf |> ignore')
     a('            buf <- nb')
     a('            addr <- na)')
-    a('        buf.[count] <- { V = v }')
+    a('        // a raw f64.store: the array IS pinned, linear memory is its')
+    a('        // canonical storage — this skips the per-slot $hwset helper')
+    a('        Memory.storeFloat (addr + nativeint (count <<< 3)) v')
     a('        count <- count + 1')
     a('    let S (s : string) : unit =')
     a('        (if strCount = 0 then strs <- Js.newArr ())')
@@ -660,18 +664,20 @@ def emit_vm(model):
     a('// as indices into the side array, optionals tag-first, sequences')
     a('// count-first, records inline.')
     a('export const gpuVm = ({ mem, h: H, reg: REG }) => {')
+    a('  // the cursor: module-scope lets, set per gpuRun, register-friendly')
+    a('  let A = null, I = 0, S = null;')
     for en, vals in model['enums'].items():
         a('  const E_%s = [%s];' % (en, ', '.join('"%s"' % v for v in vals)))
     for dname in model['dicts']:
         members = dict_members(model, dname)
-        a('  const D_%s = (c) => {' % dname)
+        a('  const D_%s = () => {' % dname)
         a('    const o = {};')
         for mm in members:
             _, k = fpp_type(model, mm['type'])
             if mm['required']:
                 a('    o.%s = %s;' % (mm['name'], js_read(model, k)))
             else:
-                a('    if (c.a[c.i++]) o.%s = %s;' % (mm['name'], js_read(model, k)))
+                a('    if (A[I++]) o.%s = %s;' % (mm['name'], js_read(model, k)))
         a('    return o;')
         a('  };')
     a('  const M = [')
@@ -679,18 +685,19 @@ def emit_vm(model):
         reads = []
         for n2, k2, opt2 in args:
             r = js_read(model, k2)
-            if opt2: r = '(c.a[c.i++] ? %s : undefined)' % r
+            if opt2: r = '(A[I++] ? %s : undefined)' % r
             reads.append(r)
-        call = 'H(c.a[c.i++]).%s(%s)' % (jsname, ', '.join(reads))
+        call = 'H(A[I++]).%s(%s)' % (jsname, ', '.join(reads))
         if rk[0] == 'iface': body = 'REG(%s)' % call
         elif rk[0] == 'bool': body = '(%s ? 1 : 0)' % call
         else: body = call
-        a('    /* %d %s.%s */ (c) => %s,' % (i, iname, jsname, body))
+        a('    /* %d %s.%s */ () => %s,' % (i, iname, jsname, body))
     a('  ];')
     a('  return { gpuRun: (p, n, s) => {')
-    a('    const c = { a: new Float64Array(mem(), p >>> 0, n), i: 0, s };')
+    a('    A = new Float64Array(mem(), p >>> 0, n); I = 0; S = s;')
     a('    let r = 0;')
-    a('    while (c.i < n) r = M[c.a[c.i++]](c);')
+    a('    while (I < n) r = M[A[I++]]();')
+    a('    A = null; S = null;')
     a("    return typeof r === 'number' ? r : (r ? 1 : 0);")
     a('  } };')
     a('};')

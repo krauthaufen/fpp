@@ -403,12 +403,14 @@ module GpuVm =
     let F (v : float) : unit =
         (if count >= Array.length buf then
             let nb : Slot[] = Array.zeroCreate (Array.length buf * 2)
-            for i in 0 .. count - 1 do nb.[i] <- buf.[i]
             let na = Array.pin nb
+            Memory.copy na addr (count * 8)
             Array.unpin buf |> ignore
             buf <- nb
             addr <- na)
-        buf.[count] <- { V = v }
+        // a raw f64.store: the array IS pinned, linear memory is its
+        // canonical storage — this skips the per-slot $hwset helper
+        Memory.storeFloat (addr + nativeint (count <<< 3)) v
         count <- count + 1
     let S (s : string) : unit =
         (if strCount = 0 then strs <- Js.newArr ())

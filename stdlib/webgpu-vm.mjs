@@ -5,6 +5,8 @@
 // as indices into the side array, optionals tag-first, sequences
 // count-first, records inline.
 export const gpuVm = ({ mem, h: H, reg: REG }) => {
+  // the cursor: module-scope lets, set per gpuRun, register-friendly
+  let A = null, I = 0, S = null;
   const E_GPUPowerPreference = ["low-power", "high-performance"];
   const E_GPUFeatureName = ["core-features-and-limits", "depth-clip-control", "depth32float-stencil8", "texture-compression-bc", "texture-compression-bc-sliced-3d", "texture-compression-etc2", "texture-compression-astc", "texture-compression-astc-sliced-3d", "timestamp-query", "indirect-first-instance", "shader-f16", "rg11b10ufloat-renderable", "bgra8unorm-storage", "float32-filterable", "float32-blendable", "clip-distances", "dual-source-blending", "subgroups", "texture-formats-tier1", "texture-formats-tier2", "primitive-index", "texture-component-swizzle", "subgroup-size-control"];
   const E_GPUBufferMapState = ["unmapped", "pending", "mapped"];
@@ -39,571 +41,572 @@ export const gpuVm = ({ mem, h: H, reg: REG }) => {
   const E_GPUCanvasToneMappingMode = ["standard", "extended"];
   const E_GPUDeviceLostReason = ["unknown", "destroyed"];
   const E_GPUErrorFilter = ["validation", "out-of-memory", "internal"];
-  const D_GPUObjectDescriptorBase = (c) => {
+  const D_GPUObjectDescriptorBase = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
     return o;
   };
-  const D_GPURequestAdapterOptions = (c) => {
+  const D_GPURequestAdapterOptions = () => {
     const o = {};
-    if (c.a[c.i++]) o.featureLevel = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.powerPreference = E_GPUPowerPreference[c.a[c.i++]];
-    if (c.a[c.i++]) o.forceFallbackAdapter = !!c.a[c.i++];
-    if (c.a[c.i++]) o.xrCompatible = !!c.a[c.i++];
+    if (A[I++]) o.featureLevel = S[A[I++]];
+    if (A[I++]) o.powerPreference = E_GPUPowerPreference[A[I++]];
+    if (A[I++]) o.forceFallbackAdapter = !!A[I++];
+    if (A[I++]) o.xrCompatible = !!A[I++];
     return o;
   };
-  const D_GPUDeviceDescriptor = (c) => {
+  const D_GPUDeviceDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.requiredFeatures = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUFeatureName[c.a[c.i++]]; return r; })();
-    if (c.a[c.i++]) o.requiredLimits = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.defaultQueue = D_GPUQueueDescriptor(c);
+    if (A[I++]) o.label = S[A[I++]];
+    if (A[I++]) o.requiredFeatures = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUFeatureName[A[I++]]; return r; })();
+    if (A[I++]) o.requiredLimits = S[A[I++]];
+    if (A[I++]) o.defaultQueue = D_GPUQueueDescriptor();
     return o;
   };
-  const D_GPUBufferDescriptor = (c) => {
+  const D_GPUBufferDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.size = c.a[c.i++];
-    o.usage = c.a[c.i++];
-    if (c.a[c.i++]) o.mappedAtCreation = !!c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.size = A[I++];
+    o.usage = A[I++];
+    if (A[I++]) o.mappedAtCreation = !!A[I++];
     return o;
   };
-  const D_GPUTextureDescriptor = (c) => {
+  const D_GPUTextureDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.size = D_GPUExtent3DDict(c);
-    if (c.a[c.i++]) o.mipLevelCount = c.a[c.i++];
-    if (c.a[c.i++]) o.sampleCount = c.a[c.i++];
-    if (c.a[c.i++]) o.dimension = E_GPUTextureDimension[c.a[c.i++]];
-    o.format = E_GPUTextureFormat[c.a[c.i++]];
-    o.usage = c.a[c.i++];
-    if (c.a[c.i++]) o.viewFormats = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[c.a[c.i++]]; return r; })();
-    if (c.a[c.i++]) o.textureBindingViewDimension = E_GPUTextureViewDimension[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
+    o.size = D_GPUExtent3DDict();
+    if (A[I++]) o.mipLevelCount = A[I++];
+    if (A[I++]) o.sampleCount = A[I++];
+    if (A[I++]) o.dimension = E_GPUTextureDimension[A[I++]];
+    o.format = E_GPUTextureFormat[A[I++]];
+    o.usage = A[I++];
+    if (A[I++]) o.viewFormats = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[A[I++]]; return r; })();
+    if (A[I++]) o.textureBindingViewDimension = E_GPUTextureViewDimension[A[I++]];
     return o;
   };
-  const D_GPUTextureViewDescriptor = (c) => {
+  const D_GPUTextureViewDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.format = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.dimension = E_GPUTextureViewDimension[c.a[c.i++]];
-    if (c.a[c.i++]) o.usage = c.a[c.i++];
-    if (c.a[c.i++]) o.aspect = E_GPUTextureAspect[c.a[c.i++]];
-    if (c.a[c.i++]) o.baseMipLevel = c.a[c.i++];
-    if (c.a[c.i++]) o.mipLevelCount = c.a[c.i++];
-    if (c.a[c.i++]) o.baseArrayLayer = c.a[c.i++];
-    if (c.a[c.i++]) o.arrayLayerCount = c.a[c.i++];
-    if (c.a[c.i++]) o.swizzle = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
+    if (A[I++]) o.format = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.dimension = E_GPUTextureViewDimension[A[I++]];
+    if (A[I++]) o.usage = A[I++];
+    if (A[I++]) o.aspect = E_GPUTextureAspect[A[I++]];
+    if (A[I++]) o.baseMipLevel = A[I++];
+    if (A[I++]) o.mipLevelCount = A[I++];
+    if (A[I++]) o.baseArrayLayer = A[I++];
+    if (A[I++]) o.arrayLayerCount = A[I++];
+    if (A[I++]) o.swizzle = S[A[I++]];
     return o;
   };
-  const D_GPUExternalTextureDescriptor = (c) => {
+  const D_GPUExternalTextureDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.source = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.colorSpace = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
+    o.source = S[A[I++]];
+    if (A[I++]) o.colorSpace = S[A[I++]];
     return o;
   };
-  const D_GPUSamplerDescriptor = (c) => {
+  const D_GPUSamplerDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.addressModeU = E_GPUAddressMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.addressModeV = E_GPUAddressMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.addressModeW = E_GPUAddressMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.magFilter = E_GPUFilterMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.minFilter = E_GPUFilterMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.mipmapFilter = E_GPUMipmapFilterMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.lodMinClamp = c.a[c.i++];
-    if (c.a[c.i++]) o.lodMaxClamp = c.a[c.i++];
-    if (c.a[c.i++]) o.compare = E_GPUCompareFunction[c.a[c.i++]];
-    if (c.a[c.i++]) o.maxAnisotropy = c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    if (A[I++]) o.addressModeU = E_GPUAddressMode[A[I++]];
+    if (A[I++]) o.addressModeV = E_GPUAddressMode[A[I++]];
+    if (A[I++]) o.addressModeW = E_GPUAddressMode[A[I++]];
+    if (A[I++]) o.magFilter = E_GPUFilterMode[A[I++]];
+    if (A[I++]) o.minFilter = E_GPUFilterMode[A[I++]];
+    if (A[I++]) o.mipmapFilter = E_GPUMipmapFilterMode[A[I++]];
+    if (A[I++]) o.lodMinClamp = A[I++];
+    if (A[I++]) o.lodMaxClamp = A[I++];
+    if (A[I++]) o.compare = E_GPUCompareFunction[A[I++]];
+    if (A[I++]) o.maxAnisotropy = A[I++];
     return o;
   };
-  const D_GPUBindGroupLayoutDescriptor = (c) => {
+  const D_GPUBindGroupLayoutDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.entries = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUBindGroupLayoutEntry(c); return r; })();
+    if (A[I++]) o.label = S[A[I++]];
+    o.entries = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUBindGroupLayoutEntry(); return r; })();
     return o;
   };
-  const D_GPUBindGroupLayoutEntry = (c) => {
+  const D_GPUBindGroupLayoutEntry = () => {
     const o = {};
-    o.binding = c.a[c.i++];
-    o.visibility = c.a[c.i++];
-    if (c.a[c.i++]) o.buffer = D_GPUBufferBindingLayout(c);
-    if (c.a[c.i++]) o.sampler = D_GPUSamplerBindingLayout(c);
-    if (c.a[c.i++]) o.texture = D_GPUTextureBindingLayout(c);
-    if (c.a[c.i++]) o.storageTexture = D_GPUStorageTextureBindingLayout(c);
-    if (c.a[c.i++]) o.externalTexture = D_GPUExternalTextureBindingLayout(c);
+    o.binding = A[I++];
+    o.visibility = A[I++];
+    if (A[I++]) o.buffer = D_GPUBufferBindingLayout();
+    if (A[I++]) o.sampler = D_GPUSamplerBindingLayout();
+    if (A[I++]) o.texture = D_GPUTextureBindingLayout();
+    if (A[I++]) o.storageTexture = D_GPUStorageTextureBindingLayout();
+    if (A[I++]) o.externalTexture = D_GPUExternalTextureBindingLayout();
     return o;
   };
-  const D_GPUBufferBindingLayout = (c) => {
+  const D_GPUBufferBindingLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.type = E_GPUBufferBindingType[c.a[c.i++]];
-    if (c.a[c.i++]) o.hasDynamicOffset = !!c.a[c.i++];
-    if (c.a[c.i++]) o.minBindingSize = c.a[c.i++];
+    if (A[I++]) o.type = E_GPUBufferBindingType[A[I++]];
+    if (A[I++]) o.hasDynamicOffset = !!A[I++];
+    if (A[I++]) o.minBindingSize = A[I++];
     return o;
   };
-  const D_GPUSamplerBindingLayout = (c) => {
+  const D_GPUSamplerBindingLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.type = E_GPUSamplerBindingType[c.a[c.i++]];
+    if (A[I++]) o.type = E_GPUSamplerBindingType[A[I++]];
     return o;
   };
-  const D_GPUTextureBindingLayout = (c) => {
+  const D_GPUTextureBindingLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.sampleType = E_GPUTextureSampleType[c.a[c.i++]];
-    if (c.a[c.i++]) o.viewDimension = E_GPUTextureViewDimension[c.a[c.i++]];
-    if (c.a[c.i++]) o.multisampled = !!c.a[c.i++];
+    if (A[I++]) o.sampleType = E_GPUTextureSampleType[A[I++]];
+    if (A[I++]) o.viewDimension = E_GPUTextureViewDimension[A[I++]];
+    if (A[I++]) o.multisampled = !!A[I++];
     return o;
   };
-  const D_GPUStorageTextureBindingLayout = (c) => {
+  const D_GPUStorageTextureBindingLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.access = E_GPUStorageTextureAccess[c.a[c.i++]];
-    o.format = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.viewDimension = E_GPUTextureViewDimension[c.a[c.i++]];
+    if (A[I++]) o.access = E_GPUStorageTextureAccess[A[I++]];
+    o.format = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.viewDimension = E_GPUTextureViewDimension[A[I++]];
     return o;
   };
-  const D_GPUExternalTextureBindingLayout = (c) => {
+  const D_GPUExternalTextureBindingLayout = () => {
     const o = {};
     return o;
   };
-  const D_GPUBindGroupDescriptor = (c) => {
+  const D_GPUBindGroupDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.layout = H(c.a[c.i++]);
-    o.entries = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUBindGroupEntry(c); return r; })();
+    if (A[I++]) o.label = S[A[I++]];
+    o.layout = H(A[I++]);
+    o.entries = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUBindGroupEntry(); return r; })();
     return o;
   };
-  const D_GPUBindGroupEntry = (c) => {
+  const D_GPUBindGroupEntry = () => {
     const o = {};
-    o.binding = c.a[c.i++];
-    o.resource = c.s[c.a[c.i++]];
+    o.binding = A[I++];
+    o.resource = S[A[I++]];
     return o;
   };
-  const D_GPUBufferBinding = (c) => {
+  const D_GPUBufferBinding = () => {
     const o = {};
-    o.buffer = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.offset = c.a[c.i++];
-    if (c.a[c.i++]) o.size = c.a[c.i++];
+    o.buffer = H(A[I++]);
+    if (A[I++]) o.offset = A[I++];
+    if (A[I++]) o.size = A[I++];
     return o;
   };
-  const D_GPUPipelineLayoutDescriptor = (c) => {
+  const D_GPUPipelineLayoutDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.bindGroupLayouts = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(c.a[c.i++]); return r; })();
-    if (c.a[c.i++]) o.immediateSize = c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.bindGroupLayouts = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })();
+    if (A[I++]) o.immediateSize = A[I++];
     return o;
   };
-  const D_GPUShaderModuleDescriptor = (c) => {
+  const D_GPUShaderModuleDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.code = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.compilationHints = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUShaderModuleCompilationHint(c); return r; })();
+    if (A[I++]) o.label = S[A[I++]];
+    o.code = S[A[I++]];
+    if (A[I++]) o.compilationHints = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUShaderModuleCompilationHint(); return r; })();
     return o;
   };
-  const D_GPUShaderModuleCompilationHint = (c) => {
+  const D_GPUShaderModuleCompilationHint = () => {
     const o = {};
-    o.entryPoint = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.layout = E_GPUAutoLayoutMode[c.a[c.i++]];
+    o.entryPoint = S[A[I++]];
+    if (A[I++]) o.layout = E_GPUAutoLayoutMode[A[I++]];
     return o;
   };
-  const D_GPUPipelineErrorInit = (c) => {
+  const D_GPUPipelineErrorInit = () => {
     const o = {};
-    o.reason = E_GPUPipelineErrorReason[c.a[c.i++]];
+    o.reason = E_GPUPipelineErrorReason[A[I++]];
     return o;
   };
-  const D_GPUPipelineDescriptorBase = (c) => {
+  const D_GPUPipelineDescriptorBase = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.layout = E_GPUAutoLayoutMode[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
+    o.layout = E_GPUAutoLayoutMode[A[I++]];
     return o;
   };
-  const D_GPUProgrammableStage = (c) => {
+  const D_GPUProgrammableStage = () => {
     const o = {};
-    o.module = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.entryPoint = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.constants = c.s[c.a[c.i++]];
+    o.module = H(A[I++]);
+    if (A[I++]) o.entryPoint = S[A[I++]];
+    if (A[I++]) o.constants = S[A[I++]];
     return o;
   };
-  const D_GPUComputePipelineDescriptor = (c) => {
+  const D_GPUComputePipelineDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.layout = E_GPUAutoLayoutMode[c.a[c.i++]];
-    o.compute = D_GPUProgrammableStage(c);
+    if (A[I++]) o.label = S[A[I++]];
+    o.layout = E_GPUAutoLayoutMode[A[I++]];
+    o.compute = D_GPUProgrammableStage();
     return o;
   };
-  const D_GPURenderPipelineDescriptor = (c) => {
+  const D_GPURenderPipelineDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.layout = E_GPUAutoLayoutMode[c.a[c.i++]];
-    o.vertex = D_GPUVertexState(c);
-    if (c.a[c.i++]) o.primitive = D_GPUPrimitiveState(c);
-    if (c.a[c.i++]) o.depthStencil = D_GPUDepthStencilState(c);
-    if (c.a[c.i++]) o.multisample = D_GPUMultisampleState(c);
-    if (c.a[c.i++]) o.fragment = D_GPUFragmentState(c);
+    if (A[I++]) o.label = S[A[I++]];
+    o.layout = E_GPUAutoLayoutMode[A[I++]];
+    o.vertex = D_GPUVertexState();
+    if (A[I++]) o.primitive = D_GPUPrimitiveState();
+    if (A[I++]) o.depthStencil = D_GPUDepthStencilState();
+    if (A[I++]) o.multisample = D_GPUMultisampleState();
+    if (A[I++]) o.fragment = D_GPUFragmentState();
     return o;
   };
-  const D_GPUPrimitiveState = (c) => {
+  const D_GPUPrimitiveState = () => {
     const o = {};
-    if (c.a[c.i++]) o.topology = E_GPUPrimitiveTopology[c.a[c.i++]];
-    if (c.a[c.i++]) o.stripIndexFormat = E_GPUIndexFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.frontFace = E_GPUFrontFace[c.a[c.i++]];
-    if (c.a[c.i++]) o.cullMode = E_GPUCullMode[c.a[c.i++]];
-    if (c.a[c.i++]) o.unclippedDepth = !!c.a[c.i++];
+    if (A[I++]) o.topology = E_GPUPrimitiveTopology[A[I++]];
+    if (A[I++]) o.stripIndexFormat = E_GPUIndexFormat[A[I++]];
+    if (A[I++]) o.frontFace = E_GPUFrontFace[A[I++]];
+    if (A[I++]) o.cullMode = E_GPUCullMode[A[I++]];
+    if (A[I++]) o.unclippedDepth = !!A[I++];
     return o;
   };
-  const D_GPUMultisampleState = (c) => {
+  const D_GPUMultisampleState = () => {
     const o = {};
-    if (c.a[c.i++]) o.count = c.a[c.i++];
-    if (c.a[c.i++]) o.mask = c.a[c.i++];
-    if (c.a[c.i++]) o.alphaToCoverageEnabled = !!c.a[c.i++];
+    if (A[I++]) o.count = A[I++];
+    if (A[I++]) o.mask = A[I++];
+    if (A[I++]) o.alphaToCoverageEnabled = !!A[I++];
     return o;
   };
-  const D_GPUFragmentState = (c) => {
+  const D_GPUFragmentState = () => {
     const o = {};
-    o.module = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.entryPoint = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.constants = c.s[c.a[c.i++]];
-    o.targets = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUColorTargetState(c); return r; })();
+    o.module = H(A[I++]);
+    if (A[I++]) o.entryPoint = S[A[I++]];
+    if (A[I++]) o.constants = S[A[I++]];
+    o.targets = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUColorTargetState(); return r; })();
     return o;
   };
-  const D_GPUColorTargetState = (c) => {
+  const D_GPUColorTargetState = () => {
     const o = {};
-    o.format = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.blend = D_GPUBlendState(c);
-    if (c.a[c.i++]) o.writeMask = c.a[c.i++];
+    o.format = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.blend = D_GPUBlendState();
+    if (A[I++]) o.writeMask = A[I++];
     return o;
   };
-  const D_GPUBlendState = (c) => {
+  const D_GPUBlendState = () => {
     const o = {};
-    o.color = D_GPUBlendComponent(c);
-    o.alpha = D_GPUBlendComponent(c);
+    o.color = D_GPUBlendComponent();
+    o.alpha = D_GPUBlendComponent();
     return o;
   };
-  const D_GPUBlendComponent = (c) => {
+  const D_GPUBlendComponent = () => {
     const o = {};
-    if (c.a[c.i++]) o.operation = E_GPUBlendOperation[c.a[c.i++]];
-    if (c.a[c.i++]) o.srcFactor = E_GPUBlendFactor[c.a[c.i++]];
-    if (c.a[c.i++]) o.dstFactor = E_GPUBlendFactor[c.a[c.i++]];
+    if (A[I++]) o.operation = E_GPUBlendOperation[A[I++]];
+    if (A[I++]) o.srcFactor = E_GPUBlendFactor[A[I++]];
+    if (A[I++]) o.dstFactor = E_GPUBlendFactor[A[I++]];
     return o;
   };
-  const D_GPUDepthStencilState = (c) => {
+  const D_GPUDepthStencilState = () => {
     const o = {};
-    o.format = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.depthWriteEnabled = !!c.a[c.i++];
-    if (c.a[c.i++]) o.depthCompare = E_GPUCompareFunction[c.a[c.i++]];
-    if (c.a[c.i++]) o.stencilFront = D_GPUStencilFaceState(c);
-    if (c.a[c.i++]) o.stencilBack = D_GPUStencilFaceState(c);
-    if (c.a[c.i++]) o.stencilReadMask = c.a[c.i++];
-    if (c.a[c.i++]) o.stencilWriteMask = c.a[c.i++];
-    if (c.a[c.i++]) o.depthBias = c.a[c.i++];
-    if (c.a[c.i++]) o.depthBiasSlopeScale = c.a[c.i++];
-    if (c.a[c.i++]) o.depthBiasClamp = c.a[c.i++];
+    o.format = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.depthWriteEnabled = !!A[I++];
+    if (A[I++]) o.depthCompare = E_GPUCompareFunction[A[I++]];
+    if (A[I++]) o.stencilFront = D_GPUStencilFaceState();
+    if (A[I++]) o.stencilBack = D_GPUStencilFaceState();
+    if (A[I++]) o.stencilReadMask = A[I++];
+    if (A[I++]) o.stencilWriteMask = A[I++];
+    if (A[I++]) o.depthBias = A[I++];
+    if (A[I++]) o.depthBiasSlopeScale = A[I++];
+    if (A[I++]) o.depthBiasClamp = A[I++];
     return o;
   };
-  const D_GPUStencilFaceState = (c) => {
+  const D_GPUStencilFaceState = () => {
     const o = {};
-    if (c.a[c.i++]) o.compare = E_GPUCompareFunction[c.a[c.i++]];
-    if (c.a[c.i++]) o.failOp = E_GPUStencilOperation[c.a[c.i++]];
-    if (c.a[c.i++]) o.depthFailOp = E_GPUStencilOperation[c.a[c.i++]];
-    if (c.a[c.i++]) o.passOp = E_GPUStencilOperation[c.a[c.i++]];
+    if (A[I++]) o.compare = E_GPUCompareFunction[A[I++]];
+    if (A[I++]) o.failOp = E_GPUStencilOperation[A[I++]];
+    if (A[I++]) o.depthFailOp = E_GPUStencilOperation[A[I++]];
+    if (A[I++]) o.passOp = E_GPUStencilOperation[A[I++]];
     return o;
   };
-  const D_GPUVertexState = (c) => {
+  const D_GPUVertexState = () => {
     const o = {};
-    o.module = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.entryPoint = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.constants = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.buffers = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUVertexBufferLayout(c); return r; })();
+    o.module = H(A[I++]);
+    if (A[I++]) o.entryPoint = S[A[I++]];
+    if (A[I++]) o.constants = S[A[I++]];
+    if (A[I++]) o.buffers = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUVertexBufferLayout(); return r; })();
     return o;
   };
-  const D_GPUVertexBufferLayout = (c) => {
+  const D_GPUVertexBufferLayout = () => {
     const o = {};
-    o.arrayStride = c.a[c.i++];
-    if (c.a[c.i++]) o.stepMode = E_GPUVertexStepMode[c.a[c.i++]];
-    o.attributes = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUVertexAttribute(c); return r; })();
+    o.arrayStride = A[I++];
+    if (A[I++]) o.stepMode = E_GPUVertexStepMode[A[I++]];
+    o.attributes = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPUVertexAttribute(); return r; })();
     return o;
   };
-  const D_GPUVertexAttribute = (c) => {
+  const D_GPUVertexAttribute = () => {
     const o = {};
-    o.format = E_GPUVertexFormat[c.a[c.i++]];
-    o.offset = c.a[c.i++];
-    o.shaderLocation = c.a[c.i++];
+    o.format = E_GPUVertexFormat[A[I++]];
+    o.offset = A[I++];
+    o.shaderLocation = A[I++];
     return o;
   };
-  const D_GPUTexelCopyBufferLayout = (c) => {
+  const D_GPUTexelCopyBufferLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.offset = c.a[c.i++];
-    if (c.a[c.i++]) o.bytesPerRow = c.a[c.i++];
-    if (c.a[c.i++]) o.rowsPerImage = c.a[c.i++];
+    if (A[I++]) o.offset = A[I++];
+    if (A[I++]) o.bytesPerRow = A[I++];
+    if (A[I++]) o.rowsPerImage = A[I++];
     return o;
   };
-  const D_GPUTexelCopyBufferInfo = (c) => {
+  const D_GPUTexelCopyBufferInfo = () => {
     const o = {};
-    if (c.a[c.i++]) o.offset = c.a[c.i++];
-    if (c.a[c.i++]) o.bytesPerRow = c.a[c.i++];
-    if (c.a[c.i++]) o.rowsPerImage = c.a[c.i++];
-    o.buffer = H(c.a[c.i++]);
+    if (A[I++]) o.offset = A[I++];
+    if (A[I++]) o.bytesPerRow = A[I++];
+    if (A[I++]) o.rowsPerImage = A[I++];
+    o.buffer = H(A[I++]);
     return o;
   };
-  const D_GPUTexelCopyTextureInfo = (c) => {
+  const D_GPUTexelCopyTextureInfo = () => {
     const o = {};
-    o.texture = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.mipLevel = c.a[c.i++];
-    if (c.a[c.i++]) o.origin = D_GPUOrigin3DDict(c);
-    if (c.a[c.i++]) o.aspect = E_GPUTextureAspect[c.a[c.i++]];
+    o.texture = H(A[I++]);
+    if (A[I++]) o.mipLevel = A[I++];
+    if (A[I++]) o.origin = D_GPUOrigin3DDict();
+    if (A[I++]) o.aspect = E_GPUTextureAspect[A[I++]];
     return o;
   };
-  const D_GPUCopyExternalImageDestInfo = (c) => {
+  const D_GPUCopyExternalImageDestInfo = () => {
     const o = {};
-    o.texture = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.mipLevel = c.a[c.i++];
-    if (c.a[c.i++]) o.origin = D_GPUOrigin3DDict(c);
-    if (c.a[c.i++]) o.aspect = E_GPUTextureAspect[c.a[c.i++]];
-    if (c.a[c.i++]) o.colorSpace = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.premultipliedAlpha = !!c.a[c.i++];
+    o.texture = H(A[I++]);
+    if (A[I++]) o.mipLevel = A[I++];
+    if (A[I++]) o.origin = D_GPUOrigin3DDict();
+    if (A[I++]) o.aspect = E_GPUTextureAspect[A[I++]];
+    if (A[I++]) o.colorSpace = S[A[I++]];
+    if (A[I++]) o.premultipliedAlpha = !!A[I++];
     return o;
   };
-  const D_GPUCopyExternalImageSourceInfo = (c) => {
+  const D_GPUCopyExternalImageSourceInfo = () => {
     const o = {};
-    o.source = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.origin = D_GPUOrigin2DDict(c);
-    if (c.a[c.i++]) o.flipY = !!c.a[c.i++];
+    o.source = S[A[I++]];
+    if (A[I++]) o.origin = D_GPUOrigin2DDict();
+    if (A[I++]) o.flipY = !!A[I++];
     return o;
   };
-  const D_GPUCommandBufferDescriptor = (c) => {
+  const D_GPUCommandBufferDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
     return o;
   };
-  const D_GPUCommandEncoderDescriptor = (c) => {
+  const D_GPUCommandEncoderDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
     return o;
   };
-  const D_GPUComputePassTimestampWrites = (c) => {
+  const D_GPUComputePassTimestampWrites = () => {
     const o = {};
-    o.querySet = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.beginningOfPassWriteIndex = c.a[c.i++];
-    if (c.a[c.i++]) o.endOfPassWriteIndex = c.a[c.i++];
+    o.querySet = H(A[I++]);
+    if (A[I++]) o.beginningOfPassWriteIndex = A[I++];
+    if (A[I++]) o.endOfPassWriteIndex = A[I++];
     return o;
   };
-  const D_GPUComputePassDescriptor = (c) => {
+  const D_GPUComputePassDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.timestampWrites = D_GPUComputePassTimestampWrites(c);
+    if (A[I++]) o.label = S[A[I++]];
+    if (A[I++]) o.timestampWrites = D_GPUComputePassTimestampWrites();
     return o;
   };
-  const D_GPURenderPassTimestampWrites = (c) => {
+  const D_GPURenderPassTimestampWrites = () => {
     const o = {};
-    o.querySet = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.beginningOfPassWriteIndex = c.a[c.i++];
-    if (c.a[c.i++]) o.endOfPassWriteIndex = c.a[c.i++];
+    o.querySet = H(A[I++]);
+    if (A[I++]) o.beginningOfPassWriteIndex = A[I++];
+    if (A[I++]) o.endOfPassWriteIndex = A[I++];
     return o;
   };
-  const D_GPURenderPassDescriptor = (c) => {
+  const D_GPURenderPassDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.colorAttachments = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPURenderPassColorAttachment(c); return r; })();
-    if (c.a[c.i++]) o.depthStencilAttachment = D_GPURenderPassDepthStencilAttachment(c);
-    if (c.a[c.i++]) o.occlusionQuerySet = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.timestampWrites = D_GPURenderPassTimestampWrites(c);
-    if (c.a[c.i++]) o.maxDrawCount = c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.colorAttachments = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = D_GPURenderPassColorAttachment(); return r; })();
+    if (A[I++]) o.depthStencilAttachment = D_GPURenderPassDepthStencilAttachment();
+    if (A[I++]) o.occlusionQuerySet = H(A[I++]);
+    if (A[I++]) o.timestampWrites = D_GPURenderPassTimestampWrites();
+    if (A[I++]) o.maxDrawCount = A[I++];
     return o;
   };
-  const D_GPURenderPassColorAttachment = (c) => {
+  const D_GPURenderPassColorAttachment = () => {
     const o = {};
-    o.view = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.depthSlice = c.a[c.i++];
-    if (c.a[c.i++]) o.resolveTarget = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.clearValue = D_GPUColorDict(c);
-    o.loadOp = E_GPULoadOp[c.a[c.i++]];
-    o.storeOp = E_GPUStoreOp[c.a[c.i++]];
+    o.view = H(A[I++]);
+    if (A[I++]) o.depthSlice = A[I++];
+    if (A[I++]) o.resolveTarget = H(A[I++]);
+    if (A[I++]) o.clearValue = D_GPUColorDict();
+    o.loadOp = E_GPULoadOp[A[I++]];
+    o.storeOp = E_GPUStoreOp[A[I++]];
     return o;
   };
-  const D_GPURenderPassDepthStencilAttachment = (c) => {
+  const D_GPURenderPassDepthStencilAttachment = () => {
     const o = {};
-    o.view = H(c.a[c.i++]);
-    if (c.a[c.i++]) o.depthClearValue = c.a[c.i++];
-    if (c.a[c.i++]) o.depthLoadOp = E_GPULoadOp[c.a[c.i++]];
-    if (c.a[c.i++]) o.depthStoreOp = E_GPUStoreOp[c.a[c.i++]];
-    if (c.a[c.i++]) o.depthReadOnly = !!c.a[c.i++];
-    if (c.a[c.i++]) o.stencilClearValue = c.a[c.i++];
-    if (c.a[c.i++]) o.stencilLoadOp = E_GPULoadOp[c.a[c.i++]];
-    if (c.a[c.i++]) o.stencilStoreOp = E_GPUStoreOp[c.a[c.i++]];
-    if (c.a[c.i++]) o.stencilReadOnly = !!c.a[c.i++];
+    o.view = H(A[I++]);
+    if (A[I++]) o.depthClearValue = A[I++];
+    if (A[I++]) o.depthLoadOp = E_GPULoadOp[A[I++]];
+    if (A[I++]) o.depthStoreOp = E_GPUStoreOp[A[I++]];
+    if (A[I++]) o.depthReadOnly = !!A[I++];
+    if (A[I++]) o.stencilClearValue = A[I++];
+    if (A[I++]) o.stencilLoadOp = E_GPULoadOp[A[I++]];
+    if (A[I++]) o.stencilStoreOp = E_GPUStoreOp[A[I++]];
+    if (A[I++]) o.stencilReadOnly = !!A[I++];
     return o;
   };
-  const D_GPURenderPassLayout = (c) => {
+  const D_GPURenderPassLayout = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.colorFormats = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[c.a[c.i++]]; return r; })();
-    if (c.a[c.i++]) o.depthStencilFormat = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.sampleCount = c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.colorFormats = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[A[I++]]; return r; })();
+    if (A[I++]) o.depthStencilFormat = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.sampleCount = A[I++];
     return o;
   };
-  const D_GPURenderBundleDescriptor = (c) => {
+  const D_GPURenderBundleDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
     return o;
   };
-  const D_GPURenderBundleEncoderDescriptor = (c) => {
+  const D_GPURenderBundleEncoderDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.colorFormats = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[c.a[c.i++]]; return r; })();
-    if (c.a[c.i++]) o.depthStencilFormat = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.sampleCount = c.a[c.i++];
-    if (c.a[c.i++]) o.depthReadOnly = !!c.a[c.i++];
-    if (c.a[c.i++]) o.stencilReadOnly = !!c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.colorFormats = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[A[I++]]; return r; })();
+    if (A[I++]) o.depthStencilFormat = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.sampleCount = A[I++];
+    if (A[I++]) o.depthReadOnly = !!A[I++];
+    if (A[I++]) o.stencilReadOnly = !!A[I++];
     return o;
   };
-  const D_GPUQueueDescriptor = (c) => {
+  const D_GPUQueueDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
+    if (A[I++]) o.label = S[A[I++]];
     return o;
   };
-  const D_GPUQuerySetDescriptor = (c) => {
+  const D_GPUQuerySetDescriptor = () => {
     const o = {};
-    if (c.a[c.i++]) o.label = c.s[c.a[c.i++]];
-    o.type = E_GPUQueryType[c.a[c.i++]];
-    o.count = c.a[c.i++];
+    if (A[I++]) o.label = S[A[I++]];
+    o.type = E_GPUQueryType[A[I++]];
+    o.count = A[I++];
     return o;
   };
-  const D_GPUCanvasToneMapping = (c) => {
+  const D_GPUCanvasToneMapping = () => {
     const o = {};
-    if (c.a[c.i++]) o.mode = E_GPUCanvasToneMappingMode[c.a[c.i++]];
+    if (A[I++]) o.mode = E_GPUCanvasToneMappingMode[A[I++]];
     return o;
   };
-  const D_GPUCanvasConfiguration = (c) => {
+  const D_GPUCanvasConfiguration = () => {
     const o = {};
-    o.device = H(c.a[c.i++]);
-    o.format = E_GPUTextureFormat[c.a[c.i++]];
-    if (c.a[c.i++]) o.usage = c.a[c.i++];
-    if (c.a[c.i++]) o.viewFormats = (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[c.a[c.i++]]; return r; })();
-    if (c.a[c.i++]) o.colorSpace = c.s[c.a[c.i++]];
-    if (c.a[c.i++]) o.toneMapping = D_GPUCanvasToneMapping(c);
-    if (c.a[c.i++]) o.alphaMode = E_GPUCanvasAlphaMode[c.a[c.i++]];
+    o.device = H(A[I++]);
+    o.format = E_GPUTextureFormat[A[I++]];
+    if (A[I++]) o.usage = A[I++];
+    if (A[I++]) o.viewFormats = (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = E_GPUTextureFormat[A[I++]]; return r; })();
+    if (A[I++]) o.colorSpace = S[A[I++]];
+    if (A[I++]) o.toneMapping = D_GPUCanvasToneMapping();
+    if (A[I++]) o.alphaMode = E_GPUCanvasAlphaMode[A[I++]];
     return o;
   };
-  const D_GPUUncapturedErrorEventInit = (c) => {
+  const D_GPUUncapturedErrorEventInit = () => {
     const o = {};
-    o.error = H(c.a[c.i++]);
+    o.error = H(A[I++]);
     return o;
   };
-  const D_GPUColorDict = (c) => {
+  const D_GPUColorDict = () => {
     const o = {};
-    o.r = c.a[c.i++];
-    o.g = c.a[c.i++];
-    o.b = c.a[c.i++];
-    o.a = c.a[c.i++];
+    o.r = A[I++];
+    o.g = A[I++];
+    o.b = A[I++];
+    o.a = A[I++];
     return o;
   };
-  const D_GPUOrigin2DDict = (c) => {
+  const D_GPUOrigin2DDict = () => {
     const o = {};
-    if (c.a[c.i++]) o.x = c.a[c.i++];
-    if (c.a[c.i++]) o.y = c.a[c.i++];
+    if (A[I++]) o.x = A[I++];
+    if (A[I++]) o.y = A[I++];
     return o;
   };
-  const D_GPUOrigin3DDict = (c) => {
+  const D_GPUOrigin3DDict = () => {
     const o = {};
-    if (c.a[c.i++]) o.x = c.a[c.i++];
-    if (c.a[c.i++]) o.y = c.a[c.i++];
-    if (c.a[c.i++]) o.z = c.a[c.i++];
+    if (A[I++]) o.x = A[I++];
+    if (A[I++]) o.y = A[I++];
+    if (A[I++]) o.z = A[I++];
     return o;
   };
-  const D_GPUExtent3DDict = (c) => {
+  const D_GPUExtent3DDict = () => {
     const o = {};
-    o.width = c.a[c.i++];
-    if (c.a[c.i++]) o.height = c.a[c.i++];
-    if (c.a[c.i++]) o.depthOrArrayLayers = c.a[c.i++];
+    o.width = A[I++];
+    if (A[I++]) o.height = A[I++];
+    if (A[I++]) o.depthOrArrayLayers = A[I++];
     return o;
   };
   const M = [
-    /* 0 GPUDevice.destroy */ (c) => H(c.a[c.i++]).destroy(),
-    /* 1 GPUDevice.createBuffer */ (c) => REG(H(c.a[c.i++]).createBuffer(D_GPUBufferDescriptor(c))),
-    /* 2 GPUDevice.createTexture */ (c) => REG(H(c.a[c.i++]).createTexture(D_GPUTextureDescriptor(c))),
-    /* 3 GPUDevice.createSampler */ (c) => REG(H(c.a[c.i++]).createSampler((c.a[c.i++] ? D_GPUSamplerDescriptor(c) : undefined))),
-    /* 4 GPUDevice.importExternalTexture */ (c) => REG(H(c.a[c.i++]).importExternalTexture(D_GPUExternalTextureDescriptor(c))),
-    /* 5 GPUDevice.createBindGroupLayout */ (c) => REG(H(c.a[c.i++]).createBindGroupLayout(D_GPUBindGroupLayoutDescriptor(c))),
-    /* 6 GPUDevice.createPipelineLayout */ (c) => REG(H(c.a[c.i++]).createPipelineLayout(D_GPUPipelineLayoutDescriptor(c))),
-    /* 7 GPUDevice.createBindGroup */ (c) => REG(H(c.a[c.i++]).createBindGroup(D_GPUBindGroupDescriptor(c))),
-    /* 8 GPUDevice.createShaderModule */ (c) => REG(H(c.a[c.i++]).createShaderModule(D_GPUShaderModuleDescriptor(c))),
-    /* 9 GPUDevice.createComputePipeline */ (c) => REG(H(c.a[c.i++]).createComputePipeline(D_GPUComputePipelineDescriptor(c))),
-    /* 10 GPUDevice.createRenderPipeline */ (c) => REG(H(c.a[c.i++]).createRenderPipeline(D_GPURenderPipelineDescriptor(c))),
-    /* 11 GPUDevice.createCommandEncoder */ (c) => REG(H(c.a[c.i++]).createCommandEncoder((c.a[c.i++] ? D_GPUCommandEncoderDescriptor(c) : undefined))),
-    /* 12 GPUDevice.createRenderBundleEncoder */ (c) => REG(H(c.a[c.i++]).createRenderBundleEncoder(D_GPURenderBundleEncoderDescriptor(c))),
-    /* 13 GPUDevice.createQuerySet */ (c) => REG(H(c.a[c.i++]).createQuerySet(D_GPUQuerySetDescriptor(c))),
-    /* 14 GPUDevice.pushErrorScope */ (c) => H(c.a[c.i++]).pushErrorScope(E_GPUErrorFilter[c.a[c.i++]]),
-    /* 15 GPUBuffer.unmap */ (c) => H(c.a[c.i++]).unmap(),
-    /* 16 GPUBuffer.destroy */ (c) => H(c.a[c.i++]).destroy(),
-    /* 17 GPUTexture.createView */ (c) => REG(H(c.a[c.i++]).createView((c.a[c.i++] ? D_GPUTextureViewDescriptor(c) : undefined))),
-    /* 18 GPUTexture.destroy */ (c) => H(c.a[c.i++]).destroy(),
-    /* 19 GPUComputePipeline.getBindGroupLayout */ (c) => REG(H(c.a[c.i++]).getBindGroupLayout(c.a[c.i++])),
-    /* 20 GPURenderPipeline.getBindGroupLayout */ (c) => REG(H(c.a[c.i++]).getBindGroupLayout(c.a[c.i++])),
-    /* 21 GPUCommandEncoder.beginRenderPass */ (c) => REG(H(c.a[c.i++]).beginRenderPass(D_GPURenderPassDescriptor(c))),
-    /* 22 GPUCommandEncoder.beginComputePass */ (c) => REG(H(c.a[c.i++]).beginComputePass((c.a[c.i++] ? D_GPUComputePassDescriptor(c) : undefined))),
-    /* 23 GPUCommandEncoder.copyBufferToBuffer */ (c) => H(c.a[c.i++]).copyBufferToBuffer(H(c.a[c.i++]), H(c.a[c.i++]), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 24 GPUCommandEncoder.copyBufferToTexture */ (c) => H(c.a[c.i++]).copyBufferToTexture(D_GPUTexelCopyBufferInfo(c), D_GPUTexelCopyTextureInfo(c), D_GPUExtent3DDict(c)),
-    /* 25 GPUCommandEncoder.copyTextureToBuffer */ (c) => H(c.a[c.i++]).copyTextureToBuffer(D_GPUTexelCopyTextureInfo(c), D_GPUTexelCopyBufferInfo(c), D_GPUExtent3DDict(c)),
-    /* 26 GPUCommandEncoder.copyTextureToTexture */ (c) => H(c.a[c.i++]).copyTextureToTexture(D_GPUTexelCopyTextureInfo(c), D_GPUTexelCopyTextureInfo(c), D_GPUExtent3DDict(c)),
-    /* 27 GPUCommandEncoder.clearBuffer */ (c) => H(c.a[c.i++]).clearBuffer(H(c.a[c.i++]), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 28 GPUCommandEncoder.resolveQuerySet */ (c) => H(c.a[c.i++]).resolveQuerySet(H(c.a[c.i++]), c.a[c.i++], c.a[c.i++], H(c.a[c.i++]), c.a[c.i++]),
-    /* 29 GPUCommandEncoder.finish */ (c) => REG(H(c.a[c.i++]).finish((c.a[c.i++] ? D_GPUCommandBufferDescriptor(c) : undefined))),
-    /* 30 GPUCommandEncoder.pushDebugGroup */ (c) => H(c.a[c.i++]).pushDebugGroup(c.s[c.a[c.i++]]),
-    /* 31 GPUCommandEncoder.popDebugGroup */ (c) => H(c.a[c.i++]).popDebugGroup(),
-    /* 32 GPUCommandEncoder.insertDebugMarker */ (c) => H(c.a[c.i++]).insertDebugMarker(c.s[c.a[c.i++]]),
-    /* 33 GPUComputePassEncoder.setPipeline */ (c) => H(c.a[c.i++]).setPipeline(H(c.a[c.i++])),
-    /* 34 GPUComputePassEncoder.dispatchWorkgroups */ (c) => H(c.a[c.i++]).dispatchWorkgroups(c.a[c.i++], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 35 GPUComputePassEncoder.dispatchWorkgroupsIndirect */ (c) => H(c.a[c.i++]).dispatchWorkgroupsIndirect(H(c.a[c.i++]), c.a[c.i++]),
-    /* 36 GPUComputePassEncoder.end */ (c) => H(c.a[c.i++]).end(),
-    /* 37 GPUComputePassEncoder.pushDebugGroup */ (c) => H(c.a[c.i++]).pushDebugGroup(c.s[c.a[c.i++]]),
-    /* 38 GPUComputePassEncoder.popDebugGroup */ (c) => H(c.a[c.i++]).popDebugGroup(),
-    /* 39 GPUComputePassEncoder.insertDebugMarker */ (c) => H(c.a[c.i++]).insertDebugMarker(c.s[c.a[c.i++]]),
-    /* 40 GPUComputePassEncoder.setBindGroup */ (c) => H(c.a[c.i++]).setBindGroup(c.a[c.i++], H(c.a[c.i++]), (c.a[c.i++] ? (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = c.a[c.i++]; return r; })() : undefined)),
-    /* 41 GPUComputePassEncoder.setImmediates */ (c) => H(c.a[c.i++]).setImmediates(c.a[c.i++], c.s[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 42 GPURenderPassEncoder.setViewport */ (c) => H(c.a[c.i++]).setViewport(c.a[c.i++], c.a[c.i++], c.a[c.i++], c.a[c.i++], c.a[c.i++], c.a[c.i++]),
-    /* 43 GPURenderPassEncoder.setScissorRect */ (c) => H(c.a[c.i++]).setScissorRect(c.a[c.i++], c.a[c.i++], c.a[c.i++], c.a[c.i++]),
-    /* 44 GPURenderPassEncoder.setBlendConstant */ (c) => H(c.a[c.i++]).setBlendConstant(D_GPUColorDict(c)),
-    /* 45 GPURenderPassEncoder.setStencilReference */ (c) => H(c.a[c.i++]).setStencilReference(c.a[c.i++]),
-    /* 46 GPURenderPassEncoder.beginOcclusionQuery */ (c) => H(c.a[c.i++]).beginOcclusionQuery(c.a[c.i++]),
-    /* 47 GPURenderPassEncoder.endOcclusionQuery */ (c) => H(c.a[c.i++]).endOcclusionQuery(),
-    /* 48 GPURenderPassEncoder.executeBundles */ (c) => H(c.a[c.i++]).executeBundles((() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(c.a[c.i++]); return r; })()),
-    /* 49 GPURenderPassEncoder.end */ (c) => H(c.a[c.i++]).end(),
-    /* 50 GPURenderPassEncoder.pushDebugGroup */ (c) => H(c.a[c.i++]).pushDebugGroup(c.s[c.a[c.i++]]),
-    /* 51 GPURenderPassEncoder.popDebugGroup */ (c) => H(c.a[c.i++]).popDebugGroup(),
-    /* 52 GPURenderPassEncoder.insertDebugMarker */ (c) => H(c.a[c.i++]).insertDebugMarker(c.s[c.a[c.i++]]),
-    /* 53 GPURenderPassEncoder.setBindGroup */ (c) => H(c.a[c.i++]).setBindGroup(c.a[c.i++], H(c.a[c.i++]), (c.a[c.i++] ? (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = c.a[c.i++]; return r; })() : undefined)),
-    /* 54 GPURenderPassEncoder.setImmediates */ (c) => H(c.a[c.i++]).setImmediates(c.a[c.i++], c.s[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 55 GPURenderPassEncoder.setPipeline */ (c) => H(c.a[c.i++]).setPipeline(H(c.a[c.i++])),
-    /* 56 GPURenderPassEncoder.setIndexBuffer */ (c) => H(c.a[c.i++]).setIndexBuffer(H(c.a[c.i++]), E_GPUIndexFormat[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 57 GPURenderPassEncoder.setVertexBuffer */ (c) => H(c.a[c.i++]).setVertexBuffer(c.a[c.i++], H(c.a[c.i++]), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 58 GPURenderPassEncoder.draw */ (c) => H(c.a[c.i++]).draw(c.a[c.i++], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 59 GPURenderPassEncoder.drawIndexed */ (c) => H(c.a[c.i++]).drawIndexed(c.a[c.i++], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 60 GPURenderPassEncoder.drawIndirect */ (c) => H(c.a[c.i++]).drawIndirect(H(c.a[c.i++]), c.a[c.i++]),
-    /* 61 GPURenderPassEncoder.drawIndexedIndirect */ (c) => H(c.a[c.i++]).drawIndexedIndirect(H(c.a[c.i++]), c.a[c.i++]),
-    /* 62 GPURenderBundleEncoder.finish */ (c) => REG(H(c.a[c.i++]).finish((c.a[c.i++] ? D_GPURenderBundleDescriptor(c) : undefined))),
-    /* 63 GPURenderBundleEncoder.pushDebugGroup */ (c) => H(c.a[c.i++]).pushDebugGroup(c.s[c.a[c.i++]]),
-    /* 64 GPURenderBundleEncoder.popDebugGroup */ (c) => H(c.a[c.i++]).popDebugGroup(),
-    /* 65 GPURenderBundleEncoder.insertDebugMarker */ (c) => H(c.a[c.i++]).insertDebugMarker(c.s[c.a[c.i++]]),
-    /* 66 GPURenderBundleEncoder.setBindGroup */ (c) => H(c.a[c.i++]).setBindGroup(c.a[c.i++], H(c.a[c.i++]), (c.a[c.i++] ? (() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = c.a[c.i++]; return r; })() : undefined)),
-    /* 67 GPURenderBundleEncoder.setImmediates */ (c) => H(c.a[c.i++]).setImmediates(c.a[c.i++], c.s[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 68 GPURenderBundleEncoder.setPipeline */ (c) => H(c.a[c.i++]).setPipeline(H(c.a[c.i++])),
-    /* 69 GPURenderBundleEncoder.setIndexBuffer */ (c) => H(c.a[c.i++]).setIndexBuffer(H(c.a[c.i++]), E_GPUIndexFormat[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 70 GPURenderBundleEncoder.setVertexBuffer */ (c) => H(c.a[c.i++]).setVertexBuffer(c.a[c.i++], H(c.a[c.i++]), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 71 GPURenderBundleEncoder.draw */ (c) => H(c.a[c.i++]).draw(c.a[c.i++], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 72 GPURenderBundleEncoder.drawIndexed */ (c) => H(c.a[c.i++]).drawIndexed(c.a[c.i++], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 73 GPURenderBundleEncoder.drawIndirect */ (c) => H(c.a[c.i++]).drawIndirect(H(c.a[c.i++]), c.a[c.i++]),
-    /* 74 GPURenderBundleEncoder.drawIndexedIndirect */ (c) => H(c.a[c.i++]).drawIndexedIndirect(H(c.a[c.i++]), c.a[c.i++]),
-    /* 75 GPUQueue.submit */ (c) => H(c.a[c.i++]).submit((() => { const m = c.a[c.i++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(c.a[c.i++]); return r; })()),
-    /* 76 GPUQueue.writeBuffer */ (c) => H(c.a[c.i++]).writeBuffer(H(c.a[c.i++]), c.a[c.i++], c.s[c.a[c.i++]], (c.a[c.i++] ? c.a[c.i++] : undefined), (c.a[c.i++] ? c.a[c.i++] : undefined)),
-    /* 77 GPUQueue.writeTexture */ (c) => H(c.a[c.i++]).writeTexture(D_GPUTexelCopyTextureInfo(c), c.s[c.a[c.i++]], D_GPUTexelCopyBufferLayout(c), D_GPUExtent3DDict(c)),
-    /* 78 GPUQueue.copyExternalImageToTexture */ (c) => H(c.a[c.i++]).copyExternalImageToTexture(D_GPUCopyExternalImageSourceInfo(c), D_GPUCopyExternalImageDestInfo(c), D_GPUExtent3DDict(c)),
-    /* 79 GPUQuerySet.destroy */ (c) => H(c.a[c.i++]).destroy(),
-    /* 80 GPUCanvasContext.configure */ (c) => H(c.a[c.i++]).configure(D_GPUCanvasConfiguration(c)),
-    /* 81 GPUCanvasContext.unconfigure */ (c) => H(c.a[c.i++]).unconfigure(),
-    /* 82 GPUCanvasContext.getCurrentTexture */ (c) => REG(H(c.a[c.i++]).getCurrentTexture()),
+    /* 0 GPUDevice.destroy */ () => H(A[I++]).destroy(),
+    /* 1 GPUDevice.createBuffer */ () => REG(H(A[I++]).createBuffer(D_GPUBufferDescriptor())),
+    /* 2 GPUDevice.createTexture */ () => REG(H(A[I++]).createTexture(D_GPUTextureDescriptor())),
+    /* 3 GPUDevice.createSampler */ () => REG(H(A[I++]).createSampler((A[I++] ? D_GPUSamplerDescriptor() : undefined))),
+    /* 4 GPUDevice.importExternalTexture */ () => REG(H(A[I++]).importExternalTexture(D_GPUExternalTextureDescriptor())),
+    /* 5 GPUDevice.createBindGroupLayout */ () => REG(H(A[I++]).createBindGroupLayout(D_GPUBindGroupLayoutDescriptor())),
+    /* 6 GPUDevice.createPipelineLayout */ () => REG(H(A[I++]).createPipelineLayout(D_GPUPipelineLayoutDescriptor())),
+    /* 7 GPUDevice.createBindGroup */ () => REG(H(A[I++]).createBindGroup(D_GPUBindGroupDescriptor())),
+    /* 8 GPUDevice.createShaderModule */ () => REG(H(A[I++]).createShaderModule(D_GPUShaderModuleDescriptor())),
+    /* 9 GPUDevice.createComputePipeline */ () => REG(H(A[I++]).createComputePipeline(D_GPUComputePipelineDescriptor())),
+    /* 10 GPUDevice.createRenderPipeline */ () => REG(H(A[I++]).createRenderPipeline(D_GPURenderPipelineDescriptor())),
+    /* 11 GPUDevice.createCommandEncoder */ () => REG(H(A[I++]).createCommandEncoder((A[I++] ? D_GPUCommandEncoderDescriptor() : undefined))),
+    /* 12 GPUDevice.createRenderBundleEncoder */ () => REG(H(A[I++]).createRenderBundleEncoder(D_GPURenderBundleEncoderDescriptor())),
+    /* 13 GPUDevice.createQuerySet */ () => REG(H(A[I++]).createQuerySet(D_GPUQuerySetDescriptor())),
+    /* 14 GPUDevice.pushErrorScope */ () => H(A[I++]).pushErrorScope(E_GPUErrorFilter[A[I++]]),
+    /* 15 GPUBuffer.unmap */ () => H(A[I++]).unmap(),
+    /* 16 GPUBuffer.destroy */ () => H(A[I++]).destroy(),
+    /* 17 GPUTexture.createView */ () => REG(H(A[I++]).createView((A[I++] ? D_GPUTextureViewDescriptor() : undefined))),
+    /* 18 GPUTexture.destroy */ () => H(A[I++]).destroy(),
+    /* 19 GPUComputePipeline.getBindGroupLayout */ () => REG(H(A[I++]).getBindGroupLayout(A[I++])),
+    /* 20 GPURenderPipeline.getBindGroupLayout */ () => REG(H(A[I++]).getBindGroupLayout(A[I++])),
+    /* 21 GPUCommandEncoder.beginRenderPass */ () => REG(H(A[I++]).beginRenderPass(D_GPURenderPassDescriptor())),
+    /* 22 GPUCommandEncoder.beginComputePass */ () => REG(H(A[I++]).beginComputePass((A[I++] ? D_GPUComputePassDescriptor() : undefined))),
+    /* 23 GPUCommandEncoder.copyBufferToBuffer */ () => H(A[I++]).copyBufferToBuffer(H(A[I++]), H(A[I++]), (A[I++] ? A[I++] : undefined)),
+    /* 24 GPUCommandEncoder.copyBufferToTexture */ () => H(A[I++]).copyBufferToTexture(D_GPUTexelCopyBufferInfo(), D_GPUTexelCopyTextureInfo(), D_GPUExtent3DDict()),
+    /* 25 GPUCommandEncoder.copyTextureToBuffer */ () => H(A[I++]).copyTextureToBuffer(D_GPUTexelCopyTextureInfo(), D_GPUTexelCopyBufferInfo(), D_GPUExtent3DDict()),
+    /* 26 GPUCommandEncoder.copyTextureToTexture */ () => H(A[I++]).copyTextureToTexture(D_GPUTexelCopyTextureInfo(), D_GPUTexelCopyTextureInfo(), D_GPUExtent3DDict()),
+    /* 27 GPUCommandEncoder.clearBuffer */ () => H(A[I++]).clearBuffer(H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 28 GPUCommandEncoder.resolveQuerySet */ () => H(A[I++]).resolveQuerySet(H(A[I++]), A[I++], A[I++], H(A[I++]), A[I++]),
+    /* 29 GPUCommandEncoder.finish */ () => REG(H(A[I++]).finish((A[I++] ? D_GPUCommandBufferDescriptor() : undefined))),
+    /* 30 GPUCommandEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
+    /* 31 GPUCommandEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
+    /* 32 GPUCommandEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
+    /* 33 GPUComputePassEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
+    /* 34 GPUComputePassEncoder.dispatchWorkgroups */ () => H(A[I++]).dispatchWorkgroups(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 35 GPUComputePassEncoder.dispatchWorkgroupsIndirect */ () => H(A[I++]).dispatchWorkgroupsIndirect(H(A[I++]), A[I++]),
+    /* 36 GPUComputePassEncoder.end */ () => H(A[I++]).end(),
+    /* 37 GPUComputePassEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
+    /* 38 GPUComputePassEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
+    /* 39 GPUComputePassEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
+    /* 40 GPUComputePassEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
+    /* 41 GPUComputePassEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 42 GPURenderPassEncoder.setViewport */ () => H(A[I++]).setViewport(A[I++], A[I++], A[I++], A[I++], A[I++], A[I++]),
+    /* 43 GPURenderPassEncoder.setScissorRect */ () => H(A[I++]).setScissorRect(A[I++], A[I++], A[I++], A[I++]),
+    /* 44 GPURenderPassEncoder.setBlendConstant */ () => H(A[I++]).setBlendConstant(D_GPUColorDict()),
+    /* 45 GPURenderPassEncoder.setStencilReference */ () => H(A[I++]).setStencilReference(A[I++]),
+    /* 46 GPURenderPassEncoder.beginOcclusionQuery */ () => H(A[I++]).beginOcclusionQuery(A[I++]),
+    /* 47 GPURenderPassEncoder.endOcclusionQuery */ () => H(A[I++]).endOcclusionQuery(),
+    /* 48 GPURenderPassEncoder.executeBundles */ () => H(A[I++]).executeBundles((() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })()),
+    /* 49 GPURenderPassEncoder.end */ () => H(A[I++]).end(),
+    /* 50 GPURenderPassEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
+    /* 51 GPURenderPassEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
+    /* 52 GPURenderPassEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
+    /* 53 GPURenderPassEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
+    /* 54 GPURenderPassEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 55 GPURenderPassEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
+    /* 56 GPURenderPassEncoder.setIndexBuffer */ () => H(A[I++]).setIndexBuffer(H(A[I++]), E_GPUIndexFormat[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 57 GPURenderPassEncoder.setVertexBuffer */ () => H(A[I++]).setVertexBuffer(A[I++], H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 58 GPURenderPassEncoder.draw */ () => H(A[I++]).draw(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 59 GPURenderPassEncoder.drawIndexed */ () => H(A[I++]).drawIndexed(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 60 GPURenderPassEncoder.drawIndirect */ () => H(A[I++]).drawIndirect(H(A[I++]), A[I++]),
+    /* 61 GPURenderPassEncoder.drawIndexedIndirect */ () => H(A[I++]).drawIndexedIndirect(H(A[I++]), A[I++]),
+    /* 62 GPURenderBundleEncoder.finish */ () => REG(H(A[I++]).finish((A[I++] ? D_GPURenderBundleDescriptor() : undefined))),
+    /* 63 GPURenderBundleEncoder.pushDebugGroup */ () => H(A[I++]).pushDebugGroup(S[A[I++]]),
+    /* 64 GPURenderBundleEncoder.popDebugGroup */ () => H(A[I++]).popDebugGroup(),
+    /* 65 GPURenderBundleEncoder.insertDebugMarker */ () => H(A[I++]).insertDebugMarker(S[A[I++]]),
+    /* 66 GPURenderBundleEncoder.setBindGroup */ () => H(A[I++]).setBindGroup(A[I++], H(A[I++]), (A[I++] ? (() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = A[I++]; return r; })() : undefined)),
+    /* 67 GPURenderBundleEncoder.setImmediates */ () => H(A[I++]).setImmediates(A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 68 GPURenderBundleEncoder.setPipeline */ () => H(A[I++]).setPipeline(H(A[I++])),
+    /* 69 GPURenderBundleEncoder.setIndexBuffer */ () => H(A[I++]).setIndexBuffer(H(A[I++]), E_GPUIndexFormat[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 70 GPURenderBundleEncoder.setVertexBuffer */ () => H(A[I++]).setVertexBuffer(A[I++], H(A[I++]), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 71 GPURenderBundleEncoder.draw */ () => H(A[I++]).draw(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 72 GPURenderBundleEncoder.drawIndexed */ () => H(A[I++]).drawIndexed(A[I++], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 73 GPURenderBundleEncoder.drawIndirect */ () => H(A[I++]).drawIndirect(H(A[I++]), A[I++]),
+    /* 74 GPURenderBundleEncoder.drawIndexedIndirect */ () => H(A[I++]).drawIndexedIndirect(H(A[I++]), A[I++]),
+    /* 75 GPUQueue.submit */ () => H(A[I++]).submit((() => { const m = A[I++], r = new Array(m); for (let j = 0; j < m; j++) r[j] = H(A[I++]); return r; })()),
+    /* 76 GPUQueue.writeBuffer */ () => H(A[I++]).writeBuffer(H(A[I++]), A[I++], S[A[I++]], (A[I++] ? A[I++] : undefined), (A[I++] ? A[I++] : undefined)),
+    /* 77 GPUQueue.writeTexture */ () => H(A[I++]).writeTexture(D_GPUTexelCopyTextureInfo(), S[A[I++]], D_GPUTexelCopyBufferLayout(), D_GPUExtent3DDict()),
+    /* 78 GPUQueue.copyExternalImageToTexture */ () => H(A[I++]).copyExternalImageToTexture(D_GPUCopyExternalImageSourceInfo(), D_GPUCopyExternalImageDestInfo(), D_GPUExtent3DDict()),
+    /* 79 GPUQuerySet.destroy */ () => H(A[I++]).destroy(),
+    /* 80 GPUCanvasContext.configure */ () => H(A[I++]).configure(D_GPUCanvasConfiguration()),
+    /* 81 GPUCanvasContext.unconfigure */ () => H(A[I++]).unconfigure(),
+    /* 82 GPUCanvasContext.getCurrentTexture */ () => REG(H(A[I++]).getCurrentTexture()),
   ];
   return { gpuRun: (p, n, s) => {
-    const c = { a: new Float64Array(mem(), p >>> 0, n), i: 0, s };
+    A = new Float64Array(mem(), p >>> 0, n); I = 0; S = s;
     let r = 0;
-    while (c.i < n) r = M[c.a[c.i++]](c);
+    while (I < n) r = M[A[I++]]();
+    A = null; S = null;
     return typeof r === 'number' ? r : (r ? 1 : 0);
   } };
 };

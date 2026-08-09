@@ -15,10 +15,12 @@
 export const jsImports = (getExports) => {
   const mem = () => getExports().memory.buffer;
   // the handle table: STRONG refs, freed when the WASM wrapper dies —
-  // wasm-GC objects are JS-observable, so the registry watches THEM
-  const table = new Map();
+  // wasm-GC objects are JS-observable, so the registry watches THEM.
+  // A plain ARRAY, not a Map: ids are sequential ints and the VM resolves
+  // one per decoded command — array indexing beats a hashed Map.get
+  const table = [];
   let nextId = 1;
-  const registry = new FinalizationRegistry(id => table.delete(id));
+  const registry = new FinalizationRegistry(id => { table[id] = undefined; });
   return { js: {
     // keys arrive as JS STRINGS — literals are interned wasm-side, made
     // once through strNew; nothing decodes per call
@@ -56,8 +58,8 @@ export const jsImports = (getExports) => {
     obj: () => ({}),
     arr: () => ([]),
     push: (a, v) => { a.push(v); },
-    h: (id) => table.get(id),
-    reg: (o) => { const id = nextId++; table.set(id, o); return id; },
+    h: (id) => table[id],
+    reg: (o) => { const id = nextId++; table[id] = o; return id; },
     watch: (wrapper, id) => registry.register(wrapper, id),
     // ZERO-COPY: views over the module's own memory at a pinned address.
     // Fresh per call — memory.grow would detach a cached one.
@@ -72,8 +74,8 @@ export const jsImports = (getExports) => {
   // exactly as Js.handle does
   internals: {
     mem,
-    h: (id) => table.get(id),
-    reg: (o) => { const id = nextId++; table.set(id, o); return id; },
+    h: (id) => table[id],
+    reg: (o) => { const id = nextId++; table[id] = o; return id; },
     watch: (wrapper, id) => registry.register(wrapper, id),
   } };
 };
