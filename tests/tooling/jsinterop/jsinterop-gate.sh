@@ -11,6 +11,7 @@ command -v node >/dev/null || { echo "JSINTEROP SKIPPED (no node)"; exit 0; }
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
 "$fpp" build -o "$here/jsdemo.wasm" "$here/jsdemo.fpp"
 "$fpp" build -o "$here/webgl.wasm" "$here/webgl.fpp"
+"$fpp" build --strict -o "$here/webgl-typed.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgl.fpp" "$here/webgl-typed.fpp"
 "$fpp" build -o "$here/domdemo.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
 "$fpp" build --strict -o "$here/gpu-triangle.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgpu.fpp" "$here/gpu-triangle.fpp"
 "$fpp" build --strict -o "$here/gpu-compute.wasm" "$root/stdlib/webgpu.fpp" "$here/gpu-compute.fpp"
@@ -64,6 +65,12 @@ got=$(node "$here/gldrive.js")
 want='{"log":["2","5","5","1","2","7","0","gl-done"]}'
 if [ "$got" = "$want" ]; then
     echo "WEBGL OK (zero-copy upload and readback)"
+fi
+# the TYPED WebGL leg: same triangle through the generated surface
+got=$(node "$here/gltdrive.js")
+want='{"log":["2","5","5","1","2","7","0","gl-typed-done"]}'
+if [ "$got" = "$want" ]; then
+    echo "WEBGL-TYPED OK (generated GLenum surface renders)"
 else
     echo "WEBGL MISMATCH"
     echo "want: $want"

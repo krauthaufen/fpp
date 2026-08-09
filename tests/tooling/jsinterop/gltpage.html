@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fpp webgl gate</title>
+<body>
+<script type="module">
+  import { instantiate } from '/stdlib/fpp-js.mjs';
+  window.log = [];
+  try {
+    const exports = await instantiate('webgl-typed.wasm', {
+      sink: s => window.log.push(s.trimEnd()) });
+    exports._start();
+    window.results = { log: window.log.filter(x => x !== '') };
+  } catch (e) {
+    window.results = { error: String(e && e.stack || e) };
+  }
+  window.ready = true;
+</script>

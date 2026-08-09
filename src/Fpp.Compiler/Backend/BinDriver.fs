@@ -2241,14 +2241,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         toExtern f
         callf f "$js_itemSet"
         pushUnit f
-    | EApp (EUnknown cn, o :: k :: rest) when cn.StartsWith "jsCall" && strLen cn = 7 ->
+    | EApp (EUnknown cn, o :: k :: rest) when
+          cn.StartsWith "jsCall" && strLen cn <= 8
+          && (parseDigits (cn.Substring 6)).IsSome ->
         emitNode st f lv o
         toExtern f
         jsKeyE st f lv k
         for a in rest do
             emitNode st f lv a
             toExtern f
-        callf f ("$js_call" + cn.Substring (strLen cn - 1))
+        callf f ("$js_call" + cn.Substring 6)
         toAny f
     | EApp (EUnknown cn, ctor :: rest) when cn.StartsWith "jsNew" && strLen cn = 6 ->
         emitNode st f lv ctor
