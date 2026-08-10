@@ -26,7 +26,19 @@ Static memory: the fd_write iovec and a UTF-8 staging buffer live low, then
 string constants (baked into an active data segment), then the bump heap
 (`$hp`). Allocation is a bump with memory growth — no collection yet.
 
-## Status: slices 1–4 (shipped)
+## Status: slices 1–5 (shipped)
+
+Slice 5 added **64-bit ints and floats**, boxed (an even pointer to 8 bytes):
+float and int64 literals box their payload, arithmetic and comparisons unbox
+/ op / re-box, and the conversions (`int`↔`int64`, `int`→`float`) cross the
+representations. `printfn "%f"` is a hand-emitted `$ftoa6` — the oracle's
+fixed-six-decimals routine (NaN, sign, round at 5e-7, i64 integer part, six
+fractional digits) ported to the linear string layout — and it matches the
+oracle byte for byte on arithmetic, division, negatives and int-to-float.
+The 31-bit tag cannot hold an `int` above 2^30, same as any tagged-integer
+model; such values box when the full-width int path lands with the prelude.
+
+
 
 Slice 4 added **arrays** (boxed elements): the layout is `[len][elem…]` with
 a raw length word and tagged element slots. Literals, indexing, index

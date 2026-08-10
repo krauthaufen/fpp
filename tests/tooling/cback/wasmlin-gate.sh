@@ -73,6 +73,16 @@ let sumsq =
         asum <- asum + sq.[i]
         i <- i + 1
 let r13 = printfn "%d" asum
+let fa = 3.5
+let fb = 2.0
+let r14 = printfn "%f" (fa * fb + 1.5)
+let sqf (x : float) : float = x * x
+let r15 = printfn "%f" (sqf 4.0)
+let r16 = printfn "%f" (10.0 / 4.0)
+let r17 = printfn "%f" (0.0 - 2.25)
+let r18 = printfn "%f" (float 7 + 0.5)
+let big = 3000000000L
+let r19 = printfn "%d" (int (big - 2999999900L))
 FPP
 
 # the direct linear module — no C toolchain touched

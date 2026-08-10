@@ -32,7 +32,9 @@ let private IOV_LEN = 4        // i32: its length
 let private NWRITTEN = 8       // i32: fd_write's out-param
 let private PRINTBUF = 16      // utf-8 staging for one prints
 let private PRINTCAP = 262144
-let private CONST_BASE = PRINTBUF + PRINTCAP
+let private FMTBUF = PRINTBUF + PRINTCAP   // u16 staging for float formatting
+let private FMTCAP = 512
+let private CONST_BASE = FMTBUF + FMTCAP
 
 type private St =
     { M : Mod
@@ -128,6 +130,7 @@ let private declTemps (f : Fn) : unit =
     for i in 0 .. 15 do local f ("$pt" + string i) "i32"
     for i in 0 .. 7 do local f ("$ab" + string i) "i32"; local f ("$av" + string i) "i32"
     for i in 0 .. 7 do local f ("$ai" + string i) "i32"; local f ("$an" + string i) "i32"
+    for i in 0 .. 7 do local f ("$fd" + string i) "f64"; local f ("$ld" + string i) "i64"
     local f "$obj" "i32"
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -137,6 +140,88 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_of_int" "$lt_i2i"
     declFn m "$str_cat" "$lt_ii2i"
     declFn m "$prints" "$lt_i2v"
+    declFn m "$ftoa6" "$lt_i2i"
+
+// %f: .NET's fixed-six-decimals form, ported to the linear string layout.
+// Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
+// rounding at the sixth decimal, an i64 integer part and six fractionals.
+// A store16 helper writes one UTF-16 unit and advances $w.
+let private emitFtoa6 (m : Mod) : unit =
+    let f = beginFn m [ "$x" ]
+    local f "$v" "f64"; local f "$w" "i32"; local f "$ip" "f64"; local f "$frac" "f64"
+    local f "$ipi" "i64"; local f "$tmp" "i64"; local f "$d" "i32"; local f "$k" "i32"
+    local f "$cur" "i32"; local f "$p" "i32"; local f "$len" "i32"; local f "$i" "i32"
+    localsDone f
+    let put (code : unit -> unit) =
+        lg f "$w"; code (); mem f "i32.store16"; lg f "$w"; ic f 2; ins f "i32.add"; ls f "$w"
+    lg f "$x"; mem f "f64.load"; ls f "$v"
+    ic f FMTBUF; ls f "$w"
+    blockE f "$fin"
+    // NaN
+    lg f "$v"; lg f "$v"; ins f "f64.ne"
+    ifE f
+    for c in [ 78; 97; 78 ] do put (fun () -> ic f c)
+    br f "$fin"
+    endB f
+    // sign
+    lg f "$v"; fc f 0L; ins f "f64.lt"
+    ifE f
+    put (fun () -> ic f 45)
+    lg f "$v"; ins f "f64.neg"; ls f "$v"
+    endB f
+    // round at the sixth decimal (add 5e-7)
+    lg f "$v"; fc f 4512825593480736141L; ins f "f64.add"; ls f "$v"
+    lg f "$v"; ins f "f64.floor"; ls f "$ip"
+    lg f "$ip"; ins f "i64.trunc_f64_s"; ls f "$ipi"
+    // integer part: count digits (d), then write back-to-front from $w
+    ic f 1; ls f "$d"
+    lg f "$ipi"; ls f "$tmp"
+    blockE f "$dc"; loopE f "$dl"
+    lg f "$tmp"; lc f 10L; ins f "i64.lt_u"; brIf f "$dc"
+    lg f "$tmp"; lc f 10L; ins f "i64.div_u"; ls f "$tmp"
+    lg f "$d"; ic f 1; ins f "i32.add"; ls f "$d"
+    br f "$dl"; endB f; endB f
+    // write digits into [$w .. $w+2*d), MSB first via back-to-front
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$cur"
+    lg f "$ipi"; ls f "$tmp"
+    blockE f "$wc"; loopE f "$wl"
+    lg f "$cur"
+    lg f "$tmp"; lc f 10L; ins f "i64.rem_u"; ins f "i32.wrap_i64"; ic f 48; ins f "i32.add"
+    mem f "i32.store16"
+    lg f "$cur"; ic f 2; ins f "i32.sub"; ls f "$cur"
+    lg f "$tmp"; lc f 10L; ins f "i64.div_u"; ls f "$tmp"
+    lg f "$tmp"; lc f 0L; ins f "i64.eq"; brIf f "$wc"
+    br f "$wl"; endB f; endB f
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$w"
+    // decimal point
+    put (fun () -> ic f 46)
+    // six fractional digits
+    lg f "$v"; lg f "$ip"; ins f "f64.sub"; ls f "$frac"
+    ic f 0; ls f "$k"
+    blockE f "$fc2"; loopE f "$fl2"
+    lg f "$k"; ic f 6; ins f "i32.ge_s"; brIf f "$fc2"
+    lg f "$frac"; fc f 4621819117588971520L; ins f "f64.mul"; ls f "$frac"
+    lg f "$frac"; ins f "f64.floor"; ins f "i32.trunc_f64_s"; ls f "$d"
+    put (fun () -> ic f 48; lg f "$d"; ins f "i32.add")
+    lg f "$frac"; lg f "$frac"; ins f "f64.floor"; ins f "f64.sub"; ls f "$frac"
+    lg f "$k"; ic f 1; ins f "i32.add"; ls f "$k"
+    br f "$fl2"; endB f; endB f
+    endB f  // $fin
+    // build the string [kind=1][len][units] from FMTBUF
+    lg f "$w"; ic f FMTBUF; ins f "i32.sub"; ic f 1; ins f "i32.shr_u"; ls f "$len"
+    ic f 8; lg f "$len"; ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
+    lg f "$p"; ic f 1; mem f "i32.store"
+    lg f "$p"; ic f 4; ins f "i32.add"; lg f "$len"; mem f "i32.store"
+    ic f 0; ls f "$i"
+    blockE f "$cc"; loopE f "$cl"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_u"; brIf f "$cc"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    ic f FMTBUF; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$cl"; endB f; endB f
+    lg f "$p"
+    endFn f
 
 // $lalloc(n): 4-align the bump pointer, reserve n bytes, grow memory as
 // needed, return the aligned start.
@@ -365,6 +450,11 @@ let rec private discover (st : St) (e : Expr) : unit =
 // every expression emitter leaves ONE i32 (a tagged value) on the stack.
 let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
     match e with
+    | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" ->
+        // a 64-bit literal: boxed i64
+        (match System.Int64.TryParse (s.Substring (0, s.Length - 1)) with
+         | true, n -> lc f n; boxI64 st f
+         | _ -> constInt f 0; err st ("wasm-linear slice: bad int64 literal " + s))
     | ELit (LInt s) ->
         (match System.Int32.TryParse s with
          | true, n -> constInt f n
@@ -417,6 +507,44 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
          | None -> if (dictTryFind st.Globals (key v)).IsSome then gs f (gl v)
                    else err st ("wasm-linear slice: assignment to unbound " + v.Name))
         constInt f 0
+    | ELit (LFloat s) ->
+        // a boxed f64 [f64 bits]; box at the use site (no GC yet)
+        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
+         | true, d -> fc f (System.BitConverter.DoubleToInt64Bits d); boxF64 st f
+         | _ -> constInt f 0; err st ("wasm-linear slice: bad float literal " + s))
+    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
+        lower st f a; unboxF64 st f
+        lower st f b; unboxF64 st f
+        ins f (match op.Substring (0, op.Length - 1) with "+" -> "f64.add" | "-" -> "f64.sub" | "*" -> "f64.mul" | _ -> "f64.div")
+        boxF64 st f
+    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        lower st f a; unboxF64 st f
+        lower st f b; unboxF64 st f
+        ins f (match op.Substring (0, op.Length - 1) with "<" -> "f64.lt" | ">" -> "f64.gt" | "<=" -> "f64.le" | ">=" -> "f64.ge" | "=" -> "f64.eq" | _ -> "f64.ne")
+        tagi f
+    | EPrim ("u-f", [ a ]) ->
+        lower st f a; unboxF64 st f; ins f "f64.neg"; boxF64 st f
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
+        lower st f a; unboxI64 st f
+        lower st f b; unboxI64 st f
+        ins f (match op.Substring (0, op.Length - 1) with "+" -> "i64.add" | "-" -> "i64.sub" | "*" -> "i64.mul" | "/" -> "i64.div_s" | _ -> "i64.rem_s")
+        boxI64 st f
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        lower st f a; unboxI64 st f
+        lower st f b; unboxI64 st f
+        ins f (match op.Substring (0, op.Length - 1) with "<" -> "i64.lt_s" | ">" -> "i64.gt_s" | "<=" -> "i64.le_s" | ">=" -> "i64.ge_s" | "=" -> "i64.eq" | _ -> "i64.ne")
+        tagi f
+    | EApp (EUnknown "fixed6", [ a ]) ->
+        lower st f a; callf f "$ftoa6"
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
+        // int64 -> int: unbox, wrap to i32, tag
+        lower st f a; unboxI64 st f; ins f "i32.wrap_i64"; tagi f
+    | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
+        // int -> int64: untag i32, widen, box
+        lower st f a; untagi f; ins f "i64.extend_i32_s"; boxI64 st f
+    | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
+        // int -> float: untag, convert, box
+        lower st f a; untagi f; ins f "f64.convert_i32_s"; boxF64 st f
     | EPrim (op0, [ a; b ]) when (List.contains (baseOp op0) [ "+"; "-"; "*"; "/"; "%" ]) ->
         lower st f a; untagi f
         lower st f b; untagi f
@@ -625,6 +753,27 @@ and private emitPatTest (st : St) (f : Fn) (scrutLocal : string) (fail : string)
     | _ ->
         err st "wasm-linear slice: unsupported pattern (lists / or-patterns / type tests await a later slice)"
 
+// box/unbox the 64-bit payloads — a boxed value is a pointer to 8 bytes;
+// scratch is depth-indexed so a nested box cannot clobber this one
+and private boxF64 (st : St) (f : Fn) : unit =
+    let d = st.AllocDepth
+    st.AllocDepth <- d + 1
+    ls f ("$fd" + string d)
+    ic f 8; callf f "$lalloc"; ls f ("$ab" + string d)
+    lg f ("$ab" + string d); lg f ("$fd" + string d); mem f "f64.store"
+    st.AllocDepth <- d
+    lg f ("$ab" + string d)
+and private unboxF64 (st : St) (f : Fn) : unit = mem f "f64.load"
+and private boxI64 (st : St) (f : Fn) : unit =
+    let d = st.AllocDepth
+    st.AllocDepth <- d + 1
+    ls f ("$ld" + string d)
+    ic f 8; callf f "$lalloc"; ls f ("$ab" + string d)
+    lg f ("$ab" + string d); lg f ("$ld" + string d); mem f "i64.store"
+    st.AllocDepth <- d
+    lg f ("$ab" + string d)
+and private unboxI64 (st : St) (f : Fn) : unit = mem f "i64.load"
+
 // resolve a captured/local/global reference known only by its (path,offset)
 and private emitVarByKey (st : St) (f : Fn) (k : string) : unit =
     match dictTryFind st.Locals k with
@@ -807,7 +956,7 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
     globalI32Mut m "$hp" st.ConstNext
     exportFn m "_start" "$_start"
     // runtime bodies
-    emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m
+    emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m
     // top-level function bodies
     for d in decls do
         match d with
