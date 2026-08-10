@@ -76,7 +76,10 @@ type private St =
       SlotOf : Dict<string, int>
       mutable NSlots : int
       mutable VtBase : int
-      TestIds : Dict<string, int list> }
+      TestIds : Dict<string, int list>
+      /// set when the program throws or catches, so the module declares the
+      /// exception tag and asks the assembler for the tag section
+      mutable UsesExn : bool }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -148,6 +151,8 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
     // the closure calling convention: (environment, argument) -> result
     tyFunc m "$lclo" [ "i32"; "i32" ] [ "i32" ]
+    // the exception tag carries the thrown value (a tagged i32)
+    tyFunc m "$exntag" [ "i32" ] []
 
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -757,8 +762,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
         lowBoxF ctx (LPrim (WToF, [ lowUntag (coreToLowE ctx a) ]))
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
-    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) ->
-        LDo ((args |> List.map (fun a -> LEval (coreToLowE ctx a))) @ [ LTrap ], lowInt 0)
+    | EApp (EUnknown "failwith", [ msg ]) ->
+        LDo ([ LThrow (lowFailure ctx (coreToLowE ctx msg)) ], lowInt 0)
+    | EApp (EUnknown "raise", [ ex ]) ->
+        st.UsesExn <- true
+        LDo ([ LThrow (coreToLowE ctx ex) ], lowInt 0)
+    | EApp (EUnknown ("invalidArg" | "invalidOp" | "nullArg"), args) ->
+        // approximate as Failure(message): the last argument is the message
+        let msg = match List.rev args with m :: _ -> coreToLowE ctx m | [] -> LConstW 0
+        LDo ([ LThrow (lowFailure ctx msg) ], lowInt 0)
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
@@ -806,6 +818,22 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let callArgs = LGet (wReg t) :: List.map (coreToLowE ctx) args
         LDo ([ LSet (wReg t, coreToLowE ctx recv) ],
              LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), callArgs))
+    | ETry (body, clauses) ->
+        // run body; a throw is caught into `exn` and matched against the
+        // clauses (each a block that binds and breaks to $tdone on a match);
+        // no match re-throws. Same clause shape as a match, over the exn value.
+        st.UsesExn <- true
+        let res = freshTmp ctx
+        let exn = freshTmp ctx
+        let catchStmts =
+            clauses |> List.map (fun (pat, guard, handler) ->
+                let tests = lowPatTest ctx exn "$cnext" pat
+                let guardStmt =
+                    match guard with
+                    | Some g -> [ LBreakIf ("$cnext", LPrim (EqW, [ lowUntag (coreToLowE ctx g); LConstW 0 ])) ]
+                    | None -> []
+                LBlock ("$cnext", tests @ guardStmt @ [ LSet (wReg res, coreToLowE ctx handler); LBreak "$tdone" ]))
+        LDo ([ LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
@@ -950,6 +978,14 @@ and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
         let tclo = freshTmp ctx
         let step = LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
         lowApply ctx step rest
+
+// `failwith msg` raises Failure(msg) so `with Failure m` catches it; if the
+// prelude's Failure case is not in scope, throw the bare message instead
+and private lowFailure (ctx : LowCtx) (msg : LExpr) : LExpr =
+    ctx.LSt.UsesExn <- true
+    match dictTryFind ctx.LSt.UnionTag "Failure" with
+    | Some tag -> lowObj ctx (cidCase ctx.LSt "Failure") [ LConstW tag; msg ]
+    | None -> msg
 
 // a RAW i32 (0/1): is `v` a heap object whose class-id header is one of those
 // `tn` accepts (its own, a subclass', an implementor')? Guards the header load
@@ -1107,6 +1143,22 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
     | LBreak lbl -> br f lbl
     | LTrap -> ins f "unreachable"
     | LReturn e -> emitLowE f e; ins f "return"
+    | LThrow e -> emitLowE f e; throwExn f
+    | LTryStmt (body, res, exn, catchStmts) ->
+        // block $tdone { block $tcatch (i32) { try_table (i32) (catch → $tcatch)
+        //   <body:i32> } res := ·; br $tdone } exn := ·; <handler>; rethrow }
+        blockE f "$tdone"
+        blockI f "$tcatch"
+        tryTableI f "$tcatch"
+        emitLowE f body
+        endB f                       // end try_table — body value on stack
+        ls f (regNm res)
+        br f "$tdone"
+        endB f                       // end $tcatch — caught value on stack
+        ls f (regNm exn)
+        for s in catchStmts do emitLowS f s
+        lg f (regNm exn); throwExn f  // no handler matched: re-throw outward
+        endB f                       // end $tdone
 
 // emit one function (or init) through LowIR: allocate a register per param and
 // per let, declare the wasm locals for them, then the body. `finish` stores a
@@ -1205,7 +1257,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Captures = dictNew ()
           RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
-          SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew () }
+          SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1357,7 +1409,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // bake the constant data at CONST_BASE; $hp already starts after it
     activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
-    let bytes = assembleWith m pages false ""
+    let bytes = assembleWith m pages st.UsesExn ""
     bytes, vecToList st.Errors
 
 // the wasm-linear backend: Core straight to a linear-memory module through the

@@ -95,6 +95,14 @@ and LStmt =
     /// unreachable — an exhausted match, a trap after failwith
     | LTrap
     | LReturn of LExpr
+    /// throw an exception value (the operand) via the module's one tag
+    | LThrow of LExpr
+    /// exception handling: evaluate the body expression into the result
+    /// register; if it throws, bind the caught value to the exn register and
+    /// run the handler statements (which either assign the result and break to
+    /// the done label, or fall through to a re-throw). Fields: body, result
+    /// register, exn register, handler statements.
+    | LTryStmt of LExpr * LReg * LReg * LStmt list
 
 /// A lowered function ready for instruction selection.
 type LFunc =

@@ -499,6 +499,12 @@ let blockA (f : Fn) (label : string) : unit =
     emitByte f.B opBlock
     emitBlockTypeVal f.B (valByte "anyref")
     pushLabel f.Labels label
+// a block whose result is an i32 — the linear backend's catch block, which
+// receives the thrown (i32) exception value at its label
+let blockI (f : Fn) (label : string) : unit =
+    emitByte f.B opBlock
+    emitBlockTypeVal f.B (valByte "i32")
+    pushLabel f.Labels label
 let blockE (f : Fn) (label : string) : unit =
     emitByte f.B opBlock
     emitBlockTypeEmpty f.B
@@ -1249,6 +1255,18 @@ let tryTableA (f : Fn) (catchLabel : string) : unit =
     // clause label depths are relative to OUTSIDE the try_table — its own
     // label does not count for its immediates (checked against wasm-tools'
     // encoding of the same shape)
+    let d = labelDepth f.Labels catchLabel
+    pushLabel f.Labels ""
+    emitU32 f.B 1
+    emitByte f.B 0x00
+    emitU32 f.B 0
+    emitU32 f.B d
+
+// the linear counterpart of tryTableA: try_table with an i32 result (the body
+// value), one catch clause routing the thrown i32 to `catchLabel`
+let tryTableI (f : Fn) (catchLabel : string) : unit =
+    emitByte f.B opTryTable
+    emitBlockTypeVal f.B (valByte "i32")
     let d = labelDepth f.Labels catchLabel
     pushLabel f.Labels ""
     emitU32 f.B 1
