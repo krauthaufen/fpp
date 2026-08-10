@@ -169,3 +169,34 @@ let exportHygieneTests =
             Expect.isEmpty errs "the spine means the constructor, not the module"
         }
     ]
+
+// The editor's contract: NO request may throw, whatever the offset. A
+// hover on a prelude-defined name walked to the definition's pseudo-path
+// `(builtin)`, asked the query store for its text, and killed the whole
+// language server — five restarts, then the client gave up.
+[<Tests>]
+let editorRobustnessTests =
+    testList "editor robustness" [
+        test "hover answers at every offset, prelude names included" {
+            let ws = Fpp.Workspace()
+            let src =
+                String.concat "\n" [
+                    "module M"
+                    "let xs = ResizeArray<int>()"
+                    "let n = xs.Count + List.sum [ 1; 2 ]"
+                    "let s = string 1.5 + sprintf \"%d\" n"
+                    "" ]
+            ws.SetFileText "t.fpp" src
+            for off in 0 .. src.Length - 1 do
+                ws.HoverAt "t.fpp" off |> ignore
+            ws.DefinitionAt "t.fpp" (src.IndexOf "List.sum" + 6) |> ignore
+        }
+        test "the prelude pseudo-file checks like a file" {
+            let ws = Fpp.Workspace()
+            ws.SetFileText "t.fpp" "module M\nlet a = 1\n"
+            // the two calls the hover path makes for a builtin definition
+            let inf = ws.TypeCheck Fpp.Builtin.path
+            Expect.isTrue (not (List.isEmpty inf.DefTypes)) "the prelude's own inference answers"
+            Expect.isTrue ((ws.FileText Fpp.Builtin.path).Contains "class Add") "its text reads back"
+        }
+    ]

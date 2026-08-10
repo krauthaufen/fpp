@@ -243,6 +243,9 @@ type Workspace() =
     let mutable defines : string list = [ "WASM" ]
     do db.SetInput "project" "" (box ([] : string list))
     do db.SetInput "libs" "" (box ([] : (string * string) list))
+    // the prelude pseudo-file reads like any other: definition jumps and
+    // line math land on it (hover already takes the cached-inference path)
+    do db.SetInput "text" Builtin.path (box Builtin.source)
     let plugins = vecNew<Fpp.Core.Plugins.Plugin> ()
     let generators = vecNew<Fpp.Core.Plugins.Generator> ()
     /// plugins written in F++ ITSELF: name and sources, compiled and RUN at
@@ -516,6 +519,11 @@ type Workspace() =
         vecToList (this.ProjectCheck ()).Classes.PickLog
 
     member this.TypeCheck (path : string) : Analysis.Infer.InferResult =
+        // the prelude is a PSEUDO-file: its inference result is cached on
+        // the project, never recomputed per path. Falling through to the
+        // standalone path asked the query store for text nobody ever set,
+        // and hover on any prelude-defined name killed the language server.
+        if path = Builtin.path then (this.ProjectCheck ()).BuiltinInfer else
         match dictTryFind (this.ProjectCheck ()).Files path with
         | Some (_, i) -> i
         | None ->
