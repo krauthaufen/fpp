@@ -26,7 +26,27 @@ Static memory: the fd_write iovec and a UTF-8 staging buffer live low, then
 string constants (baked into an active data segment), then the bump heap
 (`$hp`). Allocation is a bump with memory growth — no collection yet.
 
-## Status: slices 1–5 (shipped)
+## Status: slices 1–6 (shipped) — the prelude lowers
+
+Slice 6 crossed the milestone: the backend emits **reachable prelude code**,
+not just the user program. From the user's declarations it walks the
+reference graph and emits every prelude function or global reached — most of
+the prelude is dropped, so a program pays only for what it uses. Lists came
+with it: `[…]` and `::` are `[head][tail]` cons cells with the null pointer
+for empty, `isNull` is a null test, and `PCons`/`PListLit []` patterns
+destructure them. `failwith` and friends trap (no exception machinery yet;
+an untaken guard never reaches it). With this, `List.map`, `List.filter`,
+`List.fold`, `List.sum`, `List.length`, `List.max` and a hand-written
+recursive list function all run under `--linear` and match the oracle. The
+backend is no longer slice-limited to hand-picked features — it lowers the
+prelude functions a program actually reaches. What a given program needs
+beyond this depends on which prelude corners it touches (exceptions,
+typeclass dispatch, StringBuilder, options); each is a further slice, and the
+reachability report says exactly which are required.
+
+## Status: slices 1–5
+
+
 
 Slice 5 added **64-bit ints and floats**, boxed (an even pointer to 8 bytes):
 float and int64 literals box their payload, arithmetic and comparisons unbox

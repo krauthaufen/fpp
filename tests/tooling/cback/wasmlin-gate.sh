@@ -83,6 +83,15 @@ let r17 = printfn "%f" (0.0 - 2.25)
 let r18 = printfn "%f" (float 7 + 0.5)
 let big = 3000000000L
 let r19 = printfn "%d" (int (big - 2999999900L))
+let nums = [ 1; 2; 3; 4; 5; 6 ]
+let r20 = printfn "%d" (List.sum (List.map (fun x -> x * 2) nums))
+let r21 = printfn "%d" (List.length (List.filter (fun x -> x % 2 = 0) nums))
+let r22 = printfn "%d" (List.fold (fun a x -> a + x) 0 nums)
+let rec mysum (l : int list) : int =
+    match l with
+    | [] -> 0
+    | h :: t -> h + mysum t
+let r23 = printfn "%d" (mysum nums)
 FPP
 
 # the direct linear module — no C toolchain touched

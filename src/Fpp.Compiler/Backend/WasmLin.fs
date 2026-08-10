@@ -555,6 +555,18 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
         lower st f b; untagi f
         ins f (match baseOp op0 with "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | ">=" -> "i32.ge_s" | "=" -> "i32.eq" | _ -> "i32.ne")
         tagi f
+    | EPrim ("::", [ h; t ]) ->
+        // a cons cell [head][tail]; the empty list is the null pointer 0
+        buildObj st f 2 [ 0, (fun () -> lower st f h); 1, (fun () -> lower st f t) ]
+    | EApp (EUnknown "isNull", [ e ]) ->
+        lower st f e; ic f 0; ins f "i32.eq"; tagi f
+    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) ->
+        // no exception machinery yet: evaluate the argument for its effects,
+        // then trap. `unreachable` is stack-polymorphic, so it satisfies any
+        // result type the call site expects. A program that stays off this
+        // path never reaches it.
+        for a in args do lower st f a; ins f "drop"
+        ins f "unreachable"
     | EPrim ("+t", [ a; b ]) ->
         lower st f a; lower st f b; callf f "$str_cat"
     | EApp (EUnknown "prints", [ a ]) ->
@@ -620,6 +632,9 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
         lower st f v
         mem f "i32.store"
         constInt f 0
+    | EListLit xs ->
+        // a chain of cons cells ending in the null pointer; [] is 0
+        emitList st f xs
     | EArray (_, xs) ->
         // [len][elem0..] — len is a RAW i32 at slot 0, elements are tagged
         buildObj st f (List.length xs + 1)
@@ -700,6 +715,12 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
                    | EPrim (op, _) -> "operator " + op
                    | _ -> "node"))
 
+// a list literal as a chain of [head][tail] cons cells ending in null (0)
+and private emitList (st : St) (f : Fn) (xs : Expr list) : unit =
+    match xs with
+    | [] -> ic f 0
+    | x :: rest -> buildObj st f 2 [ 0, (fun () -> lower st f x); 1, (fun () -> emitList st f rest) ]
+
 // build a heap object of `nslots` 4-byte words, filling slot `i` with the
 // thunk that emits its value; leaves the pointer on the stack. Base and
 // value scratch are indexed by allocation-nesting depth, so a field whose
@@ -750,8 +771,20 @@ and private emitPatTest (st : St) (f : Fn) (scrutLocal : string) (fail : string)
             let t = "$pt" + string (depth &&& 15)
             lg f scrutLocal; ic f (4 * i); ins f "i32.add"; mem f "i32.load"; ls f t
             emitPatTest st f t fail (depth + 1) sub)
+    | PCons (h, t) ->
+        // a non-empty list: the scrutinee is a [head][tail] cell (not null)
+        lg f scrutLocal; ins f "i32.eqz"; brIf f fail
+        let th = "$pt" + string (depth &&& 15)
+        lg f scrutLocal; mem f "i32.load"; ls f th
+        emitPatTest st f th fail (depth + 1) h
+        let tt = "$pt" + string (depth &&& 15)
+        lg f scrutLocal; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f tt
+        emitPatTest st f tt fail (depth + 1) t
+    | PListLit [] ->
+        // the empty list: a null pointer
+        lg f scrutLocal; brIf f fail
     | _ ->
-        err st "wasm-linear slice: unsupported pattern (lists / or-patterns / type tests await a later slice)"
+        err st "wasm-linear slice: unsupported pattern (non-empty list literals / or-patterns / type tests await a later slice)"
 
 // box/unbox the 64-bit payloads — a boxed value is a pointer to 8 bytes;
 // scratch is depth-indexed so a nested box cannot clobber this one
@@ -884,14 +917,51 @@ let private shallowLamHash (e : Expr) : int =
 
 // ---- driver ---------------------------------------------------------------
 let emitLinear (decls0 : Decl list) : byte[] * string list =
-    // slice 1 emits the USER program only: the prelude's own declarations
-    // and startup initializers are outside the slice, and a program that
-    // stays within it never needs them. A user call into an unemitted
-    // prelude function surfaces as a reported gap, not a bad module.
+    // emit the REACHABLE program: the user's declarations plus every
+    // prelude function or global a chain of references reaches from them.
+    // Unreachable prelude machinery (most of it) is dropped, so a program
+    // pays only for what it uses — and one that reaches a still-unsupported
+    // node gets a reported gap, never a bad module.
+    let allDlets =
+        decls0 |> List.choose (fun d -> match d with DLet (_, v, _, e) -> Some (v.Path + ":" + string v.Offset, e) | _ -> None)
+    let bodyOf = dictNew<string, Expr> ()
+    for k, e in allDlets do dictSet bodyOf k e
+    let reachable = dictNew<string, bool> ()
+    let rec refsOf (e : Expr) (acc : Vec<string>) : unit =
+        match e with
+        | EVar (v, _) | EVarI (v, _, _) -> vecAdd acc (v.Path + ":" + string v.Offset)
+        | ELam (_, b) -> refsOf b acc
+        | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> refsOf a acc; refsOf b acc
+        | EIf (a, b, c) | EIndexSet (_, a, b, c) -> refsOf a acc; refsOf b acc; refsOf c acc
+        | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do refsOf x acc
+        | EApp (g, xs) -> refsOf g acc; for x in xs do refsOf x acc
+        | EMatch (s, cs) -> refsOf s acc; for _, g, b in cs do (match g with Some x -> refsOf x acc | None -> ()); refsOf b acc
+        | ERecord (_, fs) -> for _, v in fs do refsOf v acc
+        | ERecordExt (_, b, fs) -> refsOf b acc; for _, v in fs do refsOf v acc
+        | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> refsOf r acc
+        | EFieldSet (r, _, _, v) -> refsOf r acc; refsOf v acc
+        | EAssign (_, x) -> refsOf x acc
+        | EIfaceCall (_, _, r, xs) -> refsOf r acc; for x in xs do refsOf x acc
+        | ETry (b, cs) -> refsOf b acc; for _, g, x in cs do (match g with Some y -> refsOf y acc | None -> ()); refsOf x acc
+        | _ -> ()
+    let rec visit (k : string) : unit =
+        if (dictTryFind reachable k).IsNone then
+            dictSet reachable k true
+            match dictTryFind bodyOf k with
+            | Some e -> let a = vecNew<string> () in refsOf e a; for r in vecToList a do visit r
+            | None -> ()
+    for d in decls0 do
+        match d with
+        | DLet (_, v, _, e) when v.Path <> Fpp.Analysis.Classes.builtinPath ->
+            dictSet reachable (v.Path + ":" + string v.Offset) true
+            let a = vecNew<string> () in refsOf e a; for r in vecToList a do visit r
+        | _ -> ()
+    // keep decls0 order (prelude before user — inits sequence correctly),
+    // filtered to what is reachable
     let decls =
         decls0 |> List.filter (fun d ->
             match d with
-            | DLet (_, v, _, _) -> v.Path <> Fpp.Analysis.Classes.builtinPath
+            | DLet (_, v, _, _) -> (dictTryFind reachable (v.Path + ":" + string v.Offset)).IsSome
             | _ -> false)
     let m = modNew ()
     let st =
