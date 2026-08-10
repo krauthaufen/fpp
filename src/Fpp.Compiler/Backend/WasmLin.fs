@@ -91,11 +91,17 @@ type private St =
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
       mutable TidNext : int
-      /// GC mode: each string constant's UTF-16 bytes, in root-slot order (its
-      /// slot is 1 + its index here; slot 0 is the scratch buffer). `Consts`
+      /// GC mode: each string constant as (root-slot, UTF-16 bytes). `Consts`
       /// maps the source literal to its slot. Constants are allocated through
       /// fpprt at startup and their pointers kept in the shim's root table.
-      GcConstData : Vec<byte[]> }
+      GcConstData : Vec<int * byte[]>
+      /// GC mode: a top-level global's key ("path:offset") -> its root-table
+      /// slot. Top-level bindings hold tagged values or heap pointers, so they
+      /// live in the scanned root table, not in unscanned wasm globals.
+      GlobalSlot : Dict<string, int>
+      /// next free root-table slot (0 = scratch buffer; then globals, then
+      /// string constants; the shadow stack for in-flight roots follows)
+      mutable RootNext : int }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -121,6 +127,10 @@ let mutable gc = false
 // print helpers are emitted (they bake the string tid as an immediate).
 let mutable private gcStrTid = 0
 let mutable private gcByteTid = 0
+// GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
+// slot, so emitLowE can turn a global read/write into a root-table load/store.
+// Set by the driver per compile.
+let mutable private gcGlobalSlots : Dict<string, int> = dictNew ()
 
 // fpprt's reserved type-ids; the compiler numbers its own from here (mirrors
 // FPPRT_TID_FIRST in fpprt.h)
@@ -214,8 +224,9 @@ let private internStrGc (st : St) (s : string) : int =
     match dictTryFind st.Consts s with
     | Some slot -> slot
     | None ->
-        let slot = 1 + vecLen st.GcConstData
-        vecAdd st.GcConstData (Fpp.Backend.BinDriver.unescape s)
+        let slot = st.RootNext
+        st.RootNext <- slot + 1
+        vecAdd st.GcConstData (slot, Fpp.Backend.BinDriver.unescape s)
         dictSet st.Consts s slot
         slot
 
@@ -1556,7 +1567,11 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     | LConstL n -> lc f n
     | LConstF x -> fc f (System.BitConverter.DoubleToInt64Bits x)
     | LGet r -> lg f (regNm r)
-    | LGetGlobal g -> gg f g
+    | LGetGlobal g ->
+        // GC: a top-level global lives in the root table — load its slot
+        match (if gc then dictTryFind gcGlobalSlots g else None) with
+        | Some slot -> gg f "$roots"; ic f (4 * slot); ins f "i32.add"; mem f "i32.load"
+        | None -> gg f g
     | LLoad (ty, a, off) ->
         emitLowE f a
         (if off <> 0 then (ic f off; ins f "i32.add"))
@@ -1597,7 +1612,10 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
         emitLowE f v
         mem f (storeIns ty)
     | LSet (r, e) -> emitLowE f e; ls f (regNm r)
-    | LSetGlobal (g, e) -> emitLowE f e; gs f g
+    | LSetGlobal (g, e) ->
+        match (if gc then dictTryFind gcGlobalSlots g else None) with
+        | Some slot -> gg f "$roots"; ic f (4 * slot); ins f "i32.add"; emitLowE f e; mem f "i32.store"
+        | None -> emitLowE f e; gs f g
     | LEval e -> emitLowE f e; ins f "drop"
     | LCallVoidS (sym, args) ->
         for a in args do emitLowE f a
@@ -1738,7 +1756,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
           Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
-          GcConstData = vecNew () }
+          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1792,11 +1810,19 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         dictSet st.TestIds ifn (cidsOf impls)
         dictSet st.TestIds (bareIface ifn) (cidsOf impls)
     rtTypesLin m
-    // classify top-level bindings
+    // classify top-level bindings. GC: each non-function global takes a root
+    // slot (before constants) so a collection scans+updates it.
+    if gc then gcGlobalSlots <- dictNew ()
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) -> dictSet st.Funcs (key v) (List.length ps)
-        | DLet (_, v, _, _) -> dictSet st.Globals (key v) true
+        | DLet (_, v, _, _) ->
+            dictSet st.Globals (key v) true
+            if gc then
+                let slot = st.RootNext
+                st.RootNext <- slot + 1
+                dictSet st.GlobalSlot (key v) slot
+                dictSet gcGlobalSlots (gl v) slot
         | _ -> ()
     // function type per arity used, and the function declarations
     let arities = st.Funcs |> dictPairs |> List.map snd |> List.distinct
@@ -1889,7 +1915,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for d in decls do
         match d with
         | DLet (_, _, _, ELam _) -> ()
-        | DLet (_, v, _, rhs) -> emitFuncLow st m [] rhs (fun f -> gs f (gl v))
+        | DLet (_, v, _, rhs) ->
+            emitFuncLow st m [] rhs (fun f ->
+                // GC: the init's result is on the stack — stash it via the spare
+                // $hp global, then store into the global's root slot
+                match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
+                | Some slot -> gs f "$hp"; gg f "$roots"; ic f (4 * slot); ins f "i32.add"; gg f "$hp"; mem f "i32.store"
+                | None -> gs f (gl v))
         | _ -> ()
     // _start: in GC mode bring fpprt up first (reactor ctors, then the heap),
     // then run every init in order
@@ -1919,7 +1951,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // range (scratch slot 0 + one per constant) up front — the slots read 0
         // (skipped by the scanner) until filled below
         callf rf "$rootsbase"; gs rf "$roots"
-        ic rf (1 + vecLen st.GcConstData); callf rf "$rootsreg"
+        ic rf st.RootNext; callf rf "$rootsreg"
         // register every shape's fpprt type
         for tid, size, kind, start in vecToList st.TidRegs do
             ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
@@ -1932,13 +1964,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         lg rf "$t"; ic rf 8; ins rf "i32.add"; gs rf "$sbuf"
         // each string constant -> a fresh fpprt string in its root slot, units
         // written one at a time (no data segment is ours under GC)
-        st.GcConstData |> vecToList |> List.iteri (fun i ub ->
+        for slot, ub in vecToList st.GcConstData do
             let nunits = ub.Length / 2
             ic rf gcStrTid; ic rf nunits; callf rf "$fpallocn"; ls rf "$t"
             for j in 0 .. nunits - 1 do
                 lg rf "$t"; ic rf (8 + 2 * j); ins rf "i32.add"
                 ic rf ((int ub.[2 * j]) ||| ((int ub.[2 * j + 1]) <<< 8)); mem rf "i32.store16"
-            gg rf "$roots"; ic rf (4 * (i + 1)); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store")
+            gg rf "$roots"; ic rf (4 * slot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
         endFn rf
     // bake the constant data at CONST_BASE (standalone only; GC has no data
     // segment of its own — constants are fpprt objects built at startup)
