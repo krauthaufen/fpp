@@ -1397,10 +1397,15 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         let tid = gcTid st "arr" 4 FK_REF_ARRAY 2
         let len = List.head slots
         let elems = List.tail slots
-        let ne = List.length elems
-        let pushes = elems |> List.map (fun v -> LCallVoidS ("$spush", [ v ]))
-        let pops = [ for i in ne - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), 8 + 4 * i, LCall ("$spop", [])) ]
-        LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops, LGet (wReg b))
+        // a constant element is not a heap pointer (and an even raw constant must
+        // NOT reach the pointer-scanned shadow stack) — store it directly; push
+        // only the potential pointers across the allocation safepoint
+        let isConst e = match e with LConstW _ -> true | _ -> false
+        let idx = elems |> List.mapi (fun i v -> i, v)
+        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.map (fun (_, v) -> LCallVoidS ("$spush", [ v ]))
+        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.map (fun (i, _) -> LStore (W, LGet (wReg b), 8 + 4 * i, LCall ("$spop", [])))
+        let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
+        LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops @ consts, LGet (wReg b))
     elif gc then
         let sk = "s:" + string cid + ":" + string n + ":" + string raw
         // record the tid->cid mapping the first time a shape is allocated, so
@@ -1409,9 +1414,16 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         let isNew = (dictTryFind st.Tids sk).IsNone
         let tid = gcTid st sk (HDR + 4 * n) FK_TAGGED (1 + raw)
         if isNew && cid >= CID_FIRST_USER then vecAdd st.TidCid (tid, cid)
-        let pushes = slots |> List.map (fun v -> LCallVoidS ("$spush", [ v ]))
-        let pops = [ for i in n - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), HDR + 4 * i, LCall ("$spop", [])) ]
-        LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops, LGet (wReg b))
+        // constants (the union tag, a closure's kind/code index) are raw words:
+        // store them directly. A pointer-or-tagged slot is pushed to the shadow
+        // stack across the safepoint. NEVER push a raw constant — an even one
+        // would be scanned as a bogus heap pointer.
+        let isConst e = match e with LConstW _ -> true | _ -> false
+        let idx = slots |> List.mapi (fun i v -> i, v)
+        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.map (fun (_, v) -> LCallVoidS ("$spush", [ v ]))
+        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.map (fun (i, _) -> LStore (W, LGet (wReg b), HDR + 4 * i, LCall ("$spop", [])))
+        let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
+        LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops @ consts, LGet (wReg b))
     else
         let stores =
             LStore (W, LGet (wReg b), 0, LConstW cid)
