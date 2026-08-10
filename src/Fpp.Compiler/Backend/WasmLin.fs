@@ -83,7 +83,14 @@ type private St =
       /// keys of let-bound mutables that a closure captures: they live in a
       /// heap CELL (a 1-word box) so the capture shares the mutation. Reads
       /// dereference, writes store, the capture passes the pointer.
-      CellVars : Dict<string, bool> }
+      CellVars : Dict<string, bool>
+      /// GC mode only: a shape key ("rec:7", "tup:3", "case:9", "clo:2",
+      /// "list", "arr", "str", "f64", "i64", "cell") -> its fpprt type-id, and
+      /// the registrations to emit at startup as (tid, size-bytes, kind,
+      /// first-payload-word-index). tids are numbered from TID_FIRST.
+      Tids : Dict<string, int>
+      TidRegs : Vec<int * int * int * int>
+      mutable TidNext : int }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -111,6 +118,7 @@ let private TID_FIRST = 3
 let private FK_STRUCT = 0
 let private FK_REF_ARRAY = 1
 let private FK_SCALAR_ARRAY = 2
+let private FK_TAGGED = 5    // uniform tagged-word objects (see fpprt-embedder.h)
 
 // import fpprt's memory and the allocator/GC/root API a GC-mode module needs.
 // Declared among the imports so the shared memory is index 0 and every fpprt
@@ -133,6 +141,25 @@ let private importFpprt (m : Mod) : unit =
 let private bareIfaceOf (n : string) : string =
     let n = if n.Contains "$<" then n.Substring (0, n.IndexOf "$<") else n
     match n.IndexOf '`' with i when i > 0 -> n.Substring (0, i) | _ -> n
+
+// GC mode: intern an fpprt type-id for a shape and queue its registration.
+// `sizeBytes` is the total object size (header included) for TAGGED/STRUCT, or
+// the element size for arrays; `start` is the first-payload word index a
+// TAGGED tracer scans from (skipping the header and any raw metadata words).
+let private gcTid (st : St) (shapeKey : string) (sizeBytes : int) (kind : int) (start : int) : int =
+    match dictTryFind st.Tids shapeKey with
+    | Some t -> t
+    | None ->
+        let t = st.TidNext
+        st.TidNext <- t + 1
+        dictSet st.Tids shapeKey t
+        vecAdd st.TidRegs (t, sizeBytes, kind, start)
+        t
+
+// where a captured-mutable cell keeps its value: at offset 0 in the standalone
+// headerless cell, or after the fpprt header in GC mode (a cell is a TAGGED
+// object so its value is scanned)
+let private cellOff () : int = if gc then HDR else 0
 
 let private key (v : VarId) : string = v.Path + ":" + string v.Offset
 let private fn (v : VarId) : string = "$f" + string (abs (strHash (key v)))
@@ -998,7 +1025,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         lowTag (LPrim (iop, [ ia; ib ]))
-    | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST [ coreToLowE ctx h; coreToLowE ctx t ]
+    | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
     | EPrim (op, [ a; b ]) ->
         let bop = baseOp op
         let la = lowUntag (coreToLowE ctx a)
@@ -1006,11 +1033,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         if List.contains bop [ "+"; "-"; "*"; "/"; "%" ]
         then lowTag (LPrim (intArithOp bop, [ la; lb ]))
         else lowTag (LPrim (intCmpOp bop, [ la; lb ]))
-    | ETuple xs -> lowObj ctx CID_TUPLE (List.map (coreToLowE ctx) xs)
+    | ETuple xs -> lowObj ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs)
     | EListLit xs -> lowList ctx xs
     | ERecord (name, fields) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
-        lowObj ctx (cidRec st name) (order |> List.map (fun fnm ->
+        lowObj ctx (cidRec st name) 0 (order |> List.map (fun fnm ->
             match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
             | Some e2 -> coreToLowE ctx e2
             | None -> lowInt 0))
@@ -1022,10 +1049,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> coreToLowE ctx e2
                 | None -> LLoad (W, LGet (wReg b), HDR + 4 * i))
-        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) slots)
+        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) 0 slots)
     | ECtor (case, _, args) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        lowObj ctx (cidCase st case) (LConstW tag :: List.map (coreToLowE ctx) args)
+        lowObj ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args)
     | EField (r, fname, owner) ->
         let idx =
             match dictTryFind st.RecFields owner with
@@ -1038,7 +1065,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
         LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
-    | EArray (_, xs) -> lowObj ctx CID_ARRAY (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
+    | EArray (_, xs) -> lowObj ctx CID_ARRAY 0 (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
     | EIndex (_, arr, i) ->
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LLoad (W, addr, HDR)
@@ -1054,13 +1081,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let stmts =
             [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
               LSet (wReg iv, coreToLowE ctx init)
-              LSet (wReg bs, LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))
-              LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY)
-              LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt))
-              LSet (wReg it, LConstW 0)
-              LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
-                      [ LStore (W, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg it); LConstW 1 ]); LConstW 4 ]) ]), HDR, LGet (wReg iv))
-                        LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
+              LSet (wReg bs, (if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt "arr" 4 FK_REF_ARRAY 2); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))) ]
+            @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
+            @ [ LSet (wReg it, LConstW 0)
+                LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
+                        [ LStore (W, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg it); LConstW 1 ]); LConstW 4 ]) ]), HDR, LGet (wReg iv))
+                          LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EApp (EUnknown n, _) when n.StartsWith "$zero" -> lowInt 0
     | EUnknown n when n.StartsWith "$zero" -> lowInt 0
@@ -1082,8 +1108,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // cells: $cellof yields the cell POINTER (its storage, no deref); $cellget
     // reads through it; $cellset writes; $forcecell is a marker
     | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
-    | EApp (EUnknown "$cellget", [ c ]) -> LLoad (W, coreToLowE ctx c, 0)
-    | EApp (EUnknown "$cellset", [ c; v ]) -> LDo ([ LStore (W, coreToLowE ctx c, 0, coreToLowE ctx v) ], lowInt 0)
+    | EApp (EUnknown "$cellget", [ c ]) -> LLoad (W, coreToLowE ctx c, cellOff ())
+    | EApp (EUnknown "$cellset", [ c; v ]) -> LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
     | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
     | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> lowTag (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
     | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> lowTag (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
@@ -1202,7 +1228,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         LSet (wReg id, init) :: coreToLowS ctx body
     | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
         // a captured mutable: store into its cell (shared with the closure)
-        [ LStore (W, lowVarStore ctx (key v), 0, coreToLowE ctx rhs) ]
+        [ LStore (W, lowVarStore ctx (key v), cellOff (), coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
          | Some id -> [ LSet (wReg id, coreToLowE ctx rhs) ]
@@ -1217,30 +1243,54 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
 // allocate an object: the class-id descriptor at offset 0, then each slot at
 // HDR + 4*i. A fresh register holds the base, so nesting is safe with no
 // scratch pool — the IR gives every allocation its own register.
-and private lowObj (ctx : LowCtx) (cid : int) (slots : LExpr list) : LExpr =
+// allocate a heap object of `n = List.length slots` words, `raw` of which are
+// leading non-pointer metadata (the union tag, a closure's kind+code-index)
+// that a GC trace must skip. Standalone: a bump alloc + a class-id header we
+// write. GC: fpprt_alloc writes the (tid<<1)|1 header itself, so we only store
+// the slots; the shape gets an fpprt type-id whose TAGGED tracer scans from the
+// first real word. CID_ARRAY is the variable-length REF_ARRAY case.
+and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) : LExpr =
     let n = List.length slots
     let b = freshTmp ctx
-    let stores =
-        LStore (W, LGet (wReg b), 0, LConstW cid)
-        :: (slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v)))
-    LDo (LSet (wReg b, LAlloc (LConstW (HDR + 4 * n))) :: stores, LGet (wReg b))
+    let st = ctx.LSt
+    if gc && cid = CID_ARRAY then
+        // [tag][len][elems]: fpprt_alloc_array writes tag@0 and len@4; we store
+        // the elements from offset 8. slots = [len; elem0; elem1; …]
+        let tid = gcTid st "arr" 4 FK_REF_ARRAY 2
+        let len = List.head slots
+        let stores = List.tail slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
+        LDo (LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) :: stores, LGet (wReg b))
+    elif gc then
+        let tid = gcTid st ("s:" + string cid + ":" + string n + ":" + string raw) (HDR + 4 * n) FK_TAGGED (1 + raw)
+        let stores = slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
+        LDo (LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) :: stores, LGet (wReg b))
+    else
+        let stores =
+            LStore (W, LGet (wReg b), 0, LConstW cid)
+            :: (slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v)))
+        LDo (LSet (wReg b, LAlloc (LConstW (HDR + 4 * n))) :: stores, LGet (wReg b))
 
 and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
     | [] -> LConstW 0
-    | x :: rest -> lowObj ctx CID_LIST [ coreToLowE ctx x; lowList ctx rest ]
+    | x :: rest -> lowObj ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ]
 
 // a boxed 64-bit payload: the class-id header then an 8-byte payload at HDR;
-// the wide type on the LStore/LLoad picks f64/i64 access
-and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr =
+// the wide type on the LStore/LLoad picks f64/i64 access. GC: a no-ref STRUCT
+// (size 12); fpprt writes the header, we store the payload at HDR.
+and private lowBox64 (ctx : LowCtx) (shape : string) (cid : int) (ty : LTy) (v : LExpr) : LExpr =
     let b = freshTmp ctx
-    LDo ([ LSet (wReg b, LAlloc (LConstW (HDR + 8))); LStore (W, LGet (wReg b), 0, LConstW CID_FLOAT); LStore (F64, LGet (wReg b), HDR, fv) ], LGet (wReg b))
+    let alloc =
+        if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt shape (HDR + 8) FK_STRUCT 0) ])
+        else LAlloc (LConstW (HDR + 8))
+    let hdr = if gc then [] else [ LStore (W, LGet (wReg b), 0, LConstW cid) ]
+    LDo (LSet (wReg b, alloc) :: hdr @ [ LStore (ty, LGet (wReg b), HDR, v) ], LGet (wReg b))
+
+and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID_FLOAT F64 fv
 
 and private lowUnboxF (p : LExpr) : LExpr = LLoad (F64, p, HDR)
 
-and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr =
-    let b = freshTmp ctx
-    LDo ([ LSet (wReg b, LAlloc (LConstW (HDR + 8))); LStore (W, LGet (wReg b), 0, LConstW CID_INT64); LStore (I64, LGet (wReg b), HDR, iv) ], LGet (wReg b))
+and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr = lowBox64 ctx "i64" CID_INT64 I64 iv
 
 and private lowUnboxI (p : LExpr) : LExpr = LLoad (I64, p, HDR)
 
@@ -1322,13 +1372,17 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
 // storage content directly
 and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
     let store = lowVarStore ctx k
-    if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, 0) else store
+    if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, cellOff ()) else store
 
 // a fresh 1-word cell holding `v` (headerless — cells are internal, never
 // type-tested or dispatched on)
 and private lowMkCell (ctx : LowCtx) (v : LExpr) : LExpr =
     let b = freshTmp ctx
-    LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
+    if gc then
+        let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
+        LDo ([ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, v) ], LGet (wReg b))
+    else
+        LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
 
 // build a closure object [kind=2][code-index][captures…]; its layout and the
 // (env, arg) calling convention match the hand path, so a LowIR-built closure
@@ -1343,7 +1397,7 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
     // capture the STORAGE, not the dereferenced value: for a cell var that is
     // the shared pointer, so mutation is visible on both sides
     :: (caps |> List.map (fun (p, o) -> lowVarStore ctx (p + ":" + string o)))
-    |> lowObj ctx CID_CLOSURE
+    |> lowObj ctx CID_CLOSURE 2
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -1360,7 +1414,7 @@ and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
 and private lowFailure (ctx : LowCtx) (msg : LExpr) : LExpr =
     ctx.LSt.UsesExn <- true
     match dictTryFind ctx.LSt.UnionTag "Failure" with
-    | Some tag -> lowObj ctx (cidCase ctx.LSt "Failure") [ LConstW tag; msg ]
+    | Some tag -> lowObj ctx (cidCase ctx.LSt "Failure") 1 [ LConstW tag; msg ]
     | None -> msg
 
 // a RAW i32 (0/1): is `v` a heap object whose class-id header is one of those
@@ -1634,7 +1688,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
-          CellVars = cellScan decls0 }
+          CellVars = cellScan decls0
+          Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1728,6 +1783,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for name, _, _, _ in vecToList st.Lams do
         declFn m name "$lclo"
         tblIdx m name |> ignore
+    // GC: one startup routine that registers every fpprt type-id the program's
+    // shapes need. Declared AFTER the lambdas so its body — emitted last, once
+    // lazy tid discovery during body lowering is complete — reads a full
+    // TidRegs. _start calls it before any allocation.
+    if gc then declFn m "$fpreg_all" "$lt_v2v"
     // the vtable: a flat [class-id][slot] array of function TABLE indices, so
     // dispatch is `table[cid*NSlots + slot]`. Fill each class' row from
     // slotImpl (walking its inheritance chain); every impl function joins the
@@ -1779,6 +1839,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then
         callf f "$fpinit"                 // fpprt reactor _initialize
         ic f 0; callf f "$fpheap"         // fpprt_init(NULL) -> default heap
+        callf f "$fpreg_all"              // register every shape's fpprt type
     for nm in vecToList inits do callf f nm
     endFn f
     // lifted lambda bodies: (environment, argument) -> result — declared LAST.
@@ -1788,6 +1849,16 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         st.Captures <- dictNew ()
         caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
         emitLambdaLow st m pv body
+    // GC: emit $fpreg_all LAST — every shape's tid is known now. Each shape is
+    // registered as (tid, size, kind, start, refoffs=0, name=0); `start` is the
+    // TAGGED tracer's first-payload word (0 for a no-ref STRUCT box).
+    if gc then
+        let rf = beginFn m []
+        localsDone rf
+        for tid, size, kind, start in vecToList st.TidRegs do
+            ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
+            callf rf "$fpreg"
+        endFn rf
     // bake the constant data at CONST_BASE; $hp already starts after it
     activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
