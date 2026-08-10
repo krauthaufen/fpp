@@ -101,7 +101,11 @@ type private St =
       GlobalSlot : Dict<string, int>
       /// next free root-table slot (0 = scratch buffer; then globals, then
       /// string constants; the shadow stack for in-flight roots follows)
-      mutable RootNext : int }
+      mutable RootNext : int
+      /// GC mode: (fpprt type-id, language class-id) for every type-testable
+      /// shape (records, union cases), filled into the tid->cid table so `:?`
+      /// and vtable dispatch recover the class-id from the tagged header
+      TidCid : Vec<int * int> }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -156,6 +160,7 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_write_ref" "$fpwr" [ "i32"; "i32"; "i32" ] []
     importFn m "fpprt" "fpprt_wasm_roots_base" "$rootsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_roots_register" "$rootsreg" [ "i32" ] []
+    importFn m "fpprt" "fpprt_tid2cid_base" "$t2cbase" [] [ "i32" ]
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -1030,6 +1035,15 @@ let private typeTestIds (st : St) (tn0 : string) : int list =
         match dictTryFind st.TestIds (bareIfaceOf tn) with
         | Some xs -> xs
         | None -> match dictTryFind st.ClassId tn with Some c -> [ c ] | None -> []
+// the language class-id of the object in register `t`: the header word itself
+// in the standalone path, or (under GC, where the header is (tid<<1)|1) the
+// class-id looked up in the tid->cid table
+let private lowHeaderCid (t : LReg) : LExpr =
+    if gc then
+        LLoad (W, LPrim (AddW, [ LGetGlobal "$t2c"
+                                 LPrim (ShlW, [ LPrim (ShrUW, [ LLoad (W, LGet t, 0); LConstW 1 ]); LConstW 2 ]) ]), 0)
+    else LLoad (W, LGet t, 0)
+
 let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
@@ -1276,7 +1290,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         // row, the slot the column; the word there is the impl's table index
         let slot = match dictTryFind st.SlotOf (bareIfaceOf iface + "|" + method) with Some s -> s | None -> 0
         let t = freshTmp ctx
-        let cid = LLoad (W, LGet (wReg t), 0)
+        let cid = lowHeaderCid (wReg t)
         let idxAddr =
             LPrim (AddW, [ LConstW st.VtBase
                            LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
@@ -1528,7 +1542,7 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
     let matchAny = ids |> List.fold (fun acc id -> LPrim (OrW, [ acc; LPrim (EqW, [ LGet (wReg h); LConstW id ]) ])) (LConstW 0)
     LDo ([ LSet (wReg t, v)
            LIf (isPtr,
-                [ LSet (wReg h, LLoad (W, LGet (wReg t), 0)); LSet (wReg r, matchAny) ],
+                [ LSet (wReg h, lowHeaderCid (wReg t)); LSet (wReg r, matchAny) ],
                 [ LSet (wReg r, LConstW 0) ]) ],
          LGet (wReg r))
 
@@ -1793,7 +1807,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
           Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
-          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1 }
+          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew () }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1812,6 +1826,25 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.CaseClass cn cid)
         | _ -> ()
     let nCid = nextCid
+    // GC: eagerly intern the fpprt type-id for every type-testable shape and
+    // record its tid<->cid pair. Uses the SAME shape key as allocation, so the
+    // tid the header carries matches what `:?`/dispatch look up.
+    if gc then
+        for d in decls0 do
+            match d with
+            | DRecord (n, _, fs, _) ->
+                match dictTryFind st.ClassId n with
+                | Some cid ->
+                    let nf = List.length fs
+                    vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string nf + ":0") (HDR + 4 * nf) FK_TAGGED 1, cid)
+                | None -> ()
+            | DUnion (_, _, cs) ->
+                for cn, ar in cs do
+                    match dictTryFind st.CaseClass cn with
+                    | Some cid ->
+                        vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string (1 + ar) + ":1") (HDR + 4 * (1 + ar)) FK_TAGGED 2, cid)
+                    | None -> ()
+            | _ -> ()
     // interface dispatch tables. A method slot is keyed by the BARE interface
     // name and the method (the impl clause, the dispatch site and the decl
     // spell the arity differently, but all mean one slot). slotImpl walks the
@@ -1939,6 +1972,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then globalI32Mut m "$sbuf" 0
     // GC shadow-stack pointer: a byte offset into $roots, above the fixed slots
     if gc then globalI32Mut m "$sp" 0
+    // GC: base of the tid->class-id table (fixed static memory in the shim)
+    if gc then globalI32Mut m "$t2c" 0
     exportFn m "_start" "$_start"
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
@@ -1995,6 +2030,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // stack that follows; the shadow pointer starts just past the fixed slots
         ic rf 65536; callf rf "$rootsreg"
         ic rf (st.RootNext * 4); gs rf "$sp"
+        // fill the tid->cid table (raw class-ids, fixed static memory)
+        callf rf "$t2cbase"; gs rf "$t2c"
+        for tid, cid in vecToList st.TidCid do
+            gg rf "$t2c"; ic rf (4 * tid); ins rf "i32.add"; ic rf cid; mem rf "i32.store"
         // register every shape's fpprt type
         for tid, size, kind, start in vecToList st.TidRegs do
             ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
