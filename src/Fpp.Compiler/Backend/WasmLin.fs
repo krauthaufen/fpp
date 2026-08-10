@@ -68,7 +68,15 @@ type private St =
       /// the descriptor word stored at every object's offset 0: a type's
       /// class-id. type name -> class-id, and a union CASE -> its union's id
       ClassId : Dict<string, int>
-      CaseClass : Dict<string, int> }
+      CaseClass : Dict<string, int>
+      /// interface dispatch: "bareIface|method" -> vtable slot; the row width;
+      /// the base address of the flat [class-id][slot] vtable in linear memory;
+      /// and, for hierarchy type tests, a class/interface name -> the set of
+      /// class-ids it accepts (itself + subclasses, or its implementors)
+      SlotOf : Dict<string, int>
+      mutable NSlots : int
+      mutable VtBase : int
+      TestIds : Dict<string, int list> }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -82,6 +90,13 @@ let private CID_STRING = 6
 let private CID_FIRST_USER = 7
 
 let private CLO_KIND = 2
+
+// the slot key for an interface method uses the interface's BARE name: the
+// declaration, an impl clause and a dispatch site spell its arity and type
+// arguments differently, but all mean one slot
+let private bareIfaceOf (n : string) : string =
+    let n = if n.Contains "$<" then n.Substring (0, n.IndexOf "$<") else n
+    match n.IndexOf '`' with i when i > 0 -> n.Substring (0, i) | _ -> n
 
 let private key (v : VarId) : string = v.Path + ":" + string v.Offset
 let private fn (v : VarId) : string = "$f" + string (abs (strHash (key v)))
@@ -544,6 +559,16 @@ let private cidCase (st : St) (case : string) : int = match dictTryFind st.CaseC
 let private typeTestCid (st : St) (tn0 : string) : int =
     let tn = if tn0.Contains "$<" then tn0.Substring (0, tn0.IndexOf "$<") else tn0
     match dictTryFind st.ClassId tn with Some c -> c | None -> 0 - 1
+// the SET of class-ids `:? T` accepts: a class' own id plus its subclasses',
+// an interface's implementors', or a record/union's single id
+let private typeTestIds (st : St) (tn0 : string) : int list =
+    let tn = if tn0.Contains "$<" then tn0.Substring (0, tn0.IndexOf "$<") else tn0
+    match dictTryFind st.TestIds tn with
+    | Some xs -> xs
+    | None ->
+        match dictTryFind st.TestIds (bareIfaceOf tn) with
+        | Some xs -> xs
+        | None -> match dictTryFind st.ClassId tn with Some c -> [ c ] | None -> []
 let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
@@ -721,7 +746,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
     | ETypeTest (tn, e2) -> lowTag (lowTypeTest ctx tn (coreToLowE ctx e2))
-    | ECast (tn, e2, true) when typeTestCid st tn >= 0 ->
+    | ECast (tn, e2, true) when not (List.isEmpty (typeTestIds st tn)) ->
         // `:?>` downcast to a type we carry a class-id for: check the header
         // and trap on a mismatch, then yield the value unchanged
         let t = freshTmp ctx
@@ -732,6 +757,18 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         // `:>` widening, and `:?>` to a type without a class-id: the identity —
         // the representation does not change under a cast in the tagged model
         coreToLowE ctx e2
+    | EIfaceCall (iface, method, recv, args) ->
+        // dispatch through the vtable: the receiver's class-id header indexes a
+        // row, the slot the column; the word there is the impl's table index
+        let slot = match dictTryFind st.SlotOf (bareIfaceOf iface + "|" + method) with Some s -> s | None -> 0
+        let t = freshTmp ctx
+        let cid = LLoad (W, LGet (wReg t), 0)
+        let idxAddr =
+            LPrim (AddW, [ LConstW st.VtBase
+                           LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
+        let callArgs = LGet (wReg t) :: List.map (coreToLowE ctx) args
+        LDo ([ LSet (wReg t, coreToLowE ctx recv) ],
+             LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), callArgs))
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
@@ -852,7 +889,7 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
-            | None -> err st "wasm-linear LowIR: unresolved variable"; lowInt 0
+            | None -> err st ("wasm-linear LowIR: unresolved variable " + k); lowInt 0
 
 // build a closure object [kind=2][code-index][captures…]; its layout and the
 // (env, arg) calling convention match the hand path, so a LowIR-built closure
@@ -877,19 +914,22 @@ and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
         let step = LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
         lowApply ctx step rest
 
-// a RAW i32 (0/1): is `v` a heap object whose class-id header equals the class
-// tested by `tn`? Guards the header load behind an even-and-nonzero pointer
-// test, so a tagged int or a null answers 0 without dereferencing.
+// a RAW i32 (0/1): is `v` a heap object whose class-id header is one of those
+// `tn` accepts (its own, a subclass', an implementor')? Guards the header load
+// behind an even-and-nonzero pointer test, so a tagged int or a null answers 0
+// without dereferencing.
 and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
-    let cid = typeTestCid ctx.LSt tn
+    let ids = typeTestIds ctx.LSt tn
     let t = freshTmp ctx
     let r = freshTmp ctx
+    let h = freshTmp ctx
     let isPtr =
         LPrim (AndW, [ LPrim (EqW, [ LPrim (AndW, [ LGet (wReg t); LConstW 1 ]); LConstW 0 ])
                        LPrim (NeW, [ LGet (wReg t); LConstW 0 ]) ])
+    let matchAny = ids |> List.fold (fun acc id -> LPrim (OrW, [ acc; LPrim (EqW, [ LGet (wReg h); LConstW id ]) ])) (LConstW 0)
     LDo ([ LSet (wReg t, v)
            LIf (isPtr,
-                [ LSet (wReg r, LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW cid ])) ],
+                [ LSet (wReg h, LLoad (W, LGet (wReg t), 0)); LSet (wReg r, matchAny) ],
                 [ LSet (wReg r, LConstW 0) ]) ],
          LGet (wReg r))
 
@@ -988,6 +1028,12 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
         for a in args do emitLowE f a
         emitLowE f (LLoad (W, fp, HDR + 4))
         callIndirect f "$lclo"
+    | LCallIdx (nparams, fnidx, args) ->
+        // interface dispatch: the args (receiver first), then the table index,
+        // then call_indirect with the arity's signature
+        for a in args do emitLowE f a
+        emitLowE f fnidx
+        callIndirect f ("$lfn" + string nparams)
     | LDo (ss, v) ->
         for s in ss do emitLowS f s
         emitLowE f v
@@ -1095,6 +1141,18 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             dictSet reachable (v.Path + ":" + string v.Offset) true
             let a = vecNew<string> () in refsOf e a; for r in vecToList a do visit r
         | _ -> ()
+    // a class' interface-method implementations are reached only through a
+    // vtable at run time, never by a static reference — so seed them as roots,
+    // or the reachability filter would drop the very functions dispatch calls.
+    // Restricted to user impls: prelude class dispatch (and the prelude methods
+    // it would pull in, some not yet lowerable) is a later concern.
+    for d in decls0 do
+        match d with
+        | DClass (_, _, _, impls) ->
+            for _, ms in impls do
+                for _, v in ms do
+                    if v.Path <> Fpp.Analysis.Classes.builtinPath then visit (v.Path + ":" + string v.Offset)
+        | _ -> ()
     // keep decls0 order (prelude before user — inits sequence correctly),
     // filtered to what is reachable
     let decls =
@@ -1109,7 +1167,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
           RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
-          ClassId = dictNew (); CaseClass = dictNew () }
+          ClassId = dictNew (); CaseClass = dictNew ()
+          SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew () }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1127,6 +1186,41 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.UnionArity cn ar
                 dictSet st.CaseClass cn cid)
         | _ -> ()
+    let nCid = nextCid
+    // interface dispatch tables. A method slot is keyed by the BARE interface
+    // name and the method (the impl clause, the dispatch site and the decl
+    // spell the arity differently, but all mean one slot). slotImpl walks the
+    // inheritance chain to the function implementing a slot for a class.
+    let classDecls = decls0 |> List.choose (fun d -> match d with DClass (n, b, own, impls) -> Some (n, b, own, impls) | _ -> None)
+    let interfaceDecls = decls0 |> List.choose (fun d -> match d with DInterface (n, ms) -> Some (n, ms) | _ -> None)
+    let bareIface = bareIfaceOf
+    let baseOf (n : string) = classDecls |> List.tryPick (fun (cn, b, _, _) -> if cn = n then b else None)
+    let rec chainOf (n : string) : string list =
+        match baseOf n with Some b when b <> n -> n :: chainOf b | _ -> [ n ]
+    let subclassesOf (n : string) =
+        let derived = classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
+        if List.isEmpty derived then [ n ] else derived
+    let slotImpl (cn : string) (owner : string) (mn : string) : VarId option =
+        chainOf cn
+        |> List.tryPick (fun c ->
+            classDecls
+            |> List.tryPick (fun (n2, _, _, impls) ->
+                if n2 <> c then None
+                else impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+    let vtableSlots =
+        ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
+         @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))))
+        |> List.distinct |> List.sort
+    st.NSlots <- List.length vtableSlots
+    vtableSlots |> List.iteri (fun i (ifn, mn) -> dictSet st.SlotOf (ifn + "|" + mn) i)
+    // the class-id set a `:? T` accepts: a class matches itself and its
+    // subclasses; an interface matches its implementors; anything else is exact
+    let cidsOf (names : string list) = names |> List.choose (fun n -> dictTryFind st.ClassId n)
+    for cn, _, _, _ in classDecls do dictSet st.TestIds cn (cidsOf (subclassesOf cn))
+    for ifn, _ in interfaceDecls do
+        let impls = classDecls |> List.filter (fun (_, _, _, impls) -> impls |> List.exists (fun (i, _) -> bareIface i = bareIface ifn)) |> List.collect (fun (cn, _, _, _) -> subclassesOf cn) |> List.distinct
+        dictSet st.TestIds ifn (cidsOf impls)
+        dictSet st.TestIds (bareIface ifn) (cidsOf impls)
     rtTypesLin m
     // classify top-level bindings
     for d in decls do
@@ -1168,9 +1262,32 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for name, _, _, _ in vecToList st.Lams do
         declFn m name "$lclo"
         tblIdx m name |> ignore
+    // the vtable: a flat [class-id][slot] array of function TABLE indices, so
+    // dispatch is `table[cid*NSlots + slot]`. Fill each class' row from
+    // slotImpl (walking its inheritance chain); every impl function joins the
+    // call table here. Rows for types with no impls stay 0.
+    let vtRows = Array.zeroCreate (nCid * st.NSlots)
+    for cn, _, _, _ in classDecls do
+        match dictTryFind st.ClassId cn with
+        | Some cid ->
+            vtableSlots |> List.iteri (fun slot (ifn, mn) ->
+                match slotImpl cn ifn mn with
+                // only a declared top-level function can go in the table; an
+                // impl that never became one (not reachable / not a plain
+                // function) leaves the slot 0
+                | Some v when (dictTryFind st.Funcs (key v)).IsSome ->
+                    vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
+                | _ -> ())
+        | None -> ()
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
         match d with DLet (_, _, _, e) -> scanConsts st e | _ -> ()
+    // bake the vtable right after the string constants; $hp starts after it
+    st.VtBase <- st.ConstNext
+    for w in vtRows do
+        emitByte st.ConstData (w &&& 0xFF); emitByte st.ConstData ((w >>> 8) &&& 0xFF)
+        emitByte st.ConstData ((w >>> 16) &&& 0xFF); emitByte st.ConstData ((w >>> 24) &&& 0xFF)
+    st.ConstNext <- st.ConstNext + 4 * (nCid * st.NSlots)
     globalI32Mut m "$hp" st.ConstNext
     exportFn m "_start" "$_start"
     // runtime bodies

@@ -66,6 +66,10 @@ type LExpr =
     /// indirect call: parameter types (for the wasm type index), the function
     /// pointer/closure, and the arguments
     | LCallIndirect of LTy list * LExpr * LExpr list
+    /// call through the function table by index: the parameter count (which
+    /// picks the call signature), the table-index expression, and the full
+    /// argument list. Interface dispatch reads the index from a vtable.
+    | LCallIdx of int * LExpr * LExpr list
     /// a sequence of statements evaluated for effect, then a result value —
     /// LowIR's let-region; binders are just LSet statements before the value
     | LDo of LStmt list * LExpr
