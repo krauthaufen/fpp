@@ -18,13 +18,16 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
-* `member-applied-dot-chain.fpp` — `Zero<float>.Zero` (a class member
-  as the applied head of a dot chain) still stubs and traps where
-  `Num<float>.Zero` and bare `Zero<float>` now work; `(1.5).Bogus` is
-  the sibling hole (a dot that never parks escapes the known-receiver
-  check). The file header maps the boundary.
-
 Fixed and removed (see git history for the repros):
+`member-applied-dot-chain` (the forced dot pass conceded success on any
+known receiver with no candidate — `universal () || true` — so every
+misspelled member sailed through check and stubbed; the concession now
+extends to the universal object members alone, and a member name known
+NOWHERE errors at check naming the receiver's type — `(1.5).Bogus`,
+`r.Bogus`. A name known SOMEWHERE, `Zero<float>.Zero` included, is left
+to the by-name binder, which the port's arity-split sibling shape
+legitimately needs; tightening that means fixing same-name member
+registration across the arity split first),
 `generic-instance-operator-body` and `instance-body-second-context-var`
 (both faces of one arc: parked field reads resolved AFTER numeric
 defaulting, so the guess ran before the information and ground a generic

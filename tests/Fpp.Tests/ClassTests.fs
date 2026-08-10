@@ -2157,6 +2157,24 @@ let declarationCheckTests =
             Expect.exists errs (fun e -> e.Contains "class Num has no member Bogus")
                 "reported at check, naming the class"
         }
+        test "a member that does not exist on a known type says so" {
+            // the forced dot pass used to concede success on ANY known
+            // receiver with no candidate — binding nothing — so every
+            // misspelled member sailed through check and stubbed. Records,
+            // structs, unions and the primitives all say so now.
+            let errs =
+                diagnostics
+                    [ "type R = { A : int }"
+                      "let r = { A = 1 }"
+                      "let a = r.Bogus"
+                      "let b = (1.5).Bogus" ]
+            Expect.exists errs (fun e -> e.Contains "R has no member Bogus") "record receiver"
+            Expect.exists errs (fun e -> e.Contains "float has no member Bogus") "literal receiver"
+            // Zero<float>.Zero stays SILENT for now: "Zero" is a known
+            // class-member name, and known-somewhere names are left to the
+            // by-name binder (the arity-split sibling shape in the port
+            // legitimately resolves that way)
+        }
         test "an abbreviation applied at the wrong argument count says so" {
             // it used to fall through and invent a type named after the
             // abbreviation; the error then blamed code far away

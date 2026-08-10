@@ -1211,9 +1211,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // is complete — during the main pass a member declared later
                  // in the same class has not registered yet, and giving up
                  // here silently unbound `for e in x` over self. Stay parked;
-                 // the forced pass concedes — to the UNIVERSAL object
-                 // members, when the name is one of theirs.
-                 if force then (universal () || true) else false)
+                 // the forced pass concedes to the UNIVERSAL object members
+                 // when the name is one of theirs — and to NOTHING else:
+                 // the old unconditional concession claimed success while
+                 // binding nothing, which swallowed every misspelled member
+                 // on a known type ((1.5).Bogus, r.Bogus, float's .Zero)
+                 // and left the backend to guess a field and stub.
+                 if force then universal () else false)
         | _ -> false
 
     /// `recv.[i]` where the receiver declares `member x.Item` — a .NET
@@ -6924,12 +6928,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match prune recvTy with
             | TCon (tn, _) when
                   offset < 30000000
+                  // only when the PRELUDE is present: the dogfooding gate
+                  // infers the compiler's own sources with an empty
+                  // prelude and demands zero diagnostics — there, every
+                  // prelude-provided member is unknowable, not misspelled
+                  && (dictTryFind classes.Classes "Num").IsSome
                   && ((dictTryFind knownTypes tn).IsSome
+                      || (dictTryFind recordsReg tn).IsSome
+                      || (dictTryFind structTypes tn).IsSome
+                      || (dictTryFind unionCasesReg tn).IsSome
                       || List.contains tn
                           [ "int"; "float"; "float32"; "float16"; "int64"
                             "uint32"; "uint64"; "int16"; "uint16"; "byte"
                             "sbyte"; "bool"; "char"; "nativeint" ])
-                  && List.isEmpty (freeVars recvTy) ->
+                  && List.isEmpty (freeVars recvTy)
+                  // a name that exists SOMEWHERE may still bind through
+                  // the by-name guess (the arity-split sibling shape in
+                  // the adaptive port does); only a name known NOWHERE is
+                  // certainly a misspelling
+                  && (dictTryFind fields name).IsNone
+                  && List.isEmpty (fieldCandidates name)
+                  && (dictTryFind classes.MemberOwner name).IsNone
+                  && not (dictPairs fields
+                          |> List.exists (fun (k, _) -> k.EndsWith ("." + name))) ->
                 vecAdd diags (offset, tn + " has no member " + name)
             | _ -> ()
     // a loop whose source's type only settled during the fixpoint: wire the
