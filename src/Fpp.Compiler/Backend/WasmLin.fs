@@ -896,15 +896,23 @@ and private declarePatVars (st : St) (f : Fn) (p : Pat) : unit =
 
 // intern every string literal up front, so the heap pointer's start (after
 // the constant region) is known before any global is declared
+// intern EVERY string literal reachable in a body — a literal missed here
+// is baked at an address the heap pointer already claimed, so $hp must
+// only settle once every constant is counted
 let rec private scanConsts (st : St) (e : Expr) : unit =
     match e with
     | ELit (LString s) -> internStr st s |> ignore
-    | ELet (_, _, _, a, b) | EWhile (a, b) -> scanConsts st a; scanConsts st b
-    | ESeq xs | EPrim (_, xs) | EApp (_, xs) | ETuple xs | EListLit xs -> for x in xs do scanConsts st x
-    | EIf (a, b, c) -> scanConsts st a; scanConsts st b; scanConsts st c
-    | EAssign (_, r) -> scanConsts st r
+    | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> scanConsts st a; scanConsts st b
+    | EIf (a, b, c) | EIndexSet (_, a, b, c) -> scanConsts st a; scanConsts st b; scanConsts st c
+    | ESeq xs | EPrim (_, xs) | EApp (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do scanConsts st x
+    | EAssign (_, r) | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) -> scanConsts st r
+    | EFieldSet (r, _, _, v) -> scanConsts st r; scanConsts st v
     | ELam (_, b) -> scanConsts st b
-    | ECtor (_, _, xs) -> for x in xs do scanConsts st x
+    | EMatch (s, cs) -> scanConsts st s; for _, g, b in cs do (match g with Some x -> scanConsts st x | None -> ()); scanConsts st b
+    | ERecord (_, fs) -> for _, v in fs do scanConsts st v
+    | ERecordExt (_, b, fs) -> scanConsts st b; for _, v in fs do scanConsts st v
+    | EIfaceCall (_, _, r, xs) -> scanConsts st r; for x in xs do scanConsts st x
+    | ETry (b, cs) -> scanConsts st b; for _, g, x in cs do (match g with Some y -> scanConsts st y | None -> ()); scanConsts st x
     | _ -> ()
 
 let private paramNm (v : VarId) : string = "$p" + string (abs (strHash (key v)))

@@ -92,6 +92,18 @@ let rec mysum (l : int list) : int =
     | [] -> 0
     | h :: t -> h + mysum t
 let r23 = printfn "%d" (mysum nums)
+let classify (n : int) : string =
+    match n with
+    | 0 -> "zero"
+    | 1 -> "one"
+    | _ -> "many"
+let r24 = printfn "%s" (classify 1)
+let describe (o : int option) =
+    match o with
+    | Some v -> printfn "got %d" v
+    | None -> printfn "nothing"
+let r25 = describe (Some 7)
+let r26 = describe None
 FPP
 
 # the direct linear module — no C toolchain touched
