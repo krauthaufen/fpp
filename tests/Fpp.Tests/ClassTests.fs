@@ -2142,6 +2142,21 @@ let declarationCheckTests =
             Expect.exists ws.EmitWarnings (fun w -> w.StartsWith "stubbed ")
                 "the stub is on record for --strict"
         }
+        test "written type arguments pin a class member" {
+            // Num<float>.One and One<float> both mean float's one — the
+            // pin is only VISIBLE where int and float differ, so divide
+            let out =
+                run [ "let a = print (string (Num<float>.One / 2.0))"
+                      "let b = print (string (One<float> / 4.0))"
+                      "let c = print (string (Num<int>.One + 1))" ]
+            Expect.equal out "0.5\n0.25\n2\n" "the written argument decides"
+        }
+        test "a class-applied member that does not exist says so" {
+            let errs =
+                diagnostics [ "let a = Num<float>.Bogus" ]
+            Expect.exists errs (fun e -> e.Contains "class Num has no member Bogus")
+                "reported at check, naming the class"
+        }
         test "an abbreviation applied at the wrong argument count says so" {
             // it used to fall through and invent a type named after the
             // abbreviation; the error then blamed code far away

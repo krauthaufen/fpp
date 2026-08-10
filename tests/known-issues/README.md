@@ -18,6 +18,12 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
+* `member-applied-dot-chain.fpp` — `Zero<float>.Zero` (a class member
+  as the applied head of a dot chain) still stubs and traps where
+  `Num<float>.Zero` and bare `Zero<float>` now work; `(1.5).Bogus` is
+  the sibling hole (a dot that never parks escapes the known-receiver
+  check). The file header maps the boundary.
+
 Fixed and removed (see git history for the repros):
 `generic-instance-operator-body` and `instance-body-second-context-var`
 (both faces of one arc: parked field reads resolved AFTER numeric

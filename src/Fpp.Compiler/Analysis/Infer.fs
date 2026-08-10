@@ -4687,6 +4687,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // qualified use (Module.fn): record its instantiation too
                      let oweAt (tk : Token) (qfresh : Type list) (cs : Constraint list) : unit =
                          for c in cs do addWanted tk.Offset c
+                         // `Zero<float>.Zero` / `Num<float>.Zero`: written
+                         // type arguments on the HEAD pin the member's
+                         // class constraint. Unpinned, the member stayed a
+                         // free variable and quietly defaulted — int zero
+                         // and float zero both print "0", which hid this
+                         // for a while.
+                         (match nodesOf n |> List.tryHead with
+                          | Some lhs when
+                                lhs.NodeKind = AppExpr
+                                && (nodesOf lhs |> List.exists (fun x -> x.NodeKind = TyParams))
+                                && (nodesOf lhs |> List.forall (fun x ->
+                                        x.NodeKind = TyParams || x.NodeKind = IdentExpr || x.NodeKind = DotExpr)) ->
+                              let written =
+                                  nodesOf lhs
+                                  |> List.filter (fun x -> x.NodeKind = TyParams)
+                                  |> List.collect nodesOf
+                                  |> List.filter (fun x -> isTypeKind x.NodeKind)
+                                  |> List.map (typeFromNode tyScope)
+                              let pinTo (c : Constraint) =
+                                  if c.Args.Length = written.Length then
+                                      List.iter2 (unifyAt tk.Offset) c.Args written
+                              (match (match dictTryFind memberOwnerByDef (d.Path, d.Offset) with
+                                      | Some cls -> Some cls
+                                      | None -> dictTryFind classes.MemberOwner d.Name) with
+                               | Some cls ->
+                                   (match cs |> List.tryFind (fun c -> c.Class = cls) with
+                                    | Some c -> pinTo c
+                                    | None -> ())
+                               | None ->
+                                   // not a class member: pin the freshened
+                                   // quantifieds positionally, as an
+                                   // applied call head would
+                                   if qfresh.Length = written.Length then
+                                       List.iter2 (unifyAt tk.Offset) qfresh written)
+                          | _ -> ())
                          // `Num.Zero` binds to an instance member exactly as
                          // the bare `Zero` does — the qualification only says
                          // which class, never which instance
@@ -4717,6 +4752,95 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | Some (t, _) -> t
                           | None -> st.Fresh ())
                  | None ->
+                     // `Num<float>.Zero` — a CLASS name with written type
+                     // arguments qualifies its member exactly as `Num.Zero`
+                     // does, the class parameters pinned to what was
+                     // written. Without this the class name typed as an
+                     // unresolved value and the member fell to a by-name
+                     // field guess that stubbed and trapped.
+                     let mutable resultOverride : Type option = None
+                     let classApplied =
+                         match nodesOf n |> List.tryHead, lastIdent with
+                         | Some lhs, Some mtk when
+                               lhs.NodeKind = AppExpr
+                               && (nodesOf lhs |> List.exists (fun x -> x.NodeKind = TyParams))
+                               && (nodesOf lhs |> List.forall (fun x ->
+                                       x.NodeKind = TyParams || x.NodeKind = IdentExpr)) ->
+                             (match tokensOf (List.head (nodesOf lhs)) |> List.tryFind (fun t -> t.Kind = Ident) with
+                              | Some ct ->
+                                  (match (match dictTryFind classes.Classes ct.Text with
+                                          | Some cd -> Some cd
+                                          | None ->
+                                              // `Zero<float>.Zero`: the head is a class
+                                              // MEMBER, not a class — pin the member's
+                                              // own constraint with the written types
+                                              // and let the trailing access stand or
+                                              // fall on the CONCRETE receiver (floats
+                                              // have no member Zero, and now the check
+                                              // says so instead of the backend
+                                              // stubbing a guess)
+                                              match dictTryFind classes.MemberOwner ct.Text with
+                                              | Some owner ->
+                                                  (match dictTryFind classes.Classes owner with
+                                                   | Some ocd ->
+                                                       (match ocd.Members |> List.tryFind (fun (mn, _) -> mn = ct.Text) with
+                                                        | Some (_, msch) ->
+                                                            let written =
+                                                                nodesOf lhs
+                                                                |> List.filter (fun x -> x.NodeKind = TyParams)
+                                                                |> List.collect nodesOf
+                                                                |> List.filter (fun x -> isTypeKind x.NodeKind)
+                                                                |> List.map (typeFromNode tyScope)
+                                                            let ty, fresh, cs = instantiateTracked msch
+                                                            (match cs |> List.tryFind (fun c -> c.Class = ocd.Name) with
+                                                             | Some c when c.Args.Length = written.Length ->
+                                                                 List.iter2 (unifyAt ct.Offset) c.Args written
+                                                             | _ -> ())
+                                                            for c in cs do addWanted ct.Offset c
+                                                            (match cs |> List.tryFind (fun c -> c.Class = ocd.Name) with
+                                                             | Some c -> vecAdd pendingClassUses (ct.Offset, ct.Text, c, true, fresh)
+                                                             | None -> ())
+                                                            vecAdd instRaw (ct.Offset, fresh)
+                                                            let result = st.Fresh ()
+                                                            vecAdd pendingDots (mtk.Offset, ty, result, mtk.Text)
+                                                            resultOverride <- Some result
+                                                        | None -> ())
+                                                   | None -> ())
+                                                  None
+                                              | None -> None) with
+                                   | Some cd ->
+                                       (match cd.Members |> List.tryFind (fun (mn, _) -> mn = mtk.Text) with
+                                        | Some (_, msch) ->
+                                            let written =
+                                                nodesOf lhs
+                                                |> List.filter (fun x -> x.NodeKind = TyParams)
+                                                |> List.collect nodesOf
+                                                |> List.filter (fun x -> isTypeKind x.NodeKind)
+                                                |> List.map (typeFromNode tyScope)
+                                            let ty, fresh, cs = instantiateTracked msch
+                                            (match cs |> List.tryFind (fun c -> c.Class = cd.Name) with
+                                             | Some c when c.Args.Length = written.Length ->
+                                                 List.iter2 (unifyAt mtk.Offset) c.Args written
+                                             | _ -> ())
+                                            for c in cs do addWanted mtk.Offset c
+                                            (match cs |> List.tryFind (fun c -> c.Class = cd.Name) with
+                                             | Some c -> vecAdd pendingClassUses (mtk.Offset, mtk.Text, c, true, fresh)
+                                             | None -> ())
+                                            vecAdd instRaw (mtk.Offset, fresh)
+                                            Some ty
+                                        | None ->
+                                            vecAdd diags
+                                                (mtk.Offset,
+                                                 "class " + cd.Name + " has no member " + mtk.Text)
+                                            Some (st.Fresh ()))
+                                   | None -> None)
+                              | None -> None)
+                         | _ -> None
+                     match (match classApplied with
+                            | Some t -> Some t
+                            | None -> resultOverride) with
+                     | Some t -> t
+                     | None ->
                      let lhsTy =
                          match nodesOf n |> List.tryHead with
                          | Some lhs -> Some (exprType (GNode lhs))
@@ -6788,9 +6912,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 vecAdd diags (offset - 95000000, tn + " declares no Dispose member, so `use` has nothing to call")
             | _ -> ()
     // a use that never took shape (the member passed as a VALUE, say) can
-    // wait no longer: force the tie, which binds in declaration order
+    // wait no longer: force the tie, which binds in declaration order.
+    // A member the force CANNOT bind on a receiver whose type is KNOWN is
+    // an error here, not a stub in the backend: `Zero<float>.Zero` sailed
+    // through check and trapped at run — the receiver was a plain float,
+    // and floats have no member Zero. Only concrete named receivers say
+    // so: a variable may still resolve at a stamp, and the empty-prelude
+    // dogfooding gate types everything through variables.
     for offset, recvTy, result, name in parked do
-        tryResolveDot true offset recvTy result name |> ignore
+        if not (tryResolveDot true offset recvTy result name) then
+            match prune recvTy with
+            | TCon (tn, _) when
+                  offset < 30000000
+                  && ((dictTryFind knownTypes tn).IsSome
+                      || List.contains tn
+                          [ "int"; "float"; "float32"; "float16"; "int64"
+                            "uint32"; "uint64"; "int16"; "uint16"; "byte"
+                            "sbyte"; "bool"; "char"; "nativeint" ])
+                  && List.isEmpty (freeVars recvTy) ->
+                vecAdd diags (offset, tn + " has no member " + name)
+            | _ -> ()
     // a loop whose source's type only settled during the fixpoint: wire the
     // enumerator protocol NOW, at the same synthetic offsets the eager
     // branch would have used — the lowering derives them from the loop and
