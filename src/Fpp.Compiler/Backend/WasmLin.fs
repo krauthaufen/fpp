@@ -26,8 +26,14 @@ open Fpp.Backend.WasmBinary
 open Fpp.Backend.EmitBin
 
 // ---- the linear value model -----------------------------------------------
+// Every heap object carries a DESCRIPTOR pointer at offset 0 — a static
+// structure baked into the data segment holding the type's class-id (and,
+// later, its vtable). Linear memory has no runtime type information, so this
+// word IS the type of a value: `x :? T` and interface dispatch read it. The
+// object's own content (fields, tag, elements, payload) begins after it.
+let private HDR = 4           // bytes: the descriptor-pointer header
 // static memory map (bytes): the fd_write iovec and scratch live low, then
-// string constants, then the bump heap.
+// string constants and descriptors, then the bump heap.
 let private IOV_PTR = 0        // i32: the write buffer's address
 let private IOV_LEN = 4        // i32: its length
 let private NWRITTEN = 8       // i32: fd_write's out-param
@@ -58,7 +64,22 @@ type private St =
       RecFields : Dict<string, string list>
       /// union case name -> its tag (index) and its payload arity
       UnionTag : Dict<string, int>
-      UnionArity : Dict<string, int> }
+      UnionArity : Dict<string, int>
+      /// the descriptor word stored at every object's offset 0: a type's
+      /// class-id. type name -> class-id, and a union CASE -> its union's id
+      ClassId : Dict<string, int>
+      CaseClass : Dict<string, int> }
+
+// reserved class-ids for the built-in shapes that have no declared type name;
+// declared records and unions are numbered above these
+let private CID_TUPLE = 0
+let private CID_ARRAY = 1
+let private CID_LIST = 2
+let private CID_CLOSURE = 3
+let private CID_FLOAT = 4
+let private CID_INT64 = 5
+let private CID_STRING = 6
+let private CID_FIRST_USER = 7
 
 let private CLO_KIND = 2
 
@@ -80,8 +101,10 @@ let private internStr (st : St) (s : string) : int =
         // the wasm-GC backend uses
         let ub = Fpp.Backend.BinDriver.unescape s
         let n = ub.Length / 2
-        // kind = 1 (string)
-        emitByte st.ConstData 1; emitByte st.ConstData 0; emitByte st.ConstData 0; emitByte st.ConstData 0
+        // header = the string class-id (nunits @4 and units @8 unchanged, so
+        // the string runtime functions need no adjustment)
+        emitByte st.ConstData (CID_STRING &&& 0xFF); emitByte st.ConstData ((CID_STRING >>> 8) &&& 0xFF)
+        emitByte st.ConstData ((CID_STRING >>> 16) &&& 0xFF); emitByte st.ConstData ((CID_STRING >>> 24) &&& 0xFF)
         emitByte st.ConstData (n &&& 0xFF); emitByte st.ConstData ((n >>> 8) &&& 0xFF)
         emitByte st.ConstData ((n >>> 16) &&& 0xFF); emitByte st.ConstData ((n >>> 24) &&& 0xFF)
         for b in ub do emitByte st.ConstData (int b)
@@ -134,7 +157,7 @@ let private emitFtoa6 (m : Mod) : unit =
     localsDone f
     let put (code : unit -> unit) =
         lg f "$w"; code (); mem f "i32.store16"; lg f "$w"; ic f 2; ins f "i32.add"; ls f "$w"
-    lg f "$x"; mem f "f64.load"; ls f "$v"
+    lg f "$x"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$v"
     ic f FMTBUF; ls f "$w"
     blockE f "$fin"
     // NaN
@@ -511,6 +534,16 @@ let private freshTmp (ctx : LowCtx) : int =
 
 let private wReg (id : int) : LReg = { Id = id; RTy = W }
 let private regNm (r : LReg) : string = "$r" + string r.Id
+// the class-id descriptor for a record type / a union case's union; -1 for an
+// undeclared name (a value no type test looks for)
+let private cidRec (st : St) (name : string) : int = match dictTryFind st.ClassId name with Some c -> c | None -> 0 - 1
+let private cidCase (st : St) (case : string) : int = match dictTryFind st.CaseClass case with Some c -> c | None -> 0 - 1
+// the class-id a `:? T` / `:?>` looks for. An instantiated name tests its
+// erased head (the header carries no type arguments); an unknown name yields
+// -1, which no object header holds, so the test is a safe false.
+let private typeTestCid (st : St) (tn0 : string) : int =
+    let tn = if tn0.Contains "$<" then tn0.Substring (0, tn0.IndexOf "$<") else tn0
+    match dictTryFind st.ClassId tn with Some c -> c | None -> 0 - 1
 let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
@@ -588,7 +621,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         lowTag (LPrim (iop, [ ia; ib ]))
-    | EPrim ("::", [ h; t ]) -> lowObj ctx [ coreToLowE ctx h; coreToLowE ctx t ]
+    | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST [ coreToLowE ctx h; coreToLowE ctx t ]
     | EPrim (op, [ a; b ]) ->
         let bop = baseOp op
         let la = lowUntag (coreToLowE ctx a)
@@ -596,11 +629,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         if List.contains bop [ "+"; "-"; "*"; "/"; "%" ]
         then lowTag (LPrim (intArithOp bop, [ la; lb ]))
         else lowTag (LPrim (intCmpOp bop, [ la; lb ]))
-    | ETuple xs -> lowObj ctx (List.map (coreToLowE ctx) xs)
+    | ETuple xs -> lowObj ctx CID_TUPLE (List.map (coreToLowE ctx) xs)
     | EListLit xs -> lowList ctx xs
     | ERecord (name, fields) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
-        lowObj ctx (order |> List.map (fun fnm ->
+        lowObj ctx (cidRec st name) (order |> List.map (fun fnm ->
             match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
             | Some e2 -> coreToLowE ctx e2
             | None -> lowInt 0))
@@ -611,31 +644,31 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             order |> List.mapi (fun i fnm ->
                 match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> coreToLowE ctx e2
-                | None -> LLoad (W, LGet (wReg b), 4 * i))
-        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx slots)
+                | None -> LLoad (W, LGet (wReg b), HDR + 4 * i))
+        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) slots)
     | ECtor (case, _, args) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        lowObj ctx (LConstW tag :: List.map (coreToLowE ctx) args)
+        lowObj ctx (cidCase st case) (LConstW tag :: List.map (coreToLowE ctx) args)
     | EField (r, fname, owner) ->
         let idx =
             match dictTryFind st.RecFields owner with
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
-        LLoad (W, coreToLowE ctx r, 4 * idx)
+        LLoad (W, coreToLowE ctx r, HDR + 4 * idx)
     | EFieldSet (r, fname, owner, v) ->
         let idx =
             match dictTryFind st.RecFields owner with
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
-        LDo ([ LStore (W, coreToLowE ctx r, 4 * idx, coreToLowE ctx v) ], lowInt 0)
-    | EArray (_, xs) -> lowObj ctx (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
+        LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
+    | EArray (_, xs) -> lowObj ctx CID_ARRAY (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
     | EIndex (_, arr, i) ->
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
-        LLoad (W, addr, 0)
+        LLoad (W, addr, HDR)
     | EIndexSet (_, arr, i, v) ->
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
-        LDo ([ LStore (W, addr, 0, coreToLowE ctx v) ], lowInt 0)
-    | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, 0))
+        LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
+    | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, HDR))
     | EArrayCreate (_, n, init) ->
         let cnt = freshTmp ctx
         let iv = freshTmp ctx
@@ -644,11 +677,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let stmts =
             [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
               LSet (wReg iv, coreToLowE ctx init)
-              LSet (wReg bs, LAlloc (LPrim (AddW, [ LConstW 4; LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))
-              LStore (W, LGet (wReg bs), 0, LGet (wReg cnt))
+              LSet (wReg bs, LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))
+              LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY)
+              LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt))
               LSet (wReg it, LConstW 0)
               LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
-                      [ LStore (W, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg it); LConstW 1 ]); LConstW 4 ]) ]), 0, LGet (wReg iv))
+                      [ LStore (W, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg it); LConstW 1 ]); LConstW 4 ]) ]), HDR, LGet (wReg iv))
                         LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EApp (EUnknown n, _) when n.StartsWith "$zero" -> lowInt 0
@@ -686,9 +720,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 LBlock ("$mnext", tests @ guardStmt @ [ LSet (wReg mr, coreToLowE ctx body); LBreak "$mdone" ]))
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
-    | ECast (_, e2, false) ->
-        // `:>` static widening: viewing a value as a supertype does not change
-        // its representation, so the cast is the identity
+    | ETypeTest (tn, e2) -> lowTag (lowTypeTest ctx tn (coreToLowE ctx e2))
+    | ECast (_, e2, _) ->
+        // `:>` widening and `:?>` downcast are both the identity in the tagged
+        // model — the representation does not change. The downcast is not
+        // runtime-checked yet (a bad cast is UB rather than an exception).
         coreToLowE ctx e2
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
@@ -708,34 +744,35 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | EApp (EUnknown "prints", [ a ]) -> [ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ]
     | _ -> [ LEval (coreToLowE ctx e) ]
 
-// allocate an n-word object and fill each slot; a fresh register holds the
-// base, so nesting is safe with NO scratch pool (the depth-indexed pools the
-// hand path needs fall away — the IR gives every allocation its own register)
-and private lowObj (ctx : LowCtx) (slots : LExpr list) : LExpr =
+// allocate an object: the class-id descriptor at offset 0, then each slot at
+// HDR + 4*i. A fresh register holds the base, so nesting is safe with no
+// scratch pool — the IR gives every allocation its own register.
+and private lowObj (ctx : LowCtx) (cid : int) (slots : LExpr list) : LExpr =
     let n = List.length slots
     let b = freshTmp ctx
-    let stores = slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), 4 * i, v))
-    LDo (LSet (wReg b, LAlloc (LConstW (4 * n))) :: stores, LGet (wReg b))
+    let stores =
+        LStore (W, LGet (wReg b), 0, LConstW cid)
+        :: (slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v)))
+    LDo (LSet (wReg b, LAlloc (LConstW (HDR + 4 * n))) :: stores, LGet (wReg b))
 
 and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
     | [] -> LConstW 0
-    | x :: rest -> lowObj ctx [ coreToLowE ctx x; lowList ctx rest ]
+    | x :: rest -> lowObj ctx CID_LIST [ coreToLowE ctx x; lowList ctx rest ]
 
-// a boxed 64-bit payload is a pointer to 8 bytes; box/unbox are alloc+store /
-// load, with the wide type carried on the LStore/LLoad so the backend picks
-// f64/i64 access
+// a boxed 64-bit payload: the class-id header then an 8-byte payload at HDR;
+// the wide type on the LStore/LLoad picks f64/i64 access
 and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr =
     let b = freshTmp ctx
-    LDo ([ LSet (wReg b, LAlloc (LConstW 8)); LStore (F64, LGet (wReg b), 0, fv) ], LGet (wReg b))
+    LDo ([ LSet (wReg b, LAlloc (LConstW (HDR + 8))); LStore (W, LGet (wReg b), 0, LConstW CID_FLOAT); LStore (F64, LGet (wReg b), HDR, fv) ], LGet (wReg b))
 
-and private lowUnboxF (p : LExpr) : LExpr = LLoad (F64, p, 0)
+and private lowUnboxF (p : LExpr) : LExpr = LLoad (F64, p, HDR)
 
 and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr =
     let b = freshTmp ctx
-    LDo ([ LSet (wReg b, LAlloc (LConstW 8)); LStore (I64, LGet (wReg b), 0, iv) ], LGet (wReg b))
+    LDo ([ LSet (wReg b, LAlloc (LConstW (HDR + 8))); LStore (W, LGet (wReg b), 0, LConstW CID_INT64); LStore (I64, LGet (wReg b), HDR, iv) ], LGet (wReg b))
 
-and private lowUnboxI (p : LExpr) : LExpr = LLoad (I64, p, 0)
+and private lowUnboxI (p : LExpr) : LExpr = LLoad (I64, p, HDR)
 
 // test `pat` against the value in register `scrutReg`; produce statements that
 // LBreak to `fail` on mismatch and bind pattern variables on the matching
@@ -755,20 +792,21 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PLit LUnit -> []
     | PCtor (case, _, subs) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, 0); LConstW tag ]))
+        // a union case is [cid][tag][payload…]; the tag distinguishes cases
+        let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, HDR); LConstW tag ]))
         tagTest :: List.concat (subs |> List.mapi (fun i sub ->
             let t = freshTmp ctx
-            LSet (wReg t, LLoad (W, sc, 4 * (i + 1))) :: lowPatTest ctx t fail sub))
+            LSet (wReg t, LLoad (W, sc, HDR + 4 * (i + 1))) :: lowPatTest ctx t fail sub))
     | PTuple subs ->
         List.concat (subs |> List.mapi (fun i sub ->
             let t = freshTmp ctx
-            LSet (wReg t, LLoad (W, sc, 4 * i)) :: lowPatTest ctx t fail sub))
+            LSet (wReg t, LLoad (W, sc, HDR + 4 * i)) :: lowPatTest ctx t fail sub))
     | PCons (h, tl) ->
         let th = freshTmp ctx
         let tt = freshTmp ctx
         LBreakIf (fail, LPrim (EqW, [ sc; LConstW 0 ]))
-        :: (LSet (wReg th, LLoad (W, sc, 0)) :: lowPatTest ctx th fail h)
-        @ (LSet (wReg tt, LLoad (W, sc, 4)) :: lowPatTest ctx tt fail tl)
+        :: (LSet (wReg th, LLoad (W, sc, HDR)) :: lowPatTest ctx th fail h)
+        @ (LSet (wReg tt, LLoad (W, sc, HDR + 4)) :: lowPatTest ctx tt fail tl)
     | PListLit [] -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
     | PListLit (x :: rest) ->
         // an exact list literal [a; b; …] is a :: b :: … :: []
@@ -792,6 +830,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
             |> List.map (fun (_, alt) -> LBlock ("$palt", lowPatTest ctx scrutReg "$palt" alt @ [ LBreak "$por" ]))
         let last = match List.rev alts with a :: _ -> lowPatTest ctx scrutReg fail a | [] -> []
         [ LBlock ("$por", nonLast @ last) ]
+    | PTypeTest tn -> [ LBreakIf (fail, LPrim (EqW, [ lowTypeTest ctx tn sc; LConstW 0 ])) ]
     | _ -> [ LTrap ]
 
 // resolve a variable by its (path:offset) key: a local/param register, a
@@ -803,7 +842,7 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
     | Some id -> LGet (wReg id)
     | None ->
         match dictTryFind st.Captures k with
-        | Some slot when ctx.EnvReg >= 0 -> LLoad (W, LGet (wReg ctx.EnvReg), 8 + 4 * slot)
+        | Some slot when ctx.EnvReg >= 0 -> LLoad (W, LGet (wReg ctx.EnvReg), HDR + 8 + 4 * slot)
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
@@ -820,7 +859,7 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
     LConstW CLO_KIND
     :: LConstW (tblIdx st.M name)
     :: (caps |> List.map (fun (p, o) -> lowVarByKey ctx (p + ":" + string o)))
-    |> lowObj ctx
+    |> lowObj ctx CID_CLOSURE
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -831,6 +870,22 @@ and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
         let tclo = freshTmp ctx
         let step = LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
         lowApply ctx step rest
+
+// a RAW i32 (0/1): is `v` a heap object whose class-id header equals the class
+// tested by `tn`? Guards the header load behind an even-and-nonzero pointer
+// test, so a tagged int or a null answers 0 without dereferencing.
+and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
+    let cid = typeTestCid ctx.LSt tn
+    let t = freshTmp ctx
+    let r = freshTmp ctx
+    let isPtr =
+        LPrim (AndW, [ LPrim (EqW, [ LPrim (AndW, [ LGet (wReg t); LConstW 1 ]); LConstW 0 ])
+                       LPrim (NeW, [ LGet (wReg t); LConstW 0 ]) ])
+    LDo ([ LSet (wReg t, v)
+           LIf (isPtr,
+                [ LSet (wReg r, LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW cid ])) ],
+                [ LSet (wReg r, LConstW 0) ]) ],
+         LGet (wReg r))
 
 let private lowOpIns (op : LOp) : string =
     match op with
@@ -918,13 +973,14 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
         callf f sym
     | LCallIndirect (_, fp, args) ->
         // (env, arg) -> result through table 0: the closure IS the env, and
-        // the code index is the word at closure+4. `fp` must be a pure LGet
-        // (Core->LowIR binds the closure into a register first), so emitting
-        // it twice — once as env, once for the index load — is side-effect
-        // free. Stack: env, arg, table-index, then call_indirect.
+        // the code index is the word at closure + HDR + 4 (after the class-id
+        // header and the kind word). `fp` must be a pure LGet (Core->LowIR
+        // binds the closure into a register first), so emitting it twice — once
+        // as env, once for the index load — is side-effect free. Stack: env,
+        // arg, table-index, then call_indirect.
         emitLowE f fp
         for a in args do emitLowE f a
-        emitLowE f (LLoad (W, fp, 4))
+        emitLowE f (LLoad (W, fp, HDR + 4))
         callIndirect f "$lclo"
     | LDo (ss, v) ->
         for s in ss do emitLowS f s
@@ -1046,15 +1102,24 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew () }
-    // record layouts and union case tags — needed everywhere below
+          RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          ClassId = dictNew (); CaseClass = dictNew () }
+    // record layouts, union case tags, and a class-id per declared type (the
+    // descriptor word every object of that type carries at offset 0). Records
+    // and unions are numbered from CID_FIRST_USER; a union's cases all share
+    // its id and are told apart by their tag.
+    let mutable nextCid = CID_FIRST_USER
     for d in decls0 do
         match d with
-        | DRecord (n, _, fs, _) -> dictSet st.RecFields n (fs |> List.map fst)
-        | DUnion (_, _, cs) ->
+        | DRecord (n, _, fs, _) ->
+            dictSet st.RecFields n (fs |> List.map fst)
+            if (dictTryFind st.ClassId n).IsNone then (dictSet st.ClassId n nextCid; nextCid <- nextCid + 1)
+        | DUnion (uname, _, cs) ->
+            let cid = match dictTryFind st.ClassId uname with Some c -> c | None -> (let c = nextCid in dictSet st.ClassId uname c; nextCid <- nextCid + 1; c)
             cs |> List.iteri (fun i (cn, ar) ->
                 dictSet st.UnionTag cn i
-                dictSet st.UnionArity cn ar)
+                dictSet st.UnionArity cn ar
+                dictSet st.CaseClass cn cid)
         | _ -> ()
     rtTypesLin m
     // classify top-level bindings

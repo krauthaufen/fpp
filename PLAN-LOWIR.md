@@ -107,20 +107,27 @@ stays wasm-only; it is NOT retargeted to C.
 char-literal expressions, and `:>` widening casts (identity in the tagged
 model). `return` (opcode 0x0F) added to the assembler.
 
-**Still missing — the two big pieces:**
+**Universal object header + type tests — LANDED.** Every heap object now
+carries a **class-id** at offset 0 (`HDR = 4`): records and unions are numbered
+from `CID_FIRST_USER`, the built-in shapes (tuple, array, list, closure, float
+box, int64 box, string) take reserved ids `CID_*`. A union's cases share the
+union's id and are told apart by their tag (now at `HDR`, payloads after).
+Strings reuse their existing word-0 (was a `kind` tag) for the id, so the
+string runtime is untouched. `ETypeTest` / `PTypeTest` read the header, guarded
+behind an even-and-nonzero pointer test so a tagged int or null answers false
+without dereferencing. NOTE: the wasm-GC oracle CANNOT type-test against a
+union ("not a class"), so `lowir-typetest-gate.sh` checks the answer directly —
+the linear backend is strictly MORE capable here.
 
-- **A descriptor / vtable type system** for interface dispatch (`EIfaceCall`),
-  type tests (`ETypeTest`, `PTypeTest`) and downcasts (`ECast … true`). The
-  reference (BinDriver, wasm-GC) gets runtime type info free from typed refs;
-  linear memory has none, so it must be explicit. Design derived from the
-  reference: give each dispatch-participating object a DESCRIPTOR pointer at
-  word 0 — a static structure `[class-id : i32][vtable slot : i32 …]` baked
-  into the data segment, the slot holding a function table-index for
-  `call_indirect`. `EIfaceCall` = obj[0]→desc→desc[1+slot]→call_indirect;
-  `ETypeTest`/`ECast` = obj[0]→desc→desc[0] compared against the valid class-id
-  set (`SubsOf`/`ImplsOf`). The invasive part is the word-0 header shifting
-  every field/tag/element offset — decide universal header vs. only
-  dispatch-participating types. This is the largest remaining slice.
+**Still missing:**
+
+- **Vtables / interface dispatch** (`EIfaceCall`) and **class hierarchies**
+  (subclass/implementor matching for `:? Base` / `:? IFoo`). The class-id
+  header is the substrate; what's left is a per-class-id vtable table (a global
+  `call_indirect` table indexed by class-id × slot) and processing
+  `DClass`/`DInterface`/`DBaseInst`/`DMembers` to fill `SubsOf`/`ImplsOf`/slots.
+  `:?>` downcasts are currently the identity (NOT runtime-checked). This is the
+  main gate to self-hosting (the compiler leans on typeclasses).
 
 - **Exceptions** (`ETry`, real `raise`). The reference uses the wasm EH
   proposal (`try_table` / `throw` / tags); wasmtime supports it (the oracle
