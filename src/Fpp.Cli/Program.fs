@@ -65,6 +65,8 @@ let private buildLib (out : string) (files : string list) : int =
         System.IO.File.WriteAllText(out, lib)
         0
 
+let mutable private linearBackend = false
+
 let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
     let ws = Workspace()
     // the target IS the configuration: `#if WASM` code exists only in wasm
@@ -98,6 +100,15 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
             1
         else
             System.IO.File.WriteAllText(out, text)
+            0
+    elif linearBackend then
+        // --linear: the direct wasm-LINEAR module, no C compiler in the path
+        let bytes, errors = ws.EmitProgramWasmLinear ()
+        if not (List.isEmpty errors) then
+            for e in errors |> List.distinct do eprintfn "error: %s" e
+            1
+        else
+            System.IO.File.WriteAllBytes(out, bytes)
             0
     else
         let bytes, errors = ws.EmitProgramWasm ()
@@ -497,7 +508,8 @@ let private isProject (f : string) = f.EndsWith Project.extension
 let main argv =
     let argl0 = List.ofArray argv
     let strict = argl0 |> List.exists (fun a -> a = "--strict")
-    match argl0 |> List.filter (fun a -> a <> "--strict") with
+    linearBackend <- argl0 |> List.exists (fun a -> a = "--linear")
+    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _, defs) -> check strict defs files
@@ -525,7 +537,7 @@ let main argv =
     | _ ->
         eprintfn "usage:"
         eprintfn "  fpp check [--strict] <project.fppproj> | fpp check [--strict] <file>..."
-        eprintfn "  fpp build [--strict] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
+        eprintfn "  fpp build [--strict] [--linear] <project.fppproj> [-o out.wasm] | fpp build [--strict] -o out.wasm <file>..."
         eprintfn "      --strict: fail when any function had to be stubbed (would trap if reached)"
         eprintfn "  fpp lib -o out.fppir <file>..."
         eprintfn "  fpp pack <project.fppproj> -o out.fpkg      (needs a `version` line)"

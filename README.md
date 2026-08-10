@@ -41,6 +41,7 @@ self-host fixpoint is byte-identical and gates every change.
 - **MOBILE.md** - reaching a phone: the Android NDK and iOS build recipes over the C backend
 - **PLAN-THREADS.md** - the concurrency and parallelism design, and how far it is built
 - **PLAN-CBACK.md** - the C backend and fpprt: value model, the TRUE-structs arc
+- **PLAN-WASMLIN.md** - the direct wasm-linear backend: `fpp build --linear`, no C compiler in the path
 - **PLAN-THREADS.md** - concurrency/parallelism design: virtual threads, barriers, the GC uniqueness query
 - **CLAUDE.md** - how to work in this repo: the gates, and what they cost
 - **editors/README.md** - VS Code, Rider, Visual Studio

@@ -967,6 +967,14 @@ type Workspace() =
 
     /// The program as ONE C translation unit against the fpprt runtime
     /// (runtime/): gcc for native, emcc for wasm-linear. PLAN-CBACK.md.
+    /// The program as a wasm-LINEAR module emitted DIRECTLY — no C
+    /// compiler, no emscripten. Slice 1 of the linear backend (see
+    /// Backend/WasmLin.fs): the int/string/control-flow subset.
+    member this.EmitProgramWasmLinear () : byte[] * string list =
+        let linked, errs = this.LinkedCore true
+        if not (List.isEmpty errs) then [||], errs
+        else Fpp.Backend.WasmLin.emitLinear linked
+
     member this.EmitProgramC () : string * string list =
         let linked, errs = this.LinkedCore true
         if not (List.isEmpty errs) then "", errs

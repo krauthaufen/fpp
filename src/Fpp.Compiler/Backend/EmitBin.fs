@@ -611,6 +611,17 @@ let dataSeg (m : Mod) (name : string) (bytes : byte[]) : unit =
     emitByte m.DataBody 1
     emitVec m.DataBody bytes
 
+/// an ACTIVE data segment: `bytes` land at `offset` in memory 0 at
+/// instantiation. The linear backend bakes its string constants this way.
+let activeData (m : Mod) (offset : int) (bytes : byte[]) : unit =
+    if bytes.Length > 0 then
+        m.DataCount <- m.DataCount + 1
+        emitByte m.DataBody 0            // mode 0: active, memory 0
+        emitByte m.DataBody opI32Const
+        emitS32 m.DataBody offset
+        emitByte m.DataBody opEnd
+        emitVec m.DataBody bytes
+
 /// Record what a local was called in the source. Display only — it changes
 /// what a debugger shows, never which slot anything reads.
 let nameLocal (f : Fn) (localName : string) (srcName : string) : unit =
