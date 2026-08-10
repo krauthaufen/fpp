@@ -184,6 +184,31 @@ The end-state test is self-hosting on `--lowir`: compiling the compiler itself
 through the linear backend. That needs all of the above (the compiler leans on
 typeclasses and exceptions heavily).
 
+## Toward self-hosting on `--lowir`
+
+Interface dispatch and exceptions landed, so the backend now covers the whole
+*language*. The remaining question is the *library surface* the compiler's own
+source uses. Compiling the compiler's 20 sources through `--lowir` emits ~2.1 MB
+of wasm — it gets most of the way — with the gaps a BOUNDED list of intrinsics,
+not architecture. From the gap histogram (probe: load the sources into a
+`Workspace`, `EmitProgramWasmLinearWith true`, count the reported errors):
+
+- DONE: `not`/`unot`, unary minus (int/int64), `int`/`char` conversions,
+  `int` of a float, `refEq`, `$listLength`.
+- **String methods** (~630): `$str.StartsWith` / `Substring` / `EndsWith` /
+  `Contains` / `IndexOf`. The largest chunk — hand-emitted runtime routines over
+  the `[cid][len][u16…]` string layout (like `$streq`).
+- **`hash`** (~110): structural hashing (`$hashv` counterpart).
+- **Cells** (~100): a closure-captured `let mutable` needs a heap cell — the
+  read (`$cellget`) and the write (`assignment to captured mutable`, currently a
+  clean-reported gap). Port the wasm-GC `$cellof`/`$cellget`/`$cellset` shape.
+- **`int#t`** (string→int parse), and the remaining long tail of prelude
+  intrinsics.
+
+None of these are architectural — each is a runtime routine or a small lowering.
+The finish line is a `--lowir` self-host fixpoint: stage-1 built through the
+linear backend reproducing stage-0.
+
 ## The rest of the road
 
 1. **Implement the still-missing nodes** (above) in Core→LowIR.
