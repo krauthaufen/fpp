@@ -618,7 +618,12 @@ let rec private kindOfLite (st : St) (e : Expr) : string =
         if k = "f" || k = "s" || k = "l" then k
         elif k = "p" then "i"
         else "u"
-    | EPrim (("-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"), _) -> "i"
+    // a BARE -,*,/,% is the operator whose type never resolved (a generic
+    // body): its result is int only when its operands are — claiming "i"
+    // unconditionally routed a dynamic float result onto an int rail
+    | EPrim (("-" | "*" | "/" | "%"), [ a2; b2 ]) ->
+        if kindOfLite a2 = "i" && kindOfLite b2 = "i" then "i" else "u"
+    | EPrim (("&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"), _) -> "i"
     | EPrim ("u-f", _) -> "f"
     | EPrim ("u-s", _) -> "s"
     | EPrim ("u-l", _) -> "l"
@@ -2573,7 +2578,48 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | "sbyte", "l" -> emitA (); callf f "$tol"; ins f "i32.wrap_i64"; sext8 (); callf f "$ofi"
          | "sbyte", _ -> emitA (); callf f "$toi"; sext8 (); callf f "$ofi"
          | "string", "c" -> emitA (); callf f "$toi"; ic f 1; gcT f "array.new" "$str"
-         | "string", _ -> emitA (); callf f "$toi"; callf f "$itoa"
+         | "string", "i" -> emitA (); callf f "$toi"; callf f "$itoa"
+         | "string", _ ->
+             // the operand's kind never resolved (a generic body):
+             // dispatch on the BOX, like the arithmetic helpers — the
+             // int-only fallback read a boxed float as an int
+             let sv = freshLocal f "$svb" "anyref"
+             emitA ()
+             ls f sv
+             lg f sv
+             gcT f "ref.test" "$boxf"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tof"
+             callf f "$ftoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$boxs"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tos"
+             ins f "f64.promote_f32"
+             callf f "$ftoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$boxl"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tol"
+             callf f "$ltoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$str"
+             ifV f "anyref"
+             lg f sv
+             elseB f
+             lg f sv
+             callf f "$toi"
+             callf f "$itoa"
+             endB f
+             endB f
+             endB f
+             endB f
          | "float", "f" -> emitA ()
          | "float", "s" -> emitA (); callf f "$tos"; ins f "f64.promote_f32"; callf f "$off"
          | "float", "l" -> emitA (); callf f "$tol"; ins f "f64.convert_i64_s"; callf f "$off"
@@ -2619,7 +2665,48 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | "f" -> emitNode st f lv a; callf f "$tof"; callf f "$ftoa"
          | "s" -> emitNode st f lv a; callf f "$tos"; ins f "f64.promote_f32"; callf f "$ftoa"
          | "l" -> emitNode st f lv a; callf f "$tol"; callf f "$ltoa"
-         | _ -> emitNode st f lv a; callf f "$toi"; callf f "$itoa")
+         | "i" -> emitNode st f lv a; callf f "$toi"; callf f "$itoa"
+         | _ ->
+             // the kind never resolved (a generic body): dispatch on the
+             // BOX, like the arithmetic helpers — the int-only fallback
+             // here read a boxed float as an int
+             let sv = freshLocal f "$sva" "anyref"
+             emitNode st f lv a
+             ls f sv
+             lg f sv
+             gcT f "ref.test" "$boxf"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tof"
+             callf f "$ftoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$boxs"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tos"
+             ins f "f64.promote_f32"
+             callf f "$ftoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$boxl"
+             ifV f "anyref"
+             lg f sv
+             callf f "$tol"
+             callf f "$ltoa"
+             elseB f
+             lg f sv
+             gcT f "ref.test" "$str"
+             ifV f "anyref"
+             lg f sv
+             elseB f
+             lg f sv
+             callf f "$toi"
+             callf f "$itoa"
+             endB f
+             endB f
+             endB f
+             endB f)
     | EApp (EUnknown "float16#f", [ a ]) ->
         // a half is its bit pattern: round the double once, here
         emitNode st f lv a
@@ -2790,7 +2877,10 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv a
         emitNode st f lv b
         callf f "$equal"
-    | EPrim (op, [ a; b ]) when List.contains op [ "-"; "*"; "/"; "%" ] ->
+    | EPrim (op, [ a; b ]) when
+        List.contains op [ "-"; "*"; "/"; "%" ]
+        && kindOfLite st a = "i" && kindOfLite st b = "i" ->
+        // both sides statically int: skip the dispatch, as + does
         let insn =
             match op with
             | "-" -> "i32.sub" | "*" -> "i32.mul" | "%" -> "i32.rem_s" | _ -> "i32.div_s"
@@ -2800,6 +2890,13 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         callf f "$toi"
         ins f insn
         callf f "$ofi"
+    | EPrim (op, [ a; b ]) when List.contains op [ "-"; "*"; "/"; "%" ] ->
+        // the operator whose type never resolved: dispatch on the boxes
+        // at run time, like $addv — the int-only path here unboxed a
+        // float as an int and trapped
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f (match op with "-" -> "$subv" | "*" -> "$mulv" | "%" -> "$remv" | _ -> "$divv")
     | EPrim (op, [ a; b ]) when List.contains op [ "<"; ">"; "<="; ">=" ] ->
         let insn = match op with "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | _ -> "i32.ge_s"
         emitNode st f lv a
@@ -3745,14 +3842,28 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         for a in args do
             emitNode st f lv a
             callf f "$applyc"
+    | EPrim (op, [ a; b ]) when
+        op.Contains "@#"
+        && List.contains (op.Substring (0, op.IndexOf "@")) [ "+"; "-"; "*"; "/"; "%" ] ->
+        // a class OPERATOR whose operand type is a variable that nothing
+        // will ever ground — a dropped per-stamp constraint's projection
+        // (`a*b + c*d`: the products' Result variables are free by
+        // construction). No substitution can name it, so dispatch on the
+        // BOXES at run time: in a stamped float copy the operands arrive
+        // as boxed floats and take the f64 path. This used to be an
+        // unconditional trap, from before the dynamic family existed.
+        emitNode st f lv a
+        emitNode st f lv b
+        callf f (match op.Substring (0, op.IndexOf "@") with
+                 | "+" -> "$addv" | "-" -> "$subv" | "*" -> "$mulv"
+                 | "%" -> "$remv" | _ -> "$divv")
     | EPrim (op, _) when op.Contains "@#" ->
-        // a class OPERATOR whose operand is a type variable in an unstamped
-        // template. The scalar classes have no reference-type instance, so
-        // canonical (all-reference) code cannot reach here — every real use
-        // is stamped, where the suffix is a concrete kind. A trap, not a
-        // stub: the surrounding function is otherwise portable, and warning
-        // here failed --strict on every program once members carried
-        // constraints (RangeOps.Seq is member-demanded in EVERY binary).
+        // non-arithmetic class operators at an unresolvable variable: the
+        // scalar classes have no reference-type instance, so canonical
+        // code cannot reach here. A trap, not a stub: the surrounding
+        // function is otherwise portable, and warning here failed
+        // --strict on every program once members carried constraints
+        // (RangeOps.Seq is member-demanded in EVERY binary).
         ins f "unreachable"
         refNull f "any"
     | other ->

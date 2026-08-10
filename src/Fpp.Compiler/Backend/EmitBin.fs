@@ -1338,6 +1338,10 @@ let rtCoreDecls2 (m : Mod) : unit =
     declFn m "$ofi" "$rt_i2a"
     declFn m "$toi" "$rt_a2i"
     declFn m "$addv" "$u1"
+    declFn m "$subv" "$u1"
+    declFn m "$mulv" "$u1"
+    declFn m "$divv" "$u1"
+    declFn m "$remv" "$u1"
 
 let rtTypes2 (m : Mod) : unit =
     tyFunc m "$rt_a2i" [ "anyref" ] [ "i32" ]
@@ -1388,76 +1392,100 @@ let rtCore2 (m : Mod) : unit =
     gcTF f "struct.get" "$boxi" 0
     endB f
     endFn f
-    // $addv: two i31s fast-path, strings concat later; int fallback
-    let f = beginFn m [ "$a"; "$b" ]
-    localsDone f
-    lg f "$a"
-    gcAbs f "ref.test" "i31"
-    lg f "$b"
-    gcAbs f "ref.test" "i31"
-    ins f "i32.and"
-    ifA f
-    lg f "$a"
-    gcAbs f "ref.cast" "i31"
-    i31get f
-    lg f "$b"
-    gcAbs f "ref.cast" "i31"
-    i31get f
-    ins f "i32.add"
-    refI31 f
-    elseB f
-    // FLOAT on either side adds as floats (an int seed meets float
-    // elements at the uniform representation): generic `+` reaches every
-    // numeric kind, not only int. A MINIMAL runtime (no float support
-    // declared) keeps the int-only fallback.
-    if funcIdx m "$tof" >= 0 && funcIdx m "$off" >= 0 then
+    // $addv/$subv/$mulv/$divv/$remv: generic arithmetic the checker left
+    // unstamped arrives here with BOXED operands of ANY numeric kind.
+    // Dispatch on the box — small ints fast, then f64, f32, i64 — and
+    // fall back to the int path (big-int boxes). The old helpers covered
+    // int everywhere and f64 only on `+`: a generic instance body doing
+    // `a * b` at float unboxed the float as an int and TRAPPED, which
+    // was every "works at int, dies at float" runtime death.
+    for opBase in [ "add"; "sub"; "mul"; "div"; "rem" ] do
+        let f = beginFn m [ "$a"; "$b" ]
+        localsDone f
+        // one operand as the given scalar kind, whatever box it arrived in
+        let side (v : string) (kind : string) : unit =
+            lg f v
+            gcAbs f "ref.test" "i31"
+            ifV f (if kind = "f" then "f64" elif kind = "s" then "f32" else "i64")
+            lg f v
+            gcAbs f "ref.cast" "i31"
+            i31get f
+            ins f (if kind = "f" then "f64.convert_i32_s"
+                   elif kind = "s" then "f32.convert_i32_s"
+                   else "i64.extend_i32_s")
+            elseB f
+            lg f v
+            callf f (if kind = "f" then "$tof" elif kind = "s" then "$tos" else "$tol")
+            endB f
+        let intOp = "i32." + opBase + (if opBase = "div" || opBase = "rem" then "_s" else "")
+        // both small ints: the fast path
         lg f "$a"
-        gcT f "ref.test" "$boxf"
+        gcAbs f "ref.test" "i31"
         lg f "$b"
-        gcT f "ref.test" "$boxf"
-        ins f "i32.or"
+        gcAbs f "ref.test" "i31"
+        ins f "i32.and"
         ifA f
         lg f "$a"
-        gcAbs f "ref.test" "i31"
-        ifV f "f64"
-        lg f "$a"
         gcAbs f "ref.cast" "i31"
         i31get f
-        ins f "f64.convert_i32_s"
-        elseB f
-        lg f "$a"
-        callf f "$tof"
-        endB f
-        lg f "$b"
-        gcAbs f "ref.test" "i31"
-        ifV f "f64"
         lg f "$b"
         gcAbs f "ref.cast" "i31"
         i31get f
-        ins f "f64.convert_i32_s"
+        ins f intOp
+        refI31 f
         elseB f
-        lg f "$b"
-        callf f "$tof"
-        endB f
-        ins f "f64.add"
-        callf f "$off"
-        elseB f
+        let mutable closes = 1
+        // floats have no rem instruction; `%` keeps int and i64 only. A
+        // MINIMAL runtime (converters not declared) keeps the int-only
+        // fallback, exactly as $addv always did.
+        if opBase <> "rem" && funcIdx m "$tof" >= 0 && funcIdx m "$off" >= 0 then
+            lg f "$a"
+            gcT f "ref.test" "$boxf"
+            lg f "$b"
+            gcT f "ref.test" "$boxf"
+            ins f "i32.or"
+            ifA f
+            side "$a" "f"
+            side "$b" "f"
+            ins f ("f64." + opBase)
+            callf f "$off"
+            elseB f
+            closes <- closes + 1
+        if opBase <> "rem" && funcIdx m "$tos" >= 0 && funcIdx m "$oss" >= 0 then
+            lg f "$a"
+            gcT f "ref.test" "$boxs"
+            lg f "$b"
+            gcT f "ref.test" "$boxs"
+            ins f "i32.or"
+            ifA f
+            side "$a" "s"
+            side "$b" "s"
+            ins f ("f32." + opBase)
+            callf f "$oss"
+            elseB f
+            closes <- closes + 1
+        if funcIdx m "$tol" >= 0 && funcIdx m "$ofl" >= 0 then
+            lg f "$a"
+            gcT f "ref.test" "$boxl"
+            lg f "$b"
+            gcT f "ref.test" "$boxl"
+            ins f "i32.or"
+            ifA f
+            side "$a" "l"
+            side "$b" "l"
+            ins f ("i64." + opBase + (if opBase = "div" || opBase = "rem" then "_s" else ""))
+            callf f "$ofl"
+            elseB f
+            closes <- closes + 1
+        // whatever remains unboxes as int ($boxi big ints land here)
         lg f "$a"
         callf f "$toi"
         lg f "$b"
         callf f "$toi"
-        ins f "i32.add"
+        ins f intOp
         callf f "$ofi"
-        endB f
-    else
-        lg f "$a"
-        callf f "$toi"
-        lg f "$b"
-        callf f "$toi"
-        ins f "i32.add"
-        callf f "$ofi"
-    endB f
-    endFn f
+        for _ in 1 .. closes do endB f
+        endFn f
 
 // ---- runtime: strings, equality --------------------------------------------
 

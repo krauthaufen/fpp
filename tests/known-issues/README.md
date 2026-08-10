@@ -18,19 +18,15 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
-* `generic-instance-operator-body.fpp` — a generic instance whose body
-  applies a class operator (`+`) to the instance's own type variable
-  compiles clean and traps (`toi` cast failure): the operator lowers to
-  the int primitive instead of riding to the per-type copy. Named
-  members in the same position work; a generic `let` with the same
-  operator works. The diagnosis at the top of the file marks the
-  boundary. Concrete per-type instances are the working shape meanwhile.
-
-* `instance-body-second-context-var.fpp` — the same trap's second face:
-  an instance body dispatching on TWO context variables resolves the
-  second one down the int path. One variable works; see the file header.
-
 Fixed and removed (see git history for the repros):
+`generic-instance-operator-body` and `instance-body-second-context-var`
+(both faces of one arc: parked field reads resolved AFTER numeric
+defaulting, so the guess ran before the information and ground a generic
+instance's variable to int, freezing its member template at int layouts;
+and the dynamic arithmetic helpers covered int-and-f64-on-plus only, so
+everything else unboxed a float as an int — dots now resolve first,
+dropped per-stamp constraints pull their result variables along, and
++,-,*,/ dispatch on the boxes at run time),
 `generic-class-through-interface` (the Enumerator shape: the enclosing
 member is not layout-dependent, so its call classified CANON and ran the
 template, whose inner construction canonicalized against packed fields — a

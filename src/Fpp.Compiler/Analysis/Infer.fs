@@ -6231,6 +6231,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let context =
                 nodesOf n |> List.filter (fun m -> m.NodeKind = WhenDecl)
                 |> List.choose (constraintOf vars)
+            // the instance's variables are DECLARATION-level, exactly like a
+            // top-level binding's: shared project-wide through the stored
+            // head, context and associated types. Left at inner level, one
+            // leftover wanted let numeric defaulting ground 'a to int — and
+            // the member template then rendered M33$<int> layouts with no
+            // `#` left in any name, so nothing marked it for stamping and
+            // every use ran the int body.
+            for v in ps do v.Level <- 0
+            for _, at in assoc do
+                for v in freeVars at do v.Level <- 0
+            for c in context do
+                for a in c.Args do
+                    for v in freeVars a do v.Level <- 0
+                for _, at in c.Assoc do
+                    for v in freeVars at do v.Level <- 0
             let bodied = members |> List.filter (fun m -> not (isAssocDecl m) && hasBody m)
             let offset = match tokensOf n |> List.tryHead with Some t -> t.Offset | None -> 0
             // A PRELUDE instance is primitive: the backend supplies whatever
@@ -6607,6 +6622,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // Numeric defaulting, as F# does it: a constraint nothing in the program
     // ever pins down resolves at int. `Zero + One` has to mean something, and
     // int is the answer every F# programmer already expects.
+    // A parked dot-access carries INFORMATION; defaulting only invents.
+    // With the guess running first, an operator's placeholder went to int
+    // and the late dot resolution back-propagated int into a generic
+    // instance's own variable — its member template froze at int layouts,
+    // nothing marked it for stamping, and every use ran the int body. So:
+    // resolve everything resolvable, THEN default what remains.
+    let dotsLeft = vecNew<int * Type * Type * string> ()
+    (let mutable parked0 = vecToList pendingDots
+     let mutable progress0 = true
+     while progress0 do
+         progress0 <- false
+         let still0 = vecNew<int * Type * Type * string> ()
+         for offset, recvTy, result, name in parked0 do
+             if tryResolveDot false offset recvTy result name then progress0 <- true
+             else vecAdd still0 (offset, recvTy, result, name)
+         parked0 <- vecToList still0
+     for e in parked0 do vecAdd dotsLeft e)
+    solveWanted ()
+
     let mutable defaulting = true
     while defaulting do
         defaulting <- false
@@ -6616,10 +6650,32 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // to int through one leftover constraint. Such a constraint resolves
         // per instantiation when the use is stamped; drop it here.
         let declLevel (c : Constraint) =
+            // CONTAINING a declaration-level variable is enough: the nine
+            // `Mul<'a,'a>` wanteds of a generic instance body reach here
+            // (field accesses park and resolve after the file walk, past
+            // the instance's given-context) and defaulting them ground the
+            // instance's 'a to int — the member template then rendered
+            // int layouts with no `#` left, nothing marked it for
+            // stamping, and every use ran the int body. Dropped instead,
+            // the operators dispatch on their boxes at run time.
             c.Args |> List.exists (fun a ->
-                match prune a with
-                | TVar v -> v.Level = 0
-                | _ -> false)
+                freeVars a |> List.exists (fun v -> v.Level = 0))
+        // a declaration-level constraint pulls its ASSOCIATED variables
+        // along before anything is dropped: the projection of a per-stamp
+        // constraint is itself per-stamp. Left at inner level, the chain
+        // `a*b + c*d` defaulted the products' Result variables to int and
+        // the record they built pulled int back into the instance's own
+        // variable through its declared Result.
+        let mutable spread = true
+        while spread do
+            spread <- false
+            for _, c in wanted do
+                if not (isGround c) && declLevel c then
+                    for _, at in c.Assoc do
+                        for v in freeVars at do
+                            if v.Level <> 0 then
+                                v.Level <- 0
+                                spread <- true
         wanted <- wanted |> List.filter (fun (_, c) -> isGround c || not (declLevel c))
         match wanted |> List.tryFind (fun (_, c) -> not (isGround c)) with
         | Some (offset, c) ->
@@ -6691,9 +6747,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  vecAdd diags (off, tn0 + " does not implement " + ifc + ", which this case requires")
          | _ -> ())
 
-    // retry parked dot-accesses until nothing more can be learned: resolving
-    // one can fix a variable that unblocks another
-    let mutable parked = vecToList pendingDots
+    // retry the dots the pre-defaulting pass could not place: defaulting
+    // may have ground the receiver they were waiting on
+    let mutable parked = vecToList dotsLeft
     let mutable progress = true
     while progress do
         progress <- false

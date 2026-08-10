@@ -2011,6 +2011,59 @@ let resolutionRuleTests =
                       "let r2 = print (string (both 7 1.5))" ]
             Expect.equal out "11\n3\n" "and-joined constraints parse and discharge"
         }
+        test "generic instance bodies compute at every numeric kind" {
+            // the arc that closed two known issues: +,-,* on the
+            // instance's own variable, at f64, f32, int and int64 — each
+            // dispatches on its box at run time
+            let out =
+                run [ "type W<'a> = { V : 'a }"
+                      "instance Mul<W<'a>, W<'a>> when Num<'a>"
+                      "    type Result = W<'a>"
+                      "    static (*) a b = { V = a.V * b.V }"
+                      "instance Sub<W<'a>, W<'a>> when Num<'a>"
+                      "    type Result = W<'a>"
+                      "    static (-) a b = { V = a.V - b.V }"
+                      "instance Add<W<'a>, W<'a>> when Num<'a>"
+                      "    type Result = W<'a>"
+                      "    static (+) a b = { V = a.V + b.V }"
+                      "let pr (x : W<'a>) = print (string x.V)"
+                      "let a = pr ({ V = 1.5 } * { V = 2.0 })"
+                      "let b = pr ({ V = 1.5f } * { V = 4.0f })"
+                      "let c = pr ({ V = 3 } * { V = 4 })"
+                      "let d = pr ({ V = 10L } * { V = 5L })"
+                      "let e = pr ({ V = 8.5 } - { V = 2.25 })"
+                      "let g = pr ({ V = 2.5f } + { V = 0.25f })"
+                      "let h = pr ({ V = 100L } - { V = 58L })" ]
+            Expect.equal out "3\n6\n12\n50\n6.25\n2.75\n42\n" "every kind, every operator"
+        }
+        test "a constrained identity matrix multiplies a vector, generically" {
+            // the playground program that drove the arc: one [<Struct>]
+            // generic matrix, a constrained static member, a generic Mul
+            // instance whose body chains * and + — at float AND int
+            let out =
+                run [ "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "[<Struct>]"
+                      "type M33<'a> ="
+                      "    { M00 : 'a; M01 : 'a; M02 : 'a"
+                      "      M10 : 'a; M11 : 'a; M12 : 'a"
+                      "      M20 : 'a; M21 : 'a; M22 : 'a }"
+                      "    static member Identity when Num<'a> ="
+                      "        { M00 = One; M01 = Zero; M02 = Zero"
+                      "          M10 = Zero; M11 = One; M12 = Zero"
+                      "          M20 = Zero; M21 = Zero; M22 = One }"
+                      "instance Mul<M33<'a>, V3<'a>> when Num<'a>"
+                      "    type Result = V3<'a>"
+                      "    static (*) m v ="
+                      "        { X = m.M00 * v.X + m.M01 * v.Y + m.M02 * v.Z"
+                      "          Y = m.M10 * v.X + m.M11 * v.Y + m.M12 * v.Z"
+                      "          Z = m.M20 * v.X + m.M21 * v.Y + m.M22 * v.Z }"
+                      "let r = M33.Identity * { X = 3.0; Y = 4.0; Z = 7.0 }"
+                      "let a = print (string r.Y)"
+                      "let ri = M33.Identity * { X = 3; Y = 4; Z = 7 }"
+                      "let b = print (string (ri.X + ri.Z))" ]
+            Expect.equal out "4\n10\n" "identity at float and at int"
+        }
         test "overlap with a unique most-specific instance still selects it" {
             // rule 2 kept as decided: overlap is fine as long as one
             // instance is strictly most specific at the use
