@@ -126,8 +126,24 @@ the linear backend is strictly MORE capable here.
   header is the substrate; what's left is a per-class-id vtable table (a global
   `call_indirect` table indexed by class-id × slot) and processing
   `DClass`/`DInterface`/`DBaseInst`/`DMembers` to fill `SubsOf`/`ImplsOf`/slots.
-  `:?>` downcasts are currently the identity (NOT runtime-checked). This is the
-  main gate to self-hosting (the compiler leans on typeclasses).
+  This is the main gate to self-hosting (the compiler leans on typeclasses).
+
+  DESIGN NOTE / snag to reconcile first: the reference (BinDriver) does NOT use
+  a separate header — it models a class instance as an ordinary `ERecord` whose
+  field ORDER carries a synthetic `__desc` field, filled at construction with a
+  descriptor global (`$desc_<T>`) that holds `[class-id][vtable]`. So in Core, a
+  class's `FieldsOf` already includes `__desc`. Our universal header ALSO
+  supplies the class-id at offset 0 — so for classes there are two descriptor
+  sources. Before building vtables, decide: either (a) recognise a `__desc`
+  field and MAP it onto the header (drop it from the field layout, use offset 0),
+  or (b) keep `__desc` as a real field pointing at a `[class-id][vtable]`
+  descriptor and have `EIfaceCall`/type-tests read THAT, making the header
+  redundant for classes. (a) keeps one uniform mechanism; (b) matches the
+  reference's Core shape with less remapping. The universal-header type tests
+  already work for records/unions regardless.
+
+  `:?>` downcasts to a class-id-carrying type are now runtime-checked (trap on
+  mismatch); to an untracked type they stay the identity.
 
 - **Exceptions** (`ETry`, real `raise`). The reference uses the wasm EH
   proposal (`try_table` / `throw` / tags); wasmtime supports it (the oracle

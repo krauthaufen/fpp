@@ -721,10 +721,16 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
     | ETypeTest (tn, e2) -> lowTag (lowTypeTest ctx tn (coreToLowE ctx e2))
+    | ECast (tn, e2, true) when typeTestCid st tn >= 0 ->
+        // `:?>` downcast to a type we carry a class-id for: check the header
+        // and trap on a mismatch, then yield the value unchanged
+        let t = freshTmp ctx
+        LDo ([ LSet (wReg t, coreToLowE ctx e2)
+               LIf (LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]), [ LTrap ], []) ],
+             LGet (wReg t))
     | ECast (_, e2, _) ->
-        // `:>` widening and `:?>` downcast are both the identity in the tagged
-        // model — the representation does not change. The downcast is not
-        // runtime-checked yet (a bad cast is UB rather than an exception).
+        // `:>` widening, and `:?>` to a type without a class-id: the identity —
+        // the representation does not change under a cast in the tagged model
         coreToLowE ctx e2
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
