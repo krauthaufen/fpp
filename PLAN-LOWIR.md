@@ -121,12 +121,18 @@ the linear backend is strictly MORE capable here.
 
 **Still missing:**
 
-- **Vtables / interface dispatch** (`EIfaceCall`) and **class hierarchies**
-  (subclass/implementor matching for `:? Base` / `:? IFoo`). The class-id
-  header is the substrate; what's left is a per-class-id vtable table (a global
-  `call_indirect` table indexed by class-id × slot) and processing
-  `DClass`/`DInterface`/`DBaseInst`/`DMembers` to fill `SubsOf`/`ImplsOf`/slots.
-  This is the main gate to self-hosting (the compiler leans on typeclasses).
+- **Vtables / interface dispatch — DONE** (`lowir-iface-gate.sh`). `x.M args`
+  dispatches through a flat class-id-indexed vtable; `:? IFoo` matches
+  implementors, `:? Base` subclasses (`lowTypeTest` over a class-id SET from
+  `SubsOf`/`ImplsOf`). Class methods read ctor params as receiver fields (the
+  frontend lowers them to `EField` already). Two general bugs had to be fixed:
+  `freeVars`/`discover` were incomplete (didn't traverse records/arrays/match/
+  iface-calls, so a lambda over them lost its captures), and `scanConsts`
+  skipped the function position of an application (a string in an eta-expansion
+  lambda interned late, past `$hp`). Still TODO: the 3 identity slots
+  (Equals/GetHashCode/Compare — need `$cmpv`/`$hashv`), built-in-seq iteration
+  (`for` over a list dispatches `IEnumerable` with no vtable entry), and prelude
+  class dispatch (only user impls are rooted today).
 
   DECIDED: approach (a). And it turns out to need NO `__desc` remapping — the
   `__desc`/`__idhash` fields are SYNTHESISED by the reference (BinDriver prepends
