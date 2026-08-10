@@ -184,6 +184,46 @@ The end-state test is self-hosting on `--lowir`: compiling the compiler itself
 through the linear backend. That needs all of the above (the compiler leans on
 typeclasses and exceptions heavily).
 
+## THE GOAL: full parity with the C backend (drop C)
+
+Nothing less. The wasm-linear backend must compile everything CEmit/fpprt does,
+correctly. Two fronts:
+
+**Language (≈95% — nearly done).** Types, unions, records, closures, HOFs,
+pattern matching, interface dispatch, exceptions, strings, captured mutables —
+all at parity, oracle-verified. Remaining is the self-host punch-list below.
+
+**Runtime / systems (the real distance).** In priority order:
+1. **A real GC.** Today the linear backend BUMP-allocates and never frees;
+   fpprt has a precise moving collector (Whippet). Needed for any long-running
+   program. The value model is already fpprt's tagged word, so a semispace
+   copier or a compiled vendored collector drops in against the same
+   representation. THE big piece.
+2. **POD / struct value semantics.** The linear backend boxes everything
+   (reference semantics); CEmit has `[<Struct>]` value records with COPY
+   semantics (`fpp_rec_clone`/`fpp_pod_clone`) and packed `int[]`. A struct
+   assigned by value must copy — this is semantics, not perf. The LowIR
+   struct/copy enrichment.
+3. **Pinning + native interop** (`EArrayPin`/`Unpin`/`Bytes`, `DExtern`).
+4. **Threads / parallelism** (`fpp_parallel_for`, monitors).
+
+Milestone order: finish self-host (proves the language) → GC → struct semantics
+→ pinning/interop → threads → **BENCHMARK against C** → only then drop C.
+
+**The drop criterion is BENCHMARKS, not just feature parity.** C stays until the
+wasm-linear backend is measured against it (the `tests/tooling/perf/` suite that
+already compares against C — run wasm-linear via wasmtime AOT / `fpp exe`) and
+proven competitive. That makes PERFORMANCE a first-class requirement, so two
+items that would otherwise be "correctness done, optimise later" are actually
+load-bearing for the goal:
+- **Register allocation** (liveness colouring of `LReg` → wasm locals; today it
+  is one local per register). Needed before the numbers mean anything.
+- **POD/struct value semantics + packed arrays.** Boxing every numeric/struct
+  value is not just a semantics gap — it is the perf gap on the vertex/array
+  benchmarks where CEmit worked hardest (see the C-backend perf history).
+Measure, do not reason (the repo's own hard-won rule): the benchmark suite,
+best-of-three warm, is the arbiter — not instruction counts.
+
 ## Toward self-hosting on `--lowir`
 
 Interface dispatch and exceptions landed, so the backend now covers the whole

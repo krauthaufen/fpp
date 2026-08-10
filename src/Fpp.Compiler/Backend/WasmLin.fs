@@ -173,6 +173,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_ends" "$lt_ii2i"
     declFn m "$str_find" "$lt_iii2i"
     declFn m "$strsub" "$lt_iii2i"
+    declFn m "$str_trim" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -520,6 +521,35 @@ let private emitStrsub (m : Mod) : unit =
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$l"; endB f; endB f
     lg f "$p"
+    endFn f
+
+// $str_trim(s): s with leading and trailing ASCII whitespace removed. Finds
+// the first and last non-space unit, then reuses $strsub for the copy.
+let private emitStrTrim (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$sl" "i32"; local f "$i" "i32"; local f "$j" "i32"; local f "$u" "i32"
+    localsDone f
+    let isWs () =
+        lg f "$u"; ic f 0x20; ins f "i32.eq"
+        lg f "$u"; ic f 0x09; ins f "i32.eq"; ins f "i32.or"
+        lg f "$u"; ic f 0x0A; ins f "i32.eq"; ins f "i32.or"
+        lg f "$u"; ic f 0x0D; ins f "i32.eq"; ins f "i32.or"
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    ic f 0; ls f "$i"
+    blockE f "$sc"; loopE f "$sl2"
+    lg f "$i"; lg f "$sl"; ins f "i32.ge_s"; brIf f "$sc"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ls f "$u"
+    isWs (); ins f "i32.eqz"; brIf f "$sc"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$sl2"; endB f; endB f
+    lg f "$sl"; ls f "$j"
+    blockE f "$ec"; loopE f "$el"
+    lg f "$j"; lg f "$i"; ins f "i32.le_s"; brIf f "$ec"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 1; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ls f "$u"
+    isWs (); ins f "i32.eqz"; brIf f "$ec"
+    lg f "$j"; ic f 1; ins f "i32.sub"; ls f "$j"
+    br f "$el"; endB f; endB f
+    lg f "$s"; lg f "$i"; lg f "$j"; lg f "$i"; ins f "i32.sub"; callf f "$strsub"
     endFn f
 
 // operators arrive with a type-kind suffix (`+i`, `<>i`, `=l`); slice 1 is
@@ -929,6 +959,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowTag (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
     | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
         lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
+    | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
         LCall ("$strsub", [ coreToLowE ctx s; lowUntag (coreToLowE ctx start); lowUntag (coreToLowE ctx len) ])
     | EApp (EUnknown "$str.Substring", [ s; start ]) ->
@@ -1594,7 +1625,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
