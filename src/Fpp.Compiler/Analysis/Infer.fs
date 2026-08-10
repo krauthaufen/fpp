@@ -458,8 +458,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// the offsets whose constraints were raised inside a member body
     let eagerSeats = dictNew<int, bool> ()
 
+    /// the givens in scope when a wanted was raised, by its offset: a
+    /// wanted born in an instance body often RESOLVES late (its operands
+    /// come from parked field reads), long after the ambient givens are
+    /// gone — kept here, the context's associated-type equalities
+    /// (`Mul<'a,'a> = 'a` from Num) still discharge it, the operators
+    /// decorate with the instance's own variable, and the stamp rewrites
+    /// them to TYPED instructions instead of runtime dispatch
+    let seatGivens = dictNew<int, Constraint list> ()
+
     let addWanted (offset : int) (c : Constraint) : unit =
         if inMemberBody then dictSet eagerSeats offset true
+        if not (List.isEmpty givens) && (dictTryFind seatGivens offset).IsNone then
+            dictSet seatGivens offset givens
         wanted <- wanted @ [ offset, c ]
 
     let isGround (c : Constraint) : bool = List.isEmpty (List.collect freeVars c.Args)
@@ -1743,7 +1754,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if (dictTryFind seenKey k).IsSome then vecAdd survivors (offset, c)
             else
             dictSet seenKey k true
-            match byGiven c with
+            match (match byGiven c with
+                   | Some a -> Some a
+                   | None ->
+                       match dictTryFind seatGivens offset with
+                       | Some gs ->
+                           gs
+                           |> List.collect (Classes.entailed classes)
+                           |> List.tryPick (fun g -> if Classes.sameHead g c then Some g.Assoc else None)
+                       | None -> None) with
             | Some assoc ->
                 progress <- true
                 for n, ty in c.Assoc do
