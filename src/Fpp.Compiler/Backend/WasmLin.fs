@@ -937,6 +937,9 @@ type private LowCtx =
     { LSt : St
       // a Core VarId (param or let) -> its dense LowIR register id
       Regs : Dict<string, int>
+      // when lowering a lifted lambda body: the register holding the env
+      // pointer (-1 elsewhere). Captured vars load from env+8+4*slot.
+      mutable EnvReg : int
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -976,18 +979,28 @@ let private intCmpOp (b : string) : LOp =
     | "=" -> EqW
     | _ -> NeW
 
-// is this whole expression inside the LowIR subset? (called on a function
-// body before choosing the IR path; a false anywhere falls the function back)
+// can this pattern be compiled by lowPatTest?
+let rec private patSupported (p : Pat) : bool =
+    match p with
+    | PWild | PVar _ -> true
+    | PLit (LInt _) | PLit (LBool _) | PLit LUnit -> true
+    | PAs (inner, _, _) -> patSupported inner
+    | PCtor (_, _, subs) -> List.forall patSupported subs
+    | PTuple subs -> List.forall patSupported subs
+    | PCons (a, b) -> patSupported a && patSupported b
+    | PListLit [] -> true
+    // non-empty list literals, or-patterns, `:?` type tests, string/float/char
+    // literal patterns still fall back
+    | _ -> false
+
+// is this whole expression inside the LowIR subset? (called on a function body
+// before choosing the IR path; a false anywhere falls the function back to the
+// hand-lowering). Nested lambda BODIES are not walked — they lower on the
+// lifted path — but constructing a lambda (the closure) here is supported.
 let rec private lowSupported (st : St) (e : Expr) : bool =
-    let rec allS (xs : Expr list) : bool =
-        match xs with
-        | [] -> true
-        | x :: r -> if lowSupported st x then allS r else false
+    let allS (xs : Expr list) : bool = List.forall (lowSupported st) xs
     match e with
-    | ELit (LInt s) ->
-        not (s.EndsWith "L" || s.EndsWith "l")
-        && (match System.Int32.TryParse s with | true, _ -> true | _ -> false)
-    | ELit (LBool _) | ELit LUnit | ELit LNull | ELit (LString _) -> true
+    | ELit (LInt _) | ELit (LFloat _) | ELit (LBool _) | ELit LUnit | ELit LNull | ELit (LString _) -> true
     | EVar (v, _) | EVarI (v, _, _) ->
         // params, lets and globals are fine; a bare top-level function used as
         // a first-class value is not (only direct calls are supported)
@@ -997,29 +1010,96 @@ let rec private lowSupported (st : St) (e : Expr) : bool =
     | EIf (a, b, c) -> lowSupported st a && lowSupported st b && lowSupported st c
     | EWhile (a, b) -> lowSupported st a && lowSupported st b
     | EAssign (_, x) -> lowSupported st x
-    | EPrim ("+t", [ a; b ]) -> lowSupported st a && lowSupported st b
-    | EPrim (op, [ a; b ]) ->
-        let last = if strLen op >= 1 then charAt op (strLen op - 1) else ' '
-        last <> 'f' && last <> 'l' && last <> 's'
-        && List.contains (baseOp op) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ]
-        && lowSupported st a && lowSupported st b
-    | EApp (EUnknown "prints", [ a ]) -> lowSupported st a
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> lowSupported st a
+    | ETuple xs | EListLit xs -> allS xs
+    | ERecord (_, fs) -> List.forall (fun (_, v) -> lowSupported st v) fs
+    | ERecordExt (_, b, fs) -> lowSupported st b && List.forall (fun (_, v) -> lowSupported st v) fs
+    | ECtor (_, _, args) -> allS args
+    | EField (r, _, _) | EArrayLen (_, r) -> lowSupported st r
+    | EFieldSet (r, _, _, v) -> lowSupported st r && lowSupported st v
+    | EArray (_, xs) -> allS xs
+    | EIndex (_, a, b) -> lowSupported st a && lowSupported st b
+    | EIndexSet (_, a, b, c) -> lowSupported st a && lowSupported st b && lowSupported st c
+    | EArrayCreate (_, a, b) -> lowSupported st a && lowSupported st b
+    | EMatch (scrut, clauses) ->
+        lowSupported st scrut
+        && List.forall (fun (p, g, b) ->
+            patSupported p
+            && (match g with Some x -> lowSupported st x | None -> true)
+            && lowSupported st b) clauses
+    | ELam (_, _) -> true
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) -> allS args
+    | EPrim ("u-f", [ a ]) -> lowSupported st a
+    | EPrim (op, [ a; b ]) ->
+        (op = "+t" || op = "::"
+         || List.contains (baseOp op) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ])
+        && lowSupported st a && lowSupported st b
+    | EPrim (_, _) -> false
+    | EApp (EUnknown "prints", [ a ]) -> lowSupported st a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> lowSupported st a
+    | EApp (EUnknown "fixed6", [ a ]) -> lowSupported st a
+    | EApp (EUnknown "isNull", [ a ]) -> lowSupported st a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int64#" || n.StartsWith "int64#"
+                                    || ((n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32")) -> lowSupported st a
+    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) -> allS args
+    | EApp (EUnknown n, _) when n.StartsWith "$zero" -> true
+    | EUnknown n when n.StartsWith "$zero" -> true
+    | EApp (EUnknown _, _) -> false
+    | EApp (g, args) -> lowSupported st g && allS args
     | _ -> false
+
+// for --lowir stats: the tag of the first node that keeps a body off the LowIR
+// path, so the remaining fallbacks are legible
+let rec private unsupReason (st : St) (e : Expr) : string =
+    let firstBad (xs : Expr list) : string =
+        match xs |> List.filter (fun x -> not (lowSupported st x)) with
+        | b :: _ -> unsupReason st b
+        | [] -> ""
+    let orSelf (self : string) (xs : Expr list) : string =
+        let r = firstBad xs in if r = "" then self else r
+    if lowSupported st e then "" else
+    match e with
+    | EIfaceCall (i, mn, r, xs) -> orSelf ("ifacecall " + i + "." + mn) (r :: xs)
+    | ECast (_, r, _) -> orSelf "cast" [ r ]
+    | ETypeTest (_, r) -> orSelf "typetest" [ r ]
+    | ETry _ -> "try"
+    | EArrayPin (_, r) -> orSelf "arraypin" [ r ]
+    | EArrayUnpin (_, r) -> orSelf "arrayunpin" [ r ]
+    | EArrayBytes (_, r) -> orSelf "arraybytes" [ r ]
+    | EApp (EUnknown n, xs) -> orSelf ("unknown " + n) xs
+    | EVar (v, _) | EVarI (v, _, _) -> "func-as-value " + v.Name
+    | EMatch (s, cs) ->
+        if not (lowSupported st s) then unsupReason st s
+        else match cs |> List.filter (fun (p, _, _) -> not (patSupported p)) with
+             | (p, _, _) :: _ -> "pattern " + printPat p
+             | [] -> (match cs |> List.filter (fun (_, _, b) -> not (lowSupported st b)) with (_, _, b) :: _ -> unsupReason st b | [] -> "match")
+    | ELet (_, _, _, a, b) | EWhile (a, b) -> firstBad [ a; b ]
+    | EIf (a, b, c) -> firstBad [ a; b; c ]
+    | EFieldSet (r, _, _, v) -> firstBad [ r; v ]
+    | EField (r, _, _) | EArrayLen (_, r) -> firstBad [ r ]
+    | ERecord (_, fs) -> orSelf "record" (List.map snd fs)
+    | ERecordExt (_, b, fs) -> orSelf "recordext" (b :: List.map snd fs)
+    | EPrim (op, xs) -> orSelf ("prim " + op) xs
+    | EApp (g, xs) -> orSelf "app" (g :: xs)
+    | ESeq xs | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> orSelf "app" xs
+    | _ -> "node"
 
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
+    | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" ->
+        (match System.Int64.TryParse (s.Substring (0, s.Length - 1)) with
+         | true, n -> lowBoxI ctx (LConstL n)
+         | _ -> lowInt 0)
     | ELit (LInt s) -> (match System.Int32.TryParse s with | true, n -> lowInt n | _ -> lowInt 0)
+    | ELit (LFloat s) ->
+        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
+         | true, d -> lowBoxF ctx (LConstF d)
+         | _ -> lowInt 0)
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> LConstW (internStr st s)
-    | EVar (v, _) | EVarI (v, _, _) ->
-        (match dictTryFind ctx.Regs (key v) with
-         | Some id -> LGet (wReg id)
-         | None -> LGetGlobal (gl v))
+    | EVar (v, _) | EVarI (v, _, _) -> lowVarByKey ctx (key v)
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
         LDo ([ LSet (wReg id, coreToLowE ctx rhs) ], coreToLowE ctx body)
@@ -1038,6 +1118,28 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
              LGet (wReg r))
     | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
     | EPrim ("+t", [ a; b ]) -> LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
+    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
+        let fa = lowUnboxF (coreToLowE ctx a)
+        let fb = lowUnboxF (coreToLowE ctx b)
+        let fop = match op.Substring (0, op.Length - 1) with | "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
+        lowBoxF ctx (LPrim (fop, [ fa; fb ]))
+    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        let fa = lowUnboxF (coreToLowE ctx a)
+        let fb = lowUnboxF (coreToLowE ctx b)
+        let fop = match op.Substring (0, op.Length - 1) with | "<" -> LtF | ">" -> GtF | "<=" -> LeF | ">=" -> GeF | "=" -> EqF | _ -> NeF
+        lowTag (LPrim (fop, [ fa; fb ]))
+    | EPrim ("u-f", [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
+        let ia = lowUnboxI (coreToLowE ctx a)
+        let ib = lowUnboxI (coreToLowE ctx b)
+        let iop = match op.Substring (0, op.Length - 1) with | "+" -> AddL | "-" -> SubL | "*" -> MulL | "/" -> DivSL | _ -> RemSL
+        lowBoxI ctx (LPrim (iop, [ ia; ib ]))
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        let ia = lowUnboxI (coreToLowE ctx a)
+        let ib = lowUnboxI (coreToLowE ctx b)
+        let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
+        lowTag (LPrim (iop, [ ia; ib ]))
+    | EPrim ("::", [ h; t ]) -> lowObj ctx [ coreToLowE ctx h; coreToLowE ctx t ]
     | EPrim (op, [ a; b ]) ->
         let bop = baseOp op
         let la = lowUntag (coreToLowE ctx a)
@@ -1045,9 +1147,96 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         if List.contains bop [ "+"; "-"; "*"; "/"; "%" ]
         then lowTag (LPrim (intArithOp bop, [ la; lb ]))
         else lowTag (LPrim (intCmpOp bop, [ la; lb ]))
+    | ETuple xs -> lowObj ctx (List.map (coreToLowE ctx) xs)
+    | EListLit xs -> lowList ctx xs
+    | ERecord (name, fields) ->
+        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
+        lowObj ctx (order |> List.map (fun fnm ->
+            match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
+            | Some e2 -> coreToLowE ctx e2
+            | None -> lowInt 0))
+    | ERecordExt (name, baseE, updates) ->
+        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
+        let b = freshTmp ctx
+        let slots =
+            order |> List.mapi (fun i fnm ->
+                match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
+                | Some e2 -> coreToLowE ctx e2
+                | None -> LLoad (W, LGet (wReg b), 4 * i))
+        LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx slots)
+    | ECtor (case, _, args) ->
+        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
+        lowObj ctx (LConstW tag :: List.map (coreToLowE ctx) args)
+    | EField (r, fname, owner) ->
+        let idx =
+            match dictTryFind st.RecFields owner with
+            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
+            | None -> 0
+        LLoad (W, coreToLowE ctx r, 4 * idx)
+    | EFieldSet (r, fname, owner, v) ->
+        let idx =
+            match dictTryFind st.RecFields owner with
+            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
+            | None -> 0
+        LDo ([ LStore (W, coreToLowE ctx r, 4 * idx, coreToLowE ctx v) ], lowInt 0)
+    | EArray (_, xs) -> lowObj ctx (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
+    | EIndex (_, arr, i) ->
+        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
+        LLoad (W, addr, 0)
+    | EIndexSet (_, arr, i, v) ->
+        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
+        LDo ([ LStore (W, addr, 0, coreToLowE ctx v) ], lowInt 0)
+    | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, 0))
+    | EArrayCreate (_, n, init) ->
+        let cnt = freshTmp ctx
+        let iv = freshTmp ctx
+        let bs = freshTmp ctx
+        let it = freshTmp ctx
+        let stmts =
+            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
+              LSet (wReg iv, coreToLowE ctx init)
+              LSet (wReg bs, LAlloc (LPrim (AddW, [ LConstW 4; LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))
+              LStore (W, LGet (wReg bs), 0, LGet (wReg cnt))
+              LSet (wReg it, LConstW 0)
+              LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
+                      [ LStore (W, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg it); LConstW 1 ]); LConstW 4 ]) ]), 0, LGet (wReg iv))
+                        LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
+        LDo (stmts, LGet (wReg bs))
+    | EApp (EUnknown n, _) when n.StartsWith "$zero" -> lowInt 0
+    | EUnknown n when n.StartsWith "$zero" -> lowInt 0
+    | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
+        lowTag (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
+        lowBoxI ctx (LPrim (WToL, [ lowUntag (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
+        lowBoxF ctx (LPrim (WToF, [ lowUntag (coreToLowE ctx a) ]))
+    | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
+    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) ->
+        LDo ((args |> List.map (fun a -> LEval (coreToLowE ctx a))) @ [ LTrap ], lowInt 0)
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) -> LCall (fn v, List.map (coreToLowE ctx) args)
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
+        when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
+        LCall (fn v, List.map (coreToLowE ctx) args)
+    | ELam (_, _) ->
+        (match refMapTryFind st.LamName e with
+         | Some name -> lowClosure ctx name
+         | None -> err st "wasm-linear LowIR: lambda not discovered"; lowInt 0)
+    | EApp (g, args) -> lowApply ctx (coreToLowE ctx g) args
+    | EMatch (scrut, clauses) ->
+        let sc = freshTmp ctx
+        let mr = freshTmp ctx
+        let clauseStmts =
+            clauses |> List.map (fun (pat, guard, body) ->
+                let tests = lowPatTest ctx sc "$mnext" pat
+                let guardStmt =
+                    match guard with
+                    | Some g -> [ LBreakIf ("$mnext", LPrim (EqW, [ lowUntag (coreToLowE ctx g); LConstW 0 ])) ]
+                    | None -> []
+                LBlock ("$mnext", tests @ guardStmt @ [ LSet (wReg mr, coreToLowE ctx body); LBreak "$mdone" ]))
+        LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
+               LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
@@ -1065,6 +1254,108 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | ELit LUnit -> []
     | EApp (EUnknown "prints", [ a ]) -> [ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ]
     | _ -> [ LEval (coreToLowE ctx e) ]
+
+// allocate an n-word object and fill each slot; a fresh register holds the
+// base, so nesting is safe with NO scratch pool (the depth-indexed pools the
+// hand path needs fall away — the IR gives every allocation its own register)
+and private lowObj (ctx : LowCtx) (slots : LExpr list) : LExpr =
+    let n = List.length slots
+    let b = freshTmp ctx
+    let stores = slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), 4 * i, v))
+    LDo (LSet (wReg b, LAlloc (LConstW (4 * n))) :: stores, LGet (wReg b))
+
+and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
+    match xs with
+    | [] -> LConstW 0
+    | x :: rest -> lowObj ctx [ coreToLowE ctx x; lowList ctx rest ]
+
+// a boxed 64-bit payload is a pointer to 8 bytes; box/unbox are alloc+store /
+// load, with the wide type carried on the LStore/LLoad so the backend picks
+// f64/i64 access
+and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr =
+    let b = freshTmp ctx
+    LDo ([ LSet (wReg b, LAlloc (LConstW 8)); LStore (F64, LGet (wReg b), 0, fv) ], LGet (wReg b))
+
+and private lowUnboxF (p : LExpr) : LExpr = LLoad (F64, p, 0)
+
+and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr =
+    let b = freshTmp ctx
+    LDo ([ LSet (wReg b, LAlloc (LConstW 8)); LStore (I64, LGet (wReg b), 0, iv) ], LGet (wReg b))
+
+and private lowUnboxI (p : LExpr) : LExpr = LLoad (I64, p, 0)
+
+// test `pat` against the value in register `scrutReg`; produce statements that
+// LBreak to `fail` on mismatch and bind pattern variables on the matching
+// path. Sub-values load into fresh registers — again no scratch pool.
+and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pat) : LStmt list =
+    let st = ctx.LSt
+    let sc = LGet (wReg scrutReg)
+    match pat with
+    | PWild -> []
+    | PVar (v, _) -> [ LSet (wReg (freshReg ctx (key v)), sc) ]
+    | PAs (p, v, _) -> LSet (wReg (freshReg ctx (key v)), sc) :: lowPatTest ctx scrutReg fail p
+    | PLit (LInt s) ->
+        (match System.Int32.TryParse s with
+         | true, n -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW n ])) ]
+         | _ -> [])
+    | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (if b then 1 else 0) ])) ]
+    | PLit LUnit -> []
+    | PCtor (case, _, subs) ->
+        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
+        let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, 0); LConstW tag ]))
+        tagTest :: List.concat (subs |> List.mapi (fun i sub ->
+            let t = freshTmp ctx
+            LSet (wReg t, LLoad (W, sc, 4 * (i + 1))) :: lowPatTest ctx t fail sub))
+    | PTuple subs ->
+        List.concat (subs |> List.mapi (fun i sub ->
+            let t = freshTmp ctx
+            LSet (wReg t, LLoad (W, sc, 4 * i)) :: lowPatTest ctx t fail sub))
+    | PCons (h, tl) ->
+        let th = freshTmp ctx
+        let tt = freshTmp ctx
+        LBreakIf (fail, LPrim (EqW, [ sc; LConstW 0 ]))
+        :: (LSet (wReg th, LLoad (W, sc, 0)) :: lowPatTest ctx th fail h)
+        @ (LSet (wReg tt, LLoad (W, sc, 4)) :: lowPatTest ctx tt fail tl)
+    | PListLit [] -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
+    | _ -> [ LTrap ]
+
+// resolve a variable by its (path:offset) key: a local/param register, a
+// captured free variable read from the env (when lowering a lifted lambda
+// body), or a module global — the LowIR counterpart of emitVarByKey
+and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
+    let st = ctx.LSt
+    match dictTryFind ctx.Regs k with
+    | Some id -> LGet (wReg id)
+    | None ->
+        match dictTryFind st.Captures k with
+        | Some slot when ctx.EnvReg >= 0 -> LLoad (W, LGet (wReg ctx.EnvReg), 8 + 4 * slot)
+        | _ ->
+            match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
+            | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
+            | None -> err st "wasm-linear LowIR: unresolved variable"; lowInt 0
+
+// build a closure object [kind=2][code-index][captures…]; its layout and the
+// (env, arg) calling convention match the hand path, so a LowIR-built closure
+// interoperates with a lifted body emitted by `lower` and vice versa
+and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
+    let st = ctx.LSt
+    let caps =
+        st.Lams |> vecToList |> List.tryPick (fun (n, _, _, c) -> if n = name then Some c else None)
+        |> Option.defaultValue []
+    LConstW CLO_KIND
+    :: LConstW (tblIdx st.M name)
+    :: (caps |> List.map (fun (p, o) -> lowVarByKey ctx (p + ":" + string o)))
+    |> lowObj ctx
+
+and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
+    match args with
+    | [] -> cloE
+    | a :: rest ->
+        // bind the closure to a register so LCallIndirect can read it twice
+        // (as env and to load the code index) without re-evaluating it
+        let tclo = freshTmp ctx
+        let step = LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
+        lowApply ctx step rest
 
 let private lowOpIns (op : LOp) : string =
     match op with
@@ -1087,19 +1378,62 @@ let private lowOpIns (op : LOp) : string =
     | GeSW -> "i32.ge_s"
     | LtUW -> "i32.lt_u"
     | GeUW -> "i32.ge_u"
-    | _ -> "unreachable"
+    | AddL -> "i64.add"
+    | SubL -> "i64.sub"
+    | MulL -> "i64.mul"
+    | DivSL -> "i64.div_s"
+    | RemSL -> "i64.rem_s"
+    | EqL -> "i64.eq"
+    | NeL -> "i64.ne"
+    | LtSL -> "i64.lt_s"
+    | GtSL -> "i64.gt_s"
+    | LeSL -> "i64.le_s"
+    | GeSL -> "i64.ge_s"
+    | AddF -> "f64.add"
+    | SubF -> "f64.sub"
+    | MulF -> "f64.mul"
+    | DivF -> "f64.div"
+    | NegF -> "f64.neg"
+    | EqF -> "f64.eq"
+    | NeF -> "f64.ne"
+    | LtF -> "f64.lt"
+    | GtF -> "f64.gt"
+    | LeF -> "f64.le"
+    | GeF -> "f64.ge"
+    | WToL -> "i64.extend_i32_s"
+    | LToW -> "i32.wrap_i64"
+    | WToF -> "f64.convert_i32_s"
+    | FToW -> "i32.trunc_f64_s"
+    | LToF -> "f64.convert_i64_s"
+    | FToL -> "i64.trunc_f64_s"
+
+let private loadIns (ty : LTy) : string =
+    match ty with
+    | F64 -> "f64.load"
+    | I64 -> "i64.load"
+    | I8 -> "i32.load8_u"
+    | I16 -> "i32.load16_u"
+    | _ -> "i32.load"
+
+let private storeIns (ty : LTy) : string =
+    match ty with
+    | F64 -> "f64.store"
+    | I64 -> "i64.store"
+    | I8 -> "i32.store8"
+    | I16 -> "i32.store16"
+    | _ -> "i32.store"
 
 let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     match e with
     | LConstW n -> ic f n
     | LConstL n -> lc f n
-    | LConstF _ -> ic f 0
+    | LConstF x -> fc f (System.BitConverter.DoubleToInt64Bits x)
     | LGet r -> lg f (regNm r)
     | LGetGlobal g -> gg f g
-    | LLoad (_, a, off) ->
+    | LLoad (ty, a, off) ->
         emitLowE f a
         (if off <> 0 then (ic f off; ins f "i32.add"))
-        mem f "i32.load"
+        mem f (loadIns ty)
     | LPrim (op, args) ->
         for a in args do emitLowE f a
         ins f (lowOpIns op)
@@ -1108,19 +1442,26 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
         for a in args do emitLowE f a
         callf f sym
     | LCallIndirect (_, fp, args) ->
+        // (env, arg) -> result through table 0: the closure IS the env, and
+        // the code index is the word at closure+4. `fp` must be a pure LGet
+        // (Core->LowIR binds the closure into a register first), so emitting
+        // it twice — once as env, once for the index load — is side-effect
+        // free. Stack: env, arg, table-index, then call_indirect.
         emitLowE f fp
         for a in args do emitLowE f a
+        emitLowE f (LLoad (W, fp, 4))
+        callIndirect f "$lclo"
     | LDo (ss, v) ->
         for s in ss do emitLowS f s
         emitLowE f v
 
 and private emitLowS (f : Fn) (s : LStmt) : unit =
     match s with
-    | LStore (_, a, off, v) ->
+    | LStore (ty, a, off, v) ->
         emitLowE f a
         (if off <> 0 then (ic f off; ins f "i32.add"))
         emitLowE f v
-        mem f "i32.store"
+        mem f (storeIns ty)
     | LSet (r, e) -> emitLowE f e; ls f (regNm r)
     | LSetGlobal (g, e) -> emitLowE f e; gs f g
     | LEval e -> emitLowE f e; ins f "drop"
@@ -1151,7 +1492,7 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
 let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     let bodyLow = coreToLowE ctx body
     let f = beginFn m pnames
@@ -1160,6 +1501,20 @@ let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (fin
     localsDone f
     emitLowE f bodyLow
     finish f
+    endFn f
+
+// a lifted lambda body: params are (env, arg); captured free variables read
+// from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
+// the env, register 1 the argument.
+let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; NReg = 0 }
+    let envId = freshTmp ctx
+    let argId = freshReg ctx (key pv)
+    let bodyLow = coreToLowE ctx body
+    let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
+    for id in 2 .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+    localsDone f
+    emitLowE f bodyLow
     endFn f
 
 // ---- driver ---------------------------------------------------------------
@@ -1275,10 +1630,14 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m
     // top-level function bodies
+    let mutable nLow = 0
+    let mutable nHand = 0
+    let reasons = vecNew<string> ()
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
             if useLow && lowSupported st body then
+                nLow <- nLow + 1
                 emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
             else
                 st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
@@ -1289,6 +1648,7 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
                 localsDone f
                 lower st f body
                 endFn f
+                if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st body))
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -1297,6 +1657,7 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) ->
             if useLow && lowSupported st rhs then
+                nLow <- nLow + 1
                 emitFuncLow st m [] rhs (fun f -> gs f (gl v))
             else
                 st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
@@ -1307,6 +1668,7 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
                 lower st f rhs
                 gs f (gl v)
                 endFn f
+                if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st rhs))
         | _ -> ()
     // _start: run every init in order
     let f = beginFn m []
@@ -1317,18 +1679,28 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
     for name, (pv, _), body, caps in vecToList st.Lams do
         st.Locals <- dictNew (); st.Captures <- dictNew (); st.ClosDepth <- 0
         caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
-        let f = beginFn m [ "$env"; paramNm pv ]
-        st.EnvName <- "$env"
-        dictSet st.Locals (key pv) (paramNm pv)
-        scanLets st f body
-        declTemps f
-        localsDone f
-        lower st f body
-        endFn f
+        if useLow && lowSupported st body then
+            nLow <- nLow + 1
+            emitLambdaLow st m pv body
+        else
+            let f = beginFn m [ "$env"; paramNm pv ]
+            st.EnvName <- "$env"
+            dictSet st.Locals (key pv) (paramNm pv)
+            scanLets st f body
+            declTemps f
+            localsDone f
+            lower st f body
+            endFn f
+            if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st body))
     // bake the constant data at CONST_BASE; $hp already starts after it
     activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
     let bytes = assembleWith m pages false ""
+    if useLow && System.Environment.GetEnvironmentVariable "FPP_LOWIR_STATS" <> null then
+        eprintfn "LOWIR: %d functions via LowIR, %d fell back to hand-lowering" nLow nHand
+        for r in reasons |> vecToList |> List.distinct do
+            let c = reasons |> vecToList |> List.filter (fun x -> x = r) |> List.length
+            eprintfn "  fallback: %s (x%d)" r c
     bytes, vecToList st.Errors
 
 // the hand-lowered path (default) and the LowIR path (`--linear` with the

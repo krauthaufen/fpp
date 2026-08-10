@@ -44,43 +44,54 @@ optimisations still live on LowIR. A direct LowIR→x64/arm64 backend is pure
 upside later, only if the wasmtime dependency is worth shedding — not a
 prerequisite.
 
-## Status: the seam is in and proven
+## Status: the whole gate program lowers through LowIR
 
 `Core/LowIR.fs` defines the IR (`LExpr`/`LStmt`/`LFunc`, the `LOp` ALU, `LTy`,
-`LReg`). `WasmLin.fs` gained a Core→LowIR lowering (`coreToLowE`/`coreToLowS`,
-tag/box expanded here) and a LowIR→wasm emitter (`emitLowE`/`emitLowS`,
-`emitFuncLow`). `fpp build --lowir` routes a function's body through LowIR
-where a `lowSupported` predicate says the whole body is in the covered subset,
-and **falls back to the hand-lowering `lower` otherwise** — so the two paths
-coexist in one interoperating module and the output can never regress. As the
-subset widens, `lower` shrinks; when it is empty, LowIR is the only path and
-the hand-lowering is deleted.
+`LReg`). `WasmLin.fs` gained a Core→LowIR lowering (`coreToLowE`/`coreToLowS`
+plus `lowObj`/`lowList`/`lowBoxF`/`lowBoxI`/`lowPatTest`/`lowClosure`/
+`lowApply`, tag/box expanded here) and a LowIR→wasm emitter (`emitLowE`/
+`emitLowS`, `emitFuncLow` for top functions and inits, `emitLambdaLow` for
+lifted lambda bodies). `fpp build --lowir` routes a body through LowIR where a
+`lowSupported` predicate says the whole body is in the covered subset, and
+**falls back to the hand-lowering `lower` otherwise** — the two paths coexist
+in one interoperating module (a LowIR-built closure and a hand-lowered body
+share one ABI), so output can never regress. `FPP_LOWIR_STATS=1` reports how
+many bodies took each path.
 
-Covered subset today: integers, arithmetic and comparison, `let`/`let mutable`
-and top-level globals, top-level functions with direct calls and recursion,
-`if`/`elif`/`while`/assignment/sequencing, string literals, int-to-string,
-string concat, `printfn`. Registers are allocated one wasm local per `LReg`
-(no liveness colouring yet — that IS the register-allocation pass, still to
-come).
+Covered subset: integers, floats and int64 (boxed wide payloads), arithmetic /
+comparison / conversions, `let`/`let mutable` and globals, top-level functions
+with direct calls and recursion, `if`/`elif`/`while`/assignment/sequencing,
+records, unions, tuples, arrays (`.[]`, `.Length`, `zeroCreate`/`create`),
+`match` (literals, constructors, tuples, cons, `[]`, `as`, wildcards, guards),
+lists, options, closures / higher-order functions / indirect calls, string
+literals, int-to-string, `%f` formatting, concat, `printfn`, and `failwith` &
+friends (trap). Registers are one wasm local per `LReg` (no liveness colouring
+yet — that IS the register-allocation pass, still to come).
 
-Gated by `tests/tooling/cback/lowir-gate.sh`: a program entirely inside the
-subset (fib, fact, gcd, a polynomial, collatz, a summation loop, formatted
-output) is emitted through Core→LowIR→wasm and diffed against the wasm-GC
-oracle — a THIRD independent emission path agreeing on one meaning. The full
-`wasmlin-gate.sh` program (closures, records, unions, arrays, floats, int64,
-lists, match, options) also runs clean under `--lowir`: its in-subset
-functions take the LowIR path, the rest fall back, and the mixed module still
-matches the oracle. Both `fixpoint.fsx` and `fixpoint.fsx self` reproduce
-byte-for-byte with `LowIR.fs` now among the compiled sources.
+The nesting-safe scratch pools the hand path needs (`$ab`/`$pt`/`$ms`/`$fd`…,
+indexed by allocation/match/box depth) FALL AWAY: every allocation, match
+temp and box gets a fresh `LReg`, so nesting safety is structural.
+
+Gated by `tests/tooling/cback/lowir-gate.sh`: a WHOLE-LANGUAGE program
+(recursion, while/mutable, records, unions, tuples, arrays, match, lists,
+options, floats, int64, closures, HOFs) is built with `--lowir`, the stats are
+asserted to show **zero fallbacks** (every function, init and lambda body took
+the LowIR path), and the output is diffed against the wasm-GC oracle — a THIRD
+independent emission path agreeing on one meaning, with `lower` proven unused
+on the whole-language program. Both `fixpoint.fsx` and `fixpoint.fsx self`
+reproduce byte-for-byte with the new code among the compiled sources.
+
+`lower` is NOT deleted: it still serves the genuinely-hard nodes the gate does
+not reach — exceptions (`ETry`), typeclass dispatch (`EIfaceCall`), casts /
+type tests, or-patterns, non-empty list-literal patterns, array pinning. Those
+are the remaining ports before it can go.
 
 ## The road
 
-1. **Widen `lowSupported` + `coreToLowE`** to closures/indirect calls,
-   records/unions/tuples, arrays, `match`, floats and int64 — porting each
-   from `lower` into the Core→LowIR expansion. When the whole `wasmlin-gate`
-   program lowers through LowIR, delete `lower`. The deferred wasm-linear
-   features (local recursive closures, full-width ints, exceptions, typeclass
-   dispatch) come nearly free here, since LowIR gives them a structured home.
+1. **Port the remaining hard nodes** into Core→LowIR — exceptions, typeclass
+   dispatch (vtables), casts / type tests, or-patterns, pinning — then delete
+   `lower` on the wasm-linear leg. These need real new machinery (a wasm
+   exception model, a vtable lowering), not just expansion.
 2. **A liveness register allocator** over `LReg` → wasm local slots, replacing
    one-local-per-register. This is the wasm backend's only real allocation
    work; C needs none.
