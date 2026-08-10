@@ -68,6 +68,36 @@ let private buildLib (out : string) (files : string list) : int =
 let mutable private linearBackend = false
 let mutable private lowirBackend = false
 
+// GC mode emits a module that IMPORTS fpprt's memory + API; link it with the
+// fpprt reactor (wasm-merge) and re-encode the result (wasm-tools) so `out` is a
+// single runnable file. Tool + reactor locations are env-overridable.
+let private mergeGcModule (moduleBytes : byte[]) (out : string) : int =
+    let home = System.Environment.GetEnvironmentVariable "HOME"
+    let envOr (name : string) (dflt : string) =
+        match System.Environment.GetEnvironmentVariable name with
+        | null | "" -> dflt
+        | p -> p
+    let reactor = envOr "FPP_REACTOR" (home + "/projects/fpp/runtime/build/wasm/fpprt_reactor.wasm")
+    let wasmMerge = envOr "FPP_WASM_MERGE" (home + "/emsdk/upstream/bin/wasm-merge")
+    let wasmTools = envOr "FPP_WASM_TOOLS" "wasm-tools"
+    let tmp = System.IO.Path.GetTempPath() + System.IO.Path.GetRandomFileName()
+    let modWasm = tmp + ".mod.wasm"
+    let wat = tmp + ".merged.wat"
+    System.IO.File.WriteAllBytes(modWasm, moduleBytes)
+    let run (exe : string) (args : string list) : int =
+        let psi = System.Diagnostics.ProcessStartInfo(exe)
+        for a in args do psi.ArgumentList.Add a
+        psi.UseShellExecute <- false
+        use p = System.Diagnostics.Process.Start psi
+        p.WaitForExit()
+        p.ExitCode
+    let r1 = run wasmMerge [ "-all"; reactor; "fpprt"; modWasm; "mutator"; "-S"; "-o"; wat ]
+    if r1 <> 0 then (eprintfn "error: wasm-merge failed (is %s present? set FPP_WASM_MERGE / FPP_REACTOR)" wasmMerge; 1)
+    else
+        let r2 = run wasmTools [ "parse"; wat; "-o"; out ]
+        (try System.IO.File.Delete modWasm; System.IO.File.Delete wat with _ -> ())
+        if r2 <> 0 then (eprintfn "error: wasm-tools parse failed (set FPP_WASM_TOOLS)"; 1) else 0
+
 let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
     let ws = Workspace()
     // the target IS the configuration: `#if WASM` code exists only in wasm
@@ -110,6 +140,8 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
         if not (List.isEmpty errors) then
             for e in errors |> List.distinct do eprintfn "error: %s" e
             1
+        elif Fpp.Backend.WasmLin.gc then
+            mergeGcModule bytes out
         else
             System.IO.File.WriteAllBytes(out, bytes)
             0
