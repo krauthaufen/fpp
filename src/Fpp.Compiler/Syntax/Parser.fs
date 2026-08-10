@@ -1327,9 +1327,11 @@ let parse (src : string) : ParseResult =
         if s.IsOp ":" then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseType letCol)
-            // declared constraints: `let solve ... : Vector<'a> when Fractional<'a> = ...`
-            while s.IsKw "when" && (s.SameLine || s.CurCol > letCol) do
-                for w__ in parseWhen false letCol do vecAdd acc w__
+        // declared constraints — after the ascription (`... : Vector<'a>
+        // when Fractional<'a>`) or standing alone (`let lengthSq v when
+        // VecSpace<'v> = ...`), exactly as a member's may
+        while s.IsKw "when" && (s.SameLine || s.CurCol > letCol) do
+            for w__ in parseWhen false letCol do vecAdd acc w__
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"

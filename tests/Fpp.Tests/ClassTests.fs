@@ -2080,6 +2080,96 @@ let resolutionRuleTests =
         }
     ]
 
+// Typical typeclass programs, the shapes a user actually writes — each
+// verified by running before its output was frozen here.
+[<Tests>]
+let typeclassPracticeTests =
+    testList "typeclasses in practice" [
+        test "lerp composes vector add, sub and scalar mul" {
+            let out =
+                run [ "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "instance Add<V3<'a>, V3<'a>> when Num<'a>"
+                      "    type Result = V3<'a>"
+                      "    static (+) a b = { X = a.X + b.X; Y = a.Y + b.Y; Z = a.Z + b.Z }"
+                      "instance Sub<V3<'a>, V3<'a>> when Num<'a>"
+                      "    type Result = V3<'a>"
+                      "    static (-) a b = { X = a.X - b.X; Y = a.Y - b.Y; Z = a.Z - b.Z }"
+                      "instance Mul<V3<'a>, 'a> when Num<'a>"
+                      "    type Result = V3<'a>"
+                      "    static (*) v k = { X = v.X * k; Y = v.Y * k; Z = v.Z * k }"
+                      "let lerp (t : float) (a : V3<float>) (b : V3<float>) = a + (b - a) * t"
+                      "let p = lerp 0.25 { X = 0.0; Y = 0.0; Z = 0.0 } { X = 4.0; Y = 8.0; Z = 12.0 }"
+                      "let r1 = print (string p.Y)"
+                      "let q = { X = 1; Y = 2; Z = 3 } * 10"
+                      "let r2 = print (string (q.X + q.Y + q.Z))" ]
+            Expect.equal out "2\n60\n" "vector-scalar Mul at float and int"
+        }
+        test "generic dot product and squared length over Num" {
+            let out =
+                run [ "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "let dot (a : V3<'a>) (b : V3<'a>) : 'a when Num<'a> ="
+                      "    a.X * b.X + a.Y * b.Y + a.Z * b.Z"
+                      "let lengthSq (v : V3<'a>) : 'a when Num<'a> = dot v v"
+                      "let r1 = print (string (dot { X = 1.0; Y = 2.0; Z = 3.0 } { X = 4.0; Y = 5.0; Z = 6.0 }))"
+                      "let r2 = print (string (lengthSq { X = 3; Y = 4; Z = 12 }))" ]
+            Expect.equal out "32\n169\n" "one generic body, both element kinds"
+        }
+        test "a matrix pipeline: identity, composition, rotation" {
+            // rot90 twice is -I, so (3,4) lands on (-3,-4); the identity
+            // member stamps at the use exactly as the user's M33 did
+            let out =
+                run [ "[<Struct>]"
+                      "type V2<'a> = { X : 'a; Y : 'a }"
+                      "[<Struct>]"
+                      "type M22<'a> ="
+                      "    { M00 : 'a; M01 : 'a"
+                      "      M10 : 'a; M11 : 'a }"
+                      "    static member Identity when Num<'a> ="
+                      "        { M00 = One; M01 = Zero"
+                      "          M10 = Zero; M11 = One }"
+                      "instance Mul<M22<'a>, M22<'a>> when Num<'a>"
+                      "    type Result = M22<'a>"
+                      "    static (*) a b ="
+                      "        { M00 = a.M00 * b.M00 + a.M01 * b.M10; M01 = a.M00 * b.M01 + a.M01 * b.M11"
+                      "          M10 = a.M10 * b.M00 + a.M11 * b.M10; M11 = a.M10 * b.M01 + a.M11 * b.M11 }"
+                      "instance Mul<M22<'a>, V2<'a>> when Num<'a>"
+                      "    type Result = V2<'a>"
+                      "    static (*) m v ="
+                      "        { X = m.M00 * v.X + m.M01 * v.Y"
+                      "          Y = m.M10 * v.X + m.M11 * v.Y }"
+                      "let rot90 = { M00 = 0.0; M01 = 0.0 - 1.0; M10 = 1.0; M11 = 0.0 }"
+                      "let v = rot90 * rot90 * { X = 3.0; Y = 4.0 }"
+                      "let r1 = print (string v.X + \" \" + string v.Y)"
+                      "let w = M22.Identity * { X = 7.0; Y = 9.0 }"
+                      "let r2 = print (string w.X + \" \" + string w.Y)" ]
+            Expect.equal out "-3 -4\n7 9\n" "two multiplies chain through Result"
+        }
+        test "an associated-type class of one's own dispatches by dimension" {
+            // ascription-free `let ... when VecSpace<'v> =` parses since the
+            // let-when hoist — the member form's twin
+            let out =
+                run [ "[<Struct>]"
+                      "type V2<'a> = { X : 'a; Y : 'a }"
+                      "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "class VecSpace<'v>"
+                      "    type Scalar"
+                      "    static dot : 'v -> 'v -> Scalar"
+                      "instance VecSpace<V2<float>>"
+                      "    type Scalar = float"
+                      "    static dot a b = a.X * b.X + a.Y * b.Y"
+                      "instance VecSpace<V3<float>>"
+                      "    type Scalar = float"
+                      "    static dot a b = a.X * b.X + a.Y * b.Y + a.Z * b.Z"
+                      "let lengthSq (v : 'v) when VecSpace<'v> = VecSpace.dot v v"
+                      "let r1 = print (string (lengthSq { X = 3.0; Y = 4.0 }))"
+                      "let r2 = print (string (lengthSq { X = 1.0; Y = 2.0; Z = 2.0 }))" ]
+            Expect.equal out "25\n9\n" "Scalar rides the instance; the head picks by shape"
+        }
+    ]
+
 // Diagnostics that stop a clean check from handing over a broken binary —
 // each of these compiled silently and misbehaved before its check existed.
 [<Tests>]
