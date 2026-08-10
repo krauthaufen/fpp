@@ -224,6 +224,26 @@ load-bearing for the goal:
 Measure, do not reason (the repo's own hard-won rule): the benchmark suite,
 best-of-three warm, is the arbiter — not instruction counts.
 
+## The self-host RUN (proving the language) — the concrete next step
+
+Two things stand between "compiles most of the source" and a `--lowir` self-host
+fixpoint:
+1. **Host imports (`DExtern`).** The compiler reads its input (corpus, prelude)
+   through host services that BinDriver emits as wasm imports from the `env`
+   module (`fixpoint.fsx` preloads `env.wat`). The linear backend only imports
+   WASI `fd_write` today — it must emit the same `DExtern` imports so a
+   `--lowir`-built compiler can read its input under the same host contract.
+2. **Trap vs. garbage on unimplemented nodes.** `lowInt 0` fallback lets a
+   `--lowir` module build despite unsupported intrinsics; the self-host DIFF
+   against stage-0 then pinpoints exactly which unimplemented node is on a LIVE
+   path (dead ones — e.g. `int#t`, which BinDriver itself doesn't handle — never
+   matter). So the remaining intrinsic work is DEMAND-DRIVEN by the diff, not a
+   blind sweep of the whole prelude surface.
+
+Then a `--lowir` self-host fixpoint: emit the compiler via `--lowir`, run it
+under wasmtime with the `env` host, diff its output against stage-0. Green = the
+language is proven on the linear backend.
+
 ## Toward self-hosting on `--lowir`
 
 Interface dispatch and exceptions landed, so the backend now covers the whole
