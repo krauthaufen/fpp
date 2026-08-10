@@ -678,6 +678,9 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let fop = match op.Substring (0, op.Length - 1) with | "<" -> LtF | ">" -> GtF | "<=" -> LeF | ">=" -> GeF | "=" -> EqF | _ -> NeF
         lowTag (LPrim (fop, [ fa; fb ]))
     | EPrim ("u-f", [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EPrim ("u-l", [ a ]) -> lowBoxI ctx (LPrim (SubL, [ LConstL 0L; lowUnboxI (coreToLowE ctx a) ]))
+    | EPrim (("u-" | "u-i"), [ a ]) -> lowTag (LPrim (SubW, [ LConstW 0; lowUntag (coreToLowE ctx a) ]))
+    | EPrim (("unot" | "not"), [ a ]) -> lowTag (LPrim (EqW, [ lowUntag (coreToLowE ctx a); LConstW 0 ]))
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
@@ -761,7 +764,23 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowBoxI ctx (LPrim (WToL, [ lowUntag (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
         lowBoxF ctx (LPrim (WToF, [ lowUntag (coreToLowE ctx a) ]))
+    // char and int share the tagged-int representation, so `int c` / `char i`
+    // are the identity
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#c" || n.StartsWith "char" -> coreToLowE ctx a
+    // int from float: unbox, truncate, tag
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
+    | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    | EApp (EUnknown "$listLength", [ l ]) ->
+        // walk the cons cells ([cid][head][tail], null = 0) counting nodes
+        let p = freshTmp ctx
+        let n = freshTmp ctx
+        LDo ([ LSet (wReg p, coreToLowE ctx l)
+               LSet (wReg n, LConstW 0)
+               LWhile (LPrim (NeW, [ LGet (wReg p); LConstW 0 ]),
+                       [ LSet (wReg n, LPrim (AddW, [ LGet (wReg n); LConstW 1 ]))
+                         LSet (wReg p, LLoad (W, LGet (wReg p), HDR + 4)) ]) ],
+             lowTag (LGet (wReg n)))
     | EApp (EUnknown "failwith", [ msg ]) ->
         LDo ([ LThrow (lowFailure ctx (coreToLowE ctx msg)) ], lowInt 0)
     | EApp (EUnknown "raise", [ ex ]) ->
@@ -834,7 +853,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                     | None -> []
                 LBlock ("$cnext", tests @ guardStmt @ [ LSet (wReg res, coreToLowE ctx handler); LBreak "$tdone" ]))
         LDo ([ LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
-    | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
+    | _ ->
+        let what =
+            match e with
+            | EUnknown n -> "unknown " + n
+            | EApp (EUnknown n, _) -> "apply-unknown " + n
+            | EPrim (op, _) -> "prim " + op
+            | EArrayPin _ -> "arraypin" | EArrayUnpin _ -> "arrayunpin" | EArrayBytes _ -> "arraybytes"
+            | ELit _ -> "lit" | _ -> "node"
+        err st ("wasm-linear LowIR: unsupported " + what); lowInt 0
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     match e with
@@ -845,7 +872,10 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
          | Some id -> [ LSet (wReg id, coreToLowE ctx rhs) ]
-         | None -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ])
+         | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ]
+         // a mutable captured by a closure needs a heap CELL (like the wasm-GC
+         // backend's $cellof/$cellset); not yet handled — report, don't crash
+         | None -> err ctx.LSt ("wasm-linear LowIR: assignment to captured mutable " + v.Name); [ LEval (coreToLowE ctx rhs) ])
     | EIf (c, a, b) -> [ LIf (lowUntag (coreToLowE ctx c), coreToLowS ctx a, coreToLowS ctx b) ]
     | EWhile (c, b) -> [ LWhile (lowUntag (coreToLowE ctx c), coreToLowS ctx b) ]
     | ELit LUnit -> []
