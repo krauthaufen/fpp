@@ -21,6 +21,7 @@ module Fpp.Backend.WasmLin
 open Fpp.Prelude
 open Fpp.Analysis.Types
 open Fpp.Core.Ir
+open Fpp.Core.LowIR
 open Fpp.Backend.WasmBinary
 open Fpp.Backend.EmitBin
 
@@ -923,8 +924,246 @@ let private shallowLamHash (e : Expr) : int =
     | ELam ((pv, _) :: _, _) -> 31 * pv.Offset + 7
     | _ -> 7
 
+// ---- LowIR: Core -> a shared machine IR, then IR -> wasm ------------------
+// The migration seam off the hand-lowering above. A function whose body lies
+// in the supported subset is lowered to LowIR (Core/LowIR.fs) and emitted
+// from there; everything else still goes through `lower`. Tag/box arithmetic
+// is EXPANDED here into plain machine ops, so LowIR carries no tag primitive
+// of its own — the property that lets one IR serve the C backend and an
+// eventual native backend the same way it serves this one. As coverage grows,
+// `lowSupported` widens until `lower` is dead and the IR is the only path.
+
+type private LowCtx =
+    { LSt : St
+      // a Core VarId (param or let) -> its dense LowIR register id
+      Regs : Dict<string, int>
+      mutable NReg : int }
+
+let private freshReg (ctx : LowCtx) (k : string) : int =
+    match dictTryFind ctx.Regs k with
+    | Some id -> id
+    | None ->
+        let id = ctx.NReg
+        dictSet ctx.Regs k id
+        ctx.NReg <- id + 1
+        id
+
+let private freshTmp (ctx : LowCtx) : int =
+    let id = ctx.NReg
+    ctx.NReg <- id + 1
+    id
+
+let private wReg (id : int) : LReg = { Id = id; RTy = W }
+let private regNm (r : LReg) : string = "$r" + string r.Id
+let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
+let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
+let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
+
+let private intArithOp (b : string) : LOp =
+    match b with
+    | "+" -> AddW
+    | "-" -> SubW
+    | "*" -> MulW
+    | "/" -> DivSW
+    | _ -> RemSW
+
+let private intCmpOp (b : string) : LOp =
+    match b with
+    | "<" -> LtSW
+    | ">" -> GtSW
+    | "<=" -> LeSW
+    | ">=" -> GeSW
+    | "=" -> EqW
+    | _ -> NeW
+
+// is this whole expression inside the LowIR subset? (called on a function
+// body before choosing the IR path; a false anywhere falls the function back)
+let rec private lowSupported (st : St) (e : Expr) : bool =
+    let rec allS (xs : Expr list) : bool =
+        match xs with
+        | [] -> true
+        | x :: r -> if lowSupported st x then allS r else false
+    match e with
+    | ELit (LInt s) ->
+        not (s.EndsWith "L" || s.EndsWith "l")
+        && (match System.Int32.TryParse s with | true, _ -> true | _ -> false)
+    | ELit (LBool _) | ELit LUnit | ELit LNull | ELit (LString _) -> true
+    | EVar (v, _) | EVarI (v, _, _) ->
+        // params, lets and globals are fine; a bare top-level function used as
+        // a first-class value is not (only direct calls are supported)
+        (dictTryFind st.Funcs (key v)).IsNone
+    | ELet (_, _, _, a, b) -> lowSupported st a && lowSupported st b
+    | ESeq xs -> allS xs
+    | EIf (a, b, c) -> lowSupported st a && lowSupported st b && lowSupported st c
+    | EWhile (a, b) -> lowSupported st a && lowSupported st b
+    | EAssign (_, x) -> lowSupported st x
+    | EPrim ("+t", [ a; b ]) -> lowSupported st a && lowSupported st b
+    | EPrim (op, [ a; b ]) ->
+        let last = if strLen op >= 1 then charAt op (strLen op - 1) else ' '
+        last <> 'f' && last <> 'l' && last <> 's'
+        && List.contains (baseOp op) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ]
+        && lowSupported st a && lowSupported st b
+    | EApp (EUnknown "prints", [ a ]) -> lowSupported st a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> lowSupported st a
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
+        when (dictTryFind st.Funcs (key v)) = Some (List.length args) -> allS args
+    | _ -> false
+
+let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
+    let st = ctx.LSt
+    match e with
+    | ELit (LInt s) -> (match System.Int32.TryParse s with | true, n -> lowInt n | _ -> lowInt 0)
+    | ELit (LBool b) -> lowInt (if b then 1 else 0)
+    | ELit LUnit | ELit LNull -> lowInt 0
+    | ELit (LString s) -> LConstW (internStr st s)
+    | EVar (v, _) | EVarI (v, _, _) ->
+        (match dictTryFind ctx.Regs (key v) with
+         | Some id -> LGet (wReg id)
+         | None -> LGetGlobal (gl v))
+    | ELet (_, v, _, rhs, body) ->
+        let id = freshReg ctx (key v)
+        LDo ([ LSet (wReg id, coreToLowE ctx rhs) ], coreToLowE ctx body)
+    | ESeq xs ->
+        let rec go (xs : Expr list) : LExpr =
+            match xs with
+            | [] -> lowInt 0
+            | [ x ] -> coreToLowE ctx x
+            | x :: rest -> LDo (coreToLowS ctx x, go rest)
+        go xs
+    | EIf (c, a, b) ->
+        let r = freshTmp ctx
+        LDo ([ LIf (lowUntag (coreToLowE ctx c),
+                    [ LSet (wReg r, coreToLowE ctx a) ],
+                    [ LSet (wReg r, coreToLowE ctx b) ]) ],
+             LGet (wReg r))
+    | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
+    | EPrim ("+t", [ a; b ]) -> LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
+    | EPrim (op, [ a; b ]) ->
+        let bop = baseOp op
+        let la = lowUntag (coreToLowE ctx a)
+        let lb = lowUntag (coreToLowE ctx b)
+        if List.contains bop [ "+"; "-"; "*"; "/"; "%" ]
+        then lowTag (LPrim (intArithOp bop, [ la; lb ]))
+        else lowTag (LPrim (intCmpOp bop, [ la; lb ]))
+    | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) -> LCall (fn v, List.map (coreToLowE ctx) args)
+    | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
+
+and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
+    match e with
+    | ESeq xs -> List.collect (coreToLowS ctx) xs
+    | ELet (_, v, _, rhs, body) ->
+        let id = freshReg ctx (key v)
+        LSet (wReg id, coreToLowE ctx rhs) :: coreToLowS ctx body
+    | EAssign (v, rhs) ->
+        (match dictTryFind ctx.Regs (key v) with
+         | Some id -> [ LSet (wReg id, coreToLowE ctx rhs) ]
+         | None -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ])
+    | EIf (c, a, b) -> [ LIf (lowUntag (coreToLowE ctx c), coreToLowS ctx a, coreToLowS ctx b) ]
+    | EWhile (c, b) -> [ LWhile (lowUntag (coreToLowE ctx c), coreToLowS ctx b) ]
+    | ELit LUnit -> []
+    | EApp (EUnknown "prints", [ a ]) -> [ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ]
+    | _ -> [ LEval (coreToLowE ctx e) ]
+
+let private lowOpIns (op : LOp) : string =
+    match op with
+    | AddW -> "i32.add"
+    | SubW -> "i32.sub"
+    | MulW -> "i32.mul"
+    | DivSW -> "i32.div_s"
+    | RemSW -> "i32.rem_s"
+    | AndW -> "i32.and"
+    | OrW -> "i32.or"
+    | XorW -> "i32.xor"
+    | ShlW -> "i32.shl"
+    | ShrSW -> "i32.shr_s"
+    | ShrUW -> "i32.shr_u"
+    | EqW -> "i32.eq"
+    | NeW -> "i32.ne"
+    | LtSW -> "i32.lt_s"
+    | GtSW -> "i32.gt_s"
+    | LeSW -> "i32.le_s"
+    | GeSW -> "i32.ge_s"
+    | LtUW -> "i32.lt_u"
+    | GeUW -> "i32.ge_u"
+    | _ -> "unreachable"
+
+let rec private emitLowE (f : Fn) (e : LExpr) : unit =
+    match e with
+    | LConstW n -> ic f n
+    | LConstL n -> lc f n
+    | LConstF _ -> ic f 0
+    | LGet r -> lg f (regNm r)
+    | LGetGlobal g -> gg f g
+    | LLoad (_, a, off) ->
+        emitLowE f a
+        (if off <> 0 then (ic f off; ins f "i32.add"))
+        mem f "i32.load"
+    | LPrim (op, args) ->
+        for a in args do emitLowE f a
+        ins f (lowOpIns op)
+    | LAlloc n -> emitLowE f n; callf f "$lalloc"
+    | LCall (sym, args) ->
+        for a in args do emitLowE f a
+        callf f sym
+    | LCallIndirect (_, fp, args) ->
+        emitLowE f fp
+        for a in args do emitLowE f a
+    | LDo (ss, v) ->
+        for s in ss do emitLowS f s
+        emitLowE f v
+
+and private emitLowS (f : Fn) (s : LStmt) : unit =
+    match s with
+    | LStore (_, a, off, v) ->
+        emitLowE f a
+        (if off <> 0 then (ic f off; ins f "i32.add"))
+        emitLowE f v
+        mem f "i32.store"
+    | LSet (r, e) -> emitLowE f e; ls f (regNm r)
+    | LSetGlobal (g, e) -> emitLowE f e; gs f g
+    | LEval e -> emitLowE f e; ins f "drop"
+    | LCallVoidS (sym, args) ->
+        for a in args do emitLowE f a
+        callf f sym
+    | LIf (c, t, el) ->
+        emitLowE f c; ifE f
+        for s in t do emitLowS f s
+        elseB f
+        for s in el do emitLowS f s
+        endB f
+    | LWhile (c, body) ->
+        blockE f "$wb"; loopE f "$wl"
+        emitLowE f c; ins f "i32.eqz"; brIf f "$wb"
+        for s in body do emitLowS f s
+        br f "$wl"; endB f; endB f
+    | LBlock (lbl, body) ->
+        blockE f lbl
+        for s in body do emitLowS f s
+        endB f
+    | LBreakIf (lbl, c) -> emitLowE f c; brIf f lbl
+    | LBreak lbl -> br f lbl
+    | LTrap -> ins f "unreachable"
+    | LReturn e -> emitLowE f e; ins f "return"
+
+// emit one function (or init) through LowIR: allocate a register per param and
+// per let, declare the wasm locals for them, then the body. `finish` stores a
+// global for an init and does nothing for an ordinary function.
+let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); NReg = 0 }
+    let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
+    let bodyLow = coreToLowE ctx body
+    let f = beginFn m pnames
+    let np = List.length ps
+    for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+    localsDone f
+    emitLowE f bodyLow
+    finish f
+    endFn f
+
 // ---- driver ---------------------------------------------------------------
-let emitLinear (decls0 : Decl list) : byte[] * string list =
+let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * string list =
     // emit the REACHABLE program: the user's declarations plus every
     // prelude function or global a chain of references reaches from them.
     // Unreachable prelude machinery (most of it) is dropped, so a program
@@ -1039,14 +1278,17 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
-            st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
-            let f = beginFn m (ps |> List.map (fun (pv, _) -> paramNm pv))
-            for pv, _ in ps do dictSet st.Locals (key pv) (paramNm pv)
-            scanLets st f body
-            declTemps f
-            localsDone f
-            lower st f body
-            endFn f
+            if useLow && lowSupported st body then
+                emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
+            else
+                st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
+                let f = beginFn m (ps |> List.map (fun (pv, _) -> paramNm pv))
+                for pv, _ in ps do dictSet st.Locals (key pv) (paramNm pv)
+                scanLets st f body
+                declTemps f
+                localsDone f
+                lower st f body
+                endFn f
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -1054,14 +1296,17 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) ->
-            st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
-            let f = beginFn m []
-            scanLets st f rhs
-            declTemps f
-            localsDone f
-            lower st f rhs
-            gs f (gl v)
-            endFn f
+            if useLow && lowSupported st rhs then
+                emitFuncLow st m [] rhs (fun f -> gs f (gl v))
+            else
+                st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
+                let f = beginFn m []
+                scanLets st f rhs
+                declTemps f
+                localsDone f
+                lower st f rhs
+                gs f (gl v)
+                endFn f
         | _ -> ()
     // _start: run every init in order
     let f = beginFn m []
@@ -1085,3 +1330,9 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
     let pages = (st.ConstNext / 65536) + 64
     let bytes = assembleWith m pages false ""
     bytes, vecToList st.Errors
+
+// the hand-lowered path (default) and the LowIR path (`--linear` with the
+// shared IR). Both share the whole driver; they differ only in whether a
+// function's body is emitted by `lower` or through Core/LowIR.fs.
+let emitLinear (decls0 : Decl list) : byte[] * string list = emitLinearImpl false decls0
+let emitLinearLow (decls0 : Decl list) : byte[] * string list = emitLinearImpl true decls0

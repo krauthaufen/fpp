@@ -66,6 +66,7 @@ let private buildLib (out : string) (files : string list) : int =
         0
 
 let mutable private linearBackend = false
+let mutable private lowirBackend = false
 
 let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
     let ws = Workspace()
@@ -102,8 +103,10 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
             System.IO.File.WriteAllText(out, text)
             0
     elif linearBackend then
-        // --linear: the direct wasm-LINEAR module, no C compiler in the path
-        let bytes, errors = ws.EmitProgramWasmLinear ()
+        // --linear: the direct wasm-LINEAR module, no C compiler in the path.
+        // --lowir additionally routes supported functions through the shared
+        // LowIR (Core/LowIR.fs) rather than the hand-lowering.
+        let bytes, errors = ws.EmitProgramWasmLinearWith lowirBackend
         if not (List.isEmpty errors) then
             for e in errors |> List.distinct do eprintfn "error: %s" e
             1
@@ -508,8 +511,9 @@ let private isProject (f : string) = f.EndsWith Project.extension
 let main argv =
     let argl0 = List.ofArray argv
     let strict = argl0 |> List.exists (fun a -> a = "--strict")
-    linearBackend <- argl0 |> List.exists (fun a -> a = "--linear")
-    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear") with
+    lowirBackend <- argl0 |> List.exists (fun a -> a = "--lowir")
+    linearBackend <- (argl0 |> List.exists (fun a -> a = "--linear")) || lowirBackend
+    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _, defs) -> check strict defs files

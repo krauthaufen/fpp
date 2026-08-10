@@ -20,6 +20,7 @@
     <Compile Include="Analysis/Classes.fs" />
     <Compile Include="Analysis/Infer.fs" />
     <Compile Include="Core/Core.fs" />
+    <Compile Include="Core/LowIR.fs" />
     <Compile Include="Core/Lower.fs" />
     <Compile Include="Core/Lint.fs" />
     <Compile Include="Core/Serialize.fs" />

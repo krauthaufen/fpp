@@ -971,11 +971,17 @@ type Workspace() =
     /// compiler, no emscripten. Slice 1 of the linear backend (see
     /// Backend/WasmLin.fs): the int/string/control-flow subset.
     member this.EmitProgramWasmLinear () : byte[] * string list =
+        this.EmitProgramWasmLinearWith false
+
+    /// `low = true` routes function bodies through the shared LowIR
+    /// (Core/LowIR.fs) where the subset covers them, else the hand-lowering.
+    member this.EmitProgramWasmLinearWith (low : bool) : byte[] * string list =
         // the linear backend lowers UNOPTIMIZED core: the wasm-GC optimizer's
         // inlining shares and beta-reduces lambda nodes, which the reference-
         // keyed lambda lift is not built for. Slice work first, speed later.
         let linked, errs = this.LinkedCore false
         if not (List.isEmpty errs) then [||], errs
+        elif low then Fpp.Backend.WasmLin.emitLinearLow linked
         else Fpp.Backend.WasmLin.emitLinear linked
 
     member this.EmitProgramC () : string * string list =
