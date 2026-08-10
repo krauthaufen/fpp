@@ -26,3 +26,13 @@ void fpprt_register_type_s(uint32_t tid, uint32_t size, uint32_t kind,
   struct fpprt_type t = { size, kind, nrefs, refoffs, name };
   fpprt_register_type(tid, t);
 }
+
+/* Root table for a hand-emitted wasm mutator: its module globals holding heap
+ * pointers (constant strings, the print scratch buffer) live in THIS array,
+ * which sits in fpprt's stable static memory — so a moving collection scans and
+ * UPDATES the slots, and the mutator reads current addresses back. Slot 0 is
+ * the scratch buffer; 1.. are string constants. */
+#define FPPRT_WASM_NROOTS 8192
+static fpprt_ref g_wasm_roots[FPPRT_WASM_NROOTS];
+uint32_t fpprt_wasm_roots_base(void) { return (uint32_t)(uintptr_t)g_wasm_roots; }
+void fpprt_wasm_roots_register(uint32_t n) { fpprt_add_static_roots(g_wasm_roots, n); }
