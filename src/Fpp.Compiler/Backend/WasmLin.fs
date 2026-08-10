@@ -44,8 +44,6 @@ type private St =
       Funcs : Dict<string, int>          // "path:offset" -> arity
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
-      /// per-function: a Core VarId -> its wasm local name
-      mutable Locals : Dict<string, string>
       /// interned string literals -> their constant address
       Consts : Dict<string, int>
       mutable ConstNext : int
@@ -54,21 +52,13 @@ type private St =
       LamName : RefMap<Expr, string>
       /// every lifted lambda, in emission order: (name, param, body, captures)
       Lams : Vec<string * (VarId * Scheme) * Expr * (string * int) list>
-      /// while emitting a lambda body: captured key -> its env slot
+      /// while emitting a lifted lambda body: captured key -> its env slot
       mutable Captures : Dict<string, int>
-      /// while emitting a lambda body: the environment parameter's local name
-      mutable EnvName : string
-      /// closure-apply temporaries, indexed by nesting depth (pre-declared)
-      mutable ClosDepth : int
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
       /// union case name -> its tag (index) and its payload arity
       UnionTag : Dict<string, int>
-      UnionArity : Dict<string, int>
-      /// match temporaries, indexed by nesting depth (pre-declared)
-      mutable MatchDepth : int
-      /// allocation-nesting depth: indexes the base/value scratch pools
-      mutable AllocDepth : int }
+      UnionArity : Dict<string, int> }
 
 let private CLO_KIND = 2
 
@@ -121,18 +111,6 @@ let private rtTypesLin (m : Mod) : unit =
     // the closure calling convention: (environment, argument) -> result
     tyFunc m "$lclo" [ "i32"; "i32" ] [ "i32" ]
 
-// closure-apply temporaries (indexed by nesting depth) and the closure-build
-// scratch — declared in every function body, before any instruction
-let private declTemps (f : Fn) : unit =
-    local f "$cbuild" "i32"
-    for i in 0 .. 15 do local f ("$ct" + string i) "i32"
-    // per-match scrutinee and result, indexed by match-nesting depth
-    for i in 0 .. 7 do local f ("$ms" + string i) "i32"; local f ("$mr" + string i) "i32"
-    for i in 0 .. 15 do local f ("$pt" + string i) "i32"
-    for i in 0 .. 7 do local f ("$ab" + string i) "i32"; local f ("$av" + string i) "i32"
-    for i in 0 .. 7 do local f ("$ai" + string i) "i32"; local f ("$an" + string i) "i32"
-    for i in 0 .. 7 do local f ("$fd" + string i) "f64"; local f ("$ld" + string i) "i64"
-    local f "$obj" "i32"
 
 let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
@@ -447,454 +425,6 @@ let rec private discover (st : St) (e : Expr) : unit =
     | EAssign (_, x) -> discover st x
     | _ -> ()
 
-// ---- lowering -------------------------------------------------------------
-// every expression emitter leaves ONE i32 (a tagged value) on the stack.
-let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
-    match e with
-    | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" ->
-        // a 64-bit literal: boxed i64
-        (match System.Int64.TryParse (s.Substring (0, s.Length - 1)) with
-         | true, n -> lc f n; boxI64 st f
-         | _ -> constInt f 0; err st ("wasm-linear slice: bad int64 literal " + s))
-    | ELit (LInt s) ->
-        (match System.Int32.TryParse s with
-         | true, n -> constInt f n
-         | _ -> constInt f 0; err st ("wasm-linear slice: integer literal out of 31-bit range: " + s))
-    | ELit (LBool b) -> constInt f (if b then 1 else 0)
-    | ELit LUnit -> constInt f 0
-    | ELit LNull -> constInt f 0
-    | ELit (LString s) -> ic f (internStr st s)
-    | EVar (v, _) | EVarI (v, _, _) ->
-        (match dictTryFind st.Locals (key v) with
-         | Some ln -> lg f ln
-         | None ->
-             match dictTryFind st.Captures (key v) with
-             | Some slot ->
-                 // a captured free variable: env[8 + 4*slot]
-                 lg f st.EnvName; ic f (8 + 4 * slot); ins f "i32.add"; mem f "i32.load"
-             | None ->
-                 if (dictTryFind st.Globals (key v)).IsSome then gg f (gl v)
-                 else (constInt f 0; err st ("wasm-linear slice: unbound value " + v.Name)))
-    | ELet (_, v, _, rhs, body) ->
-        lower st f rhs
-        (match dictTryFind st.Locals (key v) with
-         | Some ln -> ls f ln
-         | None -> ins f "drop"; err st "wasm-linear slice: let local not pre-declared")
-        lower st f body
-    | ESeq xs ->
-        (match xs with
-         | [] -> constInt f 0
-         | _ ->
-             xs |> List.iteri (fun i x ->
-                 lower st f x
-                 if i < List.length xs - 1 then ins f "drop"))
-    | EIf (c, a, b) ->
-        lower st f c; untagi f
-        ifV f "i32"
-        lower st f a
-        elseB f
-        lower st f b
-        endB f
-    | EWhile (c, body) ->
-        blockE f "$wb"; loopE f "$wl"
-        lower st f c; untagi f; ins f "i32.eqz"; brIf f "$wb"
-        lower st f body; ins f "drop"
-        br f "$wl"; endB f; endB f
-        constInt f 0
-    | EAssign (v, rhs) ->
-        lower st f rhs
-        (match dictTryFind st.Locals (key v) with
-         | Some ln -> ls f ln
-         | None -> if (dictTryFind st.Globals (key v)).IsSome then gs f (gl v)
-                   else err st ("wasm-linear slice: assignment to unbound " + v.Name))
-        constInt f 0
-    | ELit (LFloat s) ->
-        // a boxed f64 [f64 bits]; box at the use site (no GC yet)
-        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
-         | true, d -> fc f (System.BitConverter.DoubleToInt64Bits d); boxF64 st f
-         | _ -> constInt f 0; err st ("wasm-linear slice: bad float literal " + s))
-    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
-        lower st f a; unboxF64 st f
-        lower st f b; unboxF64 st f
-        ins f (match op.Substring (0, op.Length - 1) with "+" -> "f64.add" | "-" -> "f64.sub" | "*" -> "f64.mul" | _ -> "f64.div")
-        boxF64 st f
-    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
-        lower st f a; unboxF64 st f
-        lower st f b; unboxF64 st f
-        ins f (match op.Substring (0, op.Length - 1) with "<" -> "f64.lt" | ">" -> "f64.gt" | "<=" -> "f64.le" | ">=" -> "f64.ge" | "=" -> "f64.eq" | _ -> "f64.ne")
-        tagi f
-    | EPrim ("u-f", [ a ]) ->
-        lower st f a; unboxF64 st f; ins f "f64.neg"; boxF64 st f
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
-        lower st f a; unboxI64 st f
-        lower st f b; unboxI64 st f
-        ins f (match op.Substring (0, op.Length - 1) with "+" -> "i64.add" | "-" -> "i64.sub" | "*" -> "i64.mul" | "/" -> "i64.div_s" | _ -> "i64.rem_s")
-        boxI64 st f
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
-        lower st f a; unboxI64 st f
-        lower st f b; unboxI64 st f
-        ins f (match op.Substring (0, op.Length - 1) with "<" -> "i64.lt_s" | ">" -> "i64.gt_s" | "<=" -> "i64.le_s" | ">=" -> "i64.ge_s" | "=" -> "i64.eq" | _ -> "i64.ne")
-        tagi f
-    | EApp (EUnknown "fixed6", [ a ]) ->
-        lower st f a; callf f "$ftoa6"
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
-        // int64 -> int: unbox, wrap to i32, tag
-        lower st f a; unboxI64 st f; ins f "i32.wrap_i64"; tagi f
-    | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
-        // int -> int64: untag i32, widen, box
-        lower st f a; untagi f; ins f "i64.extend_i32_s"; boxI64 st f
-    | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
-        // int -> float: untag, convert, box
-        lower st f a; untagi f; ins f "f64.convert_i32_s"; boxF64 st f
-    | EPrim (op0, [ a; b ]) when (List.contains (baseOp op0) [ "+"; "-"; "*"; "/"; "%" ]) ->
-        lower st f a; untagi f
-        lower st f b; untagi f
-        ins f (match baseOp op0 with "+" -> "i32.add" | "-" -> "i32.sub" | "*" -> "i32.mul" | "/" -> "i32.div_s" | _ -> "i32.rem_s")
-        tagi f
-    | EPrim (op0, [ a; b ]) when (List.contains (baseOp op0) [ "<"; ">"; "<="; ">="; "="; "<>" ]) ->
-        lower st f a; untagi f
-        lower st f b; untagi f
-        ins f (match baseOp op0 with "<" -> "i32.lt_s" | ">" -> "i32.gt_s" | "<=" -> "i32.le_s" | ">=" -> "i32.ge_s" | "=" -> "i32.eq" | _ -> "i32.ne")
-        tagi f
-    | EPrim ("::", [ h; t ]) ->
-        // a cons cell [head][tail]; the empty list is the null pointer 0
-        buildObj st f 2 [ 0, (fun () -> lower st f h); 1, (fun () -> lower st f t) ]
-    | EApp (EUnknown "isNull", [ e ]) ->
-        lower st f e; ic f 0; ins f "i32.eq"; tagi f
-    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) ->
-        // no exception machinery yet: evaluate the argument for its effects,
-        // then trap. `unreachable` is stack-polymorphic, so it satisfies any
-        // result type the call site expects. A program that stays off this
-        // path never reaches it.
-        for a in args do lower st f a; ins f "drop"
-        ins f "unreachable"
-    | EPrim ("+t", [ a; b ]) ->
-        lower st f a; lower st f b; callf f "$str_cat"
-    | EApp (EUnknown "prints", [ a ]) ->
-        lower st f a; callf f "$prints"; constInt f 0
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" ->
-        // slice 1: only int-to-string; other formatters await later slices
-        lower st f a; callf f "$str_of_int"
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
-        when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
-        // a direct call to a top-level function at its exact arity
-        for a in args do lower st f a
-        callf f (fn v)
-    | ELam (_, _) ->
-        (match refMapTryFind st.LamName e with
-         | Some name -> buildClosure st f name
-         | None -> constInt f 0; err st "wasm-linear slice: lambda not discovered")
-    | EApp (g, args) ->
-        // an indirect application: g evaluates to a closure. Curry — apply
-        // one argument at a time through the closure's code slot.
-        lower st f g
-        for a in args do applyClosure st f a
-    | ETuple xs ->
-        // a heap object of the elements, in order (no header — the pattern
-        // that reads it knows the arity)
-        buildObj st f (List.length xs) (xs |> List.mapi (fun i x -> i, (fun () -> lower st f x)))
-    | ERecord (name, fields) ->
-        // fields stored in DECLARED order, whatever order they are written
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
-        buildObj st f (List.length order)
-            (order |> List.mapi (fun i fn ->
-                i, (fun () ->
-                    match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fn then Some e2 else None) with
-                    | Some e2 -> lower st f e2
-                    | None -> constInt f 0)))
-    | ERecordExt (name, baseE, updates) ->
-        // copy the base record, overwrite the named fields
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
-        let d = st.AllocDepth
-        let bs = "$ab" + string d       // base reserved at depth d
-        st.AllocDepth <- d + 1          // base-eval and buildObj live above it
-        lower st f baseE; ls f bs
-        buildObj st f (List.length order)
-            (order |> List.mapi (fun i fn ->
-                i, (fun () ->
-                    match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = fn then Some e2 else None) with
-                    | Some e2 -> lower st f e2
-                    | None -> lg f bs; ic f (4 * i); ins f "i32.add"; mem f "i32.load")))
-        st.AllocDepth <- d
-    | EField (r, fname, owner) ->
-        let idx =
-            match dictTryFind st.RecFields owner with
-            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
-            | None -> 0
-        lower st f r
-        ic f (4 * idx); ins f "i32.add"; mem f "i32.load"
-    | EFieldSet (r, fname, owner, v) ->
-        let idx =
-            match dictTryFind st.RecFields owner with
-            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
-            | None -> 0
-        lower st f r
-        ic f (4 * idx); ins f "i32.add"
-        lower st f v
-        mem f "i32.store"
-        constInt f 0
-    | EListLit xs ->
-        // a chain of cons cells ending in the null pointer; [] is 0
-        emitList st f xs
-    | EArray (_, xs) ->
-        // [len][elem0..] — len is a RAW i32 at slot 0, elements are tagged
-        buildObj st f (List.length xs + 1)
-            ((0, (fun () -> ic f (List.length xs)))
-             :: (xs |> List.mapi (fun i x -> i + 1, (fun () -> lower st f x))))
-    | EIndex (_, arr, i) ->
-        // element k is at slot (k+1): address = base + 4*(untag i + 1)
-        lower st f arr
-        lower st f i; untagi f; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"
-        ins f "i32.add"; mem f "i32.load"
-    | EIndexSet (_, arr, i, v) ->
-        lower st f arr
-        lower st f i; untagi f; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"
-        ins f "i32.add"
-        lower st f v; mem f "i32.store"
-        constInt f 0
-    | EArrayLen (_, arr) ->
-        lower st f arr; mem f "i32.load"; tagi f
-    | EArrayCreate (_, n, init) ->
-        // [len][init x count] — count and fill value are dynamic, so a loop;
-        // all scratch is depth-indexed for nesting safety
-        let d = st.AllocDepth
-        let bs = "$ab" + string d
-        let cnt = "$av" + string d
-        let iv = "$ai" + string d
-        let it = "$an" + string d
-        st.AllocDepth <- d + 1
-        lower st f n; untagi f; ls f cnt
-        lower st f init; ls f iv
-        ic f 4; lg f cnt; ic f 4; ins f "i32.mul"; ins f "i32.add"; callf f "$lalloc"; ls f bs
-        lg f bs; lg f cnt; mem f "i32.store"
-        ic f 0; ls f it
-        blockE f "$acc"; loopE f "$acl"
-        lg f it; lg f cnt; ins f "i32.ge_u"; brIf f "$acc"
-        lg f bs; lg f it; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"; lg f iv; mem f "i32.store"
-        lg f it; ic f 1; ins f "i32.add"; ls f it
-        br f "$acl"; endB f; endB f
-        st.AllocDepth <- d
-        lg f bs
-    | EApp (EUnknown n, _) when n.StartsWith "$zero" -> constInt f 0
-    | EUnknown n when n.StartsWith "$zero" -> constInt f 0
-    | ECtor (case, _, args) ->
-        // [tag][payload0..] — the tag (a RAW i32, not a tagged value) is the
-        // case's index in its union; payloads are ordinary tagged values
-        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        buildObj st f (List.length args + 1)
-            ((0, (fun () -> ic f tag))
-             :: (args |> List.mapi (fun i a -> i + 1, (fun () -> lower st f a))))
-    | EMatch (scrut, clauses) ->
-        let d = st.MatchDepth
-        let sc = "$ms" + string d
-        let mr = "$mr" + string d
-        st.MatchDepth <- d + 1
-        lower st f scrut; ls f sc
-        blockE f "$mdone"
-        for pat, guard, body in clauses do
-            blockE f "$mnext"
-            emitPatTest st f sc "$mnext" 0 pat
-            (match guard with
-             | Some g -> lower st f g; untagi f; ins f "i32.eqz"; brIf f "$mnext"
-             | None -> ())
-            lower st f body; ls f mr
-            br f "$mdone"
-            endB f
-        ins f "unreachable"
-        endB f
-        st.MatchDepth <- d
-        lg f mr
-    | _ ->
-        constInt f 0
-        err st ("wasm-linear slice: unsupported expression: "
-                + (match e with
-                   | ECtor (n, _, _) -> "constructor " + n
-                   | ERecord (n, _) -> "record " + n
-                   | EMatch _ -> "match" | ETuple _ -> "tuple"
-                   | EArray _ -> "array" | EField _ -> "field access"
-                   | ELam _ -> "nested lambda"
-                   | EPrim (op, _) -> "operator " + op
-                   | _ -> "node"))
-
-// a list literal as a chain of [head][tail] cons cells ending in null (0)
-and private emitList (st : St) (f : Fn) (xs : Expr list) : unit =
-    match xs with
-    | [] -> ic f 0
-    | x :: rest -> buildObj st f 2 [ 0, (fun () -> lower st f x); 1, (fun () -> emitList st f rest) ]
-
-// build a heap object of `nslots` 4-byte words, filling slot `i` with the
-// thunk that emits its value; leaves the pointer on the stack. Base and
-// value scratch are indexed by allocation-nesting depth, so a field whose
-// value is itself an allocation cannot clobber the enclosing one.
-and private buildObj (st : St) (f : Fn) (nslots : int) (fills : (int * (unit -> unit)) list) : unit =
-    let d = st.AllocDepth
-    let ab = "$ab" + string d
-    let av = "$av" + string d
-    st.AllocDepth <- d + 1
-    ic f (4 * nslots); callf f "$lalloc"; ls f ab
-    for i, emit in fills do
-        emit ()            // may recurse at depth d+1
-        ls f av
-        lg f ab; ic f (4 * i); ins f "i32.add"; lg f av; mem f "i32.store"
-    st.AllocDepth <- d
-    lg f ab
-
-// test `pat` against the value in local `scrutLocal`; branch to `fail` on
-// mismatch, and bind any pattern variables on the matching path. `depth`
-// indexes the pattern-scratch pool for sub-value loads.
-and private emitPatTest (st : St) (f : Fn) (scrutLocal : string) (fail : string) (depth : int) (pat : Pat) : unit =
-    match pat with
-    | PWild -> ()
-    | PVar (v, _) ->
-        (match dictTryFind st.Locals (key v) with
-         | Some ln -> lg f scrutLocal; ls f ln
-         | None -> err st "wasm-linear slice: pattern binder not pre-declared")
-    | PAs (p, v, _) ->
-        (match dictTryFind st.Locals (key v) with Some ln -> lg f scrutLocal; ls f ln | None -> ())
-        emitPatTest st f scrutLocal fail depth p
-    | PLit (LInt s) ->
-        (match System.Int32.TryParse s with
-         | true, n -> lg f scrutLocal; untagi f; ic f n; ins f "i32.ne"; brIf f fail
-         | _ -> err st "wasm-linear slice: integer pattern out of range")
-    | PLit (LBool b) ->
-        lg f scrutLocal; untagi f; ic f (if b then 1 else 0); ins f "i32.ne"; brIf f fail
-    | PLit LUnit -> ()
-    | PCtor (case, _, subs) ->
-        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        // the tag is a RAW i32 at slot 0
-        lg f scrutLocal; mem f "i32.load"; ic f tag; ins f "i32.ne"; brIf f fail
-        subs |> List.iteri (fun i sub ->
-            let t = "$pt" + string (depth &&& 15)
-            lg f scrutLocal; ic f (4 * (i + 1)); ins f "i32.add"; mem f "i32.load"; ls f t
-            emitPatTest st f t fail (depth + 1) sub)
-    | PTuple subs ->
-        subs |> List.iteri (fun i sub ->
-            let t = "$pt" + string (depth &&& 15)
-            lg f scrutLocal; ic f (4 * i); ins f "i32.add"; mem f "i32.load"; ls f t
-            emitPatTest st f t fail (depth + 1) sub)
-    | PCons (h, t) ->
-        // a non-empty list: the scrutinee is a [head][tail] cell (not null)
-        lg f scrutLocal; ins f "i32.eqz"; brIf f fail
-        let th = "$pt" + string (depth &&& 15)
-        lg f scrutLocal; mem f "i32.load"; ls f th
-        emitPatTest st f th fail (depth + 1) h
-        let tt = "$pt" + string (depth &&& 15)
-        lg f scrutLocal; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f tt
-        emitPatTest st f tt fail (depth + 1) t
-    | PListLit [] ->
-        // the empty list: a null pointer
-        lg f scrutLocal; brIf f fail
-    | _ ->
-        err st "wasm-linear slice: unsupported pattern (non-empty list literals / or-patterns / type tests await a later slice)"
-
-// box/unbox the 64-bit payloads — a boxed value is a pointer to 8 bytes;
-// scratch is depth-indexed so a nested box cannot clobber this one
-and private boxF64 (st : St) (f : Fn) : unit =
-    let d = st.AllocDepth
-    st.AllocDepth <- d + 1
-    ls f ("$fd" + string d)
-    ic f 8; callf f "$lalloc"; ls f ("$ab" + string d)
-    lg f ("$ab" + string d); lg f ("$fd" + string d); mem f "f64.store"
-    st.AllocDepth <- d
-    lg f ("$ab" + string d)
-and private unboxF64 (st : St) (f : Fn) : unit = mem f "f64.load"
-and private boxI64 (st : St) (f : Fn) : unit =
-    let d = st.AllocDepth
-    st.AllocDepth <- d + 1
-    ls f ("$ld" + string d)
-    ic f 8; callf f "$lalloc"; ls f ("$ab" + string d)
-    lg f ("$ab" + string d); lg f ("$ld" + string d); mem f "i64.store"
-    st.AllocDepth <- d
-    lg f ("$ab" + string d)
-and private unboxI64 (st : St) (f : Fn) : unit = mem f "i64.load"
-
-// resolve a captured/local/global reference known only by its (path,offset)
-and private emitVarByKey (st : St) (f : Fn) (k : string) : unit =
-    match dictTryFind st.Locals k with
-    | Some ln -> lg f ln
-    | None ->
-        match dictTryFind st.Captures k with
-        | Some slot -> lg f st.EnvName; ic f (8 + 4 * slot); ins f "i32.add"; mem f "i32.load"
-        | None ->
-            match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
-            | Some _ -> gg f ("$g" + string (abs (strHash k)))
-            | None -> constInt f 0; err st "wasm-linear slice: unresolved captured variable"
-
-// build a closure object [kind=2][code-table-idx][cap0..] and leave its
-// pointer on the stack
-and private buildClosure (st : St) (f : Fn) (name : string) : unit =
-    let caps =
-        st.Lams |> vecToList |> List.tryPick (fun (n, _, _, c) -> if n = name then Some c else None)
-        |> Option.defaultValue []
-    let nc = List.length caps
-    ic f (8 + 4 * nc); callf f "$lalloc"
-    ls f "$cbuild"
-    lg f "$cbuild"; ic f CLO_KIND; mem f "i32.store"
-    lg f "$cbuild"; ic f 4; ins f "i32.add"; ic f (tblIdx st.M name); mem f "i32.store"
-    caps |> List.iteri (fun i (p, o) ->
-        lg f "$cbuild"; ic f (8 + 4 * i); ins f "i32.add"
-        emitVarByKey st f (p + ":" + string o)
-        mem f "i32.store")
-    lg f "$cbuild"
-
-// apply the closure currently on the stack to argument `a` (unary)
-and private applyClosure (st : St) (f : Fn) (a : Expr) : unit =
-    let t = "$ct" + string st.ClosDepth
-    ls f t                              // stash the closure ptr
-    lg f t                              // env (operand 0)
-    st.ClosDepth <- st.ClosDepth + 1
-    lower st f a                         // arg (operand 1)
-    st.ClosDepth <- st.ClosDepth - 1
-    lg f t; ic f 4; ins f "i32.add"; mem f "i32.load"   // code index (table slot)
-    callIndirect f "$lclo"
-
-// pre-declare every let-bound local in a function body (locals must be
-// declared before any instruction is emitted)
-and private scanLets (st : St) (f : Fn) (e : Expr) : unit =
-    match e with
-    | ELet (_, v, _, rhs, body) ->
-        (dictTryFind st.Locals (key v) |> ignore)
-        if (dictTryFind st.Locals (key v)).IsNone then
-            let ln = "$l" + string (List.length (dictPairs st.Locals))
-            local f ln "i32"
-            dictSet st.Locals (key v) ln
-        scanLets st f rhs; scanLets st f body
-    | ESeq xs | EApp (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) -> for x in xs do scanLets st f x
-    | EIf (c, a, b) -> scanLets st f c; scanLets st f a; scanLets st f b
-    | EWhile (c, b) -> scanLets st f c; scanLets st f b
-    | EAssign (_, r) -> scanLets st f r
-    | EPrim (_, xs) -> for x in xs do scanLets st f x
-    | ERecord (_, fs) -> for _, v in fs do scanLets st f v
-    | ERecordExt (_, b, fs) -> scanLets st f b; for _, v in fs do scanLets st f v
-    | EField (r, _, _) -> scanLets st f r
-    | EFieldSet (r, _, _, v) -> scanLets st f r; scanLets st f v
-    | EArray (_, xs) -> for x in xs do scanLets st f x
-    | EIndex (_, a, i) -> scanLets st f a; scanLets st f i
-    | EIndexSet (_, a, i, v) -> scanLets st f a; scanLets st f i; scanLets st f v
-    | EArrayLen (_, a) -> scanLets st f a
-    | EArrayCreate (_, n, ini) -> scanLets st f n; scanLets st f ini
-    | ELam (_, _) -> ()   // a nested lambda's OWN body scans in its own pass
-    | EMatch (scrut, clauses) ->
-        scanLets st f scrut
-        for pat, guard, body in clauses do
-            declarePatVars st f pat
-            (match guard with Some g -> scanLets st f g | None -> ())
-            scanLets st f body
-    | _ -> ()
-
-// declare a local for every variable a pattern binds
-and private declarePatVars (st : St) (f : Fn) (p : Pat) : unit =
-    match p with
-    | PVar (v, _) | PAs (_, v, _) ->
-        if (dictTryFind st.Locals (key v)).IsNone then
-            let ln = "$l" + string (List.length (dictPairs st.Locals))
-            local f ln "i32"
-            dictSet st.Locals (key v) ln
-        (match p with PAs (inner, _, _) -> declarePatVars st f inner | _ -> ())
-    | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> for x in ps do declarePatVars st f x
-    | PCons (a, b) -> declarePatVars st f a; declarePatVars st f b
-    | _ -> ()
-
 // intern every string literal up front, so the heap pointer's start (after
 // the constant region) is known before any global is declared
 // intern EVERY string literal reachable in a body — a literal missed here
@@ -915,8 +445,6 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> scanConsts st r; for x in xs do scanConsts st x
     | ETry (b, cs) -> scanConsts st b; for _, g, x in cs do (match g with Some y -> scanConsts st y | None -> ()); scanConsts st x
     | _ -> ()
-
-let private paramNm (v : VarId) : string = "$p" + string (abs (strHash (key v)))
 
 // a reference-map hash over lambda nodes, keyed by the bound param's offset
 let private shallowLamHash (e : Expr) : int =
@@ -1047,42 +575,6 @@ let rec private lowSupported (st : St) (e : Expr) : bool =
     | EApp (EUnknown _, _) -> false
     | EApp (g, args) -> lowSupported st g && allS args
     | _ -> false
-
-// for --lowir stats: the tag of the first node that keeps a body off the LowIR
-// path, so the remaining fallbacks are legible
-let rec private unsupReason (st : St) (e : Expr) : string =
-    let firstBad (xs : Expr list) : string =
-        match xs |> List.filter (fun x -> not (lowSupported st x)) with
-        | b :: _ -> unsupReason st b
-        | [] -> ""
-    let orSelf (self : string) (xs : Expr list) : string =
-        let r = firstBad xs in if r = "" then self else r
-    if lowSupported st e then "" else
-    match e with
-    | EIfaceCall (i, mn, r, xs) -> orSelf ("ifacecall " + i + "." + mn) (r :: xs)
-    | ECast (_, r, _) -> orSelf "cast" [ r ]
-    | ETypeTest (_, r) -> orSelf "typetest" [ r ]
-    | ETry _ -> "try"
-    | EArrayPin (_, r) -> orSelf "arraypin" [ r ]
-    | EArrayUnpin (_, r) -> orSelf "arrayunpin" [ r ]
-    | EArrayBytes (_, r) -> orSelf "arraybytes" [ r ]
-    | EApp (EUnknown n, xs) -> orSelf ("unknown " + n) xs
-    | EVar (v, _) | EVarI (v, _, _) -> "func-as-value " + v.Name
-    | EMatch (s, cs) ->
-        if not (lowSupported st s) then unsupReason st s
-        else match cs |> List.filter (fun (p, _, _) -> not (patSupported p)) with
-             | (p, _, _) :: _ -> "pattern " + printPat p
-             | [] -> (match cs |> List.filter (fun (_, _, b) -> not (lowSupported st b)) with (_, _, b) :: _ -> unsupReason st b | [] -> "match")
-    | ELet (_, _, _, a, b) | EWhile (a, b) -> firstBad [ a; b ]
-    | EIf (a, b, c) -> firstBad [ a; b; c ]
-    | EFieldSet (r, _, _, v) -> firstBad [ r; v ]
-    | EField (r, _, _) | EArrayLen (_, r) -> firstBad [ r ]
-    | ERecord (_, fs) -> orSelf "record" (List.map snd fs)
-    | ERecordExt (_, b, fs) -> orSelf "recordext" (b :: List.map snd fs)
-    | EPrim (op, xs) -> orSelf ("prim " + op) xs
-    | EApp (g, xs) -> orSelf "app" (g :: xs)
-    | ESeq xs | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> orSelf "app" xs
-    | _ -> "node"
 
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
@@ -1518,7 +1010,7 @@ let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit 
     endFn f
 
 // ---- driver ---------------------------------------------------------------
-let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * string list =
+let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // emit the REACHABLE program: the user's declarations plus every
     // prelude function or global a chain of references reaches from them.
     // Unreachable prelude machinery (most of it) is dropped, so a program
@@ -1568,10 +1060,10 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); Funcs = dictNew (); Globals = dictNew ()
-          Locals = dictNew (); Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
+          Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
-          Captures = dictNew (); EnvName = ""; ClosDepth = 0
-          RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); MatchDepth = 0; AllocDepth = 0 }
+          Captures = dictNew ()
+          RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew () }
     // record layouts and union case tags — needed everywhere below
     for d in decls0 do
         match d with
@@ -1629,82 +1121,38 @@ let private emitLinearImpl (useLow : bool) (decls0 : Decl list) : byte[] * strin
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m
-    // top-level function bodies
-    let mutable nLow = 0
-    let mutable nHand = 0
-    let reasons = vecNew<string> ()
+    // top-level function bodies — all through LowIR (Core/LowIR.fs); an
+    // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) ->
-            if useLow && lowSupported st body then
-                nLow <- nLow + 1
-                emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
-            else
-                st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
-                let f = beginFn m (ps |> List.map (fun (pv, _) -> paramNm pv))
-                for pv, _ in ps do dictSet st.Locals (key pv) (paramNm pv)
-                scanLets st f body
-                declTemps f
-                localsDone f
-                lower st f body
-                endFn f
-                if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st body))
+        | DLet (_, v, _, ELam (ps, body)) -> emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
     for d in decls do
         match d with
         | DLet (_, _, _, ELam _) -> ()
-        | DLet (_, v, _, rhs) ->
-            if useLow && lowSupported st rhs then
-                nLow <- nLow + 1
-                emitFuncLow st m [] rhs (fun f -> gs f (gl v))
-            else
-                st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
-                let f = beginFn m []
-                scanLets st f rhs
-                declTemps f
-                localsDone f
-                lower st f rhs
-                gs f (gl v)
-                endFn f
-                if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st rhs))
+        | DLet (_, v, _, rhs) -> emitFuncLow st m [] rhs (fun f -> gs f (gl v))
         | _ -> ()
     // _start: run every init in order
     let f = beginFn m []
     localsDone f
     for nm in vecToList inits do callf f nm
     endFn f
-    // lifted lambda bodies: (environment, argument) -> result — declared LAST
+    // lifted lambda bodies: (environment, argument) -> result — declared LAST.
+    // st.Captures maps each captured (path:offset) to its env slot; the LowIR
+    // lowering reads them from the env register.
     for name, (pv, _), body, caps in vecToList st.Lams do
-        st.Locals <- dictNew (); st.Captures <- dictNew (); st.ClosDepth <- 0
+        st.Captures <- dictNew ()
         caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
-        if useLow && lowSupported st body then
-            nLow <- nLow + 1
-            emitLambdaLow st m pv body
-        else
-            let f = beginFn m [ "$env"; paramNm pv ]
-            st.EnvName <- "$env"
-            dictSet st.Locals (key pv) (paramNm pv)
-            scanLets st f body
-            declTemps f
-            localsDone f
-            lower st f body
-            endFn f
-            if useLow then (nHand <- nHand + 1; vecAdd reasons (unsupReason st body))
+        emitLambdaLow st m pv body
     // bake the constant data at CONST_BASE; $hp already starts after it
     activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
     let bytes = assembleWith m pages false ""
-    if useLow && System.Environment.GetEnvironmentVariable "FPP_LOWIR_STATS" <> null then
-        eprintfn "LOWIR: %d functions via LowIR, %d fell back to hand-lowering" nLow nHand
-        for r in reasons |> vecToList |> List.distinct do
-            let c = reasons |> vecToList |> List.filter (fun x -> x = r) |> List.length
-            eprintfn "  fallback: %s (x%d)" r c
     bytes, vecToList st.Errors
 
-// the hand-lowered path (default) and the LowIR path (`--linear` with the
-// shared IR). Both share the whole driver; they differ only in whether a
-// function's body is emitted by `lower` or through Core/LowIR.fs.
-let emitLinear (decls0 : Decl list) : byte[] * string list = emitLinearImpl false decls0
-let emitLinearLow (decls0 : Decl list) : byte[] * string list = emitLinearImpl true decls0
+// the wasm-linear backend: Core straight to a linear-memory module through the
+// shared LowIR. `--lowir` is a retained alias for the same path.
+let emitLinear (decls0 : Decl list) : byte[] * string list = emitLinearImpl decls0
+let emitLinearLow (decls0 : Decl list) : byte[] * string list = emitLinearImpl decls0

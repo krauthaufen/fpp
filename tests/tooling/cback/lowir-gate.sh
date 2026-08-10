@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# The shared LowIR (Core/LowIR.fs) on the wasm-linear leg: `fpp build --lowir`
-# lowers a function's body to LowIR — a small machine IR with tag/box expanded
-# to plain shifts, loads and allocations — then emits wasm from THAT, instead
-# of the hand-lowering `--linear` uses. This gate runs a COMPREHENSIVE program
-# (recursion, while/mutable, records, unions, tuples, arrays, pattern match,
-# lists, options, floats, int64, closures and higher-order functions) and
-# checks TWO things:
-#   1. FPP_LOWIR_STATS reports ZERO fallbacks — every top-level function, init
-#      and lifted lambda body was emitted through LowIR, none through `lower`.
-#   2. The program's output matches the wasm-GC oracle byte for byte.
-# One meaning across a third independent emission path, with the hand-lowering
-# proven unused on the whole-language program.
+# The shared LowIR (Core/LowIR.fs) is the wasm-linear backend's ONLY lowering:
+# `fpp build --lowir` (an alias for `--linear`) lowers each body to LowIR — a
+# small machine IR with tag/box expanded to plain shifts, loads and
+# allocations — then emits wasm from THAT. This gate runs a COMPREHENSIVE
+# program (recursion, while/mutable, records, unions, tuples, arrays, pattern
+# match, lists, options, floats, int64, closures and higher-order functions)
+# and checks its output matches the wasm-GC oracle byte for byte — one meaning
+# across two independent emitters (the hand-lowering that once backed
+# `--linear` is gone; LowIR is the sole path).
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -105,12 +102,8 @@ let describe (o : int option) =
 let r22 = describe (Some 7)
 FPP
 
-# emit through LowIR with stats; every function must take the LowIR path
-stats=$(FPP_LOWIR_STATS=1 "$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp" 2>&1 1>/dev/null)
-echo "$stats"
-if ! echo "$stats" | grep -q "0 fell back to hand-lowering"; then
-    echo "LOWIR INCOMPLETE: some functions fell back to the hand-lowering"; exit 1
-fi
+# emit through LowIR (the sole wasm-linear lowering)
+"$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp"
 "$wt" run "$out/low.wasm" > "$out/low.txt"
 
 # the wasm-GC oracle for the same program
@@ -118,7 +111,7 @@ fi
 "$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
 
 if diff -u "$out/gc.txt" "$out/low.txt"; then
-    echo "LOWIR OK (whole-language program via LowIR, no fallback, == wasm-GC oracle, $(wc -l < "$out/low.txt") lines)"
+    echo "LOWIR OK (whole-language program, sole wasm-linear lowering == wasm-GC oracle, $(wc -l < "$out/low.txt") lines)"
 else
     echo "LOWIR MISMATCH"; exit 1
 fi

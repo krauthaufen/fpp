@@ -81,23 +81,38 @@ independent emission path agreeing on one meaning, with `lower` proven unused
 on the whole-language program. Both `fixpoint.fsx` and `fixpoint.fsx self`
 reproduce byte-for-byte with the new code among the compiled sources.
 
-`lower` is NOT deleted: it still serves the genuinely-hard nodes the gate does
-not reach — exceptions (`ETry`), typeclass dispatch (`EIfaceCall`), casts /
-type tests, or-patterns, non-empty list-literal patterns, array pinning. Those
-are the remaining ports before it can go.
+**`lower` is DELETED.** LowIR is the sole wasm-linear lowering — `--linear`
+routes every body through it, and the ~590-line hand-lowering (`lower`,
+`buildObj`, `emitPatTest`, the box/closure helpers, the depth-indexed scratch
+pools) is gone, along with the `St` fields that served it. It turned out
+`lower` covered *exactly* what LowIR covers — both errored on the same nodes —
+so retiring it needed no new ports, only proving the equivalence. The compiler
+shrank ~29 KB (the duplicate lowering is no longer among the compiled sources).
+
+The nodes neither path ever handled on this leg — exceptions (`ETry`),
+typeclass dispatch (`EIfaceCall`), casts / type tests, or-patterns, non-empty
+list-literal patterns, array pinning — remain genuinely unimplemented on
+wasm-linear. Implementing them is new work (a wasm exception model, a vtable
+lowering), but now there is only ONE place to add it.
 
 ## The road
 
-1. **Port the remaining hard nodes** into Core→LowIR — exceptions, typeclass
-   dispatch (vtables), casts / type tests, or-patterns, pinning — then delete
-   `lower` on the wasm-linear leg. These need real new machinery (a wasm
-   exception model, a vtable lowering), not just expansion.
+1. **Implement the still-missing nodes** in Core→LowIR — exceptions, typeclass
+   dispatch (vtables), casts / type tests, or-patterns, pinning. New machinery,
+   not ports, but a single lowering to grow.
 2. **A liveness register allocator** over `LReg` → wasm local slots, replacing
    one-local-per-register. This is the wasm backend's only real allocation
    work; C needs none.
-3. **LowIR→C** in `CEmit`, validated against CEmit's existing native/ABI test
-   suite (its output must stay behaviourally identical). This is what retires
-   the second copy of the lowering.
+3. **LowIR→C** in `CEmit`. CEmit uses the SAME tag model (`TAGI`/`UNTAGI`/
+   `fpp_box_*` = the low-bit scheme, native-width), so LowIR ports there in
+   principle. BUT CEmit's value model is RICHER than LowIR currently
+   represents: copy-semantics POD structs (`fpp_rec_clone`/`fpp_pod_clone`),
+   mutable cells for captured mutables (`$cellof`/`$cellget`), packed arrays,
+   pinning. A naive LowIR→C would give a struct record REFERENCE semantics
+   where C copies — wrong, not just slow. So this needs LowIR to grow struct /
+   copy / cell representation first; then LowIR→C, validated against CEmit's
+   native/ABI suite, retires the second copy of the lowering. Bigger than the
+   wasm leg was.
 4. **Optimisation passes** on LowIR: box elimination, POD-struct avoidance,
    alloc sinking — the representation-aware set.
 5. **Native**: rely on wasmtime AOT now; a direct LowIR→x64/arm64 selector is
