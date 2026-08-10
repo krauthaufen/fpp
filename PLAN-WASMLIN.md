@@ -26,6 +26,21 @@ Static memory: the fd_write iovec and a UTF-8 staging buffer live low, then
 string constants (baked into an active data segment), then the bump heap
 (`$hp`). Allocation is a bump with memory growth — no collection yet.
 
+## Status: slices 1–2 (shipped)
+
+Slice 2 added **closures**: nested lambdas are lifted (curried to unary) to
+`(env, arg) -> result` functions in the code table; a closure is a heap
+object `[kind][code-index][captures…]`; free variables are captured into
+that env and read back from it; indirect application is `call_indirect`
+through table 0 with the closure as the environment. Higher-order
+functions, capture (including a mutable captured through a closure), and
+composition all match the wasm-GC oracle. The backend lowers UNOPTIMIZED
+core — the optimizer shares and beta-reduces lambda nodes, which the
+reference-keyed lift is not built for; speed is a later concern than
+coverage. Still open in this area: a top-level function used as a
+first-class VALUE (eta-expansion / `let f = someFn`) — inline lambdas cover
+the common case meanwhile.
+
 ## Status: slice 1 (shipped)
 
 `fpp build --linear -o out.wasm prog.fpp` emits a module that runs under

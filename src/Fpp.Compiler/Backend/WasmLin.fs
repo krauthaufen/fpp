@@ -19,6 +19,7 @@ module Fpp.Backend.WasmLin
 // reported, not silently mis-emitted.
 
 open Fpp.Prelude
+open Fpp.Analysis.Types
 open Fpp.Core.Ir
 open Fpp.Backend.WasmBinary
 open Fpp.Backend.EmitBin
@@ -45,7 +46,19 @@ type private St =
       /// interned string literals -> their constant address
       Consts : Dict<string, int>
       mutable ConstNext : int
-      ConstData : Bytes }
+      ConstData : Bytes
+      /// a NESTED lambda node -> the lifted function name it became
+      LamName : RefMap<Expr, string>
+      /// every lifted lambda, in emission order: (name, param, body, captures)
+      Lams : Vec<string * (VarId * Scheme) * Expr * (string * int) list>
+      /// while emitting a lambda body: captured key -> its env slot
+      mutable Captures : Dict<string, int>
+      /// while emitting a lambda body: the environment parameter's local name
+      mutable EnvName : string
+      /// closure-apply temporaries, indexed by nesting depth (pre-declared)
+      mutable ClosDepth : int }
+
+let private CLO_KIND = 2
 
 let private key (v : VarId) : string = v.Path + ":" + string v.Offset
 let private fn (v : VarId) : string = "$f" + string (abs (strHash (key v)))
@@ -93,6 +106,14 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_i2v" [ "i32" ] []
     tyFunc m "$lt_v2v" [] []
     tyFunc m "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+    // the closure calling convention: (environment, argument) -> result
+    tyFunc m "$lclo" [ "i32"; "i32" ] [ "i32" ]
+
+// closure-apply temporaries (indexed by nesting depth) and the closure-build
+// scratch — declared in every function body, before any instruction
+let private declTemps (f : Fn) : unit =
+    local f "$cbuild" "i32"
+    for i in 0 .. 15 do local f ("$ct" + string i) "i32"
 
 let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
@@ -264,6 +285,67 @@ let private baseOp (op : string) : string =
         else op
     else op
 
+// ---- lambda lifting -------------------------------------------------------
+// the free (path,offset) VarIds a lambda body reads, EXCLUDING its own
+// bound param, globals and top-level functions — those resolve directly.
+let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (string * int) list =
+    let acc = vecNew<string * int> ()
+    let seen = dictNew<string, bool> ()
+    let rec go (bnd : Dict<string, bool>) (e : Expr) : unit =
+        match e with
+        | EVar (v, _) | EVarI (v, _, _) ->
+            let k = key v
+            if (dictTryFind bnd k).IsNone
+               && (dictTryFind st.Globals k).IsNone
+               && (dictTryFind st.Funcs k).IsNone
+               && (dictTryFind seen k).IsNone then
+                dictSet seen k true
+                vecAdd acc (v.Path, v.Offset)
+        | ELam (ps, b) ->
+            let bnd2 = dictNew<string, bool> ()
+            for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
+            for pv, _ in ps do dictSet bnd2 (key pv) true
+            go bnd2 b
+        | ELet (_, v, _, rhs, b) ->
+            go bnd rhs
+            let bnd2 = dictNew<string, bool> ()
+            for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
+            dictSet bnd2 (key v) true
+            go bnd2 b
+        | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) -> for x in xs do go bnd x
+        | EApp (g, xs) -> go bnd g; for x in xs do go bnd x
+        | EIf (a, b, c) -> go bnd a; go bnd b; go bnd c
+        | EWhile (a, b) -> go bnd a; go bnd b
+        | EAssign (_, x) -> go bnd x
+        | _ -> ()
+    go bound body
+    vecToList acc
+
+// discover every nested lambda, curry to unary, name it, record its
+// captures — the same lifting the wasm-GC backend does.
+let rec private discover (st : St) (e : Expr) : unit =
+    match e with
+    | ELam ([ (pv, psch) ], body) ->
+        let name = "$blam" + string (vecLen st.Lams)
+        refMapSet st.LamName e name
+        let bnd = dictNew<string, bool> ()
+        dictSet bnd (key pv) true
+        let caps = freeVars st bnd body
+        vecAdd st.Lams (name, (pv, psch), body, caps)
+        discover st body
+    | ELam ((pv, psch) :: rest, body) ->
+        let curried = ELam ([ (pv, psch) ], ELam (rest, body))
+        discover st curried
+        (match refMapTryFind st.LamName curried with
+         | Some n -> refMapSet st.LamName e n
+         | None -> ())
+    | ELet (_, _, _, a, b) | EWhile (a, b) -> discover st a; discover st b
+    | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) -> for x in xs do discover st x
+    | EApp (g, xs) -> discover st g; for x in xs do discover st x
+    | EIf (a, b, c) -> discover st a; discover st b; discover st c
+    | EAssign (_, x) -> discover st x
+    | _ -> ()
+
 // ---- lowering -------------------------------------------------------------
 // every expression emitter leaves ONE i32 (a tagged value) on the stack.
 let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
@@ -280,8 +362,13 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
         (match dictTryFind st.Locals (key v) with
          | Some ln -> lg f ln
          | None ->
-             if (dictTryFind st.Globals (key v)).IsSome then gg f (gl v)
-             else (constInt f 0; err st ("wasm-linear slice: unbound value " + v.Name)))
+             match dictTryFind st.Captures (key v) with
+             | Some slot ->
+                 // a captured free variable: env[8 + 4*slot]
+                 lg f st.EnvName; ic f (8 + 4 * slot); ins f "i32.add"; mem f "i32.load"
+             | None ->
+                 if (dictTryFind st.Globals (key v)).IsSome then gg f (gl v)
+                 else (constInt f 0; err st ("wasm-linear slice: unbound value " + v.Name)))
     | ELet (_, v, _, rhs, body) ->
         lower st f rhs
         (match dictTryFind st.Locals (key v) with
@@ -332,14 +419,20 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" ->
         // slice 1: only int-to-string; other formatters await later slices
         lower st f a; callf f "$str_of_int"
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Funcs (key v)).IsSome ->
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
+        when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
+        // a direct call to a top-level function at its exact arity
         for a in args do lower st f a
         callf f (fn v)
+    | ELam (_, _) ->
+        (match refMapTryFind st.LamName e with
+         | Some name -> buildClosure st f name
+         | None -> constInt f 0; err st "wasm-linear slice: lambda not discovered")
     | EApp (g, args) ->
-        // no closures in slice 1
+        // an indirect application: g evaluates to a closure. Curry — apply
+        // one argument at a time through the closure's code slot.
         lower st f g
-        for a in args do lower st f a |> ignore
-        err st "wasm-linear slice: indirect / closure application not supported yet"
+        for a in args do applyClosure st f a
     | _ ->
         constInt f 0
         err st ("wasm-linear slice: unsupported expression: "
@@ -351,6 +444,46 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
                    | ELam _ -> "nested lambda"
                    | EPrim (op, _) -> "operator " + op
                    | _ -> "node"))
+
+// resolve a captured/local/global reference known only by its (path,offset)
+and private emitVarByKey (st : St) (f : Fn) (k : string) : unit =
+    match dictTryFind st.Locals k with
+    | Some ln -> lg f ln
+    | None ->
+        match dictTryFind st.Captures k with
+        | Some slot -> lg f st.EnvName; ic f (8 + 4 * slot); ins f "i32.add"; mem f "i32.load"
+        | None ->
+            match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
+            | Some _ -> gg f ("$g" + string (abs (strHash k)))
+            | None -> constInt f 0; err st "wasm-linear slice: unresolved captured variable"
+
+// build a closure object [kind=2][code-table-idx][cap0..] and leave its
+// pointer on the stack
+and private buildClosure (st : St) (f : Fn) (name : string) : unit =
+    let caps =
+        st.Lams |> vecToList |> List.tryPick (fun (n, _, _, c) -> if n = name then Some c else None)
+        |> Option.defaultValue []
+    let nc = List.length caps
+    ic f (8 + 4 * nc); callf f "$lalloc"
+    ls f "$cbuild"
+    lg f "$cbuild"; ic f CLO_KIND; mem f "i32.store"
+    lg f "$cbuild"; ic f 4; ins f "i32.add"; ic f (tblIdx st.M name); mem f "i32.store"
+    caps |> List.iteri (fun i (p, o) ->
+        lg f "$cbuild"; ic f (8 + 4 * i); ins f "i32.add"
+        emitVarByKey st f (p + ":" + string o)
+        mem f "i32.store")
+    lg f "$cbuild"
+
+// apply the closure currently on the stack to argument `a` (unary)
+and private applyClosure (st : St) (f : Fn) (a : Expr) : unit =
+    let t = "$ct" + string st.ClosDepth
+    ls f t                              // stash the closure ptr
+    lg f t                              // env (operand 0)
+    st.ClosDepth <- st.ClosDepth + 1
+    lower st f a                         // arg (operand 1)
+    st.ClosDepth <- st.ClosDepth - 1
+    lg f t; ic f 4; ins f "i32.add"; mem f "i32.load"   // code index (table slot)
+    callIndirect f "$lclo"
 
 // pre-declare every let-bound local in a function body (locals must be
 // declared before any instruction is emitted)
@@ -385,6 +518,12 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
 
 let private paramNm (v : VarId) : string = "$p" + string (abs (strHash (key v)))
 
+// a reference-map hash over lambda nodes, keyed by the bound param's offset
+let private shallowLamHash (e : Expr) : int =
+    match e with
+    | ELam ((pv, _) :: _, _) -> 31 * pv.Offset + 7
+    | _ -> 7
+
 // ---- driver ---------------------------------------------------------------
 let emitLinear (decls0 : Decl list) : byte[] * string list =
     // slice 1 emits the USER program only: the prelude's own declarations
@@ -399,7 +538,9 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); Funcs = dictNew (); Globals = dictNew ()
-          Locals = dictNew (); Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew () }
+          Locals = dictNew (); Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
+          LamName = refMapNew shallowLamHash; Lams = vecNew ()
+          Captures = dictNew (); EnvName = ""; ClosDepth = 0 }
     rtTypesLin m
     // classify top-level bindings
     for d in decls do
@@ -430,6 +571,17 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
             declFn m nm "$lt_v2v"
         | _ -> ()
     declFn m "$_start" "$lt_v2v"
+    // discover every NESTED lambda (the top-level ELams ARE the functions,
+    // so walk their bodies, not the whole binding) and give each a lifted
+    // function and a code-table slot
+    for d in decls do
+        match d with
+        | DLet (_, _, _, ELam (_, body)) -> discover st body
+        | DLet (_, _, _, e) -> discover st e
+        | _ -> ()
+    for name, _, _, _ in vecToList st.Lams do
+        declFn m name "$lclo"
+        tblIdx m name |> ignore
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
         match d with DLet (_, _, _, e) -> scanConsts st e | _ -> ()
@@ -437,39 +589,51 @@ let emitLinear (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m
-    // function bodies
+    // top-level function bodies
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, body)) ->
-            st.Locals <- dictNew ()
+            st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
             let f = beginFn m (ps |> List.map (fun (pv, _) -> paramNm pv))
-            // params are locals 0..: record them by their Core key
             for pv, _ in ps do dictSet st.Locals (key pv) (paramNm pv)
             scanLets st f body
+            declTemps f
             localsDone f
             lower st f body
             endFn f
         | _ -> ()
-    // init bodies
-    let mutable ii = 0
+    // init bodies — DECLARED before _start and the lambdas, so emitted here
+    // too (the function and code sections are positional and must agree)
     for d in decls do
         match d with
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) ->
-            st.Locals <- dictNew ()
+            st.Locals <- dictNew (); st.Captures <- dictNew (); st.EnvName <- ""; st.ClosDepth <- 0
             let f = beginFn m []
             scanLets st f rhs
+            declTemps f
             localsDone f
             lower st f rhs
             gs f (gl v)
             endFn f
-            ii <- ii + 1
         | _ -> ()
     // _start: run every init in order
     let f = beginFn m []
     localsDone f
     for nm in vecToList inits do callf f nm
     endFn f
+    // lifted lambda bodies: (environment, argument) -> result — declared LAST
+    for name, (pv, _), body, caps in vecToList st.Lams do
+        st.Locals <- dictNew (); st.Captures <- dictNew (); st.ClosDepth <- 0
+        caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
+        let f = beginFn m [ "$env"; paramNm pv ]
+        st.EnvName <- "$env"
+        dictSet st.Locals (key pv) (paramNm pv)
+        scanLets st f body
+        declTemps f
+        localsDone f
+        lower st f body
+        endFn f
     // bake the constant data at CONST_BASE; $hp already starts after it
     activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64

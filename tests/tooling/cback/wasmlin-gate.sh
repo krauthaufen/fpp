@@ -35,6 +35,17 @@ let loop =
         acc <- acc + i
         i <- i + 1
 let r5 = printfn "%d" acc
+let adder (n : int) : int -> int = fun x -> x + n
+let apply (f : int -> int) (v : int) : int = f v
+let twice (f : int -> int) (x : int) : int = f (f x)
+let add10 = adder 10
+let r6 = printfn "%d" (apply add10 5)
+let r7 = printfn "%d" (twice (fun y -> y * y) 3)
+let compose (f : int -> int) (g : int -> int) : int -> int = fun x -> f (g x)
+let r8 = printfn "%d" ((compose (fun n -> n + 1) (fun m -> m * 2)) 20)
+let counter (start : int) : int -> int =
+    let mutable c = start
+    fun step -> c + step
 FPP
 
 # the direct linear module — no C toolchain touched
