@@ -428,6 +428,16 @@ let private baseOp (op : string) : string =
     else op
 
 // ---- lambda lifting -------------------------------------------------------
+// the variables a pattern binds (so a match/try arm's binders shadow the
+// captured set); mirrors the shape lowPatTest binds
+let rec private patBinders (p : Pat) : VarId list =
+    match p with
+    | PVar (v, _) -> [ v ]
+    | PAs (inner, v, _) -> v :: patBinders inner
+    | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.collect patBinders ps
+    | PCons (a, b) -> patBinders a @ patBinders b
+    | _ -> []
+
 // the free (path,offset) VarIds a lambda body reads, EXCLUDING its own
 // bound param, globals and top-level functions — those resolve directly.
 let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (string * int) list =
@@ -454,11 +464,24 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
             for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
             dictSet bnd2 (key v) true
             go bnd2 b
-        | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) -> for x in xs do go bnd x
+        | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do go bnd x
         | EApp (g, xs) -> go bnd g; for x in xs do go bnd x
-        | EIf (a, b, c) -> go bnd a; go bnd b; go bnd c
-        | EWhile (a, b) -> go bnd a; go bnd b
+        | EIf (a, b, c) | EIndexSet (_, a, b, c) -> go bnd a; go bnd b; go bnd c
+        | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> go bnd a; go bnd b
         | EAssign (_, x) -> go bnd x
+        | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> go bnd r
+        | EFieldSet (r, _, _, x) -> go bnd r; go bnd x
+        | ERecord (_, fs) -> for _, x in fs do go bnd x
+        | ERecordExt (_, b, fs) -> go bnd b; for _, x in fs do go bnd x
+        | EIfaceCall (_, _, r, xs) -> go bnd r; for x in xs do go bnd x
+        | EMatch (s, cs) | ETry (s, cs) ->
+            go bnd s
+            for pat, guard, body2 in cs do
+                let bnd2 = dictNew<string, bool> ()
+                for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
+                for v in patBinders pat do dictSet bnd2 (key v) true
+                (match guard with Some g -> go bnd2 g | None -> ())
+                go bnd2 body2
         | _ -> ()
     go bound body
     vecToList acc
@@ -481,11 +504,21 @@ let rec private discover (st : St) (e : Expr) : unit =
         (match refMapTryFind st.LamName curried with
          | Some n -> refMapSet st.LamName e n
          | None -> ())
-    | ELet (_, _, _, a, b) | EWhile (a, b) -> discover st a; discover st b
-    | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) -> for x in xs do discover st x
+    | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> discover st a; discover st b
+    | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do discover st x
     | EApp (g, xs) -> discover st g; for x in xs do discover st x
-    | EIf (a, b, c) -> discover st a; discover st b; discover st c
+    | EIf (a, b, c) | EIndexSet (_, a, b, c) -> discover st a; discover st b; discover st c
     | EAssign (_, x) -> discover st x
+    | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> discover st r
+    | EFieldSet (r, _, _, x) -> discover st r; discover st x
+    | ERecord (_, fs) -> for _, x in fs do discover st x
+    | ERecordExt (_, b, fs) -> discover st b; for _, x in fs do discover st x
+    | EIfaceCall (_, _, r, xs) -> discover st r; for x in xs do discover st x
+    | EMatch (s, cs) | ETry (s, cs) ->
+        discover st s
+        for _, guard, body2 in cs do
+            (match guard with Some g -> discover st g | None -> ())
+            discover st body2
     | _ -> ()
 
 // intern every string literal up front, so the heap pointer's start (after
@@ -498,7 +531,11 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
     | ELit (LString s) -> internStr st s |> ignore
     | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> scanConsts st a; scanConsts st b
     | EIf (a, b, c) | EIndexSet (_, a, b, c) -> scanConsts st a; scanConsts st b; scanConsts st c
-    | ESeq xs | EPrim (_, xs) | EApp (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do scanConsts st x
+    | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do scanConsts st x
+    // the function position matters: an eta-expansion lambda lives there and
+    // may hold string literals (a missed one is interned late, past $hp, and
+    // the first allocation overwrites it)
+    | EApp (g, xs) -> scanConsts st g; for x in xs do scanConsts st x
     | EAssign (_, r) | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) -> scanConsts st r
     | EFieldSet (r, _, _, v) -> scanConsts st r; scanConsts st v
     | ELam (_, b) -> scanConsts st b
