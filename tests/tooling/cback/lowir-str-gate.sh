@@ -20,6 +20,9 @@ let r7 = printfn "%d" (s.IndexOf "zzz")
 let r8 = printfn "%s" (s.Substring 6)
 let r9 = printfn "%s" (s.Substring (0, 5))
 let r10 = printfn "%d" ((s.Substring 6).Length)
+let r11 = printfn "[%s]" ("  x y  ".Trim ())
+let r12 = printfn "[%s]" ("hello".Replace ("l", "L"))
+let r13 = printfn "[%s]" ("aXbXc".Replace ("X", "--"))
 FPP
 "$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp"
 "$wt" run "$out/low.wasm" > "$out/low.txt"
