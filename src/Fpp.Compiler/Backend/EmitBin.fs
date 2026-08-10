@@ -56,7 +56,11 @@ type Mod =
       TableOrder : Vec<string>
       /// funcs referenced first-class; the declarative elem segment
       Declared : Dict<string, bool>
-      DeclaredOrder : Vec<string> }
+      DeclaredOrder : Vec<string>
+      /// when Some (module, field, min, max): memory is IMPORTED (the GC
+      /// backend shares fpprt's linear memory) instead of defined+exported,
+      /// so assembleWith emits an import entry and skips the memory section
+      mutable MemImport : (string * string * int * int) option }
 
 let modNew () : Mod =
     { SrcPos = vecNew (); FieldNames = vecNew (); LocalNames = vecNew (); TypeIdx = dictNew (); TypeBody = bytesNew (); TypeCount = 0
@@ -67,7 +71,7 @@ let modNew () : Mod =
       CodeBody = bytesNew (); CodeCount = 0
       DataIdx = dictNew (); DataBody = bytesNew (); DataCount = 0
       Declared = dictNew (); DeclaredOrder = vecNew ()
-      TableIdx = dictNew (); TableOrder = vecNew () }
+      TableIdx = dictNew (); TableOrder = vecNew (); MemImport = None }
 
 let tyIdx (m : Mod) (name : string) : int =
     match dictTryFind m.TypeIdx name with
@@ -610,6 +614,19 @@ let exportMem (m : Mod) (name : string) : unit =
     emitU32 m.ExportBody 0
     m.ExportCount <- m.ExportCount + 1
 
+/// IMPORT memory `module.field` (min/max pages) as memory 0. The GC backend
+/// shares fpprt's linear memory this way; assembleWith then skips defining a
+/// memory of its own. Wired to fpprt's export by wasm-merge at link time.
+let importMem (m : Mod) (module_ : string) (field : string) (mn : int) (mx : int) : unit =
+    emitVec m.ImportBody (stringBytes module_)
+    emitVec m.ImportBody (stringBytes field)
+    emitByte m.ImportBody 0x02      // memory import
+    emitByte m.ImportBody 0x01      // limits: has max
+    emitU32 m.ImportBody mn
+    emitU32 m.ImportBody mx
+    m.ImportCount <- m.ImportCount + 1
+    m.MemImport <- Some (module_, field, mn, mx)
+
 /// a passive data segment
 let dataSeg (m : Mod) (name : string) (bytes : byte[]) : unit =
     dictSet m.DataIdx name m.DataCount
@@ -692,10 +709,13 @@ let assembleWith (m : Mod) (memPages : int) (hasTag : bool) (mapUrl : string) : 
         emitByte b 1
         emitU32 b (vecLen m.TableOrder)
         emitU32 b (vecLen m.TableOrder))
-    emitSection out 5 (fun b ->
-        emitU32 b 1
-        emitByte b 0
-        emitU32 b memPages)
+    // memory section: skipped when memory is imported (GC backend shares
+    // fpprt's memory — it arrives through the import section instead)
+    if m.MemImport.IsNone then
+        emitSection out 5 (fun b ->
+            emitU32 b 1
+            emitByte b 0
+            emitU32 b memPages)
     if hasTag then
         emitSection out 13 (fun b ->
             emitU32 b 1

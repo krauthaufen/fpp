@@ -98,6 +98,35 @@ let private CID_FIRST_USER = 7
 
 let private CLO_KIND = 2
 
+// GC mode: allocation, the header and roots go through fpprt (the F++ runtime
+// over Whippet), linked as an imported reactor module and fused with a
+// wasm-merge pass. Off = the standalone bump-allocator path (no collection).
+// Set by the CLI (`--gc`) before emission.
+let mutable gc = false
+
+// fpprt's reserved type-ids; the compiler numbers its own from here (mirrors
+// FPPRT_TID_FIRST in fpprt.h)
+let private TID_FIRST = 3
+// fpprt type kinds (enum fpprt_type_kind)
+let private FK_STRUCT = 0
+let private FK_REF_ARRAY = 1
+let private FK_SCALAR_ARRAY = 2
+
+// import fpprt's memory and the allocator/GC/root API a GC-mode module needs.
+// Declared among the imports so the shared memory is index 0 and every fpprt
+// function keeps a stable index below the module's own functions.
+let private importFpprt (m : Mod) : unit =
+    importFn m "fpprt" "_initialize" "$fpinit" [] []
+    importFn m "fpprt" "fpprt_init" "$fpheap" [ "i32" ] []
+    importFn m "fpprt" "fpprt_alloc" "$fpalloc" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_alloc_array" "$fpallocn" [ "i32"; "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_register_type_s" "$fpreg" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i32" ] []
+    importFn m "fpprt" "fpprt_add_static_roots" "$fproots" [ "i32"; "i32" ] []
+    importFn m "fpprt" "fpprt_frame_push" "$fppush" [ "i32" ] []
+    importFn m "fpprt" "fpprt_frame_pop" "$fppop" [ "i32" ] []
+    importFn m "fpprt" "fpprt_write_ref" "$fpwr" [ "i32"; "i32"; "i32" ] []
+    importMem m "fpprt" "memory" 258 32768
+
 // the slot key for an interface method uses the interface's BARE name: the
 // declaration, an impl clause and a dispatch site spell its arity and type
 // arguments differently, but all mean one slot
@@ -162,7 +191,9 @@ let private rtTypesLin (m : Mod) : unit =
 
 let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
-    exportMem m "memory"
+    // GC mode imports fpprt's memory + API (all imports must precede declared
+    // functions in the index space); the standalone path defines+exports its own
+    if gc then importFpprt m else exportMem m "memory"
     declFn m "$lalloc" "$lt_i2i"
     declFn m "$str_of_int" "$lt_i2i"
     declFn m "$str_cat" "$lt_ii2i"
@@ -1741,9 +1772,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DLet (_, _, _, ELam _) -> ()
         | DLet (_, v, _, rhs) -> emitFuncLow st m [] rhs (fun f -> gs f (gl v))
         | _ -> ()
-    // _start: run every init in order
+    // _start: in GC mode bring fpprt up first (reactor ctors, then the heap),
+    // then run every init in order
     let f = beginFn m []
     localsDone f
+    if gc then
+        callf f "$fpinit"                 // fpprt reactor _initialize
+        ic f 0; callf f "$fpheap"         // fpprt_init(NULL) -> default heap
     for nm in vecToList inits do callf f nm
     endFn f
     // lifted lambda bodies: (environment, argument) -> result — declared LAST.

@@ -511,9 +511,13 @@ let private isProject (f : string) = f.EndsWith Project.extension
 let main argv =
     let argl0 = List.ofArray argv
     let strict = argl0 |> List.exists (fun a -> a = "--strict")
-    lowirBackend <- argl0 |> List.exists (fun a -> a = "--lowir")
+    // --gc routes through the LowIR wasm-linear backend with fpprt/Whippet as
+    // the collector (imported reactor, wasm-merge at link time)
+    let useGc = argl0 |> List.exists (fun a -> a = "--gc")
+    Fpp.Backend.WasmLin.gc <- useGc
+    lowirBackend <- (argl0 |> List.exists (fun a -> a = "--lowir")) || useGc
     linearBackend <- (argl0 |> List.exists (fun a -> a = "--linear")) || lowirBackend
-    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir") with
+    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _, defs) -> check strict defs files
