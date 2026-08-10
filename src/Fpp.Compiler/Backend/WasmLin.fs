@@ -256,6 +256,8 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lclo" [ "i32"; "i32" ] [ "i32" ]
     // the exception tag carries the thrown value (a tagged i32)
     tyFunc m "$exntag" [ "i32" ] []
+    // GC shadow stack: push a value (i32->void), pop one (void->i32)
+    tyFunc m "$lt_v2i" [] [ "i32" ]
 
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -263,6 +265,9 @@ let private rtDeclsLin (m : Mod) : unit =
     // GC mode imports fpprt's memory + API (all imports must precede declared
     // functions in the index space); the standalone path defines+exports its own
     if gc then importFpprt m else exportMem m "memory"
+    // GC shadow-stack push/pop for in-flight roots (declared before the string
+    // helpers so declaration order matches body-emission order)
+    if gc then (declFn m "$spush" "$lt_i2v"; declFn m "$spop" "$lt_v2i")
     declFn m "$lalloc" "$lt_i2i"
     declFn m "$str_of_int" "$lt_i2i"
     declFn m "$str_cat" "$lt_ii2i"
@@ -376,6 +381,28 @@ let private emitLalloc (m : Mod) : unit =
     endB f
     lg f "$p"; lg f "$n"; ins f "i32.add"; gs f "$hp"
     lg f "$p"
+    endFn f
+
+// GC shadow stack (in-flight roots): a LIFO of live heap pointers in the
+// scanned root table, above the scratch/global/constant slots. A value pushed
+// before an allocation survives the collection it might trigger, and pop reads
+// its (possibly relocated) address back. $sp is a byte offset into $roots.
+let private emitSpush (m : Mod) : unit =
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    gg f "$roots"; gg f "$sp"; ins f "i32.add"; lg f "$v"; mem f "i32.store"
+    gg f "$sp"; ic f 4; ins f "i32.add"; gs f "$sp"
+    endFn f
+
+let private emitSpop (m : Mod) : unit =
+    let f = beginFn m []
+    local f "$a" "i32"; local f "$r" "i32"
+    localsDone f
+    gg f "$sp"; ic f 4; ins f "i32.sub"; gs f "$sp"
+    gg f "$roots"; gg f "$sp"; ins f "i32.add"; ls f "$a"
+    lg f "$a"; mem f "i32.load"; ls f "$r"
+    lg f "$a"; ic f 0; mem f "i32.store"      // clear the popped slot (no stale scan)
+    lg f "$r"
     endFn f
 
 // a scratch address: a fixed low offset in the standalone path, or `$sbuf`
@@ -1139,8 +1166,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let it = freshTmp ctx
         let stmts =
             [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
-              LSet (wReg iv, coreToLowE ctx init)
-              LSet (wReg bs, (if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt "arr" 4 FK_REF_ARRAY 2); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))) ]
+              LSet (wReg iv, coreToLowE ctx init) ]
+            // GC: the fill value may be a heap pointer live across the array
+            // allocation — push it over the safepoint and read it back
+            @ (if gc then [ LCallVoidS ("$spush", [ LGet (wReg iv) ]) ] else [])
+            @ [ LSet (wReg bs, (if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt "arr" 4 FK_REF_ARRAY 2); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 4 ]) ])))) ]
+            @ (if gc then [ LSet (wReg iv, LCall ("$spop", [])) ] else [])
             @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
             @ [ LSet (wReg it, LConstW 0)
                 LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
@@ -1314,15 +1345,21 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
     let st = ctx.LSt
     if gc && cid = CID_ARRAY then
         // [tag][len][elems]: fpprt_alloc_array writes tag@0 and len@4; we store
-        // the elements from offset 8. slots = [len; elem0; elem1; …]
+        // the elements from offset 8. Each element is pushed to the shadow stack
+        // BEFORE the allocation (which may collect) and popped back after — a
+        // move updates the pushed pointer, so nothing in flight is lost.
         let tid = gcTid st "arr" 4 FK_REF_ARRAY 2
         let len = List.head slots
-        let stores = List.tail slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
-        LDo (LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) :: stores, LGet (wReg b))
+        let elems = List.tail slots
+        let ne = List.length elems
+        let pushes = elems |> List.map (fun v -> LCallVoidS ("$spush", [ v ]))
+        let pops = [ for i in ne - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), 8 + 4 * i, LCall ("$spop", [])) ]
+        LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops, LGet (wReg b))
     elif gc then
         let tid = gcTid st ("s:" + string cid + ":" + string n + ":" + string raw) (HDR + 4 * n) FK_TAGGED (1 + raw)
-        let stores = slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
-        LDo (LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) :: stores, LGet (wReg b))
+        let pushes = slots |> List.map (fun v -> LCallVoidS ("$spush", [ v ]))
+        let pops = [ for i in n - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), HDR + 4 * i, LCall ("$spop", [])) ]
+        LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops, LGet (wReg b))
     else
         let stores =
             LStore (W, LGet (wReg b), 0, LConstW cid)
@@ -1439,7 +1476,7 @@ and private lowMkCell (ctx : LowCtx) (v : LExpr) : LExpr =
     let b = freshTmp ctx
     if gc then
         let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
-        LDo ([ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, v) ], LGet (wReg b))
+        LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
     else
         LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
 
@@ -1900,8 +1937,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // buffer (I/O iovec + UTF-8 staging + float formatting); filled at startup
     if gc then globalI32Mut m "$roots" 0
     if gc then globalI32Mut m "$sbuf" 0
+    // GC shadow-stack pointer: a byte offset into $roots, above the fixed slots
+    if gc then globalI32Mut m "$sp" 0
     exportFn m "_start" "$_start"
     // runtime bodies
+    if gc then (emitSpush m; emitSpop m)
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
@@ -1951,7 +1991,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // range (scratch slot 0 + one per constant) up front — the slots read 0
         // (skipped by the scanner) until filled below
         callf rf "$rootsbase"; gs rf "$roots"
-        ic rf st.RootNext; callf rf "$rootsreg"
+        // register the fixed slots (scratch/globals/constants) AND the shadow
+        // stack that follows; the shadow pointer starts just past the fixed slots
+        ic rf 65536; callf rf "$rootsreg"
+        ic rf (st.RootNext * 4); gs rf "$sp"
         // register every shape's fpprt type
         for tid, size, kind, start in vecToList st.TidRegs do
             ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
