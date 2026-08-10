@@ -42,6 +42,9 @@ enum fpprt_type_kind {
   FPPRT_KIND_REF_ARRAY = 1,    /* [tag][len][ref x len]                  */
   FPPRT_KIND_SCALAR_ARRAY = 2, /* [tag][len][elem x len], size = elem sz */
   FPPRT_KIND_EPHEMERON = 3,    /* internal: gc_ephemeron payload         */
+  FPPRT_KIND_TAGGED = 5,       /* wasm-linear uniform model: scan body words
+                                  from `nrefs` (first-payload index), follow
+                                  the even (pointer) ones; no refoffs map    */
   FPPRT_KIND_POD_ARRAY = 4     /* flat struct elems WITH ref fields:
                                   size = elem bytes, refoffs = per-elem
                                   ELEM-RELATIVE ref offsets              */

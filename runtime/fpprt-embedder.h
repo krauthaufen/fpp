@@ -36,6 +36,7 @@ extern uint32_t fpprt_ntypes_;
 #define FPPRT_EMB_KIND_SCALAR_ARRAY 2u
 #define FPPRT_EMB_KIND_EPHEMERON 3u
 #define FPPRT_EMB_KIND_POD_ARRAY 4u
+#define FPPRT_EMB_KIND_TAGGED 5u
 
 struct fpprt_header { uintptr_t tag; };
 
@@ -62,6 +63,8 @@ static inline size_t fpprt_object_size_(uintptr_t tag, void *obj) {
   case FPPRT_EMB_KIND_POD_ARRAY:
     return fpprt_align_(2 * sizeof(uintptr_t)
                         + ((uintptr_t *)obj)[1] * (size_t)t->size);
+  case FPPRT_EMB_KIND_TAGGED:
+    return t->size;
   case FPPRT_EMB_KIND_EPHEMERON:
   default:
     return gc_ephemeron_size();
@@ -111,6 +114,19 @@ static inline size_t gc_trace_object(struct gc_ref ref,
         if (*slot && !(*slot & 1))
           visit(gc_edge(slot), heap, trace_data);
       }
+    return t->size;
+  case FPPRT_EMB_KIND_TAGGED:
+    /* the wasm-linear backend's uniform value model: every body word is
+     * either a tagged scalar (bit 0 set) or a heap pointer (even). No
+     * refoffs map — scan all words from `nrefs` (the first-payload index,
+     * skipping the header and any raw metadata) and follow the even ones. */
+    if (visit) {
+      uintptr_t *w = (uintptr_t *)obj;
+      uint32_t n = t->size / (uint32_t)sizeof(uintptr_t);
+      for (uint32_t i = t->nrefs; i < n; i++)
+        if (w[i] && !(w[i] & 1))
+          visit(gc_edge(&w[i]), heap, trace_data);
+    }
     return t->size;
   case FPPRT_EMB_KIND_REF_ARRAY: {
     uintptr_t len = ((uintptr_t *)obj)[1];
