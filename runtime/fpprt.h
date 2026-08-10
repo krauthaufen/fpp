@@ -189,6 +189,9 @@ typedef void (*fpp_phase_kernel)(void *env, int phase, int lo, int hi);
 void fpp_pool_dispatch_phased(int n, int chunk, int groups, int phases,
                               fpp_phase_kernel kernel, void *env);
 
+/* heap+static edges into `target`, counted up to 2; stack edges excluded */
+int fpprt_heap_refs_upto2(fpprt_ref target);
+
 void fpprt_collect(void);            /* full collection, for tests        */
 void fpprt_safepoint(void);          /* poll: park if a GC wants the world */
 /* the collector's stop-request flag for THIS thread — emitted loops test

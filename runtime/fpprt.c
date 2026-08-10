@@ -624,3 +624,102 @@ void fpp_pool_dispatch_phased(int n, int chunk, int groups, int phases,
   int workers = pool_started_ ? pool_size_ + 1 : fpp_pool_size() + 1;
   fpp_pool_dispatch(workers, 1, phased_pool_kernel_, NULL);
 }
+
+/* ---- the uniqueness query ----------------------------------------------
+ * "Does anything on the HEAP (or in a static) point at x?" — counted up
+ * to 2, by an on-demand mark from the roots. Stack/frame edges are
+ * DELIBERATELY excluded: they are the asking caller's own transient view,
+ * and codegen decides how many frame slots a value transits. Ephemerons
+ * are excluded too (the idhash table must not pin uniqueness).
+ * Single-mutator use: run it outside parallel sections. */
+
+struct uniq_set { uintptr_t *tab; size_t cap, n; };
+
+static int uniq_add_(struct uniq_set *s, uintptr_t v) {
+  if (s->n * 4 >= s->cap * 3) {
+    size_t ncap = s->cap ? s->cap * 2 : 1024;
+    uintptr_t *nt = calloc(ncap, sizeof(uintptr_t));
+    for (size_t i = 0; i < s->cap; i++)
+      if (s->tab[i]) {
+        size_t j = (s->tab[i] >> 4) & (ncap - 1);
+        while (nt[j]) j = (j + 1) & (ncap - 1);
+        nt[j] = s->tab[i];
+      }
+    free(s->tab);
+    s->tab = nt;
+    s->cap = ncap;
+  }
+  size_t j = (v >> 4) & (s->cap - 1);
+  while (s->tab[j]) {
+    if (s->tab[j] == v) return 0;
+    j = (j + 1) & (s->cap - 1);
+  }
+  s->tab[j] = v;
+  s->n++;
+  return 1;
+}
+
+int fpprt_heap_refs_upto2(fpprt_ref target) {
+  if (!target) return 0;
+  struct uniq_set seen = { NULL, 0, 0 };
+  size_t wcap = 4096, wn = 0;
+  uintptr_t *work = malloc(wcap * sizeof(uintptr_t));
+  int count = 0;
+  /* seed: statics (ranges); ephemeron buckets skipped by design */
+  for (size_t r = 0; r < heap_roots_.nranges; r++)
+    for (size_t i = 0; i < heap_roots_.ranges[r].n; i++) {
+      uintptr_t v = (uintptr_t)heap_roots_.ranges[r].base[i];
+      if (!v || (v & 1)) continue;
+      if (v == (uintptr_t)target) { count++; }
+      else if (uniq_add_(&seen, v)) {
+        if (wn == wcap) { wcap *= 2; work = realloc(work, wcap * sizeof(uintptr_t)); }
+        work[wn++] = v;
+      }
+    }
+  /* stack frames seed TRAVERSAL (their referents are live and may hold
+   * heap edges to the target) but a frame slot equal to the target does
+   * NOT count */
+  for (struct fpprt_frame *fr = fpprt_top_frame; fr && count < 2; fr = fr->prev)
+    for (size_t i = 0; i < fr->nslots; i++) {
+      uintptr_t v = (uintptr_t)fr->slots[i];
+      if (!v || (v & 1) || v == (uintptr_t)target) continue;
+      if (uniq_add_(&seen, v)) {
+        if (wn == wcap) { wcap *= 2; work = realloc(work, wcap * sizeof(uintptr_t)); }
+        work[wn++] = v;
+      }
+    }
+  while (wn > 0 && count < 2) {
+    uintptr_t o = work[--wn];
+    uintptr_t tag = *(uintptr_t *)o;
+    struct fpprt_type_intern *t = &fpprt_types_[tag >> 1];
+    uintptr_t *fields = NULL;
+    size_t nfields = 0;
+    if (t->kind == FPPRT_EMB_KIND_STRUCT) {
+      for (uint32_t k = 0; k < t->nrefs; k++) {
+        uintptr_t v = *(uintptr_t *)((char *)o + t->refoffs[k]);
+        if (!v || (v & 1)) continue;
+        if (v == (uintptr_t)target) { if (++count >= 2) break; }
+        else if (uniq_add_(&seen, v)) {
+          if (wn == wcap) { wcap *= 2; work = realloc(work, wcap * sizeof(uintptr_t)); }
+          work[wn++] = v;
+        }
+      }
+    } else if (t->kind == FPPRT_EMB_KIND_REF_ARRAY) {
+      nfields = ((uintptr_t *)o)[1];
+      fields = (uintptr_t *)o + 2;
+      for (size_t k = 0; k < nfields; k++) {
+        uintptr_t v = fields[k];
+        if (!v || (v & 1)) continue;
+        if (v == (uintptr_t)target) { if (++count >= 2) break; }
+        else if (uniq_add_(&seen, v)) {
+          if (wn == wcap) { wcap *= 2; work = realloc(work, wcap * sizeof(uintptr_t)); }
+          work[wn++] = v;
+        }
+      }
+    }
+    /* scalar/pod arrays carry no refs; ephemerons skipped */
+  }
+  free(work);
+  free(seen.tab);
+  return count >= 2 ? 2 : count;
+}

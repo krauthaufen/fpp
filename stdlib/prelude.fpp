@@ -6160,3 +6160,27 @@ module Parallel =
                         w <- w + 1
                     | None -> ())
             out
+
+// ---- GC: the uniqueness query --------------------------------------------
+#if NATIVE
+/// heap+static edges into the object, counted up to 2 — stack references
+/// are the asker's own view and do not count
+extern let gcHeapRefs : obj -> int
+#endif
+
+/// Honest "do I hold the only reference?" — well-defined here because
+/// every live reference is a frame slot, a static or a heap field. The
+/// oracle backend cannot ask its host GC, so it answers CONSERVATIVELY:
+/// never unique, and callers take their copying fallback.
+type GC =
+#if NATIVE
+    /// no heap object or static points at x: the caller's stack holds the
+    /// only references, so mutating in place is unobservable
+    static member ReuseIfUnique (x : 'a) (f : 'a -> 'b) : option<'b> =
+        if gcHeapRefs (box x) = 0 then Some (f x) else None
+    /// heap edges into x, saturated at 2 (0, 1, or "2 = shared")
+    static member HeapRefs (x : 'a) : int = gcHeapRefs (box x)
+#else
+    static member ReuseIfUnique (x : 'a) (f : 'a -> 'b) : option<'b> = None
+    static member HeapRefs (x : 'a) : int = 2
+#endif

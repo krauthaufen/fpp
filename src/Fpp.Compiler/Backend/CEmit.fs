@@ -1080,6 +1080,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("fpp_parallel_phased((int)UNTAGI(" + sref xn + "), (int)UNTAGI(" + sref xc
                 + "), (int)UNTAGI(" + sref xg + "), (int)UNTAGI(" + sref xp + "), " + sref xf + ");")
         unitV ()
+    | EApp (EUnknown "gcheaprefs", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpprt_heap_refs_upto2(" + sref x + "));")
+        d
     | EApp (EUnknown "monoms", [ a ]) ->
         emitE st f a |> ignore
         let d = slot f
