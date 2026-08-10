@@ -1165,12 +1165,18 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowTag (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
     | EPrim (op, [ a; b ]) ->
+        // Tagged-int fast paths: with x tagged as 2x+1, addition is
+        // (a+b)-1 and subtraction (a-b)+1 — no untag/retag — and comparisons
+        // hold on the tagged words unchanged (2x+1 is monotonic and sign-
+        // preserving in x). Only *, /, % need the untagged operands.
         let bop = baseOp op
-        let la = lowUntag (coreToLowE ctx a)
-        let lb = lowUntag (coreToLowE ctx b)
-        if List.contains bop [ "+"; "-"; "*"; "/"; "%" ]
-        then lowTag (LPrim (intArithOp bop, [ la; lb ]))
-        else lowTag (LPrim (intCmpOp bop, [ la; lb ]))
+        let ta = coreToLowE ctx a
+        let tb = coreToLowE ctx b
+        match bop with
+        | "+" -> LPrim (SubW, [ LPrim (AddW, [ ta; tb ]); LConstW 1 ])
+        | "-" -> LPrim (AddW, [ LPrim (SubW, [ ta; tb ]); LConstW 1 ])
+        | "<" | ">" | "<=" | ">=" | "=" | "<>" -> lowTag (LPrim (intCmpOp bop, [ ta; tb ]))
+        | _ -> lowTag (LPrim (intArithOp bop, [ lowUntag ta; lowUntag tb ]))
     | ETuple xs -> lowObj ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs)
     | EListLit xs -> lowList ctx xs
     | ERecord (name, fields) ->
