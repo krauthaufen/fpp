@@ -1143,9 +1143,69 @@ type Workspace() =
         | None -> ()
         vecToList out
 
+    /// Receiver-aware candidates for `expr.` completion: the fields and
+    /// members of the receiver's TYPE, walked up its base chain — what a
+    /// dot actually offers, where the flat export list cannot know the
+    /// receiver. (label, rendered type).
+    member this.MemberCompletions (path : string) (dotOffset : int) : (string * string) list =
+        let r = this.ProjectCheck ()
+        let inf = this.TypeCheck path
+        let byExpr =
+            inf.ExprTypes
+            |> List.filter (fun (_, en, _) -> en = dotOffset)
+            |> List.sortBy (fun (st, en, _) -> en - st)
+            |> List.tryHead
+            |> Option.map (fun (_, _, tys) -> tys)
+        // a dangling `a.` mid-edit types its receiver through the
+        // qualified route, which records no expression span — the token
+        // ending at the dot still names a definition, and the
+        // definition's rendered type is the same answer hover gives
+        let byToken =
+            match byExpr with
+            | Some _ -> byExpr
+            | None ->
+                Green.tokens (GNode (this.ParseFile path).Root)
+                |> List.tryFind (fun t ->
+                    t.Kind = Syntax.Ident && t.Offset + strLen t.Text = dotOffset)
+                |> Option.bind (fun t -> this.DefinitionAt path t.Offset)
+                |> Option.bind (fun d ->
+                    match dictTryFind r.Schemes (d.Path + ":" + string d.Offset) with
+                    | Some sch -> Some (Analysis.Types.typeString sch.Body)
+                    | None ->
+                        (this.TypeCheck d.Path).DefTypes
+                        |> List.tryFind (fun (off, _, _) -> off = d.Offset)
+                        |> Option.map (fun (_, _, ts) -> ts))
+        match byToken with
+        | None -> []
+        | Some tys ->
+            let head =
+                let i = tys.IndexOf "<"
+                (if i > 0 then tys.Substring (0, i) else tys).Trim ()
+            let out = vecNew<string * string> ()
+            let seen = dictNew<string, bool> ()
+            let mutable tn = head
+            let mutable fuel = 8
+            while tn <> "" && fuel > 0 do
+                fuel <- fuel - 1
+                for k, fi in dictPairs r.Fields do
+                    if k.StartsWith (tn + ".") && not ((k.Substring (tn.Length + 1)).Contains ".") then
+                        let m = k.Substring (tn.Length + 1)
+                        if (dictTryFind seen m).IsNone && not (m.StartsWith "$")
+                           && not (m.StartsWith "__") then
+                            dictSet seen m true
+                            vecAdd out (m, Analysis.Types.typeString fi.FieldType)
+                tn <-
+                    match dictTryFind r.Bases tn with
+                    | Some (_, bt) ->
+                        (match Analysis.Types.prune bt with
+                         | Analysis.Types.TCon (bn, _) -> bn
+                         | _ -> "")
+                    | None -> ""
+            vecToList out |> List.sortBy fst
+
     member this.HoverAt (path : string) (offset : int) : string option =
-        this.DefinitionAt path offset
-        |> Option.map (fun d ->
+        match this.DefinitionAt path offset with
+        | Some d ->
             let basis = Analysis.Resolve.kindLabel d.Kind + " `" + d.Name + "`"
             // the generalized scheme is the better answer where there is one:
             // it carries the class context, which is most of what a reader
@@ -1154,9 +1214,32 @@ type Workspace() =
             // has nothing to say.
             let scheme =
                 dictTryFind (this.ProjectCheck ()).Schemes (d.Path + ":" + string d.Offset)
-            match scheme with
-            | Some sch -> basis + " : " + Analysis.Types.schemeString sch
-            | None ->
-                match (this.TypeCheck d.Path).DefTypes |> List.tryFind (fun (off, _, _) -> off = d.Offset) with
-                | Some (_, _, ts) -> basis + " : " + ts
-                | None -> basis)
+            (match scheme with
+             | Some sch -> Some (basis + " : " + Analysis.Types.schemeString sch)
+             | None ->
+                 match (this.TypeCheck d.Path).DefTypes |> List.tryFind (fun (off, _, _) -> off = d.Offset) with
+                 | Some (_, _, ts) -> Some (basis + " : " + ts)
+                 | None -> Some basis)
+        | None ->
+            // no resolved definition — a CLASS MEMBER spelled through the
+            // class (`Num<float>.Zero`) binds in the class layer, which
+            // the resolver never sees. The member's declared scheme is
+            // still the right hover.
+            let tok =
+                Green.tokens (GNode (this.ParseFile path).Root)
+                |> List.tryFind (fun t ->
+                    t.Kind = Ident && offset >= t.Offset && offset < t.Offset + strLen t.Text)
+            match tok with
+            | Some t ->
+                let cls = this.ProjectCheck ()
+                (match dictTryFind cls.Classes.MemberOwner t.Text with
+                 | Some owner ->
+                     (match dictTryFind cls.Classes.Classes owner with
+                      | Some cd ->
+                          cd.Members
+                          |> List.tryFind (fun (mn, _) -> mn = t.Text)
+                          |> Option.map (fun (mn, sch) ->
+                              "member `" + owner + "." + mn + "` : " + Analysis.Types.schemeString sch)
+                      | None -> None)
+                 | None -> None)
+            | None -> None

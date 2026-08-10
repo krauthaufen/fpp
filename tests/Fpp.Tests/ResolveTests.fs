@@ -191,6 +191,36 @@ let editorRobustnessTests =
                 ws.HoverAt "t.fpp" off |> ignore
             ws.DefinitionAt "t.fpp" (src.IndexOf "List.sum" + 6) |> ignore
         }
+        test "a dot offers the receiver's own members" {
+            // the flat export list cannot know the receiver; `r.` must
+            // offer Alpha and Beta, mid-edit dangling dot included
+            let ws = Fpp.Workspace()
+            let src =
+                String.concat "\n" [
+                    "module M"
+                    "type R = { Alpha : int; Beta : float }"
+                    "type S() ="
+                    "    member x.Go () = 1"
+                    "    member x.Halt = 2"
+                    "let a = { Alpha = 1; Beta = 2.0 }"
+                    "let b = S()"
+                    "let c = a." ]
+            ws.SetFileText "t.fpp" src
+            let ms = ws.MemberCompletions "t.fpp" (src.Length - 1) |> List.map fst
+            Expect.equal ms [ "Alpha"; "Beta" ] "record fields offered"
+            let src2 = src.Replace ("let c = a.", "let c = b.")
+            ws.SetFileText "t.fpp" src2
+            let ms2 = ws.MemberCompletions "t.fpp" (src2.Length - 1) |> List.map fst
+            Expect.equal ms2 [ "Go"; "Halt" ] "class members offered"
+        }
+        test "hover answers on a class-applied member" {
+            let ws = Fpp.Workspace()
+            let src = "module M\nlet z = Num<float>.Zero\n"
+            ws.SetFileText "t.fpp" src
+            match ws.HoverAt "t.fpp" (src.IndexOf ".Zero" + 2) with
+            | Some h -> Expect.stringContains h "Num.Zero" "names the class member"
+            | None -> failtest "no hover on the applied member"
+        }
         test "the prelude pseudo-file checks like a file" {
             let ws = Fpp.Workspace()
             ws.SetFileText "t.fpp" "module M\nlet a = 1\n"

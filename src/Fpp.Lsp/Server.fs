@@ -149,7 +149,20 @@ type Server(ws : Workspace) =
                 let defStarts = if d.Path = path then starts else Lines.starts (ws.FileText d.Path)
                 let sl, sc = Lines.toLineCol defStarts d.Offset
                 let el, ec = Lines.toLineCol defStarts (d.Offset + d.Length)
-                respond (jobj [ "uri", jstr (Uri.ofPath d.Path); "range", range sl sc el ec ])
+                // the PRELUDE is a pseudo-file: jump to the real
+                // stdlib/prelude.fpp when a checkout is in reach (its text
+                // IS the embedded resource, so every offset lines up)
+                let target =
+                    if d.Path = Fpp.Builtin.path then
+                        let candidates =
+                            [ System.IO.Path.Combine (System.AppContext.BaseDirectory, "..", "..", "..", "..", "..", "stdlib", "prelude.fpp")
+                              System.IO.Path.Combine (System.AppContext.BaseDirectory, "..", "..", "stdlib", "prelude.fpp")
+                              System.IO.Path.Combine (System.Environment.CurrentDirectory, "stdlib", "prelude.fpp") ]
+                        match candidates |> List.tryFind System.IO.File.Exists with
+                        | Some real -> System.IO.Path.GetFullPath real
+                        | None -> d.Path
+                    else d.Path
+                respond (jobj [ "uri", jstr (Uri.ofPath target); "range", range sl sc el ec ])
             | None -> respond null
         | "textDocument/hover" ->
             let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
@@ -167,6 +180,24 @@ type Server(ws : Workspace) =
         | "textDocument/completion" ->
             let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
             this.EnsureProject path
+            // after a DOT, offer the receiver's OWN members — the flat
+            // export list cannot know the receiver, and `v.` deserves
+            // X and Y, not a thousand globals
+            let memberItems =
+                let line = (fld (fld ps "position") "line").GetValue<int>()
+                let ch = (fld (fld ps "position") "character").GetValue<int>()
+                let text = ws.FileText path
+                let starts = Lines.starts text
+                let offset = (if line < starts.Length then starts.[line] else 0) + ch
+                if offset > 0 && offset <= text.Length && text.[offset - 1] = '.' then
+                    ws.MemberCompletions path (offset - 1)
+                else []
+            if not (List.isEmpty memberItems) then
+                respond (jarr (memberItems |> List.map (fun (label, ty) ->
+                    jobj [ "label", jstr label
+                           "kind", jint 5
+                           "detail", jstr ty ])))
+            else
             let items =
                 ws.Completions path
                 |> List.map (fun (label, kind, ty, full) ->
