@@ -14,6 +14,13 @@ out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
 
 cat > "$out/p.fpp" <<'FPP'
 module WasmLin
+type Point = { X : int; Y : int }
+type Shape = Circle of int | Rect of int * int | Dot
+let area (s : Shape) : int =
+    match s with
+    | Circle r -> 3 * r * r
+    | Rect (w, h) -> w * h
+    | Dot -> 0
 let rec fib (n : int) : int = if n < 2 then n else fib (n - 1) + fib (n - 2)
 let rec fact (n : int) : int = if n <= 1 then 1 else n * fact (n - 1)
 let gcd (a : int) (b : int) : int =
@@ -46,6 +53,11 @@ let r8 = printfn "%d" ((compose (fun n -> n + 1) (fun m -> m * 2)) 20)
 let counter (start : int) : int -> int =
     let mutable c = start
     fun step -> c + step
+let pt = { X = 3; Y = 4 }
+let r9 = printfn "%d" (pt.X * 100 + pt.Y)
+let r10 = printfn "%d" (area (Circle 5) + area (Rect (6, 7)) + area Dot)
+let swap (t : int * int) : int * int = let (a, b) = t in (b, a)
+let r11 = printfn "%d" (let (a, b) = swap (2, 9) in a * 10 + b)
 FPP
 
 # the direct linear module — no C toolchain touched

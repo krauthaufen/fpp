@@ -26,7 +26,20 @@ Static memory: the fd_write iovec and a UTF-8 staging buffer live low, then
 string constants (baked into an active data segment), then the bump heap
 (`$hp`). Allocation is a bump with memory growth — no collection yet.
 
-## Status: slices 1–2 (shipped)
+## Status: slices 1–3 (shipped)
+
+Slice 3 added **records, unions, tuples and pattern matching**. Layouts,
+static-typed so no runtime kind word is needed: a record is its fields in
+declared order; a tuple is its elements; a union case is `[tag][payloads…]`
+with the tag the case's index. Construction allocates and fills (nesting-safe
+via a depth-indexed base/value scratch pool); field access is a load at the
+declared offset; `match` compiles to a linear scan of clauses, each a block
+whose pattern test branches out on mismatch and binds variables on the
+matching path, with `unreachable` after an exhaustive set. Records, sum types
+with mixed arities, tuple destructuring and nested patterns all match the
+oracle. Lists, or-patterns and `:?` type tests await a later slice.
+
+
 
 Slice 2 added **closures**: nested lambdas are lifted (curried to unary) to
 `(env, arg) -> result` functions in the code table; a closure is a heap
