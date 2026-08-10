@@ -127,6 +127,7 @@ let private declTemps (f : Fn) : unit =
     for i in 0 .. 7 do local f ("$ms" + string i) "i32"; local f ("$mr" + string i) "i32"
     for i in 0 .. 15 do local f ("$pt" + string i) "i32"
     for i in 0 .. 7 do local f ("$ab" + string i) "i32"; local f ("$av" + string i) "i32"
+    for i in 0 .. 7 do local f ("$ai" + string i) "i32"; local f ("$an" + string i) "i32"
     local f "$obj" "i32"
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -491,6 +492,47 @@ let rec private lower (st : St) (f : Fn) (e : Expr) : unit =
         lower st f v
         mem f "i32.store"
         constInt f 0
+    | EArray (_, xs) ->
+        // [len][elem0..] — len is a RAW i32 at slot 0, elements are tagged
+        buildObj st f (List.length xs + 1)
+            ((0, (fun () -> ic f (List.length xs)))
+             :: (xs |> List.mapi (fun i x -> i + 1, (fun () -> lower st f x))))
+    | EIndex (_, arr, i) ->
+        // element k is at slot (k+1): address = base + 4*(untag i + 1)
+        lower st f arr
+        lower st f i; untagi f; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"
+        ins f "i32.add"; mem f "i32.load"
+    | EIndexSet (_, arr, i, v) ->
+        lower st f arr
+        lower st f i; untagi f; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"
+        ins f "i32.add"
+        lower st f v; mem f "i32.store"
+        constInt f 0
+    | EArrayLen (_, arr) ->
+        lower st f arr; mem f "i32.load"; tagi f
+    | EArrayCreate (_, n, init) ->
+        // [len][init x count] — count and fill value are dynamic, so a loop;
+        // all scratch is depth-indexed for nesting safety
+        let d = st.AllocDepth
+        let bs = "$ab" + string d
+        let cnt = "$av" + string d
+        let iv = "$ai" + string d
+        let it = "$an" + string d
+        st.AllocDepth <- d + 1
+        lower st f n; untagi f; ls f cnt
+        lower st f init; ls f iv
+        ic f 4; lg f cnt; ic f 4; ins f "i32.mul"; ins f "i32.add"; callf f "$lalloc"; ls f bs
+        lg f bs; lg f cnt; mem f "i32.store"
+        ic f 0; ls f it
+        blockE f "$acc"; loopE f "$acl"
+        lg f it; lg f cnt; ins f "i32.ge_u"; brIf f "$acc"
+        lg f bs; lg f it; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"; lg f iv; mem f "i32.store"
+        lg f it; ic f 1; ins f "i32.add"; ls f it
+        br f "$acl"; endB f; endB f
+        st.AllocDepth <- d
+        lg f bs
+    | EApp (EUnknown n, _) when n.StartsWith "$zero" -> constInt f 0
+    | EUnknown n when n.StartsWith "$zero" -> constInt f 0
     | ECtor (case, _, args) ->
         // [tag][payload0..] — the tag (a RAW i32, not a tagged value) is the
         // case's index in its union; payloads are ordinary tagged values
@@ -643,6 +685,11 @@ and private scanLets (st : St) (f : Fn) (e : Expr) : unit =
     | ERecordExt (_, b, fs) -> scanLets st f b; for _, v in fs do scanLets st f v
     | EField (r, _, _) -> scanLets st f r
     | EFieldSet (r, _, _, v) -> scanLets st f r; scanLets st f v
+    | EArray (_, xs) -> for x in xs do scanLets st f x
+    | EIndex (_, a, i) -> scanLets st f a; scanLets st f i
+    | EIndexSet (_, a, i, v) -> scanLets st f a; scanLets st f i; scanLets st f v
+    | EArrayLen (_, a) -> scanLets st f a
+    | EArrayCreate (_, n, ini) -> scanLets st f n; scanLets st f ini
     | ELam (_, _) -> ()   // a nested lambda's OWN body scans in its own pass
     | EMatch (scrut, clauses) ->
         scanLets st f scrut

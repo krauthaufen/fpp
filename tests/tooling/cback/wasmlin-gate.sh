@@ -58,6 +58,21 @@ let r9 = printfn "%d" (pt.X * 100 + pt.Y)
 let r10 = printfn "%d" (area (Circle 5) + area (Rect (6, 7)) + area Dot)
 let swap (t : int * int) : int * int = let (a, b) = t in (b, a)
 let r11 = printfn "%d" (let (a, b) = swap (2, 9) in a * 10 + b)
+let lit = [| 10; 20; 30; 40 |]
+let r12 = printfn "%d" (lit.[2] + lit.Length)
+let sq : int[] = Array.zeroCreate 6
+let fillsq =
+    let mutable i = 0
+    while i < sq.Length do
+        sq.[i] <- i * i
+        i <- i + 1
+let mutable asum = 0
+let sumsq =
+    let mutable i = 0
+    while i < sq.Length do
+        asum <- asum + sq.[i]
+        i <- i + 1
+let r13 = printfn "%d" asum
 FPP
 
 # the direct linear module — no C toolchain touched

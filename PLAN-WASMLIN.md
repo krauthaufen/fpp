@@ -26,7 +26,19 @@ Static memory: the fd_write iovec and a UTF-8 staging buffer live low, then
 string constants (baked into an active data segment), then the bump heap
 (`$hp`). Allocation is a bump with memory growth — no collection yet.
 
-## Status: slices 1–3 (shipped)
+## Status: slices 1–4 (shipped)
+
+Slice 4 added **arrays** (boxed elements): the layout is `[len][elem…]` with
+a raw length word and tagged element slots. Literals, indexing, index
+assignment, `.Length`, and `Array.zeroCreate`/`Array.create` (a fill loop,
+depth-indexed scratch) all match the oracle — including a build-then-mutate
+and a summation loop. The oracle stores `int[]` in a packed representation
+and this backend boxes it, but the integer results are identical, which is
+what the diff checks. Packed/POD element layouts and pinning are a later
+slice; `Array.length` (a prelude function rather than the `.Length` node)
+lands when the prelude lowers.
+
+
 
 Slice 3 added **records, unions, tuples and pattern matching**. Layouts,
 static-typed so no runtime kind word is needed: a record is its fields in
