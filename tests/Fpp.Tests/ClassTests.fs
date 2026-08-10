@@ -1977,6 +1977,40 @@ let resolutionRuleTests =
                       "let b = print (string t2.Y)" ]
             Expect.equal out "4\n60\n" "two uses, independent element types"
         }
+        test "a static member carries its own when-constraints" {
+            // `static member Identity when Num<'a> = ...` — no type
+            // ascription needed before the `when`; the constraints are
+            // givens for the body and demanded at every use, per stamp
+            let out =
+                run [ "[<Struct>]"
+                      "type V2<'a> = { X : 'a; Y : 'a }"
+                      "    static member Identity when Num<'a> ="
+                      "        { X = One; Y = Zero }"
+                      "let a : V2<float> = V2.Identity"
+                      "let b : V2<int> = V2.Identity"
+                      "let r1 = print (string a.X)"
+                      "let r2 = print (string (b.X + b.Y))" ]
+            Expect.equal out "1\n1\n" "one member, two instantiations"
+        }
+        test "when-constraints join with and" {
+            // `when Num<'a> and Ordered<'a>` — one `when`, several heads;
+            // members, lets and instance contexts all read the same shape
+            let out =
+                run [ "type P<'a, 'b> = { A : 'a; B : 'b }"
+                      "class Sz<'x>"
+                      "    static sz : 'x -> int"
+                      "instance Sz<int>"
+                      "    static sz x = 1"
+                      "instance Sz<float>"
+                      "    static sz x = 2"
+                      "instance Sz<P<'a, 'b>> when Sz<'a> and Sz<'b>"
+                      "    static sz p = Sz.sz p.A + 10"
+                      "let both (x : 'a) (y : 'b) : int when Sz<'a> and Sz<'b> ="
+                      "    Sz.sz x + Sz.sz y"
+                      "let r1 = print (string (Sz.sz { A = 1; B = 2.5 }))"
+                      "let r2 = print (string (both 7 1.5))" ]
+            Expect.equal out "11\n3\n" "and-joined constraints parse and discharge"
+        }
         test "overlap with a unique most-specific instance still selects it" {
             // rule 2 kept as decided: overlap is fine as long as one
             // instance is strictly most specific at the use

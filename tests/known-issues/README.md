@@ -26,6 +26,10 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   operator works. The diagnosis at the top of the file marks the
   boundary. Concrete per-type instances are the working shape meanwhile.
 
+* `instance-body-second-context-var.fpp` — the same trap's second face:
+  an instance body dispatching on TWO context variables resolves the
+  second one down the int path. One variable works; see the file header.
+
 Fixed and removed (see git history for the repros):
 `generic-class-through-interface` (the Enumerator shape: the enclosing
 member is not layout-dependent, so its call classified CANON and ran the

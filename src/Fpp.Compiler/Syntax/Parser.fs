@@ -1329,7 +1329,7 @@ let parse (src : string) : ParseResult =
             vecAdd acc (parseType letCol)
             // declared constraints: `let solve ... : Vector<'a> when Fractional<'a> = ...`
             while s.IsKw "when" && (s.SameLine || s.CurCol > letCol) do
-                vecAdd acc (parseWhen false letCol)
+                for w__ in parseWhen false letCol do vecAdd acc w__
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
             if s.AtEof || (not s.SameLine && s.CurCol <= letCol) then s.Diag "expected a binding body"
@@ -1394,7 +1394,7 @@ let parse (src : string) : ParseResult =
         // declared class constraints: `type Box<'a> when Ordered<'a> = ...`,
         // the same `when C<'a>` a let signature carries
         while s.IsKw "when" && (s.SameLine || s.CurCol > typeCol) do
-            vecAdd acc (parseWhen false typeCol)
+            for w__ in parseWhen false typeCol do vecAdd acc w__
         // `type X with member ... ` — an INTRINSIC TYPE EXTENSION: members
         // for a type declared elsewhere, and no representation of its own.
         // The `with` in place of `=` is what says so, and it is the whole
@@ -1567,22 +1567,24 @@ let parse (src : string) : ParseResult =
             if s.IsOp ":" then
                 vecAdd acc (s.Bump ())
                 vecAdd acc (parseType mcol)
-                // trailing constraints: `... : int when Pinnable<'a>` — the
-                // same WhenDecl a let signature carries, so the member's
-                // walk can skip the node and constraintOf can read it. Left
-                // as bare tokens, `Pinnable` and `'a` land among the
-                // pre-`=` identifiers and the member loses its NAME.
-                while s.IsKw "when" && (s.SameLine || s.CurCol > mcol) do
-                    if (s.Peek 1).Kind = Ident then vecAdd acc (parseWhen false mcol)
-                    else
-                        // F#-style variable constraint (`when 'm : Monad`):
-                        // its tokens, in their own node
-                        let cons = vecNew<Green> ()
+            // trailing constraints — after the ascription (`... : int when
+            // Pinnable<'a>`) or standing alone (`static member Identity
+            // when Num<'a> = ...`). The same WhenDecl a let signature
+            // carries, so the member's walk can skip the node and
+            // constraintOf can read it. Left as bare tokens, `Pinnable`
+            // and `'a` land among the pre-`=` identifiers and the member
+            // loses its NAME.
+            while s.IsKw "when" && (s.SameLine || s.CurCol > mcol) do
+                if (s.Peek 1).Kind = Ident then (for w__ in parseWhen false mcol do vecAdd acc w__)
+                else
+                    // F#-style variable constraint (`when 'm : Monad`):
+                    // its tokens, in their own node
+                    let cons = vecNew<Green> ()
+                    vecAdd cons (s.Bump ())
+                    while not s.AtEof && not (s.IsOp "=") && not (s.IsKw "when")
+                          && (s.SameLine || s.CurCol > mcol) do
                         vecAdd cons (s.Bump ())
-                        while not s.AtEof && not (s.IsOp "=") && not (s.IsKw "when")
-                              && (s.SameLine || s.CurCol > mcol) do
-                            vecAdd cons (s.Bump ())
-                        vecAdd acc (Green.node WhenDecl (vecToList cons))
+                    vecAdd acc (Green.node WhenDecl (vecToList cons))
             if s.IsKw "with"
                && (let p = s.Peek 1 in
                    p.Text = "get" || p.Text = "set" || p.Text = "inline"
@@ -1659,7 +1661,7 @@ let parse (src : string) : ParseResult =
                         vecAdd acc (s.Bump ())   // :>
                         vecAdd acc (parseType barCol)
                         vecAdd c (Green.node WhenDecl (vecToList acc))
-                    else vecAdd c (parseWhen false barCol)
+                    else for w__ in parseWhen false barCol do vecAdd c w__
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
                 vecAdd c (parseCasePayload barCol)
@@ -1772,19 +1774,29 @@ let parse (src : string) : ParseResult =
     /// `allowEq` is off in a `let`, where a trailing `=` opens the body
     /// rather than fixing an associated type. `with Result = 'a` still
     /// works there, and is unambiguous.
-    and parseWhen (allowEq : bool) (col : int) : Green =
-        let acc = vecNew<Green> ()
-        vecAdd acc (s.Bump ())   // when
-        vecAdd acc (parseClassHead col)
-        let mutable sawWith = false
-        if s.IsKw "with" then
-            sawWith <- true
-            vecAdd acc (s.Bump ())
-            if s.Is Ident then vecAdd acc (s.Bump ())
-        if s.IsOp "=" && (allowEq || sawWith) then
-            vecAdd acc (s.Bump ())
-            vecAdd acc (parseType col)
-        Green.node WhenDecl (vecToList acc)
+    /// One WhenDecl per constraint HEAD: `when A<'a> and B<'a>` is two
+    /// nodes, each carrying its keyword token (`when`, then `and`), so
+    /// constraintOf reads every head and the leaves still round-trip.
+    and parseWhen (allowEq : bool) (col : int) : Green list =
+        let out = vecNew<Green> ()
+        let one (kw : Green) : unit =
+            let acc = vecNew<Green> ()
+            vecAdd acc kw
+            vecAdd acc (parseClassHead col)
+            let mutable sawWith = false
+            if s.IsKw "with" then
+                sawWith <- true
+                vecAdd acc (s.Bump ())
+                if s.Is Ident then vecAdd acc (s.Bump ())
+            if s.IsOp "=" && (allowEq || sawWith) then
+                vecAdd acc (s.Bump ())
+                vecAdd acc (parseType col)
+            vecAdd out (Green.node WhenDecl (vecToList acc))
+        one (s.Bump ())   // when
+        while s.IsKw "and" && (s.SameLine || s.CurCol > col)
+              && ((s.Peek 1).Kind = Ident || (s.Peek 1).Text = "'") do
+            one (s.Bump ())   // and
+        vecToList out
 
     /// `class C<'a,'b>` / `instance C<int,int>` — head, context, then a body
     /// of associated types and members. Both shapes are identical; only the
@@ -1795,14 +1807,14 @@ let parse (src : string) : ParseResult =
         vecAdd acc (s.Bump ())   // class / instance
         vecAdd acc (parseClassHead col)
         while s.IsKw "when" && (s.SameLine || s.CurCol > col) do
-            vecAdd acc (parseWhen true col)
+            for w__ in parseWhen true col do vecAdd acc w__
         if s.IsOp "=" then vecAdd acc (s.Bump ())
         let mutable go = true
         while go && not s.AtEof && not s.SameLine && s.CurCol > col do
             let mark = s.Mark
             // `type Result` declares (or binds) an associated type; inside a
             // class body it needs no `static abstract` ceremony
-            if s.IsKw "when" then vecAdd acc (parseWhen true col)
+            if s.IsKw "when" then (for w__ in parseWhen true col do vecAdd acc w__)
             elif s.IsKw "type" || isMemberStart () then vecAdd acc (parseMember ())
             else go <- false
             if s.Mark = mark then go <- false
