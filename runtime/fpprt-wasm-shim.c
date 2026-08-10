@@ -32,7 +32,15 @@ void fpprt_register_type_s(uint32_t tid, uint32_t size, uint32_t kind,
  * which sits in fpprt's stable static memory — so a moving collection scans and
  * UPDATES the slots, and the mutator reads current addresses back. Slot 0 is
  * the scratch buffer; 1.. are string constants. */
-#define FPPRT_WASM_NROOTS 8192
+#define FPPRT_WASM_NROOTS 65536
 static fpprt_ref g_wasm_roots[FPPRT_WASM_NROOTS];
 uint32_t fpprt_wasm_roots_base(void) { return (uint32_t)(uintptr_t)g_wasm_roots; }
 void fpprt_wasm_roots_register(uint32_t n) { fpprt_add_static_roots(g_wasm_roots, n); }
+
+/* tid -> class-id table for the wasm-linear backend: the object header holds
+ * (tid<<1)|1 for the collector, but type tests and vtable dispatch want the
+ * language class-id. This fixed static table (raw ints, never scanned as
+ * pointers) maps one to the other; the mutator fills it at startup. */
+#define FPPRT_WASM_NTIDS 4096
+static uint32_t g_tid2cid[FPPRT_WASM_NTIDS];
+uint32_t fpprt_tid2cid_base(void) { return (uint32_t)(uintptr_t)g_tid2cid; }
