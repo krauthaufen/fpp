@@ -1762,6 +1762,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match Classes.select classes ((dictTryFind eagerSeats offset).IsSome) c.Class c.Args c.Assoc with
                 | Classes.Solved (inst, sub) ->
                     progress <- true
+                    // an instance variable that appears only in the CONTEXT
+                    // or an associated type — 'c in `when Add<'a,'b> = 'c` —
+                    // is not bound by the head match, so it is missing from
+                    // `sub`. Left alone it is ONE variable shared by every
+                    // use of the instance: the first use's element type
+                    // leaked into all later ones. Freshen it per use, which
+                    // is what "freshened per match" always meant.
+                    let scanExtra (t : Type) : unit =
+                        for v in freeVars t do
+                            if (dictTryFind sub v.Id).IsNone then dictSet sub v.Id (st.Fresh ())
+                    for _, it in inst.Assoc do scanExtra it
+                    for ctx in inst.Context do
+                        for a2 in ctx.Args do scanExtra a2
+                        for _, at2 in ctx.Assoc do scanExtra at2
                     for n, ty in c.Assoc do
                         match inst.Assoc |> List.tryFind (fun (an, _) -> an = n) with
                         | Some (_, it) -> unifyAt offset ty (Classes.substInst sub it)

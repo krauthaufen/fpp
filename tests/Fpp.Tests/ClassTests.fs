@@ -1961,6 +1961,22 @@ let resolutionRuleTests =
             System.IO.File.Delete tmp
             Expect.equal out "999\n" "the copy at Mine runs Mine's instance"
         }
+        test "a context-bound variable is fresh at every use" {
+            // 'c lives only in the `when`, never in the head — the head
+            // match cannot bind it, and unfreshened it was ONE variable
+            // shared by every use: the first use's element type leaked
+            // into the second ("type mismatch: float32 vs int")
+            let out =
+                run [ "type V2<'a when Num<'a>> = { X : 'a; Y : 'a }"
+                      "instance Add<V2<'a>, V2<'b>> when Add<'a, 'b> = 'c"
+                      "    type Result = V2<'c>"
+                      "    static (+) a b = { X = a.X + b.X; Y = a.Y + b.Y }"
+                      "let t1 = { X = 1; Y = 2 } + { X = 3; Y = 4 }"
+                      "let t2 = { X = 10; Y = 20 } + { X = 30; Y = 40 }"
+                      "let a = print (string t1.X)"
+                      "let b = print (string t2.Y)" ]
+            Expect.equal out "4\n60\n" "two uses, independent element types"
+        }
         test "overlap with a unique most-specific instance still selects it" {
             // rule 2 kept as decided: overlap is fine as long as one
             // instance is strictly most specific at the use
