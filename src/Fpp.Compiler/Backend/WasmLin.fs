@@ -90,7 +90,12 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
-      mutable TidNext : int }
+      mutable TidNext : int
+      /// GC mode: each string constant's UTF-16 bytes, in root-slot order (its
+      /// slot is 1 + its index here; slot 0 is the scratch buffer). `Consts`
+      /// maps the source literal to its slot. Constants are allocated through
+      /// fpprt at startup and their pointers kept in the shim's root table.
+      GcConstData : Vec<byte[]> }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -110,6 +115,12 @@ let private CLO_KIND = 2
 // wasm-merge pass. Off = the standalone bump-allocator path (no collection).
 // Set by the CLI (`--gc`) before emission.
 let mutable gc = false
+
+// GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
+// raw SCALAR byte buffer, resolved by the driver before the runtime string and
+// print helpers are emitted (they bake the string tid as an immediate).
+let mutable private gcStrTid = 0
+let mutable private gcByteTid = 0
 
 // fpprt's reserved type-ids; the compiler numbers its own from here (mirrors
 // FPPRT_TID_FIRST in fpprt.h)
@@ -133,6 +144,8 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_frame_push" "$fppush" [ "i32" ] []
     importFn m "fpprt" "fpprt_frame_pop" "$fppop" [ "i32" ] []
     importFn m "fpprt" "fpprt_write_ref" "$fpwr" [ "i32"; "i32"; "i32" ] []
+    importFn m "fpprt" "fpprt_wasm_roots_base" "$rootsbase" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_wasm_roots_register" "$rootsreg" [ "i32" ] []
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -193,6 +206,24 @@ let private internStr (st : St) (s : string) : int =
         st.ConstNext <- st.ConstNext + total + pad
         dictSet st.Consts s addr
         addr
+
+// GC: assign a string constant its root-table slot (1-based; slot 0 is the
+// scratch buffer) and record its UTF-16 bytes for startup allocation. No data
+// segment — constants become fpprt objects kept alive by the root table.
+let private internStrGc (st : St) (s : string) : int =
+    match dictTryFind st.Consts s with
+    | Some slot -> slot
+    | None ->
+        let slot = 1 + vecLen st.GcConstData
+        vecAdd st.GcConstData (Fpp.Backend.BinDriver.unescape s)
+        dictSet st.Consts s slot
+        slot
+
+// a string constant as a value: standalone bakes it at a fixed address; GC
+// loads its (possibly relocated) pointer from the root table
+let private lowStrConst (st : St) (s : string) : LExpr =
+    if gc then LLoad (W, LGetGlobal "$roots", 4 * internStrGc st s)
+    else LConstW (internStr st s)
 
 // ---- tag helpers (operate on the wasm stack) ------------------------------
 let private tagi (f : Fn) : unit =           // i32 int -> tagged
@@ -336,6 +367,15 @@ let private emitLalloc (m : Mod) : unit =
     lg f "$p"
     endFn f
 
+// a scratch address: a fixed low offset in the standalone path, or `$sbuf`
+// (the fpprt-allocated scratch buffer) plus that offset in GC mode, where no
+// fixed low memory is ours.
+let private saddr (f : Fn) (n : int) : unit =
+    if gc then
+        gg f "$sbuf"
+        if n <> 0 then (ic f n; ins f "i32.add")
+    else ic f n
+
 // $str_of_int(tagged): decimal, with a leading '-' for negatives.
 let private emitStrOfInt (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
@@ -358,15 +398,20 @@ let private emitStrOfInt (m : Mod) : unit =
     lg f "$t"; ic f 10; ins f "i32.div_u"; ls f "$t"
     lg f "$d"; ic f 1; ins f "i32.add"; ls f "$d"
     br f "$dl"; endB f; endB f
-    // total units = d + neg ; alloc 8 + 2*units (align inside lalloc)
-    ic f 8
-    lg f "$d"; lg f "$neg"; ins f "i32.add"; ic f 1; ins f "i32.shl"
-    ins f "i32.add"
-    callf f "$lalloc"; ls f "$p"
-    // header: kind=1, len = d+neg
-    lg f "$p"; ic f 1; mem f "i32.store"
-    lg f "$p"; ic f 4; ins f "i32.add"
-    lg f "$d"; lg f "$neg"; ins f "i32.add"; mem f "i32.store"
+    // total units = d + neg. GC: fpprt_alloc_array writes the tag and length;
+    // standalone: bump-alloc 8 + 2*units and write the header + length here.
+    if gc then
+        ic f gcStrTid
+        lg f "$d"; lg f "$neg"; ins f "i32.add"
+        callf f "$fpallocn"; ls f "$p"
+    else
+        ic f 8
+        lg f "$d"; lg f "$neg"; ins f "i32.add"; ic f 1; ins f "i32.shl"
+        ins f "i32.add"
+        callf f "$lalloc"; ls f "$p"
+        lg f "$p"; ic f 1; mem f "i32.store"
+        lg f "$p"; ic f 4; ins f "i32.add"
+        lg f "$d"; lg f "$neg"; ins f "i32.add"; mem f "i32.store"
     // write digits back to front into [p+8 .. )
     // w = p + 8 + 2*(neg + d - 1)  (last digit slot)
     lg f "$p"; ic f 8; ins f "i32.add"
@@ -431,8 +476,11 @@ let private emitPrints (m : Mod) : unit =
     let f = beginFn m [ "$s" ]
     local f "$len" "i32"; local f "$i" "i32"; local f "$w" "i32"; local f "$u" "i32"
     localsDone f
+    // GC: the scratch buffer may have moved since the last print — reload its
+    // current address from the root table
+    if gc then (gg f "$roots"; mem f "i32.load"; ic f 8; ins f "i32.add"; gs f "$sbuf")
     lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
-    ic f PRINTBUF; ls f "$w"
+    saddr f PRINTBUF; ls f "$w"
     ic f 0; ls f "$i"
     blockE f "$pc"; loopE f "$pl"
     lg f "$i"; lg f "$len"; ins f "i32.ge_u"; brIf f "$pc"
@@ -460,9 +508,9 @@ let private emitPrints (m : Mod) : unit =
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$pl"; endB f; endB f
     // iovec = (PRINTBUF, w - PRINTBUF); fd_write(1, IOV, 1, NWRITTEN)
-    ic f IOV_PTR; ic f PRINTBUF; mem f "i32.store"
-    ic f IOV_LEN; lg f "$w"; ic f PRINTBUF; ins f "i32.sub"; mem f "i32.store"
-    ic f 1; ic f IOV_PTR; ic f 1; ic f NWRITTEN
+    saddr f IOV_PTR; saddr f PRINTBUF; mem f "i32.store"
+    saddr f IOV_LEN; lg f "$w"; saddr f PRINTBUF; ins f "i32.sub"; mem f "i32.store"
+    ic f 1; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN
     callf f "$fd_write"; ins f "drop"
     endFn f
 
@@ -866,7 +914,7 @@ let rec private discover (st : St) (e : Expr) : unit =
 // only settle once every constant is counted
 let rec private scanConsts (st : St) (e : Expr) : unit =
     match e with
-    | ELit (LString s) -> internStr st s |> ignore
+    | ELit (LString s) -> (if gc then internStrGc st s else internStr st s) |> ignore
     | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> scanConsts st a; scanConsts st b
     | EIf (a, b, c) | EIndexSet (_, a, b, c) -> scanConsts st a; scanConsts st b; scanConsts st c
     | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do scanConsts st x
@@ -980,7 +1028,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
-    | ELit (LString s) -> LConstW (internStr st s)
+    | ELit (LString s) -> lowStrConst st s
     | EVar (v, _) | EVarI (v, _, _) -> lowVarByKey ctx (key v)
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
@@ -1339,7 +1387,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
          | _ -> [])
     | PLit (LString raw) ->
         // a string pattern is a value compare: $streq returns 1 when equal
-        [ LBreakIf (fail, LPrim (EqW, [ LCall ("$streq", [ sc; LConstW (internStr st raw) ]); LConstW 0 ])) ]
+        [ LBreakIf (fail, LPrim (EqW, [ LCall ("$streq", [ sc; lowStrConst st raw ]); LConstW 0 ])) ]
     | POr alts ->
         // try each alternative in its own block; a match breaks past the rest
         // to $por, a mismatch falls to the next. All alternatives bind the same
@@ -1689,7 +1737,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
-          Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST }
+          Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
+          GcConstData = vecNew () }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1753,6 +1802,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let arities = st.Funcs |> dictPairs |> List.map snd |> List.distinct
     for a in arities do
         tyFunc m ("$lfn" + string a) (List.replicate a "i32") [ "i32" ]
+    // GC: reserve the string and scratch-byte type-ids up front (eagerly
+    // registered) so the hand-emitted string/print helpers can bake the string
+    // tid as an immediate and $fpreg_all can allocate the scratch buffer.
+    if gc then
+        gcStrTid <- gcTid st "str" 2 FK_SCALAR_ARRAY 0
+        gcByteTid <- gcTid st "byte" 1 FK_SCALAR_ARRAY 0
     rtDeclsLin m
     for d in decls do
         match d with
@@ -1815,6 +1870,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         emitByte st.ConstData ((w >>> 16) &&& 0xFF); emitByte st.ConstData ((w >>> 24) &&& 0xFF)
     st.ConstNext <- st.ConstNext + 4 * (nCid * st.NSlots)
     globalI32Mut m "$hp" st.ConstNext
+    // GC: base of the shim's root table, and of the fpprt-allocated scratch
+    // buffer (I/O iovec + UTF-8 staging + float formatting); filled at startup
+    if gc then globalI32Mut m "$roots" 0
+    if gc then globalI32Mut m "$sbuf" 0
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
@@ -1854,13 +1913,36 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // TAGGED tracer's first-payload word (0 for a no-ref STRUCT box).
     if gc then
         let rf = beginFn m []
+        local rf "$t" "i32"
         localsDone rf
+        // the root table lives in fpprt's static memory: register the whole
+        // range (scratch slot 0 + one per constant) up front — the slots read 0
+        // (skipped by the scanner) until filled below
+        callf rf "$rootsbase"; gs rf "$roots"
+        ic rf (1 + vecLen st.GcConstData); callf rf "$rootsreg"
+        // register every shape's fpprt type
         for tid, size, kind, start in vecToList st.TidRegs do
             ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
             callf rf "$fpreg"
+        // scratch buffer (iovec + PRINTBUF + FMTBUF) -> root slot 0; $sbuf points
+        // past its [tag][len] header so the fixed offsets apply unchanged. Kept
+        // in the root table so a moving collection updates it.
+        ic rf gcByteTid; ic rf (PRINTBUF + PRINTCAP + FMTCAP + 64); callf rf "$fpallocn"; ls rf "$t"
+        gg rf "$roots"; lg rf "$t"; mem rf "i32.store"
+        lg rf "$t"; ic rf 8; ins rf "i32.add"; gs rf "$sbuf"
+        // each string constant -> a fresh fpprt string in its root slot, units
+        // written one at a time (no data segment is ours under GC)
+        st.GcConstData |> vecToList |> List.iteri (fun i ub ->
+            let nunits = ub.Length / 2
+            ic rf gcStrTid; ic rf nunits; callf rf "$fpallocn"; ls rf "$t"
+            for j in 0 .. nunits - 1 do
+                lg rf "$t"; ic rf (8 + 2 * j); ins rf "i32.add"
+                ic rf ((int ub.[2 * j]) ||| ((int ub.[2 * j + 1]) <<< 8)); mem rf "i32.store16"
+            gg rf "$roots"; ic rf (4 * (i + 1)); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store")
         endFn rf
-    // bake the constant data at CONST_BASE; $hp already starts after it
-    activeData m CONST_BASE (bytesToArray st.ConstData)
+    // bake the constant data at CONST_BASE (standalone only; GC has no data
+    // segment of its own — constants are fpprt objects built at startup)
+    if not gc then activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
     let bytes = assembleWith m pages st.UsesExn ""
     bytes, vecToList st.Errors
