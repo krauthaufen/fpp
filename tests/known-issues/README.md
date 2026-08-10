@@ -18,6 +18,14 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
+* `generic-instance-operator-body.fpp` — a generic instance whose body
+  applies a class operator (`+`) to the instance's own type variable
+  compiles clean and traps (`toi` cast failure): the operator lowers to
+  the int primitive instead of riding to the per-type copy. Named
+  members in the same position work; a generic `let` with the same
+  operator works. The diagnosis at the top of the file marks the
+  boundary. Concrete per-type instances are the working shape meanwhile.
+
 Fixed and removed (see git history for the repros):
 `generic-class-through-interface` (the Enumerator shape: the enclosing
 member is not layout-dependent, so its call classified CANON and ran the
