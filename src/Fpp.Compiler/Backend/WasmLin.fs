@@ -120,6 +120,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_cat" "$lt_ii2i"
     declFn m "$prints" "$lt_i2v"
     declFn m "$ftoa6" "$lt_i2i"
+    declFn m "$streq" "$lt_ii2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -352,6 +353,30 @@ let private emitPrints (m : Mod) : unit =
     callf f "$fd_write"; ins f "drop"
     endFn f
 
+// $streq(a, b): value equality of two strings. 1 when equal, 0 otherwise —
+// same pointer short-circuits, then length, then unit-by-unit. String
+// PATTERNS (`match name with "i32.add" -> …`) compile to this.
+let private emitStreq (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$la" "i32"; local f "$i" "i32"
+    localsDone f
+    lg f "$a"; lg f "$b"; ins f "i32.eq"
+    ifE f; ic f 1; ins f "return"; endB f
+    lg f "$a"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$la"
+    lg f "$la"; lg f "$b"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.ne"
+    ifE f; ic f 0; ins f "return"; endB f
+    ic f 0; ls f "$i"
+    blockE f "$sc"; loopE f "$sl"
+    lg f "$i"; lg f "$la"; ins f "i32.ge_u"; brIf f "$sc"
+    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ins f "i32.ne"
+    ifE f; ic f 0; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$sl"; endB f; endB f
+    ic f 1
+    endFn f
+
 // operators arrive with a type-kind suffix (`+i`, `<>i`, `=l`); slice 1 is
 // int-only, so strip a trailing kind letter to recover the base operator
 let private baseOp (op : string) : string =
@@ -507,75 +532,6 @@ let private intCmpOp (b : string) : LOp =
     | "=" -> EqW
     | _ -> NeW
 
-// can this pattern be compiled by lowPatTest?
-let rec private patSupported (p : Pat) : bool =
-    match p with
-    | PWild | PVar _ -> true
-    | PLit (LInt _) | PLit (LBool _) | PLit LUnit -> true
-    | PAs (inner, _, _) -> patSupported inner
-    | PCtor (_, _, subs) -> List.forall patSupported subs
-    | PTuple subs -> List.forall patSupported subs
-    | PCons (a, b) -> patSupported a && patSupported b
-    | PListLit [] -> true
-    // non-empty list literals, or-patterns, `:?` type tests, string/float/char
-    // literal patterns still fall back
-    | _ -> false
-
-// is this whole expression inside the LowIR subset? (called on a function body
-// before choosing the IR path; a false anywhere falls the function back to the
-// hand-lowering). Nested lambda BODIES are not walked — they lower on the
-// lifted path — but constructing a lambda (the closure) here is supported.
-let rec private lowSupported (st : St) (e : Expr) : bool =
-    let allS (xs : Expr list) : bool = List.forall (lowSupported st) xs
-    match e with
-    | ELit (LInt _) | ELit (LFloat _) | ELit (LBool _) | ELit LUnit | ELit LNull | ELit (LString _) -> true
-    | EVar (v, _) | EVarI (v, _, _) ->
-        // params, lets and globals are fine; a bare top-level function used as
-        // a first-class value is not (only direct calls are supported)
-        (dictTryFind st.Funcs (key v)).IsNone
-    | ELet (_, _, _, a, b) -> lowSupported st a && lowSupported st b
-    | ESeq xs -> allS xs
-    | EIf (a, b, c) -> lowSupported st a && lowSupported st b && lowSupported st c
-    | EWhile (a, b) -> lowSupported st a && lowSupported st b
-    | EAssign (_, x) -> lowSupported st x
-    | ETuple xs | EListLit xs -> allS xs
-    | ERecord (_, fs) -> List.forall (fun (_, v) -> lowSupported st v) fs
-    | ERecordExt (_, b, fs) -> lowSupported st b && List.forall (fun (_, v) -> lowSupported st v) fs
-    | ECtor (_, _, args) -> allS args
-    | EField (r, _, _) | EArrayLen (_, r) -> lowSupported st r
-    | EFieldSet (r, _, _, v) -> lowSupported st r && lowSupported st v
-    | EArray (_, xs) -> allS xs
-    | EIndex (_, a, b) -> lowSupported st a && lowSupported st b
-    | EIndexSet (_, a, b, c) -> lowSupported st a && lowSupported st b && lowSupported st c
-    | EArrayCreate (_, a, b) -> lowSupported st a && lowSupported st b
-    | EMatch (scrut, clauses) ->
-        lowSupported st scrut
-        && List.forall (fun (p, g, b) ->
-            patSupported p
-            && (match g with Some x -> lowSupported st x | None -> true)
-            && lowSupported st b) clauses
-    | ELam (_, _) -> true
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
-        when (dictTryFind st.Funcs (key v)) = Some (List.length args) -> allS args
-    | EPrim ("u-f", [ a ]) -> lowSupported st a
-    | EPrim (op, [ a; b ]) ->
-        (op = "+t" || op = "::"
-         || List.contains (baseOp op) [ "+"; "-"; "*"; "/"; "%"; "<"; ">"; "<="; ">="; "="; "<>" ])
-        && lowSupported st a && lowSupported st b
-    | EPrim (_, _) -> false
-    | EApp (EUnknown "prints", [ a ]) -> lowSupported st a
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> lowSupported st a
-    | EApp (EUnknown "fixed6", [ a ]) -> lowSupported st a
-    | EApp (EUnknown "isNull", [ a ]) -> lowSupported st a
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int64#" || n.StartsWith "int64#"
-                                    || ((n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32")) -> lowSupported st a
-    | EApp (EUnknown ("failwith" | "raise" | "invalidArg" | "invalidOp" | "nullArg"), args) -> allS args
-    | EApp (EUnknown n, _) when n.StartsWith "$zero" -> true
-    | EUnknown n when n.StartsWith "$zero" -> true
-    | EApp (EUnknown _, _) -> false
-    | EApp (g, args) -> lowSupported st g && allS args
-    | _ -> false
-
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
@@ -589,6 +545,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
          | true, d -> lowBoxF ctx (LConstF d)
          | _ -> lowInt 0)
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
+    | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> LConstW (internStr st s)
     | EVar (v, _) | EVarI (v, _, _) -> lowVarByKey ctx (key v)
@@ -729,6 +686,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 LBlock ("$mnext", tests @ guardStmt @ [ LSet (wReg mr, coreToLowE ctx body); LBreak "$mdone" ]))
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
+    | ECast (_, e2, false) ->
+        // `:>` static widening: viewing a value as a supertype does not change
+        // its representation, so the cast is the identity
+        coreToLowE ctx e2
     | _ -> err st "wasm-linear LowIR: node outside subset reached emission"; lowInt 0
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
@@ -809,6 +770,28 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
         :: (LSet (wReg th, LLoad (W, sc, 0)) :: lowPatTest ctx th fail h)
         @ (LSet (wReg tt, LLoad (W, sc, 4)) :: lowPatTest ctx tt fail tl)
     | PListLit [] -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
+    | PListLit (x :: rest) ->
+        // an exact list literal [a; b; …] is a :: b :: … :: []
+        lowPatTest ctx scrutReg fail (PCons (x, PListLit rest))
+    | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
+    | PLit LNull -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
+    | PLit (LFloat s) ->
+        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
+         | true, d -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF d ])) ]
+         | _ -> [])
+    | PLit (LString raw) ->
+        // a string pattern is a value compare: $streq returns 1 when equal
+        [ LBreakIf (fail, LPrim (EqW, [ LCall ("$streq", [ sc; LConstW (internStr st raw) ]); LConstW 0 ])) ]
+    | POr alts ->
+        // try each alternative in its own block; a match breaks past the rest
+        // to $por, a mismatch falls to the next. All alternatives bind the same
+        // identities, and freshReg's per-VarId reuse makes their slots agree.
+        let n = List.length alts
+        let nonLast =
+            alts |> List.mapi (fun j alt -> j, alt) |> List.filter (fun (j, _) -> j < n - 1)
+            |> List.map (fun (_, alt) -> LBlock ("$palt", lowPatTest ctx scrutReg "$palt" alt @ [ LBreak "$por" ]))
+        let last = match List.rev alts with a :: _ -> lowPatTest ctx scrutReg fail a | [] -> []
+        [ LBlock ("$por", nonLast @ last) ]
     | _ -> [ LTrap ]
 
 // resolve a variable by its (path:offset) key: a local/param register, a
@@ -1120,7 +1103,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     globalI32Mut m "$hp" st.ConstNext
     exportFn m "_start" "$_start"
     // runtime bodies
-    emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m
+    emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

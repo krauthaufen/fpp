@@ -220,6 +220,7 @@ let opByte (name : string) : int =
     | "unreachable" -> 0x00
     | "nop" -> 0x01
     | "throw" -> 0x08
+    | "return" -> 0x0F
     | "drop" -> 0x1A
     | "select" -> 0x1B
     | "i32.eqz" -> 0x45 | "i32.eq" -> 0x46 | "i32.ne" -> 0x47

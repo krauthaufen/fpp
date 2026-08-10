@@ -95,11 +95,49 @@ list-literal patterns, array pinning — remain genuinely unimplemented on
 wasm-linear. Implementing them is new work (a wasm exception model, a vtable
 lowering), but now there is only ONE place to add it.
 
-## The road
+## Completing the backend (the current push)
 
-1. **Implement the still-missing nodes** in Core→LowIR — exceptions, typeclass
-   dispatch (vtables), casts / type tests, or-patterns, pinning. New machinery,
-   not ports, but a single lowering to grow.
+The goal is now to make the wasm-linear backend, through LowIR, handle the
+WHOLE language — so the C backend can be dropped once this proves out. LowIR
+stays wasm-only; it is NOT retargeted to C.
+
+**Landed:** or-patterns (`POr`, nested blocks), exact list-literal patterns
+(`[a; b]` → nested cons), char / null / float / string literal patterns
+(strings via a new `$streq` runtime — value equality by length then units),
+char-literal expressions, and `:>` widening casts (identity in the tagged
+model). `return` (opcode 0x0F) added to the assembler.
+
+**Still missing — the two big pieces:**
+
+- **A descriptor / vtable type system** for interface dispatch (`EIfaceCall`),
+  type tests (`ETypeTest`, `PTypeTest`) and downcasts (`ECast … true`). The
+  reference (BinDriver, wasm-GC) gets runtime type info free from typed refs;
+  linear memory has none, so it must be explicit. Design derived from the
+  reference: give each dispatch-participating object a DESCRIPTOR pointer at
+  word 0 — a static structure `[class-id : i32][vtable slot : i32 …]` baked
+  into the data segment, the slot holding a function table-index for
+  `call_indirect`. `EIfaceCall` = obj[0]→desc→desc[1+slot]→call_indirect;
+  `ETypeTest`/`ECast` = obj[0]→desc→desc[0] compared against the valid class-id
+  set (`SubsOf`/`ImplsOf`). The invasive part is the word-0 header shifting
+  every field/tag/element offset — decide universal header vs. only
+  dispatch-participating types. This is the largest remaining slice.
+
+- **Exceptions** (`ETry`, real `raise`). The reference uses the wasm EH
+  proposal (`try_table` / `throw` / tags); wasmtime supports it (the oracle
+  runs `-W exceptions=y`). The linear leg would emit the same and enable EH at
+  run time; `failwith`/`raise` currently just trap.
+
+**Smaller:** array pinning (`EArrayPin`/`Unpin`/`Bytes`) needs packed/POD
+arrays (the linear backend boxes elements today); remaining `EUnknown`
+intrinsics (`print`/`printb`/`printc`/`printu`, cells, monitor/parallel ops).
+
+The end-state test is self-hosting on `--lowir`: compiling the compiler itself
+through the linear backend. That needs all of the above (the compiler leans on
+typeclasses and exceptions heavily).
+
+## The rest of the road
+
+1. **Implement the still-missing nodes** (above) in Core→LowIR.
 2. **A liveness register allocator** over `LReg` → wasm local slots, replacing
    one-local-per-register. This is the wasm backend's only real allocation
    work; C needs none.

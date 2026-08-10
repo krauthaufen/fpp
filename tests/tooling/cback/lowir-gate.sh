@@ -100,6 +100,31 @@ let describe (o : int option) =
     | Some v -> printfn "got %d" v
     | None -> printfn "nothing"
 let r22 = describe (Some 7)
+let sized (n : int) : string =
+    match n with
+    | 0 | 1 | 2 -> "small"
+    | _ -> "big"
+let opcode (s : string) : int =
+    match s with
+    | "add" -> 1
+    | "sub" -> 2
+    | _ -> 0
+let digitval (c : char) : int =
+    match c with
+    | '0' -> 0
+    | '7' -> 7
+    | _ -> 0 - 1
+let pairsum (l : int list) : int =
+    match l with
+    | [ a; b ] -> a + b
+    | _ -> 0 - 1
+let r23 = printfn "%s" (sized 1)
+let r24 = printfn "%s" (sized 9)
+let r25 = printfn "%d" (opcode "sub")
+let r26 = printfn "%d" (opcode "zzz")
+let r27 = printfn "%d" (digitval '7')
+let r28 = printfn "%d" (pairsum [ 4; 5 ])
+let r29 = printfn "%d" (pairsum [ 1; 2; 3 ])
 FPP
 
 # emit through LowIR (the sole wasm-linear lowering)
