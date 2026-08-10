@@ -79,7 +79,11 @@ type private St =
       TestIds : Dict<string, int list>
       /// set when the program throws or catches, so the module declares the
       /// exception tag and asks the assembler for the tag section
-      mutable UsesExn : bool }
+      mutable UsesExn : bool
+      /// keys of let-bound mutables that a closure captures: they live in a
+      /// heap CELL (a 1-word box) so the capture shares the mutation. Reads
+      /// dereference, writes store, the capture passes the pointer.
+      CellVars : Dict<string, bool> }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -530,6 +534,49 @@ let private baseOp (op : string) : string =
         else op
     else op
 
+// which let-bound mutables need a heap cell: those that are ASSIGNED and also
+// referenced INSIDE a lambda (captured). A top-level function's outermost
+// lambda IS the function, not a capture boundary, so its params are skipped.
+let private cellScan (decls : Decl list) : Dict<string, bool> =
+    let letBound = dictNew<string, bool> ()
+    let assigned = dictNew<string, bool> ()
+    let inLambda = dictNew<string, bool> ()
+    let rec go (depth : int) (e : Expr) : unit =
+        let g = go depth
+        match e with
+        | EVar (v, _) | EVarI (v, _, _) -> if depth > 0 then dictSet inLambda (key v) true
+        | ELam (_, b) -> go (depth + 1) b
+        | EAssign (v, x) ->
+            dictSet assigned (key v) true
+            (if depth > 0 then dictSet inLambda (key v) true)
+            g x
+        | ELet (_, v, _, EApp (EUnknown "$forcecell", [ r ]), b) ->
+            dictSet letBound (key v) true; dictSet assigned (key v) true; dictSet inLambda (key v) true; g r; g b
+        | ELet (_, v, _, r, b) -> dictSet letBound (key v) true; g r; g b
+        | EApp (fn, args) -> g fn; List.iter g args
+        | EIf (a, b, c) -> g a; g b; g c
+        | EMatch (s, cs) | ETry (s, cs) ->
+            g s
+            for _, gd, b in cs do (match gd with Some gd -> g gd | None -> ()); g b
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) -> List.iter g xs
+        | ERecord (_, fs) -> for _, v in fs do g v
+        | ERecordExt (_, b, fs) -> g b; (for _, v in fs do g v)
+        | EField (r, _, _) -> g r
+        | EFieldSet (r, _, _, v) -> g r; g v
+        | EWhile (c, b) -> g c; g b
+        | EIndex (_, a, i) -> g a; g i
+        | EIndexSet (_, a, i, v) -> g a; g i; g v
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> g a
+        | EArrayCreate (_, n, v) -> g n; g v
+        | EIfaceCall (_, _, recv, args) -> g recv; List.iter g args
+        | _ -> ()
+    let skipParams (e : Expr) : Expr = match e with ELam (_, b) -> b | _ -> e
+    for d in decls do match d with DLet (_, _, _, e) -> go 0 (skipParams e) | _ -> ()
+    let cells = dictNew<string, bool> ()
+    for k, _ in dictPairs assigned do
+        if (dictTryFind letBound k).IsSome && (dictTryFind inLambda k).IsSome then dictSet cells k true
+    cells
+
 // ---- lambda lifting -------------------------------------------------------
 // the variables a pattern binds (so a match/try arm's binders shadow the
 // captured set); mirrors the shape lowPatTest binds
@@ -749,7 +796,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EVar (v, _) | EVarI (v, _, _) -> lowVarByKey ctx (key v)
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
-        LDo ([ LSet (wReg id, coreToLowE ctx rhs) ], coreToLowE ctx body)
+        let init = if (dictTryFind st.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
+        LDo ([ LSet (wReg id, init) ], coreToLowE ctx body)
     | ESeq xs ->
         let rec go (xs : Expr list) : LExpr =
             match xs with
@@ -869,6 +917,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    // cells: $cellof yields the cell POINTER (its storage, no deref); $cellget
+    // reads through it; $cellset writes; $forcecell is a marker
+    | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
+    | EApp (EUnknown "$cellget", [ c ]) -> LLoad (W, coreToLowE ctx c, 0)
+    | EApp (EUnknown "$cellset", [ c; v ]) -> LDo ([ LStore (W, coreToLowE ctx c, 0, coreToLowE ctx v) ], lowInt 0)
+    | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
     | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> lowTag (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
     | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> lowTag (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
     | EApp (EUnknown "$str.Contains", [ s; p ]) ->
@@ -980,14 +1034,16 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | ESeq xs -> List.collect (coreToLowS ctx) xs
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
-        LSet (wReg id, coreToLowE ctx rhs) :: coreToLowS ctx body
+        let init = if (dictTryFind ctx.LSt.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
+        LSet (wReg id, init) :: coreToLowS ctx body
+    | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
+        // a captured mutable: store into its cell (shared with the closure)
+        [ LStore (W, lowVarStore ctx (key v), 0, coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
          | Some id -> [ LSet (wReg id, coreToLowE ctx rhs) ]
          | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ]
-         // a mutable captured by a closure needs a heap CELL (like the wasm-GC
-         // backend's $cellof/$cellset); not yet handled — report, don't crash
-         | None -> err ctx.LSt ("wasm-linear LowIR: assignment to captured mutable " + v.Name); [ LEval (coreToLowE ctx rhs) ])
+         | None -> err ctx.LSt ("wasm-linear LowIR: assignment to unbound " + v.Name); [ LEval (coreToLowE ctx rhs) ])
     | EIf (c, a, b) -> [ LIf (lowUntag (coreToLowE ctx c), coreToLowS ctx a, coreToLowS ctx b) ]
     | EWhile (c, b) -> [ LWhile (lowUntag (coreToLowE ctx c), coreToLowS ctx b) ]
     | ELit LUnit -> []
@@ -1083,10 +1139,10 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PTypeTest tn -> [ LBreakIf (fail, LPrim (EqW, [ lowTypeTest ctx tn sc; LConstW 0 ])) ]
     | _ -> [ LTrap ]
 
-// resolve a variable by its (path:offset) key: a local/param register, a
-// captured free variable read from the env (when lowering a lifted lambda
-// body), or a module global — the LowIR counterpart of emitVarByKey
-and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
+// the raw STORAGE a variable occupies: a local/param register, an env slot (in
+// a lifted lambda body), or a module global. For a cell var this content is the
+// CELL POINTER; for an ordinary var it is the value itself.
+and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     let st = ctx.LSt
     match dictTryFind ctx.Regs k with
     | Some id -> LGet (wReg id)
@@ -1098,6 +1154,18 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
             | None -> err st ("wasm-linear LowIR: unresolved variable " + k); lowInt 0
 
+// read a variable: dereference the cell for a captured mutable, else the
+// storage content directly
+and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
+    let store = lowVarStore ctx k
+    if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, 0) else store
+
+// a fresh 1-word cell holding `v` (headerless — cells are internal, never
+// type-tested or dispatched on)
+and private lowMkCell (ctx : LowCtx) (v : LExpr) : LExpr =
+    let b = freshTmp ctx
+    LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
+
 // build a closure object [kind=2][code-index][captures…]; its layout and the
 // (env, arg) calling convention match the hand path, so a LowIR-built closure
 // interoperates with a lifted body emitted by `lower` and vice versa
@@ -1108,7 +1176,9 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
         |> Option.defaultValue []
     LConstW CLO_KIND
     :: LConstW (tblIdx st.M name)
-    :: (caps |> List.map (fun (p, o) -> lowVarByKey ctx (p + ":" + string o)))
+    // capture the STORAGE, not the dereferenced value: for a cell var that is
+    // the shared pointer, so mutation is visible on both sides
+    :: (caps |> List.map (fun (p, o) -> lowVarStore ctx (p + ":" + string o)))
     |> lowObj ctx CID_CLOSURE
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
@@ -1399,7 +1469,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Captures = dictNew ()
           RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
-          SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false }
+          SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
+          CellVars = cellScan decls0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
