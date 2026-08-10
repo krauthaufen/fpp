@@ -174,6 +174,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_find" "$lt_iii2i"
     declFn m "$strsub" "$lt_iii2i"
     declFn m "$str_trim" "$lt_i2i"
+    declFn m "$hashv" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -550,6 +551,49 @@ let private emitStrTrim (m : Mod) : unit =
     lg f "$j"; ic f 1; ins f "i32.sub"; ls f "$j"
     br f "$el"; endB f; endB f
     lg f "$s"; lg f "$i"; lg f "$j"; lg f "$i"; ins f "i32.sub"; callf f "$strsub"
+    endFn f
+
+// $hashv(v): a structural hash matching the wasm-GC backend's $hashv exactly
+// (so a dictionary keyed the same way iterates the same order). A tagged int
+// hashes to itself; a string is the SAMPLED FNV (offset 0x811c9dc5, prime
+// 0x01000193, up to four units from each end); an array to its length; the
+// wide boxes to their bit pattern folded to 32; other objects to the class-id.
+let private emitHashv (m : Mod) : unit =
+    let f = beginFn m [ "$v" ]
+    local f "$h" "i32"; local f "$n" "i32"; local f "$i" "i32"; local f "$cid" "i32"; local f "$b" "i64"
+    localsDone f
+    lg f "$v"; ic f 1; ins f "i32.and"
+    ifE f; lg f "$v"; ic f 1; ins f "i32.shr_s"; ins f "return"; endB f
+    lg f "$v"; mem f "i32.load"; ls f "$cid"
+    lg f "$cid"; ic f CID_STRING; ins f "i32.eq"
+    ifE f
+    lg f "$v"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    lg f "$n"; ic f -2128831035; ins f "i32.xor"; ls f "$h"
+    ic f 0; ls f "$i"
+    blockE f "$hd"; loopE f "$hgo"
+    lg f "$i"; ic f 4; ins f "i32.ge_u"; brIf f "$hd"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_u"; brIf f "$hd"
+    lg f "$h"
+    lg f "$v"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ins f "i32.xor"; ic f 16777619; ins f "i32.mul"
+    lg f "$v"; ic f 8; ins f "i32.add"; lg f "$n"; ic f 1; ins f "i32.sub"; lg f "$i"; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ins f "i32.xor"; ic f 16777619; ins f "i32.mul"
+    ls f "$h"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$hgo"; endB f; endB f
+    lg f "$h"; ins f "return"
+    endB f
+    lg f "$cid"; ic f CID_ARRAY; ins f "i32.eq"
+    ifE f; lg f "$v"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ins f "return"; endB f
+    lg f "$cid"; ic f CID_FLOAT; ins f "i32.eq"
+    ifE f
+    lg f "$v"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ins f "i64.reinterpret_f64"; ls f "$b"
+    lg f "$b"; ins f "i32.wrap_i64"; lg f "$b"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ins f "return"
+    endB f
+    lg f "$cid"; ic f CID_INT64; ins f "i32.eq"
+    ifE f
+    lg f "$v"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$b"
+    lg f "$b"; ins f "i32.wrap_i64"; lg f "$b"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ins f "return"
+    endB f
+    lg f "$cid"
     endFn f
 
 // operators arrive with a type-kind suffix (`+i`, `<>i`, `=l`); slice 1 is
@@ -947,6 +991,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> lowTag (LCall ("$hashv", [ coreToLowE ctx a ]))
     // cells: $cellof yields the cell POINTER (its storage, no deref); $cellget
     // reads through it; $cellset writes; $forcecell is a marker
     | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
@@ -1625,7 +1670,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
