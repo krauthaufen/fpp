@@ -128,19 +128,39 @@ the linear backend is strictly MORE capable here.
   `DClass`/`DInterface`/`DBaseInst`/`DMembers` to fill `SubsOf`/`ImplsOf`/slots.
   This is the main gate to self-hosting (the compiler leans on typeclasses).
 
-  DESIGN NOTE / snag to reconcile first: the reference (BinDriver) does NOT use
-  a separate header — it models a class instance as an ordinary `ERecord` whose
-  field ORDER carries a synthetic `__desc` field, filled at construction with a
-  descriptor global (`$desc_<T>`) that holds `[class-id][vtable]`. So in Core, a
-  class's `FieldsOf` already includes `__desc`. Our universal header ALSO
-  supplies the class-id at offset 0 — so for classes there are two descriptor
-  sources. Before building vtables, decide: either (a) recognise a `__desc`
-  field and MAP it onto the header (drop it from the field layout, use offset 0),
-  or (b) keep `__desc` as a real field pointing at a `[class-id][vtable]`
-  descriptor and have `EIfaceCall`/type-tests read THAT, making the header
-  redundant for classes. (a) keeps one uniform mechanism; (b) matches the
-  reference's Core shape with less remapping. The universal-header type tests
-  already work for records/unions regardless.
+  DECIDED: approach (a). And it turns out to need NO `__desc` remapping — the
+  `__desc`/`__idhash` fields are SYNTHESISED by the reference (BinDriver prepends
+  them to its `FieldsOf`); they are NOT in the Core IR. A class emits a `DClass`
+  (dispatch) AND a `DRecord` (its real fields), so our driver already gives every
+  class a class-id via its `DRecord`, and `:? Class` (exact) already works. The
+  universal header IS the descriptor.
+
+  Concrete `EIfaceCall` plan (interface-method dispatch; skip the 3 identity
+  slots Equals/GetHashCode/Compare — they need `$cmpv`/`$hashv` we don't have):
+  1. From `decls0`: `classDecls` = the `DClass`es, `interfaceDecls` = `DInterface`s.
+     `bareIface n` strips a `` ` ``-arity suffix. `vtableSlots` = distinct-sorted
+     `(bareIface, method)` from interface decls + every class's impl clauses;
+     `SlotOf(bareIface,method) → index`, `NSLOTS = count`.
+  2. `chainOf`/`subclassesOf`/`slotImpl` ported from BinDriver: `slotImpl cn iface
+     method` walks the inheritance chain to the `VarId` implementing that slot.
+  3. Reachability: the impl `VarId`s are dispatched dynamically, so they are NOT
+     reached by the ref walk — add their keys as ROOTS before filtering `decls`,
+     or they get dropped and the vtable points at nothing.
+  4. Give each impl function a table slot (`tblIdx st.M (fn v)`), like lifted
+     lambdas, and ensure `$lfn(1+nargs)` types are declared.
+  5. Bake a flat VTABLE into the data segment: for `cid` in 0..maxCid, for `slot`
+     in 0..NSLOTS-1, a 4-byte function table-index (0 = none), row-major. Record
+     `VTABLE_BASE`.
+  6. `EIfaceCall(iface, method, recv, args)` → bind `recv` to a reg `t`;
+     `cid = load t[0]`; `fnidx = load VTABLE_BASE + (cid*NSLOTS + slot)*4`; push
+     `t, args, fnidx`; `call_indirect $lfn(1+len args)`. (Currying: interface
+     methods are uncurried — recv + args, matching the reference's `$v(1+n)`.)
+  7. Built-in seqs (lists/arrays as `IEnumerable`) carry no vtable entry — the
+     reference pre-tests and routes to `$iterNew`/`$iterNext`; port later.
+  Hierarchy type tests: generalise `lowTypeTest` to a SET of class-ids —
+  `SubsOf(class)` (subclasses' cids) for `:? Base`, `ImplsOf(iface)` (implementor
+  cids) for `:? IFoo`. Gateable against the wasm-GC oracle (it CAN do interface
+  dispatch, unlike union type tests).
 
   `:?>` downcasts to a class-id-carrying type are now runtime-checked (trap on
   mismatch); to an untracked type they stay the identity.
