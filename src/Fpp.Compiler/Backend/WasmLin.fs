@@ -105,7 +105,10 @@ type private St =
       /// GC mode: (fpprt type-id, language class-id) for every type-testable
       /// shape (records, union cases), filled into the tid->cid table so `:?`
       /// and vtable dispatch recover the class-id from the tagged header
-      TidCid : Vec<int * int> }
+      TidCid : Vec<int * int>
+      /// GC mode: the root-table slot holding the vtable array pointer (the
+      /// vtable can't live in a data segment — that would land in fpprt's heap)
+      mutable VtSlot : int }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -131,6 +134,7 @@ let mutable gc = false
 // print helpers are emitted (they bake the string tid as an immediate).
 let mutable private gcStrTid = 0
 let mutable private gcByteTid = 0
+let mutable private gcIntTid = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
@@ -291,6 +295,40 @@ let private rtDeclsLin (m : Mod) : unit =
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
 // rounding at the sixth decimal, an i64 integer part and six fractionals.
 // A store16 helper writes one UTF-16 unit and advances $w.
+// allocate a fresh string of `pushLen` UTF-16 units, leaving its pointer in the
+// caller's `$p` local. Standalone bump-allocs and writes the [kind][len] header;
+// GC calls fpprt_alloc_array (which writes the tag and length). `pushLen` emits
+// code leaving the unit count on the stack, and is invoked up to twice.
+let private strAllocN (f : Fn) (pushLen : unit -> unit) : unit =
+    if gc then
+        ic f gcStrTid; pushLen (); callf f "$fpallocn"; ls f "$p"
+    else
+        ic f 8; pushLen (); ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
+        lg f "$p"; ic f CID_STRING; mem f "i32.store"
+        lg f "$p"; ic f 4; ins f "i32.add"; pushLen (); mem f "i32.store"
+
+// push/pop a source string pointer across a string allocation (GC only): the
+// allocation may collect and relocate the source we are about to copy from
+let private strGuard (f : Fn) (locals : string list) : (unit -> unit) =
+    if gc then
+        for v in locals do lg f v; callf f "$spush"
+        fun () -> for v in List.rev locals do callf f "$spop"; ls f v
+    else fun () -> ()
+
+// GC: reload $sbuf from the (rooted) scratch buffer's current address — after a
+// safepoint the collector may have relocated it
+let private emitSbufRefresh (f : Fn) : unit =
+    if gc then (gg f "$roots"; mem f "i32.load"; ic f 8; ins f "i32.add"; gs f "$sbuf")
+
+// a scratch address: a fixed low offset in the standalone path, or `$sbuf`
+// (the fpprt-allocated scratch buffer) plus that offset in GC mode, where no
+// fixed low memory is ours.
+let private saddr (f : Fn) (n : int) : unit =
+    if gc then
+        gg f "$sbuf"
+        if n <> 0 then (ic f n; ins f "i32.add")
+    else ic f n
+
 let private emitFtoa6 (m : Mod) : unit =
     let f = beginFn m [ "$x" ]
     local f "$v" "f64"; local f "$w" "i32"; local f "$ip" "f64"; local f "$frac" "f64"
@@ -299,8 +337,9 @@ let private emitFtoa6 (m : Mod) : unit =
     localsDone f
     let put (code : unit -> unit) =
         lg f "$w"; code (); mem f "i32.store16"; lg f "$w"; ic f 2; ins f "i32.add"; ls f "$w"
+    emitSbufRefresh f
     lg f "$x"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$v"
-    ic f FMTBUF; ls f "$w"
+    saddr f FMTBUF; ls f "$w"
     blockE f "$fin"
     // NaN
     lg f "$v"; lg f "$v"; ins f "f64.ne"
@@ -353,15 +392,15 @@ let private emitFtoa6 (m : Mod) : unit =
     br f "$fl2"; endB f; endB f
     endB f  // $fin
     // build the string [kind=1][len][units] from FMTBUF
-    lg f "$w"; ic f FMTBUF; ins f "i32.sub"; ic f 1; ins f "i32.shr_u"; ls f "$len"
-    ic f 8; lg f "$len"; ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
-    lg f "$p"; ic f 1; mem f "i32.store"
-    lg f "$p"; ic f 4; ins f "i32.add"; lg f "$len"; mem f "i32.store"
+    lg f "$w"; saddr f FMTBUF; ins f "i32.sub"; ic f 1; ins f "i32.shr_u"; ls f "$len"
+    strAllocN f (fun () -> lg f "$len")
+    // the result allocation may have moved the scratch buffer we copy from
+    emitSbufRefresh f
     ic f 0; ls f "$i"
     blockE f "$cc"; loopE f "$cl"
     lg f "$i"; lg f "$len"; ins f "i32.ge_u"; brIf f "$cc"
     lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
-    ic f FMTBUF; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    saddr f FMTBUF; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
     mem f "i32.store16"
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$cl"; endB f; endB f
@@ -409,15 +448,6 @@ let private emitSpop (m : Mod) : unit =
     lg f "$a"; ic f 0; mem f "i32.store"      // clear the popped slot (no stale scan)
     lg f "$r"
     endFn f
-
-// a scratch address: a fixed low offset in the standalone path, or `$sbuf`
-// (the fpprt-allocated scratch buffer) plus that offset in GC mode, where no
-// fixed low memory is ours.
-let private saddr (f : Fn) (n : int) : unit =
-    if gc then
-        gg f "$sbuf"
-        if n <> 0 then (ic f n; ins f "i32.add")
-    else ic f n
 
 // $str_of_int(tagged): decimal, with a leading '-' for negatives.
 let private emitStrOfInt (m : Mod) : unit =
@@ -484,13 +514,9 @@ let private emitStrCat (m : Mod) : unit =
     localsDone f
     lg f "$a"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$la"
     lg f "$b"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$lb"
-    ic f 8
-    lg f "$la"; lg f "$lb"; ins f "i32.add"; ic f 1; ins f "i32.shl"
-    ins f "i32.add"
-    callf f "$lalloc"; ls f "$p"
-    lg f "$p"; ic f 1; mem f "i32.store"
-    lg f "$p"; ic f 4; ins f "i32.add"
-    lg f "$la"; lg f "$lb"; ins f "i32.add"; mem f "i32.store"
+    let unpin = strGuard f [ "$a"; "$b" ]
+    strAllocN f (fun () -> lg f "$la"; lg f "$lb"; ins f "i32.add")
+    unpin ()
     // copy a
     ic f 0; ls f "$i"
     blockE f "$ac"; loopE f "$al"
@@ -660,9 +686,9 @@ let private emitStrsub (m : Mod) : unit =
     let f = beginFn m [ "$s"; "$start"; "$len" ]
     local f "$p" "i32"; local f "$i" "i32"
     localsDone f
-    ic f 8; lg f "$len"; ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
-    lg f "$p"; ic f CID_STRING; mem f "i32.store"
-    lg f "$p"; ic f 4; ins f "i32.add"; lg f "$len"; mem f "i32.store"
+    let unpin = strGuard f [ "$s" ]
+    strAllocN f (fun () -> lg f "$len")
+    unpin ()
     ic f 0; ls f "$i"
     blockE f "$c"; loopE f "$l"
     lg f "$i"; lg f "$len"; ins f "i32.ge_s"; brIf f "$c"
@@ -726,9 +752,9 @@ let private emitStrReplace (m : Mod) : unit =
     br f "$cl"; endB f; endB f
     // resultLen = sl + cnt*(bl - al); alloc
     lg f "$sl"; lg f "$cnt"; lg f "$bl"; lg f "$al"; ins f "i32.sub"; ins f "i32.mul"; ins f "i32.add"; ls f "$k"
-    ic f 8; lg f "$k"; ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
-    lg f "$p"; ic f CID_STRING; mem f "i32.store"
-    lg f "$p"; ic f 4; ins f "i32.add"; lg f "$k"; mem f "i32.store"
+    let unpin = strGuard f [ "$s"; "$b" ]
+    strAllocN f (fun () -> lg f "$k")
+    unpin ()
     // build
     ic f 0; ls f "$w"; ic f 0; ls f "$i"
     blockE f "$bc"; loopE f "$bl2"
@@ -1291,8 +1317,14 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let slot = match dictTryFind st.SlotOf (bareIfaceOf iface + "|" + method) with Some s -> s | None -> 0
         let t = freshTmp ctx
         let cid = lowHeaderCid (wReg t)
+        // the vtable base: a fixed constant in the standalone path; under GC the
+        // vtable is a fpprt array kept in a root slot (its data starts past the
+        // [tag][len] header), read fresh so a collection's move is seen
+        let vtBase =
+            if gc then LPrim (AddW, [ LLoad (W, LGetGlobal "$roots", 4 * st.VtSlot); LConstW 8 ])
+            else LConstW st.VtBase
         let idxAddr =
-            LPrim (AddW, [ LConstW st.VtBase
+            LPrim (AddW, [ vtBase
                            LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
         let callArgs = LGet (wReg t) :: List.map (coreToLowE ctx) args
         LDo ([ LSet (wReg t, coreToLowE ctx recv) ],
@@ -1370,7 +1402,13 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         let pops = [ for i in ne - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), 8 + 4 * i, LCall ("$spop", [])) ]
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops, LGet (wReg b))
     elif gc then
-        let tid = gcTid st ("s:" + string cid + ":" + string n + ":" + string raw) (HDR + 4 * n) FK_TAGGED (1 + raw)
+        let sk = "s:" + string cid + ":" + string n + ":" + string raw
+        // record the tid->cid mapping the first time a shape is allocated, so
+        // `:?`/dispatch recover the class-id (covers classes, which the eager
+        // record/union pass does not enumerate)
+        let isNew = (dictTryFind st.Tids sk).IsNone
+        let tid = gcTid st sk (HDR + 4 * n) FK_TAGGED (1 + raw)
+        if isNew && cid >= CID_FIRST_USER then vecAdd st.TidCid (tid, cid)
         let pushes = slots |> List.map (fun v -> LCallVoidS ("$spush", [ v ]))
         let pops = [ for i in n - 1 .. -1 .. 0 -> LStore (W, LGet (wReg b), HDR + 4 * i, LCall ("$spop", [])) ]
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops, LGet (wReg b))
@@ -1807,7 +1845,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
           Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
-          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew () }
+          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -1904,6 +1942,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then
         gcStrTid <- gcTid st "str" 2 FK_SCALAR_ARRAY 0
         gcByteTid <- gcTid st "byte" 1 FK_SCALAR_ARRAY 0
+        gcIntTid <- gcTid st "int" 4 FK_SCALAR_ARRAY 0
+        // a root slot for the vtable array pointer (filled at startup)
+        st.VtSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
     rtDeclsLin m
     for d in decls do
         match d with
@@ -2038,6 +2080,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         for tid, size, kind, start in vecToList st.TidRegs do
             ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
             callf rf "$fpreg"
+        // vtable: a fpprt int array in root slot VtSlot; fill the nonzero rows
+        // (fpprt zeroed the array). Its data starts past the [tag][len] header.
+        if nCid * st.NSlots > 0 then
+            ic rf gcIntTid; ic rf (nCid * st.NSlots); callf rf "$fpallocn"; ls rf "$t"
+            gg rf "$roots"; ic rf (4 * st.VtSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+            vtRows |> Array.iteri (fun i w ->
+                if w <> 0 then (lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf w; mem rf "i32.store"))
         // scratch buffer (iovec + PRINTBUF + FMTBUF) -> root slot 0; $sbuf points
         // past its [tag][len] header so the fixed offsets apply unchanged. Kept
         // in the root table so a moving collection updates it.
