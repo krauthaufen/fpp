@@ -44,6 +44,13 @@ beyond this depends on which prelude corners it touches (exceptions,
 typeclass dispatch, StringBuilder, options); each is a further slice, and the
 reachability report says exactly which are required.
 
+Known gap found here: a **local recursive function** (`let rec go … = … go …`
+inside a body) needs a self-referential closure — the closure must be able to
+call itself before it is fully built. Top-level recursion and prelude
+recursion work; a user-written local `let rec` does not yet. Options through
+top-level functions and `match` work; `find` via an inner `let rec` is the
+shape that waits on this.
+
 ## Status: slices 1–5
 
 
