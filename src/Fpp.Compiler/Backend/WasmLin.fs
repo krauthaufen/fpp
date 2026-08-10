@@ -1070,6 +1070,18 @@ let private lowHeaderCid (t : LReg) : LExpr =
                                  LPrim (ShlW, [ LPrim (ShrUW, [ LLoad (W, LGet t, 0); LConstW 1 ]); LConstW 2 ]) ]), 0)
     else LLoad (W, LGet t, 0)
 
+// GC shadow-stack push/pop, inlined (no call) — roots[sp]=v; sp+=4, and the
+// reverse. Only tagged/pointer values are ever pushed (constants are stored
+// directly), so a popped slot left non-zero always holds a valid pointer: the
+// scanner retains it for at most one cycle until overwritten — no corruption,
+// so pop need not clear the slot.
+let private gcPushStmts (v : LExpr) : LStmt list =
+    [ LStore (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0, v)
+      LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
+let private gcPopInto (addr : LExpr) (off : int) : LStmt list =
+    [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
+      LStore (W, addr, off, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
+
 let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
@@ -1402,8 +1414,8 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         // only the potential pointers across the allocation safepoint
         let isConst e = match e with LConstW _ -> true | _ -> false
         let idx = elems |> List.mapi (fun i v -> i, v)
-        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.map (fun (_, v) -> LCallVoidS ("$spush", [ v ]))
-        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.map (fun (i, _) -> LStore (W, LGet (wReg b), 8 + 4 * i, LCall ("$spop", [])))
+        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.collect (fun (_, v) -> gcPushStmts v)
+        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.collect (fun (i, _) -> gcPopInto (LGet (wReg b)) (8 + 4 * i))
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops @ consts, LGet (wReg b))
     elif gc then
@@ -1420,8 +1432,8 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         // would be scanned as a bogus heap pointer.
         let isConst e = match e with LConstW _ -> true | _ -> false
         let idx = slots |> List.mapi (fun i v -> i, v)
-        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.map (fun (_, v) -> LCallVoidS ("$spush", [ v ]))
-        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.map (fun (i, _) -> LStore (W, LGet (wReg b), HDR + 4 * i, LCall ("$spop", [])))
+        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.collect (fun (_, v) -> gcPushStmts v)
+        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.collect (fun (i, _) -> gcPopInto (LGet (wReg b)) (HDR + 4 * i))
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops @ consts, LGet (wReg b))
     else

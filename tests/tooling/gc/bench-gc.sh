@@ -11,7 +11,7 @@ wm="$HOME/emsdk/upstream/bin/wasm-merge"; reactor="$HOME/projects/fpp/runtime/bu
 source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1
 out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
 
-gcbuild(){ "$fpp" build --gc -o "$out/p.wasm" "$1" 2>/dev/null; "$wm" -all "$reactor" fpprt "$out/p.wasm" mutator -S -o "$out/p.wat" 2>/dev/null; wasm-tools parse "$out/p.wat" -o "$2"; }
+gcbuild(){ "$fpp" build --gc -o "$2" "$1" 2>/dev/null; }
 bench(){ best=999999; for k in 1 2 3 4; do s=$(date +%s%N); r=$("$wt" run -W gc=y,exceptions=y "$1" 2>&1|tail -1); e=$(date +%s%N); ms=$(((e-s)/1000000)); [ $ms -lt $best ]&&best=$ms; done; printf "%-16s %5d ms  (%s)\n" "$2" "$best" "$r"; }
 
 cat > "$out/int.fpp" <<'FPP'
