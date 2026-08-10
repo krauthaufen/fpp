@@ -146,6 +146,7 @@ let private constInt (f : Fn) (n : int) : unit =
 let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_i2i" [ "i32" ] [ "i32" ]
     tyFunc m "$lt_ii2i" [ "i32"; "i32" ] [ "i32" ]
+    tyFunc m "$lt_iii2i" [ "i32"; "i32"; "i32" ] [ "i32" ]
     tyFunc m "$lt_i2v" [ "i32" ] []
     tyFunc m "$lt_v2v" [] []
     tyFunc m "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
@@ -164,6 +165,10 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$prints" "$lt_i2v"
     declFn m "$ftoa6" "$lt_i2i"
     declFn m "$streq" "$lt_ii2i"
+    declFn m "$str_starts" "$lt_ii2i"
+    declFn m "$str_ends" "$lt_ii2i"
+    declFn m "$str_find" "$lt_iii2i"
+    declFn m "$strsub" "$lt_iii2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -418,6 +423,99 @@ let private emitStreq (m : Mod) : unit =
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$sl"; endB f; endB f
     ic f 1
+    endFn f
+
+// string-method runtime, over the [cid][nunits@4][u16 units@8] layout. u16 unit
+// i of string x is at x + 8 + 2*i; its length is the word at x + 4.
+
+// $str_starts(s, p): 1 if s begins with p
+let private emitStrStarts (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$pl" "i32"; local f "$sl" "i32"; local f "$i" "i32"
+    localsDone f
+    lg f "$p"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$pl"
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    lg f "$pl"; lg f "$sl"; ins f "i32.gt_s"
+    ifE f; ic f 0; ins f "return"; endB f
+    ic f 0; ls f "$i"
+    blockE f "$c"; loopE f "$l"
+    lg f "$i"; lg f "$pl"; ins f "i32.ge_s"; brIf f "$c"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ins f "i32.ne"
+    ifE f; ic f 0; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l"; endB f; endB f
+    ic f 1
+    endFn f
+
+// $str_ends(s, p): 1 if s ends with p (compare p against s from offset sl-pl)
+let private emitStrEnds (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$pl" "i32"; local f "$sl" "i32"; local f "$i" "i32"; local f "$off" "i32"
+    localsDone f
+    lg f "$p"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$pl"
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    lg f "$pl"; lg f "$sl"; ins f "i32.gt_s"
+    ifE f; ic f 0; ins f "return"; endB f
+    lg f "$sl"; lg f "$pl"; ins f "i32.sub"; ls f "$off"
+    ic f 0; ls f "$i"
+    blockE f "$c"; loopE f "$l"
+    lg f "$i"; lg f "$pl"; ins f "i32.ge_s"; brIf f "$c"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$off"; lg f "$i"; ins f "i32.add"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ins f "i32.ne"
+    ifE f; ic f 0; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l"; endB f; endB f
+    ic f 1
+    endFn f
+
+// $str_find(s, p, from): index of the first occurrence of p in s at or after
+// `from`, or -1. An empty pattern matches at `from`.
+let private emitStrFind (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$p"; "$from" ]
+    local f "$pl" "i32"; local f "$sl" "i32"; local f "$j" "i32"; local f "$k" "i32"; local f "$mm" "i32"
+    localsDone f
+    lg f "$p"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$pl"
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    lg f "$pl"; ins f "i32.eqz"
+    ifE f; lg f "$from"; ins f "return"; endB f
+    lg f "$from"; ls f "$j"
+    blockE f "$jc"; loopE f "$jl"
+    lg f "$j"; lg f "$sl"; lg f "$pl"; ins f "i32.sub"; ins f "i32.gt_s"; brIf f "$jc"
+    ic f 1; ls f "$mm"; ic f 0; ls f "$k"
+    blockE f "$kc"; loopE f "$kl"
+    lg f "$k"; lg f "$pl"; ins f "i32.ge_s"; brIf f "$kc"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$j"; lg f "$k"; ins f "i32.add"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$k"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ins f "i32.ne"
+    ifE f; ic f 0; ls f "$mm"; br f "$kc"; endB f
+    lg f "$k"; ic f 1; ins f "i32.add"; ls f "$k"
+    br f "$kl"; endB f; endB f
+    lg f "$mm"; ifE f; lg f "$j"; ins f "return"; endB f
+    lg f "$j"; ic f 1; ins f "i32.add"; ls f "$j"
+    br f "$jl"; endB f; endB f
+    ic f -1
+    endFn f
+
+// $strsub(s, start, len): a fresh string of s' units [start, start+len)
+let private emitStrsub (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$start"; "$len" ]
+    local f "$p" "i32"; local f "$i" "i32"
+    localsDone f
+    ic f 8; lg f "$len"; ic f 1; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$p"
+    lg f "$p"; ic f CID_STRING; mem f "i32.store"
+    lg f "$p"; ic f 4; ins f "i32.add"; lg f "$len"; mem f "i32.store"
+    ic f 0; ls f "$i"
+    blockE f "$c"; loopE f "$l"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_s"; brIf f "$c"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$start"; lg f "$i"; ins f "i32.add"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l"; endB f; endB f
+    lg f "$p"
     endFn f
 
 // operators arrive with a type-kind suffix (`+i`, `<>i`, `=l`); slice 1 is
@@ -771,6 +869,20 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> lowTag (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
+    | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> lowTag (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
+    | EApp (EUnknown "$str.Contains", [ s; p ]) ->
+        lowTag (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
+    | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
+        lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
+    | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
+        LCall ("$strsub", [ coreToLowE ctx s; lowUntag (coreToLowE ctx start); lowUntag (coreToLowE ctx len) ])
+    | EApp (EUnknown "$str.Substring", [ s; start ]) ->
+        // one-arg Substring runs to the end: len = s.Length - start
+        let ts = freshTmp ctx
+        let ti = freshTmp ctx
+        LDo ([ LSet (wReg ts, coreToLowE ctx s); LSet (wReg ti, lowUntag (coreToLowE ctx start)) ],
+             LCall ("$strsub", [ LGet (wReg ts); LGet (wReg ti); LPrim (SubW, [ LLoad (W, LGet (wReg ts), 4); LGet (wReg ti) ]) ]))
     | EApp (EUnknown "$listLength", [ l ]) ->
         // walk the cons cells ([cid][head][tail], null = 0) counting nodes
         let p = freshTmp ctx
@@ -1411,6 +1523,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
