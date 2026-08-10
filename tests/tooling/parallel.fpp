@@ -27,3 +27,19 @@ let r7 = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun a b -> a + b) stO
 let acc : int[] = Array.zeroCreate n
 let r8 = Parallel.dispatchPhased n 16 3 (fun phase i -> acc.[i] <- acc.[i] + phase + 1)
 let r9 = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun a b -> a + b) acc)
+
+// the BARRIER LIFT: `fun vt -> ... vt.Sync() ...` fissions into phases at
+// compile time. Race-free kernels only — the three-way schedule diff is
+// exactly the assertion that they mean one thing.
+let src = Parallel.init n (fun i -> float (i % 13))
+let dst : float[] = Array.zeroCreate n
+let rA =
+    Parallel.dispatch n (fun vt ->
+        let doubled = src.[vt.Index] * 2.0
+        vt.Sync ()
+        dst.[vt.Index] <- doubled + (if vt.Index > 0 then src.[vt.Index - 1] else 0.0))
+let rB = printfn "%d" (int (Parallel.fold (fun s x -> s + x) 0.0 (fun x y -> x + y) dst))
+// barrier-free kernels take the runtime Vt unchanged
+let cnt : int[] = Array.zeroCreate n
+let rC = Parallel.dispatch n (fun vt -> cnt.[vt.Index] <- vt.Index % 7)
+let rD = printfn "%d" (Parallel.fold (fun s x -> s + x) 0 (fun x y -> x + y) cnt)

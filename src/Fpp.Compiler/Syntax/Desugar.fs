@@ -199,7 +199,249 @@ let rec private walk (g : Green) : Green =
     | GToken _ -> g
     | GNode n ->
         if n.NodeKind = CompExpr then comp n
+        elif n.NodeKind = AppExpr then
+            match tryBarrierLift n with
+            | Some lifted -> lifted
+            | None -> Green.node n.NodeKind (List.map walk n.Children)
         else Green.node n.NodeKind (List.map walk n.Children)
+
+
+// ---- barrier lift ---------------------------------------------------------
+// `Parallel.dispatch n (fun vt -> ... vt.Sync() ...)` fissions at every
+// top-level `vt.Sync ()` into phases of `Parallel.dispatchPhased`; a local
+// LIVE across a barrier spills into a per-thread array. Only the literal
+// lambda form lifts, and only top-level Syncs — a barrier under control
+// flow is not uniformly encountered, and the kernel is left for the
+// runtime Vt, whose Sync explains the rule when reached.
+
+and private isVtSyncDot (vt : string) (d : GreenNode) : bool =
+    d.NodeKind = DotExpr
+    && (match d.Children with
+        | [ GNode i; GToken _; GToken s ] ->
+            i.NodeKind = IdentExpr && s.Text = "Sync"
+            && (match i.Children with
+                | [ GToken t ] -> t.Text = vt
+                | _ -> false)
+        | _ -> false)
+
+and private isSyncStmt (vt : string) (m : GreenNode) : bool =
+    if isVtSyncDot vt m then true
+    elif m.NodeKind = AppExpr then
+        (match m.Children |> List.tryHead with
+         | Some (GNode d) -> isVtSyncDot vt d
+         | _ -> false)
+    else false
+
+and private anySyncBelow (vt : string) (g : Green) : bool =
+    match g with
+    | GToken _ -> false
+    | GNode d ->
+        isVtSyncDot vt d || List.exists (anySyncBelow vt) d.Children
+
+/// every bare identifier read of `name`, rewritten by `mk` (an assignment
+/// left side included — the caller decides what the write becomes)
+and private substIdent (name : string) (mk : unit -> Green) (g : Green) : Green =
+    match g with
+    | GToken _ -> g
+    | GNode d when d.NodeKind = IdentExpr ->
+        (match d.Children with
+         | [ GToken t ] when t.Text = name -> mk ()
+         | _ -> g)
+    | GNode d -> Green.node d.NodeKind (List.map (substIdent name mk) d.Children)
+
+and private indexExpr (arr : string) (ix : string) : Green =
+    Green.node DotExpr
+        [ ident arr; tk Operator "."
+          Green.node ListExpr [ tk LBracket "["; ident ix; tk RBracket "]" ] ]
+
+and private letBoundName (m : GreenNode) : string option =
+    if m.NodeKind <> LetDecl then None
+    else
+        m.Children
+        |> List.tryPick (fun c ->
+            match c with
+            | GNode p when p.NodeKind = IdentPat ->
+                (match p.Children with
+                 | [ GToken t ] -> Some t.Text
+                 | _ -> None)
+            | _ -> None)
+
+and private mentions (name : string) (g : Green) : bool =
+    match g with
+    | GToken _ -> false
+    | GNode d when d.NodeKind = IdentExpr ->
+        (match d.Children with
+         | [ GToken t ] -> t.Text = name
+         | _ -> false)
+    | GNode d -> List.exists (mentions name) d.Children
+
+and private tryBarrierLift (n : GreenNode) : Green option =
+    // AppExpr: [ DotExpr(Parallel . dispatch); nArg; (fun vt -> ...) ] —
+    // the lambda usually rides inside its parens
+    let unparen (m : GreenNode) : GreenNode =
+        if m.NodeKind = ParenExpr then
+            match nodesOf m with
+            | [ inner ] when inner.NodeKind = LambdaExpr -> inner
+            | _ -> m
+        else m
+    match nodesOf n |> List.map unparen with
+    | [ head; nArg; lam ] when
+          n.NodeKind = AppExpr && head.NodeKind = DotExpr && lam.NodeKind = LambdaExpr
+          && (match head.Children with
+              | [ GNode m; GToken _; GToken d ] ->
+                  d.Text = "dispatch" && m.NodeKind = IdentExpr
+                  && (match m.Children with
+                      | [ GToken t ] -> t.Text = "Parallel"
+                      | _ -> false)
+              | _ -> false) ->
+        // the kernel parameter's name
+        let vt =
+            nodesOf lam
+            |> List.filter (fun p -> p.NodeKind = IdentPat)
+            |> List.tryHead
+            |> Option.bind (fun p -> tokensOf p |> List.tryFind (fun t -> t.Kind = Ident))
+            |> Option.map (fun t -> t.Text)
+        match vt with
+        | None -> None
+        | Some vt ->
+            let body = nodesOf lam |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast
+            match body with
+            | None -> None
+            | Some body ->
+                let items =
+                    // statements INCLUDE let-bindings — they are exactly
+                    // what spills across a barrier
+                    if body.NodeKind = BlockExpr then
+                        nodesOf body |> List.filter (fun m -> isExprish m.NodeKind || m.NodeKind = LetDecl)
+                    else [ body ]
+                if not (items |> List.exists (isSyncStmt vt)) then None
+                else
+                // fission at top-level Syncs
+                let phases = vecNew<GreenNode list> ()
+                let cur = vecNew<GreenNode> ()
+                let mutable illegal = false
+                for it in items do
+                    if isSyncStmt vt it then
+                        vecAdd phases (vecToList cur)
+                        vecClear cur
+                    else
+                        if anySyncBelow vt (GNode it) then illegal <- true
+                        vecAdd cur it
+                vecAdd phases (vecToList cur)
+                if illegal then None
+                else
+                let phaseList = vecToList phases
+                let k = List.length phaseList
+                let iv = "__vt" + string (freshOffset ())
+                let pv = "__p" + string (freshOffset ())
+                let nv = "__n" + string (freshOffset ())
+                // vt.Index -> the index variable; done before spilling
+                let fixIndex (g : Green) : Green =
+                    let rec go (x : Green) : Green =
+                        match x with
+                        | GToken _ -> x
+                        | GNode d when
+                              d.NodeKind = DotExpr
+                              && (match d.Children with
+                                  | [ GNode i; GToken _; GToken f ] ->
+                                      f.Text = "Index" && i.NodeKind = IdentExpr
+                                      && (match i.Children with
+                                          | [ GToken t ] -> t.Text = vt
+                                          | _ -> false)
+                                  | _ -> false) -> ident iv
+                        | GNode d -> Green.node d.NodeKind (List.map go d.Children)
+                    go g
+                let phaseList = phaseList |> List.map (List.map (fun m -> match fixIndex (GNode m) with GNode x -> x | _ -> m))
+                // the LIVE SET: let-bound in phase p, mentioned after it
+                let spills = vecNew<string * string * int> ()   // name, arr, phase
+                phaseList |> List.iteri (fun p stmts ->
+                    for st in stmts do
+                        match letBoundName st with
+                        | Some nm when
+                              phaseList
+                              |> List.mapi (fun q ss -> q, ss)
+                              |> List.exists (fun (q, ss) ->
+                                  q > p && ss |> List.exists (fun s2 -> mentions nm (GNode s2))) ->
+                            vecAdd spills (nm, "__arr_" + nm + string (freshOffset ()), p)
+                        | _ -> ())
+                let spillList = vecToList spills
+                // rewrite each phase: the binding becomes an element WRITE,
+                // later reads become element READS
+                let rewritePhase (p : int) (stmts : GreenNode list) : Green list =
+                    stmts
+                    |> List.map (fun st ->
+                        let asW =
+                            match letBoundName st with
+                            | Some nm ->
+                                (match spillList |> List.tryFind (fun (n2, _, ph) -> n2 = nm && ph = p) with
+                                 | Some (_, arr, _) ->
+                                     // `let x = e` -> `arr.[i] <- e`
+                                     let rhs =
+                                         st.Children
+                                         |> List.rev
+                                         |> List.tryPick (fun c ->
+                                             match c with
+                                             | GNode m when isExprish m.NodeKind -> Some (GNode m)
+                                             | _ -> None)
+                                     (match rhs with
+                                      | Some e ->
+                                          Some (Green.node BinaryExpr
+                                                  [ indexExpr arr iv; tk Operator "<-"; e ])
+                                      | None -> None)
+                                 | None -> None)
+                            | None -> None
+                        match asW with
+                        | Some w -> w
+                        | None ->
+                            // reads of any spill from an EARLIER phase
+                            let mutable g : Green = GNode st
+                            for nm, arr, ph in spillList do
+                                if ph < p then g <- substIdent nm (fun () -> indexExpr arr iv) g
+                                elif ph = p then
+                                    // same-phase reads keep the local ONLY if
+                                    // the binding stayed; it did not — read
+                                    // the array here too
+                                    g <- substIdent nm (fun () -> indexExpr arr iv) g
+                            g)
+                let phaseBodies =
+                    phaseList |> List.mapi (fun p stmts ->
+                        match rewritePhase p stmts with
+                        | [] -> unitExpr ()
+                        | [ one ] -> one
+                        | many -> Green.node BlockExpr many)
+                // if __p = 0 then B0 elif ... else Bk-1
+                let rec chain (p : int) (bodies : Green list) : Green =
+                    match bodies with
+                    | [ last ] -> last
+                    | b0 :: rest ->
+                        Green.node IfExpr
+                            [ tk Keyword "if"
+                              Green.node BinaryExpr
+                                  [ ident pv; tk Operator "="
+                                    Green.node LiteralExpr [ tk IntLit (string p) ] ]
+                              tk Keyword "then"; b0
+                              tk Keyword "else"; chain (p + 1) rest ]
+                    | [] -> unitExpr ()
+                let kernel = lambda [ identPat pv; identPat iv ] (chain 0 phaseBodies)
+                let callP =
+                    Green.node AppExpr
+                        [ Green.node DotExpr [ ident "Parallel"; tk Operator "."; tk Ident "dispatchPhased" ]
+                          ident nv
+                          Green.node LiteralExpr [ tk IntLit "1" ]
+                          Green.node LiteralExpr [ tk IntLit (string k) ]
+                          paren kernel ]
+                let decls = vecNew<Green> ()
+                vecAdd decls (Green.node LetDecl [ tk Keyword "let"; identPat nv; tk Operator "="; walk (GNode nArg) ])
+                for nm, arr, _ in spillList do
+                    vecAdd decls
+                        (Green.node LetDecl
+                            [ tk Keyword "let"; identPat arr; tk Operator "="
+                              Green.node AppExpr
+                                  [ Green.node DotExpr [ ident "Array"; tk Operator "."; tk Ident "zeroCreate" ]
+                                    ident nv ] ])
+                vecAdd decls callP
+                Some (Green.node BlockExpr (vecToList decls))
+    | _ -> None
 
 /// `builder { body }`, which F# renders as
 /// `let b = <builder> in b.Run(b.Delay(fun () -> BODY))` — with `Run` and
@@ -598,7 +840,19 @@ let desugarWithStatements (lookup : int -> CeBuilder) (isStatement : int -> bool
 let rec hasComp (g : Green) : bool =
     match g with
     | GToken _ -> false
-    | GNode n -> n.NodeKind = CompExpr || List.exists hasComp n.Children
+    | GNode n ->
+        n.NodeKind = CompExpr
+        // a Parallel.dispatch call may need the barrier lift — cheap to
+        // over-approximate here, the lift itself decides
+        || (n.NodeKind = DotExpr
+            && (match n.Children with
+                | [ GNode m; GToken _; GToken d ] ->
+                    d.Text = "dispatch" && m.NodeKind = IdentExpr
+                    && (match m.Children with
+                        | [ GToken t ] -> t.Text = "Parallel"
+                        | _ -> false)
+                | _ -> false))
+        || List.exists hasComp n.Children
 
 let desugarWith (lookup : int -> CeBuilder) (root : GreenNode) : GreenNode =
     desugarWithStatements lookup (fun _ -> false) root

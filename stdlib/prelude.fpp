@@ -6029,6 +6029,16 @@ extern let parallelFor : int -> int -> (int -> unit) -> unit
 extern let parallelPhased : int -> int -> int -> int -> (int -> int -> unit) -> unit
 #endif
 
+/// a VIRTUAL THREAD as kernels see it. The compiler LIFTS the literal
+/// `Parallel.dispatch n (fun vt -> ... vt.Sync() ...)` form into phases,
+/// and this type never runs a barrier; a kernel that escapes the lift
+/// (vt captured, Sync under control flow) reaches THIS Sync, which
+/// explains the rule.
+type Vt(i : int) =
+    member x.Index : int = i
+    member x.Sync () : unit =
+        failwith "vt.Sync() must be written at the kernel's top level (a barrier is encountered uniformly); this kernel was not lifted"
+
 module Parallel =
 #if NATIVE
     /// run f over [0, n) across the pool; the degenerate sequential
@@ -6054,6 +6064,11 @@ module Parallel =
         for p in 0 .. phases - 1 do
             for i in 0 .. n - 1 do kernel p i
 #endif
+    /// virtual-thread dispatch WITHOUT barriers: the compiler rewrites
+    /// the literal-kernel form with `vt.Sync()` into dispatchPhased; a
+    /// barrier-free kernel (or one the lift declined) runs here
+    let dispatch (n : int) (kernel : Vt -> unit) : unit =
+        iter n (fun i -> kernel (Vt i))
     /// machine-independent chunking: 64-way regardless of pool size
     let private chunkOf (n : int) : int = n / 64 + 1
     let init (n : int) (f : int -> 'a) : 'a[] =
