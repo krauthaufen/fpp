@@ -467,6 +467,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// them to TYPED instructions instead of runtime dispatch
     let seatGivens = dictNew<int, Constraint list> ()
 
+    /// projection constraints minted by `C<args>.Assoc` in TYPE position —
+    /// an instance declaration drains the ones minted while its assoc
+    /// types were read into its OWN context, so every use re-poses them
+    let projCons = vecNew<Constraint> ()
+
     let addWanted (offset : int) (c : Constraint) : unit =
         if inMemberBody then dictSet eagerSeats offset true
         if not (List.isEmpty givens) && (dictTryFind seatGivens offset).IsNone then
@@ -1446,8 +1451,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                "class " + clsName + " takes " + string cd.Params.Length
                                + " type arguments, not " + string args.Length)
                       let r = st.Fresh ()
-                      addWanted assocTok.Offset
-                          { Class = clsName; Args = args; Assoc = [ assocTok.Text, r ] }
+                      let con = { Class = clsName; Args = args; Assoc = [ assocTok.Text, r ] }
+                      addWanted assocTok.Offset con
+                      vecAdd projCons con
                       r
                   | Some cd ->
                       vecAdd diags
@@ -6414,15 +6420,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | Some (name, args) ->
             let ps = args |> List.collect freeVars |> List.distinctBy (fun v -> v.Id)
             let members = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+            let projMark = vecLen projCons
             let assoc =
                 members |> List.filter isAssocDecl
                 |> List.choose (fun m ->
                     match memberNameOf m, nodesOf m |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
                     | Some t, Some tn -> Some (t.Text, typeFromNode vars tn)
                     | _ -> None)
+            // a projection in an assoc definition (`type Result =
+            // V3<Mul<'a,'b>.Result>`) is a REQUIREMENT of the instance:
+            // carried in its context, every use re-poses it substituted,
+            // and the per-use freshening keys the assoc and the context
+            // through one substitution so the result variable coheres
+            let projected =
+                [ for i in projMark .. vecLen projCons - 1 -> vecGet projCons i ]
             let context =
-                nodesOf n |> List.filter (fun m -> m.NodeKind = WhenDecl)
-                |> List.choose (constraintOf vars)
+                (nodesOf n |> List.filter (fun m -> m.NodeKind = WhenDecl)
+                 |> List.choose (constraintOf vars))
+                @ projected
             // the instance's variables are DECLARATION-level, exactly like a
             // top-level binding's: shared project-wide through the stored
             // head, context and associated types. Left at inner level, one
@@ -6874,20 +6889,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match Classes.select classes true c.Class (c.Args |> List.map (fun _ -> tInt)) [] with
              | Classes.Solved _ ->
                  // a defaulting unification can FAIL (the arg is a tuple,
-                 // int is not): report once and drop the constraint, or
-                 // tryFind selects the very same one forever
+                 // int is not — or a matrix whose element type nothing
+                 // determined): report once and drop the constraint, or
+                 // tryFind selects the very same one forever. The raw
+                 // unifier message ("M33<'a> vs int") reads as a compiler
+                 // bug; the actual situation is an UNDETERMINED type, and
+                 // the fix is the user's — say so.
                  let mutable failed = false
                  for a in c.Args do
                      match unify a tInt with
-                     | Some err ->
-                         failed <- true
-                         vecAdd diags (offset, err)
+                     | Some _ -> failed <- true
                      | None -> ()
                  if failed then
+                     vecAdd diags
+                         (offset,
+                          "the type here cannot be determined: " + c.Class + "<"
+                          + String.concat ", " (List.map typeString c.Args)
+                          + "> is still open once everything else is solved, and no"
+                          + " default applies — annotate an operand to pin it")
                      wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c)))
                  defaulting <- true
                  solveWanted ()
-             | _ -> wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c))))
+             | _ ->
+                 // no int-shaped instance either: the constraint cannot
+                 // resolve and cannot default. Dropping it SILENTLY left
+                 // a binding hovering as a bare 'a with no error anywhere.
+                 (if (dictTryFind classes.Classes c.Class).IsSome then
+                     vecAdd diags
+                         (offset,
+                          "the type here cannot be determined: " + c.Class + "<"
+                          + String.concat ", " (List.map typeString c.Args)
+                          + "> is still open once everything else is solved —"
+                          + " annotate an operand to pin it"))
+                 wanted <- wanted |> List.filter (fun (_, w) -> not (System.Object.ReferenceEquals (w, c))))
         | None -> ()
 
     // a class-member use binds to an instance member only once solving has

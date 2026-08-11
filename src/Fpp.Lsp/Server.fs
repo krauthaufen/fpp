@@ -101,6 +101,15 @@ type Server(ws : Workspace) =
                    "children", jarr (List.map conv it.Children) ]
         jarr (ws.Outline uri |> List.map conv)
 
+    /// The PRELUDE opened as a disk file must be served as the builtin it
+    /// already is — treated as an ordinary project file it loads TWICE,
+    /// and the second copy has bodiless primitive instances and a
+    /// duplicate of every instance ("Ordered<int> and Ordered<int>").
+    member private _.MapPath (p : string) : string =
+        if p.EndsWith "/stdlib/prelude.fpp" || p.EndsWith "\\stdlib\\prelude.fpp" then
+            Fpp.Builtin.path
+        else p
+
     /// Handle one incoming message; returns the messages to send back.
     member this.Handle (msg : JsonNode) : JsonNode list =
         let method = match fld msg "method" with null -> "" | m -> m.GetValue<string>()
@@ -121,24 +130,35 @@ type Server(ws : Workspace) =
         | "initialized" -> []
         | "textDocument/didOpen" ->
             let doc = fld ps "textDocument"
-            let path = Uri.toPath ((fld doc "uri").GetValue<string>())
+            let rawPath = Uri.toPath ((fld doc "uri").GetValue<string>())
+            if this.MapPath rawPath = Fpp.Builtin.path then
+                // the prelude: already loaded as the builtin — read-only
+                // view, clean by construction
+                [ jobj [ "jsonrpc", jstr "2.0"
+                         "method", jstr "textDocument/publishDiagnostics"
+                         "params", jobj [ "uri", jstr (Uri.ofPath rawPath); "diagnostics", jarr [] ] ] ]
+            else
+            let path = rawPath
             // the project first, so the file lands in its declared position
             // in the compile order rather than being appended
             this.EnsureProject path
             ws.SetFileText path ((fld doc "text").GetValue<string>())
             [ this.PublishDiagnostics path ]
         | "textDocument/didChange" ->
-            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let rawPath = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            if this.MapPath rawPath = Fpp.Builtin.path then []
+            else
+            let path = rawPath
             let changes = (fld ps "contentChanges").AsArray()
             if changes.Count > 0 then
                 ws.SetFileText path ((fld changes.[changes.Count - 1] "text").GetValue<string>())
             [ this.PublishDiagnostics path ]
         | "textDocument/didClose" -> []
         | "textDocument/documentSymbol" ->
-            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
             respond (this.Symbols path)
         | "textDocument/definition" ->
-            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
             let line = (fld (fld ps "position") "line").GetValue<int>()
             let ch = (fld (fld ps "position") "character").GetValue<int>()
             let starts = Lines.starts (ws.FileText path)
@@ -165,7 +185,7 @@ type Server(ws : Workspace) =
                 respond (jobj [ "uri", jstr (Uri.ofPath target); "range", range sl sc el ec ])
             | None -> respond null
         | "textDocument/hover" ->
-            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
             let line = (fld (fld ps "position") "line").GetValue<int>()
             let ch = (fld (fld ps "position") "character").GetValue<int>()
             let starts = Lines.starts (ws.FileText path)
@@ -178,7 +198,7 @@ type Server(ws : Workspace) =
                 respond (jobj [ "contents", jobj [ "kind", jstr "markdown"; "value", jstr md ] ])
             | None -> respond null
         | "textDocument/completion" ->
-            let path = Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>())
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
             this.EnsureProject path
             // after a DOT, offer the receiver's OWN members — the flat
             // export list cannot know the receiver, and `v.` deserves
