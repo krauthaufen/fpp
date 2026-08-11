@@ -1299,7 +1299,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
-        || k = FunType || k = AppType || k = PostfixType || k = ParenType
+        || k = FunType || k = AppType || k = AssocType || k = PostfixType || k = ParenType
 
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
 
@@ -1415,6 +1415,51 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some t -> namedVar t.Text
              | None -> st.Fresh ())
         | AnonType -> st.Fresh ()
+        | AssocType ->
+            // `Mul<'a,'b>.Result` — the projection is not a type FUNCTION
+            // (unification stays first-order): it is a fresh variable
+            // bound by the constraint `Mul<'a,'b> with Result = 'r` at
+            // this spot. Concrete arguments solve on the spot; generic
+            // ones ride the enclosing declaration like any inferred
+            // context.
+            (match nodesOf n, tokensOf n |> List.tryLast with
+             | inner :: _, Some assocTok when assocTok.Kind = Ident ->
+                 let clsName =
+                     match nodesOf inner with
+                     | h :: _ ->
+                         (match tokensOf h |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          | Some t -> t.Text
+                          | None -> "?")
+                     | [] ->
+                         (match tokensOf inner |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                          | Some t -> t.Text
+                          | None -> "?")
+                 let args =
+                     nodesOf inner |> List.tail
+                     |> List.filter (fun m -> isTypeKind m.NodeKind)
+                     |> List.map (typeFromNode vars)
+                 (match dictTryFind classes.Classes clsName with
+                  | Some cd when List.contains assocTok.Text cd.Assoc ->
+                      if cd.Params.Length <> args.Length then
+                          vecAdd diags
+                              (assocTok.Offset,
+                               "class " + clsName + " takes " + string cd.Params.Length
+                               + " type arguments, not " + string args.Length)
+                      let r = st.Fresh ()
+                      addWanted assocTok.Offset
+                          { Class = clsName; Args = args; Assoc = [ assocTok.Text, r ] }
+                      r
+                  | Some cd ->
+                      vecAdd diags
+                          (assocTok.Offset,
+                           "class " + cd.Name + " has no associated type " + assocTok.Text)
+                      st.Fresh ()
+                  | None ->
+                      vecAdd diags
+                          (assocTok.Offset,
+                           clsName + " is not a class, so it has no associated type to project")
+                      st.Fresh ())
+             | _ -> st.Fresh ())
         | NamedType ->
             let nameTok =
                 tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast

@@ -84,6 +84,7 @@ type NodeKind =
     | StructTupleType
     | FunType
     | AppType
+    | AssocType
     | PostfixType
     | ParenType
     // recovery

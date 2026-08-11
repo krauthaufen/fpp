@@ -430,9 +430,19 @@ let parse (src : string) : ParseResult =
 
     and parseAppType (ctx : int) : Green =
         let atom = parseAtomType ctx
-        if s.IsOp "<" && s.SameLine then
-            Green.node AppType (atom :: parseAngleArgs ctx)
-        else atom
+        let applied =
+            if s.IsOp "<" && s.SameLine then
+                Green.node AppType (atom :: parseAngleArgs ctx)
+            else atom
+        // an associated-type PROJECTION: `Mul<'a,'b>.Result` is a type —
+        // it desugars in inference to a fresh variable bound by the
+        // constraint `Mul<'a,'b> with Result = 'r`. A plain dotted NAME
+        // (`System.String`) never reaches here: its dots are consumed
+        // inside the atom, so a dot at this point is only ever the
+        // projection.
+        if s.IsOp "." && s.SameLine && (s.Peek 1).Kind = Ident then
+            Green.node AssocType [ applied; s.Bump (); s.Bump () ]
+        else applied
 
     /// `<` typeArgs `>`, tolerant of `when`-constraints and `_` holes; splits
     /// a `>>` run so nested generics close correctly.

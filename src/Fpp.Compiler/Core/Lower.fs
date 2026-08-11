@@ -305,7 +305,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         || k = SplicePat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
-        || k = FunType || k = AppType || k = PostfixType || k = ParenType
+        || k = FunType || k = AppType || k = AssocType || k = PostfixType || k = ParenType
         // `%t` in type position is a type node like any other
         || k = SpliceType
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams

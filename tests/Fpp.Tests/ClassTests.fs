@@ -2146,6 +2146,54 @@ let typeclassPracticeTests =
                       "let r2 = print (string w.X + \" \" + string w.Y)" ]
             Expect.equal out "-3 -4\n7 9\n" "two multiplies chain through Result"
         }
+        test "an associated type projects as a TYPE in annotations" {
+            // `Mul<'a,'b>.Result` in type position desugars to a fresh
+            // variable bound by the constraint at that spot — first-order
+            // unification throughout, concrete arguments solve on sight
+            let out =
+                run [ "let a : Mul<float, float>.Result = 1.5 * 2.0"
+                      "let r1 = print (string a)"
+                      "let b : Add<int, int>.Result = 40 + 2"
+                      "let r2 = print (string b)" ]
+            Expect.equal out "3\n42\n" "ground projections resolve on the spot"
+        }
+        test "a heterogeneous instance names its result through a projection" {
+            // the user's matrix: independent element types, the result
+            // element projected from Mul — note the ANNOTATED matrices:
+            // with 'a and 'b independent, nothing else determines the
+            // matrix's element type
+            let out =
+                run [ "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "[<Struct>]"
+                      "type M33<'a> ="
+                      "    { M00 : 'a; M01 : 'a; M02 : 'a"
+                      "      M10 : 'a; M11 : 'a; M12 : 'a"
+                      "      M20 : 'a; M21 : 'a; M22 : 'a }"
+                      "    static member Identity when Num<'a> ="
+                      "        { M00 = One; M01 = Zero; M02 = Zero"
+                      "          M10 = Zero; M11 = One; M12 = Zero"
+                      "          M20 = Zero; M21 = Zero; M22 = One }"
+                      "instance Mul<M33<'a>, V3<'b>>"
+                      "    type Result = V3<Mul<'a, 'b>.Result>"
+                      "    static (*) a b ="
+                      "        { X = a.M00 * b.X + a.M01 * b.Y + a.M02 * b.Z"
+                      "          Y = a.M10 * b.X + a.M11 * b.Y + a.M12 * b.Z"
+                      "          Z = a.M20 * b.X + a.M21 * b.Y + a.M22 * b.Z }"
+                      "let m : M33<float> = M33.Identity"
+                      "let r = m * { X = 3.0; Y = 4.0; Z = 7.0 }"
+                      "let p1 = print (string r.Y)"
+                      "let mi : M33<int> = M33.Identity"
+                      "let ri = mi * { X = 3; Y = 4; Z = 7 }"
+                      "let p2 = print (string (ri.X + ri.Z))" ]
+            Expect.equal out "4\n10\n" "the projection carries the element through"
+        }
+        test "a projection on a missing associated type says so" {
+            let errs =
+                diagnostics [ "let x : Mul<int, int>.Bogus = 1" ]
+            Expect.exists errs (fun e -> e.Contains "class Mul has no associated type Bogus")
+                "reported at the annotation, naming the class"
+        }
         test "an associated-type class of one's own dispatches by dimension" {
             // ascription-free `let ... when VecSpace<'v> =` parses since the
             // let-when hoist — the member form's twin
