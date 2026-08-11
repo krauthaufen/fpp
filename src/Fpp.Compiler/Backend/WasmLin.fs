@@ -46,6 +46,15 @@ let private CONST_BASE = FMTBUF + FMTCAP
 type private St =
     { M : Mod
       Errors : Vec<string>
+      /// per-function gap redirect (mirrors the wasm-GC driver's probe): while
+      /// lowering one function body, gaps go HERE instead of Errors, so the
+      /// driver can turn a body with any gap into an unreachable STUB + warning
+      /// rather than a hard error. None -> gaps are real errors.
+      mutable GapSink : Vec<string> option
+      /// functions stubbed because their body hit an unported node — the gap
+      /// text, one per stub (dead prelude/backend members that survive DCE but
+      /// are never called during self-host)
+      Warnings : Vec<string>
       /// top-level function names (their DLet is an ELam): reached by call
       Funcs : Dict<string, int>          // "path:offset" -> arity
       /// top-level non-lambda bindings: a mutable global each
@@ -198,7 +207,10 @@ let private key (v : VarId) : string = v.Path + ":" + string v.Offset
 let private fn (v : VarId) : string = "$f" + string (abs (strHash (key v)))
 let private gl (v : VarId) : string = "$g" + string (abs (strHash (key v)))
 
-let private err (st : St) (m : string) : unit = vecAdd st.Errors m
+let private err (st : St) (m : string) : unit =
+    match st.GapSink with
+    | Some v -> vecAdd v m
+    | None -> vecAdd st.Errors m
 
 // a UTF-16 string constant, baked into the active data segment; its address
 // is stable and even (a heap pointer). Layout: [i32 kind=1][i32 nunits][u16..]
@@ -1869,13 +1881,24 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
+    let sink = vecNew ()
+    st.GapSink <- Some sink
     let bodyLow = coreToLowE ctx body
+    st.GapSink <- None
     let f = beginFn m pnames
-    let np = List.length ps
-    for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
-    localsDone f
-    emitLowE f bodyLow
-    finish f
+    if vecLen sink > 0 then
+        // a gap in this body: emit an unreachable STUB (mirrors the wasm-GC
+        // driver's per-function probe). The gap becomes a warning; the function
+        // traps if ever reached. Dead prelude/backend members survive DCE.
+        vecAdd st.Warnings ("stubbed (" + vecGet sink 0 + ")")
+        localsDone f
+        ins f "unreachable"
+    else
+        let np = List.length ps
+        for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+        localsDone f
+        emitLowE f bodyLow
+        finish f
     endFn f
 
 // a lifted lambda body: params are (env, arg); captured free variables read
@@ -1885,11 +1908,19 @@ let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit 
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
+    let sink = vecNew ()
+    st.GapSink <- Some sink
     let bodyLow = coreToLowE ctx body
+    st.GapSink <- None
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
-    for id in 2 .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
-    localsDone f
-    emitLowE f bodyLow
+    if vecLen sink > 0 then
+        vecAdd st.Warnings ("stubbed lambda (" + vecGet sink 0 + ")")
+        localsDone f
+        ins f "unreachable"
+    else
+        for id in 2 .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+        localsDone f
+        emitLowE f bodyLow
     endFn f
 
 // ---- driver ---------------------------------------------------------------
@@ -2037,7 +2068,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             | _ -> false)
     let m = modNew ()
     let st =
-        { M = m; Errors = vecNew (); Funcs = dictNew (); Globals = dictNew ()
+        { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
+          Funcs = dictNew (); Globals = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
