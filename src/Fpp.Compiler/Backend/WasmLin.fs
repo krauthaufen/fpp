@@ -1538,7 +1538,8 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
 // in the object, so it is synthesised from the static type), a string / list /
 // array through the runtime $str_cmp / $cmpv.
 type private CmpShape =
-    | ShScalar | ShStr | ShFloat | ShInt64 | ShListArr | ShTup of CmpShape list | ShOther
+    | ShScalar | ShStr | ShFloat | ShInt64
+    | ShList of CmpShape | ShArr of CmpShape | ShTup of CmpShape list | ShOther
 
 let rec private shapeOfType (t : Type) : CmpShape =
     match prune t with
@@ -1548,7 +1549,11 @@ let rec private shapeOfType (t : Type) : CmpShape =
     | TCon (("float" | "double" | "single" | "float32" | "float16"), _) -> ShFloat
     | TCon (("int64" | "uint64"), _) -> ShInt64
     | TCon (("int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint"), _) -> ShScalar
-    | TCon (("list" | "array" | "[]" | "seq"), _) -> ShListArr
+    | TCon (("list" | "[]" | "seq"), (e :: _)) -> ShList (shapeOfType e)
+    | TCon (("list" | "[]" | "seq"), _) -> ShList ShOther
+    | TCon ("array", (e :: _)) -> ShArr (shapeOfType e)
+    | TCon ("array", _) -> ShArr ShOther
+    | TApp (h, (e :: _)) -> (match prune h with TCon (("list" | "[]" | "seq"), _) -> ShList (shapeOfType e) | TCon ("array", _) -> ShArr (shapeOfType e) | _ -> ShOther)
     | _ -> ShOther
 
 let rec private shapeOfExpr (e : Expr) : CmpShape =
@@ -1558,7 +1563,10 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     | ELit (LFloat _) -> ShFloat
     | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" -> ShInt64
     | ELit (LInt _ | LChar _ | LBool _) -> ShScalar
-    | EListLit _ | EArray _ -> ShListArr
+    | EListLit (x :: _) -> ShList (shapeOfExpr x)
+    | EListLit [] -> ShList ShOther
+    | EArray (_, (x :: _)) -> ShArr (shapeOfExpr x)
+    | EArray _ -> ShArr ShOther
     | EVar (_, sch) | EVarI (_, sch, _) -> shapeOfType sch.Body
     | _ -> ShOther
 
@@ -1566,11 +1574,13 @@ let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
     match a, b with
     | ShOther, x | x, ShOther -> x
     | ShTup xs, ShTup ys when List.length xs = List.length ys -> ShTup (List.map2 mergeShape xs ys)
+    | ShList x, ShList y -> ShList (mergeShape x y)
+    | ShArr x, ShArr y -> ShArr (mergeShape x y)
     | _ -> a
 
 let private needsStructCmp (sh : CmpShape) : bool =
     match sh with
-    | ShStr | ShFloat | ShInt64 | ShListArr | ShTup _ -> true
+    | ShStr | ShFloat | ShInt64 | ShList _ | ShArr _ | ShTup _ -> true
     | ShScalar | ShOther -> false
 
 // the shape from a mangled type name — "$tupN$<t0.t1...>", "string", "int", … —
@@ -1598,7 +1608,8 @@ let rec private shapeOfName (nm : string) : CmpShape =
         | "float" | "double" | "single" | "float32" | "float16" -> ShFloat
         | "int64" | "uint64" -> ShInt64
         | "int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint" -> ShScalar
-        | "list" | "array" | "seq" -> ShListArr
+        | "list" | "seq" | "[]" -> ShList ShOther
+        | "array" -> ShArr ShOther
         | _ -> ShOther
 
 // compare two operand WORDS by their static shape -> a raw -1/0/1 LExpr. Scalars
@@ -1609,12 +1620,15 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
     match sh with
     | ShScalar ->
         LPrim (SubW, [ LPrim (GtSW, [ lowUntag wa; lowUntag wb ]); LPrim (LtSW, [ lowUntag wa; lowUntag wb ]) ])
+    // an unknown/opaque operand: compare the tagged WORDS directly — correct for
+    // tagged ints (2x+1 is monotone in x), best-effort (address order) otherwise.
+    // NOT $cmpv: the GC object header is not a stable class-id at word-0.
+    | ShOther -> LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])
     | ShStr -> LCall ("$str_cmp", [ wa; wb ])
     | ShFloat ->
         LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
     | ShInt64 ->
         LPrim (SubW, [ LPrim (GtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
-    | ShListArr | ShOther -> LCall ("$cmpv", [ wa; wb ])
     | ShTup shapes ->
         let ra = freshTmp ctx
         let rb = freshTmp ctx
@@ -1626,6 +1640,44 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
             let init = [ LSet (wReg ra, wa); LSet (wReg rb, wb); LSet (wReg r, elemCmp 0 sh0) ]
             let guards = more |> List.mapi (fun k shi -> LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]), [ LSet (wReg r, elemCmp (k + 1) shi) ], []))
             LDo (init @ guards, LGet (wReg r))
+    | ShList esh ->
+        // walk two cons chains (head@HDR, tail@HDR+4; nil = 0) element-wise; on a
+        // common prefix the shorter list is the smaller
+        let pa = freshTmp ctx
+        let pb = freshTmp ctx
+        let r = freshTmp ctx
+        let notNil p = LPrim (NeW, [ LGet (wReg p); LConstW 0 ])
+        let cond = LPrim (AndW, [ notNil pa; LPrim (AndW, [ notNil pb; LPrim (EqW, [ LGet (wReg r); LConstW 0 ]) ]) ])
+        let body =
+            [ LSet (wReg r, structCmp ctx esh (LLoad (W, LGet (wReg pa), HDR)) (LLoad (W, LGet (wReg pb), HDR)))
+              LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
+                   [ LSet (wReg pa, LLoad (W, LGet (wReg pa), HDR + 4)); LSet (wReg pb, LLoad (W, LGet (wReg pb), HDR + 4)) ], []) ]
+        LDo ([ LSet (wReg pa, wa); LSet (wReg pb, wb); LSet (wReg r, LConstW 0)
+               LWhile (cond, body)
+               LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
+                    [ LSet (wReg r, LPrim (SubW, [ notNil pa; notNil pb ])) ], []) ],
+             LGet (wReg r))
+    | ShArr esh ->
+        // element-wise over the shorter length (len@HDR, elem i @ 8+4*i); on a
+        // common prefix the shorter array is the smaller
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        let na = freshTmp ctx
+        let nb = freshTmp ctx
+        let i = freshTmp ctx
+        let r = freshTmp ctx
+        let elemAt reg = LLoad (W, LPrim (AddW, [ LGet (wReg reg); LPrim (AddW, [ LConstW 8; LPrim (MulW, [ LGet (wReg i); LConstW 4 ]) ]) ]), 0)
+        let cond = LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg na) ]); LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg nb) ]); LPrim (EqW, [ LGet (wReg r); LConstW 0 ]) ]) ])
+        let body =
+            [ LSet (wReg r, structCmp ctx esh (elemAt ra) (elemAt rb))
+              LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]), [ LSet (wReg i, LPrim (AddW, [ LGet (wReg i); LConstW 1 ])) ], []) ]
+        LDo ([ LSet (wReg ra, wa); LSet (wReg rb, wb)
+               LSet (wReg na, LLoad (W, LGet (wReg ra), HDR)); LSet (wReg nb, LLoad (W, LGet (wReg rb), HDR))
+               LSet (wReg i, LConstW 0); LSet (wReg r, LConstW 0)
+               LWhile (cond, body)
+               LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
+                    [ LSet (wReg r, LPrim (SubW, [ LPrim (GtSW, [ LGet (wReg na); LGet (wReg nb) ]); LPrim (LtSW, [ LGet (wReg na); LGet (wReg nb) ]) ])) ], []) ],
+             LGet (wReg r))
 
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
@@ -1706,6 +1758,14 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let n = LGet (wReg t)
         let m = LPrim (ShrSW, [ n; LConstW 31 ])
         LDo ([ LSet (wReg t, lowUntag (coreToLowE ctx a)) ], lowTag (LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ])))
+    // the builtin `compare a b` (an unbound EVar in the unoptimised core):
+    // -1/0/1 by the operands' static shape
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
+        let sh = mergeShape (shapeOfExpr a) (shapeOfExpr b)
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        LDo ([ LSet (wReg ra, coreToLowE ctx a); LSet (wReg rb, coreToLowE ctx b) ],
+             lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
@@ -2462,6 +2522,10 @@ let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
         List.foldBack (fun p body -> ELam ([ p ], body)) ps call
     let rec go (e : Expr) : Expr =
         match e with
+        // an APPLIED builtin `compare`: keep the head (do not eta it — that is
+        // only for the bare-value use), recurse into the arguments
+        | EApp ((EVar (v, _) | EVarI (v, _, _)) as h, args) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
+            EApp (h, List.map go args)
         | EApp ((EVar (v, sch) | EVarI (v, sch, _)) as h, args) when (dictTryFind funcs (key v)).IsSome ->
             let n = (dictTryFind funcs (key v)).Value
             let args = List.map go args
@@ -2469,6 +2533,12 @@ let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
             if k = n then EApp (h, args)
             elif k < n then wrap v sch args (n - k)
             else EApp (EApp (EVar (v, sch), List.truncate n args), List.skip n args)
+        // the builtin `compare` used as a value: eta so the applied handler
+        // fires (operand shapes drive it; opaque operands degrade to scalar)
+        | EVar (v, sch) | EVarI (v, sch, _) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
+            let av, asch = fresh sch
+            let bv, bsch = fresh sch
+            ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (EVar (v, sch), [ EVar (av, asch); EVar (bv, bsch) ])))
         | EVar (v, sch) | EVarI (v, sch, _) ->
             match dictTryFind funcs (key v) with Some n when n > 0 -> wrap v sch [] n | _ -> e
         // `compare` used as a VALUE (List.sortWith compare, …): eta to
