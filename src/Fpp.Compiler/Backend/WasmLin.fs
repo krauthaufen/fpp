@@ -2208,11 +2208,27 @@ and private lowBox64 (ctx : LowCtx) (shape : string) (cid : int) (ty : LTy) (v :
 
 and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID_FLOAT F64 fv
 
-and private lowUnboxF (p : LExpr) : LExpr = LLoad (F64, p, HDR)
+// box elimination: unbox(box(v)) is just v — a box built here (an LDo whose
+// value is its own register and whose last store is the payload) is cancelled
+// on the spot, so a float/int64 chain (a+b, arr.[i]+c) never materialises the
+// intermediate heap box. Correct because the elided alloc is side-effect free.
+and private lowUnboxF (p : LExpr) : LExpr =
+    match p with
+    | LDo (stmts, LGet rb) ->
+        (match List.tryLast stmts with
+         | Some (LStore (F64, LGet rb2, off, v)) when rb2 = rb && off = HDR -> v
+         | _ -> LLoad (F64, p, HDR))
+    | _ -> LLoad (F64, p, HDR)
 
 and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr = lowBox64 ctx "i64" CID_INT64 I64 iv
 
-and private lowUnboxI (p : LExpr) : LExpr = LLoad (I64, p, HDR)
+and private lowUnboxI (p : LExpr) : LExpr =
+    match p with
+    | LDo (stmts, LGet rb) ->
+        (match List.tryLast stmts with
+         | Some (LStore (I64, LGet rb2, off, v)) when rb2 = rb && off = HDR -> v
+         | _ -> LLoad (I64, p, HDR))
+    | _ -> LLoad (I64, p, HDR)
 
 // test `pat` against the value in register `scrutReg`; produce statements that
 // LBreak to `fail` on mismatch and bind pattern variables on the matching
