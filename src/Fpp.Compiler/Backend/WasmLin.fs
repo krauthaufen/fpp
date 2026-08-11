@@ -145,6 +145,9 @@ let mutable private nameOf : Dict<string, string> = dictNew ()
 let mutable private gcStrTid = 0
 let mutable private gcByteTid = 0
 let mutable private gcIntTid = 0
+// a ref-array tid baked for the hand-emitted $str_split_char helper (which has
+// no LowCtx to call gcTid); registered eagerly beside the string/byte tids
+let mutable private gcArrTid = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
@@ -304,6 +307,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_replace" "$lt_iii2i"
     declFn m "$str_find_char" "$lt_ii2i"
     declFn m "$str_last_find_char" "$lt_ii2i"
+    declFn m "$str_split_char" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
@@ -830,6 +834,59 @@ let private emitStrLastFindChar (m : Mod) : unit =
     lg f "$i"; ic f 1; ins f "i32.sub"; ls f "$i"
     br f "$l"; endB f; endB f
     ic f -1
+    endFn f
+
+// $str_split_char(s, c): split s on unit c into a fresh string array of n+1
+// pieces (n = separator count). Two passes: count, then cut each [start, i)
+// slice via $strsub. Under GC the source `$s` and the growing result `$r` are
+// rooted across every $strsub allocation (a safepoint may relocate them).
+// Array layout matches EArrayCreate: [cid@0][len@4][elem0@8][elem i@8+4i].
+let private emitStrSplitChar (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$sl" "i32"; local f "$n" "i32"; local f "$i" "i32"
+    local f "$start" "i32"; local f "$k" "i32"; local f "$r" "i32"; local f "$sub" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    // pass 1: n = 1 + count(c)
+    ic f 1; ls f "$n"
+    ic f 0; ls f "$i"
+    blockE f "$c1"; loopE f "$l1"
+    lg f "$i"; lg f "$sl"; ins f "i32.ge_s"; brIf f "$c1"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$c"; ins f "i32.eq"
+    ifE f; lg f "$n"; ic f 1; ins f "i32.add"; ls f "$n"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l1"; endB f; endB f
+    // allocate the result array (root $s across the alloc)
+    let unpinA = strGuard f [ "$s" ]
+    if gc then (ic f gcArrTid; lg f "$n"; callf f "$fpallocn"; ls f "$r")
+    else
+        ic f 8; lg f "$n"; ic f 2; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$r"
+        lg f "$r"; ic f CID_ARRAY; mem f "i32.store"
+        lg f "$r"; ic f 4; ins f "i32.add"; lg f "$n"; mem f "i32.store"
+    unpinA ()
+    // pass 2: cut a piece at each separator
+    ic f 0; ls f "$i"; ic f 0; ls f "$start"; ic f 0; ls f "$k"
+    blockE f "$c2"; loopE f "$l2"
+    lg f "$i"; lg f "$sl"; ins f "i32.ge_s"; brIf f "$c2"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$c"; ins f "i32.eq"
+    ifE f
+    let unpin = strGuard f [ "$s"; "$r" ]
+    lg f "$s"; lg f "$start"; lg f "$i"; lg f "$start"; ins f "i32.sub"; callf f "$strsub"; ls f "$sub"
+    unpin ()
+    lg f "$r"; ic f 8; ins f "i32.add"; lg f "$k"; ic f 2; ins f "i32.shl"; ins f "i32.add"; lg f "$sub"; mem f "i32.store"
+    lg f "$k"; ic f 1; ins f "i32.add"; ls f "$k"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$start"
+    endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l2"; endB f; endB f
+    // the final piece: [start, sl)
+    let unpin2 = strGuard f [ "$s"; "$r" ]
+    lg f "$s"; lg f "$start"; lg f "$sl"; lg f "$start"; ins f "i32.sub"; callf f "$strsub"; ls f "$sub"
+    unpin2 ()
+    lg f "$r"; ic f 8; ins f "i32.add"; lg f "$k"; ic f 2; ins f "i32.shl"; ins f "i32.add"; lg f "$sub"; mem f "i32.store"
+    lg f "$r"
     endFn f
 
 // $hashv(v): a structural hash matching the wasm-GC backend's $hashv exactly
@@ -1365,6 +1422,9 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; lowUntag (coreToLowE ctx from) ]))
     | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
         lowTag (LCall ("$str_last_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]))
+    | EApp (EUnknown "$str.Split", [ s; c ]) ->
+        // returns a heap string array (an even pointer), not a tagged value
+        LCall ("$str_split_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ])
     | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> LCall ("$str_replace", [ coreToLowE ctx s; coreToLowE ctx a; coreToLowE ctx b ])
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
@@ -2183,6 +2243,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         gcStrTid <- gcTid st "str" 2 FK_SCALAR_ARRAY 0
         gcByteTid <- gcTid st "byte" 1 FK_SCALAR_ARRAY 0
         gcIntTid <- gcTid st "int" 4 FK_SCALAR_ARRAY 0
+        gcArrTid <- gcTid st "arr" 4 FK_REF_ARRAY 2
         // a root slot for the vtable array pointer (filled at startup)
         st.VtSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
@@ -2260,7 +2321,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitHashv m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m; emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
