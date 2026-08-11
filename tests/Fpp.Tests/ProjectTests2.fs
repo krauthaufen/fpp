@@ -120,8 +120,10 @@ let lspProjectTests =
             match find "min" with
             | Some (_, _, ty, _) -> Expect.stringContains ty "MinMax" "min shows its constraint"
             | None -> failtest "min not offered"
-            // a definition exported under two names appears ONCE
-            let zeros = items |> List.filter (fun (l, _, _, _) -> l = "Zero")
+            // a definition exported under two names appears ONCE — the
+            // label "Zero" now legitimately names two things (the class
+            // and its member), so count the MEMBER entries
+            let zeros = items |> List.filter (fun (l, k, _, _) -> l = "Zero" && k <> "type")
             Expect.hasLength zeros 1 "class members are not offered twice"
             // and the project's own bindings are there
             Expect.isSome (find "double") "the project's own function"

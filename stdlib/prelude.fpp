@@ -19,12 +19,18 @@ class Rem<'a, 'b>
     type Result
     static (%) : 'a -> 'b -> Result
 [<AutoOpen>]
+class Zero<'a>
+    static Zero : 'a
+[<AutoOpen>]
+class One<'a>
+    static One : 'a
+[<AutoOpen>]
 class Num<'a>
+    when Zero<'a>
+    when One<'a>
     when Add<'a, 'a> = 'a
     when Sub<'a, 'a> = 'a
     when Mul<'a, 'a> = 'a
-    static Zero : 'a
-    static One : 'a
 [<AutoOpen>]
 class Fractional<'a>
     when Num<'a>
@@ -79,6 +85,8 @@ class Floating<'a>
     static pow : 'a -> 'a -> 'a
 instance Add<string, string>
     type Result = string
+instance Zero<string>
+    static Zero = ""
 instance Add<int, int>
     type Result = int
 instance Sub<int, int>
@@ -89,9 +97,11 @@ instance Div<int, int>
     type Result = int
 instance Rem<int, int>
     type Result = int
-instance Num<int>
+instance Zero<int>
     static Zero = 0
+instance One<int>
     static One = 1
+instance Num<int>
 instance Integral<int>
 instance Ordered<int>
 instance Neg<int>
@@ -109,9 +119,11 @@ instance Div<int64, int64>
     type Result = int64
 instance Rem<int64, int64>
     type Result = int64
-instance Num<int64>
+instance Zero<int64>
     static Zero = 0L
+instance One<int64>
     static One = 1L
+instance Num<int64>
 instance Integral<int64>
 instance Ordered<int64>
 instance Neg<int64>
@@ -129,9 +141,11 @@ instance Div<uint32, uint32>
     type Result = uint32
 instance Rem<uint32, uint32>
     type Result = uint32
-instance Num<uint32>
+instance Zero<uint32>
     static Zero = 0u
+instance One<uint32>
     static One = 1u
+instance Num<uint32>
 instance Integral<uint32>
 instance Ordered<uint32>
 instance MinMax<uint32>
@@ -145,9 +159,11 @@ instance Mul<float, float>
     type Result = float
 instance Div<float, float>
     type Result = float
-instance Num<float>
+instance Zero<float>
     static Zero = 0.0
+instance One<float>
     static One = 1.0
+instance Num<float>
 instance Fractional<float>
 instance Ordered<float>
 instance Neg<float>
@@ -163,9 +179,11 @@ instance Mul<float32, float32>
     type Result = float32
 instance Div<float32, float32>
     type Result = float32
-instance Num<float32>
+instance Zero<float32>
     static Zero = 0.0f
+instance One<float32>
     static One = 1.0f
+instance Num<float32>
 instance Fractional<float32>
 instance Ordered<float32>
 instance Neg<float32>
@@ -184,9 +202,11 @@ instance Div<uint64, uint64>
     type Result = uint64
 instance Rem<uint64, uint64>
     type Result = uint64
-instance Num<uint64>
+instance Zero<uint64>
     static Zero = 0UL
+instance One<uint64>
     static One = 1UL
+instance Num<uint64>
 instance Integral<uint64>
 instance Ordered<uint64>
 instance MinMax<uint64>
@@ -208,9 +228,11 @@ instance Div<nativeint, nativeint>
     type Result = nativeint
 instance Rem<nativeint, nativeint>
     type Result = nativeint
-instance Num<nativeint>
+instance Zero<nativeint>
     static Zero = nativeint 0
+instance One<nativeint>
     static One = nativeint 1
+instance Num<nativeint>
 instance Integral<nativeint>
 instance Ordered<nativeint>
 instance Neg<nativeint>
@@ -230,9 +252,11 @@ instance Div<int16, int16>
     type Result = int16
 instance Rem<int16, int16>
     type Result = int16
-instance Num<int16>
+instance Zero<int16>
     static Zero = 0s
+instance One<int16>
     static One = 1s
+instance Num<int16>
 instance Integral<int16>
 instance Ordered<int16>
 instance Neg<int16>
@@ -251,9 +275,11 @@ instance Div<uint16, uint16>
     type Result = uint16
 instance Rem<uint16, uint16>
     type Result = uint16
-instance Num<uint16>
+instance Zero<uint16>
     static Zero = 0us
+instance One<uint16>
     static One = 1us
+instance Num<uint16>
 instance Integral<uint16>
 instance Ordered<uint16>
 instance MinMax<uint16>
@@ -272,9 +298,11 @@ instance Div<byte, byte>
     type Result = byte
 instance Rem<byte, byte>
     type Result = byte
-instance Num<byte>
+instance Zero<byte>
     static Zero = 0uy
+instance One<byte>
     static One = 1uy
+instance Num<byte>
 instance Integral<byte>
 instance Unmanaged<int>
     static byteSize = 4
@@ -320,9 +348,11 @@ instance Div<sbyte, sbyte>
     type Result = sbyte
 instance Rem<sbyte, sbyte>
     type Result = sbyte
-instance Num<sbyte>
+instance Zero<sbyte>
     static Zero = 0y
+instance One<sbyte>
     static One = 1y
+instance Num<sbyte>
 instance Integral<sbyte>
 instance Neg<sbyte>
 instance Abs<sbyte>
@@ -745,9 +775,11 @@ instance Abs<float16>
 instance MinMax<float16>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
-instance Num<float16>
+instance Zero<float16>
     static Zero = 0.0h
+instance One<float16>
     static One = 1.0h
+instance Num<float16>
 instance Fractional<float16>
 instance Floating<float16>
     static exp x = float16 (exp (float32 x))

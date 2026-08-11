@@ -59,9 +59,11 @@ let private v2d =
       "instance Mul<V2d, V2d>"
       "    type Result = V2d"
       "    static (*) a b = { X = a.X * b.X; Y = a.Y * b.Y }"
-      "instance Num<V2d>"
+      "instance Zero<V2d>"
       "    static Zero = { X = 0.0; Y = 0.0 }"
-      "    static One = { X = 1.0; Y = 1.0 }" ]
+      "instance One<V2d>"
+      "    static One = { X = 1.0; Y = 1.0 }"
+      "instance Num<V2d>" ]
 
 [<Tests>]
 let primitiveInstanceTests =
@@ -380,7 +382,7 @@ let qualificationTests =
     testList "classes: qualified members" [
         test "a member can always be named through its class" {
             let out =
-                run [ "let a = print (Num.Zero + Num.One)"
+                run [ "let a = print (Zero.Zero + One.One)"
                       "let b = print (Add.(+) 3 4)"
                       "let c = print (Mul.(*) 2.5 4.0)" ]
             // the qualification says which CLASS; the instance is still
@@ -390,13 +392,13 @@ let qualificationTests =
         test "qualification survives at a user instance" {
             let out =
                 run (v2d @
-                     [ "let z : V2d = Num.One"
+                     [ "let z : V2d = One.One"
                        "let a = print (Add.(+) z z).X" ])
             Expect.equal out "2\n" "the operator member is the instance's body"
         }
         test "a qualified member still picks the instance by type" {
-            let out = run (v2d @ [ "let z : V2d = Num.Zero"; "let a = print z.Y" ])
-            Expect.equal out "0\n" "Num.Zero at V2d is the user instance's Zero"
+            let out = run (v2d @ [ "let z : V2d = Zero.Zero"; "let a = print z.Y" ])
+            Expect.equal out "0\n" "Zero.Zero at V2d is the user instance's Zero"
         }
     ]
 
@@ -2370,9 +2372,9 @@ let declarationCheckTests =
             // Num<float>.One and One<float> both mean float's one — the
             // pin is only VISIBLE where int and float differ, so divide
             let out =
-                run [ "let a = print (string (Num<float>.One / 2.0))"
+                run [ "let a = print (string (One<float>.One / 2.0))"
                       "let b = print (string (One<float> / 4.0))"
-                      "let c = print (string (Num<int>.One + 1))" ]
+                      "let c = print (string (One<int>.One + 1))" ]
             Expect.equal out "0.5\n0.25\n2\n" "the written argument decides"
         }
         test "a class-applied member that does not exist says so" {
@@ -2400,20 +2402,30 @@ let declarationCheckTests =
             // legitimately resolves that way)
         }
         test "a when-clause naming a class MEMBER points at its class" {
-            // `when Zero<'a>` looks right and is wrong — Zero is Num's
-            // member. Unvalidated, it surfaced as `no instance
-            // Zero<float>` at every distant use; now the clause itself
-            // names the class that provides it
+            // `when compare<'a>` looks plausible and is wrong — compare
+            // is Ordered's member. The clause itself names the class
             let errs =
-                diagnostics
-                    [ "[<Struct>]"
-                      "type M33<'a> = { M00 : 'a }"
-                      "    static member Identity when Zero<'a> and One<'a> ="
-                      "        { M00 = One }"
-                      "let t : M33<float> = M33.Identity" ]
+                diagnostics [ "let f (x : 'a) : 'a when compare<'a> = x" ]
             Expect.exists errs (fun e ->
-                e.Contains "Zero is a member of class Num" && e.Contains "when Num<...>")
+                e.Contains "compare is a member of class Ordered" && e.Contains "when Ordered<...>")
                 "the remedy is spelled out at the clause"
+        }
+        test "Zero and One are their own classes; Num requires them" {
+            // the day-one spelling works, Num still entails both, and the
+            // string monoid gets the identity its concat deserves — with
+            // no One in sight
+            let out =
+                run [ "[<Struct>]"
+                      "type M22<'a> = { M00 : 'a; M11 : 'a }"
+                      "    static member Identity when Zero<'a> and One<'a> ="
+                      "        { M00 = One; M11 = One }"
+                      "let m : M22<float> = M22.Identity"
+                      "let r1 = print (string (m.M00 + m.M11))"
+                      "let viaNum (x : 'a) : 'a when Num<'a> = x * One + Zero"
+                      "let r2 = print (string (viaNum 21))"
+                      "let r3 = print (Zero + \"monoid\" + Zero)"
+                      "let r4 = print (List.fold (fun a b -> a + b) Zero [ \"a\"; \"b\"; \"c\" ])" ]
+            Expect.equal out "2\n21\nmonoid\nabc\n" "split classes, entailment, string zero"
         }
         test "a when-clause naming nothing known says so at the clause" {
             let errs =

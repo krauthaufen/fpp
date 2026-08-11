@@ -215,10 +215,10 @@ let editorRobustnessTests =
         }
         test "hover answers on a class-applied member" {
             let ws = Fpp.Workspace()
-            let src = "module M\nlet z = Num<float>.Zero\n"
+            let src = "module M\nlet z = Zero<float>.Zero\n"
             ws.SetFileText "t.fpp" src
             match ws.HoverAt "t.fpp" (src.IndexOf ".Zero" + 2) with
-            | Some h -> Expect.stringContains h "Num.Zero" "names the class member"
+            | Some h -> Expect.stringContains h "Zero.Zero" "names the class member"
             | None -> failtest "no hover on the applied member"
         }
         test "the prelude pseudo-file checks like a file" {
