@@ -117,7 +117,11 @@ type private St =
       TidCid : Vec<int * int>
       /// GC mode: the root-table slot holding the vtable array pointer (the
       /// vtable can't live in a data segment — that would land in fpprt's heap)
-      mutable VtSlot : int }
+      mutable VtSlot : int
+      /// GC mode: root slot holding the tid->shape-info array the generic $cmpv
+      /// uses to structurally compare ANY shape at runtime (kind/start/nwords
+      /// packed per tid). Standalone reads the same info from static memory.
+      mutable CmpTblSlot : int }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -154,6 +158,7 @@ let mutable private gcArrTid = 0
 let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
 let mutable private gcListTid = 0
+let mutable private gcCmpTblSlot = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
@@ -1121,12 +1126,16 @@ let private emitStrCmp (m : Mod) : unit =
 let private emitCmpv (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"; local f "$y" "i32"
+    local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$r" "i32"
+    local f "$w" "i32"; local f "$st" "i32"; local f "$tot" "i32"; local f "$tbl" "i32"; local f "$tid" "i32"
     local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     let strH = hv CID_STRING gcStrTid
     let fltH = hv CID_FLOAT gcFloatTid
     let i64H = hv CID_INT64 gcInt64Tid
+    let arrH = hv CID_ARRAY gcArrTid
+    let both h = (lg f "$ca"; ic f h; ins f "i32.eq"; lg f "$cb"; ic f h; ins f "i32.eq"; ins f "i32.and")
     lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
     lg f "$a"; ic f 1; ins f "i32.and"; lg f "$b"; ic f 1; ins f "i32.and"; ins f "i32.and"
     ifE f
@@ -1138,27 +1147,72 @@ let private emitCmpv (m : Mod) : unit =
     lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
     lg f "$a"; ic f 1; ins f "i32.and"; ifE f; ic f -1; ins f "return"; endB f
     lg f "$b"; ic f 1; ins f "i32.and"; ifE f; ic f 1; ins f "return"; endB f
-    // both heap pointers. Only the STABLE-header kinds (string, float, int64
-    // boxes) are dispatched — an FK_TAGGED object (tuple/list/record) has NO
-    // stable class-id at word-0 (it reads back per-object), so those compare
-    // EQUAL (0) here rather than risk walking garbage. Both operands must carry
-    // the same header, so a stray word-0 match cannot misdispatch a compound.
     lg f "$a"; mem f "i32.load"; ls f "$ca"
     lg f "$b"; mem f "i32.load"; ls f "$cb"
-    lg f "$ca"; ic f strH; ins f "i32.eq"; lg f "$cb"; ic f strH; ins f "i32.eq"; ins f "i32.and"
+    both strH
     ifE f; lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "return"; endB f
-    lg f "$ca"; ic f fltH; ins f "i32.eq"; lg f "$cb"; ic f fltH; ins f "i32.eq"; ins f "i32.and"
+    both fltH
     ifE f
     lg f "$a"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fa"
     lg f "$b"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fb"
     lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ins f "return"
     endB f
-    lg f "$ca"; ic f i64H; ins f "i32.eq"; lg f "$cb"; ic f i64H; ins f "i32.eq"; ins f "i32.and"
+    both i64H
     ifE f
     lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$la"
     lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$lb"
     lg f "$la"; lg f "$lb"; ins f "i64.gt_s"; lg f "$la"; lg f "$lb"; ins f "i64.lt_s"; ins f "i32.sub"; ins f "return"
     endB f
+    both arrH
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
+    ic f 0; ls f "$i"
+    blockE f "$ad"; loopE f "$ago"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ad"
+    lg f "$i"; lg f "$mm"; ins f "i32.ge_s"; brIf f "$ad"
+    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+    callf f "$cmpv"; ls f "$r"
+    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$ago"; endB f; endB f
+    lg f "$n"; lg f "$mm"; ins f "i32.gt_s"; lg f "$n"; lg f "$mm"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+    endB f
+    // remaining compound shapes: under GC walk the payload words structurally via
+    // the tid->info table (tuples/records/lists/cons/closures, uniform); raw
+    // metadata words (a union tag) compare as ints, ref/payload words recurse.
+    // Different tids order by header. Standalone has no table -> equal (0).
+    if gc then
+        lg f "$ca"; lg f "$cb"; ins f "i32.ne"
+        ifE f; lg f "$ca"; lg f "$cb"; ins f "i32.gt_s"; lg f "$ca"; lg f "$cb"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+        lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
+        lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
+        gg f "$roots"; ic f (4 * gcCmpTblSlot); ins f "i32.add"; mem f "i32.load"; ls f "$tbl"
+        lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
+        lg f "$r"; ic f 10; ins f "i32.shr_u"; ic f 0x3FF; ins f "i32.and"; ls f "$st"
+        lg f "$st"; ic f 1; ins f "i32.lt_s"; ifE f; ic f 1; ls f "$st"; endB f
+        lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
+        // raw metadata words [1, start): int compare (union tag)
+        ic f 1; ls f "$w"
+        blockE f "$rd"; loopE f "$rgo"
+        lg f "$w"; lg f "$st"; ins f "i32.ge_s"; brIf f "$rd"
+        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$x"
+        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$y"
+        lg f "$x"; lg f "$y"; ins f "i32.ne"
+        ifE f; lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+        lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
+        br f "$rgo"; endB f; endB f
+        // payload words [start, tot): recurse
+        lg f "$st"; ls f "$w"
+        blockE f "$td"; loopE f "$tgo"
+        lg f "$w"; lg f "$tot"; ins f "i32.ge_s"; brIf f "$td"
+        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        callf f "$cmpv"; ls f "$r"
+        lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
+        lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
+        br f "$tgo"; endB f; endB f
     ic f 0
     endFn f
 
@@ -1742,18 +1796,21 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
         LDo (pre, lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
-    // a comparison whose operands are a COMPOUND value (tuple/list/...) or a
-    // STRING (`=t`/`<t` — the `t` type suffix): the tagged-int fast path below
-    // would compare heap POINTERS, so route it through a structural comparison.
+    // a comparison whose operands are a COMPOUND value (tuple/list/...), a STRING
+    // (`=t`/`<t` — the `t` type suffix), or a STRUCTURAL `=@Type`/`<>@Type`
+    // (records/unions): the tagged-int fast path below would compare heap
+    // POINTERS, so route it through a structural comparison.
     | EPrim (op, [ a; b ]) when
-        (let b0 = baseOp op
-         let cb = if b0.EndsWith "t" then b0.Substring (0, b0.Length - 1) else b0
+        (let hasAt = op.Contains "@"
+         let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
+         let cb = if (not hasAt) && b0.EndsWith "t" then b0.Substring (0, b0.Length - 1) else b0
          (match cb with "<" | ">" | "<=" | ">=" | "=" | "<>" -> true | _ -> false)
-         && (b0.EndsWith "t" || needsStructCmp (mergeShape (shapeOfExpr a) (shapeOfExpr b)))) ->
-        let b0 = baseOp op
-        let isStr = b0.EndsWith "t"
+         && (hasAt || (baseOp op).EndsWith "t" || needsStructCmp (mergeShape (shapeOfExpr a) (shapeOfExpr b)))) ->
+        let hasAt = op.Contains "@"
+        let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
+        let isStr = (not hasAt) && b0.EndsWith "t"
         let cb = if isStr then b0.Substring (0, b0.Length - 1) else b0
-        let sh = if isStr then ShStr else mergeShape (shapeOfExpr a) (shapeOfExpr b)
+        let sh = if isStr then ShStr elif hasAt then ShOther else mergeShape (shapeOfExpr a) (shapeOfExpr b)
         let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
         let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
@@ -2658,7 +2715,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
           Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
-          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0 }
+          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -2770,6 +2827,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // a root slot for the vtable array pointer (filled at startup)
         st.VtSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
+        st.CmpTblSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        gcCmpTblSlot <- st.CmpTblSlot
     rtDeclsLin m
     for d in decls do
         match d with
@@ -2913,6 +2973,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             gg rf "$roots"; ic rf (4 * st.VtSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
             vtRows |> Array.iteri (fun i w ->
                 if w <> 0 then (lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf w; mem rf "i32.store"))
+        // tid -> shape info (kind<<20 | start<<10 | nwords) for the generic $cmpv
+        if st.TidNext > 0 then
+            ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
+            gg rf "$roots"; ic rf (4 * st.CmpTblSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+            for tid, size, kind, start in vecToList st.TidRegs do
+                let info = (kind <<< 20) ||| (start <<< 10) ||| ((size / 4) &&& 0x3FF)
+                lg rf "$t"; ic rf (8 + 4 * tid); ins rf "i32.add"; ic rf info; mem rf "i32.store"
         // scratch buffer (iovec + PRINTBUF + FMTBUF) -> root slot 0; $sbuf points
         // past its [tag][len] header so the fixed offsets apply unchanged. Kept
         // in the root table so a moving collection updates it.
