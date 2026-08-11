@@ -928,7 +928,15 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
         | EApp (g, xs) -> go bnd g; for x in xs do go bnd x
         | EIf (a, b, c) | EIndexSet (_, a, b, c) -> go bnd a; go bnd b; go bnd c
         | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> go bnd a; go bnd b
-        | EAssign (_, x) -> go bnd x
+        | EAssign (v, x) ->
+            // a mutable ASSIGNED inside a lambda is captured too (it lives in a
+            // shared cell) — count the target as free, exactly like a read
+            let k = key v
+            if (dictTryFind bnd k).IsNone && (dictTryFind st.Globals k).IsNone
+               && (dictTryFind st.Funcs k).IsNone && (dictTryFind seen k).IsNone then
+                dictSet seen k true
+                vecAdd acc (v.Path, v.Offset)
+            go bnd x
         | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> go bnd r
         | EFieldSet (r, _, _, x) -> go bnd r; go bnd x
         | ERecord (_, fs) -> for _, x in fs do go bnd x
