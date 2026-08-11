@@ -148,6 +148,12 @@ let mutable private gcIntTid = 0
 // a ref-array tid baked for the hand-emitted $str_split_char helper (which has
 // no LowCtx to call gcTid); registered eagerly beside the string/byte tids
 let mutable private gcArrTid = 0
+// reserved-shape tids the hand-emitted $cmpv matches: under GC an object's
+// word-0 is (tid<<1)|1, NOT the class-id, so $cmpv compares those headers.
+// Interned eagerly with the SAME shape keys lowObj/lowBox64 use (shared tids).
+let mutable private gcFloatTid = 0
+let mutable private gcInt64Tid = 0
+let mutable private gcListTid = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
@@ -318,6 +324,8 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_trim_end_chars" "$lt_ii2i"
     declFn m "$str_insert" "$lt_iii2i"
     declFn m "$str_remove2" "$lt_iii2i"
+    declFn m "$str_cmp" "$lt_ii2i"
+    declFn m "$cmpv" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
@@ -1082,6 +1090,110 @@ let private emitStrRemove2 (m : Mod) : unit =
     lg f "$h"; lg f "$t"; callf f "$str_cat"
     endFn f
 
+// $str_cmp(a, b): lexical comparison of two strings -> -1/0/1 (shorter first on
+// a tie). Both args ARE strings, so no class-id dispatch.
+let private emitStrCmp (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$x" "i32"; local f "$y" "i32"
+    localsDone f
+    lg f "$a"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    lg f "$b"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
+    ic f 0; ls f "$i"
+    blockE f "$d"; loopE f "$g"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$d"
+    lg f "$i"; lg f "$mm"; ins f "i32.ge_s"; brIf f "$d"
+    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ls f "$x"
+    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ls f "$y"
+    lg f "$x"; lg f "$y"; ins f "i32.ne"
+    ifE f; lg f "$x"; lg f "$y"; ins f "i32.gt_u"; lg f "$x"; lg f "$y"; ins f "i32.lt_u"; ins f "i32.sub"; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$g"; endB f; endB f
+    lg f "$n"; lg f "$mm"; ins f "i32.gt_s"; lg f "$n"; lg f "$mm"; ins f "i32.lt_s"; ins f "i32.sub"
+    endFn f
+
+// $cmpv(a, b): structural comparison -> -1/0/1 for the SELF-DESCRIBING reps —
+// tagged int, nil(0), string, float, int64, list and array (element-wise,
+// recursively). Tuples/records have no arity in the object, so they are compared
+// by TYPE-DIRECTED synthesis at the call site, not here; a nested tuple reaching
+// $cmpv falls to the best-effort equal tail. Never allocates. Under GC an
+// object's word-0 is (tid<<1)|1, so we match the reserved tid headers (else the
+// raw class-id in the standalone path).
+let private emitCmpv (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"; local f "$y" "i32"
+    local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$r" "i32"
+    local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
+    localsDone f
+    let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
+    let strH = hv CID_STRING gcStrTid
+    let fltH = hv CID_FLOAT gcFloatTid
+    let i64H = hv CID_INT64 gcInt64Tid
+    let lstH = hv CID_LIST gcListTid
+    let arrH = hv CID_ARRAY gcArrTid
+    lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
+    lg f "$a"; ic f 1; ins f "i32.and"; lg f "$b"; ic f 1; ins f "i32.and"; ins f "i32.and"
+    ifE f
+    lg f "$a"; ic f 1; ins f "i32.shr_s"; ls f "$x"
+    lg f "$b"; ic f 1; ins f "i32.shr_s"; ls f "$y"
+    lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+    endB f
+    lg f "$a"; ins f "i32.eqz"; ifE f; ic f -1; ins f "return"; endB f
+    lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
+    lg f "$a"; ic f 1; ins f "i32.and"; ifE f; ic f -1; ins f "return"; endB f
+    lg f "$b"; ic f 1; ins f "i32.and"; ifE f; ic f 1; ins f "return"; endB f
+    lg f "$a"; mem f "i32.load"; ls f "$ca"
+    lg f "$b"; mem f "i32.load"; ls f "$cb"
+    lg f "$ca"; lg f "$cb"; ins f "i32.ne"
+    ifE f; lg f "$ca"; lg f "$cb"; ins f "i32.gt_s"; lg f "$ca"; lg f "$cb"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+    lg f "$ca"; ic f strH; ins f "i32.eq"
+    ifE f
+    lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "return"
+    endB f
+    lg f "$ca"; ic f fltH; ins f "i32.eq"
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fa"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fb"
+    lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ins f "return"
+    endB f
+    lg f "$ca"; ic f i64H; ins f "i32.eq"
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$la"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$lb"
+    lg f "$la"; lg f "$lb"; ins f "i64.gt_s"; lg f "$la"; lg f "$lb"; ins f "i64.lt_s"; ins f "i32.sub"; ins f "return"
+    endB f
+    lg f "$ca"; ic f lstH; ins f "i32.eq"
+    ifE f
+    blockE f "$ld"; loopE f "$lgo"
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$x"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$y"
+    lg f "$x"; lg f "$y"; callf f "$cmpv"; ls f "$r"
+    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
+    lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$a"
+    lg f "$b"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$b"
+    lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
+    lg f "$a"; ins f "i32.eqz"; ifE f; ic f -1; ins f "return"; endB f
+    lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
+    br f "$lgo"; endB f; endB f
+    endB f
+    lg f "$ca"; ic f arrH; ins f "i32.eq"
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
+    ic f 0; ls f "$i"
+    blockE f "$ad"; loopE f "$ago"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ad"
+    lg f "$i"; lg f "$mm"; ins f "i32.ge_s"; brIf f "$ad"
+    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$x"
+    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$y"
+    lg f "$x"; lg f "$y"; callf f "$cmpv"; ls f "$r"
+    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$ago"; endB f; endB f
+    lg f "$n"; lg f "$mm"; ins f "i32.gt_s"; lg f "$n"; lg f "$mm"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+    endB f
+    ic f 0
+    endFn f
+
 // $hashv(v): a structural hash matching the wasm-GC backend's $hashv exactly
 // (so a dictionary keyed the same way iterates the same order). A tagged int
 // hashes to itself; a string is the SAMPLED FNV (offset 0x811c9dc5, prime
@@ -1420,6 +1532,101 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
     | ELet (true, v, _, (ELam (_, _) as lam), rest) -> let ms, body = recGroupOf rest in (v, lam) :: ms, body
     | _ -> [], e
 
+// The comparison shape of an operand: how `=`/`<`/`compare` must treat it. The
+// tagged-int fast path is CORRECT only for scalars (immediate values); a heap
+// shape needs a STRUCTURAL comparison — a tuple element-wise (its arity is not
+// in the object, so it is synthesised from the static type), a string / list /
+// array through the runtime $str_cmp / $cmpv.
+type private CmpShape =
+    | ShScalar | ShStr | ShFloat | ShInt64 | ShListArr | ShTup of CmpShape list | ShOther
+
+let rec private shapeOfType (t : Type) : CmpShape =
+    match prune t with
+    | TTuple ts -> ShTup (List.map shapeOfType ts)
+    | TCon (n, _) when n.StartsWith "$tup" -> ShOther
+    | TCon ("string", _) -> ShStr
+    | TCon (("float" | "double" | "single" | "float32" | "float16"), _) -> ShFloat
+    | TCon (("int64" | "uint64"), _) -> ShInt64
+    | TCon (("int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint"), _) -> ShScalar
+    | TCon (("list" | "array" | "[]" | "seq"), _) -> ShListArr
+    | _ -> ShOther
+
+let rec private shapeOfExpr (e : Expr) : CmpShape =
+    match e with
+    | ETuple xs -> ShTup (List.map shapeOfExpr xs)
+    | ELit (LString _) -> ShStr
+    | ELit (LFloat _) -> ShFloat
+    | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" -> ShInt64
+    | ELit (LInt _ | LChar _ | LBool _) -> ShScalar
+    | EListLit _ | EArray _ -> ShListArr
+    | EVar (_, sch) | EVarI (_, sch, _) -> shapeOfType sch.Body
+    | _ -> ShOther
+
+let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
+    match a, b with
+    | ShOther, x | x, ShOther -> x
+    | ShTup xs, ShTup ys when List.length xs = List.length ys -> ShTup (List.map2 mergeShape xs ys)
+    | _ -> a
+
+let private needsStructCmp (sh : CmpShape) : bool =
+    match sh with
+    | ShStr | ShFloat | ShInt64 | ShListArr | ShTup _ -> true
+    | ShScalar | ShOther -> false
+
+// the shape from a mangled type name — "$tupN$<t0.t1...>", "string", "int", … —
+// used for the `compare` intrinsic, whose dispatch name carries the operand type
+// even when the operands themselves are opaque (e.g. eta parameters).
+let rec private shapeOfName (nm : string) : CmpShape =
+    if nm.Contains "#" then ShOther
+    elif nm.StartsWith "$tup" && nm.Contains "$<" then
+        let lt = nm.IndexOf "$<"
+        let inner = substr nm (lt + 2) (strLen nm - (lt + 2) - 1)
+        let parts = vecNew<string> ()
+        let mutable depth = 0
+        let mutable start = 0
+        for i in 0 .. strLen inner - 1 do
+            let c = charAt inner i
+            if c = '<' then depth <- depth + 1
+            elif c = '>' then depth <- depth - 1
+            elif c = '.' && depth = 0 then (vecAdd parts (substr inner start (i - start)); start <- i + 1)
+        vecAdd parts (substr inner start (strLen inner - start))
+        ShTup (List.map shapeOfName (vecToList parts))
+    else
+        let bare = if nm.Contains "$<" then nm.Substring (0, nm.IndexOf "$<") else nm
+        match bare with
+        | "string" -> ShStr
+        | "float" | "double" | "single" | "float32" | "float16" -> ShFloat
+        | "int64" | "uint64" -> ShInt64
+        | "int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint" -> ShScalar
+        | "list" | "array" | "seq" -> ShListArr
+        | _ -> ShOther
+
+// compare two operand WORDS by their static shape -> a raw -1/0/1 LExpr. Scalars
+// compare their tagged payloads; strings/lists/arrays go through the runtime
+// helpers; a tuple is unrolled element by element (reading HDR+4*i), recursing
+// and short-circuiting on the first difference.
+let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExpr) : LExpr =
+    match sh with
+    | ShScalar ->
+        LPrim (SubW, [ LPrim (GtSW, [ lowUntag wa; lowUntag wb ]); LPrim (LtSW, [ lowUntag wa; lowUntag wb ]) ])
+    | ShStr -> LCall ("$str_cmp", [ wa; wb ])
+    | ShFloat ->
+        LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
+    | ShInt64 ->
+        LPrim (SubW, [ LPrim (GtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
+    | ShListArr | ShOther -> LCall ("$cmpv", [ wa; wb ])
+    | ShTup shapes ->
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        let r = freshTmp ctx
+        let elemCmp i shi = structCmp ctx shi (LLoad (W, LGet (wReg ra), HDR + 4 * i)) (LLoad (W, LGet (wReg rb), HDR + 4 * i))
+        match shapes with
+        | [] -> LConstW 0
+        | sh0 :: more ->
+            let init = [ LSet (wReg ra, wa); LSet (wReg rb, wb); LSet (wReg r, elemCmp 0 sh0) ]
+            let guards = more |> List.mapi (fun k shi -> LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]), [ LSet (wReg r, elemCmp (k + 1) shi) ], []))
+            LDo (init @ guards, LGet (wReg r))
+
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
@@ -1499,6 +1706,33 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let n = LGet (wReg t)
         let m = LPrim (ShrSW, [ n; LConstW 31 ])
         LDo ([ LSet (wReg t, lowUntag (coreToLowE ctx a)) ], lowTag (LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ])))
+    // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
+    | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
+        let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        LDo ([ LSet (wReg ra, coreToLowE ctx a); LSet (wReg rb, coreToLowE ctx b) ],
+             lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+    // a comparison whose operands are a COMPOUND value (tuple/list/...) or a
+    // STRING (`=t`/`<t` — the `t` type suffix): the tagged-int fast path below
+    // would compare heap POINTERS, so route it through a structural comparison.
+    | EPrim (op, [ a; b ]) when
+        (let b0 = baseOp op
+         let cb = if b0.EndsWith "t" then b0.Substring (0, b0.Length - 1) else b0
+         (match cb with "<" | ">" | "<=" | ">=" | "=" | "<>" -> true | _ -> false)
+         && (b0.EndsWith "t" || needsStructCmp (mergeShape (shapeOfExpr a) (shapeOfExpr b)))) ->
+        let b0 = baseOp op
+        let isStr = b0.EndsWith "t"
+        let cb = if isStr then b0.Substring (0, b0.Length - 1) else b0
+        let sh = if isStr then ShStr else mergeShape (shapeOfExpr a) (shapeOfExpr b)
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        let cr = freshTmp ctx
+        let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
+        LDo ([ LSet (wReg ra, coreToLowE ctx a)
+               LSet (wReg rb, coreToLowE ctx b)
+               LSet (wReg cr, structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))) ],
+             lowTag (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
     | EPrim (op, [ a; b ]) ->
         // Tagged-int fast paths: with x tagged as 2x+1, addition is
         // (a+b)-1 and subtraction (a-b)+1 — no untag/retag — and comparisons
@@ -2237,6 +2471,13 @@ let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
             else EApp (EApp (EVar (v, sch), List.truncate n args), List.skip n args)
         | EVar (v, sch) | EVarI (v, sch, _) ->
             match dictTryFind funcs (key v) with Some n when n > 0 -> wrap v sch [] n | _ -> e
+        // `compare` used as a VALUE (List.sortWith compare, …): eta to
+        // `fun a b -> compare a b` so the applied handler fires; the operand
+        // types come from the dispatch NAME, so the params' schemes are moot
+        | EUnknown n when n.StartsWith "$class:Ordered:compare:" ->
+            let av, asch = fresh (mono tInt)
+            let bv, bsch = fresh (mono tInt)
+            ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (EUnknown n, [ EVar (av, asch); EVar (bv, bsch) ])))
         | EUnknown _ -> e
         | ELam (ps, b) -> ELam (ps, go b)
         | EApp (h, args) -> EApp (go h, List.map go args)
@@ -2471,6 +2712,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         gcByteTid <- gcTid st "byte" 1 FK_SCALAR_ARRAY 0
         gcIntTid <- gcTid st "int" 4 FK_SCALAR_ARRAY 0
         gcArrTid <- gcTid st "arr" 4 FK_REF_ARRAY 2
+        gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
+        gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
+        gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
         // a root slot for the vtable array pointer (filled at startup)
         st.VtSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
@@ -2550,7 +2794,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitHashv m
+    emitStrCmp m; emitCmpv m; emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
