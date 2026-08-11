@@ -903,6 +903,7 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
         match e with
         | EVar (v, _) | EVarI (v, _, _) ->
             let k = key v
+            dictSet nameOf k v.Name
             if (dictTryFind bnd k).IsNone
                && (dictTryFind st.Globals k).IsNone
                && (dictTryFind st.Funcs k).IsNone
