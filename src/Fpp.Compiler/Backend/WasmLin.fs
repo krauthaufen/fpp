@@ -1477,6 +1477,12 @@ type private LowCtx =
       // when lowering a lifted lambda body: the register holding the env
       // pointer (-1 elsewhere). Captured vars load from env+8+4*slot.
       mutable EnvReg : int
+      // parallel to register ids (0..NReg-1): each local's wasm type, so the
+      // declaration loop emits f64/i64 locals — not everything is a tagged i32
+      // word. A scalar f64/i64 kept in a typed local survives an allocation
+      // safepoint untouched (the GC never scans a value local), which is what
+      // makes unboxed floats in flat arrays / struct fields correct.
+      RegTys : Vec<LTy>
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -1485,15 +1491,31 @@ let private freshReg (ctx : LowCtx) (k : string) : int =
     | None ->
         let id = ctx.NReg
         dictSet ctx.Regs k id
+        vecAdd ctx.RegTys W
         ctx.NReg <- id + 1
         id
 
-let private freshTmp (ctx : LowCtx) : int =
+let private freshTmpT (ctx : LowCtx) (ty : LTy) : int =
     let id = ctx.NReg
+    vecAdd ctx.RegTys ty
     ctx.NReg <- id + 1
     id
 
+let private freshTmp (ctx : LowCtx) : int = freshTmpT ctx W
+
 let private wReg (id : int) : LReg = { Id = id; RTy = W }
+let private fReg (id : int) : LReg = { Id = id; RTy = F64 }
+let private lReg (id : int) : LReg = { Id = id; RTy = I64 }
+
+// element kinds stored inline as a raw scalar (no per-element heap box): the
+// 64-bit boxed scalars. `int`/`bool`/`char` are already unboxed tagged words;
+// float32/16 still ride an f64 box. The tid shape key keeps the two apart.
+let private flatScalarTy (k : string) : LTy option =
+    match k with
+    | "float" -> Some F64
+    | "int64" | "uint64" -> Some I64
+    | _ -> None
+let private flatShape (ty : LTy) : string = match ty with F64 -> "af64" | _ -> "ai64"
 let private regNm (r : LReg) : string = "$r" + string r.Id
 // the class-id descriptor for a record type / a union case's union; -1 for an
 // undeclared name (a value no type test looks for)
@@ -1883,6 +1905,40 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
         LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
+    // flat scalar arrays: a `float[]`/`int64[]` is a scalar array
+    // [tag][len][elem x len] with elements inline at HDR+4, stride 8 — no
+    // per-element box, GC-invisible. The scalar values ride in typed f64/i64
+    // locals across the allocation, so no shadow-stack rooting is needed. Reads
+    // box (cancelled by unbox in arithmetic), writes unbox. `int`/`bool`/`char`
+    // are already unboxed tagged words, so only the 64-bit boxed scalars flatten
+    // here; float32/16 still ride an f64 box (a later inline-4-byte case).
+    | EArray (k, xs) when (flatScalarTy k).IsSome ->
+        let ty = (flatScalarTy k).Value
+        let n = List.length xs
+        let vregs = xs |> List.map (fun _ -> freshTmpT ctx ty)
+        let bs = freshTmp ctx
+        let evals = List.map2 (fun vr x -> LSet ({ Id = vr; RTy = ty }, flatUnbox ty (coreToLowE ctx x))) vregs xs
+        let alloc =
+            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (flatShape ty) 8 FK_SCALAR_ARRAY 0); LConstW n ])
+            else LAlloc (LConstW (HDR + 4 + n * 8))
+        let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LConstW n) ]
+        let stores = vregs |> List.mapi (fun i vr -> LStore (ty, LGet (wReg bs), HDR + 4 + i * 8, LGet { Id = vr; RTy = ty }))
+        LDo (evals @ [ LSet (wReg bs, alloc) ] @ hdr @ stores, LGet (wReg bs))
+    | EIndex (k, arr, i) when (flatScalarTy k).IsSome ->
+        let ty = (flatScalarTy k).Value
+        let ir = freshTmp ctx
+        let fv = freshTmpT ctx ty
+        LDo ([ LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LSet ({ Id = fv; RTy = ty }, LLoad (ty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 8 ]) ]), HDR + 4)) ],
+             flatBox ctx ty (LGet { Id = fv; RTy = ty }))
+    | EIndexSet (k, arr, i, v) when (flatScalarTy k).IsSome ->
+        let ty = (flatScalarTy k).Value
+        let fv = freshTmpT ctx ty
+        let ir = freshTmp ctx
+        LDo ([ LSet ({ Id = fv; RTy = ty }, flatUnbox ty (coreToLowE ctx v))
+               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LStore (ty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 8 ]) ]), HDR + 4, LGet { Id = fv; RTy = ty }) ],
+             lowInt 0)
     | EArray (_, xs) -> lowObj ctx CID_ARRAY 0 (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
     | EIndex (_, arr, i) ->
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
@@ -1891,6 +1947,25 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, HDR))
+    | EArrayCreate (k, n, init) when (flatScalarTy k).IsSome ->
+        let ty = (flatScalarTy k).Value
+        let cnt = freshTmp ctx
+        let fv = freshTmpT ctx ty
+        let bs = freshTmp ctx
+        let it = freshTmp ctx
+        let alloc =
+            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (flatShape ty) 8 FK_SCALAR_ARRAY 0); LGet (wReg cnt) ])
+            else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 8 ]) ]))
+        let stmts =
+            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
+              LSet ({ Id = fv; RTy = ty }, flatUnbox ty (coreToLowE ctx init))
+              LSet (wReg bs, alloc) ]
+            @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
+            @ [ LSet (wReg it, LConstW 0)
+                LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
+                        [ LStore (ty, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW 8 ]) ]), HDR + 4, LGet { Id = fv; RTy = ty })
+                          LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
+        LDo (stmts, LGet (wReg bs))
     | EArrayCreate (_, n, init) ->
         let cnt = freshTmp ctx
         let iv = freshTmp ctx
@@ -2214,21 +2289,29 @@ and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID
 // intermediate heap box. Correct because the elided alloc is side-effect free.
 and private lowUnboxF (p : LExpr) : LExpr =
     match p with
-    | LDo (stmts, LGet rb) ->
-        (match List.tryLast stmts with
-         | Some (LStore (F64, LGet rb2, off, v)) when rb2 = rb && off = HDR -> v
-         | _ -> LLoad (F64, p, HDR))
+    // a box built here is (…stmts…; store payload) with the register as its
+    // value — cancel to the payload. The load-into-an-f64-local-then-box shape
+    // (LDo whose value is itself a box) needs the unbox pushed through the LDo,
+    // so a `float[]` read in arithmetic reduces to the bare f64 load.
+    | LDo (stmts, LGet rb) when (match List.tryLast stmts with Some (LStore (F64, LGet rb2, off, _)) -> rb2 = rb && off = HDR | _ -> false) ->
+        (match List.tryLast stmts with Some (LStore (_, _, _, v)) -> v | _ -> LLoad (F64, p, HDR))
+    | LDo (stmts, tail) -> LDo (stmts, lowUnboxF tail)
     | _ -> LLoad (F64, p, HDR)
 
 and private lowBoxI (ctx : LowCtx) (iv : LExpr) : LExpr = lowBox64 ctx "i64" CID_INT64 I64 iv
 
 and private lowUnboxI (p : LExpr) : LExpr =
     match p with
-    | LDo (stmts, LGet rb) ->
-        (match List.tryLast stmts with
-         | Some (LStore (I64, LGet rb2, off, v)) when rb2 = rb && off = HDR -> v
-         | _ -> LLoad (I64, p, HDR))
+    | LDo (stmts, LGet rb) when (match List.tryLast stmts with Some (LStore (I64, LGet rb2, off, _)) -> rb2 = rb && off = HDR | _ -> false) ->
+        (match List.tryLast stmts with Some (LStore (_, _, _, v)) -> v | _ -> LLoad (I64, p, HDR))
+    | LDo (stmts, tail) -> LDo (stmts, lowUnboxI tail)
     | _ -> LLoad (I64, p, HDR)
+
+// box/unbox picked by the flat-scalar element type (F64 vs I64)
+and private flatBox (ctx : LowCtx) (ty : LTy) (v : LExpr) : LExpr =
+    match ty with F64 -> lowBoxF ctx v | _ -> lowBoxI ctx v
+and private flatUnbox (ty : LTy) (p : LExpr) : LExpr =
+    match ty with F64 -> lowUnboxF p | _ -> lowUnboxI p
 
 // test `pat` against the value in register `scrutReg`; produce statements that
 // LBreak to `fail` on mismatch and bind pattern variables on the matching
@@ -2422,6 +2505,14 @@ let private lowOpIns (op : LOp) : string =
     | LToF -> "f64.convert_i64_s"
     | FToL -> "i64.trunc_f64_s"
 
+// the wasm value type a local of this LTy is declared as: I64 is a real i64
+// local, F64 an f64; the packed byte widths live inside i32.
+let private wtyName (ty : LTy) : string =
+    match ty with
+    | I64 -> "i64"
+    | F64 -> "f64"
+    | _ -> "i32"
+
 let private loadIns (ty : LTy) : string =
     match ty with
     | F64 -> "f64.load"
@@ -2537,7 +2628,7 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
 let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     let sink = vecNew ()
     st.GapSink <- Some sink
@@ -2553,7 +2644,7 @@ let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (fin
         ins f "unreachable"
     else
         let np = List.length ps
-        for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+        for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
         localsDone f
         emitLowE f bodyLow
         finish f
@@ -2563,7 +2654,7 @@ let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (fin
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
@@ -2576,7 +2667,7 @@ let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit 
         localsDone f
         ins f "unreachable"
     else
-        for id in 2 .. ctx.NReg - 1 do local f (regNm (wReg id)) "i32"
+        for id in 2 .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
         localsDone f
         emitLowE f bodyLow
     endFn f
