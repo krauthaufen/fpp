@@ -471,6 +471,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// an instance declaration drains the ones minted while its assoc
     /// types were read into its OWN context, so every use re-poses them
     let projCons = vecNew<Constraint> ()
+    /// every class NAME a written `when` clause used, validated once the
+    /// file's own classes are all declared: an unknown one used to pass
+    /// silently and surface as `no instance` at every distant use
+    let writtenConNames = vecNew<int * string> ()
 
     let addWanted (offset : int) (c : Constraint) : unit =
         if inMemberBody then dictSet eagerSeats offset true
@@ -2382,6 +2386,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | None ->
         classHead vars n
         |> Option.map (fun (cls, args) ->
+            // remember the written name for end-of-file validation —
+            // except subtype bounds (`when 'B :> IFace`), whose "head"
+            // is not a class use
+            (if not (tokensOf n |> List.exists (fun tk -> tk.Kind = Operator && tk.Text = ":>")) then
+                match tokensOf n |> List.tryHead with
+                | Some t -> vecAdd writtenConNames (t.Offset, cls)
+                | None -> ())
             let assocName =
                     match tokensOf n |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                     | Some t when tokensOf n |> List.exists (fun t2 -> t2.Kind = Keyword && t2.Text = "with") -> Some t.Text
@@ -6803,6 +6814,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // never written (the class is sealed); a generic struct derives with
     // Unmanaged contexts on its parameters, and a nested struct field
     // gates through its OWN derived instance at solve time
+    // written constraints must name DECLARED classes — checked here, once
+    // the file's own classes are all registered. `when Zero<'a>` with no
+    // class Zero passed silently and every use said `no instance
+    // Zero<float>`, far from the sin; and Zero IS known — as a MEMBER of
+    // Num — which is worth saying.
+    if (dictTryFind classes.Classes "Num").IsSome then
+        for coff, cname in vecToList writtenConNames do
+            if (dictTryFind classes.Classes cname).IsNone then
+                match dictTryFind classes.MemberOwner cname with
+                | Some owner ->
+                    vecAdd diags
+                        (coff,
+                         cname + " is a member of class " + owner + ", not a class — `when "
+                         + owner + "<...>` is the constraint that provides it")
+                | None ->
+                    vecAdd diags (coff, "unknown class " + cname + " in constraint")
+
     // superclass requirements of this file's instances: a fully concrete
     // one must have an instance NOW (everything that could provide it is
     // declared by the end of this file — the same reasoning as the orphan

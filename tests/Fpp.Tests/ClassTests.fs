@@ -2399,6 +2399,28 @@ let declarationCheckTests =
             // by-name binder (the arity-split sibling shape in the port
             // legitimately resolves that way)
         }
+        test "a when-clause naming a class MEMBER points at its class" {
+            // `when Zero<'a>` looks right and is wrong — Zero is Num's
+            // member. Unvalidated, it surfaced as `no instance
+            // Zero<float>` at every distant use; now the clause itself
+            // names the class that provides it
+            let errs =
+                diagnostics
+                    [ "[<Struct>]"
+                      "type M33<'a> = { M00 : 'a }"
+                      "    static member Identity when Zero<'a> and One<'a> ="
+                      "        { M00 = One }"
+                      "let t : M33<float> = M33.Identity" ]
+            Expect.exists errs (fun e ->
+                e.Contains "Zero is a member of class Num" && e.Contains "when Num<...>")
+                "the remedy is spelled out at the clause"
+        }
+        test "a when-clause naming nothing known says so at the clause" {
+            let errs =
+                diagnostics [ "let zz (x : 'a) : 'a when Bogus<'a> = x" ]
+            Expect.exists errs (fun e -> e.Contains "unknown class Bogus in constraint")
+                "reported at the declaration, not the use"
+        }
         test "an abbreviation applied at the wrong argument count says so" {
             // it used to fall through and invent a type named after the
             // abbreviation; the error then blamed code far away
