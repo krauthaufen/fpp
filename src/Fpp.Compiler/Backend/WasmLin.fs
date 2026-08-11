@@ -274,6 +274,7 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_i2i" [ "i32" ] [ "i32" ]
     tyFunc m "$lt_ii2i" [ "i32"; "i32" ] [ "i32" ]
     tyFunc m "$lt_iii2i" [ "i32"; "i32"; "i32" ] [ "i32" ]
+    tyFunc m "$lt_iiii2i" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
     tyFunc m "$lt_i2v" [ "i32" ] []
     tyFunc m "$lt_v2v" [] []
     tyFunc m "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
@@ -295,6 +296,7 @@ let private rtDeclsLin (m : Mod) : unit =
     if gc then (declFn m "$spush" "$lt_i2v"; declFn m "$spop" "$lt_v2i")
     declFn m "$lalloc" "$lt_i2i"
     declFn m "$str_of_int" "$lt_i2i"
+    declFn m "$str_of_char" "$lt_i2i"
     declFn m "$str_cat" "$lt_ii2i"
     declFn m "$prints" "$lt_i2v"
     declFn m "$ftoa6" "$lt_i2i"
@@ -308,6 +310,14 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_find_char" "$lt_ii2i"
     declFn m "$str_last_find_char" "$lt_ii2i"
     declFn m "$str_split_char" "$lt_ii2i"
+    declFn m "$str_upper" "$lt_i2i"
+    declFn m "$str_lower" "$lt_i2i"
+    declFn m "$str_chars" "$lt_i2i"
+    declFn m "$str_pad" "$lt_iiii2i"
+    declFn m "$str_trim_start_chars" "$lt_ii2i"
+    declFn m "$str_trim_end_chars" "$lt_ii2i"
+    declFn m "$str_insert" "$lt_iii2i"
+    declFn m "$str_remove2" "$lt_iii2i"
     declFn m "$hashv" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
@@ -522,6 +532,16 @@ let private emitStrOfInt (m : Mod) : unit =
     ifE f
     lg f "$p"; ic f 8; ins f "i32.add"; ic f 45; mem f "i32.store16"
     endB f
+    lg f "$p"
+    endFn f
+
+// $str_of_char(c): a fresh one-unit string holding the raw char code c.
+let private emitStrOfChar (m : Mod) : unit =
+    let f = beginFn m [ "$c" ]
+    local f "$p" "i32"
+    localsDone f
+    strAllocN f (fun () -> ic f 1)
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$c"; mem f "i32.store16"
     lg f "$p"
     endFn f
 
@@ -887,6 +907,179 @@ let private emitStrSplitChar (m : Mod) : unit =
     unpin2 ()
     lg f "$r"; ic f 8; ins f "i32.add"; lg f "$k"; ic f 2; ins f "i32.shl"; ins f "i32.add"; lg f "$sub"; mem f "i32.store"
     lg f "$r"
+    endFn f
+
+// $str_upper / $str_lower: ASCII case mapping, unit for unit. `lower=false`
+// emits $str_upper (a..z -> A..Z), `lower=true` emits $str_lower — declared and
+// emitted in that order. The mapped unit is chosen branchless via `select`.
+let private emitStrCase (m : Mod) (lower : bool) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$p" "i32"; local f "$len" "i32"; local f "$i" "i32"; local f "$c" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    let unpin = strGuard f [ "$s" ]
+    strAllocN f (fun () -> lg f "$len")
+    unpin ()
+    ic f 0; ls f "$i"
+    blockE f "$d"; loopE f "$go"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_s"; brIf f "$d"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"; ls f "$c"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    lg f "$c"; ic f (if lower then 32 else -32); ins f "i32.add"     // val1 = c + delta
+    lg f "$c"                                                        // val2 = c
+    lg f "$c"; ic f (if lower then 65 else 97); ins f "i32.ge_u"
+    lg f "$c"; ic f (if lower then 90 else 122); ins f "i32.le_u"; ins f "i32.and"   // cond = in range
+    ins f "select"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$go"; endB f; endB f
+    lg f "$p"
+    endFn f
+
+// $str_chars(s): a fresh array of the string's units as TAGGED chars (the
+// array element representation used everywhere: odd = int/char). Root $s across
+// the array allocation.
+let private emitStrChars (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$r" "i32"; local f "$len" "i32"; local f "$i" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    let unpin = strGuard f [ "$s" ]
+    if gc then (ic f gcArrTid; lg f "$len"; callf f "$fpallocn"; ls f "$r")
+    else
+        ic f 8; lg f "$len"; ic f 2; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$r"
+        lg f "$r"; ic f CID_ARRAY; mem f "i32.store"
+        lg f "$r"; ic f 4; ins f "i32.add"; lg f "$len"; mem f "i32.store"
+    unpin ()
+    ic f 0; ls f "$i"
+    blockE f "$d"; loopE f "$go"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_s"; brIf f "$d"
+    lg f "$r"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ic f 1; ins f "i32.shl"; ic f 1; ins f "i32.or"     // tag the char
+    mem f "i32.store"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$go"; endB f; endB f
+    lg f "$r"
+    endFn f
+
+// $str_pad(s, w, pc, right): pad s to width w with unit pc. right=1 appends the
+// padding (PadRight), right=0 prepends it (PadLeft). Result length = max(len,w).
+let private emitStrPad (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$w"; "$pc"; "$right" ]
+    local f "$p" "i32"; local f "$len" "i32"; local f "$out" "i32"; local f "$pad" "i32"
+    local f "$i" "i32"; local f "$src" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    // out = max(len, w); pad = out - len
+    lg f "$len"; lg f "$w"; lg f "$len"; lg f "$w"; ins f "i32.gt_s"; ins f "select"; ls f "$out"
+    lg f "$out"; lg f "$len"; ins f "i32.sub"; ls f "$pad"
+    let unpin = strGuard f [ "$s" ]
+    strAllocN f (fun () -> lg f "$out")
+    unpin ()
+    ic f 0; ls f "$i"
+    blockE f "$d"; loopE f "$go"
+    lg f "$i"; lg f "$out"; ins f "i32.ge_s"; brIf f "$d"
+    // src index: right ? i : i - pad
+    lg f "$i"; lg f "$i"; lg f "$pad"; ins f "i32.sub"; lg f "$right"; ins f "select"; ls f "$src"
+    // dest addr p+8+2i
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    // isContent: right ? (i < len) : (i >= pad)
+    lg f "$i"; lg f "$len"; ins f "i32.lt_s"
+    lg f "$i"; lg f "$pad"; ins f "i32.ge_s"
+    lg f "$right"; ins f "select"
+    ifV f "i32"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$src"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    elseB f
+    lg f "$pc"
+    endB f
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$go"; endB f; endB f
+    lg f "$p"
+    endFn f
+
+// $str_trim_start_chars / _end: trim leading/trailing units that are in the set
+// $cs (a char or a tagged-char array). `atStart=true` emits the start variant.
+let private emitStrTrimChars (m : Mod) (atStart : bool) : unit =
+    let f = beginFn m [ "$s"; "$cs" ]
+    local f "$len" "i32"; local f "$a" "i32"; local f "$b" "i32"
+    local f "$c" "i32"; local f "$j" "i32"; local f "$hit" "i32"; local f "$cn" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    // count of set elements: 1 for a char, array length for an array
+    lg f "$cs"; ic f 1; ins f "i32.and"
+    ifV f "i32"
+    ic f 1
+    elseB f
+    lg f "$cs"; ic f 4; ins f "i32.add"; mem f "i32.load"
+    endB f
+    ls f "$cn"
+    ic f 0; ls f "$a"
+    lg f "$len"; ls f "$b"
+    blockE f "$done"; loopE f "$go"
+    lg f "$a"; lg f "$b"; ins f "i32.ge_s"; brIf f "$done"
+    // current unit: from the start or just before the end
+    (if atStart then (lg f "$s"; ic f 8; ins f "i32.add"; lg f "$a"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u")
+     else (lg f "$s"; ic f 8; ins f "i32.add"; lg f "$b"; ic f 1; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"))
+    ls f "$c"
+    // hit = c in set
+    ic f 0; ls f "$hit"; ic f 0; ls f "$j"
+    blockE f "$sd"; loopE f "$sg"
+    lg f "$j"; lg f "$cn"; ins f "i32.ge_s"; brIf f "$sd"
+    // set element j (untagged): char -> cs>>1; array -> tag at elem, >>1
+    lg f "$cs"; ic f 1; ins f "i32.and"
+    ifV f "i32"
+    lg f "$cs"; ic f 1; ins f "i32.shr_s"
+    elseB f
+    lg f "$cs"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ic f 1; ins f "i32.shr_s"
+    endB f
+    lg f "$c"; ins f "i32.eq"
+    ifE f; ic f 1; ls f "$hit"; br f "$sd"; endB f
+    lg f "$j"; ic f 1; ins f "i32.add"; ls f "$j"
+    br f "$sg"; endB f; endB f
+    lg f "$hit"; ins f "i32.eqz"; brIf f "$done"
+    (if atStart then (lg f "$a"; ic f 1; ins f "i32.add"; ls f "$a") else (lg f "$b"; ic f 1; ins f "i32.sub"; ls f "$b"))
+    br f "$go"; endB f; endB f
+    lg f "$s"; lg f "$a"; lg f "$b"; lg f "$a"; ins f "i32.sub"; callf f "$strsub"
+    endFn f
+
+// $str_insert(s, i, v): s[0..i) ++ v ++ s[i..). $str_remove2(s, i, n): s[0..i)
+// ++ s[i+n..). Both cut with $strsub then $str_cat; each intermediate string is
+// rooted over the next allocation (GC only) via the shadow stack.
+let private emitStrInsert (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$i"; "$v" ]
+    local f "$len" "i32"; local f "$h" "i32"; local f "$t" "i32"; local f "$hv" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    // h = s[0, i)   (root s and v across the alloc)
+    let u1 = strGuard f [ "$s"; "$v" ]
+    lg f "$s"; ic f 0; lg f "$i"; callf f "$strsub"; ls f "$h"
+    u1 ()
+    // hv = h ++ v   (root s across it — $str_cat guards h and v itself)
+    let u2 = strGuard f [ "$s"; "$h" ]
+    lg f "$h"; lg f "$v"; callf f "$str_cat"; ls f "$hv"
+    u2 ()
+    // t = s[i, len-i)  (root hv across the alloc)
+    let u3 = strGuard f [ "$hv" ]
+    lg f "$s"; lg f "$i"; lg f "$len"; lg f "$i"; ins f "i32.sub"; callf f "$strsub"; ls f "$t"
+    u3 ()
+    lg f "$hv"; lg f "$t"; callf f "$str_cat"
+    endFn f
+
+let private emitStrRemove2 (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$i"; "$n" ]
+    local f "$len" "i32"; local f "$h" "i32"; local f "$t" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    let u1 = strGuard f [ "$s" ]
+    lg f "$s"; ic f 0; lg f "$i"; callf f "$strsub"; ls f "$h"
+    u1 ()
+    // t = s[i+n, len-i-n)  (root h across the alloc)
+    let u2 = strGuard f [ "$s"; "$h" ]
+    lg f "$s"; lg f "$i"; lg f "$n"; ins f "i32.add"; lg f "$len"; lg f "$i"; ins f "i32.sub"; lg f "$n"; ins f "i32.sub"; callf f "$strsub"; ls f "$t"
+    u2 ()
+    lg f "$h"; lg f "$t"; callf f "$str_cat"
     endFn f
 
 // $hashv(v): a structural hash matching the wasm-GC backend's $hashv exactly
@@ -1425,6 +1618,36 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "$str.Split", [ s; c ]) ->
         // returns a heap string array (an even pointer), not a tagged value
         LCall ("$str_split_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ])
+    | EApp (EUnknown "$str.Contains#2", [ s; c ]) ->
+        lowTag (LPrim (GeSW, [ LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]); LConstW 0 ]))
+    | EApp (EUnknown "$str.StartsWith#2", [ s; c ]) ->
+        lowTag (LPrim (EqW, [ LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]); LConstW 0 ]))
+    | EApp (EUnknown "$str.EndsWith#2", [ s; c ]) ->
+        // last occurrence index == len-1 (and >=0, which excludes the empty string)
+        let sv = freshTmp ctx
+        let nv = freshTmp ctx
+        LDo ([ LSet (wReg sv, coreToLowE ctx s)
+               LSet (wReg nv, LCall ("$str_last_find_char", [ LGet (wReg sv); lowUntag (coreToLowE ctx c) ])) ],
+             lowTag (LPrim (AndW, [ LPrim (GeSW, [ LGet (wReg nv); LConstW 0 ])
+                                    LPrim (EqW, [ LGet (wReg nv); LPrim (SubW, [ LLoad (W, LGet (wReg sv), HDR); LConstW 1 ]) ]) ])))
+    | EApp (EUnknown "$str.ToUpper", [ s ]) -> LCall ("$str_upper", [ coreToLowE ctx s ])
+    | EApp (EUnknown "$str.ToLower", [ s ]) -> LCall ("$str_lower", [ coreToLowE ctx s ])
+    | EApp (EUnknown "$str.ToCharArray", [ s ]) -> LCall ("$str_chars", [ coreToLowE ctx s ])
+    | EApp (EUnknown "$str.PadLeft", [ s; w ]) ->
+        LCall ("$str_pad", [ coreToLowE ctx s; lowUntag (coreToLowE ctx w); LConstW 32; LConstW 0 ])
+    | EApp (EUnknown "$str.PadRight", [ s; w ]) ->
+        LCall ("$str_pad", [ coreToLowE ctx s; lowUntag (coreToLowE ctx w); LConstW 32; LConstW 1 ])
+    | EApp (EUnknown ("$str.TrimStart" | "$str.TrimStart#2"), [ s; cs ]) ->
+        // cs is either a tagged char or a tagged-char array — the helper tests the low bit
+        LCall ("$str_trim_start_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
+    | EApp (EUnknown ("$str.TrimEnd" | "$str.TrimEnd#2"), [ s; cs ]) ->
+        LCall ("$str_trim_end_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
+    | EApp (EUnknown "$str.Insert", [ s; i; v ]) ->
+        LCall ("$str_insert", [ coreToLowE ctx s; lowUntag (coreToLowE ctx i); coreToLowE ctx v ])
+    | EApp (EUnknown "$str.Remove", [ s; i ]) ->
+        LCall ("$strsub", [ coreToLowE ctx s; LConstW 0; lowUntag (coreToLowE ctx i) ])
+    | EApp (EUnknown "$str.Remove#2", [ s; i; n ]) ->
+        LCall ("$str_remove2", [ coreToLowE ctx s; lowUntag (coreToLowE ctx i); lowUntag (coreToLowE ctx n) ])
     | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> LCall ("$str_replace", [ coreToLowE ctx s; coreToLowE ctx a; coreToLowE ctx b ])
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
@@ -1455,6 +1678,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let msg = match List.rev args with m :: _ -> coreToLowE ctx m | [] -> LConstW 0
         LDo ([ LThrow (lowFailure ctx msg) ], lowInt 0)
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
+    // string of a char: a fresh one-unit string (NOT the decimal of its code)
+    | EApp (EUnknown "string#c", [ a ]) -> LCall ("$str_of_char", [ lowUntag (coreToLowE ctx a) ])
+    // string of a string is the identity
+    | EApp (EUnknown "string#t", [ a ]) -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
@@ -2320,8 +2547,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
-    emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m; emitHashv m
+    emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
+    emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
+    emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
