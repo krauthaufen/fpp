@@ -132,6 +132,7 @@ let mutable gc = false
 // GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
 // raw SCALAR byte buffer, resolved by the driver before the runtime string and
 // print helpers are emitted (they bake the string tid as an immediate).
+let mutable private nameOf : Dict<string, string> = dictNew ()
 let mutable private gcStrTid = 0
 let mutable private gcByteTid = 0
 let mutable private gcIntTid = 0
@@ -1119,7 +1120,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> lowStrConst st s
-    | EVar (v, _) | EVarI (v, _, _) -> lowVarByKey ctx (key v)
+    | EVar (v, _) | EVarI (v, _, _) -> dictSet nameOf (key v) v.Name; lowVarByKey ctx (key v)
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
         let init = if (dictTryFind st.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
@@ -1544,7 +1545,7 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
-            | None -> err st ("wasm-linear LowIR: unresolved variable " + k); lowInt 0
+            | None -> err st ("wasm-linear LowIR: unresolved variable " + k + " name=" + (match dictTryFind nameOf k with Some n -> n | None -> "?")); lowInt 0
 
 // read a variable: dereference the cell for a captured mutable, else the
 // storage content directly
@@ -1805,6 +1806,89 @@ let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit 
     endFn f
 
 // ---- driver ---------------------------------------------------------------
+// Eta-expand a top-level function used as a VALUE (a bare reference, or an
+// under-applied call) into explicit nested single-argument lambdas, so the
+// ordinary closure machinery lowers it. `f` (arity N) alone becomes
+// `fun a1 -> … -> fun aN -> f a1 … aN`; a partial `f x` fills the rest.
+// Over-application `f a…(>N)` splits into a saturated call applied to the tail.
+// Definitions (DLet heads) are never touched — only EVar/EVarI references.
+let mutable private etaCtr = 0
+let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
+    let fresh (sch : Scheme) : VarId * Scheme =
+        etaCtr <- etaCtr + 1
+        { Path = "(eta)"; Offset = etaCtr; Name = "$e" + string etaCtr }, sch
+    let wrap (v : VarId) (sch : Scheme) (pre : Expr list) (need : int) : Expr =
+        let ps = List.init need (fun _ -> fresh sch)
+        let call = EApp (EVar (v, sch), pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
+        List.foldBack (fun p body -> ELam ([ p ], body)) ps call
+    let rec go (e : Expr) : Expr =
+        match e with
+        | EApp ((EVar (v, sch) | EVarI (v, sch, _)) as h, args) when (dictTryFind funcs (key v)).IsSome ->
+            let n = (dictTryFind funcs (key v)).Value
+            let args = List.map go args
+            let k = List.length args
+            if k = n then EApp (h, args)
+            elif k < n then wrap v sch args (n - k)
+            else EApp (EApp (EVar (v, sch), List.truncate n args), List.skip n args)
+        | EVar (v, sch) | EVarI (v, sch, _) ->
+            match dictTryFind funcs (key v) with Some n when n > 0 -> wrap v sch [] n | _ -> e
+        | EUnknown _ -> e
+        | ELam (ps, b) -> ELam (ps, go b)
+        | EApp (h, args) -> EApp (go h, List.map go args)
+        | ELet (r, v, s, a, b) -> ELet (r, v, s, go a, go b)
+        | EIf (a, b, c) -> EIf (go a, go b, go c)
+        | EMatch (s, cs) -> EMatch (go s, cs |> List.map (fun (p, g, b) -> p, Option.map go g, go b))
+        | ETry (b, cs) -> ETry (go b, cs |> List.map (fun (p, g, bd) -> p, Option.map go g, go bd))
+        | ETuple xs -> ETuple (List.map go xs)
+        | EListLit xs -> EListLit (List.map go xs)
+        | ECtor (n, s, xs) -> ECtor (n, s, List.map go xs)
+        | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (nm, x) -> nm, go x))
+        | ERecordExt (n, b, fs) -> ERecordExt (n, go b, fs |> List.map (fun (nm, x) -> nm, go x))
+        | EField (r, n, o) -> EField (go r, n, o)
+        | EFieldSet (r, n, o, v) -> EFieldSet (go r, n, o, go v)
+        | EPrim (op, xs) -> EPrim (op, List.map go xs)
+        | ESeq xs -> ESeq (List.map go xs)
+        | EWhile (a, b) -> EWhile (go a, go b)
+        | EAssign (v, x) -> EAssign (v, go x)
+        | EArray (t, xs) -> EArray (t, List.map go xs)
+        | EIndex (t, a, b) -> EIndex (t, go a, go b)
+        | EIndexSet (t, a, b, c) -> EIndexSet (t, go a, go b, go c)
+        | EArrayLen (t, a) -> EArrayLen (t, go a)
+        | EArrayCreate (t, a, b) -> EArrayCreate (t, go a, go b)
+        | EArrayPin (t, a) -> EArrayPin (t, go a)
+        | EArrayUnpin (t, a) -> EArrayUnpin (t, go a)
+        | EArrayBytes (t, a) -> EArrayBytes (t, go a)
+        | EIfaceCall (i, m, r, xs) -> EIfaceCall (i, m, go r, List.map go xs)
+        | ECast (t, a, d) -> ECast (t, go a, d)
+        | ETypeTest (t, a) -> ETypeTest (t, go a)
+        | _ -> e
+    go
+
+// keys of every top-level binding that is ASSIGNED somewhere: a `let mutable`
+// function must be a mutable GLOBAL holding a closure, not a fixed Func — its
+// value changes at run time, and it is both read and reassigned as a value.
+let private collectAssigned (decls : Decl list) : Dict<string, bool> =
+    let s = dictNew<string, bool> ()
+    let rec go (e : Expr) : unit =
+        match e with
+        | EAssign (v, x) -> dictSet s (key v) true; go x
+        | ELam (_, b) -> go b
+        | EApp (h, xs) -> go h; List.iter go xs
+        | ELet (_, _, _, a, b) -> go a; go b
+        | EIf (a, b, c) -> go a; go b; go c
+        | EMatch (sc, cs) | ETry (sc, cs) -> go sc; for _, g, b in cs do (match g with Some x -> go x | None -> ()); go b
+        | ETuple xs | EListLit xs | ESeq xs | EArray (_, xs) | EPrim (_, xs) | ECtor (_, _, xs) -> List.iter go xs
+        | ERecord (_, fs) -> for _, x in fs do go x
+        | ERecordExt (_, b, fs) -> go b; (for _, x in fs do go x)
+        | EField (r, _, _) | EArrayLen (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) | ECast (_, r, _) | ETypeTest (_, r) -> go r
+        | EFieldSet (r, _, _, v) -> go r; go v
+        | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> go a; go b
+        | EIndexSet (_, a, b, c) -> go a; go b; go c
+        | EIfaceCall (_, _, r, xs) -> go r; List.iter go xs
+        | _ -> ()
+    for d in decls do match d with DLet (_, _, _, e) -> go e | _ -> ()
+    s
+
 let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // emit the REACHABLE program: the user's declarations plus every
     // prelude function or global a chain of references reaches from them.
@@ -1948,12 +2032,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         dictSet st.TestIds ifn (cidsOf impls)
         dictSet st.TestIds (bareIface ifn) (cidsOf impls)
     rtTypesLin m
-    // classify top-level bindings. GC: each non-function global takes a root
-    // slot (before constants) so a collection scans+updates it.
+    // classify top-level bindings. A lambda-valued binding that is REASSIGNED
+    // is a mutable global holding a closure, not a fixed function. GC: each
+    // non-function global takes a root slot (before constants).
+    let assigned = collectAssigned decls
     if gc then gcGlobalSlots <- dictNew ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) -> dictSet st.Funcs (key v) (List.length ps)
+        | DLet (_, v, _, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone -> dictSet st.Funcs (key v) (List.length ps)
         | DLet (_, v, _, _) ->
             dictSet st.Globals (key v) true
             if gc then
@@ -1962,6 +2048,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.GlobalSlot (key v) slot
                 dictSet gcGlobalSlots (gl v) slot
         | _ -> ()
+    // eta-expand every function used as a VALUE into explicit lambdas, BEFORE
+    // discover — so the synthesized closures get lifted and lowered like any
+    // other and a bare/partial function reference no longer dangles
+    etaCtr <- 0
+    let decls = decls |> List.map (fun d -> match d with DLet (r, v, s, e) -> DLet (r, v, s, etaExpand st.Funcs e) | _ -> d)
     // function type per arity used, and the function declarations
     let arities = st.Funcs |> dictPairs |> List.map snd |> List.distinct
     for a in arities do
@@ -1979,14 +2070,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     rtDeclsLin m
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) -> declFn m (fn v) ("$lfn" + string (List.length ps))
+        | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome -> declFn m (fn v) ("$lfn" + string (List.length ps))
         | _ -> ()
     // one init function per top-level global, plus _start
     let inits = vecNew<string> ()
     let mutable initN = 0
     for d in decls do
         match d with
-        | DLet (_, _, _, ELam _) -> ()
+        | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, _) ->
             globalI32Mut m (gl v) 0
             let nm = "$linit" + string initN
@@ -2000,7 +2091,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // function and a code-table slot
     for d in decls do
         match d with
-        | DLet (_, _, _, ELam (_, body)) -> discover st body
+        | DLet (_, v, _, ELam (_, body)) when (dictTryFind st.Funcs (key v)).IsSome -> discover st body
         | DLet (_, _, _, e) -> discover st e
         | _ -> ()
     for name, _, _, _ in vecToList st.Lams do
@@ -2055,13 +2146,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) -> emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
+        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
     for d in decls do
         match d with
-        | DLet (_, _, _, ELam _) -> ()
+        | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
             emitFuncLow st m [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
