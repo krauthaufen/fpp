@@ -1483,6 +1483,11 @@ type private LowCtx =
       // safepoint untouched (the GC never scans a value local), which is what
       // makes unboxed floats in flat arrays / struct fields correct.
       RegTys : Vec<LTy>
+      // local `let`-bindings whose value rides UNBOXED in a typed f64/i64 local
+      // (var key -> its scalar type). A read re-boxes for the uniform-word
+      // contract (box-elim cancels it back in arithmetic); a capture re-boxes
+      // into the closure env. Captured mutables are cells, so never listed here.
+      VarScalar : Dict<string, LTy>
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -1609,6 +1614,15 @@ let rec private shapeOfType (t : Type) : CmpShape =
     | TCon ("array", _) -> ShArr ShOther
     | TApp (h, (e :: _)) -> (match prune h with TCon (("list" | "[]" | "seq"), _) -> ShList (shapeOfType e) | TCon ("array", _) -> ShArr (shapeOfType e) | _ -> ShOther)
     | _ -> ShOther
+
+// the unboxed local type for a monomorphic scalar binding, or None to keep it
+// a tagged word. Mirrors flatScalarTy: only the 64-bit boxed scalars gain (int/
+// bool/char are already unboxed words; float32/16 still ride an f64 box).
+let private scalarLTy (t : Type) : LTy option =
+    match prune t with
+    | TCon (("float" | "double"), _) -> Some F64
+    | TCon (("int64" | "uint64"), _) -> Some I64
+    | _ -> None
 
 let rec private shapeOfExpr (e : Expr) : CmpShape =
     match e with
@@ -1767,10 +1781,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx (lowInt 0)))
         let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
         LDo (allocs @ fills, coreToLowE ctx body)
-    | ELet (_, v, _, rhs, body) ->
-        let id = freshReg ctx (key v)
-        let init = if (dictTryFind st.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
-        LDo ([ LSet (wReg id, init) ], coreToLowE ctx body)
+    | ELet (_, v, sch, rhs, body) ->
+        LDo ([ lowLetBind ctx v sch rhs ], coreToLowE ctx body)
     | ESeq xs ->
         let rec go (xs : Expr list) : LExpr =
             match xs with
@@ -2193,16 +2205,17 @@ and private evalRooted (ctx : LowCtx) (a : Expr) (b : Expr) : int * int * LStmt 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     match e with
     | ESeq xs -> List.collect (coreToLowS ctx) xs
-    | ELet (_, v, _, rhs, body) ->
-        let id = freshReg ctx (key v)
-        let init = if (dictTryFind ctx.LSt.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
-        LSet (wReg id, init) :: coreToLowS ctx body
+    | ELet (_, v, sch, rhs, body) ->
+        lowLetBind ctx v sch rhs :: coreToLowS ctx body
     | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
         // a captured mutable: store into its cell (shared with the closure)
         [ LStore (W, lowVarStore ctx (key v), cellOff (), coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
-         | Some id -> [ LSet (wReg id, coreToLowE ctx rhs) ]
+         | Some id ->
+             (match dictTryFind ctx.VarScalar (key v) with
+              | Some ty -> [ LSet ({ Id = id; RTy = ty }, flatUnbox ty (coreToLowE ctx rhs)) ]
+              | None -> [ LSet (wReg id, coreToLowE ctx rhs) ])
          | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ]
          | None -> err ctx.LSt ("wasm-linear LowIR: assignment to unbound " + v.Name); [ LEval (coreToLowE ctx rhs) ])
     | EIf (c, a, b) -> [ LIf (lowUntag (coreToLowE ctx c), coreToLowS ctx a, coreToLowS ctx b) ]
@@ -2387,11 +2400,32 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
             | None -> err st ("wasm-linear LowIR: unresolved variable " + k + " name=" + (match dictTryFind nameOf k with Some n -> n | None -> "?")); lowInt 0
 
-// read a variable: dereference the cell for a captured mutable, else the
-// storage content directly
+// bind a local `let`: a monomorphic scalar rides unboxed in a typed local
+// (recorded in VarScalar, read/captured through a re-box), everything else a
+// tagged word — wrapped in a cell when captured-and-mutable.
+and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : LStmt =
+    let st = ctx.LSt
+    let k = key v
+    let isCell = (dictTryFind st.CellVars k).IsSome
+    match (if isCell then None else scalarLTy sch.Body) with
+    | Some ty ->
+        let id = freshReg ctx k
+        vecSet ctx.RegTys id ty
+        dictSet ctx.VarScalar k ty
+        LSet ({ Id = id; RTy = ty }, flatUnbox ty (coreToLowE ctx rhs))
+    | None ->
+        let id = freshReg ctx k
+        let init = if isCell then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
+        LSet (wReg id, init)
+
+// read a variable: an unboxed scalar re-boxes to a word; a captured mutable
+// dereferences its cell; else the storage content directly
 and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
-    let store = lowVarStore ctx k
-    if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, cellOff ()) else store
+    match dictTryFind ctx.VarScalar k with
+    | Some ty -> (match dictTryFind ctx.Regs k with Some id -> flatBox ctx ty (LGet { Id = id; RTy = ty }) | None -> lowVarStore ctx k)
+    | None ->
+        let store = lowVarStore ctx k
+        if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, cellOff ()) else store
 
 // a fresh 1-word cell holding `v` (headerless — cells are internal, never
 // type-tested or dispatched on)
@@ -2414,8 +2448,14 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
     LConstW CLO_KIND
     :: LConstW (tblIdx st.M name)
     // capture the STORAGE, not the dereferenced value: for a cell var that is
-    // the shared pointer, so mutation is visible on both sides
-    :: (caps |> List.map (fun (p, o) -> lowVarStore ctx (p + ":" + string o)))
+    // the shared pointer, so mutation is visible on both sides. An unboxed
+    // scalar has no word storage to grab, so re-box it into the env slot (the
+    // lambda body reads it back as an ordinary boxed word).
+    :: (caps |> List.map (fun (p, o) ->
+            let k = p + ":" + string o
+            match dictTryFind ctx.VarScalar k with
+            | Some ty -> (match dictTryFind ctx.Regs k with Some id -> flatBox ctx ty (LGet { Id = id; RTy = ty }) | None -> lowVarStore ctx k)
+            | None -> lowVarStore ctx k))
     |> lowObj ctx CID_CLOSURE 2
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
@@ -2628,7 +2668,7 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
 let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     let sink = vecNew ()
     st.GapSink <- Some sink
@@ -2654,7 +2694,7 @@ let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (fin
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
