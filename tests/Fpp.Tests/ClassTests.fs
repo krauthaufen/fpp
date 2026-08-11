@@ -2219,10 +2219,49 @@ let typeclassPracticeTests =
                       "let p = print (string t.X + \" \" + string t.Z)" ]
             Expect.equal out "4 10\n" "identity times v plus w, componentwise"
         }
+        test "an open match still improves: one fitting scalar instance pins the element" {
+            // M33.Identity * v with independent 'a/'b: the vector fixes 'b
+            // = float, the instance context re-poses Mul<'a, float>, and
+            // exactly ONE scalar instance fits a float second argument —
+            // improvement pins 'a, no annotation anywhere. The open-match
+            // deferral used to withhold the context and call it ambiguous;
+            // now types commit while the CODE still waits for the stamp
+            let out =
+                run [ "[<Struct>]"
+                      "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
+                      "[<Struct>]"
+                      "type M33<'a> ="
+                      "    { M00 : 'a; M01 : 'a; M02 : 'a"
+                      "      M10 : 'a; M11 : 'a; M12 : 'a"
+                      "      M20 : 'a; M21 : 'a; M22 : 'a }"
+                      "    static member Identity when Num<'a> ="
+                      "        { M00 = One; M01 = Zero; M02 = Zero"
+                      "          M10 = Zero; M11 = One; M12 = Zero"
+                      "          M20 = Zero; M21 = Zero; M22 = One }"
+                      "instance Add<V3<'a>, V3<'b>> when Add<'a, 'b> = 'c"
+                      "    type Result = V3<'c>"
+                      "    static (+) a b = { X = a.X + b.X; Y = a.Y + b.Y; Z = a.Z + b.Z }"
+                      "instance Mul<M33<'a>, V3<'b>>"
+                      "    type Result = V3<Mul<'a, 'b>.Result>"
+                      "    static (*) a b ="
+                      "        { X = a.M00 * b.X + a.M01 * b.Y + a.M02 * b.Z"
+                      "          Y = a.M10 * b.X + a.M11 * b.Y + a.M12 * b.Z"
+                      "          Z = a.M20 * b.X + a.M21 * b.Y + a.M22 * b.Z }"
+                      "let test2 = M33.Identity * { X = 1.0; Y = 2.0; Z = 3.0 } + { X = 3.0; Y = 4.0; Z = 7.0 }"
+                      "let p = print (string test2.X + \" \" + string test2.Y + \" \" + string test2.Z)" ]
+            Expect.equal out "4 6 10\n" "no annotation needed anywhere"
+        }
         test "an undetermined operand says so instead of mumbling about int" {
+            // TWO scalar instances fit Mul<'a, float> here, so improvement
+            // rightly refuses to guess — and the error says what to do
             let errs =
                 diagnostics
                     [ "[<Struct>]"
+                      "type Ratio = { N : int }"
+                      "instance Mul<Ratio, float>"
+                      "    type Result = float"
+                      "    static (*) r x = x"
+                      "[<Struct>]"
                       "type V3<'a> = { X : 'a; Y : 'a; Z : 'a }"
                       "[<Struct>]"
                       "type M33<'a> = { M00 : 'a }"
@@ -2233,7 +2272,7 @@ let typeclassPracticeTests =
                       "let t = M33.Identity * { X = 1.0; Y = 2.0; Z = 3.0 }" ]
             Expect.exists errs (fun e ->
                 e.Contains "cannot be determined" && e.Contains "annotate")
-                "the ambiguity names itself and the remedy"
+                "two candidates, no guess — the remedy is named"
         }
         test "a projection on a missing associated type says so" {
             let errs =

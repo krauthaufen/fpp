@@ -2061,6 +2061,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `eager` for a member-body use (nothing to ride); a let-body OPEN
         // use answers None here and takes the caller's stamping fallback
         match Classes.select classes eager c.Class c.Args c.Assoc with
+        | Classes.Solved (_, sub) when not eager && Classes.openSub sub ->
+            // the TYPES committed in the solver; the CODE waits for the
+            // stamp — binding here froze a later file's better instance out
+            None
         | Classes.Solved (inst, sub) ->
             let nameTy (t : Type) : string =
                 match prune t with

@@ -342,10 +342,8 @@ let private selectCore (t : Tables) (eager : bool) (cls : string) (args : Type l
     // the whole program's. A GROUND match may commit: the orphan rule plus
     // declare-before-use means every instance that could match a ground
     // type is already visible when it is solved.
-    let openMatch (sub : Dict<int, Type>) =
-        dictPairs sub |> List.exists (fun (_, ty) -> not (List.isEmpty (freeVars ty)))
     let settle (i : InstanceDef) (sub : Dict<int, Type>) =
-        if overtakable i || (not eager && openMatch sub) then Deferred else Solved (i, sub)
+        if overtakable i then Deferred else Solved (i, sub)
     match exact with
     | [ (i, sub) ] -> settle i sub
     // OVERLAPPING instances: the most specific one wins, and it has to be
@@ -411,6 +409,17 @@ let select (t : Tables) (eager : bool) (cls : string) (args : Type list) (assoc 
              + String.concat "|" (cands |> List.map (fun i ->
                  String.concat ";" (List.map dumpTy i.Head))))
     result
+
+/// An OPEN match bound an instance variable to a type still containing
+/// a variable: the caller has not finished asking. The TYPE-level
+/// consequences of a unique such match commit anyway — its context is
+/// re-posed and its associated types improve, which is what lets
+/// `Mul<'a, float>` pin 'a when only one scalar instance fits — but
+/// CODE must not bind to it: which body runs is the stamp's decision,
+/// where the argument is concrete and the whole program's instances are
+/// on the table. Consumers split on this predicate.
+let openSub (sub : Dict<int, Type>) : bool =
+    dictPairs sub |> List.exists (fun (_, ty) -> not (List.isEmpty (freeVars ty)))
 
 /// Substitute an instance's own variables into one of its types.
 let substInst (sub : Dict<int, Type>) (t : Type) : Type =
