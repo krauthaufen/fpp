@@ -290,6 +290,8 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$strsub" "$lt_iii2i"
     declFn m "$str_trim" "$lt_i2i"
     declFn m "$str_replace" "$lt_iii2i"
+    declFn m "$str_find_char" "$lt_ii2i"
+    declFn m "$str_last_find_char" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
@@ -783,6 +785,39 @@ let private emitStrReplace (m : Mod) : unit =
     endB f
     br f "$bl2"; endB f; endB f
     lg f "$p"
+    endFn f
+
+// $str_find_char(s, c): index of the first unit equal to c, or -1.
+let private emitStrFindChar (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$sl" "i32"; local f "$i" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    ic f 0; ls f "$i"
+    blockE f "$c0"; loopE f "$l"
+    lg f "$i"; lg f "$sl"; ins f "i32.ge_s"; brIf f "$c0"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$c"; ins f "i32.eq"
+    ifE f; lg f "$i"; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$l"; endB f; endB f
+    ic f -1
+    endFn f
+
+// $str_last_find_char(s, c): index of the last unit equal to c, or -1.
+let private emitStrLastFindChar (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$c" ]
+    local f "$i" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ic f 1; ins f "i32.sub"; ls f "$i"
+    blockE f "$c0"; loopE f "$l"
+    lg f "$i"; ic f 0; ins f "i32.lt_s"; brIf f "$c0"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$c"; ins f "i32.eq"
+    ifE f; lg f "$i"; ins f "return"; endB f
+    lg f "$i"; ic f 1; ins f "i32.sub"; ls f "$i"
+    br f "$l"; endB f; endB f
+    ic f -1
     endFn f
 
 // $hashv(v): a structural hash matching the wasm-GC backend's $hashv exactly
@@ -1312,6 +1347,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowTag (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
     | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
         lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
+    | EApp (EUnknown "$str.IndexOf#2", [ s; c ]) ->
+        lowTag (LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]))
+    | EApp (EUnknown "$str.IndexOf#3", [ s; p; from ]) ->
+        lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; lowUntag (coreToLowE ctx from) ]))
+    | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
+        lowTag (LCall ("$str_last_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]))
     | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> LCall ("$str_replace", [ coreToLowE ctx s; coreToLowE ctx a; coreToLowE ctx b ])
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
@@ -2187,7 +2228,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
     emitLalloc m; emitStrOfInt m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitHashv m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitHashv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
