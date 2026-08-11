@@ -915,11 +915,14 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
             for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
             for pv, _ in ps do dictSet bnd2 (key pv) true
             go bnd2 b
-        | ELet (_, v, _, rhs, b) ->
-            go bnd rhs
+        | ELet (r, v, _, rhs, b) ->
             let bnd2 = dictNew<string, bool> ()
             for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
             dictSet bnd2 (key v) true
+            // a `let rec` binds v in its OWN rhs: a recursive self-reference is
+            // NOT a free variable, so it must not be captured by an enclosing
+            // lambda (which would then fail to resolve it in the outer scope)
+            go (if r then bnd2 else bnd) rhs
             go bnd2 b
         | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do go bnd x
         | EApp (g, xs) -> go bnd g; for x in xs do go bnd x

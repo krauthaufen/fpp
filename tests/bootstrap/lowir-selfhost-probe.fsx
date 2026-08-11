@@ -25,3 +25,4 @@ errors
 |> List.sortByDescending snd
 |> List.truncate 40
 |> List.iter (fun (e, n) -> printfn "%5d  %s" n e)
+System.IO.File.WriteAllLines("/tmp/lowir-errs.txt", errors |> List.filter (fun e -> e.Contains "unresolved") )
