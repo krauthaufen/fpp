@@ -1335,7 +1335,11 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
         | EVar (v, _) | EVarI (v, _, _) ->
             let k = key v
             dictSet nameOf k v.Name
-            if (dictTryFind bnd k).IsNone
+            // a `(builtin)` var (e.g. `compare`) is an INTRINSIC resolved by a
+            // coreToLowE handler, not a real value — it must never be captured
+            // (capturing it reads an unresolved variable, stubbing the closure)
+            if v.Path <> "(builtin)"
+               && (dictTryFind bnd k).IsNone
                && (dictTryFind st.Globals k).IsNone
                && (dictTryFind st.Funcs k).IsNone
                && (dictTryFind seen k).IsNone then
