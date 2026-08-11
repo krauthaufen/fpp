@@ -71,6 +71,12 @@ type private St =
       mutable Captures : Dict<string, int>
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
+      /// repr(T) single-field collapse: a record with EXACTLY one field, never
+      /// mutated (no EFieldSet), travels AS that field — no heap object. Maps the
+      /// record name -> its sole field name. This is the general "any one-field
+      /// struct is a newtype" rule; construction/access on such a record become
+      /// the identity on the field value.
+      Collapse : Dict<string, string>
       /// union case name -> its tag (index) and its payload arity
       UnionTag : Dict<string, int>
       UnionArity : Dict<string, int>
@@ -1835,6 +1841,17 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         | _ -> lowTag (LPrim (intArithOp bop, [ lowUntag ta; lowUntag tb ]))
     | ETuple xs -> lowObj ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs)
     | EListLit xs -> lowList ctx xs
+    // a collapsed one-field record IS its field value — no heap object
+    | ERecord (name, fields) when (dictTryFind st.Collapse name).IsSome ->
+        let f = (dictTryFind st.Collapse name).Value
+        (match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = f then Some e2 else None) with
+         | Some e2 -> coreToLowE ctx e2
+         | None -> lowInt 0)
+    | ERecordExt (name, baseE, updates) when (dictTryFind st.Collapse name).IsSome ->
+        let f = (dictTryFind st.Collapse name).Value
+        (match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = f then Some e2 else None) with
+         | Some e2 -> coreToLowE ctx e2
+         | None -> coreToLowE ctx baseE)
     | ERecord (name, fields) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
         lowObj ctx (cidRec st name) 0 (order |> List.map (fun fnm ->
@@ -1853,6 +1870,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | ECtor (case, _, args) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         lowObj ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args)
+    | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
     | EField (r, fname, owner) ->
         let idx =
             match dictTryFind st.RecFields owner with
@@ -2648,6 +2666,34 @@ let private collectAssigned (decls : Decl list) : Dict<string, bool> =
     for d in decls do match d with DLet (_, _, _, e) -> go e | _ -> ()
     s
 
+// record/type NAMES a single-field collapse must NOT touch: a field-mutated
+// record (mutation needs the object's identity), or a type-tested / downcast
+// type (the test reads the object's class-id header, which a raw value lacks).
+// Class NAMES are excluded separately by the caller (they carry a vtable).
+let private scanNoCollapse (decls : Decl list) : Dict<string, bool> =
+    let m = dictNew<string, bool> ()
+    let rec go (e : Expr) : unit =
+        match e with
+        | EFieldSet (r, _, owner, v) -> dictSet m owner true; go r; go v
+        | ETypeTest (tn, r) -> dictSet m tn true; go r
+        | ECast (tn, r, _) -> dictSet m tn true; go r
+        | EAssign (_, x) -> go x
+        | ELam (_, b) -> go b
+        | EApp (h, xs) -> go h; List.iter go xs
+        | ELet (_, _, _, a, b) -> go a; go b
+        | EIf (a, b, c) -> go a; go b; go c
+        | EMatch (sc, cs) | ETry (sc, cs) -> go sc; for _, g, b in cs do (match g with Some x -> go x | None -> ()); go b
+        | ETuple xs | EListLit xs | ESeq xs | EArray (_, xs) | EPrim (_, xs) | ECtor (_, _, xs) -> List.iter go xs
+        | ERecord (_, fs) -> for _, x in fs do go x
+        | ERecordExt (_, b, fs) -> go b; (for _, x in fs do go x)
+        | EField (r, _, _) | EArrayLen (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> go r
+        | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> go a; go b
+        | EIndexSet (_, a, b, c) -> go a; go b; go c
+        | EIfaceCall (_, _, r, xs) -> go r; List.iter go xs
+        | _ -> ()
+    for d in decls do match d with DLet (_, _, _, e) -> go e | _ -> ()
+    m
+
 let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // emit the REACHABLE program: the user's declarations plus every
     // prelude function or global a chain of references reaches from them.
@@ -2714,7 +2760,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
@@ -2736,6 +2782,18 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.UnionTag cn i
                 dictSet st.UnionArity cn ar
                 dictSet st.CaseClass cn cid)
+        | _ -> ()
+    // single-field-collapse (repr(T)): a one-field record travels as its field
+    // (no heap object), UNLESS it is mutated, type-tested/cast, or a CLASS (a
+    // class has a vtable + its storage is a DRecord, so it also lands in
+    // RecFields — but its instance-field reads and dispatch need the object).
+    let noCollapse = scanNoCollapse decls0
+    let classNames = dictNew<string, bool> ()
+    for d in decls0 do match d with DClass (n, _, _, _) -> dictSet classNames n true | _ -> ()
+    for kv in dictPairs st.RecFields do
+        match snd kv with
+        | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
+            dictSet st.Collapse (fst kv) f
         | _ -> ()
     let nCid = nextCid
     // GC: eagerly intern the fpprt type-id for every type-testable shape and
