@@ -133,3 +133,43 @@ their frame, so the frontend does part of this.
 
 Kept behind the existing `--lowir`/seam so the current backend stays the default
 and byte-exact until each piece proves out.
+
+## Progress (wasm-linear)
+
+Landed, each byte-exact self-host + run-gc + lowir gates green:
+
+* **box-elim peephole** (`d73a594`): `unbox(box v) → v` at the LowIR level, and
+  pushed through `LDo` (so a load-into-typed-local-then-box shape still cancels).
+  This is what makes every unbox below reduce to a bare typed load in arithmetic.
+* **Typed f64/i64 locals** (`da74e4b`): the emitter declared *every* register
+  `i32`; now `LowCtx.RegTys` tracks a per-register wasm type and the declaration
+  loops emit `f64`/`i64` locals. THE enabling primitive — an unboxed scalar now
+  has somewhere to live across a call/allocation (a value local the GC never
+  scans). `fReg`/`lReg`/`freshTmpT` construct them.
+* **Flat scalar arrays** (`da74e4b`): `float[]`/`int64[]` are `FK_SCALAR_ARRAY`
+  `[tag][len][elem×len]`, elems inline at HDR+4 stride 8 — no per-element box,
+  GC-invisible. `int`/`bool`/`char` are already unboxed tagged words, so only the
+  64-bit boxed scalars flatten (`flatScalarTy`); float32/16 still ride an f64 box.
+* **Unboxed scalar `let`-bindings** (`29f5e3a`): a monomorphic `float`/`int64`
+  `let` binds an unboxed typed local (`LowCtx.VarScalar`, `scalarLTy` off the
+  binding's `Scheme.Body`). Reads re-box for the uniform-word contract (box-elim
+  cancels it in arithmetic), captures re-box into the closure env, and captured
+  mutables stay cells. Verified: fn-arg-derived locals, mutable loops, captured
+  scalars, int64, and re-boxing a scalar into a generic `List`.
+
+Net: inside a function body, scalar locals / arithmetic / `float[]`,`int64[]`
+elements are all unboxed. Boxing now survives only at (a) function-call arg/return
+boundaries and (b) generic containers.
+
+### Next
+
+* **Scalar ABI** — pass/return `float`/`int64` as raw f64/i64. Needs a
+  specialized direct-call entry alongside the uniform `(env,arg)→word` closure
+  entry (the monomorphize-vs-uniform tension): a function used first-class keeps
+  the boxed closure form; a direct `LCall` to a known head uses the unboxed
+  signature. Retires the box at every scalar call.
+* **float32/float16 arrays + locals** — inline 4-byte f32 (stride 4) with
+  demote/promote at the box boundary; extend `flatScalarTy`/`scalarLTy`.
+* **Value-stack structs** (steps 3-4) — the typed-local + `repr(T)` groundwork is
+  now in place; multi-field POD structs on the `$vsp` arena, by-value/sret/byref,
+  then frame descriptors for ref-holding structs.
