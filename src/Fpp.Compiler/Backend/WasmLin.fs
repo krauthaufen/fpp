@@ -1536,6 +1536,11 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     | EArray (_, (x :: _)) -> ShArr (shapeOfExpr x)
     | EArray _ -> ShArr ShOther
     | EVar (_, sch) | EVarI (_, sch, _) -> shapeOfType sch.Body
+    // a function-built value (mk 3, List.head xs, …): the shape is the head's
+    // RESULT type with `args` argument arrows peeled off
+    | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
+        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
+        shapeOfType (peel sch.Body (List.length args))
     | _ -> ShOther
 
 let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
@@ -1730,17 +1735,13 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // -1/0/1 by the operands' static shape
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
         let sh = mergeShape (shapeOfExpr a) (shapeOfExpr b)
-        let ra = freshTmp ctx
-        let rb = freshTmp ctx
-        LDo ([ LSet (wReg ra, coreToLowE ctx a); LSet (wReg rb, coreToLowE ctx b) ],
-             lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        let ra, rb, pre = evalRooted ctx a b
+        LDo (pre, lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
-        let ra = freshTmp ctx
-        let rb = freshTmp ctx
-        LDo ([ LSet (wReg ra, coreToLowE ctx a); LSet (wReg rb, coreToLowE ctx b) ],
-             lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        let ra, rb, pre = evalRooted ctx a b
+        LDo (pre, lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
     // a comparison whose operands are a COMPOUND value (tuple/list/...) or a
     // STRING (`=t`/`<t` — the `t` type suffix): the tagged-int fast path below
     // would compare heap POINTERS, so route it through a structural comparison.
@@ -1753,13 +1754,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let isStr = b0.EndsWith "t"
         let cb = if isStr then b0.Substring (0, b0.Length - 1) else b0
         let sh = if isStr then ShStr else mergeShape (shapeOfExpr a) (shapeOfExpr b)
-        let ra = freshTmp ctx
-        let rb = freshTmp ctx
+        let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
         let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
-        LDo ([ LSet (wReg ra, coreToLowE ctx a)
-               LSet (wReg rb, coreToLowE ctx b)
-               LSet (wReg cr, structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))) ],
+        LDo (pre @ [ LSet (wReg cr, structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))) ],
              lowTag (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
     | EPrim (op, [ a; b ]) ->
         // Tagged-int fast paths: with x tagged as 2x+1, addition is
@@ -2021,6 +2019,22 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | EArrayPin _ -> "arraypin" | EArrayUnpin _ -> "arrayunpin" | EArrayBytes _ -> "arraybytes"
             | ELit _ -> "lit" | _ -> "node"
         err st ("wasm-linear LowIR: unsupported " + what); lowInt 0
+
+// evaluate two comparison operands into fresh registers, keeping the FIRST
+// rooted (GC shadow stack) across the SECOND's evaluation — the second operand
+// may allocate and, under the moving collector, relocate the first. Without
+// this a `compare (f x) (g y)` on heap values reads a STALE first operand.
+and private evalRooted (ctx : LowCtx) (a : Expr) (b : Expr) : int * int * LStmt list =
+    let ra = freshTmp ctx
+    let rb = freshTmp ctx
+    let stmts =
+        if gc then
+            [ LCallVoidS ("$spush", [ coreToLowE ctx a ])
+              LSet (wReg rb, coreToLowE ctx b)
+              LSet (wReg ra, LCall ("$spop", [])) ]
+        else
+            [ LSet (wReg ra, coreToLowE ctx a); LSet (wReg rb, coreToLowE ctx b) ]
+    ra, rb, stmts
 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     match e with
