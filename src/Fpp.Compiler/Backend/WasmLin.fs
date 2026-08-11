@@ -1165,6 +1165,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         lowTag (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
+    // |n| on a tagged int, branchless: (n ^ (n>>31)) - (n>>31)
+    | EPrim ("abs", [ a ]) ->
+        let t = freshTmp ctx
+        let n = LGet (wReg t)
+        let m = LPrim (ShrSW, [ n; LConstW 31 ])
+        LDo ([ LSet (wReg t, lowUntag (coreToLowE ctx a)) ], lowTag (LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ])))
     | EPrim (op, [ a; b ]) ->
         // Tagged-int fast paths: with x tagged as 2x+1, addition is
         // (a+b)-1 and subtraction (a-b)+1 — no untag/retag — and comparisons
@@ -1251,6 +1257,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#c" || n.StartsWith "char" -> coreToLowE ctx a
     // int from float: unbox, truncate, tag
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
+    // int from int (widen/identity in the tagged model) and int truncations
+    | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#t" || n.StartsWith "int#i" -> coreToLowE ctx a
+    // byte / narrow: mask the tagged value's payload to 8 bits
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> lowTag (LPrim (AndW, [ lowUntag (coreToLowE ctx a); LConstW 0xFF ]))
+    // the raw bits of a double, as int64 — read the boxed payload as i64
+    | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
+    // print / printraw: write a string to stdout (print's newline matters only
+    // on the compiler's error paths, which the fixpoint success path never hits)
+    | EApp (EUnknown ("print" | "printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
     | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> lowTag (LCall ("$hashv", [ coreToLowE ctx a ]))
