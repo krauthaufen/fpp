@@ -57,6 +57,12 @@ type private St =
       Warnings : Vec<string>
       /// top-level function names (their DLet is an ELam): reached by call
       Funcs : Dict<string, int>          // "path:offset" -> arity
+      /// unboxed ABI of a top-level function whose signature has any scalar
+      /// param/return: (param wasm types, return wasm type). Only present for
+      /// SPECIALIZED functions; a direct caller unboxes scalar args and re-boxes
+      /// a scalar result. Safe because a top-level fn is only ever direct-called
+      /// (first-class uses eta-expand to a lambda that itself does a direct call).
+      FuncSig : Dict<string, LTy list * LTy>
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
       /// interned string literals -> their constant address
@@ -1624,6 +1630,22 @@ let private scalarLTy (t : Type) : LTy option =
     | TCon (("int64" | "uint64"), _) -> Some I64
     | _ -> None
 
+// the wasm ABI type a value of this type is passed as: a raw f64/i64 for a
+// monomorphic 64-bit scalar, else a tagged word.
+let private abiTy (t : Type) : LTy = match scalarLTy t with Some ty -> ty | None -> W
+
+// (param abi types, return abi type) of a top-level function: peel `arity`
+// arrows off its scheme. None when every slot is a plain word (nothing to
+// specialize — the uniform $lfn signature already fits).
+let private funSigOf (sch : Scheme) (arity : int) : (LTy list * LTy) option =
+    let rec go t n = if n <= 0 then [], t else (match prune t with TFun (a, r) -> let (ps, ret) = go r (n - 1) in a :: ps, ret | _ -> [], t)
+    let argTs, retT = go sch.Body arity
+    if List.length argTs <> arity then None
+    else
+        let ps = argTs |> List.map abiTy
+        let ret = abiTy retT
+        if List.forall (fun t -> t = W) ps && ret = W then None else Some (ps, ret)
+
 let rec private shapeOfExpr (e : Expr) : CmpShape =
     match e with
     | ETuple xs -> ShTup (List.map shapeOfExpr xs)
@@ -2111,7 +2133,17 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
-        LCall (fn v, List.map (coreToLowE ctx) args)
+        (match dictTryFind st.FuncSig (key v) with
+         | Some (paramTys, retTy) ->
+             let loweredArgs = List.map2 (fun ty a -> match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)) paramTys args
+             (match retTy with
+              | W -> LCall (fn v, loweredArgs)
+              // hold the scalar result in a typed local before boxing: the call
+              // is a safepoint, so a bare box-around-call would let the GC move
+              // the fresh box out from under the store. box-elim pushes through
+              // the LDo, so an arithmetic use still reduces to the raw call.
+              | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy })))
+         | None -> LCall (fn v, List.map (coreToLowE ctx) args))
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name -> lowClosure ctx name
@@ -2667,12 +2699,22 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // emit one function (or init) through LowIR: allocate a register per param and
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
-let private emitFuncLow (st : St) (m : Mod) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
+    // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
+    // local (registered in VarScalar so reads re-box, just like a scalar let);
+    // a scalar return is unboxed off the body's boxed word before the return.
+    let retTy =
+        match sig_ with
+        | Some (paramTys, ret) ->
+            List.iter2 (fun pv ty -> match ty with W -> () | _ -> let id = ctx.Regs.[key pv] in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty) ps paramTys
+            ret
+        | None -> W
     let sink = vecNew ()
     st.GapSink <- Some sink
-    let bodyLow = coreToLowE ctx body
+    let bodyLow0 = coreToLowE ctx body
+    let bodyLow = match retTy with W -> bodyLow0 | _ -> flatUnbox retTy bodyLow0
     st.GapSink <- None
     let f = beginFn m pnames
     if vecLen sink > 0 then
@@ -2903,7 +2945,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
-          Funcs = dictNew (); Globals = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
@@ -3004,7 +3046,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then gcGlobalSlots <- dictNew ()
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone -> dictSet st.Funcs (key v) (List.length ps)
+        | DLet (_, v, s, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone ->
+            dictSet st.Funcs (key v) (List.length ps)
+            match funSigOf s (List.length ps) with Some sig_ -> dictSet st.FuncSig (key v) sig_ | None -> ()
         | DLet (_, v, _, _) ->
             dictSet st.Globals (key v) true
             if gc then
@@ -3042,7 +3086,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     rtDeclsLin m
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome -> declFn m (fn v) ("$lfn" + string (List.length ps))
+        | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome ->
+            (match dictTryFind st.FuncSig (key v) with
+             | Some (paramTys, retTy) ->
+                 let tn = "$ft" + fn v
+                 tyFunc m tn (paramTys |> List.map wtyName) [ wtyName retTy ]
+                 declFn m (fn v) tn
+             | None -> declFn m (fn v) ("$lfn" + string (List.length ps)))
         | _ -> ()
     // one init function per top-level global, plus _start
     let inits = vecNew<string> ()
@@ -3120,7 +3170,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m (ps |> List.map fst) body (fun _ -> ())
+        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -3128,7 +3178,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m [] rhs (fun f ->
+            emitFuncLow st m None [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
