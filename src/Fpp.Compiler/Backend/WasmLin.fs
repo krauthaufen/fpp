@@ -1105,6 +1105,13 @@ let private intCmpOp (b : string) : LOp =
     | "=" -> EqW
     | _ -> NeW
 
+// a `let rec f = fun … and g = fun …` group is a spine of consecutive
+// recursive lambda bindings; collect them and the body they wrap.
+let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
+    match e with
+    | ELet (true, v, _, (ELam (_, _) as lam), rest) -> let ms, body = recGroupOf rest in (v, lam) :: ms, body
+    | _ -> [], e
+
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
@@ -1122,6 +1129,18 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> lowStrConst st s
     | EVar (v, _) | EVarI (v, _, _) -> dictSet nameOf (key v) v.Name; lowVarByKey ctx (key v)
+    | ELet (true, _, _, ELam _, _) ->
+        // a recursive local-function group: every member may reference every
+        // other, so bind them all to CELLS first (their pointers are stable),
+        // build each closure over those cells, then fill the cells. Reads
+        // dereference the cell; a capture grabs the cell pointer. Handles both
+        // self-recursion (a one-member group) and mutual `… and …`.
+        let members, body = recGroupOf e
+        let regs = members |> List.map (fun (v, lam) -> v, lam, freshReg ctx (key v))
+        for v, _, _ in regs do dictSet ctx.LSt.CellVars (key v) true
+        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx (lowInt 0)))
+        let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
+        LDo (allocs @ fills, coreToLowE ctx body)
     | ELet (_, v, _, rhs, body) ->
         let id = freshReg ctx (key v)
         let init = if (dictTryFind st.CellVars (key v)).IsSome then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
