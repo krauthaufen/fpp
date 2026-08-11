@@ -1121,15 +1121,12 @@ let private emitStrCmp (m : Mod) : unit =
 let private emitCmpv (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"; local f "$y" "i32"
-    local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$r" "i32"
     local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     let strH = hv CID_STRING gcStrTid
     let fltH = hv CID_FLOAT gcFloatTid
     let i64H = hv CID_INT64 gcInt64Tid
-    let lstH = hv CID_LIST gcListTid
-    let arrH = hv CID_ARRAY gcArrTid
     lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
     lg f "$a"; ic f 1; ins f "i32.and"; lg f "$b"; ic f 1; ins f "i32.and"; ins f "i32.and"
     ifE f
@@ -1141,55 +1138,26 @@ let private emitCmpv (m : Mod) : unit =
     lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
     lg f "$a"; ic f 1; ins f "i32.and"; ifE f; ic f -1; ins f "return"; endB f
     lg f "$b"; ic f 1; ins f "i32.and"; ifE f; ic f 1; ins f "return"; endB f
+    // both heap pointers. Only the STABLE-header kinds (string, float, int64
+    // boxes) are dispatched — an FK_TAGGED object (tuple/list/record) has NO
+    // stable class-id at word-0 (it reads back per-object), so those compare
+    // EQUAL (0) here rather than risk walking garbage. Both operands must carry
+    // the same header, so a stray word-0 match cannot misdispatch a compound.
     lg f "$a"; mem f "i32.load"; ls f "$ca"
     lg f "$b"; mem f "i32.load"; ls f "$cb"
-    lg f "$ca"; lg f "$cb"; ins f "i32.ne"
-    ifE f; lg f "$ca"; lg f "$cb"; ins f "i32.gt_s"; lg f "$ca"; lg f "$cb"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
-    lg f "$ca"; ic f strH; ins f "i32.eq"
-    ifE f
-    lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "return"
-    endB f
-    lg f "$ca"; ic f fltH; ins f "i32.eq"
+    lg f "$ca"; ic f strH; ins f "i32.eq"; lg f "$cb"; ic f strH; ins f "i32.eq"; ins f "i32.and"
+    ifE f; lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "return"; endB f
+    lg f "$ca"; ic f fltH; ins f "i32.eq"; lg f "$cb"; ic f fltH; ins f "i32.eq"; ins f "i32.and"
     ifE f
     lg f "$a"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fa"
     lg f "$b"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fb"
     lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ins f "return"
     endB f
-    lg f "$ca"; ic f i64H; ins f "i32.eq"
+    lg f "$ca"; ic f i64H; ins f "i32.eq"; lg f "$cb"; ic f i64H; ins f "i32.eq"; ins f "i32.and"
     ifE f
     lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$la"
     lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$lb"
     lg f "$la"; lg f "$lb"; ins f "i64.gt_s"; lg f "$la"; lg f "$lb"; ins f "i64.lt_s"; ins f "i32.sub"; ins f "return"
-    endB f
-    lg f "$ca"; ic f lstH; ins f "i32.eq"
-    ifE f
-    blockE f "$ld"; loopE f "$lgo"
-    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$x"
-    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$y"
-    lg f "$x"; lg f "$y"; callf f "$cmpv"; ls f "$r"
-    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
-    lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$a"
-    lg f "$b"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$b"
-    lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
-    lg f "$a"; ins f "i32.eqz"; ifE f; ic f -1; ins f "return"; endB f
-    lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
-    br f "$lgo"; endB f; endB f
-    endB f
-    lg f "$ca"; ic f arrH; ins f "i32.eq"
-    ifE f
-    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$n"
-    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
-    ic f 0; ls f "$i"
-    blockE f "$ad"; loopE f "$ago"
-    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ad"
-    lg f "$i"; lg f "$mm"; ins f "i32.ge_s"; brIf f "$ad"
-    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$x"
-    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$y"
-    lg f "$x"; lg f "$y"; callf f "$cmpv"; ls f "$r"
-    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
-    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
-    br f "$ago"; endB f; endB f
-    lg f "$n"; lg f "$mm"; ins f "i32.gt_s"; lg f "$n"; lg f "$mm"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
     endB f
     ic f 0
     endFn f
@@ -1620,10 +1588,10 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
     match sh with
     | ShScalar ->
         LPrim (SubW, [ LPrim (GtSW, [ lowUntag wa; lowUntag wb ]); LPrim (LtSW, [ lowUntag wa; lowUntag wb ]) ])
-    // an unknown/opaque operand: compare the tagged WORDS directly — correct for
-    // tagged ints (2x+1 is monotone in x), best-effort (address order) otherwise.
-    // NOT $cmpv: the GC object header is not a stable class-id at word-0.
-    | ShOther -> LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])
+    // an opaque operand (a generic HOF's element, type unknown here): the safe
+    // runtime comparator — correct for ints/strings/float/int64, a no-op (0) for
+    // compound FK_TAGGED shapes it cannot identify at runtime.
+    | ShOther -> LCall ("$cmpv", [ wa; wb ])
     | ShStr -> LCall ("$str_cmp", [ wa; wb ])
     | ShFloat ->
         LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
