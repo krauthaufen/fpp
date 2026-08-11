@@ -157,19 +157,29 @@ Landed, each byte-exact self-host + run-gc + lowir gates green:
   mutables stay cells. Verified: fn-arg-derived locals, mutable loops, captured
   scalars, int64, and re-boxing a scalar into a generic `List`.
 
-Net: inside a function body, scalar locals / arithmetic / `float[]`,`int64[]`
-elements are all unboxed. Boxing now survives only at (a) function-call arg/return
-boundaries and (b) generic containers.
+* **Unboxed scalar ABI** (`de6e53d`): a top-level function whose scheme has any
+  `float`/`int64` param or return is emitted with a specialized wasm signature
+  (raw f64/i64) via a per-function type, recorded in `St.FuncSig`. Scalar params
+  arrive unboxed (registered in VarScalar); a scalar return is unboxed off the
+  body's word. The direct-call site unboxes scalar args and re-boxes a scalar
+  result (through a typed local — the call is a safepoint). Safe because a
+  top-level fn is only ever direct-called: a first-class use eta-expands to a
+  lambda that itself does a direct `LCall`, so it bridges for free (verified:
+  `List.map sq fs`). Uniform `(env,arg)→word` closure convention untouched.
+
+Net: primitives are now fully unboxed — locals, arithmetic, `float[]`/`int64[]`
+elements, AND function arg/return boundaries. Boxing survives only at generic
+containers, which is correct (uniform representation until monomorphized).
 
 ### Next
 
-* **Scalar ABI** — pass/return `float`/`int64` as raw f64/i64. Needs a
-  specialized direct-call entry alongside the uniform `(env,arg)→word` closure
-  entry (the monomorphize-vs-uniform tension): a function used first-class keeps
-  the boxed closure form; a direct `LCall` to a known head uses the unboxed
-  signature. Retires the box at every scalar call.
+* **Struct fields inline** (repr step 1, applied to records) — a record's
+  `float`/`int64` field stored raw in the payload (`[header][f64 x][f64 y]`)
+  instead of a boxed pointer; field read boxes (cancelled in arithmetic), write
+  unboxes — the same transform as flat arrays. Needs a per-record LAYOUT (mixed
+  4/8-byte fields, aligned) and a GC ref-map so the tid scans only the ref
+  fields. This is the aggregate-`repr(T)` foundation the value stack also needs.
 * **float32/float16 arrays + locals** — inline 4-byte f32 (stride 4) with
   demote/promote at the box boundary; extend `flatScalarTy`/`scalarLTy`.
-* **Value-stack structs** (steps 3-4) — the typed-local + `repr(T)` groundwork is
-  now in place; multi-field POD structs on the `$vsp` arena, by-value/sret/byref,
-  then frame descriptors for ref-holding structs.
+* **Value-stack structs** (steps 3-4) — multi-field POD structs on the `$vsp`
+  arena, by-value/sret/byref, then frame descriptors for ref-holding structs.
