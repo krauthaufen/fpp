@@ -54,6 +54,35 @@ This RETIRES the hand-placed `$spush`/`$spop` for struct locals: a struct's ref
 fields are covered by its frame descriptor, so rooting is structural and complete
 (kills the "did I remember to root this" bug class).
 
+### fpprt already supports this (confirmed ABI)
+
+The runtime (`fpprt.h`) already has the exact mechanism — no separate stack map
+needed, the object's **tid IS the descriptor**:
+
+    struct fpprt_frame {
+      struct fpprt_frame *prev;   // linked list; fpprt_top_frame is the head
+      uint32_t nslots;            // count of bare-ref slots
+      fpprt_ref *slots;           // refs the GC reads AND UPDATES (moving)
+      uint32_t npods;             // stack structs WITH ref fields
+      struct fpprt_frame_pod *pods;
+    };
+    struct fpprt_frame_pod {
+      char *base;   // struct address MINUS FPP_POD_OFF (blob-relative ref offsets apply)
+      uint32_t tid; // the GC walks the type table's ref offsets for this tid
+    };
+
+So a stack struct with refs is registered as a frame POD `(base, tid)`; the
+collector finds its inner ref fields through the tid's type-table ref-offset
+list and scans+updates them in place. A pure-POD struct (no refs) needs no
+registration at all. Pinning exists too (`fpprt_pin` / `fpprt_can_pin`, a
+capability the `mmc` collector provides, `copying` does not) for the arena.
+
+The wasm-linear work is: build a `fpprt_frame` in linear memory matching this
+layout, push it (set the imported `fpprt_top_frame`) on entry, add stack structs
+to `pods` with their `(base, tid)`, and pop on exit — plus reserving a
+NON-MOVING value-stack region in the imported memory (the one piece needing
+fpprt-side memory-layout coordination).
+
 ## Calling convention
 
 * **scalar** args/returns: wasm value (raw i32/f64/i64), by value. GC-invisible.
