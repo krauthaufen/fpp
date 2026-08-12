@@ -1537,11 +1537,10 @@ let private storLTy (k : string) : (LTy * int) option =
     | "float" | "double" -> Some (F64, 8)
     | "int64" | "uint64" -> Some (I64, 8)
     | "float32" | "single" -> Some (W, 4)
-    // byte/sbyte/int16/uint16 would pack too (I8/I16, and storBox/storUnbox
-    // already carry the sign handling) — but int16/byte VALUES are not yet
-    // complete in this backend: an `int16` literal (`100s`) lowers to 0, so a
-    // round-trip reads back 0 (the array store/load itself is fine). Packing
-    // them waits on real int16/byte value support, not more array work.
+    | "int16" | "uint16" -> Some (I16, 2)
+    // byte/sbyte still route through the string/$str packed-i8 path at some
+    // frontend sites, so their element-kind string disagrees between create and
+    // access — kept generic until that routing is shared (no regression).
     | _ -> None
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
@@ -1814,7 +1813,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         (match System.Int64.TryParse (s.Substring (0, s.Length - 1)) with
          | true, n -> lowBoxI ctx (LConstL n)
          | _ -> lowInt 0)
-    | ELit (LInt s) -> (match System.Int32.TryParse s with | true, n -> lowInt n | _ -> lowInt 0)
+    | ELit (LInt s) ->
+        // strip an integer TYPE suffix before parsing — int16 `s`, uint16 `us`,
+        // sbyte `y`, byte `uy`, uint32 `u`, nativeint `n` — else Int32.TryParse
+        // rejects it and the literal silently becomes 0. (int64 `L` handled above.)
+        let digits =
+            match [ "us"; "uy"; "un"; "s"; "y"; "u"; "n" ] |> List.tryFind s.EndsWith with
+            | Some suf -> s.Substring (0, s.Length - suf.Length)
+            | None -> s
+        (match System.Int32.TryParse digits with | true, n -> lowInt n | _ -> lowInt 0)
     | ELit (LFloat s) ->
         (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
          | true, d -> lowBoxF ctx (LConstF d)
