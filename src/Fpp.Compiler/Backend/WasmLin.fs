@@ -65,6 +65,11 @@ type private St =
       FuncSig : Dict<string, LTy list * LTy>
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
+      /// `extern` host imports (readTextRaw, preludeSourceRaw, …). WasmLin has
+      /// no host env yet, so a call to one lowers to a null default rather than
+      /// stubbing its callers — enough for the compiler to RUN the pipeline
+      /// (readTextRaw null → None; a real host env is the self-host follow-up).
+      Externs : Dict<string, bool>
       /// interned string literals -> their constant address
       Consts : Dict<string, int>
       mutable ConstNext : int
@@ -1862,6 +1867,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> lowStrConst st s
+    | EVar (v, _) | EVarI (v, _, _) when (dictTryFind st.Externs v.Name).IsSome -> lowInt 0
     | EVar (v, _) | EVarI (v, _, _) -> dictSet nameOf (key v) v.Name; lowVarByKey ctx (key v)
     | ELet (true, _, _, ELam _, _) ->
         // a recursive local-function group: every member may reference every
@@ -2384,6 +2390,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // string of a string is the identity
     | EApp (EUnknown "string#t", [ a ]) -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
+    // a call to an `extern` host import: no host env yet, so answer the null
+    // default (readTextRaw null -> None), letting the pipeline RUN instead of
+    // stubbing the caller. Args still evaluate for their side effects.
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
+        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
         (match dictTryFind st.FuncSig (key v) with
@@ -3250,7 +3261,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
-          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew (); Externs = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
@@ -3389,7 +3400,15 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 st.RootNext <- slot + 1
                 dictSet st.GlobalSlot (key v) slot
                 dictSet gcGlobalSlots (gl v) slot
+        | DExtern (v, _) -> dictSet st.Externs v.Name true
         | _ -> ()
+    // the host FILE-I/O externs have no WasmLin implementation (DExterns are
+    // stripped before the backend, so they arrive as unresolved refs). Answer
+    // their calls with a null default so the pipeline RUNS: readTextRaw null ->
+    // None, etc. A real fpprt-string host env is the self-host follow-up. The
+    // handled host externs (print/box/mem*/js*/…) are NOT listed here.
+    for n in [ "readTextRaw"; "existsRaw"; "listDirRaw"; "canonicalizeRaw"; "preludeSourceRaw" ] do
+        dictSet st.Externs n true
     // eta-expand every function used as a VALUE into explicit lambdas, BEFORE
     // discover — so the synthesized closures get lifted and lowered like any
     // other and a bare/partial function reference no longer dangles
