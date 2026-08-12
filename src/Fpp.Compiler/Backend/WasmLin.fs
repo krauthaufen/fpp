@@ -2990,7 +2990,7 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // emit one function (or init) through LowIR: allocate a register per param and
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
-let private emitFuncLow (st : St) (m : Mod) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (isInit : bool) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
@@ -3014,7 +3014,11 @@ let private emitFuncLow (st : St) (m : Mod) (sig_ : (LTy list * LTy) option) (ps
         // traps if ever reached. Dead prelude/backend members survive DCE.
         vecAdd st.Warnings ("stubbed (" + vecGet sink 0 + ")")
         localsDone f
-        ins f "unreachable"
+        // a stubbed INIT (a .NET-only top-level `let`, e.g. an Encoding object)
+        // must NOT trap: _start runs every init at startup, so store a harmless
+        // 0 instead — the value is only ever touched by already-stubbed .NET
+        // methods. A stubbed FUNCTION still traps loudly if it is ever called.
+        if isInit then (ic f 0; finish f) else ins f "unreachable"
     else
         let np = List.length ps
         for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
@@ -3489,7 +3493,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
+        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m false (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -3497,7 +3501,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m None [] rhs (fun f ->
+            emitFuncLow st m true None [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
