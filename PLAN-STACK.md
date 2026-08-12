@@ -167,9 +167,27 @@ Landed, each byte-exact self-host + run-gc + lowir gates green:
   lambda that itself does a direct `LCall`, so it bridges for free (verified:
   `List.map sq fs`). Uniform `(env,arg)→word` closure convention untouched.
 
-Net: primitives are now fully unboxed — locals, arithmetic, `float[]`/`int64[]`
-elements, AND function arg/return boundaries. Boxing survives only at generic
-containers, which is correct (uniform representation until monomorphized).
+* **float32 unboxed** (`3320887`): the last boxed primitive value. `float32`
+  rides an f64 box in this backend, so its arithmetic (`+s`…), locals, and ABI
+  now lower exactly like `float` — a pre-existing gap where `s`-ops fell through
+  to the tagged-int path (adding boxed pointers as ints → wild pointer) is fixed.
+  `float32[]` packs as raw 4-byte f32 via reinterpret (`Bits2F`/`F2Bits`/`PromF`/
+  `DemF`) with no new machine type — the f32 lives only transiently on the stack.
+  `Array.zeroCreate` now fills the raw per-storage zero, not a mis-unboxed 0.
+
+Net — the full primitive matrix, VALUES (locals/arithmetic/ABI):
+* `int`/`char`/`bool`/`int16`/`byte`/`sbyte`/`nativeint`… — already unboxed as a
+  tagged 31-bit word (never a heap object; the tag bit is the 31-bit cost).
+* `float`/`int64` — unboxed f64/i64. `float32` — unboxed (rides f64). **All done.**
+
+STORAGE (array elements; struct fields reuse the same `storLTy` table):
+* `float`(f64)/`int64`(i64)/`float32`(4-byte f32) packed inline. ✓
+* `byte`/`sbyte`/`int16`/`uint16` — `storBox`/`storUnbox` already carry their
+  sign handling and `storLTy` maps them to I8/I16, but their element-kind string
+  is not the plain type name at every site (bytes route through the string/`$str`
+  packed-i8 path in the sibling backend), so the naive match disagreed between
+  create and access. Held on the generic slot until that routing is shared —
+  no regression.
 
 ### Next
 
