@@ -239,8 +239,26 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
   semantics); struct LOCALS are still heap pointers. Put POD struct locals on the
   non-moving value stack, copy-on-pass / sret / byref (step 3).
 * **Monomorphize generics** (step 4) — the endgame that removes the last uniform
-  slots (so `List<Vec3>` holds inline Vec3s); build on the `EVarI` instantiation
-  + Lower per-type stamping.
+  slots (so `List<Vec3>` holds inline Vec3s). MECHANISM PROVEN, blocker located:
+  - It lives in `Link.fs` (`classify`, `Link.fs:19`), NOT the backend — `EVarI`
+    instantiations are consumed there and erased before any backend runs. Link
+    already stamps a specialised clone per STRUCT instantiation; ref types share
+    a boxed body. Widening `classify` to also stamp the boxed SCALARS
+    (`float`/`double`, then `int64`/`float32`) is a ~1-line change and routes
+    value-type generics through WasmLin's existing unboxing (scalarLTy/RecPod).
+  - Adding `float` there: byte-exact self-host held (+105 bytes — float generics
+    are rare in the compiler), corpus fixpoint + lowir gates + WasmLin probe all
+    green, and a generic fold over floats runs correct on WasmLin.
+  - BUT it broke 2 unit tests: the **wasm-GC backend** traps with `ref.cast`
+    failure on a scalar-STAMPED generic (the adaptive suite) — the latent
+    "vtable member keeps the all-anyref signature" limitation (see repo CLAUDE.md)
+    surfacing on a concrete-scalar clone. The self-host didn't catch it (the
+    compiler doesn't use float generics that way); the broader suite did.
+  - Monomorphization runs ONCE in the shared IR pipeline (`Workspace.fs:953`),
+    consumed by whichever backend runs, so it can't be gated to WasmLin cheaply.
+    So the true NEXT step is in the **wasm-GC backend**: make a scalar-stamped
+    generic body lower with the concrete scalar rep (fix the anyref-vtable-vs-
+    concrete cast), THEN the one-line `classify` widening lands for both backends.
 * **Mixed-record arrays** — `{x:float; tag:string}[]` needs FK_POD_ARRAY with a
   per-element refoffs map (stable-memory question again; array-of-struct is
   all-scalar for now).
