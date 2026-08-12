@@ -356,3 +356,34 @@ REMAINING for a running baked-corpus gate:
 Diagnostics added this session (env-gated, harmless): `FPP_LINWARN` dumps the
 linear backend's dropped `st.Warnings`; `FPP_FUNC_DUMP` maps `$f<hash>` → binding;
 stub warnings now carry the function/lambda name.
+
+### WasmLin self-host — deeper progress (real bugs found + fixed)
+
+Grinding the self-host surfaced GENUINE WasmLin correctness bugs (untested because
+run-gc programs and the wasm-GC self-host never exercised them):
+
+* **`&&&`/`&&`/`|||`/`||`/`^^^`/`<<<`/`>>>` were lowered as `rem`** (`2e27b36`):
+  `intArithOp` handled only `+-*/` and defaulted everything else to `RemSW`, so
+  `255 &&& 15` gave 0 (= `255 rem 15`) and `A && B` gave `A rem B`. This is what
+  trapped the self-compiled `dictSlotH` (`h &&& mask` → `h rem mask`, and later
+  `A && B`). Fixed → the Dictionary machinery runs.
+
+Progress chain (each a real fix, gated byte-exact + 698 tests):
+boot → static inits (init-stub-as-0) → prelude read (extern → null) → inference
+→ Dictionary (bitwise/logical fix) → traps now in `Query.GetInput`.
+
+REMAINING, concrete:
+* **`GetInput` miss**: the query `table` (a `Dict` with TUPLE keys `(query,key)`)
+  misses under WasmLin though the minidrive works in .NET. Tuple EQUALITY is
+  correct; tuple HASH is DEGENERATE (`hash("x","y") = hash("p","q")` → true, the
+  `$hashv` "other → class-id" path) — consistent so still correct, just O(n). The
+  miss itself is a separate not-yet-isolated bug in the self-compiled dict/query
+  path (dictNew isn't in the user prelude, so it can't be reproduced in a small
+  run-gc test — only in the self-compiled compiler).
+* Then: more traps likely, AND a REAL fpprt-string host env (the extern→null is a
+  hack that yields wrong output, so even a fully-running compiler wouldn't
+  byte-exact self-host until the prelude/corpus are really read).
+
+So: from "traps at the first init" to "runs boot+prelude+inference+Dictionary and
+into the query engine", plus two real op-lowering bugs fixed. A byte-exact WasmLin
+self-host is a multi-session finish, but no longer speculative.
