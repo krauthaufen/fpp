@@ -322,3 +322,37 @@ this). Attempted end-to-end; the state is concrete and promising:
 
 This is a multi-step arc but no longer speculative: the module builds, boots, and
 the remaining gaps are a concrete, finite stub list.
+
+### WasmLin self-host — session progress (from "immediate trap" to "host-I/O boundary")
+
+The WasmLin-compiled compiler (baked-corpus `wstest` driver: construct a
+Workspace, SetFileText a trivial program) now BOOTS, runs its whole static-init
+sequence, and executes the full startup + collection machinery. It advanced
+blocker-by-blocker:
+
+* literal parsers (`1e7714b`) + float-suffix parse (`fc2cd92`) → `coreToLowE`/
+  `lowPatTest` self-host (were `TryParse`/`Double.Parse` stubs; `5.0f` crashed
+  `Double.Parse`, now filtered + f32-rounded like BinDriver).
+* stubbed inits store 0, don't trap (`3634a48`) → survives .NET-only global inits.
+* freeVars captures `(builtin)`-path LOCALS (`fc2cd92`) → cleared DOZENS of
+  `name=x/acc` capture stubs. Only bare `compare` (the one valueless intrinsic)
+  stays excluded from capture.
+* CORPUS FIX (not a compiler change): the self-host substitutes `Prelude.fs` →
+  `stdlib/bootstrap.fpp` (line 43 of fixpoint.fsx) — the self-hostable `Vec`
+  (`{Items; Count}` record over an array) vs `Prelude.fs`'s `Vec = .NET List`.
+  An ad-hoc build that compiles `Prelude.fs` traps in `vecNew` (`List()` → LTrap).
+
+Now blocked ONLY at the file-I/O boundary: `preludeSource()` calls
+`preludeSourceRaw` (an `extern` host import), and WasmLin has no `DExtern`
+handling, so it stubs → traps when the Workspace reads the prelude.
+
+REMAINING for a running baked-corpus gate:
+* **DExtern host imports** — emit `readTextRaw`/`preludeSourceRaw` as wasm imports
+  (Core has `DExtern of VarId * Scheme`; BinDriver emits jsExterns via `importFn`).
+* **A WasmLin host env** providing them with the fpprt/linear string ABI (the
+  tricky part: the host must build an fpprt i16-array string to return), OR bake
+  the prelude/corpus as constants so no host import is needed.
+
+Diagnostics added this session (env-gated, harmless): `FPP_LINWARN` dumps the
+linear backend's dropped `st.Warnings`; `FPP_FUNC_DUMP` maps `$f<hash>` → binding;
+stub warnings now carry the function/lambda name.
