@@ -286,3 +286,39 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
   all-scalar for now).
 * ~~Narrow-int packed arrays~~ — DONE (int16/uint16/byte/sbyte all pack; the
   blocker was the suffixed-literal value bug, now fixed).
+
+## WasmLin self-host (the byte-exact gate for WasmLin)
+
+Goal: run the self-host on the WASM-LINEAR backend, so WasmLin gets its own
+byte-exact correctness gate (today's `fixpoint self` runs on wasm-GC and never
+executes WasmLin code — corruption-prone arcs like `$vsp` can't be gated without
+this). Attempted end-to-end; the state is concrete and promising:
+
+* `fpp build --gc <compiler sources> <baked-corpus driver>` produces a **3.8 MB
+  runnable module** — the whole compiler compiled through WasmLin.
+* It **boots and survives startup** now (was: trapped at the first init). Two
+  fixes got it there:
+  - **self-hostable literal parsers** (`1e7714b`): WasmLin.fs used
+    `System.Int32.TryParse`/`Double.TryParse` to lower numeric literals, which
+    stub `coreToLowE`/`lowPatTest` to `unreachable`. Replaced with hand-written
+    `parseI32Lit`/`parseI64Lit` (int) and the `parseFloat` prelude helper (float,
+    isolating `Double.Parse` in a leaf), so the critical functions self-host.
+  - **stubbed inits store 0, don't trap** (`3634a48`): a .NET-only top-level
+    `let` (e.g. `let latin1 = System.Text.Encoding.Latin1`) lowered its init to
+    `unreachable`, and `_start` runs every init → startup trap. A stubbed INIT
+    now stores 0 (the value is only touched by already-stubbed .NET methods); a
+    stubbed FUNCTION still traps loudly.
+* Now traps in a CALLED stub on the compile path — the remaining blockers are a
+  finite set: `$class:Num:One` (numeric-typeclass member), and the .NET-API
+  stubs `ToString`/`GetEnvironmentVariable`/`eprintfn`/`DoubleToInt64Bits`
+  (+ `box`). Each is: implement the intrinsic in WasmLin OR route it through an
+  isolating leaf helper so the caller self-hosts.
+* NOTE: the linear backend does not surface `st.Warnings` (it returns
+  `st.Errors`; `EmitWarnings` is only set by the wasm-GC path) — surfacing them
+  from `emitLinear` is the cheap next step to ENUMERATE the remaining stubs.
+* For the FULL self-host (not just the baked-corpus run) WasmLin also needs
+  `DExtern`/`readTextRaw` host-import support to read source files; a baked-corpus
+  driver sidesteps that for the correctness-gate purpose.
+
+This is a multi-step arc but no longer speculative: the module builds, boots, and
+the remaining gaps are a concrete, finite stub list.
