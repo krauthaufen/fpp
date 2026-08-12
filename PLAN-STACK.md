@@ -387,3 +387,30 @@ REMAINING, concrete:
 So: from "traps at the first init" to "runs boot+prelude+inference+Dictionary and
 into the query engine", plus two real op-lowering bugs fixed. A byte-exact WasmLin
 self-host is a multi-session finish, but no longer speculative.
+
+### ROOT CAUSE of the GetInput/dict miss: generic `=` compared POINTERS
+
+The self-host `GetInput` trap was a real WasmLin miscompile, now fixed and
+verified end-to-end.
+
+* Isolation: `geq<'k> a b = a = b` returned FALSE for two equal tuples, while
+  the same `("q","a") = ("q","a")` at a concrete site returned true. Tuple
+  EQUALITY and HASH were both fine; the generic wrapper was the difference.
+* Cause: `shapeOfExpr` on a generic variable prunes to a type variable →
+  `ShOther`, and `needsStructCmp(ShOther)` was FALSE, so `a = b` fell to the
+  tagged-int/pointer fast path — which compares heap ADDRESSES. Two distinct
+  but equal tuples/strings/records held in a generic `'k` always missed. That
+  is exactly `dictSlotH`'s `d.Keys.[e-1] = k`: every tuple-keyed lookup missed,
+  so the compiler's Query DB (`Dict<(query,key), Entry>`) reported "unset input".
+* Fix: `needsStructCmp(ShOther) = true`. `$cmpv` is self-describing — it handles
+  tagged ints, strings, floats and compounds uniformly — so the unknown/generic
+  case routes through it correctly (a KNOWN `ShScalar` still keeps the fast path).
+* Verified: generic tuple eq → true; tuple-keyed `Dict` resolves qa→10/qb→20;
+  and `querydrive.fpp` (the FULL query engine: inputs, memo, dep-tracking,
+  invalidation, early cutoff) run under WasmLin (`fpp build --gc`) prints
+  `10computes 310computes 37computes 57` — byte-identical to the .NET
+  `queryOracle`. The query engine, which `EmitProgramWasm` is built on, now
+  works under WasmLin.
+
+Gates after the fix: lowir cell/str/typetest/iface/exn PASS; byte-exact
+`fixpoint self` still reproduces stage-0 (2613369 bytes); unit suite pending.

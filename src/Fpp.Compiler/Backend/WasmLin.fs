@@ -1758,7 +1758,16 @@ let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
 let private needsStructCmp (sh : CmpShape) : bool =
     match sh with
     | ShStr | ShFloat | ShInt64 | ShList _ | ShArr _ | ShTup _ -> true
-    | ShScalar | ShOther -> false
+    // ShOther is an unknown/generic type variable ('k in a generic function, e.g.
+    // dictSlotH's `d.Keys.[e-1] = k`). The tagged-int/pointer fast path below is
+    // correct ONLY for a statically-known tagged scalar; a compound held in a
+    // generic (tuple/string/record key) lives behind a POINTER, so the fast path
+    // compares heap addresses and every distinct-but-equal key misses. $cmpv is
+    // self-describing — it handles tagged ints, strings, floats and compounds
+    // uniformly — so route the unknown case through it. Only a KNOWN scalar keeps
+    // the fast path.
+    | ShScalar -> false
+    | ShOther -> true
 
 // the shape from a mangled type name — "$tupN$<t0.t1...>", "string", "int", … —
 // used for the `compare` intrinsic, whose dispatch name carries the operand type
