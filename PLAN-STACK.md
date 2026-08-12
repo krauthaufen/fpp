@@ -238,8 +238,22 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
 * **Value semantics + `$vsp`** — array elements already copy in/out (value
   semantics); struct LOCALS are still heap pointers. Put POD struct locals on the
   non-moving value stack, copy-on-pass / sret / byref (step 3).
+* **Scalar monomorphization LANDED (float, wasm-linear)** (`6b8b271`): `classify`
+  now stamps a specialised clone per `float`/`double` instantiation too — but
+  ONLY on the wasm-linear target (`stampScalars`, threaded
+  `LinkedCoreFor(forLinear:true) → monomorphizeWith → classify`; wasm-GC and C
+  keep the shared body). So a generic used at `float` carries it UNBOXED through
+  WasmLin's existing scalar lowering (`scalarLTy`/scalar ABI), while the wasm-GC
+  self-host and adaptive suite are untouched. Structs ALREADY stamped for every
+  target (`isStructName`), so structs were already unboxed in generics; this
+  closes the boxed-scalar gap for float. Gated: byte-exact self-host, WasmLin
+  probe (0 errors compiling the whole compiler WITH stamping), all 698 unit
+  tests, run-gc on a generic fold over floats. NEXT: add `int64`/`uint64`/
+  `float32` to the gated predicate (one line each + a self-host/suite run).
+
 * **Monomorphize generics** (step 4) — the endgame that removes the last uniform
-  slots (so `List<Vec3>` holds inline Vec3s). MECHANISM PROVEN, blocker located:
+  slots (so `List<Vec3>` holds inline Vec3s). Now PARTLY LANDED (structs + float
+  on wasm-linear, above). Remaining, and why the wasm-GC path is still gated OFF: 
   - It lives in `Link.fs` (`classify`, `Link.fs:19`), NOT the backend — `EVarI`
     instantiations are consumed there and erased before any backend runs. Link
     already stamps a specialised clone per STRUCT instantiation; ref types share
