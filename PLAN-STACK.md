@@ -181,13 +181,13 @@ Net — the full primitive matrix, VALUES (locals/arithmetic/ABI):
 * `float`/`int64` — unboxed f64/i64. `float32` — unboxed (rides f64). **All done.**
 
 STORAGE (array elements; struct fields reuse the same `storLTy` table):
-* `float`(f64)/`int64`(i64)/`float32`(4-byte f32) packed inline. ✓
-* `byte`/`sbyte`/`int16`/`uint16` — `storBox`/`storUnbox` already carry their
-  sign handling and `storLTy` maps them to I8/I16, but their element-kind string
-  is not the plain type name at every site (bytes route through the string/`$str`
-  packed-i8 path in the sibling backend), so the naive match disagreed between
-  create and access. Held on the generic slot until that routing is shared —
-  no regression.
+* The FULL matrix packs inline now: `float`(f64), `double`, `int64`/`uint64`(i64),
+  `float32`/`single`(4-byte f32 via reinterpret), `int16`/`uint16`(i16),
+  `byte`/`sbyte`(i8). ✓ The earlier "byte/int16 disagree" belief was WRONG — it
+  was purely a value bug: a suffixed integer literal (`100s`, `200uy`) hit
+  `Int32.TryParse` with its type suffix and silently became 0, so every narrow-int
+  round-trip read back 0. Stripping the suffix (int16 `s`, uint16 `us`, sbyte `y`,
+  byte `uy`, uint32 `u`) fixed the values AND unblocked the packed arrays.
 
 * **Inline value-type record storage** (`762cf11`, Phase 1): an all-scalar
   record/struct (`Vec3{x,y,z:float}`, `{a:float32;b:int64;c:float}`) stores its
@@ -284,5 +284,5 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
 * **Mixed-record arrays** — `{x:float; tag:string}[]` needs FK_POD_ARRAY with a
   per-element refoffs map (stable-memory question again; array-of-struct is
   all-scalar for now).
-* **Narrow-int packed arrays** (`byte`/`int16`) — share the `$str`-style element
-  routing so the kind string agrees between create and access.
+* ~~Narrow-int packed arrays~~ — DONE (int16/uint16/byte/sbyte all pack; the
+  blocker was the suffixed-literal value bug, now fixed).

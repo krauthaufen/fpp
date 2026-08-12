@@ -1538,9 +1538,7 @@ let private storLTy (k : string) : (LTy * int) option =
     | "int64" | "uint64" -> Some (I64, 8)
     | "float32" | "single" -> Some (W, 4)
     | "int16" | "uint16" -> Some (I16, 2)
-    // byte/sbyte still route through the string/$str packed-i8 path at some
-    // frontend sites, so their element-kind string disagrees between create and
-    // access — kept generic until that routing is shared (no regression).
+    | "byte" | "sbyte" -> Some (I8, 1)
     | _ -> None
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
