@@ -2648,6 +2648,20 @@ and private evalRooted (ctx : LowCtx) (a : Expr) (b : Expr) : int * int * LStmt 
 and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     match e with
     | ESeq xs -> List.collect (coreToLowS ctx) xs
+    // a `let rec f = fun … and g = fun …` group in STATEMENT position needs the
+    // same cell treatment as in expression position (coreToLowE): bind every
+    // member to a cell FIRST so a member's closure can capture its siblings,
+    // then fill the cells. Without this the statement path bound each member in
+    // turn, so an earlier member captured a later one before it existed and the
+    // reference lowered to an unresolved variable (a stub that traps when the
+    // enclosing function runs — a `let rec quoteTy …` in `lower` did exactly this).
+    | ELet (true, _, _, ELam _, _) ->
+        let members, body = recGroupOf e
+        let regs = members |> List.map (fun (v, lam) -> v, lam, freshReg ctx (key v))
+        for v, _, _ in regs do dictSet ctx.LSt.CellVars (key v) true
+        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx (lowInt 0)))
+        let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
+        allocs @ fills @ coreToLowS ctx body
     | ELet (_, v, sch, rhs, body) ->
         lowLetBind ctx v sch rhs :: coreToLowS ctx body
     | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
@@ -3158,6 +3172,42 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // emit one function (or init) through LowIR: allocate a register per param and
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
+// Pre-assign a register and cell mark to every `let rec f = fun … and …` member
+// anywhere in a body BEFORE it is lowered. The rec-group lowering does this too,
+// but only when it REACHES the group; eta-expansion can lift a bare member
+// reference (`List.map quoteTy xs` -> `… (fun a -> quoteTy a) …`) to a position
+// that lowers earlier, and then the reference found no register and stubbed the
+// whole function (a `let rec … and quoteTy` in `lower` did exactly this under
+// self-host). freshReg is idempotent, so the group lowering reuses these slots.
+// Pre-assign a register and cell mark to every `let rec f = fun … and …` member
+// reachable from a body BEFORE it is lowered. The rec-group lowering does this
+// too, but only when it REACHES the group; eta-expansion can lift a bare member
+// reference (`List.map quoteTy xs`) to a spot that lowers earlier, and the
+// reference then finds no register and stubs the whole function (a `let rec …
+// and quoteTy` inside `lower` did exactly this under self-host). freshReg is
+// idempotent, so the group lowering reuses these slots.
+let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
+    match e with
+    | ELet (true, _, _, ELam _, _) ->
+        let members, body = recGroupOf e
+        for v, _ in members do
+            freshReg ctx (key v) |> ignore
+            dictSet ctx.LSt.CellVars (key v) true
+        for _, lam in members do preRecGroups ctx lam
+        preRecGroups ctx body
+    | ELam (_, b) -> preRecGroups ctx b
+    | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> preRecGroups ctx a; preRecGroups ctx b
+    | EApp (f, xs) -> preRecGroups ctx f; List.iter (preRecGroups ctx) xs
+    | EIf (a, b, c) | EIndexSet (_, a, b, c) -> preRecGroups ctx a; preRecGroups ctx b; preRecGroups ctx c
+    | EMatch (s, cs) | ETry (s, cs) -> preRecGroups ctx s; for _, gd, b in cs do (match gd with Some x -> preRecGroups ctx x | None -> ()); preRecGroups ctx b
+    | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> List.iter (preRecGroups ctx) xs
+    | ERecord (_, fs) -> for _, x in fs do preRecGroups ctx x
+    | ERecordExt (_, b, fs) -> preRecGroups ctx b; for _, x in fs do preRecGroups ctx x
+    | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) | EAssign (_, r) -> preRecGroups ctx r
+    | EFieldSet (r, _, _, x) -> preRecGroups ctx r; preRecGroups ctx x
+    | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
+    | _ -> ()
+
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
@@ -3172,6 +3222,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         | None -> W
     let sink = vecNew ()
     st.GapSink <- Some sink
+    preRecGroups ctx body
     let bodyLow0 = coreToLowE ctx body
     let bodyLow = match retTy with W -> bodyLow0 | _ -> flatUnbox retTy bodyLow0
     st.GapSink <- None
@@ -3204,6 +3255,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (b
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
     st.GapSink <- Some sink
+    preRecGroups ctx body
     let bodyLow = coreToLowE ctx body
     st.GapSink <- None
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]

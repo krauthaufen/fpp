@@ -513,3 +513,32 @@ the exact node fingerprints. The lexer + parser self-host under WasmLin.
 
 Fixes verified together: 698 unit tests, byte-exact `fixpoint self` (2617123
 bytes), lowir gates, run-gc sanity (@, seq, String.concat, roundtrip).
+
+### WasmLin self-host — the `let rec … and` bug is fixed; full pipeline RUNS
+
+Wired a full-compiler self-compile harness (whole frontier + a driver that calls
+`ws.EmitProgramWasm ()` on an embedded module, emit via WasmLin, fpprt-merged,
+run). It compiles cleanly (0 errors) and RUNS the whole pipeline — the first time
+`lower`/`infer`/emit execute under WasmLin.
+
+Fixed the long-documented **`let rec … and` self-host bug** (CLAUDE.md +
+tests/known-issues/let-rec-and-group-self-host.fpp). `lower` has a
+`let rec quote … and quoteTy …` group in a match arm; `quoteTy` stubbed as an
+"unresolved variable", so `lower` became an `unreachable` trap. Root cause: a
+rec-group member gets its register + cell ONLY when the rec-group lowering
+REACHES the group, but a reference can lower earlier (eta-lifted `List.map
+quoteTy` etc.), finding no register. Fix: `preRecGroups` pre-assigns a register
+and cell mark to every rec-group member in a body before it is lowered (freshReg
+is idempotent, so the group lowering reuses the slot). Also added the rec-group
+CELL treatment to `coreToLowS` (statement position lacked it — it bound each
+member in turn, so an earlier member captured a later one before it existed).
+Gates green: 698 units, byte-exact `fixpoint self` (2625564 bytes), lowir.
+
+REMAINING: with `lower` reachable, the end-to-end self-compile (module M + the
+whole embedded prelude) now runs but hits a RUNAWAY allocation — OOMs even at a
+512 MB semi-space heap, which for a tiny compile means a real bug in the
+now-first-time-executed deep pipeline (`lower`/`infer`/emit under WasmLin), not
+heap pressure. That is the next frontier: run the pipeline stage by stage
+(parse✓ → resolve → infer → lower → emit) under WasmLin and fix each as the
+parser was fixed. The parser already self-hosts byte-exact; the query engine,
+list/seq, value types, and now the rec-group resolution are all in place.
