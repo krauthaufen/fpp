@@ -208,11 +208,22 @@ boundary and takes an implicit box/vtable like `obj`; it is small and must be
 flagged, never silently boxed. The tagged 31-bit word is NOT a heap box — it is
 stack passing — so `int` and every ≤4-byte primitive already never heap-allocate.
 
+* **Mixed inline records** (`2d84d14`, Phase 1b): a record with >=1 scalar field
+  AND ref fields inlines its scalars raw and keeps the refs as word slots. Fields
+  are laid out SCALARS-FIRST, REFS-LAST and registered `FK_TAGGED` with `start` =
+  the first ref word — so the collector scans ONLY the ref suffix (never a raw
+  f64 that could look like a pointer) with NO `refoffs` array (which would need
+  stable memory the GC module lacks), and the existing `$cmpv` compares the
+  scalar prefix raw and recurses only the refs. Construction roots each ref
+  pointer on the shadow stack across the allocation. This also FIXED a latent
+  Phase-1 bug where all-scalar records recursed on f64 words in `$cmpv` (could
+  deref a float bit-pattern as a pointer) — both paths are unified on FK_TAGGED
+  now. Verified: mixed fields, functional update, structural equality (recurses
+  into the string field), and a 200k-record GC-stress run where a kept record's
+  string field survived relocation.
+
 ### Next
 
-* **Mixed records** (some ref fields) — inline scalar fields + word ref slots,
-  registered `FK_STRUCT` with a materialised `refoffs` byte-offset array so the
-  GC scans exactly the ref fields. `RecPod` currently covers all-scalar only.
 * **Array-of-struct flat** — a `Vec3[]` as contiguous inline elements (stride =
   struct size), not an array of pointers; per-element ref-map for ref-holding
   elements.
