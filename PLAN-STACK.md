@@ -492,3 +492,24 @@ hits it via `String.concat`. Fix direction: WasmLin interface dispatch must
 support closure/object-expression impls (receiver = the captured env), i.e.
 put object-expression members in the vtable and call them as closures. This is
 the last piece before the parser round-trips and the frontier self-hosts.
+
+### WasmLin self-host — the PARSER self-hosts byte-for-byte
+
+The last blocker (seq-based interface dispatch) is fixed: a **built-in list
+iterator**, mirroring the GC backend's `$isBuiltinSeq`/`$iterNew`/`$iterNext`/
+`$iterCur`. A cons list carries no IEnumerable vtable row, so `for x in (list :>
+seq)` — how `String.concat`/`List.collect`/`Seq.*` consume a list — routed a
+GetEnumerator/MoveNext/Current dispatch at vtable slot 0 and trapped. Now
+`EIfaceCall` for the enumerator protocol tests the receiver: a built-in seq
+(nil or a cons cell) uses the linear iterator `[remaining][current]` (CID_ITER /
+gcIterTid), anything else falls through to the vtable (an object-expression
+IEnumerator). Plus `print` now emits its trailing newline (was raw `$prints`),
+matching the GC backend's `putc '\n'`.
+
+RESULT: `parsedrive.fpp` compiled through WasmLin (bootstrap-substituted,
+fpprt-merged) prints output **byte-identical to the wasm-GC oracle** —
+diagnostics 0, roundtrip ok, tokens 128, lets 4, types 2, cases 3, errors 0, and
+the exact node fingerprints. The lexer + parser self-host under WasmLin.
+
+Fixes verified together: 698 unit tests, byte-exact `fixpoint self` (2617123
+bytes), lowir gates, run-gc sanity (@, seq, String.concat, roundtrip).

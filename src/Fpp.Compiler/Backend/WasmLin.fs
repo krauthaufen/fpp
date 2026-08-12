@@ -165,7 +165,11 @@ let private CID_CLOSURE = 3
 let private CID_FLOAT = 4
 let private CID_INT64 = 5
 let private CID_STRING = 6
-let private CID_FIRST_USER = 7
+// the built-in list/array enumerator (`for x in (list :> seq)`): lists carry no
+// IEnumerable vtable row, so GetEnumerator/MoveNext/Current on one route to these
+// linear iterator helpers instead of a vtable dispatch, mirroring the GC backend.
+let private CID_ITER = 7
+let private CID_FIRST_USER = 8
 
 let private CLO_KIND = 2
 
@@ -191,6 +195,7 @@ let mutable private gcArrTid = 0
 let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
 let mutable private gcListTid = 0
+let mutable private gcIterTid = 0
 let mutable private gcCmpTblSlot = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
@@ -366,6 +371,10 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$cmpv" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
     declFn m "$lappend" "$lt_ii2i"
+    declFn m "$isBuiltinSeq" "$lt_i2i"
+    declFn m "$literNew" "$lt_i2i"
+    declFn m "$literNext" "$lt_i2i"
+    declFn m "$literCur" "$lt_i2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -652,6 +661,50 @@ let private emitLappend (m : Mod) : unit =
     lg f "$cell"; ic f HDR; ins f "i32.add"; lg f "$h"; mem f "i32.store"
     lg f "$cell"; ic f (HDR + 4); ins f "i32.add"; lg f "$rec"; mem f "i32.store"
     lg f "$cell"
+    endFn f
+
+// The built-in list iterator: `for x in (list :> seq)` lowers to the enumerator
+// protocol, but a cons list has no IEnumerable vtable row, so GetEnumerator/
+// MoveNext/Current on one route here (see the EIfaceCall lowering) instead of a
+// vtable dispatch that would read slot 0 and trap. Mirrors the GC backend's
+// $isBuiltinSeq/$iterNew/$iterNext/$iterCur.
+let private emitListIter (m : Mod) : unit =
+    let listHdr = if gc then (gcListTid <<< 1) ||| 1 else CID_LIST
+    // $isBuiltinSeq(v) -> raw 0/1: nil (empty list) or a cons cell
+    let f = beginFn m [ "$v" ]
+    localsDone f
+    lg f "$v"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
+    lg f "$v"; mem f "i32.load"; ic f listHdr; ins f "i32.eq"
+    endFn f
+    // $literNew(list) -> a fresh iterator [remaining=list][current=0]
+    let f = beginFn m [ "$list" ]
+    local f "$it" "i32"
+    localsDone f
+    if gc then
+        lg f "$list"; callf f "$spush"
+        ic f gcIterTid; callf f "$fpalloc"; ls f "$it"
+        callf f "$spop"; ls f "$list"
+    else
+        ic f (HDR + 8); callf f "$lalloc"; ls f "$it"
+        lg f "$it"; ic f CID_ITER; mem f "i32.store"
+    lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$list"; mem f "i32.store"
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; ic f 0; mem f "i32.store"
+    lg f "$it"
+    endFn f
+    // $literNext(it) -> tagged bool: pop the head into current, advance remaining
+    let f = beginFn m [ "$it" ]
+    local f "$rem" "i32"
+    localsDone f
+    lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$rem"
+    lg f "$rem"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f   // nil -> tagged false
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$rem"; ic f HDR; ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
+    lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$rem"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
+    ic f 3   // tagged true
+    endFn f
+    // $literCur(it) -> the current element
+    let f = beginFn m [ "$it" ]
+    localsDone f
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
     endFn f
 
 // $prints(s): UTF-16 -> UTF-8 into PRINTBUF, then fd_write(1). Handles the
@@ -2374,7 +2427,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
     // print / printraw: write a string to stdout (print's newline matters only
     // on the compiler's error paths, which the fixpoint success path never hits)
-    | EApp (EUnknown ("print" | "printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
+    // `print` writes the string THEN a newline (matching the GC backend's putc
+    // '\n'); `printraw`/`printRaw` are the newline-free form.
+    | EApp (EUnknown "print", [ a ]) ->
+        LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
+    | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
     | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> lowTag (LCall ("$hashv", [ coreToLowE ctx a ]))
@@ -2513,23 +2570,39 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         // the representation does not change under a cast in the tagged model
         coreToLowE ctx e2
     | EIfaceCall (iface, method, recv, args) ->
-        // dispatch through the vtable: the receiver's class-id header indexes a
-        // row, the slot the column; the word there is the impl's table index
-        let slot = match dictTryFind st.SlotOf (bareIfaceOf iface + "|" + method) with Some s -> s | None -> 0
+        let bi = bareIfaceOf iface
         let t = freshTmp ctx
-        let cid = lowHeaderCid (wReg t)
-        // the vtable base: a fixed constant in the standalone path; under GC the
-        // vtable is a fpprt array kept in a root slot (its data starts past the
-        // [tag][len] header), read fresh so a collection's move is seen
-        let vtBase =
-            if gc then LPrim (AddW, [ LLoad (W, LGetGlobal "$roots", 4 * st.VtSlot); LConstW 8 ])
-            else LConstW st.VtBase
-        let idxAddr =
-            LPrim (AddW, [ vtBase
-                           LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
-        let callArgs = LGet (wReg t) :: List.map (coreToLowE ctx) args
-        LDo ([ LSet (wReg t, coreToLowE ctx recv) ],
-             LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), callArgs))
+        // dispatch through the vtable: the receiver's class-id header indexes a
+        // row, the slot the column; the word there is the impl's table index.
+        // Under GC the vtable is a fpprt array in a root slot (data past the
+        // [tag][len] header), read fresh so a collection's move is seen.
+        let vtDispatch () =
+            let slot = match dictTryFind st.SlotOf (bi + "|" + method) with Some s -> s | None -> 0
+            let cid = lowHeaderCid (wReg t)
+            let vtBase =
+                if gc then LPrim (AddW, [ LLoad (W, LGetGlobal "$roots", 4 * st.VtSlot); LConstW 8 ])
+                else LConstW st.VtBase
+            let idxAddr =
+                LPrim (AddW, [ vtBase
+                               LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
+            LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), LGet (wReg t) :: List.map (coreToLowE ctx) args)
+        // a list has no IEnumerable vtable row, so route the enumerator protocol
+        // to the built-in iterator when the receiver IS a built-in seq / iterator,
+        // else fall through to the vtable (an object-expression IEnumerator).
+        let iterHdr = if gc then (gcIterTid <<< 1) ||| 1 else CID_ITER
+        let branch (builtin : LExpr) (cond : LExpr) =
+            let res = freshTmp ctx
+            LDo ([ LSet (wReg t, coreToLowE ctx recv)
+                   LIf (cond, [ LSet (wReg res, builtin) ], [ LSet (wReg res, vtDispatch ()) ]) ],
+                 LGet (wReg res))
+        if bi = "IEnumerable" && method = "GetEnumerator" then
+            branch (LCall ("$literNew", [ LGet (wReg t) ])) (LCall ("$isBuiltinSeq", [ LGet (wReg t) ]))
+        elif bi = "IEnumerator" && method = "MoveNext" then
+            branch (LCall ("$literNext", [ LGet (wReg t) ])) (LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW iterHdr ]))
+        elif bi = "IEnumerator" && method = "Current" then
+            branch (LCall ("$literCur", [ LGet (wReg t) ])) (LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW iterHdr ]))
+        else
+            LDo ([ LSet (wReg t, coreToLowE ctx recv) ], vtDispatch ())
     | ETry (body, clauses) ->
         // run body; a throw is caught into `exn` and matched against the
         // clauses (each a block that binds and breaks to $tdone on a match);
@@ -3503,6 +3576,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
+        // the built-in list iterator: [remaining][current], both scanned as
+        // tagged words (start=1) so a ref element is rooted and a tagged int skipped
+        gcIterTid <- gcTid st "iter" (HDR + 8) FK_TAGGED 1
         // a root slot for the vtable array pointer (filled at startup)
         st.VtSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
@@ -3599,7 +3675,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m
+    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
