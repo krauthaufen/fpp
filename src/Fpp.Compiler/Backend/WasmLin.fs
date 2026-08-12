@@ -1652,7 +1652,15 @@ let private intArithOp (b : string) : LOp =
     | "-" -> SubW
     | "*" -> MulW
     | "/" -> DivSW
-    | _ -> RemSW
+    // bitwise AND logical ops were falling through to RemSW — `&&&`/`&&`
+    // compiled as `rem`. `&&`/`||` on 0/1 bools give the right result via
+    // AndW/OrW (both operands are pure comparisons where this reaches the backend).
+    | "&&&" | "&&" -> AndW
+    | "|||" | "||" -> OrW
+    | "^^^" -> XorW
+    | "<<<" -> ShlW
+    | ">>>" -> ShrSW
+    | _ -> RemSW   // %
 
 let private intCmpOp (b : string) : LOp =
     match b with
