@@ -189,15 +189,36 @@ STORAGE (array elements; struct fields reuse the same `storLTy` table):
   create and access. Held on the generic slot until that routing is shared —
   no regression.
 
+* **Inline value-type record storage** (`762cf11`, Phase 1): an all-scalar
+  record/struct (`Vec3{x,y,z:float}`, `{a:float32;b:int64;c:float}`) stores its
+  fields RAW inline — `[header][f64 x][f64 y]…`, GC-invisible (`FK_STRUCT`,
+  nrefs=0), no per-field box. `St.RecPod` holds the field→(offset,kind) layout
+  and object size; construction/`{with}`/read/write/mutation go through it, a
+  field read boxes (cancelled by unbox in arithmetic). Verified: fields, `dot`,
+  mutable fields, mixed 4/8-byte widths, functional update, structural equality.
+
+### The model (settled with the user)
+
+Real value types: `int`/`float`/`struct` box ONLY on an explicit `obj` upcast —
+never in generics or function calls. That mandates **monomorphized/reified
+generics** (a value type flows through unboxed; `List<Vec3>` holds inline Vec3s).
+The residue that can't be statically monomorphized — polymorphic recursion,
+first-class-polymorphic / HKT-existential values — is the genuine dynamic
+boundary and takes an implicit box/vtable like `obj`; it is small and must be
+flagged, never silently boxed. The tagged 31-bit word is NOT a heap box — it is
+stack passing — so `int` and every ≤4-byte primitive already never heap-allocate.
+
 ### Next
 
-* **Struct fields inline** (repr step 1, applied to records) — a record's
-  `float`/`int64` field stored raw in the payload (`[header][f64 x][f64 y]`)
-  instead of a boxed pointer; field read boxes (cancelled in arithmetic), write
-  unboxes — the same transform as flat arrays. Needs a per-record LAYOUT (mixed
-  4/8-byte fields, aligned) and a GC ref-map so the tid scans only the ref
-  fields. This is the aggregate-`repr(T)` foundation the value stack also needs.
-* **float32/float16 arrays + locals** — inline 4-byte f32 (stride 4) with
-  demote/promote at the box boundary; extend `flatScalarTy`/`scalarLTy`.
-* **Value-stack structs** (steps 3-4) — multi-field POD structs on the `$vsp`
-  arena, by-value/sret/byref, then frame descriptors for ref-holding structs.
+* **Mixed records** (some ref fields) — inline scalar fields + word ref slots,
+  registered `FK_STRUCT` with a materialised `refoffs` byte-offset array so the
+  GC scans exactly the ref fields. `RecPod` currently covers all-scalar only.
+* **Array-of-struct flat** — a `Vec3[]` as contiguous inline elements (stride =
+  struct size), not an array of pointers; per-element ref-map for ref-holding
+  elements.
+* **Value semantics + `$vsp`** — struct locals on the non-moving value stack,
+  copy-on-pass / sret / byref (steps 3).
+* **Monomorphize generics** (step 4) — the endgame that removes the last uniform
+  slots; build on the existing `EVarI` instantiation + Lower per-type stamping.
+* **Narrow-int packed arrays** (`byte`/`int16`) — share the `$str`-style element
+  routing so the kind string agrees between create and access.
