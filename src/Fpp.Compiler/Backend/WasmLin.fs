@@ -1602,6 +1602,35 @@ let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
 
+// self-hostable integer literal parsers. The compiler runs under its OWN
+// wasm-linear backend during a WasmLin self-host, where System.Int32.TryParse
+// is not in the subset (it stubs coreToLowE/lowPatTest to `unreachable`). The
+// literals reaching here are lexer-validated, so a plain digit fold is enough.
+// invalid input -> 0, matching the Int32.TryParse fallback these replaced (a
+// hex/garbage literal was already lowered to 0, so byte-exactness is preserved).
+let private parseI32Lit (s : string) : int =
+    let neg = strLen s > 0 && charAt s 0 = '-'
+    let start = if neg then 1 else 0
+    let mutable acc = 0
+    let mutable ok = strLen s > start
+    let mutable i = start
+    while i < strLen s do
+        let d = int (charAt s i) - int '0'
+        if d < 0 || d > 9 then ok <- false else acc <- acc * 10 + d
+        i <- i + 1
+    if ok then (if neg then 0 - acc else acc) else 0
+let private parseI64Lit (s : string) : int64 =
+    let neg = strLen s > 0 && charAt s 0 = '-'
+    let start = if neg then 1 else 0
+    let mutable acc = 0L
+    let mutable ok = strLen s > start
+    let mutable i = start
+    while i < strLen s do
+        let d = int (charAt s i) - int '0'
+        if d < 0 || d > 9 then ok <- false else acc <- acc * 10L + int64 d
+        i <- i + 1
+    if ok then (if neg then 0L - acc else acc) else 0L
+
 let private intArithOp (b : string) : LOp =
     match b with
     | "+" -> AddW
@@ -1808,9 +1837,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
     | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" ->
-        (match System.Int64.TryParse (s.Substring (0, s.Length - 1)) with
-         | true, n -> lowBoxI ctx (LConstL n)
-         | _ -> lowInt 0)
+        lowBoxI ctx (LConstL (parseI64Lit (s.Substring (0, s.Length - 1))))
     | ELit (LInt s) ->
         // strip an integer TYPE suffix before parsing — int16 `s`, uint16 `us`,
         // sbyte `y`, byte `uy`, uint32 `u`, nativeint `n` — else Int32.TryParse
@@ -1819,11 +1846,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             match [ "us"; "uy"; "un"; "s"; "y"; "u"; "n" ] |> List.tryFind s.EndsWith with
             | Some suf -> s.Substring (0, s.Length - suf.Length)
             | None -> s
-        (match System.Int32.TryParse digits with | true, n -> lowInt n | _ -> lowInt 0)
-    | ELit (LFloat s) ->
-        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
-         | true, d -> lowBoxF ctx (LConstF d)
-         | _ -> lowInt 0)
+        lowInt (parseI32Lit digits)
+    | ELit (LFloat s) -> lowBoxF ctx (LConstF (Fpp.Prelude.parseFloat s))
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
@@ -2637,10 +2661,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PWild -> []
     | PVar (v, _) -> [ LSet (wReg (freshReg ctx (key v)), sc) ]
     | PAs (p, v, _) -> LSet (wReg (freshReg ctx (key v)), sc) :: lowPatTest ctx scrutReg fail p
-    | PLit (LInt s) ->
-        (match System.Int32.TryParse s with
-         | true, n -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW n ])) ]
-         | _ -> [])
+    | PLit (LInt s) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (parseI32Lit s) ])) ]
     | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (if b then 1 else 0) ])) ]
     | PLit LUnit -> []
     | PCtor (case, _, subs) ->
@@ -2666,10 +2687,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
         lowPatTest ctx scrutReg fail (PCons (x, PListLit rest))
     | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
     | PLit LNull -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
-    | PLit (LFloat s) ->
-        (match System.Double.TryParse (s, System.Globalization.CultureInfo.InvariantCulture) with
-         | true, d -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF d ])) ]
-         | _ -> [])
+    | PLit (LFloat s) -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF (Fpp.Prelude.parseFloat s) ])) ]
     | PLit (LString raw) ->
         // a string pattern is a value compare: $streq returns 1 when equal
         [ LBreakIf (fail, LPrim (EqW, [ LCall ("$streq", [ sc; lowStrConst st raw ]); LConstW 0 ])) ]
@@ -2878,7 +2896,7 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     match e with
     | LConstW n -> ic f n
     | LConstL n -> lc f n
-    | LConstF x -> fc f (System.BitConverter.DoubleToInt64Bits x)
+    | LConstF x -> fc f (Fpp.Prelude.doubleBits x)
     | LGet r -> lg f (regNm r)
     | LGetGlobal g ->
         // GC: a top-level global lives in the root table — load its slot
