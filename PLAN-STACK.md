@@ -414,3 +414,42 @@ verified end-to-end.
 
 Gates after the fix: lowir cell/str/typetest/iface/exn PASS; byte-exact
 `fixpoint self` still reproduces stage-0 (2613369 bytes); unit suite pending.
+
+### NEXT self-host blocker: wasm-merge splits the module's function table
+
+Running MORE of the compiler under WasmLin (lexer/parser drivers, and any
+default-prelude program using `List.map`) surfaced a pre-existing bug in the
+`fpp build --gc` reactor merge — NOT a regression (the raw linear module is
+self-consistent; my needsStructCmp/scalar-ABI changes never touch tables).
+
+Symptom: `List.map (fun i -> i+1) [1;2;3]` traps with `indirect call type
+mismatch`. `List.length`, cons+rev, struct-keyed dicts, and closures-via-MemoT
+all work — so it is specific to programs that MIX closures with interface/
+vtable dispatch.
+
+Root cause, pinned:
+* The RAW linear module uses ONE table (index 0) for every `call_indirect` —
+  closures (registered via `tblIdx` → `TableOrder`, active elem) AND vtable
+  method indices. Verified: raw module = 1 table, all 5 call_indirect on table 0,
+  internally consistent.
+* `fpp build --gc` runs `wasm-merge -all reactor fpprt mod mutator`. The reactor
+  has its own table, so the merged module has TWO: `$0` (reactor's) and `$0_1`
+  (the module's closures, 3 entries). The merge remaps the module's
+  `call_indirect table 0` references — but INCONSISTENTLY: most vtable dispatches
+  land on `$0` (correct) while ONE lands on `$0_1` (the closure table).
+* Concrete tell: working `querydrive` has 0 vtable-typed (`$lt_i2i`) call_indirect
+  on `$0_1`; the trapping `List.map` program has exactly 1 — that dispatch reads a
+  vtable code index and call_indirects `$0_1 (type $lt_i2i)`, but `$0_1` holds
+  2-param closures (`$lt_ii2i`) → type mismatch. (`f1578676865`/List.map, wat
+  line ~16445.)
+
+Why querydrive self-hosts anyway: its closure/dispatch mix happens to remap
+consistently (all vtable dispatches stay on `$0`). So the query-engine milestone
+stands; this blocks the FULL frontier (lexer/parser onward) under WasmLin.
+
+Fix direction (a focused, separately-gated task): make the linear module IMPORT
+the reactor's single exported table instead of defining its own, so closures and
+vtable methods share one table index space that survives the merge with no
+split. Alternatives: post-merge table unification, or a wasm-merge flag. Needs
+full re-gating (lowir + fixpoint self + 698 units) since it changes the emitted
+table/elem layout.
