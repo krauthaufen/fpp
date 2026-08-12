@@ -542,3 +542,23 @@ heap pressure. That is the next frontier: run the pipeline stage by stage
 (parse✓ → resolve → infer → lower → emit) under WasmLin and fix each as the
 parser was fixed. The parser already self-hosts byte-exact; the query engine,
 list/seq, value types, and now the rec-group resolution are all in place.
+
+### WasmLin self-host — hex literals were 0; full compile now runs to a real bug
+
+Traced the end-to-end self-compile runaway to its ROOT: `parseI32Lit`/`parseI64Lit`
+(the self-hostable integer-literal parsers the WasmLin backend uses) only handled
+DECIMAL — every `0x..` hex literal parsed as 0. Nothing in the gates exercises a
+hex literal under WasmLin, so it slipped through; the self-hosted compiler hit it
+running its OWN `emitS32` (`v &&& 0x7f` became `v &&& 0`, and the LEB128 loop
+never terminated → a 512 MB runaway). Fixed both parsers to handle `0x`/`0X` hex,
+`_` digit separators, and to stop at a type suffix (`100s`, `0xFFL`). Gates green:
+698 units, byte-exact `fixpoint self` (2626024 bytes), lowir. Diagnosis method: a
+full-compiler self-compile harness + stage markers pinned link→emit→rtCore6→
+$strcmp→`ic -1`→emitS32; isolated `0x7f = 0` in a 3-line repro.
+
+With hex fixed the self-compile no longer runs away — it now runs the whole
+link+emit pipeline and throws a real wasm exception in `List.map2` (from
+`List.zip`): a genuine different-length-lists mismatch (map2/zip are correct for
+equal lengths, verified), so an upstream list is built with the wrong length
+under WasmLin. THAT is the next bug to trace — the deep emit pipeline running
+under WasmLin for the first time, one clean root-cause fix at a time.

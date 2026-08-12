@@ -1710,25 +1710,46 @@ let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW
 let private parseI32Lit (s : string) : int =
     let neg = strLen s > 0 && charAt s 0 = '-'
     let start = if neg then 1 else 0
+    // `0x`/`0X` is hex — without this every hex literal (`0x7f`, `0x40`) parsed
+    // as 0, so e.g. the LEB128 encoder's `v &&& 0x7f` became `v &&& 0` and its
+    // loop never terminated (a runaway when the self-hosted compiler ran it).
+    let isHex = strLen s > start + 1 && charAt s start = '0' && (charAt s (start + 1) = 'x' || charAt s (start + 1) = 'X')
     let mutable acc = 0
-    let mutable ok = strLen s > start
-    let mutable i = start
-    while i < strLen s do
-        let d = int (charAt s i) - int '0'
-        if d < 0 || d > 9 then ok <- false else acc <- acc * 10 + d
-        i <- i + 1
-    if ok then (if neg then 0 - acc else acc) else 0
+    let mutable i = if isHex then start + 2 else start
+    let mutable go = true
+    while go && i < strLen s do
+        let c = charAt s i
+        if c = '_' then i <- i + 1   // digit separator
+        else
+            let d =
+                if c >= '0' && c <= '9' then int c - int '0'
+                elif isHex && c >= 'a' && c <= 'f' then int c - int 'a' + 10
+                elif isHex && c >= 'A' && c <= 'F' then int c - int 'A' + 10
+                else -1
+            // a non-digit ends the number: it is a type suffix (`100s`, `0x2Auy`)
+            if d < 0 then go <- false
+            else (acc <- (if isHex then acc * 16 else acc * 10) + d; i <- i + 1)
+    if neg then 0 - acc else acc
 let private parseI64Lit (s : string) : int64 =
     let neg = strLen s > 0 && charAt s 0 = '-'
     let start = if neg then 1 else 0
+    let isHex = strLen s > start + 1 && charAt s start = '0' && (charAt s (start + 1) = 'x' || charAt s (start + 1) = 'X')
     let mutable acc = 0L
-    let mutable ok = strLen s > start
-    let mutable i = start
-    while i < strLen s do
-        let d = int (charAt s i) - int '0'
-        if d < 0 || d > 9 then ok <- false else acc <- acc * 10L + int64 d
-        i <- i + 1
-    if ok then (if neg then 0L - acc else acc) else 0L
+    let mutable i = if isHex then start + 2 else start
+    let mutable go = true
+    while go && i < strLen s do
+        let c = charAt s i
+        if c = '_' then i <- i + 1
+        else
+            let d =
+                if c >= '0' && c <= '9' then int c - int '0'
+                elif isHex && c >= 'a' && c <= 'f' then int c - int 'a' + 10
+                elif isHex && c >= 'A' && c <= 'F' then int c - int 'A' + 10
+                else -1
+            // a non-digit ends the number: an `L`/`l` int64 suffix or a type tag
+            if d < 0 then go <- false
+            else (acc <- (if isHex then acc * 16L else acc * 10L) + int64 d; i <- i + 1)
+    if neg then 0L - acc else acc
 // float literal -> its double value: drop the F++ width suffix (Double.Parse
 // throws on `5.0f`, unlike the old TryParse), and round a `float32` literal
 // through f32 so it matches the value stored. `parseFloat` (the Double.Parse
