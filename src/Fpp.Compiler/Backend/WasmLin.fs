@@ -1548,6 +1548,18 @@ let private storLTy (k : string) : (LTy * int) option =
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
 let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | _ -> W
 let private storShape (k : string) : string = "sa:" + k
+
+// an array whose element is an ALL-SCALAR inline record stores the elements
+// contiguously and HEADERLESS (`[tag][len][fields][fields]…`): element i's
+// fields sit at ARRHDR + i*stride, stride = the record's field bytes (size-HDR),
+// and a field at record-offset off is at +(off-HDR). No per-element box or
+// header, GC-invisible (a scalar array). Returns (field layout, stride). Mixed
+// (ref-holding) element records need a per-element ref-map — not yet.
+let private ARRHDR = HDR + 4
+let private podArrOf (st : St) (kind : string) : (Dict<string, int * string> * int) option =
+    match dictTryFind st.RecPod kind with
+    | Some (layout, size, firstRefWord) when firstRefWord = size / 4 -> Some (layout, size - HDR)
+    | _ -> None
 let private regNm (r : LReg) : string = "$r" + string r.Id
 // the class-id descriptor for a record type / a union case's union; -1 for an
 // undeclared name (a value no type test looks for)
@@ -1992,6 +2004,34 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         lowObj ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args)
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
+    // fused element-field access on an array of inline records — MUST precede the
+    // plain POD field cases, or a field write would copy the element out and
+    // mutate the throwaway. Read fuses to the slot; write hits the slot directly.
+    | EField (EIndex (ek, arr, i), fname, _) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let (off, kind) = (dictTryFind layout fname).Value
+        let (sty, _) = (storLTy kind).Value
+        let vty = storValTy sty
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let fv = freshTmpT ctx vty
+        LDo ([ LSet (wReg ar, coreToLowE ctx arr)
+               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
+             storBox ctx kind (LGet { Id = fv; RTy = vty }))
+    | EFieldSet (EIndex (ek, arr, i), fname, _, v) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let (off, kind) = (dictTryFind layout fname).Value
+        let (sty, _) = (storLTy kind).Value
+        let vty = storValTy sty
+        let fv = freshTmpT ctx vty
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox kind (coreToLowE ctx v))
+               LSet (wReg ar, coreToLowE ctx arr)
+               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
+             lowInt 0)
     | EField (r, fname, owner) when (dictTryFind st.RecPod owner).IsSome ->
         let (layout, _, _) = (dictTryFind st.RecPod owner).Value
         let (off, kind) = (dictTryFind layout fname).Value
@@ -2025,6 +2065,86 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
         LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
+    // ---- arrays of inline value-type records (all-scalar elements) ----
+    // elements are contiguous & HEADERLESS at ARRHDR + i*stride. A whole-element
+    // read copies out to a fresh headed record; a whole-element write copies the
+    // source record's fields into the slot. (The FUSED field access on an element
+    // — `arr.[i].f` / `arr.[i].f <- v` — is matched earlier, ahead of the plain
+    // POD field cases, so a field write hits the slot instead of a throwaway.)
+    | EIndex (ek, arr, i) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
+        let items = order |> List.map (fun fn ->
+            let (off, kind) = (dictTryFind layout fn).Value
+            let (sty, _) = (storLTy kind).Value
+            (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
+        LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, lowUntag (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
+    | EIndexSet (ek, arr, i, v) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
+        let vr = freshTmp ctx
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
+        let copies = order |> List.map (fun fn ->
+            let (off, kind) = (dictTryFind layout fn).Value
+            let (sty, _) = (storLTy kind).Value
+            LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
+        LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, lowUntag (coreToLowE ctx i)) ] @ copies, lowInt 0)
+    | EArrayCreate (ek, n, init) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
+        let cnt = freshTmp ctx
+        let vr = freshTmp ctx
+        let bs = freshTmp ctx
+        let it = freshTmp ctx
+        let elemBase = LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW stride ]) ])
+        let copies = order |> List.map (fun fn ->
+            let (off, kind) = (dictTryFind layout fn).Value
+            let (sty, _) = (storLTy kind).Value
+            LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
+        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY 0); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
+        let stmts =
+            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n)); LSet (wReg vr, coreToLowE ctx init) ]
+            @ (if gc then [ LCallVoidS ("$spush", [ LGet (wReg vr) ]) ] else [])
+            @ [ LSet (wReg bs, alloc) ]
+            @ (if gc then [ LSet (wReg vr, LCall ("$spop", [])) ] else [])
+            @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
+            @ [ LSet (wReg it, LConstW 0)
+                LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]), copies @ [ LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
+        LDo (stmts, LGet (wReg bs))
+    | EArray (ek, xs) when (podArrOf st ek).IsSome ->
+        let (layout, stride) = (podArrOf st ek).Value
+        let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
+        let n = List.length xs
+        let bs = freshTmp ctx
+        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY 0); LConstW n ]) else LAlloc (LConstW (ARRHDR + n * stride))
+        let copyFields eb vr = order |> List.map (fun fn ->
+            let (off, kind) = (dictTryFind layout fn).Value
+            let (sty, _) = (storLTy kind).Value
+            LStore (sty, eb, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
+        if gc then
+            // materialise + PUSH every element record BEFORE the array alloc (each
+            // build may collect); alloc last, then pop each (LIFO) and copy its
+            // fields into its slot — no allocation during the copies, so the array
+            // base is stable and every element pointer was rooted across the alloc.
+            let pushes = xs |> List.collect (fun x -> gcPushStmts (coreToLowE ctx x))
+            let popCopy idx =
+                let tr = freshTmp ctx
+                let eb = LPrim (AddW, [ LGet (wReg bs); LConstW (idx * stride) ])
+                LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
+                :: LSet (wReg tr, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0))
+                :: copyFields eb tr
+            let popCopies = [ n - 1 .. -1 .. 0 ] |> List.collect popCopy
+            LDo (pushes @ [ LSet (wReg bs, alloc) ] @ popCopies, LGet (wReg bs))
+        else
+            let copyElem idx x =
+                let vr = freshTmp ctx
+                LSet (wReg vr, coreToLowE ctx x) :: copyFields (LPrim (AddW, [ LGet (wReg bs); LConstW (idx * stride) ])) vr
+            LDo ([ LSet (wReg bs, alloc); LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LConstW n) ] @ (xs |> List.mapi copyElem |> List.concat), LGet (wReg bs))
     // packed scalar arrays: `float[]`/`int64[]`/`float32[]`/`int16[]`/`byte[]`…
     // are scalar arrays [tag][len][elem x len] with elements inline at HDR+4,
     // stride = the element byte width — no per-element box, GC-invisible. The
