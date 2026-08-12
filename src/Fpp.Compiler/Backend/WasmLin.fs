@@ -70,6 +70,12 @@ type private St =
       /// stubbing its callers — enough for the compiler to RUN the pipeline
       /// (readTextRaw null → None; a real host env is the self-host follow-up).
       Externs : Dict<string, bool>
+      /// arities `(1 + argc)` used by interface dispatches (`EIfaceCall`). Each
+      /// needs its `$lfn<n>` call_indirect type declared — and a dispatch can
+      /// need an arity NO top-level function has (a 0-arg member like `Current`
+      /// gives arity 1), so these are collected separately from `Funcs` or the
+      /// type is missing and `callIndirect` emits a negative type index.
+      IfaceArities : Dict<int, bool>
       /// interned string literals -> their constant address
       Consts : Dict<string, int>
       mutable ConstNext : int
@@ -359,6 +365,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_cmp" "$lt_ii2i"
     declFn m "$cmpv" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
+    declFn m "$lappend" "$lt_ii2i"
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -615,6 +622,36 @@ let private emitStrCat (m : Mod) : unit =
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$bl"; endB f; endB f
     lg f "$p"
+    endFn f
+
+// $lappend(a, b): rebuild list a's spine onto b (`a @ b`). Recursive like the GC
+// backend's $append; a tagged/linear cons is [cid-or-tid][head][tail] and nil is
+// 0. GC mode roots the head across the recursive call and the head+result across
+// the allocation (both are safepoints); standalone bump-allocs and writes the cid.
+let private emitLappend (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$h" "i32"; local f "$rec" "i32"; local f "$cell" "i32"
+    localsDone f
+    // nil ++ b = b
+    lg f "$a"; ins f "i32.eqz"; ifE f; lg f "$b"; ins f "return"; endB f
+    // head, then recurse on the tail; the recursion allocates, so root the head
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$h"
+    if gc then (lg f "$h"; callf f "$spush")
+    lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+    lg f "$b"
+    callf f "$lappend"; ls f "$rec"
+    if gc then (callf f "$spop"; ls f "$h")
+    // cons the head onto the result: allocate a cell, rooting head+result across it
+    if gc then
+        lg f "$h"; callf f "$spush"; lg f "$rec"; callf f "$spush"
+        ic f gcListTid; callf f "$fpalloc"; ls f "$cell"
+        callf f "$spop"; ls f "$rec"; callf f "$spop"; ls f "$h"
+    else
+        ic f (HDR + 8); callf f "$lalloc"; ls f "$cell"
+        lg f "$cell"; ic f CID_LIST; mem f "i32.store"
+    lg f "$cell"; ic f HDR; ins f "i32.add"; lg f "$h"; mem f "i32.store"
+    lg f "$cell"; ic f (HDR + 4); ins f "i32.add"; lg f "$rec"; mem f "i32.store"
+    lg f "$cell"
     endFn f
 
 // $prints(s): UTF-16 -> UTF-8 into PRINTBUF, then fd_write(1). Handles the
@@ -1445,7 +1482,9 @@ let rec private discover (st : St) (e : Expr) : unit =
     | EFieldSet (r, _, _, x) -> discover st r; discover st x
     | ERecord (_, fs) -> for _, x in fs do discover st x
     | ERecordExt (_, b, fs) -> discover st b; for _, x in fs do discover st x
-    | EIfaceCall (_, _, r, xs) -> discover st r; for x in xs do discover st x
+    | EIfaceCall (_, _, r, xs) ->
+        dictSet st.IfaceArities (1 + List.length xs) true
+        discover st r; for x in xs do discover st x
     | EMatch (s, cs) | ETry (s, cs) ->
         discover st s
         for _, guard, body2 in cs do
@@ -1660,7 +1699,11 @@ let private intArithOp (b : string) : LOp =
     | "^^^" -> XorW
     | "<<<" -> ShlW
     | ">>>" -> ShrSW
-    | _ -> RemSW   // %
+    | "%" -> RemSW
+    | other ->
+        (if not (isNull (System.Environment.GetEnvironmentVariable "FPP_OPDUMP")) then
+             eprintfn "INTARITHOP-DEFAULT %s" other)
+        RemSW
 
 let private intCmpOp (b : string) : LOp =
     match b with
@@ -1943,6 +1986,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         lowTag (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
+    // list append: `a @ b` rebuilds a's spine onto b. Without this it fell to the
+    // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
+    // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
+    // reached nil (0). Mirrors the GC backend's `$append`.
+    | EPrim ("@", [ a; b ]) -> LCall ("$lappend", [ coreToLowE ctx a; coreToLowE ctx b ])
     // |n| on a tagged int, branchless: (n ^ (n>>31)) - (n>>31)
     | EPrim ("abs", [ a ]) ->
         let t = freshTmp ctx
@@ -2244,6 +2292,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                LStore (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     | EArray (_, xs) -> lowObj ctx CID_ARRAY 0 (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
+    // `s.[i]` on a STRING: its element type comes through as a symbolic `#id`
+    // (not "char"), so storLTy misses it and the general ref-array path below
+    // would read a 4-byte WORD (two units) as a pointer — garbage char codes,
+    // which broke every charAt and the whole lexer. A string's UTF-16 units sit
+    // at HDR+4 with stride 2; read one, zero-extended (load16_u), and tag it.
+    | EIndex (_, arr, i) when shapeOfExpr arr = ShStr ->
+        let ir = freshTmp ctx
+        LDo ([ LSet (wReg ir, lowUntag (coreToLowE ctx i)) ],
+             lowTag (LLoad (I16, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 2 ]) ]), HDR + 4)))
     | EIndex (_, arr, i) ->
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LLoad (W, addr, HDR)
@@ -3278,7 +3335,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
-          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew (); Externs = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
@@ -3485,6 +3542,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DLet (_, v, _, ELam (_, body)) when (dictTryFind st.Funcs (key v)).IsSome -> discover st body
         | DLet (_, _, _, e) -> discover st e
         | _ -> ()
+    // interface dispatches (found during discover) call a `$lfn<n>` type at
+    // arity `1 + argc`; declare any not already covered by a top-level function
+    // arity, else `callIndirect` names a type that does not exist (a 0-arg
+    // member like an enumerator's `Current` needs `$lfn1` even when nothing else
+    // in the program is a 1-arg function).
+    for a, _ in dictPairs st.IfaceArities do
+        if not (List.contains a arities) then
+            tyFunc m ("$lfn" + string a) (List.replicate a "i32") [ "i32" ]
     for name, _, _, _ in vecToList st.Lams do
         declFn m name "$lclo"
         tblIdx m name |> ignore
@@ -3534,7 +3599,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m
+    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

@@ -453,3 +453,42 @@ vtable methods share one table index space that survives the merge with no
 split. Alternatives: post-merge table unification, or a wasm-merge flag. Needs
 full re-gating (lowir + fixpoint self + 698 units) since it changes the emitted
 table/elem layout.
+
+### WasmLin self-host — the parser now builds correct trees (4 more real bugs fixed)
+
+Ran the REAL self-host (bootstrap-substituted via Workspace, fpprt-merged, no
+default-prelude contamination) — the parser drivers surfaced and I fixed four
+genuine WasmLin bugs. Each verified against the wasm-GC oracle; all gates green
+(698 units, byte-exact `fixpoint self` = 2614339 bytes, lowir gates).
+
+1. **Undeclared `$lfn<n>` for interface dispatch** — `EIfaceCall` lowers to
+   `call_indirect $lfn(1+argc)`, but the type was declared only for arities of
+   existing top-level functions. A 0-arg member (an enumerator's `Current` →
+   `$lfn1`) with no arity-1 function → `tyIdx` returns -1 → `emitU32: negative`
+   crash. Fix: collect `EIfaceCall` arities in `discover` (`St.IfaceArities`) and
+   declare their types too.
+2. **`@` (list append) mislowered to `rem`** — WasmLin had no `EPrim("@")` case,
+   so it fell to `intArithOp`'s `%` default: `a @ b` compiled as `a rem b` on two
+   list POINTERS, trapping (divide-by-zero) at the first nil (0). Fix: a linear
+   `$lappend` helper (recursive spine rebuild, GC-rooted) + the lowering case.
+   (`intArithOp`'s silent `_ -> RemSW` default now warns under `FPP_OPDUMP` —
+   that's how `@` was caught.)
+3. **`s.[i]` on a string read GARBAGE** — the element type comes through as a
+   symbolic `#id` (not "char"), so `storLTy` missed it and the general ref-array
+   path read a 4-byte WORD (two UTF-16 units) as a pointer. Every `charAt` was
+   wrong, so the whole lexer mis-tokenised (`'let x'` as one ident, no trivia).
+   Fix: a string-shape `EIndex` case reading one 16-bit unit (`load16_u`) at
+   HDR+4+i*2 and tagging it. THIS was the big one — with it the self-host parser
+   builds the byte-identical parse tree: diagnostics 0, tokens 128, lets 4,
+   types 2, cases 3, and the exact same node fingerprint as the oracle.
+
+REMAINING blocker (documented, not yet fixed): **seq-based interface dispatch**.
+`String.concat`/`Seq.*` take `seq<_>`; a list passed in is upcast and iterated
+via the IEnumerable vtable. The list/enumerator's impl isn't in the WasmLin
+vtable (`vtRows` only takes top-level-function impls from `classDecls`; the seq
+enumerators are object-expression CLOSURES), so `for x in (list :> seq)` traps
+(`indirect call type mismatch`). `Green.toText` (used by the roundtrip check)
+hits it via `String.concat`. Fix direction: WasmLin interface dispatch must
+support closure/object-expression impls (receiver = the captured env), i.e.
+put object-expression members in the vtable and call them as closures. This is
+the last piece before the parser round-trips and the frontier self-hosts.
