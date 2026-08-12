@@ -77,6 +77,13 @@ type private St =
       mutable Captures : Dict<string, int>
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
+      /// inline value-type layout (repr step 1): an ALL-SCALAR record/struct
+      /// stores its fields RAW inline (`[header][f64 x][f64 y]…`) — no per-field
+      /// box, GC-invisible (FK_STRUCT, nrefs=0). Maps the record name -> (field
+      /// name -> (byte offset, element-kind string)) and the total object size.
+      /// Mixed records (some ref fields) stay word-slot until the refoffs map is
+      /// wired. A one-field record still collapses (newtype) before this.
+      RecPod : Dict<string, Dict<string, int * string> * int>
       /// repr(T) single-field collapse: a record with EXACTLY one field, never
       /// mutated (no EFieldSet), travels AS that field — no heap object. Maps the
       /// record name -> its sole field name. This is the general "any one-field
@@ -1923,6 +1930,34 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         (match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = f then Some e2 else None) with
          | Some e2 -> coreToLowE ctx e2
          | None -> coreToLowE ctx baseE)
+    // inline value type: an all-scalar record stores its fields raw inline. Each
+    // raw field value rides a typed local before the allocation (GC-invisible),
+    // so no shadow rooting; a field read boxes (cancelled by unbox in arithmetic).
+    | ERecord (name, fields) when (dictTryFind st.RecPod name).IsSome ->
+        let (layout, _) = (dictTryFind st.RecPod name).Value
+        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
+        let raws =
+            order |> List.map (fun fn ->
+                let (off, kind) = (dictTryFind layout fn).Value
+                let (sty, _) = (storLTy kind).Value
+                let raw =
+                    match fields |> List.tryPick (fun (f, e) -> if f = fn then Some e else None) with
+                    | Some e -> storUnbox kind (coreToLowE ctx e)
+                    | None -> (match storValTy sty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+                (off, sty, storValTy sty, raw))
+        lowPodBuild ctx name raws
+    | ERecordExt (name, baseE, updates) when (dictTryFind st.RecPod name).IsSome ->
+        let (layout, _) = (dictTryFind st.RecPod name).Value
+        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
+        let bl = freshTmp ctx
+        let flds = order |> List.map (fun fn -> let (off, kind) = (dictTryFind layout fn).Value in let (sty, _) = (storLTy kind).Value in (fn, off, sty, storValTy sty, kind))
+        let fregs = flds |> List.map (fun (_, _, _, vty, _) -> freshTmpT ctx vty)
+        // read EVERY base field into a scalar local first (base is touched only
+        // here, before any update value can allocate and move it), then override
+        let readBase = List.map2 (fun fr (_, off, sty, vty, _) -> LSet ({ Id = fr; RTy = vty }, LLoad (sty, LGet (wReg bl), off))) fregs flds
+        let overrides = List.map2 (fun fr (fn, _, _, vty, kind) -> match updates |> List.tryPick (fun (f, e) -> if f = fn then Some e else None) with Some e -> [ LSet ({ Id = fr; RTy = vty }, storUnbox kind (coreToLowE ctx e)) ] | None -> []) fregs flds |> List.concat
+        let raws = List.map2 (fun fr (_, off, sty, vty, _) -> (off, sty, vty, LGet { Id = fr; RTy = vty })) fregs flds
+        LDo (LSet (wReg bl, coreToLowE ctx baseE) :: readBase @ overrides, lowPodBuild ctx name raws)
     | ERecord (name, fields) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
         lowObj ctx (cidRec st name) 0 (order |> List.map (fun fnm ->
@@ -1942,6 +1977,23 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         lowObj ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args)
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
+    | EField (r, fname, owner) when (dictTryFind st.RecPod owner).IsSome ->
+        let (layout, _) = (dictTryFind st.RecPod owner).Value
+        let (off, kind) = (dictTryFind layout fname).Value
+        let (sty, _) = (storLTy kind).Value
+        let vty = storValTy sty
+        let fv = freshTmpT ctx vty
+        LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
+    | EFieldSet (r, fname, owner, v) when (dictTryFind st.RecPod owner).IsSome ->
+        let (layout, _) = (dictTryFind st.RecPod owner).Value
+        let (off, kind) = (dictTryFind layout fname).Value
+        let (sty, _) = (storLTy kind).Value
+        let vty = storValTy sty
+        let fv = freshTmpT ctx vty
+        let rr = freshTmp ctx
+        LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox kind (coreToLowE ctx v))
+               LSet (wReg rr, coreToLowE ctx r)
+               LStore (sty, LGet (wReg rr), off, LGet { Id = fv; RTy = vty }) ], lowInt 0)
     | EField (r, fname, owner) ->
         let idx =
             match dictTryFind st.RecFields owner with
@@ -2333,6 +2385,21 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
             LStore (W, LGet (wReg b), 0, LConstW cid)
             :: (slots |> List.mapi (fun i v -> LStore (W, LGet (wReg b), HDR + 4 * i, v)))
         LDo (LSet (wReg b, LAlloc (LConstW (HDR + 4 * n))) :: stores, LGet (wReg b))
+
+// build an inline value-type record: raws is (byte offset, store type, value
+// type, RAW value expr) per field. Every raw value is evaluated into a typed
+// f64/i64/word local BEFORE the allocation — scalars the GC never scans — then
+// stored inline, so the object needs no shadow-stack rooting during its build.
+and private lowPodBuild (ctx : LowCtx) (name : string) (raws : (int * LTy * LTy * LExpr) list) : LExpr =
+    let cid = cidRec ctx.LSt name
+    let (_, size) = (dictTryFind ctx.LSt.RecPod name).Value
+    let vregs = raws |> List.map (fun (_, _, vty, _) -> freshTmpT ctx vty)
+    let bs = freshTmp ctx
+    let evals = List.map2 (fun vr (_, _, vty, ve) -> LSet ({ Id = vr; RTy = vty }, ve)) vregs raws
+    let alloc = if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt ("pod:" + string cid) size FK_STRUCT 0) ]) else LAlloc (LConstW size)
+    let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
+    let stores = List.map2 (fun vr (off, sty, vty, _) -> LStore (sty, LGet (wReg bs), off, LGet { Id = vr; RTy = vty })) vregs raws
+    LDo (evals @ [ LSet (wReg bs, alloc) ] @ hdr @ stores, LGet (wReg bs))
 
 and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
@@ -2998,7 +3065,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); RecPod = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
@@ -3033,6 +3100,21 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
             dictSet st.Collapse (fst kv) f
         | _ -> ()
+    // inline value-type layout: a record with >=2 fields, ALL scalar, that is
+    // not a class stores its fields raw inline (GC-invisible, no per-field box).
+    // Field offsets pack sequentially from HDR by each field's storage width.
+    for d in decls0 do
+        match d with
+        | DRecord (n, _, fs, _) when List.length fs >= 2
+                                     && (dictTryFind classNames n).IsNone
+                                     && List.forall (fun (_, ty) -> (storLTy ty).IsSome) fs ->
+            let m = dictNew<string, int * string> ()
+            let mutable off = HDR
+            for (fn, ty) in fs do
+                dictSet m fn (off, ty)
+                off <- off + snd (storLTy ty).Value
+            dictSet st.RecPod n (m, off)
+        | _ -> ()
     let nCid = nextCid
     // GC: eagerly intern the fpprt type-id for every type-testable shape and
     // record its tid<->cid pair. Uses the SAME shape key as allocation, so the
@@ -3043,8 +3125,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             | DRecord (n, _, fs, _) ->
                 match dictTryFind st.ClassId n with
                 | Some cid ->
-                    let nf = List.length fs
-                    vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string nf + ":0") (HDR + 4 * nf) FK_TAGGED 1, cid)
+                    match dictTryFind st.RecPod n with
+                    // POD: all-scalar fields inline, no refs to scan (FK_STRUCT)
+                    | Some (_, size) -> vecAdd st.TidCid (gcTid st ("pod:" + string cid) size FK_STRUCT 0, cid)
+                    | None ->
+                        let nf = List.length fs
+                        vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string nf + ":0") (HDR + 4 * nf) FK_TAGGED 1, cid)
                 | None -> ()
             | DUnion (_, _, cs) ->
                 for cn, ar in cs do
