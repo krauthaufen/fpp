@@ -2138,7 +2138,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
                 :: LSet (wReg tr, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0))
                 :: copyFields eb tr
-            let popCopies = [ n - 1 .. -1 .. 0 ] |> List.collect popCopy
+            let popCopies = List.init n (fun j -> n - 1 - j) |> List.collect popCopy
             LDo (pushes @ [ LSet (wReg bs, alloc) ] @ popCopies, LGet (wReg bs))
         else
             let copyElem idx x =
