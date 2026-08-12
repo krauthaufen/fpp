@@ -22,10 +22,13 @@ let classify (stampScalars : bool) (isStructName : string -> bool) (inst : strin
     // inside a stamped clone these have already been substituted away.
     // A struct instantiation always stamps a specialised clone. With
     // `stampScalars` (the wasm-linear target, whose backend unboxes concrete
-    // scalars) a boxed 64-bit scalar (float/double don't fit a tagged word)
-    // ALSO stamps, so a generic carries it unboxed instead of via a heap box.
-    // int-shaped scalars already ride an unboxed tagged word, so they stay Canon.
-    let boxedScalar (t : string) = stampScalars && (t = "float" || t = "double")
+    // scalars) a boxed scalar ALSO stamps, so a generic carries it unboxed
+    // instead of via a heap box: float/double/int64/uint64 don't fit a tagged
+    // word, and float32/single ride an f64 box. int/char/bool and the narrow
+    // ints already ride an unboxed tagged word, so they stay Canon.
+    let boxedScalar (t : string) =
+        stampScalars
+        && (t = "float" || t = "double" || t = "int64" || t = "uint64" || t = "float32" || t = "single")
     if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then Canon
     elif inst |> List.exists (fun t -> isStructName t || boxedScalar t) then Stamp inst
     else Canon
