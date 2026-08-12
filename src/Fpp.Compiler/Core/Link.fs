@@ -16,12 +16,18 @@ type Classification =
     | Unclassifiable of string  // compile error
 
 /// `isStructName` decides which type names are value types needing layout.
-let classify (isStructName : string -> bool) (inst : string list) : Classification =
+let classify (stampScalars : bool) (isStructName : string -> bool) (inst : string list) : Classification =
     // "#id" = instantiated at the enclosing binding's type variable. In the
     // UNSTAMPED generic body that is exactly the canonical (uniform) case;
     // inside a stamped clone these have already been substituted away.
+    // A struct instantiation always stamps a specialised clone. With
+    // `stampScalars` (the wasm-linear target, whose backend unboxes concrete
+    // scalars) a boxed 64-bit scalar (float/double don't fit a tagged word)
+    // ALSO stamps, so a generic carries it unboxed instead of via a heap box.
+    // int-shaped scalars already ride an unboxed tagged word, so they stay Canon.
+    let boxedScalar (t : string) = stampScalars && (t = "float" || t = "double")
     if inst |> List.exists (fun t -> t = "" || t.StartsWith "#") then Canon
-    elif inst |> List.exists isStructName then Stamp inst
+    elif inst |> List.exists (fun t -> isStructName t || boxedScalar t) then Stamp inst
     else Canon
 
 /// substitute a symbolic element/type name ("#id") with the concrete one
@@ -277,7 +283,7 @@ let stampRecords (decls : Decl list) : Decl list =
 /// and report anything that cannot be classified.
 /// `instanceFns` maps "Class@T1@T2" to the function an instance supplies,
 /// so an operator inside a body stamped at a user type becomes a call to it.
-let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool>)
+let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool>)
                      (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
     let bodies = dictNew<string * int, bool * VarId * Scheme * Expr> ()
@@ -610,7 +616,7 @@ let monomorphizeWith (isStructName : string -> bool) (instanceFns : Dict<string,
                             Unclassifiable "element layout is not statically known here"
                         else Stamp inst
                     else
-                        match classify isStructName inst with
+                        match classify stampScalars isStructName inst with
                         | Canon when
                               (dictTryFind classMemberDef (v.Path, v.Offset)).IsSome
                               && inst |> List.forall (fun t -> t <> "" && not (t.Contains "#"))
@@ -1617,4 +1623,4 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
 
 /// Monomorphize with no user instances in play.
 let monomorphize (isStructName : string -> bool) (decls : Decl list) : Decl list * string list =
-    monomorphizeWith isStructName (dictNew ()) decls
+    monomorphizeWith false isStructName (dictNew ()) decls

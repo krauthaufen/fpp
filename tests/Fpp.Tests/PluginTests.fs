@@ -943,9 +943,13 @@ let monoTests =
         }
         test "classifier: struct -> stamp, reference -> canon" {
             let isStruct (n : string) = n = "V2d"
-            Expect.equal (Fpp.Core.Link.classify isStruct [ "V2d" ]) (Fpp.Core.Link.Stamp [ "V2d" ]) "struct stamps"
-            Expect.equal (Fpp.Core.Link.classify isStruct [ "string" ]) Fpp.Core.Link.Canon "ref shares"
-            Expect.equal (Fpp.Core.Link.classify isStruct [ "int" ]) Fpp.Core.Link.Canon "int shares (i31)"
+            Expect.equal (Fpp.Core.Link.classify false isStruct [ "V2d" ]) (Fpp.Core.Link.Stamp [ "V2d" ]) "struct stamps"
+            Expect.equal (Fpp.Core.Link.classify false isStruct [ "string" ]) Fpp.Core.Link.Canon "ref shares"
+            Expect.equal (Fpp.Core.Link.classify false isStruct [ "int" ]) Fpp.Core.Link.Canon "int shares (i31)"
+            // scalar-stamping (wasm-linear target): a boxed scalar stamps too
+            Expect.equal (Fpp.Core.Link.classify true isStruct [ "float" ]) (Fpp.Core.Link.Stamp [ "float" ]) "float stamps under scalar-stamping"
+            Expect.equal (Fpp.Core.Link.classify false isStruct [ "float" ]) Fpp.Core.Link.Canon "float shares without scalar-stamping"
+            Expect.equal (Fpp.Core.Link.classify true isStruct [ "int" ]) Fpp.Core.Link.Canon "int stays i31 even under scalar-stamping"
         }
     ]
 

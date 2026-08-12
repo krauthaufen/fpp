@@ -820,6 +820,12 @@ type Workspace() =
     /// monomorphize, optimize, DCE. Returns the linked program and any
     /// errors; an erroring program returns an empty decl list.
     member private this.LinkedCore (optimize : bool) : Fpp.Core.Ir.Decl list * string list =
+        this.LinkedCoreFor optimize false
+    // `forLinear` = the wasm-linear/LowIR target, whose backend unboxes concrete
+    // scalars — so monomorphization stamps a specialised clone per boxed-scalar
+    // instantiation there, keeping value types out of a box in generics. The
+    // wasm-GC and C paths keep the shared body (false).
+    member private this.LinkedCoreFor (optimize : bool) (forLinear : bool) : Fpp.Core.Ir.Decl list * string list =
         this.RunGenerators ()
         let r = this.ProjectCheck ()
         let errs = vecNew<string> ()
@@ -950,7 +956,7 @@ type Workspace() =
             // an instance member is the operator's implementation once
             // stamping has made the operand type concrete
             let instanceFns = Fpp.Core.Link.instanceFunctions r.Classes
-            let mono0, monoErrs = Fpp.Core.Link.monomorphizeWith isStruct instanceFns program
+            let mono0, monoErrs = Fpp.Core.Link.monomorphizeWith forLinear isStruct instanceFns program
             // stamped clones have concrete instantiations, so record layouts
             // can only be settled once monomorphization has run
             let mono = Fpp.Core.Link.stampRecords mono0
@@ -987,7 +993,7 @@ type Workspace() =
         // the linear backend lowers UNOPTIMIZED core: the wasm-GC optimizer's
         // inlining shares and beta-reduces lambda nodes, which the reference-
         // keyed lambda lift is not built for. Slice work first, speed later.
-        let linked, errs = this.LinkedCore false
+        let linked, errs = this.LinkedCoreFor false true
         if not (List.isEmpty errs) then [||], errs
         elif low then Fpp.Backend.WasmLin.emitLinearLow linked
         else Fpp.Backend.WasmLin.emitLinear linked
