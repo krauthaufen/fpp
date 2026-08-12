@@ -1357,10 +1357,12 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
         | EVar (v, _) | EVarI (v, _, _) ->
             let k = key v
             dictSet nameOf k v.Name
-            // a `(builtin)` var (e.g. `compare`) is an INTRINSIC resolved by a
-            // coreToLowE handler, not a real value — it must never be captured
-            // (capturing it reads an unresolved variable, stubbing the closure)
-            if v.Path <> "(builtin)"
+            // bare `compare` is the one `(builtin)` INTRINSIC with no value (a
+            // coreToLowE handler lowers it) — it must never be captured, or the
+            // closure reads an unresolved variable. But OTHER `(builtin)`-path
+            // names are genuine locals (a prelude fold's `acc`, a lambda's `x`):
+            // those MUST be captured, else the lambda that uses them is stubbed.
+            if not (v.Path = "(builtin)" && v.Name.StartsWith "compare")
                && (dictTryFind bnd k).IsNone
                && (dictTryFind st.Globals k).IsNone
                && (dictTryFind st.Funcs k).IsNone
@@ -1630,6 +1632,14 @@ let private parseI64Lit (s : string) : int64 =
         if d < 0 || d > 9 then ok <- false else acc <- acc * 10L + int64 d
         i <- i + 1
     if ok then (if neg then 0L - acc else acc) else 0L
+// float literal -> its double value: drop the F++ width suffix (Double.Parse
+// throws on `5.0f`, unlike the old TryParse), and round a `float32` literal
+// through f32 so it matches the value stored. `parseFloat` (the Double.Parse
+// leaf) is isolated so this caller self-hosts.
+let private parseFloatLit (s : string) : float =
+    let num = s |> String.filter (fun c -> (c >= '0' && c <= '9') || c = '.' || c = '-' || c = '+' || c = 'e' || c = 'E')
+    if s.EndsWith "f" || s.EndsWith "F" then float (float32 (Fpp.Prelude.parseFloat num))
+    else Fpp.Prelude.parseFloat num
 
 let private intArithOp (b : string) : LOp =
     match b with
@@ -1847,7 +1857,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | Some suf -> s.Substring (0, s.Length - suf.Length)
             | None -> s
         lowInt (parseI32Lit digits)
-    | ELit (LFloat s) -> lowBoxF ctx (LConstF (Fpp.Prelude.parseFloat s))
+    | ELit (LFloat s) -> lowBoxF ctx (LConstF (parseFloatLit s))
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
@@ -2687,7 +2697,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
         lowPatTest ctx scrutReg fail (PCons (x, PListLit rest))
     | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
     | PLit LNull -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
-    | PLit (LFloat s) -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF (Fpp.Prelude.parseFloat s) ])) ]
+    | PLit (LFloat s) -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF (parseFloatLit s) ])) ]
     | PLit (LString raw) ->
         // a string pattern is a value compare: $streq returns 1 when equal
         [ LBreakIf (fail, LPrim (EqW, [ LCall ("$streq", [ sc; lowStrConst st raw ]); LConstW 0 ])) ]
@@ -2990,7 +3000,7 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
 // emit one function (or init) through LowIR: allocate a register per param and
 // per let, declare the wasm locals for them, then the body. `finish` stores a
 // global for an init and does nothing for an ordinary function.
-let private emitFuncLow (st : St) (m : Mod) (isInit : bool) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
@@ -3012,7 +3022,7 @@ let private emitFuncLow (st : St) (m : Mod) (isInit : bool) (sig_ : (LTy list * 
         // a gap in this body: emit an unreachable STUB (mirrors the wasm-GC
         // driver's per-function probe). The gap becomes a warning; the function
         // traps if ever reached. Dead prelude/backend members survive DCE.
-        vecAdd st.Warnings ("stubbed (" + vecGet sink 0 + ")")
+        vecAdd st.Warnings ("stubbed " + dbgName + " (" + vecGet sink 0 + ")")
         localsDone f
         // a stubbed INIT (a .NET-only top-level `let`, e.g. an Encoding object)
         // must NOT trap: _start runs every init at startup, so store a harmless
@@ -3030,7 +3040,7 @@ let private emitFuncLow (st : St) (m : Mod) (isInit : bool) (sig_ : (LTy list * 
 // a lifted lambda body: params are (env, arg); captured free variables read
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
-let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit =
+let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
@@ -3040,7 +3050,7 @@ let private emitLambdaLow (st : St) (m : Mod) (pv : VarId) (body : Expr) : unit 
     st.GapSink <- None
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
-        vecAdd st.Warnings ("stubbed lambda (" + vecGet sink 0 + ")")
+        vecAdd st.Warnings ("stubbed lambda " + lamName + " (" + vecGet sink 0 + ")")
         localsDone f
         ins f "unreachable"
     else
@@ -3493,7 +3503,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome -> emitFuncLow st m false (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
+        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome ->
+            if not (isNull (System.Environment.GetEnvironmentVariable "FPP_FUNC_DUMP")) then eprintfn "FUNC %s = %s | %s" (fn v) (key v) v.Name
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -3501,7 +3513,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m true None [] rhs (fun f ->
+            emitFuncLow st m (gl v) true None [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
@@ -3524,7 +3536,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for name, (pv, _), body, caps in vecToList st.Lams do
         st.Captures <- dictNew ()
         caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
-        emitLambdaLow st m pv body
+        emitLambdaLow st m name pv body
     // GC: emit $fpreg_all LAST — every shape's tid is known now. Each shape is
     // registered as (tid, size, kind, start, refoffs=0, name=0); `start` is the
     // TAGGED tracer's first-payload word (0 for a no-ref STRUCT box).
@@ -3583,6 +3595,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if not gc then activeData m CONST_BASE (bytesToArray st.ConstData)
     let pages = (st.ConstNext / 65536) + 64
     let bytes = assembleWith m pages st.UsesExn ""
+    if not (isNull (System.Environment.GetEnvironmentVariable "FPP_LINWARN")) then
+        for w in vecToList st.Warnings do eprintfn "LINWARN %s" w
     bytes, vecToList st.Errors
 
 // the wasm-linear backend: Core straight to a linear-memory module through the
