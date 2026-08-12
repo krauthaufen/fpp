@@ -222,14 +222,27 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
   into the string field), and a 200k-record GC-stress run where a kept record's
   string field survived relocation.
 
+* **Flat array-of-struct** (`c6521ab`, Phase 2): a `Vec3[]` (all-scalar element)
+  stores its elements CONTIGUOUS and HEADERLESS (`[tag][len][fields][fields]…`,
+  stride = the record's field bytes), GC-invisible (FK_SCALAR_ARRAY). A field
+  access `arr.[i].f` fuses straight to the slot (`ARRHDR + i*stride + off-HDR`);
+  a field WRITE must fuse (matched ahead of the plain POD-field cases, else it
+  would mutate a copy-out throwaway). A whole-element read copies out to a fresh
+  headed record; a whole-element write copies the source's fields into the slot;
+  create/literal fill each slot, rooting the source across the alloc. Verified:
+  fused read/write, whole read/write, literal, and a 1000-element array surviving
+  2000 allocations of GC pressure with exact contents.
+
 ### Next
 
-* **Array-of-struct flat** — a `Vec3[]` as contiguous inline elements (stride =
-  struct size), not an array of pointers; per-element ref-map for ref-holding
-  elements.
-* **Value semantics + `$vsp`** — struct locals on the non-moving value stack,
-  copy-on-pass / sret / byref (steps 3).
+* **Value semantics + `$vsp`** — array elements already copy in/out (value
+  semantics); struct LOCALS are still heap pointers. Put POD struct locals on the
+  non-moving value stack, copy-on-pass / sret / byref (step 3).
 * **Monomorphize generics** (step 4) — the endgame that removes the last uniform
-  slots; build on the existing `EVarI` instantiation + Lower per-type stamping.
+  slots (so `List<Vec3>` holds inline Vec3s); build on the `EVarI` instantiation
+  + Lower per-type stamping.
+* **Mixed-record arrays** — `{x:float; tag:string}[]` needs FK_POD_ARRAY with a
+  per-element refoffs map (stable-memory question again; array-of-struct is
+  all-scalar for now).
 * **Narrow-int packed arrays** (`byte`/`int16`) — share the `$str`-style element
   routing so the kind string agrees between create and access.
