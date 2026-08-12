@@ -1537,12 +1537,11 @@ let private storLTy (k : string) : (LTy * int) option =
     | "float" | "double" -> Some (F64, 8)
     | "int64" | "uint64" -> Some (I64, 8)
     | "float32" | "single" -> Some (W, 4)
-    // byte/sbyte/int16/uint16 also pack (I8/I16) and storBox/storUnbox already
-    // carry their sign handling, but their element-kind string is not the plain
-    // type name at every site (bytes route through the string/$str packed-i8
-    // path in the sibling backend), so a naive match here disagrees between the
-    // create and the access. They stay on the generic slot until that routing
-    // is shared — no regression, just not yet packed.
+    // byte/sbyte/int16/uint16 would pack too (I8/I16, and storBox/storUnbox
+    // already carry the sign handling) — but int16/byte VALUES are not yet
+    // complete in this backend: an `int16` literal (`100s`) lowers to 0, so a
+    // round-trip reads back 0 (the array store/load itself is fine). Packing
+    // them waits on real int16/byte value support, not more array work.
     | _ -> None
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
