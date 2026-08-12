@@ -596,3 +596,23 @@ step to a byte-exact self-host; the compiler pipeline itself now runs clean.
 
 (Known-remaining, not on the module-M path: `%d` on an int64 prints the box
 pointer instead of unboxing; the `System`/`eprintfn`/`Fpp` stubs are .NET-only.)
+
+### WasmLin self-host — the compiler compiles WITH ITS PRELUDE, end to end
+
+Wired the last host-env piece: `preludeSourceRaw` (the extern every module stubs
+to null) now returns the prelude text baked as a string constant — set on the
+Workspace before the linear emit, and emitted ONLY when a program references the
+extern (i.e. a compiler), so ordinary programs pay nothing. Gates green (698
+units, byte-exact `fixpoint self` = 2626673 bytes, lowir).
+
+With the prelude available, the WasmLin-hosted compiler loads all ~1626 prelude
+decls and compiles `module M … fib …` to completion — 0 errors, a valid program
+(184708 bytes) — given a larger wasm stack (`-W max-wasm-stack=256M`; the compile
+recurses deep over the whole prelude, deep-but-finite, not infinite).
+
+So the entire compiler now RUNS under WasmLin end to end WITH its real prelude.
+The output is not yet byte-identical to the .NET oracle's 78056 bytes — a
+remaining size difference (likely DCE reachability / an emit detail under
+WasmLin) is the last gap to a byte-exact self-compile. Everything up to and
+including a clean, complete, prelude-aware compile now works; the byte-exact
+diff is the final chase.

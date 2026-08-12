@@ -178,6 +178,11 @@ let private CLO_KIND = 2
 // wasm-merge pass. Off = the standalone bump-allocator path (no collection).
 // Set by the CLI (`--gc`) before emission.
 let mutable gc = false
+// the user prelude's source text: the compiler reaches it through the
+// `preludeSourceRaw` host extern, which every other module stubs to null. Baking
+// it as a string constant lets a WasmLin-hosted compiler load its prelude (a real
+// end-to-end self-compile) without an external host. Empty for ordinary programs.
+let mutable preludeSrc = ""
 
 // GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
 // raw SCALAR byte buffer, resolved by the driver before the runtime string and
@@ -2579,6 +2584,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
     // stubbing the caller. Args still evaluate for their side effects.
+    // preludeSourceRaw returns the baked prelude text (empty unless a compiler is
+    // being emitted); other host externs still answer null.
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when v.Name = "preludeSourceRaw" && preludeSrc <> "" ->
+        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConst st preludeSrc)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)

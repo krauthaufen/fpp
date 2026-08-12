@@ -993,6 +993,10 @@ type Workspace() =
         // the linear backend lowers UNOPTIMIZED core: the wasm-GC optimizer's
         // inlining shares and beta-reduces lambda nodes, which the reference-
         // keyed lambda lift is not built for. Slice work first, speed later.
+        // bake the prelude text so a WasmLin-hosted COMPILER (the only thing that
+        // references preludeSourceRaw) can load its own prelude; ordinary programs
+        // never touch it, so the constant is not emitted for them.
+        Fpp.Backend.WasmLin.preludeSrc <- Fpp.Prelude.preludeSource ()
         let linked, errs = this.LinkedCoreFor false true
         if not (List.isEmpty errs) then [||], errs
         elif low then Fpp.Backend.WasmLin.emitLinearLow linked
