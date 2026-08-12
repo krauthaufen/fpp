@@ -1518,15 +1518,26 @@ let private wReg (id : int) : LReg = { Id = id; RTy = W }
 let private fReg (id : int) : LReg = { Id = id; RTy = F64 }
 let private lReg (id : int) : LReg = { Id = id; RTy = I64 }
 
-// element kinds stored inline as a raw scalar (no per-element heap box): the
-// 64-bit boxed scalars. `int`/`bool`/`char` are already unboxed tagged words;
-// float32/16 still ride an f64 box. The tid shape key keeps the two apart.
-let private flatScalarTy (k : string) : LTy option =
+// element kinds stored inline as a raw packed scalar (no per-element heap box),
+// with (storage machine type, byte width). `int`/`int32`/`char`/`bool`/
+// `nativeint` gain nothing — they are already 4-byte tagged words — so they
+// keep the generic slot. float32 stores its 4-byte f32 bits in an i32 slot.
+let private storLTy (k : string) : (LTy * int) option =
     match k with
-    | "float" -> Some F64
-    | "int64" | "uint64" -> Some I64
+    | "float" | "double" -> Some (F64, 8)
+    | "int64" | "uint64" -> Some (I64, 8)
+    | "float32" | "single" -> Some (W, 4)
+    // byte/sbyte/int16/uint16 also pack (I8/I16) and storBox/storUnbox already
+    // carry their sign handling, but their element-kind string is not the plain
+    // type name at every site (bytes route through the string/$str packed-i8
+    // path in the sibling backend), so a naive match here disagrees between the
+    // create and the access. They stay on the generic slot until that routing
+    // is shared — no regression, just not yet packed.
     | _ -> None
-let private flatShape (ty : LTy) : string = match ty with F64 -> "af64" | _ -> "ai64"
+// the machine type a pre-store element value rides in before it hits its slot:
+// f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
+let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | _ -> W
+let private storShape (k : string) : string = "sa:" + k
 let private regNm (r : LReg) : string = "$r" + string r.Id
 // the class-id descriptor for a record type / a union case's union; -1 for an
 // undeclared name (a value no type test looks for)
@@ -1626,7 +1637,8 @@ let rec private shapeOfType (t : Type) : CmpShape =
 // bool/char are already unboxed words; float32/16 still ride an f64 box).
 let private scalarLTy (t : Type) : LTy option =
     match prune t with
-    | TCon (("float" | "double"), _) -> Some F64
+    // float32 rides an f64 box, so an unboxed float32 local/param is just an f64
+    | TCon (("float" | "double" | "float32" | "single"), _) -> Some F64
     | TCon (("int64" | "uint64"), _) -> Some I64
     | _ -> None
 
@@ -1820,17 +1832,20 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
              LGet (wReg r))
     | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
     | EPrim ("+t", [ a; b ]) -> LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
-    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
+    // float AND float32 arithmetic: float32 rides an f64 box in this backend, so
+    // an `s`-suffixed op lowers exactly like its `f` sibling (the f32 rounding
+    // happens only when a value is demoted into a float32 slot).
+    | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
         let fop = match op.Substring (0, op.Length - 1) with | "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
         lowBoxF ctx (LPrim (fop, [ fa; fb ]))
-    | EPrim (op, [ a; b ]) when op.EndsWith "f" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+    | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
         let fop = match op.Substring (0, op.Length - 1) with | "<" -> LtF | ">" -> GtF | "<=" -> LeF | ">=" -> GeF | "=" -> EqF | _ -> NeF
         lowTag (LPrim (fop, [ fa; fb ]))
-    | EPrim ("u-f", [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EPrim (("u-f" | "u-s"), [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
     | EPrim ("u-l", [ a ]) -> lowBoxI ctx (LPrim (SubL, [ LConstL 0L; lowUnboxI (coreToLowE ctx a) ]))
     | EPrim (("u-" | "u-i"), [ a ]) -> lowTag (LPrim (SubW, [ LConstW 0; lowUntag (coreToLowE ctx a) ]))
     | EPrim (("unot" | "not"), [ a ]) -> lowTag (LPrim (EqW, [ lowUntag (coreToLowE ctx a); LConstW 0 ]))
@@ -1939,39 +1954,42 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
             | None -> 0
         LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
-    // flat scalar arrays: a `float[]`/`int64[]` is a scalar array
-    // [tag][len][elem x len] with elements inline at HDR+4, stride 8 — no
-    // per-element box, GC-invisible. The scalar values ride in typed f64/i64
-    // locals across the allocation, so no shadow-stack rooting is needed. Reads
-    // box (cancelled by unbox in arithmetic), writes unbox. `int`/`bool`/`char`
-    // are already unboxed tagged words, so only the 64-bit boxed scalars flatten
-    // here; float32/16 still ride an f64 box (a later inline-4-byte case).
-    | EArray (k, xs) when (flatScalarTy k).IsSome ->
-        let ty = (flatScalarTy k).Value
+    // packed scalar arrays: `float[]`/`int64[]`/`float32[]`/`int16[]`/`byte[]`…
+    // are scalar arrays [tag][len][elem x len] with elements inline at HDR+4,
+    // stride = the element byte width — no per-element box, GC-invisible. The
+    // value rides in a typed f64/i64/word local across the allocation (no
+    // shadow-stack rooting). A read boxes (cancelled by unbox in arithmetic), a
+    // write unboxes; storBox/storUnbox carry the per-kind tag / sign-extend /
+    // f32-reinterpret. `int`/`char`/`bool`/`nativeint` stay generic tagged words.
+    | EArray (k, xs) when (storLTy k).IsSome ->
+        let (sty, w) = (storLTy k).Value
+        let vty = storValTy sty
         let n = List.length xs
-        let vregs = xs |> List.map (fun _ -> freshTmpT ctx ty)
+        let vregs = xs |> List.map (fun _ -> freshTmpT ctx vty)
         let bs = freshTmp ctx
-        let evals = List.map2 (fun vr x -> LSet ({ Id = vr; RTy = ty }, flatUnbox ty (coreToLowE ctx x))) vregs xs
+        let evals = List.map2 (fun vr x -> LSet ({ Id = vr; RTy = vty }, storUnbox k (coreToLowE ctx x))) vregs xs
         let alloc =
-            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (flatShape ty) 8 FK_SCALAR_ARRAY 0); LConstW n ])
-            else LAlloc (LConstW (HDR + 4 + n * 8))
+            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (storShape k) w FK_SCALAR_ARRAY 0); LConstW n ])
+            else LAlloc (LConstW (HDR + 4 + n * w))
         let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LConstW n) ]
-        let stores = vregs |> List.mapi (fun i vr -> LStore (ty, LGet (wReg bs), HDR + 4 + i * 8, LGet { Id = vr; RTy = ty }))
+        let stores = vregs |> List.mapi (fun i vr -> LStore (sty, LGet (wReg bs), HDR + 4 + i * w, LGet { Id = vr; RTy = vty }))
         LDo (evals @ [ LSet (wReg bs, alloc) ] @ hdr @ stores, LGet (wReg bs))
-    | EIndex (k, arr, i) when (flatScalarTy k).IsSome ->
-        let ty = (flatScalarTy k).Value
+    | EIndex (k, arr, i) when (storLTy k).IsSome ->
+        let (sty, w) = (storLTy k).Value
+        let vty = storValTy sty
         let ir = freshTmp ctx
-        let fv = freshTmpT ctx ty
+        let fv = freshTmpT ctx vty
         LDo ([ LSet (wReg ir, lowUntag (coreToLowE ctx i))
-               LSet ({ Id = fv; RTy = ty }, LLoad (ty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 8 ]) ]), HDR + 4)) ],
-             flatBox ctx ty (LGet { Id = fv; RTy = ty }))
-    | EIndexSet (k, arr, i, v) when (flatScalarTy k).IsSome ->
-        let ty = (flatScalarTy k).Value
-        let fv = freshTmpT ctx ty
+               LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4)) ],
+             storBox ctx k (LGet { Id = fv; RTy = vty }))
+    | EIndexSet (k, arr, i, v) when (storLTy k).IsSome ->
+        let (sty, w) = (storLTy k).Value
+        let vty = storValTy sty
+        let fv = freshTmpT ctx vty
         let ir = freshTmp ctx
-        LDo ([ LSet ({ Id = fv; RTy = ty }, flatUnbox ty (coreToLowE ctx v))
+        LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox k (coreToLowE ctx v))
                LSet (wReg ir, lowUntag (coreToLowE ctx i))
-               LStore (ty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 8 ]) ]), HDR + 4, LGet { Id = fv; RTy = ty }) ],
+               LStore (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     | EArray (_, xs) -> lowObj ctx CID_ARRAY 0 (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
     | EIndex (_, arr, i) ->
@@ -1981,23 +1999,29 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, HDR))
-    | EArrayCreate (k, n, init) when (flatScalarTy k).IsSome ->
-        let ty = (flatScalarTy k).Value
+    | EArrayCreate (k, n, init) when (storLTy k).IsSome ->
+        let (sty, w) = (storLTy k).Value
+        let vty = storValTy sty
         let cnt = freshTmp ctx
-        let fv = freshTmpT ctx ty
+        let fv = freshTmpT ctx vty
         let bs = freshTmp ctx
         let it = freshTmp ctx
         let alloc =
-            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (flatShape ty) 8 FK_SCALAR_ARRAY 0); LGet (wReg cnt) ])
-            else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW 8 ]) ]))
+            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (storShape k) w FK_SCALAR_ARRAY 0); LGet (wReg cnt) ])
+            else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW w ]) ]))
+        // `Array.zeroCreate` keeps a `$zero` marker whose zero is per-storage —
+        // fill the raw scalar zero, NOT a mis-unboxed tagged 0 (which would read
+        // a bogus address as if the slot were boxed).
+        let isZero = match init with EUnknown n | EApp (EUnknown n, _) -> n.StartsWith "$zero" | _ -> false
+        let fill = if isZero then (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0) else storUnbox k (coreToLowE ctx init)
         let stmts =
             [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
-              LSet ({ Id = fv; RTy = ty }, flatUnbox ty (coreToLowE ctx init))
+              LSet ({ Id = fv; RTy = vty }, fill)
               LSet (wReg bs, alloc) ]
             @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
             @ [ LSet (wReg it, LConstW 0)
                 LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
-                        [ LStore (ty, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW 8 ]) ]), HDR + 4, LGet { Id = fv; RTy = ty })
+                        [ LStore (sty, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty })
                           LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EArrayCreate (_, n, init) ->
@@ -2352,11 +2376,32 @@ and private lowUnboxI (p : LExpr) : LExpr =
     | LDo (stmts, tail) -> LDo (stmts, lowUnboxI tail)
     | _ -> LLoad (I64, p, HDR)
 
-// box/unbox picked by the flat-scalar element type (F64 vs I64)
+// box/unbox picked by the flat-scalar type (F64 vs I64) — for locals/ABI, where
+// only the 64-bit scalars are unboxed.
 and private flatBox (ctx : LowCtx) (ty : LTy) (v : LExpr) : LExpr =
     match ty with F64 -> lowBoxF ctx v | _ -> lowBoxI ctx v
 and private flatUnbox (ty : LTy) (p : LExpr) : LExpr =
     match ty with F64 -> lowUnboxF p | _ -> lowUnboxI p
+
+// a raw packed slot value -> the uniform tagged word, per element KIND: a wide
+// scalar boxes; a narrow int sign/zero-extends then tags; float32 widens its
+// stored bits to the f64 a float rides in.
+and private storBox (ctx : LowCtx) (k : string) (raw : LExpr) : LExpr =
+    match k with
+    | "float" | "double" -> lowBoxF ctx raw
+    | "int64" | "uint64" -> lowBoxI ctx raw
+    | "float32" | "single" -> lowBoxF ctx (LPrim (PromF, [ LPrim (Bits2F, [ raw ]) ]))
+    | "sbyte" -> lowTag (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 24 ]); LConstW 24 ]))
+    | "int16" -> lowTag (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 16 ]); LConstW 16 ]))
+    | _ -> lowTag raw   // byte / uint16: the unsigned load already zero-extended
+// the uniform tagged word -> the raw packed slot value (store8/store16 truncate,
+// so a narrow int just needs its low bits untagged).
+and private storUnbox (k : string) (word : LExpr) : LExpr =
+    match k with
+    | "float" | "double" -> lowUnboxF word
+    | "int64" | "uint64" -> lowUnboxI word
+    | "float32" | "single" -> LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF word ]) ])
+    | _ -> lowUntag word
 
 // test `pat` against the value in register `scrutReg`; produce statements that
 // LBreak to `fail` on mismatch and bind pattern variables on the matching
@@ -2576,6 +2621,10 @@ let private lowOpIns (op : LOp) : string =
     | FToW -> "i32.trunc_f64_s"
     | LToF -> "f64.convert_i64_s"
     | FToL -> "i64.trunc_f64_s"
+    | PromF -> "f64.promote_f32"
+    | DemF -> "f32.demote_f64"
+    | Bits2F -> "f32.reinterpret_i32"
+    | F2Bits -> "i32.reinterpret_f32"
 
 // the wasm value type a local of this LTy is declared as: I64 is a real i64
 // local, F64 an f64; the packed byte widths live inside i32.

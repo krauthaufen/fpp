@@ -46,6 +46,12 @@ type LOp =
     | EqF  | NeF  | LtF  | GtF   | LeF | GeF
     // conversions between machine types
     | WToL | LToW | WToF | FToW | LToF | FToL
+    // float32 packing: an f32 never lives in a local (no F32 LTy) — it appears
+    // only transiently on the operand stack. PromF widens a loaded f32 to the
+    // f64 a float value rides in; DemF narrows for a 4-byte store. Bits2F/F2Bits
+    // reinterpret an i32 slot as the f32 and back, so `float32` storage is a
+    // plain 4-byte word with no new machine type.
+    | PromF | DemF | Bits2F | F2Bits
 
 type LExpr =
     | LConstW of int
