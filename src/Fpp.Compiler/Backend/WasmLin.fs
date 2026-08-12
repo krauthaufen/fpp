@@ -2032,6 +2032,16 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
              LGet (wReg r))
     | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
     | EPrim ("+t", [ a; b ]) -> LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
+    // `&&`/`||` MUST short-circuit: the right operand can have effects or THROW
+    // (e.g. `n = xs.Length && List.zip xs ys …` — the zip must not run when the
+    // lengths differ). Lowering them to AndW/OrW evaluated both sides and made
+    // the self-hosted emitter zip mismatched lists. `if a then b else false`.
+    | EPrim ("&&", [ a; b ]) ->
+        let r = freshTmp ctx
+        LDo ([ LIf (lowUntag (coreToLowE ctx a), [ LSet (wReg r, coreToLowE ctx b) ], [ LSet (wReg r, lowInt 0) ]) ], LGet (wReg r))
+    | EPrim ("||", [ a; b ]) ->
+        let r = freshTmp ctx
+        LDo ([ LIf (lowUntag (coreToLowE ctx a), [ LSet (wReg r, lowInt 1) ], [ LSet (wReg r, coreToLowE ctx b) ]) ], LGet (wReg r))
     // float AND float32 arithmetic: float32 rides an f64 box in this backend, so
     // an `s`-suffixed op lowers exactly like its `f` sibling (the f32 rounding
     // happens only when a value is demoted into a float32 slot).
@@ -2053,6 +2063,22 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "+" -> AddL | "-" -> SubL | "*" -> MulL | "/" -> DivSL | _ -> RemSL
+        lowBoxI ctx (LPrim (iop, [ ia; ib ]))
+    // int64 BITWISE — both operands are boxed i64. Without this `&&&l`/`|||l`/…
+    // fell to the int32 path (or intArithOp's `%` default -> `i64 >>> n` became
+    // an i32 `rem` and DIVIDED BY ZERO), which trapped the self-hosted emitter's
+    // `emitF64Bits`.
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^" ] ->
+        let ia = lowUnboxI (coreToLowE ctx a)
+        let ib = lowUnboxI (coreToLowE ctx b)
+        let iop = match op.Substring (0, op.Length - 1) with | "&&&" -> AndL | "|||" -> OrL | _ -> XorL
+        lowBoxI ctx (LPrim (iop, [ ia; ib ]))
+    // int64 SHIFT — `int64 <<< int` / `>>>`: the amount is a tagged i32, widened
+    // to i64 for the wasm shift (whose count operand must match the value type).
+    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<<<"; ">>>" ] ->
+        let ia = lowUnboxI (coreToLowE ctx a)
+        let ib = LPrim (WToL, [ lowUntag (coreToLowE ctx b) ])
+        let iop = if op.Substring (0, op.Length - 1) = "<<<" then ShlL else ShrSL
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
@@ -2446,6 +2472,14 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> lowTag (LPrim (AndW, [ lowUntag (coreToLowE ctx a); LConstW 0xFF ]))
     // the raw bits of a double, as int64 — read the boxed payload as i64
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
+    // singleBits: a float32's raw i32 bits. float32 rides an f64 box here, so
+    // re-demote to f32 and reinterpret (mirrors storUnbox for float32).
+    | EApp (EUnknown "singleBits", [ a ]) -> lowTag (LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
+    // `float32 x`/`float16 x` FROM a float: round to f32 precision and keep the
+    // value in its f64 box (demote then promote). Half rides the same box; f32
+    // rounding is the closest we do without a dedicated f16 path.
+    | EApp (EUnknown ("float32#f" | "float16#f" | "single#f"), [ a ]) ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
     // print / printraw: write a string to stdout (print's newline matters only
     // on the compiler's error paths, which the fixpoint success path never hits)
     // `print` writes the string THEN a newline (matching the GC backend's putc
@@ -3043,6 +3077,12 @@ let private lowOpIns (op : LOp) : string =
     | MulL -> "i64.mul"
     | DivSL -> "i64.div_s"
     | RemSL -> "i64.rem_s"
+    | AndL -> "i64.and"
+    | OrL -> "i64.or"
+    | XorL -> "i64.xor"
+    | ShlL -> "i64.shl"
+    | ShrSL -> "i64.shr_s"
+    | ShrUL -> "i64.shr_u"
     | EqL -> "i64.eq"
     | NeL -> "i64.ne"
     | LtSL -> "i64.lt_s"

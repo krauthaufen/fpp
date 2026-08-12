@@ -562,3 +562,37 @@ link+emit pipeline and throws a real wasm exception in `List.map2` (from
 equal lengths, verified), so an upstream list is built with the wrong length
 under WasmLin. THAT is the next bug to trace — the deep emit pipeline running
 under WasmLin for the first time, one clean root-cause fix at a time.
+
+### WasmLin self-host — the compiler compiles a program END TO END
+
+Four more root-cause fixes, and the self-hosted compiler now runs the WHOLE
+pipeline (parse → resolve → infer → lower → link → wasm-GC emit) and produces a
+program with 0 errors — the first end-to-end self-compile under WasmLin.
+
+1. **`&&`/`||` were not short-circuit** — lowered to AndW/OrW, which evaluate
+   BOTH operands. `n = xs.Length && List.zip xs ys …` ran the zip on mismatched
+   lengths and threw. Now `if a then b else false` / `if a then true else b`.
+2. **int64 bitwise/shift unimplemented** — no AndL/OrL/XorL/ShlL/ShrSL LOps, so
+   `&&&l`/`>>>l` fell to the int32 path or intArithOp's `%` default (`i64 >>> n`
+   became an i32 `rem` → DIVIDE BY ZERO in the self-hosted `emitF64Bits`). Added
+   the LOps + i64.and/or/xor/shl/shr_s emission + lowering (shift amount widened
+   i32→i64).
+3. **`singleBits`** (float32 → its i32 bits) was an unported stub — added
+   `F2Bits(DemF(unbox))` (float32 rides an f64 box).
+4. **`float32#f`/`float16#f`** (round a float to f32) were stubs — added
+   `PromF(DemF(unbox))`.
+
+All gated: 698 units, byte-exact `fixpoint self` (2626578 bytes), lowir. Found by
+the full-compiler self-compile harness + stage markers, each isolated to a 3-line
+repro (`0x7f = 0`, non-short-circuit `&&`, `100L` printing a box pointer, int64
+`>>>` dividing by zero).
+
+RESULT: the self-hosted compiler compiles `module M … let d = fib 6 …` to a valid
+program (14651 bytes, 0 errors, deterministic). It differs from the .NET oracle's
+78056 only by the PRELUDE — the self-hosted compiler still has none, because the
+`preludeSourceRaw` host extern is stubbed to null. Wiring a real host env that
+feeds the prelude source (an fpprt string import, or embedding it) is the LAST
+step to a byte-exact self-host; the compiler pipeline itself now runs clean.
+
+(Known-remaining, not on the module-M path: `%d` on an int64 prints the box
+pointer instead of unboxing; the `System`/`eprintfn`/`Fpp` stubs are .NET-only.)

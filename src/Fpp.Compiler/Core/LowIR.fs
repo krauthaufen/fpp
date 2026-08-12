@@ -40,6 +40,7 @@ type LOp =
     | EqW  | NeW  | LtSW | GtSW  | LeSW  | GeSW | LtUW | GeUW
     // 64-bit integer ops
     | AddL | SubL | MulL | DivSL | RemSL
+    | AndL | OrL  | XorL | ShlL  | ShrSL | ShrUL
     | EqL  | NeL  | LtSL | GtSL  | LeSL  | GeSL
     // double ops
     | AddF | SubF | MulF | DivF | NegF
