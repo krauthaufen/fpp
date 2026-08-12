@@ -248,8 +248,16 @@ stack passing — so `int` and every ≤4-byte primitive already never heap-allo
   target (`isStructName`), so structs were already unboxed in generics; this
   closes the boxed-scalar gap for float. Gated: byte-exact self-host, WasmLin
   probe (0 errors compiling the whole compiler WITH stamping), all 698 unit
-  tests, run-gc on a generic fold over floats. NEXT: add `int64`/`uint64`/
-  `float32` to the gated predicate (one line each + a self-host/suite run).
+  tests, run-gc on a generic fold over floats.
+  EXTENDED (`9a8c27f`) to `int64`/`uint64`/`float32`/`single` — every boxed
+  scalar now stamps unboxed through a generic on wasm-linear (self-host byte-
+  exact, probe 0 errors, 698 tests, run-gc on generic twice/pick/fold over
+  int64 and float32). Structs were already stamped for all targets, and flow
+  through generics as a word-pointer with inline fields (verified twice/pick/
+  fold over Vec3). So: NO value type is boxed passing THROUGH a generic on
+  wasm-linear. The one gap left is a generic CONTAINER holding a struct INLINE
+  in its node (`List<Vec3>` cons cells still point at the Vec3) — that needs the
+  container TYPE monomorphized with inline element storage (`Vec3[]` already is).
 
 * **Monomorphize generics** (step 4) — the endgame that removes the last uniform
   slots (so `List<Vec3>` holds inline Vec3s). Now PARTLY LANDED (structs + float
