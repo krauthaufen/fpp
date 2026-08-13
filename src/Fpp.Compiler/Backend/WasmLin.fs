@@ -2950,9 +2950,19 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PLit LUnit -> []
     | PCtor (case, _, subs) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        // a union case is [cid][tag][payload…]; the tag distinguishes cases
+        // a union case is [cid/tid][tag][payload…]. A union's cases do not all
+        // share one class-id: they land in several groups, and the tag is
+        // numbered PER GROUP, so two cases in different groups can carry the
+        // same tag — the `Type` union's `TFun` and `TApp` both come out tag 2
+        // (headers 225 vs 227), and a tag-only test then reads a `TFun` as a
+        // `TApp`. Test the class-id too whenever the case is a real user union.
+        let cid = cidCase st case
+        let cidTest =
+            if cid >= CID_FIRST_USER then
+                [ LBreakIf (fail, LPrim (NeW, [ lowHeaderCid (wReg scrutReg); LConstW cid ])) ]
+            else []
         let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, HDR); LConstW tag ]))
-        tagTest :: List.concat (subs |> List.mapi (fun i sub ->
+        cidTest @ tagTest :: List.concat (subs |> List.mapi (fun i sub ->
             let t = freshTmp ctx
             LSet (wReg t, LLoad (W, sc, HDR + 4 * (i + 1))) :: lowPatTest ctx t fail sub))
     | PTuple subs ->
