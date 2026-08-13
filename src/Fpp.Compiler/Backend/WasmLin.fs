@@ -309,10 +309,37 @@ let private internStrGc (st : St) (s : string) : int =
         dictSet st.Consts s slot
         slot
 
+// intern a RAW string value (already-decoded text, NOT a quoted source literal):
+// each char is one UTF-16 unit verbatim. `unescape` is for LITERALS — it strips
+// surrounding quotes and processes `\` escapes and UTF-8, which mangles the baked
+// PRELUDE source (its own `\n`/`\\` and first/last chars), flattening the parse.
+let private internStrRawGc (st : St) (s : string) : int =
+    let key = "raw:" + s
+    match dictTryFind st.Consts key with
+    | Some slot -> slot
+    | None ->
+        let slot = st.RootNext
+        st.RootNext <- slot + 1
+        let out = vecNew<byte> ()
+        let mutable k = 0
+        while k < strLen s do
+            let u = int (charAt s k)
+            vecAdd out (byte (u % 256))
+            vecAdd out (byte ((u / 256) % 256))
+            k <- k + 1
+        vecAdd st.GcConstData (slot, vecToArray out)
+        dictSet st.Consts key slot
+        slot
+
 // a string constant as a value: standalone bakes it at a fixed address; GC
 // loads its (possibly relocated) pointer from the root table
 let private lowStrConst (st : St) (s : string) : LExpr =
     if gc then LLoad (W, LGetGlobal "$roots", 4 * internStrGc st s)
+    else LConstW (internStr st s)
+
+// a RAW (un-unescaped) string constant — for the baked prelude source text.
+let private lowStrConstRaw (st : St) (s : string) : LExpr =
+    if gc then LLoad (W, LGetGlobal "$roots", 4 * internStrRawGc st s)
     else LConstW (internStr st s)
 
 // ---- tag helpers (operate on the wasm stack) ------------------------------
@@ -1400,18 +1427,29 @@ let private cellScan (decls : Decl list) : Dict<string, bool> =
     let letBound = dictNew<string, bool> ()
     let assigned = dictNew<string, bool> ()
     let inLambda = dictNew<string, bool> ()
+    // A var only needs a cell when it is CAPTURED by a lambda nested inside its
+    // OWN binding scope. `depth` is lambda-nesting from the top; comparing a
+    // use's depth to the binder's catches capture. A GLOBAL depth test was
+    // wrong: a var bound AND used at the same depth inside a nested function
+    // (every `let rec … and` member is one) read as captured, so an ordinary
+    // loop counter became a heap cell and its `<-` never reached the condition.
+    let bindDepth = dictNew<string, int> ()
+    let deeper (v : VarId) (depth : int) : bool =
+        match dictTryFind bindDepth (key v) with Some d -> depth > d | None -> depth > 0
     let rec go (depth : int) (e : Expr) : unit =
         let g = go depth
         match e with
-        | EVar (v, _) | EVarI (v, _, _) -> if depth > 0 then dictSet inLambda (key v) true
-        | ELam (_, b) -> go (depth + 1) b
+        | EVar (v, _) | EVarI (v, _, _) -> if deeper v depth then dictSet inLambda (key v) true
+        | ELam (ps, b) ->
+            for pv, _ in ps do dictSet bindDepth (key pv) (depth + 1)
+            go (depth + 1) b
         | EAssign (v, x) ->
             dictSet assigned (key v) true
-            (if depth > 0 then dictSet inLambda (key v) true)
+            (if deeper v depth then dictSet inLambda (key v) true)
             g x
         | ELet (_, v, _, EApp (EUnknown "$forcecell", [ r ]), b) ->
-            dictSet letBound (key v) true; dictSet assigned (key v) true; dictSet inLambda (key v) true; g r; g b
-        | ELet (_, v, _, r, b) -> dictSet letBound (key v) true; g r; g b
+            dictSet letBound (key v) true; dictSet bindDepth (key v) depth; dictSet assigned (key v) true; dictSet inLambda (key v) true; g r; g b
+        | ELet (_, v, _, r, b) -> dictSet letBound (key v) true; dictSet bindDepth (key v) depth; g r; g b
         | EApp (fn, args) -> g fn; List.iter g args
         | EIf (a, b, c) -> g a; g b; g c
         | EMatch (s, cs) | ETry (s, cs) ->
@@ -2587,7 +2625,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // preludeSourceRaw returns the baked prelude text (empty unless a compiler is
     // being emitted); other host externs still answer null.
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when v.Name = "preludeSourceRaw" && preludeSrc <> "" ->
-        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConst st preludeSrc)
+        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConstRaw st preludeSrc)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
@@ -3848,8 +3886,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // (skipped by the scanner) until filled below
         callf rf "$rootsbase"; gs rf "$roots"
         // register the fixed slots (scratch/globals/constants) AND the shadow
-        // stack that follows; the shadow pointer starts just past the fixed slots
-        ic rf 65536; callf rf "$rootsreg"
+        // stack that follows; the shadow pointer starts just past the fixed slots.
+        // Must equal FPPRT_WASM_NROOTS in fpprt-wasm-shim.c — the shadow stack has
+        // no bounds check, so this range has to cover the deepest recursion the
+        // compiler reaches self-hosting (the full-prelude compile needs >>64K).
+        ic rf 2097152; callf rf "$rootsreg"
         ic rf (st.RootNext * 4); gs rf "$sp"
         // fill the tid->cid table (raw class-ids, fixed static memory)
         callf rf "$t2cbase"; gs rf "$t2c"

@@ -7179,6 +7179,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // a string walks by index under the sentinel, and can never
                 // have been the enumerator protocol
                 | TCon ("string", []) -> Some (off, TCon ("$str", []))
+                // a loop source whose type NEVER resolved (a forward-referenced
+                // rec-group member returns one: the sibling's return type is
+                // still a variable when the `for` is typed, and the app-result
+                // recorder parks that variable as a bogus "#N" array kind). The
+                // value is a cons list at run time, so default to a list walk —
+                // else lowering reads its cons cells as packed array elements.
+                | TVar _ -> Some (off, TCon ("list", [ st.Fresh () ]))
                 | _ -> None)))
         |> List.choose (fun (off, ty) ->
             let nameOf (t : Type) =
