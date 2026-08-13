@@ -616,3 +616,26 @@ remaining size difference (likely DCE reachability / an emit detail under
 WasmLin) is the last gap to a byte-exact self-compile. Everything up to and
 including a clean, complete, prelude-aware compile now works; the byte-exact
 diff is the final chase.
+
+### WasmLin self-host — byte-exact gap localized to Lower/generators
+
+Compared the link-pipeline counts of the WasmLin-hosted compiler vs the .NET
+oracle compiling the SAME `module M` (both with the prelude):
+
+              allDecls  mono0  mono   opt    linked  emitted-bytes
+  oracle       1627     1476   1476   1485   337     78056
+  self-hosted  6119     6119   6119   6119   6116    184708
+
+The baked prelude the self-hosted compiler sees is 256655 chars vs the file's
+256880 (~225 lost, ~0.09% — trivia, not the cause). The parser self-hosts
+byte-exact, so parsing is fine. The divergence is at `allDecls` (BEFORE mono):
+the same ~256 KB prelude lowers to 6119 decls under WasmLin vs 1627 in .NET —
+3.77×. mono/opt/DCE then all run as near-no-ops (6119→6116), so the output
+balloons to 184708 vs 78056.
+
+So the self-hosted compiler RUNS end to end and emits a program, but a Lower /
+whole-program-generator stage produces ~3.77× the decls under WasmLin. THAT is
+the byte-exact blocker: localize which of the 1627 decls balloons and why (a
+per-file/whole-program generator loop, or a Lower path emitting duplicate/extra
+decls under WasmLin). It is a fresh, deep investigation into the compiler's own
+lowering under WasmLin — the last stage, after parse✓/query✓/emit-runs✓.
