@@ -286,6 +286,15 @@ let stampRecords (decls : Decl list) : Decl list =
 /// and report anything that cannot be classified.
 /// `instanceFns` maps "Class@T1@T2" to the function an instance supplies,
 /// so an operator inside a body stamped at a user type becomes a call to it.
+/// side channel (linear backend only): a stamped generic-class member's key ->
+/// its class type params as (class-var-id, concrete-type-name). Filled while
+/// draining the specialization queue from the `enclosingSubst` the stamp
+/// already computes; read by WasmLin to seed a CONSTANT witness per class type
+/// param, so a `'k`-typed compare/hash inside the member routes by refMask
+/// (raw -> direct) instead of $cmpv/$hashv. Additive: the wasm-GC backend
+/// never reads it, so its Core/output is unchanged.
+let stampedClassWits = dictNew<string * int, (int * string) list> ()
+
 let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool>)
                      (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
@@ -977,6 +986,14 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
              // generic through its captures — the enclosing stamp's
              // substitution rides along explicitly
              for k, nm in substOverride do dictSet subst k nm
+             // forward the class-var -> concrete-type map (WasmLin-only): this
+             // stamped member's `'k` is concrete here, keyed by the SAME id the
+             // body's TVar carries, so the backend seeds a constant witness.
+             if not (List.isEmpty substOverride) then
+                 let ws =
+                     substOverride |> List.choose (fun (k, nm) ->
+                         if k.Length > 1 && k.[0] = '#' then Some (int (k.Substring 1), nm) else None)
+                 if not (List.isEmpty ws) then dictSet stampedClassWits (nv.Path, nv.Offset) ws
              // A recursive call carries no instantiation: inside its own
              // body a function is monomorphic, so the self-call is a plain
              // EVar. In a stamped clone it must target the clone, not the
@@ -1023,6 +1040,19 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                               | _ -> None)
                          | _ -> None
                      let memberInst (msch : Scheme) : string list option = memberInstFor cn inst msch
+                     // the class type params this member sees, as (class-var-id,
+                     // concrete-name) — the receiver zip memberInstFor computes
+                     // but discards. Forwarded (WasmLin-only) so the backend can
+                     // seed a constant witness for a `'k` that the member's own
+                     // Quantified does NOT cover; the body/stamping is untouched.
+                     let classMapOf (msch : Scheme) : (int * string) list =
+                         match prune msch.Body with
+                         | TFun (self, _) ->
+                             (match prune self with
+                              | TCon (n, args) when n = cn && args.Length = inst.Length ->
+                                  List.zip args inst |> List.choose (fun (a, t) -> match prune a with TVar v -> Some (v.Id, t) | _ -> None)
+                              | _ -> [])
+                         | _ -> []
                      let stampMember (mv : VarId) : VarId =
                          match dictTryFind bodies (mv.Path, mv.Offset) with
                          | Some (_, _, msch, _) when not (List.isEmpty msch.Quantified) ->
@@ -1033,6 +1063,8 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                   if not (dictTryFind seen mm).IsSome then
                                       dictSet seen mm true
                                       vecAdd queue ((mv.Path, mv.Offset), minst, [])
+                                  let cmap = classMapOf msch
+                                  if not (List.isEmpty cmap) then dictSet stampedClassWits (mv.Path, stampOffsetOf mv.Offset mm) cmap
                                   { Path = mv.Path
                                     Offset = stampOffsetOf mv.Offset mm
                                     Name = mm }

@@ -136,6 +136,11 @@ type private St =
       /// class-id. type name -> class-id, and a union CASE -> its union's id
       ClassId : Dict<string, int>
       CaseClass : Dict<string, int>
+      /// a Canon generic class carries a witness pointer per class type param,
+      /// stored in trailing (non-scanned) instance slots after its fields and
+      /// read back by its methods from `self`. name -> class-param count. A
+      /// stamped subclass is concrete (empty Quantified ctor) and is absent.
+      WitnessedClasses : Dict<string, int>
       /// interface dispatch: "bareIface|method" -> vtable slot; the row width;
       /// the base address of the flat [class-id][slot] vtable in linear memory;
       /// and, for hierarchy type tests, a class/interface name -> the set of
@@ -1833,6 +1838,10 @@ type private LowCtx =
       // hidden witness-pointer param for that type. A generic aggregate reads the
       // element type's witness through here to pick its GC scan map.
       Witness : Dict<int, int>
+      /// while emitting a Canon generic class' constructor: the class-param
+      /// witness var-ids in declared order (= this ctor's witnessVars). The
+      /// class ERecord it builds stores `ctx.Witness[each]` into trailing slots.
+      mutable ClassCtorWits : int list
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -2274,6 +2283,10 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
         let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
         shapeOfType (peel sch.Body (List.length args))
+    // an array length is always `int` — a KNOWN scalar. Without this it is
+    // ShOther, so `count >= arr.Length` mergeShapes to ShOther and routes to
+    // $cmpv on two RAW ints, which the linear backend cannot dereference.
+    | EArrayLen _ -> ShScalar
     | _ -> ShOther
 
 let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
@@ -2632,8 +2645,23 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
                 | Some e2 -> e2
                 | None -> ELit (LInt "0"))
-        lowObjR ctx (cidRec st name) 0 (valExprs |> List.map (coreToLowE ctx))
-            (Some (valExprs |> List.map (refKindOfExprC st))) (genWitsOf ctx 0 valExprs)
+        let baseSlots = valExprs |> List.map (coreToLowE ctx)
+        let baseKinds = valExprs |> List.map (refKindOfExprC st)
+        let baseWits = genWitsOf ctx 0 valExprs
+        match (if gc then dictTryFind st.WitnessedClasses name else None) with
+        | Some k ->
+            // trailing class-param witness pointers, one per class type param:
+            // stored RAW (never scanned — they point into immortal g_witnesses
+            // static data). Slot j forwards this ctor's j-th class-param witness
+            // from its hidden param, so the class' methods can read it off self.
+            let witVal j =
+                match List.tryItem j ctx.ClassCtorWits |> Option.bind (fun wid -> dictTryFind ctx.Witness wid) with
+                | Some r -> LGet (wReg r)
+                | None -> witnessPtrRM st 4 4 1
+            let wits = [ 0 .. k - 1 ] |> List.map witVal
+            lowObjR ctx (cidRec st name) 0 (baseSlots @ wits) (Some (baseKinds @ List.replicate k RKRaw)) baseWits
+        | None ->
+            lowObjR ctx (cidRec st name) 0 baseSlots (Some baseKinds) baseWits
     | ERecordExt (name, baseE, updates) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
         let b = freshTmp ctx
@@ -2926,7 +2954,20 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
-    | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> (LCall ("$hashv", [ coreToLowE ctx a ]))
+    | EApp (EUnknown ("hash" | "$hash"), [ a ]) ->
+        // route by the operand's witness when it is a type parameter: a RAW
+        // element (refMask 0 — int/char/bool) IS its own hash (matches $hashv's
+        // tagged-int path, which returns the untagged value); a ref element
+        // hashes structurally via $hashv. Without a witness, $hashv as before.
+        (match tyVarIdOfExpr a |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
+         | Some w ->
+             let at = freshTmp ctx
+             let t = freshTmp ctx
+             LDo ([ LSet (wReg at, coreToLowE ctx a)
+                    LIf (LPrim (EqW, [ LLoad (W, LGet (wReg w), 8); LConstW 0 ]),
+                         [ LSet (wReg t, LGet (wReg at)) ],
+                         [ LSet (wReg t, LCall ("$hashv", [ LGet (wReg at) ])) ]) ], LGet (wReg t))
+         | None -> LCall ("$hashv", [ coreToLowE ctx a ]))
     // cells: $cellof yields the cell POINTER (its storage, no deref); $cellget
     // reads through it; $cellset writes; $forcecell is a marker
     | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
@@ -3900,14 +3941,38 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); NReg = 0 }
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
     let wnames = witnessVars |> List.map (fun vid -> let r = freshReg ctx ("$w" + string vid) in dictSet ctx.Witness vid r; regNm (wReg r))
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
     let pnames = wnames @ pnames
+    // this ctor's class-param witnesses (for the class ERecord it builds).
+    ctx.ClassCtorWits <- witnessVars
+    // a method of a Canon generic class reads its class-param witnesses off
+    // `self` (ps[0]) at construction-time trailing slots, seeding ctx.Witness so
+    // the same routing (cmpv/hash/generic-cons) that serves function type vars
+    // serves the class' type vars. (int off) is the byte offset of slot j.
+    let selfPreamble =
+        match ps with
+        | self0 :: _ when not (List.isEmpty selfWits) ->
+            let selfReg = ctx.Regs.[key self0]
+            selfWits |> List.map (fun (vid, off) ->
+                let r = freshTmp ctx
+                dictSet ctx.Witness vid r
+                LSet (wReg r, LLoad (W, LGet (wReg selfReg), off)))
+        | _ -> []
+    // a STAMPED generic-class member: its class type param is concrete here, so
+    // seed a CONSTANT static witness for it (the receiver is fully concrete, so
+    // there is no `self` slot to read — the type is known at stamp time). The
+    // residual `'k` op then routes by that refMask instead of $cmpv/$hashv.
+    let constPreamble =
+        constWits |> List.map (fun (vid, witExpr) ->
+            let r = freshTmp ctx
+            dictSet ctx.Witness vid r
+            LSet (wReg r, witExpr))
     // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
     // local (registered in VarScalar so reads re-box, just like a scalar let);
     // a scalar return is unboxed off the body's boxed word before the return.
@@ -3920,7 +3985,9 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
-    let bodyLow0 = coreToLowE ctx body
+    let bodyLow1 = coreToLowE ctx body
+    let preamble = selfPreamble @ constPreamble
+    let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
     let bodyLow = match retTy with W -> bodyLow0 | _ -> flatUnbox retTy bodyLow0
     st.GapSink <- None
     let f = beginFn m pnames
@@ -3947,7 +4014,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
@@ -4162,7 +4229,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
           RecFields = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
-          ClassId = dictNew (); CaseClass = dictNew ()
+          ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
@@ -4481,9 +4548,28 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome ->
+        | DLet (_, v, sch, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome ->
             if not (isNull (System.Environment.GetEnvironmentVariable "FPP_FUNC_DUMP")) then eprintfn "FUNC %s = %s | %s" (fn v) (key v) v.Name
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) (ps |> List.map fst) body (fun _ -> ())
+            // a method of a Canon generic class: (class-var id, self byte-offset)
+            // for each class type param that survives as a TVar in the receiver
+            // type. The witness lives in the instance's trailing slot after its
+            // fields (see the ERecord append above).
+            let selfWits =
+                match (match prune sch.Body with TFun (a, _) -> Some a | _ -> None) with
+                | Some recv ->
+                    (match prune recv with
+                     | TCon (cn, args) when (dictTryFind st.WitnessedClasses cn).IsSome ->
+                         let nf = match dictTryFind st.RecFields cn with Some fs -> List.length fs | None -> 0
+                         args |> List.mapi (fun j a -> match prune a with TVar vv -> Some (vv.Id, HDR + 4 * nf + 4 * j) | _ -> None) |> List.choose id
+                     | _ -> [])
+                | None -> []
+            // a stamped generic-class member: constant witnesses for its class
+            // type params (Link forwards the enclosingSubst it already computes).
+            let constWits =
+                match dictTryFind Fpp.Core.Link.stampedClassWits (v.Path, v.Offset) with
+                | Some pairs -> pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
+                | None -> []
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -4491,7 +4577,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m (gl v) true None [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) true None [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
