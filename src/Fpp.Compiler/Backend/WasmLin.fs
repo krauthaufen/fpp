@@ -1928,6 +1928,23 @@ let rec private recFieldTy (st : St) (owner : string) (fname : string) : string 
     match dictTryFind st.RecFieldTypes owner with
     | Some fs -> (match fs |> List.tryPick (fun (fn, ty) -> if fn = fname then Some ty else None) with Some ty -> Some ty | None -> viaBase ())
     | None -> viaBase ()
+
+// a class' fields in DECLARED order, resolving a stamped subclass through the
+// base it was stamped from — the subclass owns no field names of its own, so
+// its RecFields is empty and a construction that used it would store NO fields,
+// leaving every slot uninitialised (a `'k[]` field then reads a garbage array).
+let rec private recFieldsOf (st : St) (owner : string) : string list =
+    match dictTryFind st.RecFields owner with
+    | Some o when not (List.isEmpty o) -> o
+    | _ -> (match dictTryFind st.RecBase owner with Some b when b <> owner -> recFieldsOf st b | _ -> [])
+
+// the field order a `new`/`with` uses. A stamped SUBCLASS (has a RecBase entry)
+// resolves through its base; anything else keeps the exact prior behaviour, so
+// only subclass construction — previously storing zero fields — changes.
+let private ctorOrder (st : St) (name : string) (provided : string list) : string list =
+    match dictTryFind st.RecBase name with
+    | Some _ -> (match recFieldsOf st name with [] -> provided | o -> o)
+    | None -> (match dictTryFind st.RecFields name with Some o -> o | None -> provided)
 let private cidCase (st : St) (case : string) : int = match dictTryFind st.CaseClass case with Some c -> c | None -> 0 - 1
 // the class-id a `:? T` / `:?>` looks for. An instantiated name tests its
 // erased head (the header carries no type arguments); an unknown name yields
@@ -2643,7 +2660,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // so no shadow rooting; a field read boxes (cancelled by unbox in arithmetic).
     | ERecord (name, fields) when (dictTryFind st.RecPod name).IsSome ->
         let (layout, _, _) = (dictTryFind st.RecPod name).Value
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
+        let order = ctorOrder st name (List.map fst fields)
         let items =
             order |> List.map (fun fn ->
                 let (off, kind) = (dictTryFind layout fn).Value
@@ -2656,7 +2673,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         lowPodBuild ctx name items
     | ERecordExt (name, baseE, updates) when (dictTryFind st.RecPod name).IsSome ->
         let (layout, _, _) = (dictTryFind st.RecPod name).Value
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
+        let order = ctorOrder st name (List.map fst updates)
         let bl = freshTmp ctx
         // pre-evaluate each update value into a local; then bind base. lowPodBuild
         // then sees only pure reads (these locals + base loads), so its single
@@ -2679,7 +2696,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                     | None -> (off, W, W, true, LLoad (W, LGet (wReg bl), off)))
         LDo (updEvals @ [ LSet (wReg bl, coreToLowE ctx baseE) ], lowPodBuild ctx name items)
     | ERecord (name, fields) ->
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
+        let order = ctorOrder st name (List.map fst fields)
         // the field VALUE expressions in slot order — a missing field defaults to
         // 0. Their ref-kinds give a precise ref-map (an int field is excluded from
         // the scan) and, in a generic body, a generic field forwards its witness.
@@ -2706,7 +2723,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         | None ->
             lowObjR ctx (cidRec st name) 0 baseSlots (Some baseKinds) baseWits
     | ERecordExt (name, baseE, updates) ->
-        let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
+        let order = ctorOrder st name (List.map fst updates)
         let b = freshTmp ctx
         let slots =
             order |> List.mapi (fun i fnm ->
