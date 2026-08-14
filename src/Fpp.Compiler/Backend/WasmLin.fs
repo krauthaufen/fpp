@@ -83,7 +83,7 @@ type private St =
       /// a NESTED lambda node -> the lifted function name it became
       LamName : RefMap<Expr, string>
       /// every lifted lambda, in emission order: (name, param, body, captures)
-      Lams : Vec<string * (VarId * Scheme) * Expr * (string * int) list>
+      Lams : Vec<string * (VarId * Scheme) * Expr * (string * int * Type) list>
       /// while emitting a lifted lambda body: captured key -> its env slot
       mutable Captures : Dict<string, int>
       /// record name -> its field names in DECLARED order (an offset each)
@@ -1568,12 +1568,12 @@ let rec private patBinders (p : Pat) : VarId list =
 
 // the free (path,offset) VarIds a lambda body reads, EXCLUDING its own
 // bound param, globals and top-level functions — those resolve directly.
-let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (string * int) list =
-    let acc = vecNew<string * int> ()
+let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (string * int * Type) list =
+    let acc = vecNew<string * int * Type> ()
     let seen = dictNew<string, bool> ()
     let rec go (bnd : Dict<string, bool>) (e : Expr) : unit =
         match e with
-        | EVar (v, _) | EVarI (v, _, _) ->
+        | EVar (v, sch) | EVarI (v, sch, _) ->
             let k = key v
             dictSet nameOf k v.Name
             // bare `compare` is the one `(builtin)` INTRINSIC with no value (a
@@ -1587,7 +1587,7 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
                && (dictTryFind st.Funcs k).IsNone
                && (dictTryFind seen k).IsNone then
                 dictSet seen k true
-                vecAdd acc (v.Path, v.Offset)
+                vecAdd acc (v.Path, v.Offset, sch.Body)
         | ELam (ps, b) ->
             let bnd2 = dictNew<string, bool> ()
             for kv in dictPairs bnd do dictSet bnd2 (fst kv) (snd kv)
@@ -1613,7 +1613,9 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
             if (dictTryFind bnd k).IsNone && (dictTryFind st.Globals k).IsNone
                && (dictTryFind st.Funcs k).IsNone && (dictTryFind seen k).IsNone then
                 dictSet seen k true
-                vecAdd acc (v.Path, v.Offset)
+                // an assigned mutable is captured as its shared CELL pointer — a
+                // reference; the recorded type only needs to classify non-raw.
+                vecAdd acc (v.Path, v.Offset, TCon ("obj", []))
             go bnd x
         | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> go bnd r
         | EFieldSet (r, _, _, x) -> go bnd r; go bnd x
@@ -3266,18 +3268,29 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
     let caps =
         st.Lams |> vecToList |> List.tryPick (fun (n, _, _, c) -> if n = name then Some c else None)
         |> Option.defaultValue []
-    LConstW CLO_KIND
-    :: LConstW (tblIdx st.M name)
     // capture the STORAGE, not the dereferenced value: for a cell var that is
     // the shared pointer, so mutation is visible on both sides. An unboxed
     // scalar has no word storage to grab, so re-box it into the env slot (the
     // lambda body reads it back as an ordinary boxed word).
-    :: (caps |> List.map (fun (p, o) ->
+    let capVals =
+        caps |> List.map (fun (p, o, _) ->
             let k = p + ":" + string o
             match dictTryFind ctx.VarScalar k with
             | Some ty -> (match dictTryFind ctx.Regs k with Some id -> flatBox ctx ty (LGet { Id = id; RTy = ty }) | None -> lowVarStore ctx k)
-            | None -> lowVarStore ctx k))
-    |> lowObj ctx CID_CLOSURE 2
+            | None -> lowVarStore ctx k)
+    // the env slot's GC nature: a VarScalar rides a boxed pointer (flatBox), a
+    // cell is a pointer, and any other capture is its var's own storage — a raw
+    // i32 for an int/bool/char, a pointer otherwise. Slots 0/1 (kind, code idx)
+    // are raw words.
+    let capKinds =
+        caps |> List.map (fun (p, o, ty) ->
+            let k = p + ":" + string o
+            if (dictTryFind ctx.VarScalar k).IsSome then RKRef
+            elif (dictTryFind ctx.LSt.CellVars k).IsSome then RKRef
+            else refKindOfTy ty)
+    lowObjR ctx CID_CLOSURE 2
+        (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: capVals)
+        (Some (RKRaw :: RKRaw :: capKinds))
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -4101,7 +4114,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // lowering reads them from the env register.
     for name, (pv, _), body, caps in vecToList st.Lams do
         st.Captures <- dictNew ()
-        caps |> List.iteri (fun i (p, o) -> dictSet st.Captures (p + ":" + string o) i)
+        caps |> List.iteri (fun i (p, o, _) -> dictSet st.Captures (p + ":" + string o) i)
         emitLambdaLow st m name pv body
     // GC: emit $fpreg_all LAST — every shape's tid is known now. Each shape is
     // registered as (tid, size, kind, start, refoffs=0, name=0); `start` is the
