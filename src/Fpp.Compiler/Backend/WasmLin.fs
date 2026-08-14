@@ -214,7 +214,11 @@ let private CID_STRING = 6
 // IEnumerable vtable row, so GetEnumerator/MoveNext/Current on one route to these
 // linear iterator helpers instead of a vtable dispatch, mirroring the GC backend.
 let private CID_ITER = 7
-let private CID_FIRST_USER = 8
+// a built-in ARRAY enumerator: [array][index]. Distinct from the list iterator
+// (CID_ITER) so MoveNext/Current route to the array path (index-based) rather
+// than the cons path. GC carries it as its own tid; non-GC uses this cid.
+let private CID_ARRITER = 8
+let private CID_FIRST_USER = 9
 
 let private CLO_KIND = 2
 
@@ -246,6 +250,7 @@ let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
 let mutable private gcListTid = 0
 let mutable private gcIterTid = 0
+let mutable private gcArrIterTid = 0
 // FK_STRUCT cons tids selected at a GENERIC cons site by the element witness's
 // refMask: RAW head (scan tail only) vs REF head (scan head+tail). Both map to
 // CID_LIST so $isBuiltinSeq still recognises them.
@@ -322,6 +327,17 @@ let private gcTidRef (st : St) (shapeKey : string) (sizeBytes : int) (refoffs : 
         vecAdd st.TidRegs (t, sizeBytes, FK_STRUCT, List.length refoffs)
         dictSet st.TidRefoffs t refoffs
         t
+
+// intern a packed-scalar array tid AND map it to CID_ARRAY on first creation,
+// so a dynamically seq-typed scalar array (`int[]`/`float[]`/… reached via
+// `(x.ToArray() :> seq).GetEnumerator()`) is recognised by $isBuiltinSeq and
+// routed to the built-in array iterator. Ref arrays share the eagerly-mapped
+// gcArrTid; strings (CID_STRING) never come through here.
+let private gcArrTidReg (st : St) (shapeKey : string) (sizeBytes : int) (kind : int) : int =
+    let isNew = (dictTryFind st.Tids shapeKey).IsNone
+    let t = gcTid st shapeKey sizeBytes kind 0
+    if isNew then vecAdd st.TidCid (t, CID_ARRAY)
+    t
 
 let private rawScalarName (n : string) : bool =
     match n with
@@ -839,47 +855,73 @@ let private emitListIter (m : Mod) : unit =
     // uniform cons — map to CID_LIST in the tid->cid table. Checking the raw
     // header instead would miss every FK_STRUCT variant and mis-route a real
     // list to the (absent) IEnumerable vtable row.
+    // arrays route here too now (CID_ARRAY): ResizeArray/Dict enumerate via
+    // `(x.ToArray() :> seq).GetEnumerator()`, and an array carries no vtable row.
+    let arrIterHdr = (gcArrIterTid <<< 1) ||| 1
+    let isArrIter (f : Fn) = (lg f "$it"; mem f "i32.load"; ic f (if gc then arrIterHdr else CID_ARRITER); ins f "i32.eq")
+    let cidOf (f : Fn) (v : string) =
+        if gc then (lg f v; mem f "i32.load"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+        else (lg f v; mem f "i32.load")
     let f = beginFn m [ "$v" ]
+    local f "$c" "i32"
     localsDone f
     lg f "$v"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
-    if gc then
-        lg f "$v"; mem f "i32.load"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"
-        gg f "$t2c"; ins f "i32.add"; mem f "i32.load"; ic f CID_LIST; ins f "i32.eq"
-    else
-        lg f "$v"; mem f "i32.load"; ic f CID_LIST; ins f "i32.eq"
+    cidOf f "$v"; ls f "$c"
+    lg f "$c"; ic f CID_LIST; ins f "i32.eq"
+    lg f "$c"; ic f CID_ARRAY; ins f "i32.eq"
+    ins f "i32.or"
     endFn f
-    // $literNew(list) -> a fresh iterator [remaining=list][current=0]
-    let f = beginFn m [ "$list" ]
-    local f "$it" "i32"
+    // $literNew(src): an array -> [array][index=-1] (index-based); else a list
+    // iterator [remaining=list][current=0].
+    let f = beginFn m [ "$src" ]
+    local f "$it" "i32"; local f "$c" "i32"
     localsDone f
-    if gc then
-        lg f "$list"; callf f "$spush"
-        ic f gcIterTid; callf f "$fpalloc"; ls f "$it"
-        callf f "$spop"; ls f "$list"
-    else
-        ic f (HDR + 8); callf f "$lalloc"; ls f "$it"
-        lg f "$it"; ic f CID_ITER; mem f "i32.store"
-    lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$list"; mem f "i32.store"
+    cidOf f "$src"; ls f "$c"
+    lg f "$c"; ic f CID_ARRAY; ins f "i32.eq"
+    ifE f
+    (if gc then (lg f "$src"; callf f "$spush"; ic f gcArrIterTid; callf f "$fpalloc"; ls f "$it"; callf f "$spop"; ls f "$src")
+     else (ic f (HDR + 8); callf f "$lalloc"; ls f "$it"; lg f "$it"; ic f CID_ARRITER; mem f "i32.store"))
+    lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$src"; mem f "i32.store"
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; ic f (0 - 1); mem f "i32.store"   // index = -1
+    elseB f
+    (if gc then (lg f "$src"; callf f "$spush"; ic f gcIterTid; callf f "$fpalloc"; ls f "$it"; callf f "$spop"; ls f "$src")
+     else (ic f (HDR + 8); callf f "$lalloc"; ls f "$it"; lg f "$it"; ic f CID_ITER; mem f "i32.store"))
+    lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$src"; mem f "i32.store"
     lg f "$it"; ic f (HDR + 4); ins f "i32.add"; ic f 0; mem f "i32.store"
+    endB f
     lg f "$it"
     endFn f
-    // $literNext(it) -> RAW bool: pop the head into current, advance remaining.
-    // RAW (0/1), not tagged (1/3) — a `while MoveNext()` reads the result raw
-    // since int/bool became unboxed, so a tagged `1` for nil would read as
-    // truthy and spin forever.
+    // $literNext(it) -> RAW bool. Array: bump the index, true while in bounds.
+    // List: pop the head into current, advance remaining. RAW (0/1), not tagged.
     let f = beginFn m [ "$it" ]
-    local f "$rem" "i32"
+    local f "$rem" "i32"; local f "$idx" "i32"
     localsDone f
+    isArrIter f
+    ifE f
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ic f 1; ins f "i32.add"; ls f "$idx"
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$idx"; mem f "i32.store"
+    lg f "$idx"; lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ins f "i32.lt_s"; ins f "return"
+    elseB f
     lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$rem"
     lg f "$rem"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f   // nil -> false
     lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$rem"; ic f HDR; ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
     lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$rem"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
-    ic f 1   // true
+    ic f 1; ins f "return"
+    endB f
+    ins f "unreachable"
     endFn f
-    // $literCur(it) -> the current element
+    // $literCur(it) -> the current element. Array: arr[idx]. List: stored current.
     let f = beginFn m [ "$it" ]
+    local f "$idx" "i32"
     localsDone f
-    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+    isArrIter f
+    ifE f
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ls f "$idx"
+    lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ic f (HDR + 4); ins f "i32.add"; lg f "$idx"; ic f 4; ins f "i32.mul"; ins f "i32.add"; mem f "i32.load"; ins f "return"
+    elseB f
+    lg f "$it"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; ins f "return"
+    endB f
+    ins f "unreachable"
     endFn f
 
 // $prints(s): UTF-16 -> UTF-8 into PRINTBUF, then fd_write(1). Handles the
@@ -2832,7 +2874,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             let (off, kind) = (dictTryFind layout fn).Value
             let (sty, _) = (storLTy kind).Value
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
-        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY 0); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
+        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
         let stmts =
             [ LSet (wReg cnt, (coreToLowE ctx n)); LSet (wReg vr, coreToLowE ctx init) ]
             @ (if gc then [ LCallVoidS ("$spush", [ LGet (wReg vr) ]) ] else [])
@@ -2847,7 +2889,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
         let n = List.length xs
         let bs = freshTmp ctx
-        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY 0); LConstW n ]) else LAlloc (LConstW (ARRHDR + n * stride))
+        let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LConstW n ]) else LAlloc (LConstW (ARRHDR + n * stride))
         let copyFields eb vr = order |> List.map (fun fn ->
             let (off, kind) = (dictTryFind layout fn).Value
             let (sty, _) = (storLTy kind).Value
@@ -2886,7 +2928,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let bs = freshTmp ctx
         let evals = List.map2 (fun vr x -> LSet ({ Id = vr; RTy = vty }, storUnbox k (coreToLowE ctx x))) vregs xs
         let alloc =
-            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (storShape k) w FK_SCALAR_ARRAY 0); LConstW n ])
+            if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt (storShape k) w FK_SCALAR_ARRAY); LConstW n ])
             else LAlloc (LConstW (HDR + 4 + n * w))
         let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LConstW n) ]
         let stores = vregs |> List.mapi (fun i vr -> LStore (sty, LGet (wReg bs), HDR + 4 + i * w, LGet { Id = vr; RTy = vty }))
@@ -2933,7 +2975,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let bs = freshTmp ctx
         let it = freshTmp ctx
         let alloc =
-            if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt (storShape k) w FK_SCALAR_ARRAY 0); LGet (wReg cnt) ])
+            if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt (storShape k) w FK_SCALAR_ARRAY); LGet (wReg cnt) ])
             else LAlloc (LPrim (AddW, [ LConstW (HDR + 4); LPrim (MulW, [ LGet (wReg cnt); LConstW w ]) ]))
         // `Array.zeroCreate` keeps a `$zero` marker whose zero is per-storage —
         // fill the raw scalar zero, NOT a mis-unboxed tagged 0 (which would read
@@ -3191,6 +3233,13 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         // to the built-in iterator when the receiver IS a built-in seq / iterator,
         // else fall through to the vtable (an object-expression IEnumerator).
         let iterHdr = if gc then (gcIterTid <<< 1) ||| 1 else CID_ITER
+        let arrIterHdr = if gc then (gcArrIterTid <<< 1) ||| 1 else CID_ARRITER
+        // the receiver is one of OUR built-in iterators (list or array) -> route
+        // MoveNext/Current to the linear helper; else it is an object-expression
+        // IEnumerator and goes through the vtable.
+        let isBuiltinIter () =
+            let h = LLoad (W, LGet (wReg t), 0)
+            LPrim (OrW, [ LPrim (EqW, [ h; LConstW iterHdr ]); LPrim (EqW, [ h; LConstW arrIterHdr ]) ])
         let branch (builtin : LExpr) (cond : LExpr) =
             let res = freshTmp ctx
             LDo ([ LSet (wReg t, coreToLowE ctx recv)
@@ -3199,9 +3248,9 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         if bi = "IEnumerable" && method = "GetEnumerator" then
             branch (LCall ("$literNew", [ LGet (wReg t) ])) (LCall ("$isBuiltinSeq", [ LGet (wReg t) ]))
         elif bi = "IEnumerator" && method = "MoveNext" then
-            branch (LCall ("$literNext", [ LGet (wReg t) ])) (LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW iterHdr ]))
+            branch (LCall ("$literNext", [ LGet (wReg t) ])) (isBuiltinIter ())
         elif bi = "IEnumerator" && method = "Current" then
-            branch (LCall ("$literCur", [ LGet (wReg t) ])) (LPrim (EqW, [ LLoad (W, LGet (wReg t), 0); LConstW iterHdr ]))
+            branch (LCall ("$literCur", [ LGet (wReg t) ])) (isBuiltinIter ())
         else
             LDo ([ LSet (wReg t, coreToLowE ctx recv) ], vtDispatch ())
     | ETry (body, clauses) ->
@@ -4484,6 +4533,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         gcByteTid <- gcTid st "byte" 1 FK_SCALAR_ARRAY 0
         gcIntTid <- gcTid st "int" 4 FK_SCALAR_ARRAY 0
         gcArrTid <- gcTid st "arr" 4 FK_REF_ARRAY 2
+        // map the ref-array tid to CID_ARRAY so a dynamically seq-typed array
+        // (e.g. `(x.ToArray() :> seq).GetEnumerator()`) is recognised by
+        // $isBuiltinSeq at runtime and routed to the built-in array iterator
+        // rather than an (absent) IEnumerable vtable row.
+        vecAdd st.TidCid (gcArrTid, CID_ARRAY)
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
@@ -4498,6 +4552,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // the built-in list iterator: [remaining][current], both scanned as
         // tagged words (start=1) so a ref element is rooted and a tagged int skipped
         gcIterTid <- gcTid st "iter" (HDR + 8) FK_TAGGED 1
+        // the built-in ARRAY iterator: [array][index]. The array (HDR) is a real
+        // pointer the collector must trace+update; the index (HDR+4) is a raw int
+        // (NEVER scanned), so an FK_STRUCT with refoffs = [HDR] only. Distinct tid
+        // from the list iterator so MoveNext/Current pick the index-based path.
+        gcArrIterTid <- gcTidRef st "arriter" (HDR + 8) [ HDR ]
         // a root slot for the vtable array pointer (filled at startup)
         st.VtSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
