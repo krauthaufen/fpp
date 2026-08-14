@@ -65,9 +65,17 @@ let lowerTests =
             Expect.stringContains printed "(let y =" "let-in chain"
         }
         test "out-of-subset constructs produce notes, not failures" {
+            // a `base` access outside a member is out of subset: lowering NOTES
+            // it (soft) rather than throwing. (A `for` loop USED to sit here but
+            // now lowers into the subset — see "for loops lower into the subset".)
+            let src = "let f () =\n    base.ToString ()\n"
+            let r, _ = lowerSrc src
+            Expect.isNonEmpty r.Notes "out-of-subset construct noted, not a failure"
+        }
+        test "for loops lower into the subset" {
             let src = "let f xs =\n    for x in xs do\n        ignore x\n    0\n"
             let r, _ = lowerSrc src
-            Expect.isNonEmpty r.Notes "for loop noted as not lowerable"
+            Expect.isEmpty r.Notes "for loop lowers with no note"
         }
         test "lint catches deliberately broken core" {
             let bad =
