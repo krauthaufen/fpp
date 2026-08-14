@@ -43,6 +43,12 @@ let private FMTBUF = PRINTBUF + PRINTCAP   // u16 staging for float formatting
 let private FMTCAP = 512
 let private CONST_BASE = FMTBUF + FMTCAP
 
+// the GC nature of a value word: a RAW inline scalar (int/bool/char — never a
+// pointer, skip in scan), a REF (a heap pointer — trace it), or GENERIC (a type
+// parameter — unknown statically). Defined before St so St can hold a cell-kind
+// map; the classifier functions that produce it live further down.
+type private RefKind = RKRaw | RKRef | RKGen
+
 type private St =
     { M : Mod
       Errors : Vec<string>
@@ -141,6 +147,12 @@ type private St =
       /// heap CELL (a 1-word box) so the capture shares the mutation. Reads
       /// dereference, writes store, the capture passes the pointer.
       CellVars : Dict<string, bool>
+      /// a cell var's GC nature (the ref-kind of the value it holds), recorded
+      /// when the cell is created. A `$cellget` of a raw-scalar cell (a mutable
+      /// int) must classify RAW so the aggregate that stores its value keeps the
+      /// scalar out of its scan map — without this a mutable int read into a
+      /// record field defaulted to the tagged form and was chased as a pointer.
+      CellKind : Dict<string, RefKind>
       /// GC mode only: a shape key ("rec:7", "tup:3", "case:9", "clo:2",
       /// "list", "arr", "str", "f64", "i64", "cell") -> its fpprt type-id, and
       /// the registrations to emit at startup as (tid, size-bytes, kind,
@@ -296,13 +308,6 @@ let private gcTidRef (st : St) (shapeKey : string) (sizeBytes : int) (refoffs : 
         vecAdd st.TidRegs (t, sizeBytes, FK_STRUCT, List.length refoffs)
         dictSet st.TidRefoffs t refoffs
         t
-
-// the GC nature of a value word: a RAW inline scalar (int/bool/char — never a
-// pointer, skip in scan), a REF (a heap pointer — trace it), or GENERIC (a type
-// parameter — unknown statically, so a container holding one cannot get a
-// static ref-map and stays uniform/tagged). Boxed scalars (int64/float/float32
-// ride an f64/i64 heap box today) are pointers, hence REF.
-type private RefKind = RKRaw | RKRef | RKGen
 
 let private rawScalarName (n : string) : bool =
     match n with
@@ -1598,6 +1603,42 @@ let private cellScan (decls : Decl list) : Dict<string, bool> =
         if (dictTryFind letBound k).IsSome && (dictTryFind inLambda k).IsSome then dictSet cells k true
     cells
 
+// the ref-kind of each cell var's held value, from the INIT value it is bound to
+// (the same kind lowLetBind gives the cell at creation). A whole-program pass, so
+// a `$cellget` reads the right kind even when the cell is created in a function
+// emitted AFTER the one that reads it (a class-level `let mutable` read across
+// members). Without this a mutable int read into a record field defaulted to the
+// tagged form and its even value was chased as a pointer.
+let private cellKindScan (decls : Decl list) (cells : Dict<string, bool>) : Dict<string, RefKind> =
+    let out = dictNew<string, RefKind> ()
+    let rec go (e : Expr) : unit =
+        (match e with
+         | ELet (_, v, _, rhs, _) when (dictTryFind cells (key v)).IsSome ->
+             let init = match rhs with EApp (EUnknown "$forcecell", [ r ]) -> r | _ -> rhs
+             dictSet out (key v) (refKindOfExpr init)
+         | _ -> ())
+        match e with
+        | ELet (_, _, _, r, b) -> go r; go b
+        | ELam (_, b) -> go b
+        | EApp (f, args) -> go f; List.iter go args
+        | EIf (a, b, c) -> go a; go b; go c
+        | EMatch (s, cs) | ETry (s, cs) -> go s; for _, gd, bb in cs do (match gd with Some g -> go g | None -> ()); go bb
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) -> List.iter go xs
+        | ERecord (_, fs) -> for _, x in fs do go x
+        | ERecordExt (_, bb, fs) -> go bb; (for _, x in fs do go x)
+        | EField (r, _, _) -> go r
+        | EFieldSet (r, _, _, x) -> go r; go x
+        | EWhile (c, b) -> go c; go b
+        | EAssign (_, x) -> go x
+        | EIndex (_, a, i) -> go a; go i
+        | EIndexSet (_, a, i, x) -> go a; go i; go x
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> go a
+        | EArrayCreate (_, a, b) -> go a; go b
+        | EIfaceCall (_, _, recv, args) -> go recv; List.iter go args
+        | _ -> ()
+    for d in decls do match d with DLet (_, _, _, e) -> go e | _ -> ()
+    out
+
 // ---- lambda lifting -------------------------------------------------------
 // the variables a pattern binds (so a match/try arm's binders shadow the
 // captured set); mirrors the shape lowPatTest binds
@@ -1872,6 +1913,41 @@ let private gcPushStmts (v : LExpr) : LStmt list =
 let private gcPopInto (addr : LExpr) (off : int) : LStmt list =
     [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
       LStore (W, addr, off, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
+
+// an aggregate field/slot value's GC nature, resolving a `$cellget` of a raw
+// mutable cell (a captured `let mutable n = 0`) to RAW. refKindOfExpr alone sees
+// the untyped cell read and defaults to RKGen, so the value rode the tagged form
+// and an even int in the cell was chased as a pointer. The cell's kind was
+// recorded when it was created (CellKind).
+let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
+    match e with
+    | EApp (EUnknown "$cellget", [ c ]) ->
+        let rec cellKey (ce : Expr) : string option =
+            match ce with
+            | EVar (v, _) | EVarI (v, _, _) -> Some (key v)
+            | EApp (EUnknown "$cellof", [ inner ]) -> cellKey inner
+            | _ -> None
+        (match cellKey c |> Option.bind (fun k -> dictTryFind st.CellKind k) with
+         | Some k -> k
+         | None -> refKindOfExpr e)
+    | _ -> refKindOfExpr e
+
+// for an aggregate allocated inside a GENERIC body, the (slot index, witness
+// register) of each slot whose static type is a type PARAMETER whose witness
+// param is in scope. `base_` is the slot index of exprs.[0] (0 for a tuple or
+// record, 1 past a union's raw tag). A slot with no witness (top level, or a
+// var that is not a witness param) is omitted, and lowObjR keeps the safe
+// tagged form for it — only witness-backed generic slots get precise refoffs.
+let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * int) list =
+    exprs
+    |> List.mapi (fun j e ->
+        match refKindOfExprC ctx.LSt e with
+        | RKGen ->
+            (match tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
+             | Some w -> Some (base_ + j, w)
+             | None -> None)
+        | _ -> None)
+    |> List.choose id
 
 // int/bool/char are RAW i32 at rest (locals, params, returns, value stack) —
 // full 32-bit, no tag. lowTag/lowUntag convert to/from the tagged immediate
@@ -2392,8 +2468,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
          | RKGen ->
              (match tyVarIdOfExpr h |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
               | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx h) (coreToLowE ctx t)
-              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ RKGen; RKRef ]))
-         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ k; RKRef ]))
+              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ RKGen; RKRef ]) [])
+         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ k; RKRef ]) [])
     // list append: `a @ b` rebuilds a's spine onto b. Without this it fell to the
     // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
     // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
@@ -2445,7 +2521,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         match bop with
         | "<" | ">" | "<=" | ">=" | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
         | _ -> LPrim (intArithOp bop, [ ta; tb ])
-    | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map refKindOfExpr xs))
+    | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map (refKindOfExprC st) xs)) (genWitsOf ctx 0 xs)
     | EListLit xs -> lowList ctx xs
     // a collapsed one-field record IS its field value — no heap object
     | ERecord (name, fields) when (dictTryFind st.Collapse name).IsSome ->
@@ -2500,10 +2576,16 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo (updEvals @ [ LSet (wReg bl, coreToLowE ctx baseE) ], lowPodBuild ctx name items)
     | ERecord (name, fields) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst fields
-        lowObj ctx (cidRec st name) 0 (order |> List.map (fun fnm ->
-            match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
-            | Some e2 -> coreToLowE ctx e2
-            | None -> lowInt 0))
+        // the field VALUE expressions in slot order — a missing field defaults to
+        // 0. Their ref-kinds give a precise ref-map (an int field is excluded from
+        // the scan) and, in a generic body, a generic field forwards its witness.
+        let valExprs =
+            order |> List.map (fun fnm ->
+                match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = fnm then Some e2 else None) with
+                | Some e2 -> e2
+                | None -> ELit (LInt "0"))
+        lowObjR ctx (cidRec st name) 0 (valExprs |> List.map (coreToLowE ctx))
+            (Some (valExprs |> List.map (refKindOfExprC st))) (genWitsOf ctx 0 valExprs)
     | ERecordExt (name, baseE, updates) ->
         let order = match dictTryFind st.RecFields name with Some o -> o | None -> List.map fst updates
         let b = freshTmp ctx
@@ -2517,8 +2599,8 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         // slot 0 is the raw tag word; the payload follows. A concrete payload
         // gets a ref-map so its unboxed scalars are skipped by the collector.
-        let kinds = RKRaw :: List.map refKindOfExpr args
-        lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds)
+        let kinds = RKRaw :: List.map (refKindOfExprC st) args
+        lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args)
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
     // fused element-field access on an array of inline records — MUST precede the
     // plain POD field cases, or a field write would copy the element out and
@@ -3069,7 +3151,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
 // the slots; the shape gets an fpprt type-id whose TAGGED tracer scans from the
 // first real word. CID_ARRAY is the variable-length REF_ARRAY case.
 and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) : LExpr =
-    lowObjR ctx cid raw slots None
+    lowObjR ctx cid raw slots None []
 // a cons cell whose head is a GENERIC element: its ref-ness is only known at
 // runtime, from the element type's witness refMask. Branch on it — a RAW head
 // (refMask 0) uses CONS_RAW and is stored directly (an unboxed int, never
@@ -3098,10 +3180,22 @@ and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tEx
 // kind is statically known). A fully-concrete shape registers FK_STRUCT with a
 // ref-map: raw scalar slots are stored inline and NEVER pushed to the shadow
 // stack, so an unboxed int in a tuple/union is invisible to the collector.
-and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) (refKinds : RefKind list option) : LExpr =
+and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) (refKinds : RefKind list option) (genWits : (int * int) list) : LExpr =
     let n = List.length slots
     let b = freshTmp ctx
     let st = ctx.LSt
+    let witOf i = genWits |> List.tryPick (fun (j, w) -> if j = i then Some w else None)
+    // generic slots that a witness resolves at runtime (RKGen with a witness in
+    // scope); an RKGen slot with NO witness leaves the whole object on the safe
+    // tagged form (its scalars must be tagged, the pre-raw-int fallback)
+    let genIdx =
+        match refKinds with
+        | Some ks when List.length ks = n -> [ 0 .. n - 1 ] |> List.filter (fun i -> List.item i ks = RKGen && (witOf i).IsSome)
+        | _ -> []
+    let unresolvedGen =
+        match refKinds with
+        | Some ks when List.length ks = n -> [ 0 .. n - 1 ] |> List.exists (fun i -> List.item i ks = RKGen && (witOf i).IsNone)
+        | _ -> false
     if gc && cid = CID_ARRAY then
         // [tag][len][elems]: fpprt_alloc_array writes tag@0 and len@4; we store
         // the elements from offset 8. Each element is pushed to the shadow stack
@@ -3119,6 +3213,64 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.collect (fun (i, _) -> gcPopInto (LGet (wReg b)) (8 + 4 * i))
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops @ consts, LGet (wReg b))
+    elif gc && not (List.isEmpty genIdx) && not unresolvedGen then
+        // GENERIC aggregate in a generic body: every slot's witness is in scope,
+        // so build PRECISE refoffs even though some slots are type parameters.
+        // A raw generic slot (witness refMask 0) is EXCLUDED from refoffs — the
+        // collector never chases its unboxed even int — and a ref one is included
+        // and rooted across the alloc. With g generic slots there are 2^g possible
+        // ref-slot sets; intern an FK_STRUCT tid per set and pick it at runtime
+        // from the witness refMasks. (This is lowGenericCons generalised past the
+        // list-cons binary case to records/tuples/unions with N generic fields.)
+        let ks = refKinds.Value
+        let isConst e = match e with LConstW _ -> true | _ -> false
+        let staticRef i = List.item i ks = RKRef
+        let staticRaw i = List.item i ks = RKRaw
+        let refMaskOf w = LLoad (W, LGet (wReg w), 8)
+        let g = List.length genIdx
+        let staticRefOffs = [ 0 .. n - 1 ] |> List.filter staticRef |> List.map (fun i -> HDR + 4 * i)
+        let pat = ks |> List.map (fun k -> match k with RKRef -> "r" | RKRaw -> "s" | RKGen -> "g") |> String.concat ""
+        let tidForMask (mask : int) : int =
+            let extra =
+                genIdx |> List.mapi (fun j i -> (mask >>> j) &&& 1, i)
+                |> List.filter (fun (bit, _) -> bit = 1) |> List.map (fun (_, i) -> HDR + 4 * i)
+            let offs = List.sort (staticRefOffs @ extra)
+            let sk = "sg:" + string cid + ":" + string n + ":" + string raw + ":" + pat + ":" + string mask
+            let isNew = (dictTryFind st.Tids sk).IsNone
+            let t = gcTidRef st sk (HDR + 4 * n) offs
+            if isNew && (cid >= CID_FIRST_USER || cid = CID_LIST) then vecAdd st.TidCid (t, cid)
+            t
+        let tidTmp = freshTmp ctx
+        let rec selTid (j : int) (accMask : int) : LStmt list =
+            if j = g then [ LSet (wReg tidTmp, LConstW (tidForMask accMask)) ]
+            else
+                let w = (witOf (List.item j genIdx)).Value
+                [ LIf (LPrim (EqW, [ refMaskOf w; LConstW 0 ]),
+                       selTid (j + 1) accMask,
+                       selTid (j + 1) (accMask ||| (1 <<< j))) ]
+        let idx = slots |> List.mapi (fun i v -> i, v)
+        // every non-const slot into a temp, evaluated once before the alloc
+        let temps = idx |> List.map (fun (i, v) -> i, (if isConst v then None else Some (freshTmp ctx)), v)
+        let hasTemp i = temps |> List.exists (fun (j, t, _) -> j = i && t.IsSome)
+        let tval i = match temps |> List.tryPick (fun (j, t, _) -> if j = i then Some t else None) with Some (Some tr) -> LGet (wReg tr) | _ -> List.item i slots
+        let evals = temps |> List.choose (fun (_, t, v) -> match t with Some tr -> Some (LSet (wReg tr, v)) | None -> None)
+        // pushes BEFORE the (collecting) alloc, ascending: concrete refs, then each
+        // generic-ref (conditionally, guarded by its witness refMask)
+        let staticRefPush = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRef i && hasTemp i) |> List.collect (fun i -> gcPushStmts (tval i))
+        let genPush = genIdx |> List.map (fun i -> LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]), [], gcPushStmts (tval i)))
+        // pops AFTER, descending (LIFO mirror): generic first, then concrete refs.
+        // A raw generic slot was never pushed — store its temp directly instead.
+        let genPop =
+            genIdx |> List.rev |> List.map (fun i ->
+                LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]),
+                     [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ],
+                     gcPopInto (LGet (wReg b)) (HDR + 4 * i)))
+        let staticRefPop = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRef i && hasTemp i) |> List.rev |> List.collect (fun i -> gcPopInto (LGet (wReg b)) (HDR + 4 * i))
+        let rawStores = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRaw i && hasTemp i) |> List.map (fun i -> LStore (W, LGet (wReg b), HDR + 4 * i, tval i))
+        let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
+        LDo (evals @ selTid 0 0 @ staticRefPush @ genPush
+             @ [ LSet (wReg b, LCall ("$fpalloc", [ LGet (wReg tidTmp) ])) ]
+             @ genPop @ staticRefPop @ rawStores @ consts, LGet (wReg b))
     elif gc then
         // every slot's ref-kind known and none generic -> FK_STRUCT with a ref-
         // map. Otherwise the uniform tagged form (scan by low-bit tag from the
@@ -3204,8 +3356,8 @@ and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
          | RKGen ->
              (match tyVarIdOfExpr x |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
               | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx x) (lowList ctx rest)
-              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ RKGen; RKRef ]))
-         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ k; RKRef ]))
+              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ RKGen; RKRef ]) [])
+         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ k; RKRef ]) [])
 
 // a boxed 64-bit payload: the class-id header then an 8-byte payload at HDR;
 // the wide type on the LStore/LLoad picks f64/i64 access. GC: a no-ref STRUCT
@@ -3364,7 +3516,12 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
         LSet ({ Id = id; RTy = ty }, flatUnbox ty (coreToLowE ctx rhs))
     | None ->
         let id = freshReg ctx k
-        let init = if isCell then lowMkCell ctx (refKindOfExpr rhs) (coreToLowE ctx rhs) else coreToLowE ctx rhs
+        let init =
+            if isCell then
+                let ck = refKindOfExpr rhs
+                dictSet ctx.LSt.CellKind k ck
+                lowMkCell ctx ck (coreToLowE ctx rhs)
+            else coreToLowE ctx rhs
         LSet (wReg id, init)
 
 // read a variable: an unboxed scalar re-boxes to a word; a captured mutable
@@ -3423,9 +3580,22 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
             if (dictTryFind ctx.VarScalar k).IsSome then RKRef
             elif (dictTryFind ctx.LSt.CellVars k).IsSome then RKRef
             else refKindOfTy ty)
+    // a capture whose type is a TYPE PARAMETER rides its raw storage in the env
+    // slot (an unboxed int for 'a=int); resolve its GC nature at runtime from the
+    // enclosing body's witness, so a captured even int is not chased as a pointer.
+    // Env slots 0/1 are the kind/code words, so a capture at position i is slot 2+i.
+    let capGenWits =
+        caps |> List.mapi (fun i (p, o, ty) ->
+            let k = p + ":" + string o
+            if (dictTryFind ctx.VarScalar k).IsSome || (dictTryFind ctx.LSt.CellVars k).IsSome then None
+            else
+                match prune ty with
+                | TVar v -> (match dictTryFind ctx.Witness v.Id with Some w -> Some (2 + i, w) | None -> None)
+                | _ -> None)
+        |> List.choose id
     lowObjR ctx CID_CLOSURE 2
         (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: capVals)
-        (Some (RKRaw :: RKRaw :: capKinds))
+        (Some (RKRaw :: RKRaw :: capKinds)) capGenWits
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -3946,7 +4116,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           RecFields = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
-          CellVars = cellScan decls0
+          CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
@@ -3986,7 +4156,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // (access is by name); the value list at construction stays declared order.
     for d in decls0 do
         match d with
-        | DRecord (n, _, fs, _) when List.length fs >= 2 && (dictTryFind classNames n).IsNone ->
+        // a BARE type-variable field (`'a`, not `'a[]`/`list<'a>` which are
+        // pointers) can hold a raw scalar at runtime, so it cannot ride the inline
+        // POD form whose FK_TAGGED tracer scans the ref suffix uniformly — that
+        // chased an even int. Such records fall to the heap path, where lowObjR
+        // builds precise witness-driven refoffs. Concrete records are unaffected.
+        | DRecord (n, _, fs, _) when
+                List.length fs >= 2 && (dictTryFind classNames n).IsNone
+                && not (fs |> List.exists (fun (_, ty) -> ty.StartsWith "'" && not (ty.Contains "[") && not (ty.Contains "<"))) ->
             let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
             let refs = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsNone)
             if not (List.isEmpty scalars) then
