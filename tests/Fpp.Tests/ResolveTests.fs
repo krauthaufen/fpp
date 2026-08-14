@@ -221,6 +221,59 @@ let editorRobustnessTests =
             | Some h -> Expect.stringContains h "Zero.Zero" "names the class member"
             | None -> failtest "no hover on the applied member"
         }
+        test "rename finds the definition and every use, nothing else" {
+            let ws = Fpp.Workspace()
+            let src = "module M\nlet count = 1\nlet counted = count + count\n"
+            ws.SetFileText "t.fpp" src
+            let occs = ws.RenameAt "t.fpp" (src.IndexOf "count = 1")
+            let offs = occs |> List.map (fun (_, o, _) -> o) |> List.sort
+            let expected =
+                [ src.IndexOf "count = 1"
+                  src.IndexOf "count + count"
+                  src.LastIndexOf "count" ] |> List.sort
+            Expect.equal offs expected "the three counts, not `counted`"
+            Expect.isTrue (occs |> List.forall (fun (_, _, l) -> l = 5)) "token-sized ranges"
+        }
+        test "rename from a member USE reaches the declaration and other uses" {
+            let ws = Fpp.Workspace()
+            let src =
+                String.concat "\n" [
+                    "module M"
+                    "type S() ="
+                    "    member x.Halt = 2"
+                    "let a = S().Halt"
+                    "let b = S().Halt"
+                    "" ]
+            ws.SetFileText "t.fpp" src
+            let occs = ws.RenameAt "t.fpp" (src.IndexOf ".Halt" + 1)
+            Expect.equal occs.Length 3 "declaration plus both dot uses"
+        }
+        test "a prelude name refuses to rename" {
+            let ws = Fpp.Workspace()
+            let src = "module M\nlet n = List.sum [ 1; 2 ]\n"
+            ws.SetFileText "t.fpp" src
+            Expect.isEmpty (ws.RenameAt "t.fpp" (src.IndexOf "sum")) "not the user's to rename"
+        }
+        test "rename request answers a WorkspaceEdit over the wire" {
+            let server = Fpp.Lsp.Server.Server(Workspace())
+            server.Handle (JsonNode.Parse """{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.fpp","languageId":"fpp","version":1,"text":"let abc = 1\nlet d = abc + 1\n"}}}""") |> ignore
+            let prep = JsonNode.Parse """{"jsonrpc":"2.0","id":7,"method":"textDocument/prepareRename","params":{"textDocument":{"uri":"file:///t.fpp"},"position":{"line":1,"character":9}}}"""
+            match server.Handle prep with
+            | [ resp ] ->
+                Expect.equal (resp.["result"].["placeholder"].GetValue<string>()) "abc" "placeholder is the token"
+            | _ -> failtest "expected one prepare response"
+            let req = JsonNode.Parse """{"jsonrpc":"2.0","id":8,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///t.fpp"},"position":{"line":1,"character":9},"newName":"xyz"}}"""
+            match server.Handle req with
+            | [ resp ] ->
+                let edits = resp.["result"].["changes"].["file:///t.fpp"].AsArray()
+                Expect.equal edits.Count 2 "definition and use"
+            | _ -> failtest "expected one rename response"
+            // an invalid identifier must not produce an edit at all
+            let bad = JsonNode.Parse """{"jsonrpc":"2.0","id":9,"method":"textDocument/rename","params":{"textDocument":{"uri":"file:///t.fpp"},"position":{"line":1,"character":9},"newName":"not valid"}}"""
+            match server.Handle bad with
+            | [ resp ] -> Expect.isTrue (isNull resp.["result"]) "refused"
+            | _ -> failtest "expected one response"
+        }
         test "the prelude pseudo-file checks like a file" {
             let ws = Fpp.Workspace()
             ws.SetFileText "t.fpp" "module M\nlet a = 1\n"

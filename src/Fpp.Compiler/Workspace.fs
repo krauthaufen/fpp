@@ -1203,6 +1203,61 @@ type Workspace() =
                     | None -> ""
             vecToList out |> List.sortBy fst
 
+    /// Every occurrence of the symbol at `offset`, project-wide: the
+    /// definition's own name token plus each use that resolves to it,
+    /// as (file, offset, length). Empty when the offset names nothing
+    /// renameable — a prelude definition is not the user's to rename,
+    /// and renaming what cannot be fully found would silently break code.
+    member this.RenameAt (path : string) (offset : int) : (string * int * int) list =
+        let r = this.ProjectCheck ()
+        // a member USE (`v.Dot`) never appears in Resolutions — inference
+        // binds it through the receiver's type. Map the token to its member
+        // definition the same way the compiler does: site -> owner -> member.
+        let memberDefAt () : Analysis.Resolve.Definition option =
+            match dictTryFind r.Files path with
+            | Some (_, inf) ->
+                let tok =
+                    Green.tokens (GNode (this.ParseFile path).Root)
+                    |> List.tryFind (fun t ->
+                        t.Kind = Syntax.Ident && offset >= t.Offset && offset < t.Offset + strLen t.Text)
+                (match tok with
+                 | Some t ->
+                     inf.MemberSites
+                     |> List.tryFind (fun (off, _) -> off = t.Offset)
+                     |> Option.bind (fun (_, tn) -> dictTryFind r.Members (tn + "." + t.Text))
+                 | None -> None)
+            | None -> None
+        let def =
+            match this.DefinitionAt path offset with
+            | Some d -> Some d
+            | None -> memberDefAt ()
+        match def with
+        | Some d when d.Path <> Builtin.path ->
+            let seen = dictNew<string, bool> ()
+            let out = vecNew<string * int * int> ()
+            let add (file : string) (off : int) (len : int) =
+                let key = file + ":" + string off
+                if (dictTryFind seen key).IsNone then
+                    dictSet seen key true
+                    vecAdd out (file, off, len)
+            add d.Path d.Offset d.Length
+            // the spellings this definition answers to as a member
+            // ("Type.Member"), so dot-bound uses are found too
+            let memberKeys =
+                dictPairs r.Members
+                |> List.filter (fun (_, md) -> md.Path = d.Path && md.Offset = d.Offset)
+                |> List.map fst
+            for file, (b, inf) in dictPairs r.Files do
+                for u in b.Resolutions do
+                    if u.Def.Path = d.Path && u.Def.Offset = d.Offset then
+                        add file u.UseOffset u.UseLength
+                if not (List.isEmpty memberKeys) then
+                    for off, tn in inf.MemberSites do
+                        if List.contains (tn + "." + d.Name) memberKeys then
+                            add file off (strLen d.Name)
+            vecToList out |> List.sortBy (fun (f, o, _) -> (f, o))
+        | _ -> []
+
     member this.HoverAt (path : string) (offset : int) : string option =
         match this.DefinitionAt path offset with
         | Some d ->

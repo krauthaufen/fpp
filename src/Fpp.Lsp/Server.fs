@@ -125,6 +125,7 @@ type Server(ws : Workspace) =
                     "documentSymbolProvider", jbool true
                     "definitionProvider", jbool true
                     "hoverProvider", jbool true
+                    "renameProvider", jobj [ "prepareProvider", jbool true ]
                     "completionProvider", jobj [ "triggerCharacters", jarr [ jstr "." ] ] ]
                 "serverInfo", jobj [ "name", jstr "fpp-lsp"; "version", jstr "0.1" ] ])
         | "initialized" -> []
@@ -233,6 +234,55 @@ type Server(ws : Workspace) =
                            "detail", jstr (if ty = "" then full else ty)
                            "documentation", jstr full ])
             respond (jarr items)
+        | "textDocument/prepareRename" ->
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
+            let line = (fld (fld ps "position") "line").GetValue<int>()
+            let ch = (fld (fld ps "position") "character").GetValue<int>()
+            let text = ws.FileText path
+            let starts = Lines.starts text
+            let offset = (if line < starts.Length then starts.[line] else 0) + ch
+            // answering here is a PROMISE the rename will find every
+            // occurrence, so it runs the same search rename does
+            let occ =
+                ws.RenameAt path offset
+                |> List.tryFind (fun (f, o, l) -> f = path && offset >= o && offset < o + l)
+            (match occ with
+             | Some (_, o, l) ->
+                 let sl, sc = Lines.toLineCol starts o
+                 let el, ec = Lines.toLineCol starts (o + l)
+                 respond (jobj [ "range", range sl sc el ec
+                                 "placeholder", jstr (text.Substring (o, l)) ])
+             | None -> respond null)
+        | "textDocument/rename" ->
+            let path = this.MapPath (Uri.toPath ((fld (fld ps "textDocument") "uri").GetValue<string>()))
+            let line = (fld (fld ps "position") "line").GetValue<int>()
+            let ch = (fld (fld ps "position") "character").GetValue<int>()
+            let starts = Lines.starts (ws.FileText path)
+            let offset = (if line < starts.Length then starts.[line] else 0) + ch
+            let newName = (fld ps "newName").GetValue<string>()
+            let tick = "'".[0]
+            let goodChar (c : char) =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c = '_' || c = tick
+            let mutable validIdent =
+                newName.Length > 0
+                && not (newName.[0] >= '0' && newName.[0] <= '9')
+            for i in 0 .. newName.Length - 1 do
+                if not (goodChar newName.[i]) then validIdent <- false
+            let occs = if validIdent then ws.RenameAt path offset else []
+            if List.isEmpty occs then respond null
+            else
+                let byFile = occs |> List.groupBy (fun (f, _, _) -> f)
+                let changes = JsonObject()
+                for f, os in byFile do
+                    let fStarts = Lines.starts (ws.FileText f)
+                    let edits =
+                        os |> List.map (fun (_, o, l) ->
+                            let sl, sc = Lines.toLineCol fStarts o
+                            let el, ec = Lines.toLineCol fStarts (o + l)
+                            jobj [ "range", range sl sc el ec; "newText", jstr newName ])
+                    changes.[Uri.ofPath f] <- jarr edits
+                respond (jobj [ "changes", changes ])
         | "shutdown" -> respond null
         | "exit" ->
             exitRequested <- true
