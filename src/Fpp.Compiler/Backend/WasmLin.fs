@@ -566,13 +566,13 @@ let private emitSpop (m : Mod) : unit =
     lg f "$r"
     endFn f
 
-// $str_of_int(tagged): decimal, with a leading '-' for negatives.
+// $str_of_int(raw i32): decimal, with a leading '-' for negatives.
 let private emitStrOfInt (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     local f "$n" "i32"; local f "$neg" "i32"; local f "$d" "i32"
     local f "$p" "i32"; local f "$w" "i32"; local f "$t" "i32"
     localsDone f
-    lg f "$v"; untagi f; ls f "$n"
+    lg f "$v"; ls f "$n"
     // neg = n < 0 ; if so n = -n
     ic f 0; ls f "$neg"
     lg f "$n"; ic f 0; ins f "i32.lt_s"
@@ -1740,7 +1740,10 @@ let private gcPopInto (addr : LExpr) (off : int) : LStmt list =
     [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
       LStore (W, addr, off, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
 
-let private lowInt (n : int) : LExpr = LConstW ((n <<< 1) ||| 1)
+// int/bool/char are RAW i32 at rest (locals, params, returns, value stack) —
+// full 32-bit, no tag. lowTag/lowUntag convert to/from the tagged immediate
+// (2n+1) that a GC-scanned uniform slot needs to tell an int from a pointer.
+let private lowInt (n : int) : LExpr = LConstW n
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
 
@@ -1965,7 +1968,7 @@ let rec private shapeOfName (nm : string) : CmpShape =
 let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExpr) : LExpr =
     match sh with
     | ShScalar ->
-        LPrim (SubW, [ LPrim (GtSW, [ lowUntag wa; lowUntag wb ]); LPrim (LtSW, [ lowUntag wa; lowUntag wb ]) ])
+        LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])
     // an opaque operand (a generic HOF's element, type unknown here): the safe
     // runtime comparator — correct for ints/strings/float/int64, a no-op (0) for
     // compound FK_TAGGED shapes it cannot identify at runtime.
@@ -2069,7 +2072,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         go xs
     | EIf (c, a, b) ->
         let r = freshTmp ctx
-        LDo ([ LIf (lowUntag (coreToLowE ctx c),
+        LDo ([ LIf (coreToLowE ctx c,
                     [ LSet (wReg r, coreToLowE ctx a) ],
                     [ LSet (wReg r, coreToLowE ctx b) ]) ],
              LGet (wReg r))
@@ -2081,10 +2084,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // the self-hosted emitter zip mismatched lists. `if a then b else false`.
     | EPrim ("&&", [ a; b ]) ->
         let r = freshTmp ctx
-        LDo ([ LIf (lowUntag (coreToLowE ctx a), [ LSet (wReg r, coreToLowE ctx b) ], [ LSet (wReg r, lowInt 0) ]) ], LGet (wReg r))
+        LDo ([ LIf (coreToLowE ctx a, [ LSet (wReg r, coreToLowE ctx b) ], [ LSet (wReg r, lowInt 0) ]) ], LGet (wReg r))
     | EPrim ("||", [ a; b ]) ->
         let r = freshTmp ctx
-        LDo ([ LIf (lowUntag (coreToLowE ctx a), [ LSet (wReg r, lowInt 1) ], [ LSet (wReg r, coreToLowE ctx b) ]) ], LGet (wReg r))
+        LDo ([ LIf (coreToLowE ctx a, [ LSet (wReg r, lowInt 1) ], [ LSet (wReg r, coreToLowE ctx b) ]) ], LGet (wReg r))
     // float AND float32 arithmetic: float32 rides an f64 box in this backend, so
     // an `s`-suffixed op lowers exactly like its `f` sibling (the f32 rounding
     // happens only when a value is demoted into a float32 slot).
@@ -2097,11 +2100,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
         let fop = match op.Substring (0, op.Length - 1) with | "<" -> LtF | ">" -> GtF | "<=" -> LeF | ">=" -> GeF | "=" -> EqF | _ -> NeF
-        lowTag (LPrim (fop, [ fa; fb ]))
+        (LPrim (fop, [ fa; fb ]))
     | EPrim (("u-f" | "u-s"), [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
     | EPrim ("u-l", [ a ]) -> lowBoxI ctx (LPrim (SubL, [ LConstL 0L; lowUnboxI (coreToLowE ctx a) ]))
-    | EPrim (("u-" | "u-i"), [ a ]) -> lowTag (LPrim (SubW, [ LConstW 0; lowUntag (coreToLowE ctx a) ]))
-    | EPrim (("unot" | "not"), [ a ]) -> lowTag (LPrim (EqW, [ lowUntag (coreToLowE ctx a); LConstW 0 ]))
+    | EPrim (("u-" | "u-i"), [ a ]) -> LPrim (SubW, [ LConstW 0; coreToLowE ctx a ])
+    | EPrim (("unot" | "not"), [ a ]) -> LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ])
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
@@ -2120,37 +2123,37 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // to i64 for the wasm shift (whose count operand must match the value type).
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<<<"; ">>>" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
-        let ib = LPrim (WToL, [ lowUntag (coreToLowE ctx b) ])
+        let ib = LPrim (WToL, [ (coreToLowE ctx b) ])
         let iop = if op.Substring (0, op.Length - 1) = "<<<" then ShlL else ShrSL
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
-        lowTag (LPrim (iop, [ ia; ib ]))
+        (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
     // list append: `a @ b` rebuilds a's spine onto b. Without this it fell to the
     // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
     // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
     // reached nil (0). Mirrors the GC backend's `$append`.
     | EPrim ("@", [ a; b ]) -> LCall ("$lappend", [ coreToLowE ctx a; coreToLowE ctx b ])
-    // |n| on a tagged int, branchless: (n ^ (n>>31)) - (n>>31)
+    // |n| on a raw int, branchless: (n ^ (n>>31)) - (n>>31)
     | EPrim ("abs", [ a ]) ->
         let t = freshTmp ctx
         let n = LGet (wReg t)
         let m = LPrim (ShrSW, [ n; LConstW 31 ])
-        LDo ([ LSet (wReg t, lowUntag (coreToLowE ctx a)) ], lowTag (LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ])))
+        LDo ([ LSet (wReg t, coreToLowE ctx a) ], LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ]))
     // the builtin `compare a b` (an unbound EVar in the unoptimised core):
     // -1/0/1 by the operands' static shape
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
         let sh = mergeShape (shapeOfExpr a) (shapeOfExpr b)
         let ra, rb, pre = evalRooted ctx a b
-        LDo (pre, lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        LDo (pre, (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
-        LDo (pre, lowTag (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        LDo (pre, (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
     // a comparison whose operands are a COMPOUND value (tuple/list/...), a STRING
     // (`=t`/`<t` — the `t` type suffix), or a STRUCTURAL `=@Type`/`<>@Type`
     // (records/unions): the tagged-int fast path below would compare heap
@@ -2170,20 +2173,16 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let cr = freshTmp ctx
         let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
         LDo (pre @ [ LSet (wReg cr, structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))) ],
-             lowTag (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
+             (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
     | EPrim (op, [ a; b ]) ->
-        // Tagged-int fast paths: with x tagged as 2x+1, addition is
-        // (a+b)-1 and subtraction (a-b)+1 — no untag/retag — and comparisons
-        // hold on the tagged words unchanged (2x+1 is monotonic and sign-
-        // preserving in x). Only *, /, % need the untagged operands.
+        // int is RAW i32: plain wasm arithmetic, no tag juggling. A comparison
+        // yields a raw 0/1 bool, which is also the raw representation.
         let bop = baseOp op
         let ta = coreToLowE ctx a
         let tb = coreToLowE ctx b
         match bop with
-        | "+" -> LPrim (SubW, [ LPrim (AddW, [ ta; tb ]); LConstW 1 ])
-        | "-" -> LPrim (AddW, [ LPrim (SubW, [ ta; tb ]); LConstW 1 ])
-        | "<" | ">" | "<=" | ">=" | "=" | "<>" -> lowTag (LPrim (intCmpOp bop, [ ta; tb ]))
-        | _ -> lowTag (LPrim (intArithOp bop, [ lowUntag ta; lowUntag tb ]))
+        | "<" | ">" | "<=" | ">=" | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
+        | _ -> LPrim (intArithOp bop, [ ta; tb ])
     | ETuple xs -> lowObj ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs)
     | EListLit xs -> lowList ctx xs
     // a collapsed one-field record IS its field value — no heap object
@@ -2268,7 +2267,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ir = freshTmp ctx
         let fv = freshTmpT ctx vty
         LDo ([ LSet (wReg ar, coreToLowE ctx arr)
-               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LSet (wReg ir, (coreToLowE ctx i))
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
              storBox ctx kind (LGet { Id = fv; RTy = vty }))
     | EFieldSet (EIndex (ek, arr, i), fname, _, v) when (podArrOf st ek).IsSome ->
@@ -2281,7 +2280,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ir = freshTmp ctx
         LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox kind (coreToLowE ctx v))
                LSet (wReg ar, coreToLowE ctx arr)
-               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LSet (wReg ir, (coreToLowE ctx i))
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     | EField (r, fname, owner) when (dictTryFind st.RecPod owner).IsSome ->
@@ -2333,7 +2332,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             let (off, kind) = (dictTryFind layout fn).Value
             let (sty, _) = (storLTy kind).Value
             (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
-        LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, lowUntag (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
+        LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
     | EIndexSet (ek, arr, i, v) when (podArrOf st ek).IsSome ->
         let (layout, stride) = (podArrOf st ek).Value
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
@@ -2345,7 +2344,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             let (off, kind) = (dictTryFind layout fn).Value
             let (sty, _) = (storLTy kind).Value
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
-        LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, lowUntag (coreToLowE ctx i)) ] @ copies, lowInt 0)
+        LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ] @ copies, lowInt 0)
     | EArrayCreate (ek, n, init) when (podArrOf st ek).IsSome ->
         let (layout, stride) = (podArrOf st ek).Value
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
@@ -2360,7 +2359,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcTid ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY 0); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
         let stmts =
-            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n)); LSet (wReg vr, coreToLowE ctx init) ]
+            [ LSet (wReg cnt, (coreToLowE ctx n)); LSet (wReg vr, coreToLowE ctx init) ]
             @ (if gc then [ LCallVoidS ("$spush", [ LGet (wReg vr) ]) ] else [])
             @ [ LSet (wReg bs, alloc) ]
             @ (if gc then [ LSet (wReg vr, LCall ("$spop", [])) ] else [])
@@ -2422,7 +2421,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let vty = storValTy sty
         let ir = freshTmp ctx
         let fv = freshTmpT ctx vty
-        LDo ([ LSet (wReg ir, lowUntag (coreToLowE ctx i))
+        LDo ([ LSet (wReg ir, (coreToLowE ctx i))
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4)) ],
              storBox ctx k (LGet { Id = fv; RTy = vty }))
     | EIndexSet (k, arr, i, v) when (storLTy k).IsSome ->
@@ -2431,7 +2430,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let fv = freshTmpT ctx vty
         let ir = freshTmp ctx
         LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox k (coreToLowE ctx v))
-               LSet (wReg ir, lowUntag (coreToLowE ctx i))
+               LSet (wReg ir, (coreToLowE ctx i))
                LStore (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     | EArray (_, xs) -> lowObj ctx CID_ARRAY 0 (LConstW (List.length xs) :: List.map (coreToLowE ctx) xs)
@@ -2442,15 +2441,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // at HDR+4 with stride 2; read one, zero-extended (load16_u), and tag it.
     | EIndex (_, arr, i) when shapeOfExpr arr = ShStr ->
         let ir = freshTmp ctx
-        LDo ([ LSet (wReg ir, lowUntag (coreToLowE ctx i)) ],
-             lowTag (LLoad (I16, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 2 ]) ]), HDR + 4)))
+        LDo ([ LSet (wReg ir, (coreToLowE ctx i)) ],
+             (LLoad (I16, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 2 ]) ]), HDR + 4)))
     | EIndex (_, arr, i) ->
-        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
+        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LLoad (W, addr, HDR)
     | EIndexSet (_, arr, i, v) ->
-        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ lowUntag (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
+        let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
-    | EArrayLen (_, arr) -> lowTag (LLoad (W, coreToLowE ctx arr, HDR))
+    | EArrayLen (_, arr) -> (LLoad (W, coreToLowE ctx arr, HDR))
     | EArrayCreate (k, n, init) when (storLTy k).IsSome ->
         let (sty, w) = (storLTy k).Value
         let vty = storValTy sty
@@ -2467,7 +2466,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let isZero = match init with EUnknown n | EApp (EUnknown n, _) -> n.StartsWith "$zero" | _ -> false
         let fill = if isZero then (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0) else storUnbox k (coreToLowE ctx init)
         let stmts =
-            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
+            [ LSet (wReg cnt, (coreToLowE ctx n))
               LSet ({ Id = fv; RTy = vty }, fill)
               LSet (wReg bs, alloc) ]
             @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
@@ -2482,7 +2481,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let bs = freshTmp ctx
         let it = freshTmp ctx
         let stmts =
-            [ LSet (wReg cnt, lowUntag (coreToLowE ctx n))
+            [ LSet (wReg cnt, (coreToLowE ctx n))
               LSet (wReg iv, coreToLowE ctx init) ]
             // GC: the fill value may be a heap pointer live across the array
             // allocation — push it over the safepoint and read it back
@@ -2499,25 +2498,25 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EUnknown n when n.StartsWith "$zero" -> lowInt 0
     | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
-        lowTag (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
+        (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
-        lowBoxI ctx (LPrim (WToL, [ lowUntag (coreToLowE ctx a) ]))
+        lowBoxI ctx (LPrim (WToL, [ (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
-        lowBoxF ctx (LPrim (WToF, [ lowUntag (coreToLowE ctx a) ]))
+        lowBoxF ctx (LPrim (WToF, [ (coreToLowE ctx a) ]))
     // char and int share the tagged-int representation, so `int c` / `char i`
     // are the identity
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#c" || n.StartsWith "char" -> coreToLowE ctx a
     // int from float: unbox, truncate, tag
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> lowTag (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     // int from int (widen/identity in the tagged model) and int truncations
     | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#t" || n.StartsWith "int#i" -> coreToLowE ctx a
     // byte / narrow: mask the tagged value's payload to 8 bits
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> lowTag (LPrim (AndW, [ lowUntag (coreToLowE ctx a); LConstW 0xFF ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> (LPrim (AndW, [ (coreToLowE ctx a); LConstW 0xFF ]))
     // the raw bits of a double, as int64 — read the boxed payload as i64
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
     // singleBits: a float32's raw i32 bits. float32 rides an f64 box here, so
     // re-demote to f32 and reinterpret (mirrors storUnbox for float32).
-    | EApp (EUnknown "singleBits", [ a ]) -> lowTag (LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
+    | EApp (EUnknown "singleBits", [ a ]) -> (LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
     // `float32 x`/`float16 x` FROM a float: round to f32 precision and keep the
     // value in its f64 box (demote then promote). Half rides the same box; f32
     // rounding is the closest we do without a dedicated f16 path.
@@ -2530,69 +2529,68 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "print", [ a ]) ->
         LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
-    | EApp (EUnknown "isNull", [ x ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
-    | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> lowTag (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
-    | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> lowTag (LCall ("$hashv", [ coreToLowE ctx a ]))
+    | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
+    | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    | EApp (EUnknown ("hash" | "$hash"), [ a ]) -> (LCall ("$hashv", [ coreToLowE ctx a ]))
     // cells: $cellof yields the cell POINTER (its storage, no deref); $cellget
     // reads through it; $cellset writes; $forcecell is a marker
     | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
     | EApp (EUnknown "$cellget", [ c ]) -> LLoad (W, coreToLowE ctx c, cellOff ())
     | EApp (EUnknown "$cellset", [ c; v ]) -> LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
     | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
-    | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> lowTag (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
-    | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> lowTag (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
+    | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
+    | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
     | EApp (EUnknown "$str.Contains", [ s; p ]) ->
-        lowTag (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
+        (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
     | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
-        lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
+        (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
     | EApp (EUnknown "$str.IndexOf#2", [ s; c ]) ->
-        lowTag (LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]))
+        (LCall ("$str_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]))
     | EApp (EUnknown "$str.IndexOf#3", [ s; p; from ]) ->
-        lowTag (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; lowUntag (coreToLowE ctx from) ]))
+        (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; (coreToLowE ctx from) ]))
     | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
-        lowTag (LCall ("$str_last_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]))
+        (LCall ("$str_last_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]))
     | EApp (EUnknown "$str.Split", [ s; c ]) ->
         // returns a heap string array (an even pointer), not a tagged value
-        LCall ("$str_split_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ])
+        LCall ("$str_split_char", [ coreToLowE ctx s; (coreToLowE ctx c) ])
     | EApp (EUnknown "$str.Contains#2", [ s; c ]) ->
-        lowTag (LPrim (GeSW, [ LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]); LConstW 0 ]))
+        (LPrim (GeSW, [ LCall ("$str_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]); LConstW 0 ]))
     | EApp (EUnknown "$str.StartsWith#2", [ s; c ]) ->
-        lowTag (LPrim (EqW, [ LCall ("$str_find_char", [ coreToLowE ctx s; lowUntag (coreToLowE ctx c) ]); LConstW 0 ]))
+        (LPrim (EqW, [ LCall ("$str_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]); LConstW 0 ]))
     | EApp (EUnknown "$str.EndsWith#2", [ s; c ]) ->
         // last occurrence index == len-1 (and >=0, which excludes the empty string)
         let sv = freshTmp ctx
         let nv = freshTmp ctx
         LDo ([ LSet (wReg sv, coreToLowE ctx s)
-               LSet (wReg nv, LCall ("$str_last_find_char", [ LGet (wReg sv); lowUntag (coreToLowE ctx c) ])) ],
-             lowTag (LPrim (AndW, [ LPrim (GeSW, [ LGet (wReg nv); LConstW 0 ])
-                                    LPrim (EqW, [ LGet (wReg nv); LPrim (SubW, [ LLoad (W, LGet (wReg sv), HDR); LConstW 1 ]) ]) ])))
+               LSet (wReg nv, LCall ("$str_last_find_char", [ LGet (wReg sv); (coreToLowE ctx c) ])) ],
+             LPrim (AndW, [ LPrim (GeSW, [ LGet (wReg nv); LConstW 0 ]); LPrim (EqW, [ LGet (wReg nv); LPrim (SubW, [ LLoad (W, LGet (wReg sv), HDR); LConstW 1 ]) ]) ]))
     | EApp (EUnknown "$str.ToUpper", [ s ]) -> LCall ("$str_upper", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.ToLower", [ s ]) -> LCall ("$str_lower", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.ToCharArray", [ s ]) -> LCall ("$str_chars", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.PadLeft", [ s; w ]) ->
-        LCall ("$str_pad", [ coreToLowE ctx s; lowUntag (coreToLowE ctx w); LConstW 32; LConstW 0 ])
+        LCall ("$str_pad", [ coreToLowE ctx s; (coreToLowE ctx w); LConstW 32; LConstW 0 ])
     | EApp (EUnknown "$str.PadRight", [ s; w ]) ->
-        LCall ("$str_pad", [ coreToLowE ctx s; lowUntag (coreToLowE ctx w); LConstW 32; LConstW 1 ])
+        LCall ("$str_pad", [ coreToLowE ctx s; (coreToLowE ctx w); LConstW 32; LConstW 1 ])
     | EApp (EUnknown ("$str.TrimStart" | "$str.TrimStart#2"), [ s; cs ]) ->
         // cs is either a tagged char or a tagged-char array — the helper tests the low bit
         LCall ("$str_trim_start_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
     | EApp (EUnknown ("$str.TrimEnd" | "$str.TrimEnd#2"), [ s; cs ]) ->
         LCall ("$str_trim_end_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
     | EApp (EUnknown "$str.Insert", [ s; i; v ]) ->
-        LCall ("$str_insert", [ coreToLowE ctx s; lowUntag (coreToLowE ctx i); coreToLowE ctx v ])
+        LCall ("$str_insert", [ coreToLowE ctx s; (coreToLowE ctx i); coreToLowE ctx v ])
     | EApp (EUnknown "$str.Remove", [ s; i ]) ->
-        LCall ("$strsub", [ coreToLowE ctx s; LConstW 0; lowUntag (coreToLowE ctx i) ])
+        LCall ("$strsub", [ coreToLowE ctx s; LConstW 0; (coreToLowE ctx i) ])
     | EApp (EUnknown "$str.Remove#2", [ s; i; n ]) ->
-        LCall ("$str_remove2", [ coreToLowE ctx s; lowUntag (coreToLowE ctx i); lowUntag (coreToLowE ctx n) ])
+        LCall ("$str_remove2", [ coreToLowE ctx s; (coreToLowE ctx i); (coreToLowE ctx n) ])
     | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
     | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> LCall ("$str_replace", [ coreToLowE ctx s; coreToLowE ctx a; coreToLowE ctx b ])
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
-        LCall ("$strsub", [ coreToLowE ctx s; lowUntag (coreToLowE ctx start); lowUntag (coreToLowE ctx len) ])
+        LCall ("$strsub", [ coreToLowE ctx s; (coreToLowE ctx start); (coreToLowE ctx len) ])
     | EApp (EUnknown "$str.Substring", [ s; start ]) ->
         // one-arg Substring runs to the end: len = s.Length - start
         let ts = freshTmp ctx
         let ti = freshTmp ctx
-        LDo ([ LSet (wReg ts, coreToLowE ctx s); LSet (wReg ti, lowUntag (coreToLowE ctx start)) ],
+        LDo ([ LSet (wReg ts, coreToLowE ctx s); LSet (wReg ti, (coreToLowE ctx start)) ],
              LCall ("$strsub", [ LGet (wReg ts); LGet (wReg ti); LPrim (SubW, [ LLoad (W, LGet (wReg ts), 4); LGet (wReg ti) ]) ]))
     | EApp (EUnknown "$listLength", [ l ]) ->
         // walk the cons cells ([cid][head][tail], null = 0) counting nodes
@@ -2603,7 +2601,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                LWhile (LPrim (NeW, [ LGet (wReg p); LConstW 0 ]),
                        [ LSet (wReg n, LPrim (AddW, [ LGet (wReg n); LConstW 1 ]))
                          LSet (wReg p, LLoad (W, LGet (wReg p), HDR + 4)) ]) ],
-             lowTag (LGet (wReg n)))
+             (LGet (wReg n)))
     | EApp (EUnknown "failwith", [ msg ]) ->
         LDo ([ LThrow (lowFailure ctx (coreToLowE ctx msg)) ], lowInt 0)
     | EApp (EUnknown "raise", [ ex ]) ->
@@ -2615,7 +2613,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LThrow (lowFailure ctx msg) ], lowInt 0)
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     // string of a char: a fresh one-unit string (NOT the decimal of its code)
-    | EApp (EUnknown "string#c", [ a ]) -> LCall ("$str_of_char", [ lowUntag (coreToLowE ctx a) ])
+    | EApp (EUnknown "string#c", [ a ]) -> LCall ("$str_of_char", [ (coreToLowE ctx a) ])
     // string of a string is the identity
     | EApp (EUnknown "string#t", [ a ]) -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
@@ -2654,12 +2652,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 let tests = lowPatTest ctx sc "$mnext" pat
                 let guardStmt =
                     match guard with
-                    | Some g -> [ LBreakIf ("$mnext", LPrim (EqW, [ lowUntag (coreToLowE ctx g); LConstW 0 ])) ]
+                    | Some g -> [ LBreakIf ("$mnext", LPrim (EqW, [ (coreToLowE ctx g); LConstW 0 ])) ]
                     | None -> []
                 LBlock ("$mnext", tests @ guardStmt @ [ LSet (wReg mr, coreToLowE ctx body); LBreak "$mdone" ]))
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
-    | ETypeTest (tn, e2) -> lowTag (lowTypeTest ctx tn (coreToLowE ctx e2))
+    | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
     | ECast (tn, e2, true) when not (List.isEmpty (typeTestIds st tn)) ->
         // `:?>` downcast to a type we carry a class-id for: check the header
         // and trap on a mismatch, then yield the value unchanged
@@ -2717,7 +2715,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                 let tests = lowPatTest ctx exn "$cnext" pat
                 let guardStmt =
                     match guard with
-                    | Some g -> [ LBreakIf ("$cnext", LPrim (EqW, [ lowUntag (coreToLowE ctx g); LConstW 0 ])) ]
+                    | Some g -> [ LBreakIf ("$cnext", LPrim (EqW, [ (coreToLowE ctx g); LConstW 0 ])) ]
                     | None -> []
                 LBlock ("$cnext", tests @ guardStmt @ [ LSet (wReg res, coreToLowE ctx handler); LBreak "$tdone" ]))
         LDo ([ LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
@@ -2777,8 +2775,8 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
               | None -> [ LSet (wReg id, coreToLowE ctx rhs) ])
          | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ]
          | None -> err ctx.LSt ("wasm-linear LowIR: assignment to unbound " + v.Name); [ LEval (coreToLowE ctx rhs) ])
-    | EIf (c, a, b) -> [ LIf (lowUntag (coreToLowE ctx c), coreToLowS ctx a, coreToLowS ctx b) ]
-    | EWhile (c, b) -> [ LWhile (lowUntag (coreToLowE ctx c), coreToLowS ctx b) ]
+    | EIf (c, a, b) -> [ LIf (coreToLowE ctx c, coreToLowS ctx a, coreToLowS ctx b) ]
+    | EWhile (c, b) -> [ LWhile (coreToLowE ctx c, coreToLowS ctx b) ]
     | ELit LUnit -> []
     | EApp (EUnknown "prints", [ a ]) -> [ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ]
     | _ -> [ LEval (coreToLowE ctx e) ]
@@ -2923,9 +2921,9 @@ and private storBox (ctx : LowCtx) (k : string) (raw : LExpr) : LExpr =
     | "float" | "double" -> lowBoxF ctx raw
     | "int64" | "uint64" -> lowBoxI ctx raw
     | "float32" | "single" -> lowBoxF ctx (LPrim (PromF, [ LPrim (Bits2F, [ raw ]) ]))
-    | "sbyte" -> lowTag (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 24 ]); LConstW 24 ]))
-    | "int16" -> lowTag (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 16 ]); LConstW 16 ]))
-    | _ -> lowTag raw   // byte / uint16: the unsigned load already zero-extended
+    | "sbyte" -> (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 24 ]); LConstW 24 ]))
+    | "int16" -> (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 16 ]); LConstW 16 ]))
+    | _ -> raw   // byte / uint16: the unsigned load already zero-extended; raw at rest
 // the uniform tagged word -> the raw packed slot value (store8/store16 truncate,
 // so a narrow int just needs its low bits untagged).
 and private storUnbox (k : string) (word : LExpr) : LExpr =
@@ -2933,7 +2931,7 @@ and private storUnbox (k : string) (word : LExpr) : LExpr =
     | "float" | "double" -> lowUnboxF word
     | "int64" | "uint64" -> lowUnboxI word
     | "float32" | "single" -> LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF word ]) ])
-    | _ -> lowUntag word
+    | _ -> word
 
 // test `pat` against the value in register `scrutReg`; produce statements that
 // LBreak to `fail` on mismatch and bind pattern variables on the matching
@@ -2945,8 +2943,8 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PWild -> []
     | PVar (v, _) -> [ LSet (wReg (freshReg ctx (key v)), sc) ]
     | PAs (p, v, _) -> LSet (wReg (freshReg ctx (key v)), sc) :: lowPatTest ctx scrutReg fail p
-    | PLit (LInt s) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (parseI32Lit s) ])) ]
-    | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (if b then 1 else 0) ])) ]
+    | PLit (LInt s) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (parseI32Lit s) ])) ]
+    | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (if b then 1 else 0) ])) ]
     | PLit LUnit -> []
     | PCtor (case, _, subs) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
@@ -2979,7 +2977,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PListLit (x :: rest) ->
         // an exact list literal [a; b; …] is a :: b :: … :: []
         lowPatTest ctx scrutReg fail (PCons (x, PListLit rest))
-    | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ lowUntag sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
+    | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
     | PLit LNull -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
     | PLit (LFloat s) -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF (parseFloatLit s) ])) ]
     | PLit (LString raw) ->
