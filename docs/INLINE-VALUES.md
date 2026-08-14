@@ -104,3 +104,42 @@ record's declared fields in order. Written in `emit`'s setup pass; read only by
    collector.
 4. **Reconcile `RecPod` + array stride to `layoutOf`** and delete the
    scalars-first scheme.
+
+## GC registration — the runtime ALREADY supports arbitrary ref-maps
+
+The anticipated wall ("the collector only scans a contiguous ref suffix, so
+.NET-sequential interleaved refs need a new scan kind") **does not exist**.
+`fpprt-embedder.h` `struct fpprt_type_intern` carries `const uint32_t *refoffs`
+(byte offsets of the ref words) and `FPPRT_EMB_KIND_STRUCT` scans exactly them:
+
+```c
+for (i = 0; i < t->nrefs; i++) {
+    slot = obj + t->refoffs[i];            // ARBITRARY byte offset
+    if (*slot && !(*slot & 1)) visit(...);
+}
+```
+
+`FPPRT_EMB_KIND_POD_ARRAY` does the same per element (contiguous struct arrays,
+interleaved refs), and the shadow-stack `pods` path scans stack structs by the
+same `refoffs`. RecPod reorders scalars-first only to fit the *simpler*
+FK_TAGGED suffix scan — it is a choice, not a runtime limit.
+
+`fpprt_wasm_reg_type(tid, size, kind, nrefs, refoffs, name)` (the shim's
+`$fpreg`) already takes the `refoffs` pointer; the backend passes `refoffs = 0`
+today (WasmLin.fs ~4009). So the concrete S1 GC work is:
+
+1. **A static, non-moving refoffs pool in the shim.** `refoffs` is read by the
+   collector during tracing, so it must not live in the moving heap. Add
+   `static uint32_t g_refoffs[N];` + a base accessor (mirror `g_tid2cid` /
+   `fpprt_wasm_reg_type`), rebuild the reactor. This is the ONLY new runtime
+   plumbing — small and additive.
+2. **`gcTid` / `TidRegs` carry a ref-offset list** (from `layoutOf.RefMask` →
+   byte offsets of the set words). The startup `$fpreg_all` pass writes each
+   list into the pool and passes `(nrefs, &g_refoffs[k])` to `$fpreg`.
+3. **Register concrete records/structs as `FK_STRUCT`** with that map instead of
+   `FK_TAGGED` + scalars-first, and struct arrays as `FK_POD_ARRAY`.
+4. **Rebuild field offsets / array stride `.NET`-sequentially from `layoutOf`**
+   (construction, access, field-set, pattern binds all read the same layout).
+
+Scans are already correct once the map is supplied; this is backend emission +
+a small shim pool, gated by the abi harness and the gc self-host.
