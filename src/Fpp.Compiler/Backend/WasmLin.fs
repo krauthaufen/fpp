@@ -1894,6 +1894,12 @@ type private LowCtx =
       /// fields (EField/EIndex of type `'k`) carries no bare type-var expr for
       /// tyVarIdOfExpr to key on, so it falls back to this unambiguous witness.
       mutable ClassWit : int option
+      /// while emitting a lifted lambda body whose env is rooted on the shadow
+      /// stack: the stable ADDRESS of the env's root slot (`$roots + $sp@entry`).
+      /// Capture reads dereference `[EnvAddr]` so a GC that relocates the env
+      /// mid-body is seen — the wasm-local `EnvReg` would go stale. None when the
+      /// env is not rooted (no captures, or a top-level function).
+      mutable EnvAddr : LExpr option
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -3268,7 +3274,18 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                     | Some g -> [ LBreakIf ("$cnext", LPrim (EqW, [ (coreToLowE ctx g); LConstW 0 ])) ]
                     | None -> []
                 LBlock ("$cnext", tests @ guardStmt @ [ LSet (wReg res, coreToLowE ctx handler); LBreak "$tdone" ]))
-        LDo ([ LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
+        // GC: an exception unwinds the body's wasm frames WITHOUT running their
+        // shadow-stack pops (a lifted lambda's env root, or any in-flight spush),
+        // so restore $sp to its try-entry value before the handler runs — else
+        // every caught exception leaks roots until the shadow stack overflows.
+        if gc then
+            let spSave = freshTmp ctx
+            let restore = LSetGlobal ("$sp", LGet (wReg spSave))
+            let catchStmts = restore :: catchStmts
+            LDo ([ LSet (wReg spSave, LGetGlobal "$sp")
+                   LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
+        else
+            LDo ([ LTryStmt (coreToLowE ctx body, wReg res, wReg exn, catchStmts) ], LGet (wReg res))
     | _ ->
         let what =
             match e with
@@ -3685,7 +3702,11 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     | Some id -> LGet (wReg id)
     | None ->
         match dictTryFind st.Captures k with
-        | Some slot when ctx.EnvReg >= 0 -> LLoad (W, LGet (wReg ctx.EnvReg), HDR + 8 + 4 * slot)
+        | Some slot when ctx.EnvReg >= 0 ->
+            // read the env through its rooted slot when the body roots it, so a
+            // GC that relocated the env mid-body is reflected; else the wasm-local.
+            let envPtr = match ctx.EnvAddr with Some a -> LLoad (W, a, 0) | None -> LGet (wReg ctx.EnvReg)
+            LLoad (W, envPtr, HDR + 8 + 4 * slot)
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
@@ -4043,7 +4064,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | _ -> ()
 
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -4116,14 +4137,36 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
+    // GC: root the env on the shadow stack for the body's duration when the body
+    // reads captures. A collection triggered by any allocation in the body can
+    // relocate the env; the wasm-local `envId` is then stale, so every capture
+    // read (`[env+8+4*slot]`) would hit a moved/collected object. Storing the env
+    // in a scanned root slot lets the collector update it in place; capture reads
+    // go through the slot's stable address (ctx.EnvAddr). Self-host blam14: the
+    // recursive closure `go` rebuilt its env by re-reading its own captured
+    // `triviaOne` AFTER a lex allocation, capturing a stale pointer.
+    let rootEnv = gc && not (dictPairs st.Captures |> List.isEmpty)
+    let envSlotReg = if rootEnv then Some (freshTmp ctx) else None
+    (match envSlotReg with Some r -> ctx.EnvAddr <- Some (LGet (wReg r)) | None -> ())
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
-    let bodyLow = coreToLowE ctx body
+    let bodyLow0 = coreToLowE ctx body
     st.GapSink <- None
+    let bodyLow =
+        match envSlotReg with
+        | Some r ->
+            let resReg = freshTmp ctx
+            LDo ([ LSet (wReg r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+                   LStore (W, LGet (wReg r), 0, LGet (wReg envId))
+                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ]))
+                   LSet (wReg resReg, bodyLow0)
+                   LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ],
+                 LGet (wReg resReg))
+        | None -> bodyLow0
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
         vecAdd st.Warnings ("stubbed lambda " + lamName + " (" + vecGet sink 0 + ")")
