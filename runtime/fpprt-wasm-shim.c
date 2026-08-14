@@ -53,3 +53,13 @@ uint32_t fpprt_tid2cid_base(void) { return (uint32_t)(uintptr_t)g_tid2cid; }
 #define FPPRT_WASM_NREFOFFS 65536
 static uint32_t g_refoffs[FPPRT_WASM_NREFOFFS];
 uint32_t fpprt_wasm_refoffs_base(void) { return (uint32_t)(uintptr_t)g_refoffs; }
+
+/* value-witness tables for the generic ABI: a flat pool of {size,align,refMask}
+ * triples. A generic function receives a POINTER into here per type parameter
+ * (a concrete type's witness is a compile-time constant interned once); a
+ * generic aggregate reads the element witness's refMask to pick its FK_STRUCT
+ * scan map. Static, never moves — witness pointers thread through the call
+ * graph as plain args and must stay valid across a moving collection. */
+#define FPPRT_WASM_NWITNESS 12288
+static uint32_t g_witnesses[FPPRT_WASM_NWITNESS];
+uint32_t fpprt_wasm_witness_base(void) { return (uint32_t)(uintptr_t)g_witnesses; }
