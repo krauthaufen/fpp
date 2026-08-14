@@ -567,8 +567,15 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                 // UNCONSTRAINED at this call: nothing observes
                                 // it, so it carries no layout requirement and
                                 // canonicalizes (this is not a deopt — there
-                                // is no representation to specialize for)
-                                if isTemplate then t else "obj"
+                                // is no representation to specialize for).
+                                // EXCEPT under the wasm-linear witness ABI: a
+                                // Canon body is emitted once but GENERIC, taking
+                                // a runtime witness per type-var. An inner call
+                                // that forwards one of those vars (`#id`) must
+                                // KEEP naming it so the backend forwards the
+                                // caller's witness — collapsing it to "obj" gave
+                                // a ref witness and scanned raw scalars as refs.
+                                if isTemplate || stampScalars then t else "obj"
                         else t)
                 // a TUPLE argument stamps by its elements only where a class
                 // CONSTRAINT observes that variable — element names are what
@@ -627,7 +634,16 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                             Stamp inst
                         | other -> other
                 (match cls with
-                 | Canon -> EVar (v, sch)
+                 // The shared (Canon) body is emitted once and generic. Under
+                 // the wasm-linear witness ABI (stampScalars) a raw scalar like
+                 // `int` is NOT a tagged word — `map<int,int>` and
+                 // `map<string,string>` share the SAME body but need different
+                 // element witnesses (raw vs ref). So the concrete instantiation
+                 // must survive on the call for the backend to pass the right
+                 // witness; dropping it defaulted every element to a ref witness
+                 // and made the GC scan raw ints as pointers. The wasm-GC path
+                 // (stampScalars = false) keeps the plain EVar and is unchanged.
+                 | Canon -> if stampScalars then EVarI (v, sch, inst) else EVar (v, sch)
                  | Unclassifiable why ->
                      if not isTemplate || nameless then
                          vecAdd errors ("cannot specialize '" + v.Name + "' in " + owner + ": " + why)

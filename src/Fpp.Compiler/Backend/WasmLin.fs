@@ -2132,80 +2132,6 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
     else
         witnessPtrRM ctx.LSt 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
 
-// a DECREASING id for backend-only fresh type vars used in trial unification —
-// negative, so it never collides with a real (non-negative) var id or a
-// ctx.Witness key (which are the enclosing fn's Quantified ids).
-let mutable private witnessFreshId = -1
-let private witnessFresh () : Type =
-    // a HIGH level so unification binds THIS fresh var to the caller's real var
-    // (the younger/higher-level var is the one bound), letting us read the
-    // caller's type-var id back for witness forwarding.
-    let id = witnessFreshId in witnessFreshId <- witnessFreshId - 1
-    TVar { Id = id; Level = 1000000000; Link = None; Rigid = false }
-
-let rec private substTy (m : Dict<int, Type>) (t : Type) : Type =
-    match prune t with
-    | TVar v -> (match dictTryFind m v.Id with Some r -> r | None -> TVar v)
-    | TCon (n, args) -> TCon (n, List.map (substTy m) args)
-    | TFun (a, b) -> TFun (substTy m a, substTy m b)
-    | TTuple ts -> TTuple (List.map (substTy m) ts)
-    | TApp (h, args) -> TApp (substTy m h, List.map (substTy m) args)
-
-// best-effort static type of an expression — enough to pin a generic call's
-// type args by unifying the callee's params against the args' types.
-let rec private typeOfExpr (e : Expr) : Type =
-    match e with
-    | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then TCon ("int64", []) else TCon ("int", [])
-    | ELit (LBool _) -> TCon ("bool", [])
-    | ELit (LChar _) -> TCon ("char", [])
-    | ELit (LFloat _) -> TCon ("float", [])
-    | ELit (LString _) -> TCon ("string", [])
-    | ELit LUnit -> TCon ("unit", [])
-    | EVar (_, sch) | EVarI (_, sch, _) -> sch.Body
-    | ELam (ps, b) -> List.foldBack (fun (_, (sch : Scheme)) acc -> TFun (sch.Body, acc)) ps (typeOfExpr b)
-    | EApp (f, args) ->
-        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> witnessFresh ())
-        peel (typeOfExpr f) (List.length args)
-    | EListLit (x :: _) -> TCon ("list", [ typeOfExpr x ])
-    | EListLit [] -> TCon ("list", [ witnessFresh () ])
-    | ETuple xs -> TTuple (List.map typeOfExpr xs)
-    | EPrim (op, args) ->
-        let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
-        (match b with
-         | "+" | "-" | "*" | "/" | "%" when op <> b -> if op.EndsWith "l" then TCon ("int64", []) else TCon ("float", [])
-         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" -> TCon ("int", [])
-         | "<" | ">" | "<=" | ">=" | "=" | "<>" | "&&" | "||" | "not" -> TCon ("bool", [])
-         | "::" -> (match args with h :: _ -> TCon ("list", [ typeOfExpr h ]) | _ -> TCon ("list", [ witnessFresh () ]))
-         | _ -> (match args with a :: _ -> typeOfExpr a | _ -> witnessFresh ()))
-    | EIf (_, a, b) -> (match prune (typeOfExpr a) with TVar _ -> typeOfExpr b | ta -> ta)
-    | ELet (_, _, _, _, b) -> typeOfExpr b
-    | ESeq xs -> (match List.tryLast xs with Some b -> typeOfExpr b | None -> witnessFresh ())
-    | EMatch (_, cs) | ETry (_, cs) -> (match cs with (_, _, b) :: _ -> typeOfExpr b | [] -> witnessFresh ())
-    | _ -> witnessFresh ()
-
-// the witnesses a generic call must pass: fresh-instantiate the callee's scheme,
-// TRIAL-unify its parameter types against the arg types, then read each
-// quantified var's resolved type. A concrete resolution -> that type's static
-// witness; a resolution to a CALLER type-var -> forward the caller's witness.
-// The trial is fully undone (no permanent unifier state). Returns None for a
-// var that stayed unresolved (the caller reports rather than mis-scanning).
-let private deriveWitnessArgs (ctx : LowCtx) (sch : Scheme) (args : Expr list) : LExpr option list =
-    let m = dictNew<int, Type> ()
-    let fresh = sch.Quantified |> List.map (fun qv -> let fv = witnessFresh () in dictSet m qv.Id fv; fv)
-    let instBody = substTy m sch.Body
-    let rec peelParams t n = if n <= 0 then [] else (match prune t with TFun (a, r) -> a :: peelParams r (n - 1) | _ -> [])
-    let paramTys = peelParams instBody (List.length args)
-    let n = min (List.length paramTys) (List.length args)
-    let trial = newTrial ()
-    List.iter2 (fun pty a -> unifyWith (Some trial) pty (typeOfExpr a) |> ignore) (List.truncate n paramTys) (List.truncate n args)
-    let out =
-        fresh |> List.map (fun fv ->
-            match prune fv with
-            | TVar v -> (match dictTryFind ctx.Witness v.Id with Some reg -> Some (LGet (wReg reg)) | None -> None)
-            | resolved -> Some (witnessPtr ctx.LSt resolved))
-    undoTrial trial
-    out
-
 // (param abi types, return abi type) of a top-level function: peel `arity`
 // arrows off its scheme. None when every slot is a plain word (nothing to
 // specialize — the uniform $lfn signature already fits).
@@ -2965,18 +2891,20 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConstRaw st preludeSrc)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
-    | EApp (((EVar (v, sch) | EVarI (v, sch, _))), args)
+    | EApp (((EVar (v, _) | EVarI (v, _, _)) as hd), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
         // a generic callee takes hidden LEADING witness pointers, one per
-        // quantified var. Derive them by trial-unifying the callee's parameter
-        // types against the arg types (undone after) and reading each var's
-        // resolution: a concrete type -> its static witness, a caller type-var
-        // -> forward the caller's witness param.
+        // quantified var, positionally matched to the call's type-arg names
+        // (EVarI.inst, recorded by Infer): concrete name -> its static witness,
+        // "#N" -> forward the enclosing witness param.
+        let inst = match hd with EVarI (_, _, i) -> i | _ -> []
         let witnessArgs =
             match dictTryFind st.FuncWitness (key v) with
-            | Some _ ->
-                deriveWitnessArgs ctx sch args
-                |> List.map (fun o -> match o with Some w -> w | None -> witnessPtrRM st 4 4 1)
+            | Some vids ->
+                vids |> List.mapi (fun i _ ->
+                    match List.tryItem i inst with
+                    | Some nm -> witnessArgOfName ctx nm
+                    | None -> witnessPtrRM st 4 4 1)
             | None -> []
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
