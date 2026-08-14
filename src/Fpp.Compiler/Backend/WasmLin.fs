@@ -103,6 +103,10 @@ type private St =
       mutable Captures : Dict<string, int>
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
+      /// record/class name -> its fields as (name, declared-type-string), ALL
+      /// records (RecFieldTys is [<Struct>]-only). Lets a `$cellget` of a
+      /// class-field cell resolve the field's scalar content to RAW.
+      RecFieldTypes : Dict<string, (string * string) list>
       /// inline value-type layout (repr step 1): a record/struct with >=1 scalar
       /// field stores its fields RAW inline. Fields are ordered SCALARS-FIRST,
       /// REFS-LAST; a scalar rides raw (`f64`/`i64`/packed), a ref/generic field
@@ -1927,9 +1931,23 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
             | EVar (v, _) | EVarI (v, _, _) -> Some (key v)
             | EApp (EUnknown "$cellof", [ inner ]) -> cellKey inner
             | _ -> None
-        (match cellKey c |> Option.bind (fun k -> dictTryFind st.CellKind k) with
-         | Some k -> k
-         | None -> refKindOfExpr e)
+        // a class-field cell (`$cellget(this.field)`): the field holds a byref
+        // cell whose declared content type names the scalar. A concrete raw
+        // scalar content (`&int`) resolves to RAW so the aggregate that stores
+        // the value excludes it from its scan map. Only ever RKGen -> RKRaw for a
+        // proven scalar; anything else falls back (never the reverse).
+        let fieldCellKind () : RefKind option =
+            match c with
+            | EField (_, f, owner) ->
+                match dictTryFind st.RecFieldTypes owner |> Option.bind (fun fs -> fs |> List.tryPick (fun (fn, ty) -> if fn = f then Some ty else None)) with
+                | Some ty ->
+                    let inner = if ty.StartsWith "&" then ty.Substring 1 else ty
+                    if rawScalarName inner then Some RKRaw else None
+                | None -> None
+            | _ -> None
+        match cellKey c |> Option.bind (fun k -> dictTryFind st.CellKind k) with
+        | Some k -> k
+        | None -> match fieldCellKind () with Some k -> k | None -> refKindOfExpr e
     | _ -> refKindOfExpr e
 
 // for an aggregate allocated inside a GENERIC body, the (slot index, witness
@@ -4113,7 +4131,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
@@ -4128,6 +4146,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DRecord (n, _, fs, _) ->
             dictSet st.RecFields n (fs |> List.map fst)
+            dictSet st.RecFieldTypes n fs
             if (dictTryFind st.ClassId n).IsNone then (dictSet st.ClassId n nextCid; nextCid <- nextCid + 1)
         | DUnion (uname, _, cs) ->
             let cid = match dictTryFind st.ClassId uname with Some c -> c | None -> (let c = nextCid in dictSet st.ClassId uname c; nextCid <- nextCid + 1; c)
