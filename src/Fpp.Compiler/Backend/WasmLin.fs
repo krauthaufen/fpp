@@ -63,6 +63,15 @@ type private St =
       /// a scalar result. Safe because a top-level fn is only ever direct-called
       /// (first-class uses eta-expand to a lambda that itself does a direct call).
       FuncSig : Dict<string, LTy list * LTy>
+      /// a top-level generic function's quantified type-var ids, in order. It
+      /// receives one hidden LEADING witness-pointer param per id; the direct
+      /// caller prepends the matching witnesses. Empty/absent = non-generic.
+      FuncWitness : Dict<string, int list>
+      /// interned value-witness tables: a "size:align:refMask" key -> its BYTE
+      /// offset in the static g_witnesses pool. Deduped, emitted at startup.
+      Witnesses : Dict<string, int>
+      WitnessData : Vec<int * int * int * int>   // (offset, size, align, refMask)
+      mutable WitnessCur : int
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
       /// `extern` host imports (readTextRaw, preludeSourceRaw, …). WasmLin has
@@ -211,6 +220,11 @@ let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
 let mutable private gcListTid = 0
 let mutable private gcIterTid = 0
+// FK_STRUCT cons tids selected at a GENERIC cons site by the element witness's
+// refMask: RAW head (scan tail only) vs REF head (scan head+tail). Both map to
+// CID_LIST so $isBuiltinSeq still recognises them.
+let mutable private gcConsRawTid = 0
+let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
@@ -243,6 +257,7 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_wasm_roots_register" "$rootsreg" [ "i32" ] []
     importFn m "fpprt" "fpprt_tid2cid_base" "$t2cbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_refoffs_base" "$refoffsbase" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_wasm_witness_base" "$witnessbase" [] [ "i32" ]
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -335,6 +350,22 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
          | [] -> RKGen
          | x :: rest -> if List.forall (fun k -> k = x) rest then x else RKGen)
     | _ -> RKGen
+
+// the type-var id of an expression whose value's type IS a type parameter (a
+// generic aggregate element). Matches the RKGen cases of refKindOfExpr; used to
+// find the witness param that describes the element for the GC scan map.
+let rec private tyVarIdOfExpr (e : Expr) : int option =
+    let ofTy t = match prune t with TVar v -> Some v.Id | _ -> None
+    match e with
+    | EVar (_, sch) | EVarI (_, sch, _) -> ofTy sch.Body
+    | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
+        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
+        ofTy (peel sch.Body (List.length args))
+    | EIf (_, a, b) -> (match tyVarIdOfExpr a with Some x -> Some x | None -> tyVarIdOfExpr b)
+    | ELet (_, _, _, _, body) -> tyVarIdOfExpr body
+    | ESeq xs -> (match List.tryLast xs with Some b -> tyVarIdOfExpr b | None -> None)
+    | EMatch (_, cs) | ETry (_, cs) -> cs |> List.tryPick (fun (_, _, b) -> tyVarIdOfExpr b)
+    | _ -> None
 
 // where a captured-mutable cell keeps its value: at offset 0 in the standalone
 // headerless cell, or after the fpprt header in GC mode (a cell is a TAGGED
@@ -1741,6 +1772,10 @@ type private LowCtx =
       // contract (box-elim cancels it back in arithmetic); a capture re-boxes
       // into the closure env. Captured mutables are cells, so never listed here.
       VarScalar : Dict<string, LTy>
+      // in a generic function: its quantified type-var id -> the register of the
+      // hidden witness-pointer param for that type. A generic aggregate reads the
+      // element type's witness through here to pick its GC scan map.
+      Witness : Dict<int, int>
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -2064,6 +2099,113 @@ and private layByName (resolve : string -> (string * string) list option) (nm0 :
 let private layoutOf (st : St) (t : Type) : Layout =
     layoutOfWith (fun n -> dictTryFind st.RecFieldTys n) t
 
+// intern a {size,align,refMask} witness (deduped into the static g_witnesses
+// pool) and return a runtime pointer to it: $witnesses + offset.
+let private witnessPtrRM (st : St) (size : int) (align : int) (refMask : int) : LExpr =
+    let k = string size + ":" + string align + ":" + string refMask
+    let off =
+        match dictTryFind st.Witnesses k with
+        | Some o -> o
+        | None ->
+            let o = st.WitnessCur
+            st.WitnessCur <- o + 12
+            dictSet st.Witnesses k o
+            vecAdd st.WitnessData (o, size, align, refMask)
+            o
+    LPrim (AddW, [ LGetGlobal "$witnesses"; LConstW off ])
+
+// a concrete type's witness from its layout.
+let private witnessPtr (st : St) (t : Type) : LExpr =
+    let l = layoutOf st t
+    witnessPtrRM st l.Size l.Align (int l.RefMask)
+
+// the witness a call must pass for one type-arg NAME (from EVarI.inst):
+// - "#N": forward the enclosing function's witness param for type-var N
+// - concrete: a 1-word element, ref iff the name is not a raw scalar (int/bool/
+//   char are unboxed → refMask 0; everything else is a pointer → refMask 1).
+//   Multi-word inline struct elements are a later step.
+let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
+    if nm.Length > 0 && nm.[0] = '#' then
+        match dictTryFind ctx.Witness (int (nm.Substring 1)) with
+        | Some reg -> LGet (wReg reg)
+        | None -> witnessPtrRM ctx.LSt 4 4 1
+    else
+        witnessPtrRM ctx.LSt 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
+
+// a DECREASING id for backend-only fresh type vars used in trial unification —
+// negative, so it never collides with a real (non-negative) var id or a
+// ctx.Witness key (which are the enclosing fn's Quantified ids).
+let mutable private witnessFreshId = -1
+let private witnessFresh () : Type =
+    // a HIGH level so unification binds THIS fresh var to the caller's real var
+    // (the younger/higher-level var is the one bound), letting us read the
+    // caller's type-var id back for witness forwarding.
+    let id = witnessFreshId in witnessFreshId <- witnessFreshId - 1
+    TVar { Id = id; Level = 1000000000; Link = None; Rigid = false }
+
+let rec private substTy (m : Dict<int, Type>) (t : Type) : Type =
+    match prune t with
+    | TVar v -> (match dictTryFind m v.Id with Some r -> r | None -> TVar v)
+    | TCon (n, args) -> TCon (n, List.map (substTy m) args)
+    | TFun (a, b) -> TFun (substTy m a, substTy m b)
+    | TTuple ts -> TTuple (List.map (substTy m) ts)
+    | TApp (h, args) -> TApp (substTy m h, List.map (substTy m) args)
+
+// best-effort static type of an expression — enough to pin a generic call's
+// type args by unifying the callee's params against the args' types.
+let rec private typeOfExpr (e : Expr) : Type =
+    match e with
+    | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then TCon ("int64", []) else TCon ("int", [])
+    | ELit (LBool _) -> TCon ("bool", [])
+    | ELit (LChar _) -> TCon ("char", [])
+    | ELit (LFloat _) -> TCon ("float", [])
+    | ELit (LString _) -> TCon ("string", [])
+    | ELit LUnit -> TCon ("unit", [])
+    | EVar (_, sch) | EVarI (_, sch, _) -> sch.Body
+    | ELam (ps, b) -> List.foldBack (fun (_, (sch : Scheme)) acc -> TFun (sch.Body, acc)) ps (typeOfExpr b)
+    | EApp (f, args) ->
+        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> witnessFresh ())
+        peel (typeOfExpr f) (List.length args)
+    | EListLit (x :: _) -> TCon ("list", [ typeOfExpr x ])
+    | EListLit [] -> TCon ("list", [ witnessFresh () ])
+    | ETuple xs -> TTuple (List.map typeOfExpr xs)
+    | EPrim (op, args) ->
+        let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
+        (match b with
+         | "+" | "-" | "*" | "/" | "%" when op <> b -> if op.EndsWith "l" then TCon ("int64", []) else TCon ("float", [])
+         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" -> TCon ("int", [])
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" | "&&" | "||" | "not" -> TCon ("bool", [])
+         | "::" -> (match args with h :: _ -> TCon ("list", [ typeOfExpr h ]) | _ -> TCon ("list", [ witnessFresh () ]))
+         | _ -> (match args with a :: _ -> typeOfExpr a | _ -> witnessFresh ()))
+    | EIf (_, a, b) -> (match prune (typeOfExpr a) with TVar _ -> typeOfExpr b | ta -> ta)
+    | ELet (_, _, _, _, b) -> typeOfExpr b
+    | ESeq xs -> (match List.tryLast xs with Some b -> typeOfExpr b | None -> witnessFresh ())
+    | EMatch (_, cs) | ETry (_, cs) -> (match cs with (_, _, b) :: _ -> typeOfExpr b | [] -> witnessFresh ())
+    | _ -> witnessFresh ()
+
+// the witnesses a generic call must pass: fresh-instantiate the callee's scheme,
+// TRIAL-unify its parameter types against the arg types, then read each
+// quantified var's resolved type. A concrete resolution -> that type's static
+// witness; a resolution to a CALLER type-var -> forward the caller's witness.
+// The trial is fully undone (no permanent unifier state). Returns None for a
+// var that stayed unresolved (the caller reports rather than mis-scanning).
+let private deriveWitnessArgs (ctx : LowCtx) (sch : Scheme) (args : Expr list) : LExpr option list =
+    let m = dictNew<int, Type> ()
+    let fresh = sch.Quantified |> List.map (fun qv -> let fv = witnessFresh () in dictSet m qv.Id fv; fv)
+    let instBody = substTy m sch.Body
+    let rec peelParams t n = if n <= 0 then [] else (match prune t with TFun (a, r) -> a :: peelParams r (n - 1) | _ -> [])
+    let paramTys = peelParams instBody (List.length args)
+    let n = min (List.length paramTys) (List.length args)
+    let trial = newTrial ()
+    List.iter2 (fun pty a -> unifyWith (Some trial) pty (typeOfExpr a) |> ignore) (List.truncate n paramTys) (List.truncate n args)
+    let out =
+        fresh |> List.map (fun fv ->
+            match prune fv with
+            | TVar v -> (match dictTryFind ctx.Witness v.Id with Some reg -> Some (LGet (wReg reg)) | None -> None)
+            | resolved -> Some (witnessPtr ctx.LSt resolved))
+    undoTrial trial
+    out
+
 // (param abi types, return abi type) of a top-level function: peel `arity`
 // arrows off its scheme. None when every slot is a plain word (nothing to
 // specialize — the uniform $lfn signature already fits).
@@ -2317,10 +2459,15 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) ->
-        // a concrete-element cons skips its raw scalar head in the GC scan; the
-        // tail is always a list pointer. A generic head (RKGen) falls back to
-        // the tagged form (the witness system, S2, handles that).
-        lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ refKindOfExpr h; RKRef ])
+        // concrete head: skip/scan by compile-time ref-kind. GENERIC head: pick
+        // the scan map at runtime from the element type's witness refMask
+        // (looked up by the head's type-var id). The tail is always a pointer.
+        (match refKindOfExpr h with
+         | RKGen ->
+             (match tyVarIdOfExpr h |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
+              | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx h) (coreToLowE ctx t)
+              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ RKGen; RKRef ]))
+         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ k; RKRef ]))
     // list append: `a @ b` rebuilds a's spine onto b. Without this it fell to the
     // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
     // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
@@ -2818,11 +2965,22 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConstRaw st preludeSrc)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
-    | EApp ((EVar (v, _) | EVarI (v, _, _)), args)
+    | EApp (((EVar (v, sch) | EVarI (v, sch, _))), args)
         when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
+        // a generic callee takes hidden LEADING witness pointers, one per
+        // quantified var. Derive them by trial-unifying the callee's parameter
+        // types against the arg types (undone after) and reading each var's
+        // resolution: a concrete type -> its static witness, a caller type-var
+        // -> forward the caller's witness param.
+        let witnessArgs =
+            match dictTryFind st.FuncWitness (key v) with
+            | Some _ ->
+                deriveWitnessArgs ctx sch args
+                |> List.map (fun o -> match o with Some w -> w | None -> witnessPtrRM st 4 4 1)
+            | None -> []
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
-             let loweredArgs = List.map2 (fun ty a -> match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)) paramTys args
+             let loweredArgs = witnessArgs @ List.map2 (fun ty a -> match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)) paramTys args
              (match retTy with
               | W -> LCall (fn v, loweredArgs)
               // hold the scalar result in a typed local before boxing: the call
@@ -2830,7 +2988,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
               // the fresh box out from under the store. box-elim pushes through
               // the LDo, so an arithmetic use still reduces to the raw call.
               | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy })))
-         | None -> LCall (fn v, List.map (coreToLowE ctx) args))
+         | None -> LCall (fn v, witnessArgs @ List.map (coreToLowE ctx) args))
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name -> lowClosure ctx name
@@ -2984,6 +3142,30 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
 // first real word. CID_ARRAY is the variable-length REF_ARRAY case.
 and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) : LExpr =
     lowObjR ctx cid raw slots None
+// a cons cell whose head is a GENERIC element: its ref-ness is only known at
+// runtime, from the element type's witness refMask. Branch on it — a RAW head
+// (refMask 0) uses CONS_RAW and is stored directly (an unboxed int, never
+// shadow-stacked); a REF head uses CONS_REF and is rooted across the alloc. The
+// tail is a list pointer, rooted in both. Head/tail are evaluated ONCE.
+and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tExpr : LExpr) : LExpr =
+    let b = freshTmp ctx
+    let ht = freshTmp ctx
+    let tt = freshTmp ctx
+    let r = freshTmp ctx
+    let rawBuild =
+        gcPushStmts (LGet (wReg tt))
+        @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW gcConsRawTid ])) ]
+        @ gcPopInto (LGet (wReg b)) (HDR + 4)
+        @ [ LStore (W, LGet (wReg b), HDR, LGet (wReg ht)); LSet (wReg r, LGet (wReg b)) ]
+    let refBuild =
+        gcPushStmts (LGet (wReg ht))
+        @ gcPushStmts (LGet (wReg tt))
+        @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW gcConsRefTid ])) ]
+        @ gcPopInto (LGet (wReg b)) (HDR + 4)
+        @ gcPopInto (LGet (wReg b)) HDR
+        @ [ LSet (wReg r, LGet (wReg b)) ]
+    LDo ([ LSet (wReg ht, hExpr); LSet (wReg tt, tExpr)
+           LIf (LPrim (EqW, [ refMask; LConstW 0 ]), rawBuild, refBuild) ], LGet (wReg r))
 // as lowObj, but with a per-slot ref-kind classification (when every slot's
 // kind is statically known). A fully-concrete shape registers FK_STRUCT with a
 // ref-map: raw scalar slots are stored inline and NEVER pushed to the shadow
@@ -3089,7 +3271,13 @@ and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy
 and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
     | [] -> LConstW 0
-    | x :: rest -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ refKindOfExpr x; RKRef ])
+    | x :: rest ->
+        (match refKindOfExpr x with
+         | RKGen ->
+             (match tyVarIdOfExpr x |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
+              | Some wreg -> lowGenericCons ctx (LLoad (W, LGet (wReg wreg), 8)) (coreToLowE ctx x) (lowList ctx rest)
+              | None -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ RKGen; RKRef ]))
+         | k -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ k; RKRef ]))
 
 // a boxed 64-bit payload: the class-id header then an 8-byte payload at HDR;
 // the wide type on the LStore/LLoad picks f64/i64 access. GC: a no-ref STRUCT
@@ -3566,9 +3754,14 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); NReg = 0 }
+    // hidden witness-pointer params come FIRST (i32), one per quantified type
+    // var, recorded in ctx.Witness so a generic aggregate can read the element
+    // type's witness. Regular params follow.
+    let wnames = witnessVars |> List.map (fun vid -> let r = freshReg ctx ("$w" + string vid) in dictSet ctx.Witness vid r; regNm (wReg r))
     let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
+    let pnames = wnames @ pnames
     // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
     // local (registered in VarScalar so reads re-box, just like a scalar let);
     // a scalar return is unboxed off the body's boxed word before the return.
@@ -3597,7 +3790,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         // methods. A stubbed FUNCTION still traps loudly if it is ever called.
         if isInit then (ic f 0; finish f) else ins f "unreachable"
     else
-        let np = List.length ps
+        let np = List.length witnessVars + List.length ps
         for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
         localsDone f
         emitLowE f bodyLow
@@ -3608,7 +3801,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
@@ -3818,7 +4011,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let m = modNew ()
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
-          Funcs = dictNew (); FuncSig = dictNew (); Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
+          Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
@@ -3970,6 +4163,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             match funSigOf s (List.length ps) with
             | Some sig_ when (dictTryFind vtImpls (key v)).IsNone -> dictSet st.FuncSig (key v) sig_
             | _ -> ()
+            // a generic top-level fn takes a hidden witness pointer per quantified
+            // type var (in Quantified order); a direct caller prepends them. The
+            // witness ABI is a GC-scan concern only — under --linear (no collector)
+            // nothing needs it, so FuncWitness stays empty and the whole hidden-
+            // param path (decl, emit, call, generic cons) is a no-op there.
+            if gc && not (List.isEmpty s.Quantified) && (dictTryFind vtImpls (key v)).IsNone then
+                dictSet st.FuncWitness (key v) (s.Quantified |> List.map (fun qv -> qv.Id))
         | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
             // a RAW-scalar top-level binding (int/bool/char) stays in its
@@ -4013,6 +4213,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // map the uniform cons tid to CID_LIST so $isBuiltinSeq recognises it
         // (the FK_STRUCT per-refmap cons variants register their own mapping)
         vecAdd st.TidCid (gcListTid, CID_LIST)
+        // the two witness-selected cons shapes ([head@HDR][tail@HDR+4])
+        gcConsRawTid <- gcTidRef st "cons$raw" (HDR + 8) [ HDR + 4 ]
+        vecAdd st.TidCid (gcConsRawTid, CID_LIST)
+        gcConsRefTid <- gcTidRef st "cons$ref" (HDR + 8) [ HDR; HDR + 4 ]
+        vecAdd st.TidCid (gcConsRefTid, CID_LIST)
         // the built-in list iterator: [remaining][current], both scanned as
         // tagged words (start=1) so a ref element is rooted and a tagged int skipped
         gcIterTid <- gcTid st "iter" (HDR + 8) FK_TAGGED 1
@@ -4026,12 +4231,16 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome ->
+            let nw = match dictTryFind st.FuncWitness (key v) with Some ws -> List.length ws | None -> 0
             (match dictTryFind st.FuncSig (key v) with
              | Some (paramTys, retTy) ->
                  let tn = "$ft" + fn v
-                 tyFunc m tn (paramTys |> List.map wtyName) [ wtyName retTy ]
+                 tyFunc m tn ((List.replicate nw "i32") @ (paramTys |> List.map wtyName)) [ wtyName retTy ]
                  declFn m (fn v) tn
-             | None -> declFn m (fn v) ("$lfn" + string (List.length ps)))
+             | None ->
+                 let a = nw + List.length ps
+                 tyFunc m ("$lfn" + string a) (List.replicate a "i32") [ "i32" ]
+                 declFn m (fn v) ("$lfn" + string a))
         | _ -> ()
     // one init function per top-level global, plus _start
     let inits = vecNew<string> ()
@@ -4106,6 +4315,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then globalI32Mut m "$sp" 0
     // GC: base of the tid->class-id table (fixed static memory in the shim)
     if gc then globalI32Mut m "$t2c" 0
+    if gc then globalI32Mut m "$witnesses" 0
     exportFn m "_start" "$_start"
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
@@ -4119,7 +4329,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome ->
             if not (isNull (System.Environment.GetEnvironmentVariable "FPP_FUNC_DUMP")) then eprintfn "FUNC %s = %s | %s" (fn v) (key v) v.Name
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (ps |> List.map fst) body (fun _ -> ())
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -4127,7 +4337,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m (gl v) true None [] rhs (fun f ->
+            emitFuncLow st m (gl v) true None [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
@@ -4172,6 +4382,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         ic rf (st.RootNext * 4); gs rf "$sp"
         // fill the tid->cid table (raw class-ids, fixed static memory)
         callf rf "$t2cbase"; gs rf "$t2c"
+        // value-witness pool: point $witnesses at it and write each interned
+        // {size,align,refMask} triple (static metadata the generic ABI passes).
+        callf rf "$witnessbase"; gs rf "$witnesses"
+        for off, size, align, refMask in vecToList st.WitnessData do
+            gg rf "$witnesses"; ic rf off; ins rf "i32.add"; ic rf size; mem rf "i32.store"
+            gg rf "$witnesses"; ic rf (off + 4); ins rf "i32.add"; ic rf align; mem rf "i32.store"
+            gg rf "$witnesses"; ic rf (off + 8); ins rf "i32.add"; ic rf refMask; mem rf "i32.store"
         for tid, cid in vecToList st.TidCid do
             gg rf "$t2c"; ic rf (4 * tid); ins rf "i32.add"; ic rf cid; mem rf "i32.store"
         // register every shape's fpprt type. A FK_STRUCT shape with a ref-map
