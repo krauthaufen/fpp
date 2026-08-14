@@ -11,6 +11,14 @@ let private readSource (path : string) : string =
 // `fpp check <files>` — batch diagnostics. Deliberately a second thin client
 // of the same Workspace the LSP server uses.
 
+/// The stubs that could actually TRAP. An unstamped template (`EUnknown
+/// $class:...`) cannot: every call of a generic class member goes through
+/// a stamped copy, and the template survives only as an artifact — so a
+/// generic member the program never USES must not fail a strict build.
+let private strictStubs (ws : Workspace) : string list =
+    ws.EmitWarnings
+    |> List.filter (fun w -> w.StartsWith "stubbed " && not (w.Contains "EUnknown $class:"))
+
 let private check (strict : bool) (defines : string list) (files : string list) : int =
     let ws = Workspace()
     // `check` sees the ORACLE's view of conditional code
@@ -32,7 +40,7 @@ let private check (strict : bool) (defines : string list) (files : string list) 
         // repeated bug shape
         let _bytes, eerrs = ws.EmitProgramWasm ()
         for e in eerrs do eprintfn "error: %s" e
-        let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
+        let stubs = strictStubs ws
         for st in stubs do eprintfn "error (strict): %s" st
         if List.isEmpty eerrs && List.isEmpty stubs then 0 else 1
 
@@ -84,7 +92,7 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
     // (unreached surface stubs are routine there) and wrong for a program
     // someone intends to ship — this flag draws that line.
     let failOnStubs (bytes : byte[]) : int =
-        let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
+        let stubs = strictStubs ws
         if strict && not (List.isEmpty stubs) then
             for s in stubs do eprintfn "error (strict): %s" s
             eprintfn "error (strict): %d function(s) would trap if reached" (List.length stubs)

@@ -2365,6 +2365,19 @@ let declarationCheckTests =
                 && e.Contains "One is a member of class One")
                 "the hint points at the owning class"
         }
+        test "an unused constrained generic member does not break the build" {
+            // M33.Identity written but never used at a ground type: its
+            // template keeps the `$class:` stamp marker forever. That is a
+            // library's normal state, not a trap — the template is
+            // unreachable (every real call goes through a stamped copy)
+            let out =
+                run [ "[<Struct>]"
+                      "type M2<'a> = { A : 'a; B : 'a }"
+                      "    static member Identity : M2<'a> when One<'a> ="
+                      "        { A = One; B = One }"
+                      "let r = print (string 7)" ]
+            Expect.equal out "7\n" "the program runs; the dead template stays dead"
+        }
         test "an instance must honor its class' when-promise" {
             // `class Aa when Bb<'a>` says every Aa is a Bb; an Aa<int>
             // without Bb<int> compiled clean and trapped at the first use

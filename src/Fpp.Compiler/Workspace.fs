@@ -551,6 +551,72 @@ type Workspace() =
                (this.Resolve path).Missing
                |> List.filter (fun (off, _) -> Set.contains off fresh)
                |> List.map (fun (off, msg) -> at off msg))
+            // a name that exists NOWHERE — deleted from its module, or
+            // never written — used to slip through to the backend as a
+            // stub: Missing only knows names some unopened module still
+            // exports. Inference tried every later owner (class members,
+            // builtins) before bottoming out at fresh, so what is fresh
+            // and not Missing is simply unbound. Guarded on the prelude:
+            // the dogfooding gate infers sources with NOTHING resolved,
+            // where every name would flood this.
+            @ (if (dictTryFind (this.ProjectCheck ()).Classes.Classes "Num").IsNone then []
+               else
+                   // the FORMS the backend owns: no definition anywhere,
+                   // typed at their application and emitted directly, so
+                   // their head idents legitimately bottom out fresh
+                   let builtinForms =
+                       [ "print"; "printf"; "printfn"; "eprintf"; "eprintfn"; "sprintf"
+                         "failwith"; "failwithf"; "raise"; "reraise"; "ignore"; "exit"
+                         "box"; "unbox"; "assert"; "lock"; "nameof"; "sizeof"; "typeof"
+                         "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"
+                         "float32"; "float16"; "string"; "char"; "byte"; "sbyte"
+                         "nativeint"; "fixed"; "stackalloc"; "hash"
+                         "refEq"; "defaultArg" ]
+                   let missingOffs = (this.Resolve path).Missing |> List.map fst |> Set.ofList
+                   let toks = Green.tokens (GNode r.Root)
+                   let text = this.FileText path
+                   // QUOTED code is data — its binders and uses live when
+                   // the quote is spliced, not here
+                   let quoteAcc = vecNew<int * int> ()
+                   let rec walkQuotes (g : Green) =
+                       match g with
+                       | GNode n when n.NodeKind = QuoteExpr ->
+                           let ts = Green.tokens g
+                           (match ts with
+                            | first :: _ ->
+                                let last = List.last ts
+                                vecAdd quoteAcc (first.Offset, last.Offset + strLen last.Text)
+                            | [] -> ())
+                       | GNode n -> for c in n.Children do walkQuotes c
+                       | _ -> ()
+                   walkQuotes (GNode r.Root)
+                   let quoteSpans = vecToList quoteAcc
+                   let quoted (off : int) =
+                       quoteSpans |> List.exists (fun (s, e) -> off >= s && off < e)
+                   // only a BARE lowercase use: the head of a dotted path
+                   // (`System.Object.…`, `Module.f`) is qualification with
+                   // its own better-aimed channels, and an unresolved
+                   // UPPERCASE name is a host-seam type or constructor
+                   // (`JsonObject()` in the LSP), which the .NET build owns
+                   let bare (tk : Syntax.Token) =
+                       let after = tk.Offset + strLen tk.Text
+                       // an ident right before `=` is a NAMED-ARGUMENT
+                       // label (`Get(recursive = true)`), which binds to a
+                       // parameter at lowering, not to a value here
+                       let mutable i = after
+                       while i < strLen text && (text.[i] = ' ' || text.[i] = '\t') do i <- i + 1
+                       (after >= strLen text || text.[after] <> '.')
+                       && (i >= strLen text || text.[i] <> '=')
+                       && tk.Text.Length > 0 && tk.Text.[0] >= 'a' && tk.Text.[0] <= 'z'
+                   t.FreshIdents
+                   |> List.filter (fun off -> not (Set.contains off missingOffs) && not (quoted off))
+                   |> List.choose (fun off ->
+                       toks
+                       |> List.tryFind (fun tk ->
+                           tk.Offset = off && tk.Kind = Syntax.Ident
+                           && not (List.contains tk.Text builtinForms)
+                           && bare tk)
+                       |> Option.map (fun tk -> at off ("unbound name " + tk.Text))))
             // by (Line, Col), spelled out: `Ordered` has no instance at a
             // TUPLE type, so a tuple key cannot drive `sortBy` (see PLAN.md)
             |> List.sortWith (fun a b ->

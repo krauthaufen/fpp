@@ -274,6 +274,23 @@ let editorRobustnessTests =
             | [ resp ] -> Expect.isTrue (isNull resp.["result"]) "refused"
             | _ -> failtest "expected one response"
         }
+        test "a name that exists nowhere errors at check, not in the backend" {
+            // `greet` was deleted from the library but a call remained: the
+            // missing-open path only knows names some module still exports,
+            // so the call sailed through check and trapped as a backend stub
+            let ws = Fpp.Workspace()
+            ws.SetFileText "lib.fpp" "module Lib\nlet whole = 1\n"
+            ws.SetFileText "t.fpp" "module M\nopen Lib\nlet a = print (string (greet 1))\n"
+            let msgs = ws.Diagnostics "t.fpp" |> List.map (fun d -> d.Message)
+            Expect.exists msgs (fun m -> m.Contains "unbound name greet") "reported at check time"
+            // a name an unopened module DOES export keeps its better message
+            let ws2 = Fpp.Workspace()
+            ws2.SetFileText "lib.fpp" "module Lib\nlet greet (n : int) = n\n"
+            ws2.SetFileText "t.fpp" "module M\nlet a = print (string (greet 1))\n"
+            let msgs2 = ws2.Diagnostics "t.fpp" |> List.map (fun d -> d.Message)
+            Expect.exists msgs2 (fun m -> m.Contains "open") "still suggests the open"
+            Expect.isFalse (msgs2 |> List.exists (fun m -> m.Contains "unbound name")) "not double-reported"
+        }
         test "the prelude pseudo-file checks like a file" {
             let ws = Fpp.Workspace()
             ws.SetFileText "t.fpp" "module M\nlet a = 1\n"
