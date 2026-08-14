@@ -782,12 +782,21 @@ let private emitLappend (m : Mod) : unit =
 // vtable dispatch that would read slot 0 and trap. Mirrors the GC backend's
 // $isBuiltinSeq/$iterNew/$iterNext/$iterCur.
 let private emitListIter (m : Mod) : unit =
-    let listHdr = if gc then (gcListTid <<< 1) ||| 1 else CID_LIST
-    // $isBuiltinSeq(v) -> raw 0/1: nil (empty list) or a cons cell
+    // $isBuiltinSeq(v) -> raw 0/1: nil (empty list) or a cons cell. A cons is
+    // recognised by its CLASS-ID = CID_LIST, not a single tid: under GC a
+    // concrete-element cons carries a per-refmap FK_STRUCT tid (so an unboxed
+    // int head is skipped by the collector), and ALL of those — plus the
+    // uniform cons — map to CID_LIST in the tid->cid table. Checking the raw
+    // header instead would miss every FK_STRUCT variant and mis-route a real
+    // list to the (absent) IEnumerable vtable row.
     let f = beginFn m [ "$v" ]
     localsDone f
     lg f "$v"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
-    lg f "$v"; mem f "i32.load"; ic f listHdr; ins f "i32.eq"
+    if gc then
+        lg f "$v"; mem f "i32.load"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"
+        gg f "$t2c"; ins f "i32.add"; mem f "i32.load"; ic f CID_LIST; ins f "i32.eq"
+    else
+        lg f "$v"; mem f "i32.load"; ic f CID_LIST; ins f "i32.eq"
     endFn f
     // $literNew(list) -> a fresh iterator [remaining=list][current=0]
     let f = beginFn m [ "$list" ]
@@ -804,15 +813,18 @@ let private emitListIter (m : Mod) : unit =
     lg f "$it"; ic f (HDR + 4); ins f "i32.add"; ic f 0; mem f "i32.store"
     lg f "$it"
     endFn f
-    // $literNext(it) -> tagged bool: pop the head into current, advance remaining
+    // $literNext(it) -> RAW bool: pop the head into current, advance remaining.
+    // RAW (0/1), not tagged (1/3) — a `while MoveNext()` reads the result raw
+    // since int/bool became unboxed, so a tagged `1` for nil would read as
+    // truthy and spin forever.
     let f = beginFn m [ "$it" ]
     local f "$rem" "i32"
     localsDone f
     lg f "$it"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$rem"
-    lg f "$rem"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f   // nil -> tagged false
+    lg f "$rem"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f   // nil -> false
     lg f "$it"; ic f (HDR + 4); ins f "i32.add"; lg f "$rem"; ic f HDR; ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
     lg f "$it"; ic f HDR; ins f "i32.add"; lg f "$rem"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"; mem f "i32.store"
-    ic f 3   // tagged true
+    ic f 1   // true
     endFn f
     // $literCur(it) -> the current element
     let f = beginFn m [ "$it" ]
@@ -3019,7 +3031,10 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                 let refOffs = [ 0 .. n - 1 ] |> List.filter isRefSlot |> List.map (fun i -> HDR + 4 * i)
                 gcTidRef st sk (HDR + 4 * n) refOffs
             else gcTid st sk (HDR + 4 * n) FK_TAGGED (1 + raw)
-        if isNew && cid >= CID_FIRST_USER then vecAdd st.TidCid (tid, cid)
+        // built-in cids skip the tid->cid table, EXCEPT CID_LIST: $isBuiltinSeq
+        // recovers a cons cell's class-id from it, so every FK_STRUCT cons variant
+        // must map back to CID_LIST.
+        if isNew && (cid >= CID_FIRST_USER || cid = CID_LIST) then vecAdd st.TidCid (tid, cid)
         let isConst e = match e with LConstW _ -> true | _ -> false
         let idx = slots |> List.mapi (fun i v -> i, v)
         // REF slots are live pointers: evaluate and push to the shadow stack
@@ -3995,6 +4010,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
+        // map the uniform cons tid to CID_LIST so $isBuiltinSeq recognises it
+        // (the FK_STRUCT per-refmap cons variants register their own mapping)
+        vecAdd st.TidCid (gcListTid, CID_LIST)
         // the built-in list iterator: [remaining][current], both scanned as
         // tagged words (start=1) so a ref element is rooted and a tagged int skipped
         gcIterTid <- gcTid st "iter" (HDR + 8) FK_TAGGED 1
