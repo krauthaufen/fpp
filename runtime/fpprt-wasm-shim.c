@@ -44,3 +44,12 @@ void fpprt_wasm_roots_register(uint32_t n) { fpprt_add_static_roots(g_wasm_roots
 #define FPPRT_WASM_NTIDS 4096
 static uint32_t g_tid2cid[FPPRT_WASM_NTIDS];
 uint32_t fpprt_tid2cid_base(void) { return (uint32_t)(uintptr_t)g_tid2cid; }
+
+/* ref-offset maps for FK_STRUCT shapes: a flat pool of uint32 byte-offsets. A
+ * shape registered as FK_STRUCT points its `refoffs` at a slice here; the
+ * collector reads these to trace ONLY the pointer words, so raw scalar words
+ * (an unboxed int/bool in a tuple or union payload) are correctly skipped.
+ * Static, never moves — the type table stores a raw pointer into it. */
+#define FPPRT_WASM_NREFOFFS 65536
+static uint32_t g_refoffs[FPPRT_WASM_NREFOFFS];
+uint32_t fpprt_wasm_refoffs_base(void) { return (uint32_t)(uintptr_t)g_refoffs; }
