@@ -2304,7 +2304,11 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
         (LPrim (iop, [ ia; ib ]))
-    | EPrim ("::", [ h; t ]) -> lowObj ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ]
+    | EPrim ("::", [ h; t ]) ->
+        // a concrete-element cons skips its raw scalar head in the GC scan; the
+        // tail is always a list pointer. A generic head (RKGen) falls back to
+        // the tagged form (the witness system, S2, handles that).
+        lowObjR ctx CID_LIST 0 [ coreToLowE ctx h; coreToLowE ctx t ] (Some [ refKindOfExpr h; RKRef ])
     // list append: `a @ b` rebuilds a's spine onto b. Without this it fell to the
     // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
     // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
@@ -3070,7 +3074,7 @@ and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy
 and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
     match xs with
     | [] -> LConstW 0
-    | x :: rest -> lowObj ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ]
+    | x :: rest -> lowObjR ctx CID_LIST 0 [ coreToLowE ctx x; lowList ctx rest ] (Some [ refKindOfExpr x; RKRef ])
 
 // a boxed 64-bit payload: the class-id header then an 8-byte payload at HDR;
 // the wide type on the LStore/LLoad picks f64/i64 access. GC: a no-ref STRUCT
