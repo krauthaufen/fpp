@@ -1800,7 +1800,12 @@ let parse (src : string) : ParseResult =
                 sawWith <- true
                 vecAdd acc (s.Bump ())
                 if s.Is Ident then vecAdd acc (s.Bump ())
-            if s.IsOp "=" && (allowEq || sawWith) then
+            // `= 'c` cannot open a body — no expression is a lone type
+            // variable (a char literal is one CharLit token) — so the
+            // equality is safe to take even where allowEq is off. A
+            // non-variable right side (`= float`) stays ambiguous there
+            // and still needs the `with Result =` spelling.
+            if s.IsOp "=" && (allowEq || sawWith || (s.Peek 1).Text = "'") then
                 vecAdd acc (s.Bump ())
                 vecAdd acc (parseType col)
             vecAdd out (Green.node WhenDecl (vecToList acc))

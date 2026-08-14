@@ -2087,6 +2087,22 @@ let resolutionRuleTests =
 [<Tests>]
 let typeclassPracticeTests =
     testList "typeclasses in practice" [
+        test "a member-level `when C = 'c and D` keeps its body" {
+            // `when Mul<'a,'b> = 'c and Add<'c,'c> = <body>`: the first `=`
+            // binds the associated type — it cannot open the body, since no
+            // expression is a lone type variable. It used to be read as the
+            // body's `=`, which type-checked by accident (the body became
+            // `'c`) and trapped in the backend as an unported unknown.
+            let out =
+                run [ "type V2<'a>(x : 'a, y : 'a) ="
+                      "    member this.X = x"
+                      "    member this.Y = y"
+                      "    member v.Dot(o : V2<'b>) when Mul<'a, 'b> = 'c and Add<'c, 'c> ="
+                      "        v.X * o.X + v.Y * o.Y"
+                      "let a = V2(1, 2)"
+                      "let r = print (string (a.Dot (V2(3, 4))))" ]
+            Expect.equal out "11\n" "the dot product, not the mis-parsed remnant"
+        }
         test "lerp composes vector add, sub and scalar mul" {
             let out =
                 run [ "[<Struct>]"
