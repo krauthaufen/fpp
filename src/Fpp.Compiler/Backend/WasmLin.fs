@@ -1677,14 +1677,17 @@ let private fReg (id : int) : LReg = { Id = id; RTy = F64 }
 let private lReg (id : int) : LReg = { Id = id; RTy = I64 }
 
 // element kinds stored inline as a raw packed scalar (no per-element heap box),
-// with (storage machine type, byte width). `int`/`int32`/`char`/`bool`/
-// `nativeint` gain nothing — they are already 4-byte tagged words — so they
-// keep the generic slot. float32 stores its 4-byte f32 bits in an i32 slot.
+// with (storage machine type, byte width). Since `int`/`bool`/`char` became RAW
+// i32 at rest (no tag bit), they are NOT GC-safe as generic word slots — an even
+// int reads as a pointer. So they store as inline scalars here, landing in the
+// raw scalar prefix (records) / a FK_SCALAR_ARRAY (arrays), which the collector
+// skips. float32 stores its 4-byte f32 bits in an i32 slot.
 let private storLTy (k : string) : (LTy * int) option =
     match k with
     | "float" | "double" -> Some (F64, 8)
     | "int64" | "uint64" -> Some (I64, 8)
     | "float32" | "single" -> Some (W, 4)
+    | "int" | "int32" | "uint32" | "nativeint" | "unativeint" | "bool" -> Some (W, 4)
     | "int16" | "uint16" -> Some (I16, 2)
     | "byte" | "sbyte" -> Some (I8, 1)
     | _ -> None
