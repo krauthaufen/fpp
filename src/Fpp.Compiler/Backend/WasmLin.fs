@@ -103,6 +103,11 @@ type private St =
       mutable Captures : Dict<string, int>
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
+      /// a stamped subclass (Dictionary$int$int) owns no fields of its own — they
+      /// belong to the base it was stamped from (Dictionary). subclass -> base,
+      /// so a field access on the subclass resolves its offset THROUGH the base's
+      /// RecFields rather than defaulting to index 0.
+      RecBase : Dict<string, string>
       /// record/class name -> its fields as (name, declared-type-string), ALL
       /// records (RecFieldTys is [<Struct>]-only). Lets a `$cellget` of a
       /// class-field cell resolve the field's scalar content to RAW.
@@ -1842,6 +1847,11 @@ type private LowCtx =
       /// witness var-ids in declared order (= this ctor's witnessVars). The
       /// class ERecord it builds stores `ctx.Witness[each]` into trailing slots.
       mutable ClassCtorWits : int list
+      /// in a stamped member with exactly ONE class type param: the register
+      /// holding that param's witness. A compare/hash whose operands are generic
+      /// fields (EField/EIndex of type `'k`) carries no bare type-var expr for
+      /// tyVarIdOfExpr to key on, so it falls back to this unambiguous witness.
+      mutable ClassWit : int option
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -1901,6 +1911,23 @@ let private regNm (r : LReg) : string = "$r" + string r.Id
 // the class-id descriptor for a record type / a union case's union; -1 for an
 // undeclared name (a value no type test looks for)
 let private cidRec (st : St) (name : string) : int = match dictTryFind st.ClassId name with Some c -> c | None -> 0 - 1
+
+// a field's slot index in its owner's layout, resolving a stamped subclass
+// (which owns no field names) through the base it was stamped from.
+let rec private recFieldIdx (st : St) (owner : string) (fname : string) : int =
+    let viaBase () = match dictTryFind st.RecBase owner with Some b when b <> owner -> recFieldIdx st b fname | _ -> 0
+    match dictTryFind st.RecFields owner with
+    | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> viaBase ())
+    | None -> viaBase ()
+
+// a field's declared type, resolving a stamped subclass through its base — the
+// subclass has no RecFieldTypes of its own, so a mutable scalar field (`&int`)
+// would otherwise miss its RAW cell-content kind and be mishandled as a pointer.
+let rec private recFieldTy (st : St) (owner : string) (fname : string) : string option =
+    let viaBase () = match dictTryFind st.RecBase owner with Some b when b <> owner -> recFieldTy st b fname | _ -> None
+    match dictTryFind st.RecFieldTypes owner with
+    | Some fs -> (match fs |> List.tryPick (fun (fn, ty) -> if fn = fname then Some ty else None) with Some ty -> Some ty | None -> viaBase ())
+    | None -> viaBase ()
 let private cidCase (st : St) (case : string) : int = match dictTryFind st.CaseClass case with Some c -> c | None -> 0 - 1
 // the class-id a `:? T` / `:?>` looks for. An instantiated name tests its
 // erased head (the header carries no type arguments); an unknown name yields
@@ -1960,7 +1987,7 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
         let fieldCellKind () : RefKind option =
             match c with
             | EField (_, f, owner) ->
-                match dictTryFind st.RecFieldTypes owner |> Option.bind (fun fs -> fs |> List.tryPick (fun (fn, ty) -> if fn = f then Some ty else None)) with
+                match recFieldTy st owner f with
                 | Some ty ->
                     let inner = if ty.StartsWith "&" then ty.Substring 1 else ty
                     if rawScalarName inner then Some RKRaw else None
@@ -1976,7 +2003,9 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
 // runtime). None outside a witnessed generic body — then $cmpv is the fallback.
 let private cmpWit (ctx : LowCtx) (a : Expr) (b : Expr) : int option =
     let ofExpr e = tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid)
-    match ofExpr a with Some w -> Some w | None -> ofExpr b
+    match ofExpr a with
+    | Some w -> Some w
+    | None -> (match ofExpr b with Some w -> Some w | None -> ctx.ClassWit)
 
 // for an aggregate allocated inside a GENERIC body, the (slot index, witness
 // register) of each slot whose static type is a type PARAMETER whose witness
@@ -2289,6 +2318,20 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     | EArrayLen _ -> ShScalar
     | _ -> ShOther
 
+// shapeOfExpr, but resolving a class FIELD's / array ELEMENT's declared type
+// through st. EField/EIndex carry no type, so a compare of two concrete scalar
+// fields (BoxI's `a < b` on int fields) would otherwise be ShOther and route to
+// $cmpv on raw ints, which the tid heuristic mis-handles. A generic field/'k[]
+// element stays "?"/'k -> ShOther and is served by the witness path instead.
+let private shapeOfExprF (st : St) (e : Expr) : CmpShape =
+    let ofTyName (ty : string) : CmpShape =
+        let inner = if ty.StartsWith "&" then ty.Substring 1 else ty
+        if rawScalarName inner then ShScalar elif inner = "string" then ShStr else ShOther
+    match e with
+    | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> ofTyName ty | None -> ShOther)
+    | EIndex (ek, _, _) -> ofTyName ek
+    | _ -> shapeOfExpr e
+
 let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
     match a, b with
     | ShOther, x | x, ShOther -> x
@@ -2545,7 +2588,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     // the builtin `compare a b` (an unbound EVar in the unoptimised core):
     // -1/0/1 by the operands' static shape
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
-        let sh = mergeShape (shapeOfExpr a) (shapeOfExpr b)
+        let sh = mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
         let ra, rb, pre = evalRooted ctx a b
         LDo (pre, (structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
@@ -2562,12 +2605,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
          let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
          let cb = if (not hasAt) && b0.EndsWith "t" then b0.Substring (0, b0.Length - 1) else b0
          (match cb with "<" | ">" | "<=" | ">=" | "=" | "<>" -> true | _ -> false)
-         && (hasAt || (baseOp op).EndsWith "t" || needsStructCmp (mergeShape (shapeOfExpr a) (shapeOfExpr b)))) ->
+         && (hasAt || (baseOp op).EndsWith "t" || needsStructCmp (mergeShape (shapeOfExprF st a) (shapeOfExprF st b)))) ->
         let hasAt = op.Contains "@"
         let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
         let isStr = (not hasAt) && b0.EndsWith "t"
         let cb = if isStr then b0.Substring (0, b0.Length - 1) else b0
-        let sh = if isStr then ShStr elif hasAt then ShOther else mergeShape (shapeOfExpr a) (shapeOfExpr b)
+        let sh = if isStr then ShStr elif hasAt then ShOther else mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
         let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
         let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
@@ -2728,17 +2771,9 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
                     LStore (sty, LGet (wReg rr), off, LGet { Id = fv; RTy = vty }) ], lowInt 0)
          | None -> LDo ([ LStore (W, coreToLowE ctx r, off, coreToLowE ctx v) ], lowInt 0))
     | EField (r, fname, owner) ->
-        let idx =
-            match dictTryFind st.RecFields owner with
-            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
-            | None -> 0
-        LLoad (W, coreToLowE ctx r, HDR + 4 * idx)
+        LLoad (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname)
     | EFieldSet (r, fname, owner, v) ->
-        let idx =
-            match dictTryFind st.RecFields owner with
-            | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> 0)
-            | None -> 0
-        LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * idx, coreToLowE ctx v) ], lowInt 0)
+        LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname, coreToLowE ctx v) ], lowInt 0)
     // ---- arrays of inline value-type records (all-scalar elements) ----
     // elements are contiguous & HEADERLESS at ARRHDR + i*stride. A whole-element
     // read copies out to a fresh headed record; a whole-element write copies the
@@ -2959,7 +2994,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         // element (refMask 0 — int/char/bool) IS its own hash (matches $hashv's
         // tagged-int path, which returns the untagged value); a ref element
         // hashes structurally via $hashv. Without a witness, $hashv as before.
-        (match tyVarIdOfExpr a |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
+        (match (match tyVarIdOfExpr a |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with Some w -> Some w | None -> ctx.ClassWit) with
          | Some w ->
              let at = freshTmp ctx
              let t = freshTmp ctx
@@ -3942,7 +3977,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | _ -> ()
 
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -3972,6 +4007,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         constWits |> List.map (fun (vid, witExpr) ->
             let r = freshTmp ctx
             dictSet ctx.Witness vid r
+            (if List.length constWits = 1 then ctx.ClassWit <- Some r)
             LSet (wReg r, witExpr))
     // a specialized scalar ABI: each scalar param arrives UNBOXED in a typed
     // local (registered in VarScalar so reads re-box, just like a scalar let);
@@ -4014,7 +4050,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     let sink = vecNew ()
@@ -4228,7 +4264,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
@@ -4259,6 +4295,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let noCollapse = scanNoCollapse decls0
     let classNames = dictNew<string, bool> ()
     for d in decls0 do match d with DClass (n, _, _, _) -> dictSet classNames n true | _ -> ()
+    // a stamped subclass resolves its fields through the base it was stamped
+    // from (DClass carries `Some base`); record subclass -> base for EField.
+    for d in decls0 do match d with DClass (n, Some b, _, _) when b <> n -> dictSet st.RecBase n b | _ -> ()
     for kv in dictPairs st.RecFields do
         match snd kv with
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
@@ -4567,7 +4606,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             // type params (Link forwards the enclosingSubst it already computes).
             let constWits =
                 match dictTryFind Fpp.Core.Link.stampedClassWits (v.Path, v.Offset) with
-                | Some pairs -> pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
+                | Some pairs ->
+                    pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
                 | None -> []
             emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) body (fun _ -> ())
         | _ -> ()
