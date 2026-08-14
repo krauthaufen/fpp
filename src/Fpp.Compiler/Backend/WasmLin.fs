@@ -138,6 +138,10 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
+      /// FK_STRUCT tid -> the byte offsets of its POINTER words (a `layoutOf`-
+      /// derived ref-map). Concrete tuples and union payloads register this so
+      /// the collector traces only real pointers and skips raw inline scalars.
+      TidRefoffs : Dict<int, int list>
       mutable TidNext : int
       /// GC mode: each string constant as (root-slot, UTF-16 bytes). `Consts`
       /// maps the source literal to its slot. Constants are allocated through
@@ -238,6 +242,7 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_wasm_roots_base" "$rootsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_roots_register" "$rootsreg" [ "i32" ] []
     importFn m "fpprt" "fpprt_tid2cid_base" "$t2cbase" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_wasm_refoffs_base" "$refoffsbase" [] [ "i32" ]
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -260,6 +265,76 @@ let private gcTid (st : St) (shapeKey : string) (sizeBytes : int) (kind : int) (
         dictSet st.Tids shapeKey t
         vecAdd st.TidRegs (t, sizeBytes, kind, start)
         t
+
+// intern a FK_STRUCT tid with an explicit ref-offset map (byte offsets of the
+// object's pointer words). `start` carries nrefs for the $fpreg call; the
+// offsets are recorded in TidRefoffs and emitted into the static g_refoffs pool
+// at startup. Lets a tuple/union hold raw inline scalars — the collector traces
+// ONLY these offsets, so an even int word is never chased as a pointer.
+let private gcTidRef (st : St) (shapeKey : string) (sizeBytes : int) (refoffs : int list) : int =
+    match dictTryFind st.Tids shapeKey with
+    | Some t -> t
+    | None ->
+        let t = st.TidNext
+        st.TidNext <- t + 1
+        dictSet st.Tids shapeKey t
+        vecAdd st.TidRegs (t, sizeBytes, FK_STRUCT, List.length refoffs)
+        dictSet st.TidRefoffs t refoffs
+        t
+
+// the GC nature of a value word: a RAW inline scalar (int/bool/char — never a
+// pointer, skip in scan), a REF (a heap pointer — trace it), or GENERIC (a type
+// parameter — unknown statically, so a container holding one cannot get a
+// static ref-map and stays uniform/tagged). Boxed scalars (int64/float/float32
+// ride an f64/i64 heap box today) are pointers, hence REF.
+type private RefKind = RKRaw | RKRef | RKGen
+
+let private rawScalarName (n : string) : bool =
+    match n with
+    | "int" | "int32" | "uint32" | "nativeint" | "unativeint"
+    | "bool" | "char" | "int16" | "uint16" | "byte" | "sbyte" -> true
+    | _ -> false
+
+let rec private refKindOfTy (t : Type) : RefKind =
+    match prune t with
+    | TVar _ -> RKGen
+    | TCon (n, _) -> if rawScalarName n then RKRaw else RKRef
+    | TFun _ | TTuple _ -> RKRef
+    | TApp (h, _) -> (match prune h with TVar _ -> RKGen | _ -> RKRef)
+
+// the ref-kind of an EXPRESSION's value, from its static type. Conservative:
+// anything it cannot pin down is RKGen (→ the container falls back to the safe
+// tagged form). It NEVER answers RKRaw unless sure — a ref mis-classified raw
+// would drop a live pointer from the scan.
+let rec private refKindOfExpr (e : Expr) : RefKind =
+    match e with
+    | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then RKRef else RKRaw
+    | ELit (LBool _) | ELit (LChar _) -> RKRaw
+    | ELit (LFloat _) | ELit (LString _) -> RKRef
+    | ELit (LNull) -> RKRef
+    | EVar (_, sch) | EVarI (_, sch, _) -> refKindOfTy sch.Body
+    | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
+        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
+        refKindOfTy (peel sch.Body (List.length args))
+    | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
+    | EPrim (op, _) ->
+        let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
+        (match b with
+         // int arithmetic / comparisons / bool ops -> a raw scalar result
+         | "+" | "-" | "*" | "/" | "%" when op = b -> RKRaw
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" -> RKRaw
+         | "&&" | "||" | "not" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" when op = b -> RKRaw
+         // a float/int64-suffixed op yields a boxed scalar (pointer)
+         | _ when op <> b -> RKRef
+         | _ -> RKGen)
+    | EIf (_, a, b) -> (match refKindOfExpr a, refKindOfExpr b with x, y when x = y -> x | _ -> RKGen)
+    | ELet (_, _, _, _, body) -> refKindOfExpr body
+    | ESeq xs -> (match List.tryLast xs with Some b -> refKindOfExpr b | None -> RKGen)
+    | EMatch (_, cs) | ETry (_, cs) ->
+        (match cs |> List.map (fun (_, _, b) -> refKindOfExpr b) with
+         | [] -> RKGen
+         | x :: rest -> if List.forall (fun k -> k = x) rest then x else RKGen)
+    | _ -> RKGen
 
 // where a captured-mutable cell keeps its value: at offset 0 in the standalone
 // headerless cell, or after the fpprt header in GC mode (a cell is a TAGGED
@@ -2154,7 +2229,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let members, body = recGroupOf e
         let regs = members |> List.map (fun (v, lam) -> v, lam, freshReg ctx (key v))
         for v, _, _ in regs do dictSet ctx.LSt.CellVars (key v) true
-        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx (lowInt 0)))
+        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx RKRef (lowInt 0)))
         let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
         LDo (allocs @ fills, coreToLowE ctx body)
     | ELet (_, v, sch, rhs, body) ->
@@ -2279,7 +2354,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         match bop with
         | "<" | ">" | "<=" | ">=" | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
         | _ -> LPrim (intArithOp bop, [ ta; tb ])
-    | ETuple xs -> lowObj ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs)
+    | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map refKindOfExpr xs))
     | EListLit xs -> lowList ctx xs
     // a collapsed one-field record IS its field value — no heap object
     | ERecord (name, fields) when (dictTryFind st.Collapse name).IsSome ->
@@ -2349,7 +2424,10 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) 0 slots)
     | ECtor (case, _, args) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
-        lowObj ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args)
+        // slot 0 is the raw tag word; the payload follows. A concrete payload
+        // gets a ref-map so its unboxed scalars are skipped by the collector.
+        let kinds = RKRaw :: List.map refKindOfExpr args
+        lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds)
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
     // fused element-field access on an array of inline records — MUST precede the
     // plain POD field cases, or a field write would copy the element out and
@@ -2855,7 +2933,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         let members, body = recGroupOf e
         let regs = members |> List.map (fun (v, lam) -> v, lam, freshReg ctx (key v))
         for v, _, _ in regs do dictSet ctx.LSt.CellVars (key v) true
-        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx (lowInt 0)))
+        let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx RKRef (lowInt 0)))
         let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
         allocs @ fills @ coreToLowS ctx body
     | ELet (_, v, sch, rhs, body) ->
@@ -2887,6 +2965,12 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
 // the slots; the shape gets an fpprt type-id whose TAGGED tracer scans from the
 // first real word. CID_ARRAY is the variable-length REF_ARRAY case.
 and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) : LExpr =
+    lowObjR ctx cid raw slots None
+// as lowObj, but with a per-slot ref-kind classification (when every slot's
+// kind is statically known). A fully-concrete shape registers FK_STRUCT with a
+// ref-map: raw scalar slots are stored inline and NEVER pushed to the shadow
+// stack, so an unboxed int in a tuple/union is invisible to the collector.
+and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) (refKinds : RefKind list option) : LExpr =
     let n = List.length slots
     let b = freshTmp ctx
     let st = ctx.LSt
@@ -2908,23 +2992,44 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), 8 + 4 * i, v))
         LDo (pushes @ [ LSet (wReg b, LCall ("$fpallocn", [ LConstW tid; len ])) ] @ pops @ consts, LGet (wReg b))
     elif gc then
-        let sk = "s:" + string cid + ":" + string n + ":" + string raw
+        // every slot's ref-kind known and none generic -> FK_STRUCT with a ref-
+        // map. Otherwise the uniform tagged form (scan by low-bit tag from the
+        // first payload word), which needs its scalars TAGGED — the pre-raw-int
+        // world, still the fallback for a generic slot.
+        let concrete = match refKinds with Some ks -> List.length ks = n && not (List.contains RKGen ks) | None -> false
+        let isRefSlot (i : int) : bool =
+            match refKinds with Some ks when concrete -> (List.item i ks) = RKRef | _ -> true
+        let sk =
+            if concrete then
+                let pat = refKinds.Value |> List.map (fun k -> if k = RKRef then "r" else "s") |> String.concat ""
+                "s:" + string cid + ":" + string n + ":" + string raw + ":" + pat
+            else "s:" + string cid + ":" + string n + ":" + string raw
         // record the tid->cid mapping the first time a shape is allocated, so
         // `:?`/dispatch recover the class-id (covers classes, which the eager
         // record/union pass does not enumerate)
         let isNew = (dictTryFind st.Tids sk).IsNone
-        let tid = gcTid st sk (HDR + 4 * n) FK_TAGGED (1 + raw)
+        let tid =
+            if concrete then
+                let refOffs = [ 0 .. n - 1 ] |> List.filter isRefSlot |> List.map (fun i -> HDR + 4 * i)
+                gcTidRef st sk (HDR + 4 * n) refOffs
+            else gcTid st sk (HDR + 4 * n) FK_TAGGED (1 + raw)
         if isNew && cid >= CID_FIRST_USER then vecAdd st.TidCid (tid, cid)
-        // constants (the union tag, a closure's kind/code index) are raw words:
-        // store them directly. A pointer-or-tagged slot is pushed to the shadow
-        // stack across the safepoint. NEVER push a raw constant — an even one
-        // would be scanned as a bogus heap pointer.
         let isConst e = match e with LConstW _ -> true | _ -> false
         let idx = slots |> List.mapi (fun i v -> i, v)
-        let pushes = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.collect (fun (_, v) -> gcPushStmts v)
-        let pops = idx |> List.filter (fun (_, v) -> not (isConst v)) |> List.rev |> List.collect (fun (i, _) -> gcPopInto (LGet (wReg b)) (HDR + 4 * i))
+        // REF slots are live pointers: evaluate and push to the shadow stack
+        // before the (collecting) alloc, pop back after. RAW non-const slots are
+        // materialised into a temp before the alloc and stored after — a raw
+        // scalar must NEVER reach the pointer-scanned shadow stack. Consts store
+        // directly.
+        let refIdx = idx |> List.filter (fun (i, v) -> isRefSlot i && not (isConst v))
+        let rawIdx = idx |> List.filter (fun (i, v) -> not (isRefSlot i) && not (isConst v))
+        let pushes = refIdx |> List.collect (fun (_, v) -> gcPushStmts v)
+        let pops = refIdx |> List.rev |> List.collect (fun (i, _) -> gcPopInto (LGet (wReg b)) (HDR + 4 * i))
+        let rawTemps = rawIdx |> List.map (fun (i, v) -> i, freshTmp ctx, v)
+        let rawEvals = rawTemps |> List.map (fun (_, t, v) -> LSet (wReg t, v))
+        let rawStores = rawTemps |> List.map (fun (i, t, _) -> LStore (W, LGet (wReg b), HDR + 4 * i, LGet (wReg t)))
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
-        LDo (pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops @ consts, LGet (wReg b))
+        LDo (rawEvals @ pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops @ rawStores @ consts, LGet (wReg b))
     else
         let stores =
             LStore (W, LGet (wReg b), 0, LConstW cid)
@@ -3122,7 +3227,7 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
         LSet ({ Id = id; RTy = ty }, flatUnbox ty (coreToLowE ctx rhs))
     | None ->
         let id = freshReg ctx k
-        let init = if isCell then lowMkCell ctx (coreToLowE ctx rhs) else coreToLowE ctx rhs
+        let init = if isCell then lowMkCell ctx (refKindOfExpr rhs) (coreToLowE ctx rhs) else coreToLowE ctx rhs
         LSet (wReg id, init)
 
 // read a variable: an unboxed scalar re-boxes to a word; a captured mutable
@@ -3135,12 +3240,21 @@ and private lowVarByKey (ctx : LowCtx) (k : string) : LExpr =
         if (dictTryFind ctx.LSt.CellVars k).IsSome then LLoad (W, store, cellOff ()) else store
 
 // a fresh 1-word cell holding `v` (headerless — cells are internal, never
-// type-tested or dispatched on)
-and private lowMkCell (ctx : LowCtx) (v : LExpr) : LExpr =
+// type-tested or dispatched on). `kind` is the ref-kind of the value the cell
+// holds: a RAW-scalar cell (a mutable int/bool) registers FK_STRUCT with no
+// ref-map and stores its word directly — never scanned, never shadow-stacked,
+// so an even int in the cell is not chased as a pointer. A ref/generic cell
+// keeps the tagged form (scan the word, push across the alloc).
+and private lowMkCell (ctx : LowCtx) (kind : RefKind) (v : LExpr) : LExpr =
     let b = freshTmp ctx
     if gc then
-        let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
-        LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
+        if kind = RKRaw then
+            let tid = gcTidRef ctx.LSt "cell$s" (HDR + 4) []
+            let t = freshTmp ctx
+            LDo ([ LSet (wReg t, v); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ], LGet (wReg b))
+        else
+            let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
+            LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
     else
         LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
 
@@ -3680,7 +3794,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
-          Tids = dictNew (); TidRegs = vecNew (); TidNext = TID_FIRST
+          Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
@@ -3811,9 +3925,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DLet (_, v, s, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone ->
             dictSet st.Funcs (key v) (List.length ps)
             match funSigOf s (List.length ps) with Some sig_ -> dictSet st.FuncSig (key v) sig_ | None -> ()
-        | DLet (_, v, _, _) ->
+        | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
-            if gc then
+            // a RAW-scalar top-level binding (int/bool/char) stays in its
+            // unscanned wasm global — an even int in the SCANNED root table
+            // reads as a bogus pointer. Only ref/generic globals take a root
+            // slot (they hold heap pointers a moving collection must update).
+            if gc && refKindOfTy s.Body <> RKRaw then
                 let slot = st.RootNext
                 st.RootNext <- slot + 1
                 dictSet st.GlobalSlot (key v) slot
@@ -3991,6 +4109,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then
         let rf = beginFn m []
         local rf "$t" "i32"
+        local rf "$ro" "i32"
         localsDone rf
         // the root table lives in fpprt's static memory: register the whole
         // range (scratch slot 0 + one per constant) up front — the slots read 0
@@ -4007,10 +4126,26 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         callf rf "$t2cbase"; gs rf "$t2c"
         for tid, cid in vecToList st.TidCid do
             gg rf "$t2c"; ic rf (4 * tid); ins rf "i32.add"; ic rf cid; mem rf "i32.store"
-        // register every shape's fpprt type
+        // register every shape's fpprt type. A FK_STRUCT shape with a ref-map
+        // writes its byte-offsets into the static g_refoffs pool (a compile-time
+        // cursor packs them contiguously) and passes (nrefs, &pool[cursor]);
+        // everything else passes (start, refoffs=0) — a NULL map with nrefs=0
+        // scans nothing, which is exactly an all-scalar tuple/union.
+        callf rf "$refoffsbase"; ls rf "$ro"
+        let mutable roCur = 0
         for tid, size, kind, start in vecToList st.TidRegs do
-            ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
-            callf rf "$fpreg"
+            match dictTryFind st.TidRefoffs tid with
+            | Some offs when not (List.isEmpty offs) ->
+                offs |> List.iteri (fun j off ->
+                    lg rf "$ro"; ic rf (roCur + 4 * j); ins rf "i32.add"; ic rf off; mem rf "i32.store")
+                ic rf tid; ic rf size; ic rf kind; ic rf start
+                lg rf "$ro"; ic rf roCur; ins rf "i32.add"
+                ic rf 0
+                callf rf "$fpreg"
+                roCur <- roCur + 4 * List.length offs
+            | _ ->
+                ic rf tid; ic rf size; ic rf kind; ic rf start; ic rf 0; ic rf 0
+                callf rf "$fpreg"
         // vtable: a fpprt int array in root slot VtSlot; fill the nonzero rows
         // (fpprt zeroed the array). Its data starts past the [tag][len] header.
         if nCid * st.NSlots > 0 then
