@@ -3937,11 +3937,24 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // non-function global takes a root slot (before constants).
     let assigned = collectAssigned decls
     if gc then gcGlobalSlots <- dictNew ()
+    // interface-method impls are reached ONLY through the vtable, which dispatches
+    // at the uniform `$lfn<n>` type. So a vtable member must NEVER take a
+    // funSigOf-specialized signature (a raw f64/i64 param/return) — its declared
+    // type would then differ from the call_indirect type and trap. It keeps the
+    // uniform sig; a scalar rides the boxed-at-rest representation coreToLowE
+    // already produces. (Matches the wasm-GC backend's all-anyref vtable rule.)
+    let vtImpls = dictNew<string, bool> ()
+    for d in decls0 do
+        match d with
+        | DClass (_, _, _, impls) -> for _, ms in impls do (for _, v in ms do dictSet vtImpls (key v) true)
+        | _ -> ()
     for d in decls do
         match d with
         | DLet (_, v, s, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone ->
             dictSet st.Funcs (key v) (List.length ps)
-            match funSigOf s (List.length ps) with Some sig_ -> dictSet st.FuncSig (key v) sig_ | None -> ()
+            match funSigOf s (List.length ps) with
+            | Some sig_ when (dictTryFind vtImpls (key v)).IsNone -> dictSet st.FuncSig (key v) sig_
+            | _ -> ()
         | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
             // a RAW-scalar top-level binding (int/bool/char) stays in its
