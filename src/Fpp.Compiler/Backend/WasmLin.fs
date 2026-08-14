@@ -98,6 +98,12 @@ type private St =
       /// type string)), the total size, and that first-ref word index (= size/4
       /// when all-scalar). A one-field record still collapses (newtype) first.
       RecPod : Dict<string, Dict<string, int * string> * int * int>
+      /// a STRUCT record's declared fields IN ORDER, as (field, type-name).
+      /// Only [<Struct>] records are listed — presence marks a value type the
+      /// inline-value layout engine (`layoutOf`) lays out .NET-sequentially;
+      /// absence means a reference type (one pointer word). Groundwork: written
+      /// here, read only by `layoutOf`, which nothing consumes yet.
+      RecFieldTys : Dict<string, (string * string) list>
       /// repr(T) single-field collapse: a record with EXACTLY one field, never
       /// mutated (no EFieldSet), travels AS that field — no heap object. Maps the
       /// record name -> its sole field name. This is the general "any one-field
@@ -1879,6 +1885,93 @@ let private scalarLTy (t : Type) : LTy option =
 // monomorphic 64-bit scalar, else a tagged word.
 let private abiTy (t : Type) : LTy = match scalarLTy t with Some ty -> ty | None -> W
 
+// ---- inline value layout (.NET-parity, value-witness groundwork) ----------
+// The bytes a VALUE of a type occupies when stored INLINE — no heap box, no
+// per-value header. `Size`/`Align` follow .NET SEQUENTIAL struct layout:
+// declaration order, each field on its natural alignment, the whole padded to
+// the struct's alignment — the SAME rule the ABI parity harness pins against a
+// real C compiler (tests/tooling/abi). `RefMask` bit i set = word i (4 bytes)
+// of the value is a GC pointer the collector must trace; every other word is
+// raw scalar bytes it skips. `Generic = true` marks a type whose layout is not
+// known statically (a type parameter or a field typed by one): a runtime
+// value-witness supplies it and Size/Align/RefMask are meaningless. A reference
+// type — string, list, array, closure, a reference tuple, a heap union or a
+// NON-struct record — is one pointer word {4,4,ref}.
+//
+// This is the single source of truth for inline .NET-parity layout. RecPod's
+// current scalars-first packing is a separate, pre-parity scheme (it reorders
+// fields and does not size `int`); the inline-value rewrite reconciles RecPod
+// TO this. Nothing consumes `layoutOf` yet — it is groundwork.
+type Layout = { Size : int; Align : int; RefMask : uint64; Generic : bool }
+
+let private layRoundUp (n : int) (a : int) : int = if a <= 1 then n else (n + a - 1) / a * a
+let private layRefWord = { Size = 4; Align = 4; RefMask = 1UL; Generic = false }
+let private layWitness = { Size = 0; Align = 0; RefMask = 0UL; Generic = true }
+let private layScalar (b : int) : Layout = { Size = b; Align = b; RefMask = 0UL; Generic = false }
+
+// primitive value types at their .NET widths: byte/bool = 1, char/int16 = 2
+// (char is UTF-16), int/float32 = 4, int64/float = 8. Not a primitive -> None.
+let private layPrim (nm : string) : Layout option =
+    match nm with
+    | "bool" | "byte" | "sbyte" -> Some (layScalar 1)
+    | "int16" | "uint16" | "char" -> Some (layScalar 2)
+    | "int" | "int32" | "uint32" | "nativeint" | "unativeint" | "float32" | "single" -> Some (layScalar 4)
+    | "int64" | "uint64" | "float" | "double" -> Some (layScalar 8)
+    | "unit" -> Some { Size = 0; Align = 1; RefMask = 0UL; Generic = false }
+    | _ -> None
+
+let private layStripGen (nm : string) : string =
+    let a = nm.IndexOf "$<"
+    let nm = if a >= 0 then nm.Substring (0, a) else nm
+    let b = nm.IndexOf "<"
+    if b >= 0 then nm.Substring (0, b) else nm
+
+// sequential .NET layout of an ordered list of already-computed field layouts.
+let private laySeq (fields : Layout list) : Layout =
+    let mutable off = 0
+    let mutable align = 1
+    let mutable mask = 0UL
+    let mutable generic = false
+    for l in fields do
+        if l.Generic then generic <- true
+        let a = if l.Align < 1 then 1 else l.Align
+        off <- layRoundUp off a
+        if l.RefMask <> 0UL then mask <- mask ||| (l.RefMask <<< (off / 4))
+        off <- off + l.Size
+        if a > align then align <- a
+    if generic then layWitness
+    else { Size = layRoundUp off align; Align = align; RefMask = mask; Generic = false }
+
+// `resolve name` -> a STRUCT record's declared fields in order, or None for a
+// reference type (its presence IS the struct-vs-reference distinction). Pure —
+// takes `resolve` rather than St, so it unit-tests without one.
+let rec layoutOfWith (resolve : string -> (string * string) list option) (t : Type) : Layout =
+    match prune t with
+    | TVar _ -> layWitness
+    | TFun _ -> layRefWord
+    | TApp (h, _) -> layoutOfWith resolve h
+    | TTuple _ -> layRefWord                       // reference tuple: a heap pointer
+    | TCon (n, args) when n.StartsWith "StructTuple" ->
+        laySeq (args |> List.map (layoutOfWith resolve))       // value tuple: inline
+    | TCon (n, _) -> layByName resolve n
+
+and private layByName (resolve : string -> (string * string) list option) (nm0 : string) : Layout =
+    let nm = layStripGen nm0
+    if nm = "?" || (nm.Length > 0 && nm.[0] = '\'') then layWitness   // a type parameter
+    else
+        match layPrim nm with
+        | Some l -> l
+        | None ->
+            match resolve nm with
+            | Some fields -> laySeq (fields |> List.map (fun (_, ty) -> layByName resolve ty))
+            | None -> layRefWord
+
+// the inline layout of a value of `t` in the context of a program's St: a
+// struct record resolves to its declared fields, everything else is primitive
+// / reference / generic as above.
+let private layoutOf (st : St) (t : Type) : Layout =
+    layoutOfWith (fun n -> dictTryFind st.RecFieldTys n) t
+
 // (param abi types, return abi type) of a top-level function: peel `arity`
 // arrows off its scheme. None when every slot is a plain word (nothing to
 // specialize — the uniform $lfn signature already fits).
@@ -3580,7 +3673,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew ()
-          RecFields = dictNew (); RecPod = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0
@@ -3637,6 +3730,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     dictSet m fn (off, ty)
                     off <- off + 4
                 dictSet st.RecPod n (m, off, firstRefWord)
+        | _ -> ()
+    // record every STRUCT record's ordered declared fields for the inline-value
+    // layout engine (`layoutOf`). Value types only — reference records stay a
+    // pointer word. Written for groundwork; no codegen path reads it yet.
+    for d in decls0 do
+        match d with
+        | DRecord (n, _, fs, true) -> dictSet st.RecFieldTys n fs
         | _ -> ()
     let nCid = nextCid
     // GC: eagerly intern the fpprt type-id for every type-testable shape and
