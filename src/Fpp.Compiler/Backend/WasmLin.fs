@@ -1466,11 +1466,23 @@ let private emitCmpv (m : Mod) : unit =
     // metadata words (a union tag) compare as ints, ref/payload words recurse.
     // Different tids order by header. Standalone has no table -> equal (0).
     if gc then
+        gg f "$roots"; ic f (4 * gcCmpTblSlot); ins f "i32.add"; mem f "i32.load"; ls f "$tbl"
+        // is $a a managed heap object? its header word must be an odd (tid<<1)|1
+        // with a tid inside the shape table. Otherwise $a is a RAW scalar — an
+        // even int under the raw-int model, whose value-as-address read a
+        // non-header — and $a/$b are compared DIRECTLY as signed words. Without
+        // this, $cmpv indexed `$tbl + 8 + 4*tid` with a raw int as the tid (OOB),
+        // and even the header comparison below was against garbage. (The value's
+        // own witness would say raw vs ref, but comparison sites are unwitnessed;
+        // the runtime shape table is the available discriminator.)
+        lg f "$ca"; ic f 1; ins f "i32.and"
+        lg f "$ca"; ic f 1; ins f "i32.shr_u"; lg f "$tbl"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.lt_u"
+        ins f "i32.and"; ins f "i32.eqz"
+        ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
         lg f "$ca"; lg f "$cb"; ins f "i32.ne"
         ifE f; lg f "$ca"; lg f "$cb"; ins f "i32.gt_s"; lg f "$ca"; lg f "$cb"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
         lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
         lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
-        gg f "$roots"; ic f (4 * gcCmpTblSlot); ins f "i32.add"; mem f "i32.load"; ls f "$tbl"
         lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
         lg f "$r"; ic f 10; ins f "i32.shr_u"; ic f 0x3FF; ins f "i32.and"; ls f "$st"
         lg f "$st"; ic f 1; ins f "i32.lt_s"; ifE f; ic f 1; ls f "$st"; endB f
@@ -1950,6 +1962,13 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
         | None -> match fieldCellKind () with Some k -> k | None -> refKindOfExpr e
     | _ -> refKindOfExpr e
 
+// the element witness register for a comparison of two operands whose static
+// type is a type PARAMETER (so its ShOther comparison can pick raw-vs-ref at
+// runtime). None outside a witnessed generic body — then $cmpv is the fallback.
+let private cmpWit (ctx : LowCtx) (a : Expr) (b : Expr) : int option =
+    let ofExpr e = tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid)
+    match ofExpr a with Some w -> Some w | None -> ofExpr b
+
 // for an aggregate allocated inside a GENERIC body, the (slot index, witness
 // register) of each slot whose static type is a type PARAMETER whose witness
 // param is in scope. `base_` is the slot index of exprs.[0] (0 for a tuple or
@@ -2312,14 +2331,25 @@ let rec private shapeOfName (nm : string) : CmpShape =
 // compare their tagged payloads; strings/lists/arrays go through the runtime
 // helpers; a tuple is unrolled element by element (reading HDR+4*i), recursing
 // and short-circuiting on the first difference.
-let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExpr) : LExpr =
+let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExpr) (wit : int option) : LExpr =
     match sh with
     | ShScalar ->
         LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])
-    // an opaque operand (a generic HOF's element, type unknown here): the safe
-    // runtime comparator — correct for ints/strings/float/int64, a no-op (0) for
-    // compound FK_TAGGED shapes it cannot identify at runtime.
-    | ShOther -> LCall ("$cmpv", [ wa; wb ])
+    // an opaque operand (a generic HOF's element, type unknown here). With the
+    // element WITNESS in scope, branch on its refMask: a RAW element (int/bool/
+    // char — an even word under the raw-int model) compares its words DIRECTLY;
+    // $cmpv would read an even int as a heap header and index the shape table at
+    // `$tbl + 8 + 4*tid` out of bounds. A REF element is a pointer -> $cmpv, the
+    // self-describing comparator (ints-as-tagged, strings, float, compounds).
+    | ShOther ->
+        (match wit with
+         | Some w ->
+             let t = freshTmp ctx
+             LDo ([ LIf (LPrim (EqW, [ LLoad (W, LGet (wReg w), 8); LConstW 0 ]),
+                         [ LSet (wReg t, LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])) ],
+                         [ LSet (wReg t, LCall ("$cmpv", [ wa; wb ])) ]) ],
+                   LGet (wReg t))
+         | None -> LCall ("$cmpv", [ wa; wb ]))
     | ShStr -> LCall ("$str_cmp", [ wa; wb ])
     | ShFloat ->
         LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
@@ -2329,7 +2359,7 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
         let ra = freshTmp ctx
         let rb = freshTmp ctx
         let r = freshTmp ctx
-        let elemCmp i shi = structCmp ctx shi (LLoad (W, LGet (wReg ra), HDR + 4 * i)) (LLoad (W, LGet (wReg rb), HDR + 4 * i))
+        let elemCmp i shi = structCmpW ctx shi (LLoad (W, LGet (wReg ra), HDR + 4 * i)) (LLoad (W, LGet (wReg rb), HDR + 4 * i)) None
         match shapes with
         | [] -> LConstW 0
         | sh0 :: more ->
@@ -2345,7 +2375,7 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
         let notNil p = LPrim (NeW, [ LGet (wReg p); LConstW 0 ])
         let cond = LPrim (AndW, [ notNil pa; LPrim (AndW, [ notNil pb; LPrim (EqW, [ LGet (wReg r); LConstW 0 ]) ]) ])
         let body =
-            [ LSet (wReg r, structCmp ctx esh (LLoad (W, LGet (wReg pa), HDR)) (LLoad (W, LGet (wReg pb), HDR)))
+            [ LSet (wReg r, structCmpW ctx esh (LLoad (W, LGet (wReg pa), HDR)) (LLoad (W, LGet (wReg pb), HDR)) None)
               LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
                    [ LSet (wReg pa, LLoad (W, LGet (wReg pa), HDR + 4)); LSet (wReg pb, LLoad (W, LGet (wReg pb), HDR + 4)) ], []) ]
         LDo ([ LSet (wReg pa, wa); LSet (wReg pb, wb); LSet (wReg r, LConstW 0)
@@ -2365,7 +2395,7 @@ let rec private structCmp (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExp
         let elemAt reg = LLoad (W, LPrim (AddW, [ LGet (wReg reg); LPrim (AddW, [ LConstW 8; LPrim (MulW, [ LGet (wReg i); LConstW 4 ]) ]) ]), 0)
         let cond = LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg na) ]); LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg nb) ]); LPrim (EqW, [ LGet (wReg r); LConstW 0 ]) ]) ])
         let body =
-            [ LSet (wReg r, structCmp ctx esh (elemAt ra) (elemAt rb))
+            [ LSet (wReg r, structCmpW ctx esh (elemAt ra) (elemAt rb) None)
               LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]), [ LSet (wReg i, LPrim (AddW, [ LGet (wReg i); LConstW 1 ])) ], []) ]
         LDo ([ LSet (wReg ra, wa); LSet (wReg rb, wb)
                LSet (wReg na, LLoad (W, LGet (wReg ra), HDR)); LSet (wReg nb, LLoad (W, LGet (wReg rb), HDR))
@@ -2504,12 +2534,12 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
         let sh = mergeShape (shapeOfExpr a) (shapeOfExpr b)
         let ra, rb, pre = evalRooted ctx a b
-        LDo (pre, (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        LDo (pre, (structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
-        LDo (pre, (structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))))
+        LDo (pre, (structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)))
     // a comparison whose operands are a COMPOUND value (tuple/list/...), a STRING
     // (`=t`/`<t` — the `t` type suffix), or a STRUCTURAL `=@Type`/`<>@Type`
     // (records/unions): the tagged-int fast path below would compare heap
@@ -2528,7 +2558,7 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
         let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
-        LDo (pre @ [ LSet (wReg cr, structCmp ctx sh (LGet (wReg ra)) (LGet (wReg rb))) ],
+        LDo (pre @ [ LSet (wReg cr, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)) ],
              (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
     | EPrim (op, [ a; b ]) ->
         // int is RAW i32: plain wasm arithmetic, no tag juggling. A comparison
