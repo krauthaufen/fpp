@@ -378,7 +378,12 @@ let private selectCore (t : Tables) (eager : bool) (cls : string) (args : Type l
 /// One line per selection for the pick checker: a term grammar the checker
 /// parses back — `name`, `name(a,b)`, `?7` for a variable, `tup(..)`,
 /// `fn(a,b)`, `app(h,a)`.
-let rec private dumpTy (t : Type) : string =
+/// Identity-precise rendering: variables print by ID. `typeString` names
+/// two DIFFERENT variables identically ('a here and 'a there), which is
+/// right for a human and wrong for a KEY — a solver dedup keyed on it
+/// collapsed one declaration's leftover wanted with the next
+/// declaration's live one, and the live one starved unsolved.
+let rec dumpTy (t : Type) : string =
     match prune t with
     | TCon (n, []) -> n
     | TCon (n, args) -> n + "(" + String.concat "," (List.map dumpTy args) + ")"

@@ -2327,6 +2327,44 @@ let typeclassPracticeTests =
 [<Tests>]
 let declarationCheckTests =
     testList "declaration checks" [
+        test "a leftover deferred wanted cannot starve a later instance's check" {
+            // the solver dedup was keyed on typeString, which prints two
+            // DIFFERENT variables alike: V3.Dot's undischargeable Add
+            // wanted collapsed with the Add instance body's live one, the
+            // live one never reached its givens, and the occurs error —
+            // Result declared 'c while the body returns V2<'c> — vanished.
+            // The instance was accepted clean and trapped in the backend.
+            let errs =
+                diagnostics
+                    [ "[<Struct>]"
+                      "type V2<'a>(x : 'a, y : 'a) ="
+                      "    member this.X = x"
+                      "    member this.Y = y"
+                      "[<Struct>]"
+                      "type V3<'a>(x : 'a, y : 'a, z : 'a) ="
+                      "    member this.X = x"
+                      "    member this.Y = y"
+                      "    member this.Z = z"
+                      "    member x.Dot(y : V3<'b>) when Mul<'a, 'b> = 'c and Add<'c, 'c> ="
+                      "        x.X * y.X + x.Y * y.Y + x.Z * y.Z"
+                      "instance Add<V2<'a>, V2<'b>> when Add<'a, 'b> = 'c"
+                      "    type Result = 'c"
+                      "    static (+) x y = V2(x.X + y.X, x.Y + y.Y)" ]
+            Expect.exists errs (fun e -> e.Contains "would contain itself")
+                "the contradictory Result declaration is reported"
+        }
+        test "an operator in the wrong instance names its owner class" {
+            let errs =
+                diagnostics
+                    [ "type P = { V : int }"
+                      "instance Zero<P>"
+                      "    static Zero = { V = 0 }"
+                      "    static One = { V = 1 }" ]
+            Expect.exists errs (fun e ->
+                e.Contains "class Zero has no member One"
+                && e.Contains "One is a member of class One")
+                "the hint points at the owning class"
+        }
         test "an instance must honor its class' when-promise" {
             // `class Aa when Bb<'a>` says every Aa is a Bb; an Aa<int>
             // without Bb<int> compiled clean and trapped at the first use

@@ -1803,13 +1803,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // an instance context that re-demands its own class would grow the
         // queue forever INSIDE this pass — dedupe repeats, bound the work
         let seenKey = dictNew<string, bool> ()
-        let keyOf (c : Constraint) =
-            c.Class + "|" + String.concat "," (List.map typeString c.Args)
+        // the key must separate what is genuinely distinct: variables by ID
+        // (typeString prints two different 'a alike, and a key collision
+        // STARVES the later wanted — it re-deduped against a leftover every
+        // pass and its discharge never ran), and the SITE, so two call sites
+        // sharing a constraint each get their assoc pinned. What remains
+        // deduped is one site re-demanding the same constraint in one pass.
+        let keyOf (offset : int) (c : Constraint) =
+            string offset + "|" + c.Class + "|" + String.concat "," (List.map Classes.dumpTy c.Args)
         let budget = vecLen queue * 4 + 256
         while i < vecLen queue && i < budget do
             let offset, c = vecGet queue i
             i <- i + 1
-            let k = keyOf c
+            let k = keyOf offset c
             if (dictTryFind seenKey k).IsSome then vecAdd survivors (offset, c)
             else
             dictSet seenKey k true
@@ -4899,9 +4905,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             vecAdd instRaw (mtk.Offset, fresh)
                                             Some ty
                                         | None ->
+                                            let hint =
+                                                match dictTryFind classes.MemberOwner mtk.Text with
+                                                | Some owner ->
+                                                    " — " + mtk.Text + " is a member of class " + owner
+                                                | None -> ""
                                             vecAdd diags
                                                 (mtk.Offset,
-                                                 "class " + cd.Name + " has no member " + mtk.Text)
+                                                 "class " + cd.Name + " has no member " + mtk.Text + hint)
                                             Some (st.Fresh ()))
                                    | None -> None)
                               | None -> None)
@@ -6253,7 +6264,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             | None -> ()
                                 Some ty
                             | None ->
-                                vecAdd diags (t.Offset, "class " + name + " has no member " + t.Text)
+                                // after the Zero/One/Num split this is an easy
+                                // slip: `instance Num` with the operators in
+                                // it. Name the class that owns the member.
+                                let hint =
+                                    match dictTryFind classes.MemberOwner t.Text with
+                                    | Some owner ->
+                                        " — " + t.Text + " is a member of class " + owner
+                                        + "; declare `instance " + owner + "<...>`"
+                                    | None -> ""
+                                vecAdd diags (t.Offset, "class " + name + " has no member " + t.Text + hint)
                                 None
                         inferInstanceMember expected t m
                 // Solve WHILE the context is still given. A member body's
