@@ -363,9 +363,21 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
     | ELit (LFloat _) | ELit (LString _) -> RKRef
     | ELit (LNull) -> RKRef
     | EVar (_, sch) | EVarI (_, sch, _) -> refKindOfTy sch.Body
-    | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
+    | EApp (((EVar (_, sch) | EVarI (_, sch, _)) as hd), args) ->
         let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
-        refKindOfTy (peel sch.Body (List.length args))
+        (match prune (peel sch.Body (List.length args)) with
+         | TVar rv ->
+             // a call whose result rides a quantified type var: resolve it through
+             // the call's instantiation NAMES (EVarI.inst, positional to Quantified)
+             // so a concrete raw result (an `int`-returning generic) is RKRaw and its
+             // cons head is not chased as a pointer — no witness needed at the caller.
+             (match hd with
+              | EVarI (_, _, inst) ->
+                  (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
+                   | Some k -> (match List.tryItem k inst with Some nm -> (if rawScalarName nm then RKRaw else RKRef) | None -> RKGen)
+                   | None -> RKGen)
+              | _ -> RKGen)
+         | rt -> refKindOfTy rt)
     | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
     | EPrim (op, _) ->
         let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
@@ -384,11 +396,11 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
         // pointer. Without this the element was RKGen with no witness and rebuilt
         // under the tag-scanning gcListTid, which traced a raw int as a ref.
         if rawScalarName k then RKRaw else RKRef
-    | EIf (_, a, b) -> (match refKindOfExpr a, refKindOfExpr b with x, y when x = y -> x | _ -> RKGen)
+    | EIf (_, a, b) -> (match refKindOfExpr a, refKindOfExpr b with x, y when x = y -> x | RKGen, y -> y | x, RKGen -> x | _ -> RKGen)
     | ELet (_, _, _, _, body) -> refKindOfExpr body
     | ESeq xs -> (match List.tryLast xs with Some b -> refKindOfExpr b | None -> RKGen)
     | EMatch (_, cs) | ETry (_, cs) ->
-        (match cs |> List.map (fun (_, _, b) -> refKindOfExpr b) with
+        (match cs |> List.map (fun (_, _, b) -> refKindOfExpr b) |> List.filter (fun k -> k <> RKGen) with
          | [] -> RKGen
          | x :: rest -> if List.forall (fun k -> k = x) rest then x else RKGen)
     | _ -> RKGen
