@@ -369,21 +369,30 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
     | ELit (LFloat _) | ELit (LString _) -> RKRef
     | ELit (LNull) -> RKRef
     | EVar (_, sch) | EVarI (_, sch, _) -> refKindOfTy sch.Body
-    | EApp (((EVar (_, sch) | EVarI (_, sch, _)) as hd), args) ->
-        let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
-        (match prune (peel sch.Body (List.length args)) with
-         | TVar rv ->
-             // a call whose result rides a quantified type var: resolve it through
-             // the call's instantiation NAMES (EVarI.inst, positional to Quantified)
-             // so a concrete raw result (an `int`-returning generic) is RKRaw and its
-             // cons head is not chased as a pointer — no witness needed at the caller.
-             (match hd with
-              | EVarI (_, _, inst) ->
-                  (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
-                   | Some k -> (match List.tryItem k inst with Some nm -> (if rawScalarName nm then RKRaw else RKRef) | None -> RKGen)
-                   | None -> RKGen)
-              | _ -> RKGen)
-         | rt -> refKindOfTy rt)
+    | EApp (_, _) ->
+        // flatten the whole application spine so a CURRIED call
+        // (`EApp(EApp(f,a1),a2)`) and a beta-redex (`EApp(ELam…,args)`, e.g. an
+        // eta-expansion) resolve their result kind, not just a direct EVar head.
+        let rec flat e acc = match e with EApp (h, a) -> flat h (a @ acc) | _ -> (e, acc)
+        let head, args = flat e []
+        (match head with
+         | (EVar (_, sch) | EVarI (_, sch, _)) as hd ->
+             let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
+             (match prune (peel sch.Body (List.length args)) with
+              | TVar rv ->
+                  // a call whose result rides a quantified type var: resolve it through
+                  // the call's instantiation NAMES (EVarI.inst, positional to Quantified)
+                  // so a concrete raw result (an `int`-returning generic) is RKRaw.
+                  (match hd with
+                   | EVarI (_, _, inst) ->
+                       (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
+                        | Some k -> (match List.tryItem k inst with Some nm -> (if rawScalarName nm then RKRaw else RKRef) | None -> RKGen)
+                        | None -> RKGen)
+                   | _ -> RKGen)
+              | rt -> refKindOfTy rt)
+         // a fully-applied beta-redex resolves to its body's kind
+         | ELam (ps, body) when List.length args >= List.length ps -> refKindOfExpr body
+         | _ -> RKGen)
     | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
     // an array length / type test is always a raw scalar (int / bool), never a
     // pointer — a generic aggregate storing one must exclude it from its scan
