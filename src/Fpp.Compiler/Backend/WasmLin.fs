@@ -1732,9 +1732,11 @@ let private cellKindScan (decls : Decl list) (cells : Dict<string, bool>) : Dict
     let out = dictNew<string, RefKind> ()
     let rec go (e : Expr) : unit =
         (match e with
-         | ELet (_, v, _, rhs, _) when (dictTryFind cells (key v)).IsSome ->
+         | ELet (_, v, sch, rhs, _) when (dictTryFind cells (key v)).IsSome ->
              let init = match rhs with EApp (EUnknown "$forcecell", [ r ]) -> r | _ -> rhs
-             dictSet out (key v) (refKindOfExpr init)
+             // MUST match lowLetBind: the declared type is authoritative for
+             // raw-vs-ref, falling back to the initialiser only when it is generic
+             dictSet out (key v) (match refKindOfTy sch.Body with RKGen -> refKindOfExpr init | k -> k)
          | _ -> ())
         match e with
         | ELet (_, _, _, r, b) -> go r; go b
@@ -4060,7 +4062,13 @@ and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : 
         let id = freshReg ctx k
         let init =
             if isCell then
-                let ck = refKindOfExpr rhs
+                // the cell's declared TYPE is authoritative for raw-vs-ref: a
+                // mutable `int`/`bool` cell holds a RAW even word even when its
+                // initialiser is a generic call (refKindOfExpr rhs = RKGen) that
+                // monomorphises to a scalar — the tagged form would scan that raw
+                // int as a pointer. Only fall back to the rhs when the type itself
+                // is unresolved (a genuinely generic mutable).
+                let ck = match refKindOfTy sch.Body with RKGen -> refKindOfExpr rhs | k -> k
                 dictSet ctx.LSt.CellKind k ck
                 lowMkCell ctx ck (coreToLowE ctx rhs)
             else coreToLowE ctx rhs
