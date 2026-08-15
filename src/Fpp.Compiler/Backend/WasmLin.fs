@@ -101,6 +101,12 @@ type private St =
       Lams : Vec<string * (VarId * Scheme) * Expr * (string * int * Type) list>
       /// while emitting a lifted lambda body: captured key -> its env slot
       mutable Captures : Dict<string, int>
+      /// lifted lambda name -> (enclosing type-var id, env slot) list: the
+      /// enclosing generic fn's witnesses captured into the closure so the
+      /// lambda body's generic aggregates resolve raw-vs-ref (the closure
+      /// analogue of a direct fn's witnessVars). Env slot holds a g_witnesses
+      /// pointer (immortal), excluded from refoffs.
+      LamWits : Dict<string, (int * int) list>
       /// record name -> its field names in DECLARED order (an offset each)
       RecFields : Dict<string, string list>
       /// a stamped subclass (Dictionary$int$int) owns no fields of its own — they
@@ -4117,9 +4123,20 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
                 | TVar v -> (match dictTryFind ctx.Witness v.Id with Some w -> Some (2 + i, LGet (wReg w)) | None -> None)
                 | _ -> None)
         |> List.choose id
+    // capture the ENCLOSING generic fn's witnesses (ctx.Witness) as trailing
+    // RKRaw env slots, so the lambda body's own generic aggregates (a tuple of
+    // its type-param params, e.g. zip's `fun x y -> (x,y)`) resolve raw-vs-ref.
+    // Sorted by id for a deterministic layout. Only fires when the enclosing is
+    // generic (non-empty Witness); non-generic closures are unchanged.
+    let encWits = ctx.Witness |> dictPairs |> Seq.sortBy fst |> Seq.toList
+    let ncaps = List.length caps
+    (if not (List.isEmpty encWits) then
+        dictSet st.LamWits name (encWits |> List.mapi (fun j (tvId, _) -> (tvId, ncaps + j))))
+    let witVals = encWits |> List.map (fun (_, r) -> LGet (wReg r))
+    let witKinds = encWits |> List.map (fun _ -> RKRaw)
     lowObjR ctx CID_CLOSURE 2
-        (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: capVals)
-        (Some (RKRaw :: RKRaw :: capKinds)) capGenWits
+        (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: (capVals @ witVals))
+        (Some (RKRaw :: RKRaw :: (capKinds @ witKinds))) capGenWits
 
 // Root ref-typed call ARGUMENTS across the evaluation of later args. Evaluating
 // `f(a, b)` leaves a's pointer on the wasm operand stack — which the GC never
@@ -4541,6 +4558,14 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
+    // read the enclosing fn's captured witnesses out of the env ONCE at entry
+    // (before any body allocation, so the env param is fresh) into stable regs,
+    // and seed ctx.Witness so the body's generic aggregates resolve. Witnesses
+    // point into immortal g_witnesses, so they never relocate.
+    let witLoads =
+        match dictTryFind st.LamWits lamName with
+        | Some wits -> wits |> List.map (fun (tvId, slot) -> let r = freshTmp ctx in dictSet ctx.Witness tvId r; LSet (wReg r, LLoad (W, LGet (wReg envId), HDR + 8 + 4 * slot)))
+        | None -> []
     let bodyLow0 = coreToLowE ctx body
     st.GapSink <- None
     // roots to establish at entry: (slot register, initial value). Pushed in
@@ -4558,6 +4583,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length entryRoots) ]))
             LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
+    let bodyLow = if List.isEmpty witLoads then bodyLow else LDo (witLoads, bodyLow)
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
         vecAdd st.Warnings ("stubbed lambda " + lamName + " (" + vecGet sink 0 + ")")
@@ -4763,7 +4789,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
-          Captures = dictNew ()
+          Captures = dictNew (); LamWits = dictNew ()
           RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
