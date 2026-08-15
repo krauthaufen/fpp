@@ -1512,7 +1512,7 @@ let private emitCmpv (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"; local f "$y" "i32"
     local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$r" "i32"
-    local f "$w" "i32"; local f "$st" "i32"; local f "$tot" "i32"; local f "$tbl" "i32"; local f "$tid" "i32"
+    local f "$w" "i32"; local f "$st" "i32"; local f "$tot" "i32"; local f "$tbl" "i32"; local f "$tid" "i32"; local f "$msz" "i32"
     local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
@@ -1532,6 +1532,16 @@ let private emitCmpv (m : Mod) : unit =
     lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
     lg f "$a"; ic f 1; ins f "i32.and"; ifE f; ic f -1; ins f "return"; endB f
     lg f "$b"; ic f 1; ins f "i32.and"; ifE f; ic f 1; ins f "return"; endB f
+    // both even and non-zero here. A generic comparison is UNWITNESSED, so a RAW
+    // scalar payload word (a large `int` tuple field — the compiler's synthetic
+    // 5e8-range offsets) is indistinguishable from a pointer by value alone.
+    // Reading its "header" below would load at that value's address and fault out
+    // of bounds. Guard the header load: if EITHER side is beyond linear memory it
+    // cannot be a heap object, so order the two directly as signed words. A small
+    // raw int (< memory) still rides the tid-table guard below, unchanged.
+    memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+    lg f "$a"; lg f "$msz"; ins f "i32.ge_u"; lg f "$b"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+    ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
     lg f "$a"; mem f "i32.load"; ls f "$ca"
     lg f "$b"; mem f "i32.load"; ls f "$cb"
     both strH
