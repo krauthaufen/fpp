@@ -2132,20 +2132,6 @@ let private cmpWit (ctx : LowCtx) (a : Expr) (b : Expr) : int option =
 
 // for an aggregate allocated inside a GENERIC body, the (slot index, witness
 // register) of each slot whose static type is a type PARAMETER whose witness
-// param is in scope. `base_` is the slot index of exprs.[0] (0 for a tuple or
-// record, 1 past a union's raw tag). A slot with no witness (top level, or a
-// var that is not a witness param) is omitted, and lowObjR keeps the safe
-// tagged form for it — only witness-backed generic slots get precise refoffs.
-let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * int) list =
-    exprs
-    |> List.mapi (fun j e ->
-        match refKindOfExprC ctx.LSt e with
-        | RKGen ->
-            (match tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with
-             | Some w -> Some (base_ + j, w)
-             | None -> None)
-        | _ -> None)
-    |> List.choose id
 
 // int/bool/char are RAW i32 at rest (locals, params, returns, value stack) —
 // full 32-bit, no tag. lowTag/lowUntag convert to/from the tagged immediate
@@ -2405,6 +2391,57 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
         | None -> witnessPtrRM ctx.LSt 4 4 1
     else
         witnessPtrRM ctx.LSt 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
+
+// A witness LExpr for a GENERIC aggregate slot, so lowObjR takes the precise
+// refoffs path (a raw element excluded, a ref included) rather than the tagged
+// fallback that mis-traces even words. Resolved from whichever source applies:
+// a type var's method/class witness (ctx.Witness), the call's instantiation
+// (EVarI.inst), or a statically concrete type/field/element (a constant witness
+// carrying that type's refMask). None only when NO source has one — a genuine
+// value-witness ABI gap that lowObjR then logs.
+let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
+    let st = ctx.LSt
+    let ofName (nm : string) = witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
+    let ofTy (t : Type) : LExpr option =
+        match prune t with
+        | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
+        | TCon (n, _) -> Some (ofName n)
+        | TApp (h, _) ->
+            (match prune h with
+             | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
+             | _ -> Some (witnessPtrRM st 4 4 1))
+        | _ -> None
+    match e with
+    | EVar (_, s) | EVarI (_, s, _) -> ofTy s.Body
+    | EApp (((EVar (_, s) | EVarI (_, s, _)) as hd), ar) ->
+        let rec pl t n = if n <= 0 then t else (match prune t with TFun (_, r) -> pl r (n - 1) | _ -> t)
+        (match prune (pl s.Body (List.length ar)) with
+         | TVar rv ->
+             // the result rides a type var: its witness is the one the call passed
+             // for that var, positional to the callee's Quantified via EVarI.inst.
+             (match hd with
+              | EVarI (_, sch, inst) ->
+                  (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
+                   | Some k -> (match List.tryItem k inst with Some nm -> Some (witnessArgOfName ctx nm) | None -> None)
+                   | None -> (match dictTryFind ctx.Witness rv.Id with Some r -> Some (LGet (wReg r)) | None -> None))
+              | _ -> (match dictTryFind ctx.Witness rv.Id with Some r -> Some (LGet (wReg r)) | None -> None))
+         | t -> ofTy t)
+    | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> Some (ofName (if ty.StartsWith "&" then ty.Substring 1 else ty)) | None -> None)
+    | EIndex (k, _, _) -> Some (ofName k)
+    | EIf (_, a, b) -> (match slotWitness ctx a with Some w -> Some w | None -> slotWitness ctx b)
+    | ELet (_, _, _, _, b) -> slotWitness ctx b
+    | _ -> (match tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with Some r -> Some (LGet (wReg r)) | None -> None)
+
+// per-slot witness for a generic aggregate: an RKGen slot gets one from
+// slotWitness; a resolved (RKRaw/RKRef) slot needs none. `base_` is the slot
+// index of exprs.[0] (0 for a tuple/record, 1 past a union's raw tag).
+let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * LExpr) list =
+    exprs
+    |> List.mapi (fun j e ->
+        match refKindOfExprC ctx.LSt e with
+        | RKGen -> (match slotWitness ctx e with Some w -> Some (base_ + j, w) | None -> None)
+        | _ -> None)
+    |> List.choose id
 
 // (param abi types, return abi type) of a top-level function: peel `arity`
 // arrows off its scheme. None when every slot is a plain word (nothing to
@@ -3630,7 +3667,7 @@ and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tEx
 // kind is statically known). A fully-concrete shape registers FK_STRUCT with a
 // ref-map: raw scalar slots are stored inline and NEVER pushed to the shadow
 // stack, so an unboxed int in a tuple/union is invisible to the collector.
-and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) (refKinds : RefKind list option) (genWits : (int * int) list) : LExpr =
+and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) (refKinds : RefKind list option) (genWits : (int * LExpr) list) : LExpr =
     let n = List.length slots
     let b = freshTmp ctx
     let st = ctx.LSt
@@ -3676,7 +3713,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         let isConst e = match e with LConstW _ -> true | _ -> false
         let staticRef i = List.item i ks = RKRef
         let staticRaw i = List.item i ks = RKRaw
-        let refMaskOf w = LLoad (W, LGet (wReg w), 8)
+        let refMaskOf (w : LExpr) = LLoad (W, w, 8)
         let g = List.length genIdx
         let staticRefOffs = [ 0 .. n - 1 ] |> List.filter staticRef |> List.map (fun i -> HDR + 4 * i)
         let pat = ks |> List.map (fun k -> match k with RKRef -> "r" | RKRaw -> "s" | RKGen -> "g") |> String.concat ""
@@ -4060,7 +4097,7 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
             if (dictTryFind ctx.VarScalar k).IsSome || (dictTryFind ctx.LSt.CellVars k).IsSome then None
             else
                 match prune ty with
-                | TVar v -> (match dictTryFind ctx.Witness v.Id with Some w -> Some (2 + i, w) | None -> None)
+                | TVar v -> (match dictTryFind ctx.Witness v.Id with Some w -> Some (2 + i, LGet (wReg w)) | None -> None)
                 | _ -> None)
         |> List.choose id
     lowObjR ctx CID_CLOSURE 2
