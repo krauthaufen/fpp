@@ -385,6 +385,9 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
               | _ -> RKGen)
          | rt -> refKindOfTy rt)
     | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
+    // an array length / type test is always a raw scalar (int / bool), never a
+    // pointer — a generic aggregate storing one must exclude it from its scan
+    | EArrayLen _ | ETypeTest _ -> RKRaw
     | EPrim (op, _) ->
         let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
         (match b with
