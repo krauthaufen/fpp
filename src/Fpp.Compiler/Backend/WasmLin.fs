@@ -377,6 +377,13 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
          // a float/int64-suffixed op yields a boxed scalar (pointer)
          | _ when op <> b -> RKRef
          | _ -> RKGen)
+    | EIndex (k, _, _) ->
+        // `arr.[i]` rides the array's ELEMENT kind, carried as the node's kind
+        // string `k`. A concrete raw scalar (int/char/bool/…) is an even RAW word,
+        // so the cons head must be RKRaw — excluded from refoffs, never chased as a
+        // pointer. Without this the element was RKGen with no witness and rebuilt
+        // under the tag-scanning gcListTid, which traced a raw int as a ref.
+        if rawScalarName k then RKRaw else RKRef
     | EIf (_, a, b) -> (match refKindOfExpr a, refKindOfExpr b with x, y when x = y -> x | _ -> RKGen)
     | ELet (_, _, _, _, body) -> refKindOfExpr body
     | ESeq xs -> (match List.tryLast xs with Some b -> refKindOfExpr b | None -> RKGen)
