@@ -4725,7 +4725,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
 // Over-application `f a…(>N)` splits into a saturated call applied to the tail.
 // Definitions (DLet heads) are never touched — only EVar/EVarI references.
 let mutable private etaCtr = 0
-let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
+let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>) : Expr -> Expr =
     let fresh (sch : Scheme) : VarId * Scheme =
         etaCtr <- etaCtr + 1
         { Path = "(eta)"; Offset = etaCtr; Name = "$e" + string etaCtr }, sch
@@ -4774,6 +4774,27 @@ let private etaExpand (funcs : Dict<string, int>) : Expr -> Expr =
             let bv, bsch = fresh (mono tInt)
             ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (EUnknown n, [ EVar (av, asch); EVar (bv, bsch) ])))
         | EUnknown _ -> e
+        // a case constructor used as a VALUE (`List.map TVar ps`, `xs |> List.map Some`):
+        // the plain ECtor lowering builds the case OBJECT, which has no code
+        // index — calling it read past the object and call_indirect'ed through
+        // garbage. Wrap it into a lambda building the saturated case, so it
+        // lifts and lowers like any closure. The ctor value is TUPLED (one
+        // arrow); a multi-payload case takes its tuple apart in a match.
+        | ECtor (cn, sch, []) when (match dictTryFind caseArity cn with Some ar -> ar > 0 | None -> false) ->
+            let ar = (dictTryFind caseArity cn).Value
+            (match prune sch.Body with
+             | TFun (dom, _) ->
+                 (match prune dom with
+                  | TTuple ts when ar > 1 && List.length ts = ar ->
+                      let pv, psch = fresh { sch with Body = dom }
+                      let elems = ts |> List.map (fun t -> fresh { sch with Body = t })
+                      let pat = PTuple (elems |> List.map PVar)
+                      ELam ([ (pv, psch) ],
+                            EMatch (EVar (pv, psch), [ pat, None, ECtor (cn, sch, elems |> List.map EVar) ]))
+                  | _ ->
+                      let pv, psch = fresh { sch with Body = dom }
+                      ELam ([ (pv, psch) ], ECtor (cn, sch, [ EVar (pv, psch) ])))
+             | _ -> e)
         | ELam (ps, b) -> ELam (ps, go b)
         | EApp (h, args) -> EApp (go h, List.map go args)
         | ELet (r, v, s, a, b) -> ELet (r, v, s, go a, go b)
@@ -5114,7 +5135,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // discover — so the synthesized closures get lifted and lowered like any
     // other and a bare/partial function reference no longer dangles
     etaCtr <- 0
-    let decls = decls |> List.map (fun d -> match d with DLet (r, v, s, e) -> DLet (r, v, s, etaExpand st.Funcs e) | _ -> d)
+    let decls = decls |> List.map (fun d -> match d with DLet (r, v, s, e) -> DLet (r, v, s, etaExpand st.Funcs st.UnionArity e) | _ -> d)
     // function type per arity used, and the function declarations
     let arities = st.Funcs |> dictPairs |> List.map snd |> List.distinct
     for a in arities do
