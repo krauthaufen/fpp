@@ -2413,6 +2413,15 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
         | _ -> None
     match e with
     | EVar (_, s) | EVarI (_, s, _) -> ofTy s.Body
+    // an immediately-applied lambda rides its BODY's result type
+    | EApp (ELam (_, body), _) -> slotWitness ctx body
+    // a builtin conversion/op: classify by the result type its name implies —
+    // int/char/bool are raw scalars, string/substring/cell/float build a ref
+    | EApp (EUnknown u, _) ->
+        let baseU = (let i = u.IndexOf '#' in if i >= 0 then u.Substring (0, i) else u)
+        if baseU = "int" || baseU = "char" || baseU = "bool" || baseU = "byte" then Some (witnessPtrRM st 4 4 0)
+        elif baseU = "string" || baseU.StartsWith "$str" || baseU = "$cellof" || baseU = "float" || baseU = "int64" then Some (witnessPtrRM st 4 4 1)
+        else None
     | EApp (((EVar (_, s) | EVarI (_, s, _)) as hd), ar) ->
         let rec pl t n = if n <= 0 then t else (match prune t with TFun (_, r) -> pl r (n - 1) | _ -> t)
         (match prune (pl s.Body (List.length ar)) with
@@ -2428,7 +2437,15 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
          | t -> ofTy t)
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> Some (ofName (if ty.StartsWith "&" then ty.Substring 1 else ty)) | None -> None)
     | EIndex (k, _, _) -> Some (ofName k)
+    | ECast (t, _, _) -> Some (ofName t)
+    | EPrim (op, _) ->
+        // the result TYPE gives raw-vs-ref with no per-op tables: a string concat /
+        // list append builds a heap value (ref); a string comparison is a bool (raw).
+        if op = "+t" || op = "@" || op = "::" then Some (witnessPtrRM st 4 4 1)
+        elif op.StartsWith "=" || op.StartsWith "<" || op.StartsWith ">" || op = "u-" || op = "unot" || op.StartsWith "u~" || op = "not" then Some (witnessPtrRM st 4 4 0)
+        else None
     | EIf (_, a, b) -> (match slotWitness ctx a with Some w -> Some w | None -> slotWitness ctx b)
+    | EMatch (_, cs) | ETry (_, cs) -> cs |> List.tryPick (fun (_, _, b) -> slotWitness ctx b)
     | ELet (_, _, _, _, b) -> slotWitness ctx b
     | _ -> (match tyVarIdOfExpr e |> Option.bind (fun vid -> dictTryFind ctx.Witness vid) with Some r -> Some (LGet (wReg r)) | None -> None)
 
