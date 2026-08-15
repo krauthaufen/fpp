@@ -391,11 +391,21 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
 // find the witness param that describes the element for the GC scan map.
 let rec private tyVarIdOfExpr (e : Expr) : int option =
     let ofTy t = match prune t with TVar v -> Some v.Id | _ -> None
+    // the ELEMENT type-var of a generic array `'a[]` expression, for `arr.[i]`
+    // whose result rides the element's type var — the witness the collector needs.
+    let arrElemVar (arr : Expr) : int option =
+        let elemOf ty =
+            match prune ty with
+            | TCon ("array", (el :: _)) -> ofTy el
+            | TApp (h, (el :: _)) -> (match prune h with TCon ("array", _) -> ofTy el | _ -> None)
+            | _ -> None
+        match arr with EVar (_, sch) | EVarI (_, sch, _) -> elemOf sch.Body | _ -> None
     match e with
     | EVar (_, sch) | EVarI (_, sch, _) -> ofTy sch.Body
     | EApp ((EVar (_, sch) | EVarI (_, sch, _)), args) ->
         let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
         ofTy (peel sch.Body (List.length args))
+    | EIndex (_, arr, _) -> arrElemVar arr
     | EIf (_, a, b) -> (match tyVarIdOfExpr a with Some x -> Some x | None -> tyVarIdOfExpr b)
     | ELet (_, _, _, _, body) -> tyVarIdOfExpr body
     | ESeq xs -> (match List.tryLast xs with Some b -> tyVarIdOfExpr b | None -> None)
@@ -829,10 +839,14 @@ let private emitLappend (m : Mod) : unit =
     lg f "$b"
     callf f "$lappend"; ls f "$rec"
     if gc then (callf f "$spop"; ls f "$h")
-    // cons the head onto the result: allocate a cell, rooting head+result across it
+    // cons the head onto the result: allocate a cell, rooting head+result across it.
+    // Allocate with the SOURCE list's own tid (read from `$a`'s header) — NOT the
+    // uniform FK_TAGGED gcListTid: a concrete int/raw-headed list carries a tid
+    // whose refoffs EXCLUDE the (raw, even) head, and rebuilding it under the
+    // tag-scanning gcListTid would chase that raw head as a pointer.
     if gc then
         lg f "$h"; callf f "$spush"; lg f "$rec"; callf f "$spush"
-        ic f gcListTid; callf f "$fpalloc"; ls f "$cell"
+        lg f "$a"; mem f "i32.load"; ic f 1; ins f "i32.shr_u"; callf f "$fpalloc"; ls f "$cell"
         callf f "$spop"; ls f "$rec"; callf f "$spop"; ls f "$h"
     else
         ic f (HDR + 8); callf f "$lalloc"; ls f "$cell"
