@@ -869,23 +869,30 @@ let private emitLappend (m : Mod) : unit =
     localsDone f
     // nil ++ b = b
     lg f "$a"; ins f "i32.eqz"; ifE f; lg f "$b"; ins f "return"; endB f
-    // head, then recurse on the tail; the recursion allocates, so root the head
-    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$h"
-    if gc then (lg f "$h"; callf f "$spush")
-    lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
-    lg f "$b"
-    callf f "$lappend"; ls f "$rec"
-    if gc then (callf f "$spop"; ls f "$h")
-    // cons the head onto the result: allocate a cell, rooting head+result across it.
-    // Allocate with the SOURCE list's own tid (read from `$a`'s header) — NOT the
-    // uniform FK_TAGGED gcListTid: a concrete int/raw-headed list carries a tid
-    // whose refoffs EXCLUDE the (raw, even) head, and rebuilding it under the
-    // tag-scanning gcListTid would chase that raw head as a pointer.
+    // GC: never put the HEAD on the shadow stack — it may be a RAW even int
+    // (an int list) the pointer scanner would chase. Root the SOURCE cons `$a`
+    // (always a real pointer) across both safepoints and re-read the head from
+    // it afterwards: tracing updates $a's own head slot, so the re-read is
+    // correct whether the head is raw or a moved ref.
     if gc then
-        lg f "$h"; callf f "$spush"; lg f "$rec"; callf f "$spush"
+        lg f "$a"; callf f "$spush"
+        lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+        lg f "$b"
+        callf f "$lappend"; ls f "$rec"
+        callf f "$spop"; ls f "$a"
+        // allocate with the SOURCE list's own tid (read from `$a`'s header) — NOT
+        // the uniform FK_TAGGED gcListTid: a concrete raw-headed list carries a
+        // tid whose refoffs EXCLUDE the head, and rebuilding it under the
+        // tag-scanning gcListTid would chase that raw head as a pointer.
+        lg f "$a"; callf f "$spush"; lg f "$rec"; callf f "$spush"
         lg f "$a"; mem f "i32.load"; ic f 1; ins f "i32.shr_u"; callf f "$fpalloc"; ls f "$cell"
-        callf f "$spop"; ls f "$rec"; callf f "$spop"; ls f "$h"
+        callf f "$spop"; ls f "$rec"; callf f "$spop"; ls f "$a"
+        lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$h"
     else
+        lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$h"
+        lg f "$a"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+        lg f "$b"
+        callf f "$lappend"; ls f "$rec"
         ic f (HDR + 8); callf f "$lalloc"; ls f "$cell"
         lg f "$cell"; ic f CID_LIST; mem f "i32.store"
     lg f "$cell"; ic f HDR; ins f "i32.add"; lg f "$h"; mem f "i32.store"
@@ -3503,10 +3510,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let witnessArgs =
             match dictTryFind st.FuncWitness (key v) with
             | Some vids ->
-                vids |> List.mapi (fun i _ ->
+                vids |> List.mapi (fun i vid ->
                     match List.tryItem i inst with
                     | Some nm -> witnessArgOfName ctx nm
-                    | None -> witnessPtrRM st 4 4 1)
+                    | None ->
+                        // no instantiation on this use — a RECURSIVE self/group
+                        // call (Infer records no EVarI on a monomorphic self-use).
+                        // The callee's quantified var IS the caller's, so forward
+                        // the caller's own witness for it; the old blanket ref
+                        // default made every recursive generic call scan raw
+                        // scalars as pointers (sortWith<int>'s sublists).
+                        match dictTryFind ctx.Witness vid with
+                        | Some reg -> LGet (wReg reg)
+                        | None -> witnessPtrRM st 4 4 1)
             | None -> []
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
@@ -4739,9 +4755,14 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
         let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
         let rec argAt t j = match prune t with TFun (a, r) -> (if j = 0 then a else argAt r (j - 1)) | _ -> t
         { sch with Body = argAt (peel sch.Body skip) idx }
-    let wrap (v : VarId) (sch : Scheme) (pre : Expr list) (need : int) : Expr =
+    // `hd` is the ORIGINAL head node — an EVarI must survive the wrap: the call
+    // lowering resolves the hidden witness arguments from EVarI.inst, and a
+    // rebuilt bare EVar made every witness fall back to the ref-claiming
+    // default, so a raw-scalar type param (distinctBy's 'k = int) was consed
+    // onto a REF-scanned list and the collector chased the raw ints.
+    let wrap (hd : Expr) (sch : Scheme) (pre : Expr list) (need : int) : Expr =
         let ps = List.init need (fun i -> fresh (peelArg sch (List.length pre) i))
-        let call = EApp (EVar (v, sch), pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
+        let call = EApp (hd, pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
         List.foldBack (fun p body -> ELam ([ p ], body)) ps call
     let rec go (e : Expr) : Expr =
         match e with
@@ -4754,18 +4775,18 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
             let args = List.map go args
             let k = List.length args
             if k = n then EApp (h, args)
-            elif k < n then wrap v sch args (n - k)
-            else EApp (EApp (EVar (v, sch), List.truncate n args), List.skip n args)
+            elif k < n then wrap h sch args (n - k)
+            else EApp (EApp (h, List.truncate n args), List.skip n args)
         // the builtin `compare` used as a value: eta so the applied handler
         // fires (operand shapes drive it; opaque operands degrade to scalar)
-        | EVar (v, sch) | EVarI (v, sch, _) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
+        | (EVar (v, sch) | EVarI (v, sch, _)) as hd when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
             // operands take compare's ARGUMENT type, not its whole `'a -> 'a -> int`
             // scheme — else a raw operand rode the shadow stack as a wild pointer.
             let av, asch = fresh (peelArg sch 0 0)
             let bv, bsch = fresh (peelArg sch 0 1)
-            ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (EVar (v, sch), [ EVar (av, asch); EVar (bv, bsch) ])))
-        | EVar (v, sch) | EVarI (v, sch, _) ->
-            match dictTryFind funcs (key v) with Some n when n > 0 -> wrap v sch [] n | _ -> e
+            ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (hd, [ EVar (av, asch); EVar (bv, bsch) ])))
+        | (EVar (v, sch) | EVarI (v, sch, _)) as hd ->
+            match dictTryFind funcs (key v) with Some n when n > 0 -> wrap hd sch [] n | _ -> e
         // `compare` used as a VALUE (List.sortWith compare, …): eta to
         // `fun a b -> compare a b` so the applied handler fires; the operand
         // types come from the dispatch NAME, so the params' schemes are moot
@@ -5434,6 +5455,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let bytes = assembleWith m pages st.UsesExn ""
     if not (isNull (System.Environment.GetEnvironmentVariable "FPP_LINWARN")) then
         for w in vecToList st.Warnings do eprintfn "LINWARN %s" w
+        for (k, _) in dictPairs st.Funcs do
+            for h in [ "2034791193"; "658953085"; "2143567545"; "1381067340"; "1380175341" ] do
+                if string (abs (strHash k)) = h then eprintfn "FNMAP f%s = %s name=%s" h k (match dictTryFind nameOf k with Some n -> n | None -> "?")
     bytes, vecToList st.Errors
 
 // the wasm-linear backend: Core straight to a linear-memory module through the
