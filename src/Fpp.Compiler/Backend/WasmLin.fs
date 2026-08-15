@@ -2110,6 +2110,15 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
         match cellKey c |> Option.bind (fun k -> dictTryFind st.CellKind k) with
         | Some k -> k
         | None -> match fieldCellKind () with Some k -> k | None -> refKindOfExpr e
+    | EField (_, f, owner) ->
+        // a record field read `x.f` rides the FIELD's type. A concrete raw scalar
+        // field (an `int` Offset, say) is RKRaw so an aggregate storing it excludes
+        // it from the scan map; a ref/generic field falls back (RKGen ⇒ the uniform
+        // tagged form still traces an even pointer correctly). Fixes a raw int
+        // field mis-traced as a pointer in a tuple/record's tagged slot.
+        (match recFieldTy st owner f with
+         | Some ty when rawScalarName (if ty.StartsWith "&" then ty.Substring 1 else ty) -> RKRaw
+         | _ -> refKindOfExpr e)
     | _ -> refKindOfExpr e
 
 // the element witness register for a comparison of two operands whose static
