@@ -2689,6 +2689,32 @@ let private genWitOf (ctx : LowCtx) (v : VarId) (sch : Scheme) : int option =
         match prune sch.Body with TVar tv -> dictTryFind ctx.Witness tv.Id | _ -> None
     else None
 
+// Does `k` get REASSIGNED (`v <- …`) anywhere in `e`? A mutable generic local
+// that is assigned in its own body must NOT ride ActiveGen: ActiveGen roots a
+// value by SNAPSHOTTING it before a safepoint and reloading it after, which
+// silently UNDOES any `<-` that ran in between — a generic `let mutable acc`
+// accumulated in a `for`/`while` (List.fold, Set.ofList) then always returned
+// its initial value. Such a local stays an ordinary register instead.
+let rec private assignsTo (k : string) (e : Expr) : bool =
+    match e with
+    | EAssign (v, x) -> key v = k || assignsTo k x
+    | ELet (_, _, _, r, b) -> assignsTo k r || assignsTo k b
+    | ELam (_, b) -> assignsTo k b
+    | EApp (f, args) -> assignsTo k f || List.exists (assignsTo k) args
+    | EIf (a, b, c) -> assignsTo k a || assignsTo k b || assignsTo k c
+    | EMatch (s, cs) | ETry (s, cs) -> assignsTo k s || List.exists (fun (_, g, b) -> (match g with Some g -> assignsTo k g | None -> false) || assignsTo k b) cs
+    | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | EArray (_, xs) | ECtor (_, _, xs) -> List.exists (assignsTo k) xs
+    | ERecord (_, fs) -> List.exists (fun (_, x) -> assignsTo k x) fs
+    | ERecordExt (_, b, fs) -> assignsTo k b || List.exists (fun (_, x) -> assignsTo k x) fs
+    | EField (r, _, _) -> assignsTo k r
+    | EFieldSet (r, _, _, x) -> assignsTo k r || assignsTo k x
+    | EWhile (c, b) -> assignsTo k c || assignsTo k b
+    | EIndex (_, a, i) | EArrayCreate (_, a, i) -> assignsTo k a || assignsTo k i
+    | EIndexSet (_, a, i, x) -> assignsTo k a || assignsTo k i || assignsTo k x
+    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> assignsTo k a
+    | EIfaceCall (_, _, r, args) -> assignsTo k r || List.exists (assignsTo k) args
+    | _ -> false
+
 // Wrap a safepoint-bearing expression (an allocation or a call) so every active
 // generic variable is rooted across it: push its value BEFORE — but only when the
 // witness refMask says the value is a pointer (a raw `'a` is an even int the
@@ -2801,24 +2827,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet (wReg resReg, bodyLow)
                LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ],
              LGet (wReg resReg))
-    | ELet (_, v, sch, rhs, body) when (genWitOf ctx v sch).IsSome ->
+    | ELet (_, v, sch, rhs, body) when (genWitOf ctx v sch).IsSome && not (assignsTo (key v) body) ->
         // a GENERIC (`'a`) let: bind normally, then track it as an active generic
         // for its body scope so every safepoint roots it conditionally (its own
         // witness decides ref vs raw). The register is its home; reads are LGet.
+        // A REASSIGNED generic mutable is excluded (assignsTo) — see genWitOf.
         let bind = lowLetBind ctx v sch rhs
         let reg = ctx.Regs.[key v]
         let saved = ctx.ActiveGen
         ctx.ActiveGen <- (reg, (genWitOf ctx v sch).Value) :: ctx.ActiveGen
-        let bodyLow = coreToLowE ctx body
-        ctx.ActiveGen <- saved
-        LDo ([ bind ], bodyLow)
-    | ELet (_, v, sch, rhs, body) when (genWitOf ctx v sch).IsSome ->
-        // a generic (`'a`) let whose element witness is in scope: bind it, then
-        // register it as active so it is rooted (conditionally, via the witness)
-        // across every safepoint in the body — a REF 'a would otherwise go stale.
-        let bind = lowLetBind ctx v sch rhs
-        let saved = ctx.ActiveGen
-        ctx.ActiveGen <- (ctx.Regs.[key v], (genWitOf ctx v sch).Value) :: ctx.ActiveGen
         let bodyLow = coreToLowE ctx body
         ctx.ActiveGen <- saved
         LDo ([ bind ], bodyLow)
