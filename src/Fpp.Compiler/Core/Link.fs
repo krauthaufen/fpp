@@ -989,11 +989,21 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
              // forward the class-var -> concrete-type map (WasmLin-only): this
              // stamped member's `'k` is concrete here, keyed by the SAME id the
              // body's TVar carries, so the backend seeds a constant witness.
-             if not (List.isEmpty substOverride) then
-                 let ws =
-                     substOverride |> List.choose (fun (k, nm) ->
-                         if k.Length > 1 && k.[0] = '#' then Some (int (k.Substring 1), nm) else None)
-                 if not (List.isEmpty ws) then dictSet stampedClassWits (nv.Path, nv.Offset) ws
+             let classWs =
+                 substOverride |> List.choose (fun (k, nm) ->
+                     if k.Length > 1 && k.[0] = '#' then Some (int (k.Substring 1), nm) else None)
+             // ALSO this instance's OWN quantified vars: the stamp renames the
+             // function but leaves a concrete tvar (e.g. `add_..$int`'s 'a) free in
+             // the body, so the backend needs its concrete type to tell a raw
+             // element from a pointer — without it the element reaches the
+             // tag-scanning fallback and an even int is mis-traced as a heap ref.
+             let ownWs =
+                 if sch.Quantified.Length = inst.Length then
+                     List.zip sch.Quantified inst
+                     |> List.collect (fun (qv, n) -> if n.Contains "#" then [] else [ prunedId qv, n; qv.Id, n ])
+                 else []
+             let allWs = classWs @ ownWs
+             if not (List.isEmpty allWs) then dictSet stampedClassWits (nv.Path, nv.Offset) allWs
              // A recursive call carries no instantiation: inside its own
              // body a function is monomorphic, so the self-call is a plain
              // EVar. In a stamped clone it must target the clone, not the
