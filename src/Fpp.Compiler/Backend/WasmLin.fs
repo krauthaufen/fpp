@@ -1900,6 +1900,15 @@ type private LowCtx =
       /// mid-body is seen — the wasm-local `EnvReg` would go stale. None when the
       /// env is not rooted (no captures, or a top-level function).
       mutable EnvAddr : LExpr option
+      /// GC: ref-typed locals rooted on the shadow stack for their scope. Maps a
+      /// var key to the STABLE address of its root slot; reads/writes go through
+      /// `[addr]` so a collection that relocates the value mid-scope is seen. A
+      /// pointer local live across a safepoint (a for-loop's list cursor across
+      /// its body's cons alloc, say) would otherwise be left stale in its wasm
+      /// local — the collector never scans a wasm local. Only RKRef, non-cell,
+      /// non-scalar locals are slotted; the value is a genuine pointer so the
+      /// scanner (which skips odd/tagged words) traces it correctly.
+      Slotted : Dict<string, LExpr>
       mutable NReg : int }
 
 let private freshReg (ctx : LowCtx) (k : string) : int =
@@ -2526,6 +2535,31 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
                     [ LSet (wReg r, LPrim (SubW, [ LPrim (GtSW, [ LGet (wReg na); LGet (wReg nb) ]); LPrim (LtSW, [ LGet (wReg na); LGet (wReg nb) ]) ])) ], []) ],
              LGet (wReg r))
 
+// Should this `let`-bound var be rooted on the shadow stack for its scope? Only
+// a genuine pointer (RKRef) that is NOT a cell (cells are heap boxes with their
+// own rooting) and NOT an unboxed scalar (those ride typed locals the GC never
+// scans). Its value is even/pointer, so the odd-tag-skipping root scanner traces
+// it correctly. Gated on gc — the standalone backend has no collector.
+let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
+    gc
+    && (dictTryFind ctx.LSt.CellVars (key v)).IsNone
+    && (scalarLTy sch.Body).IsNone
+    && (refKindOfTy sch.Body = RKRef)
+
+// the RKRef (pointer) variables a pattern binds — the match-arm analogue of a
+// let-binder that must be rooted while the arm body runs (`let (a,b) = e` lowers
+// to a PTuple match, and the tokenizer's `let kind, e = scanToken p` leaves the
+// ref `kind` live across the allocating `scanTrailing e`). Raw/scalar binders
+// and cells are excluded, as in shouldSlot.
+let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list =
+    let keep v sch = (dictTryFind ctx.LSt.CellVars (key v)).IsNone && (scalarLTy sch.Body).IsNone && refKindOfTy sch.Body = RKRef
+    match pat with
+    | PVar (v, sch) -> if keep v sch then [ v, sch ] else []
+    | PAs (p, v, sch) -> (if keep v sch then [ v, sch ] else []) @ patRefBinders ctx p
+    | PCtor (_, _, subs) | PTuple subs | PListLit subs -> List.collect (patRefBinders ctx) subs
+    | PCons (h, tl) -> patRefBinders ctx h @ patRefBinders ctx tl
+    | _ -> []
+
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let st = ctx.LSt
     match e with
@@ -2559,6 +2593,20 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx RKRef (lowInt 0)))
         let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
         LDo (allocs @ fills, coreToLowE ctx body)
+    | ELet (_, v, sch, rhs, body) when shouldSlot ctx v sch ->
+        let addrReg = freshTmp ctx
+        let addr = LGet (wReg addrReg)
+        let initVal = coreToLowE ctx rhs
+        dictSet ctx.Slotted (key v) addr
+        let bodyLow = coreToLowE ctx body
+        dictRemove ctx.Slotted (key v)
+        let resReg = freshTmp ctx
+        LDo ([ LSet (wReg addrReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+               LStore (W, addr, 0, initVal)
+               LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ]))
+               LSet (wReg resReg, bodyLow)
+               LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ],
+             LGet (wReg resReg))
     | ELet (_, v, sch, rhs, body) ->
         LDo ([ lowLetBind ctx v sch rhs ], coreToLowE ctx body)
     | ESeq xs ->
@@ -3179,15 +3227,24 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
             | None -> []
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
-             let loweredArgs = witnessArgs @ List.map2 (fun ty a -> match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)) paramTys args
-             (match retTy with
-              | W -> LCall (fn v, loweredArgs)
-              // hold the scalar result in a typed local before boxing: the call
-              // is a safepoint, so a bare box-around-call would let the GC move
-              // the fresh box out from under the store. box-elim pushes through
-              // the LDo, so an arithmetic use still reduces to the raw call.
-              | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy })))
-         | None -> LCall (fn v, witnessArgs @ List.map (coreToLowE ctx) args))
+             let argVals = List.map2 (fun ty a ->
+                             let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
+                             ((ty = W) && refKindOfExprC st a = RKRef), ty, lowered) paramTys args
+             let setup, argGets = lowRootedArgs ctx argVals
+             let loweredArgs = witnessArgs @ argGets
+             let callE =
+                 match retTy with
+                 | W -> LCall (fn v, loweredArgs)
+                 // hold the scalar result in a typed local before boxing: the call
+                 // is a safepoint, so a bare box-around-call would let the GC move
+                 // the fresh box out from under the store. box-elim pushes through
+                 // the LDo, so an arithmetic use still reduces to the raw call.
+                 | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy }))
+             if List.isEmpty setup then callE else LDo (setup, callE)
+         | None ->
+             let setup, argGets = lowRootedArgs ctx (args |> List.map (fun a -> refKindOfExprC st a = RKRef, W, coreToLowE ctx a))
+             let callE = LCall (fn v, witnessArgs @ argGets)
+             if List.isEmpty setup then callE else LDo (setup, callE))
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
          | Some name -> lowClosure ctx name
@@ -3199,11 +3256,27 @@ let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
         let clauseStmts =
             clauses |> List.map (fun (pat, guard, body) ->
                 let tests = lowPatTest ctx sc "$mnext" pat
+                // guard is lowered BEFORE the binders are slotted, so it reads them
+                // from their (freshly-bound, un-moved) registers; if it breaks to
+                // $mnext no slot has been pushed yet, so nothing leaks.
                 let guardStmt =
                     match guard with
                     | Some g -> [ LBreakIf ("$mnext", LPrim (EqW, [ (coreToLowE ctx g); LConstW 0 ])) ]
                     | None -> []
-                LBlock ("$mnext", tests @ guardStmt @ [ LSet (wReg mr, coreToLowE ctx body); LBreak "$mdone" ]))
+                // root the arm's ref binders across the body's allocations: copy
+                // each from its register into a shadow-stack slot, read through the
+                // slot in the body, pop on the matching path (a mismatch/guard-fail
+                // exits above the pushes).
+                let slotRegs = patRefBinders ctx pat |> List.map (fun (v, _) -> v, freshTmp ctx)
+                let pushes = slotRegs |> List.collect (fun (v, addrReg) ->
+                    [ LSet (wReg addrReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+                      LStore (W, LGet (wReg addrReg), 0, LGet (wReg ctx.Regs.[key v]))
+                      LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
+                for v, addrReg in slotRegs do dictSet ctx.Slotted (key v) (LGet (wReg addrReg))
+                let bodyLow = coreToLowE ctx body
+                for v, _ in slotRegs do dictRemove ctx.Slotted (key v)
+                let pop = if List.isEmpty slotRegs then [] else [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length slotRegs) ])) ]
+                LBlock ("$mnext", tests @ guardStmt @ pushes @ [ LSet (wReg mr, bodyLow) ] @ pop @ [ LBreak "$mdone" ]))
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
@@ -3329,11 +3402,26 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         let allocs = regs |> List.map (fun (_, _, id) -> LSet (wReg id, lowMkCell ctx RKRef (lowInt 0)))
         let fills = regs |> List.map (fun (_, lam, id) -> LStore (W, LGet (wReg id), cellOff (), coreToLowE ctx lam))
         allocs @ fills @ coreToLowS ctx body
+    | ELet (_, v, sch, rhs, body) when shouldSlot ctx v sch ->
+        let addrReg = freshTmp ctx
+        let addr = LGet (wReg addrReg)
+        let initVal = coreToLowE ctx rhs
+        dictSet ctx.Slotted (key v) addr
+        let bodyStmts = coreToLowS ctx body
+        dictRemove ctx.Slotted (key v)
+        [ LSet (wReg addrReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+          LStore (W, addr, 0, initVal)
+          LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
+        @ bodyStmts
+        @ [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
     | ELet (_, v, sch, rhs, body) ->
         lowLetBind ctx v sch rhs :: coreToLowS ctx body
     | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
         // a captured mutable: store into its cell (shared with the closure)
         [ LStore (W, lowVarStore ctx (key v), cellOff (), coreToLowE ctx rhs) ]
+    | EAssign (v, rhs) when (dictTryFind ctx.Slotted (key v)).IsSome ->
+        // a shadow-stack-rooted ref local: write the new value into its root slot
+        [ LStore (W, (dictTryFind ctx.Slotted (key v)).Value, 0, coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
          | Some id ->
@@ -3456,28 +3544,41 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                        selTid (j + 1) accMask,
                        selTid (j + 1) (accMask ||| (1 <<< j))) ]
         let idx = slots |> List.mapi (fun i v -> i, v)
-        // every non-const slot into a temp, evaluated once before the alloc
-        let temps = idx |> List.map (fun (i, v) -> i, (if isConst v then None else Some (freshTmp ctx)), v)
-        let hasTemp i = temps |> List.exists (fun (j, t, _) -> j = i && t.IsSome)
-        let tval i = match temps |> List.tryPick (fun (j, t, _) -> if j = i then Some t else None) with Some (Some tr) -> LGet (wReg tr) | _ -> List.item i slots
-        let evals = temps |> List.choose (fun (_, t, v) -> match t with Some tr -> Some (LSet (wReg tr, v)) | None -> None)
-        // pushes BEFORE the (collecting) alloc, ascending: concrete refs, then each
-        // generic-ref (conditionally, guarded by its witness refMask)
-        let staticRefPush = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRef i && hasTemp i) |> List.collect (fun i -> gcPushStmts (tval i))
-        let genPush = genIdx |> List.map (fun i -> LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]), [], gcPushStmts (tval i)))
-        // pops AFTER, descending (LIFO mirror): generic first, then concrete refs.
-        // A raw generic slot was never pushed — store its temp directly instead.
-        let genPop =
-            genIdx |> List.rev |> List.map (fun i ->
-                LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]),
-                     [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ],
-                     gcPopInto (LGet (wReg b)) (HDR + 4 * i)))
-        let staticRefPop = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRef i && hasTemp i) |> List.rev |> List.collect (fun i -> gcPopInto (LGet (wReg b)) (HDR + 4 * i))
-        let rawStores = [ 0 .. n - 1 ] |> List.filter (fun i -> staticRaw i && hasTemp i) |> List.map (fun i -> LStore (W, LGet (wReg b), HDR + 4 * i, tval i))
+        let tempOf = idx |> List.map (fun (i, v) -> i, (if isConst v then None else Some (freshTmp ctx)))
+        let tregOf i = match List.tryPick (fun (j, t) -> if j = i then Some t else None) tempOf with Some (Some tr) -> tr | _ -> freshTmp ctx
+        let tval i = match List.tryPick (fun (j, t) -> if j = i then Some t else None) tempOf with Some (Some tr) -> LGet (wReg tr) | _ -> List.item i slots
+        // Evaluate each non-const slot and, if it holds a pointer, push it to the
+        // shadow stack IMMEDIATELY — before the NEXT slot's (possibly collecting)
+        // evaluation. Evaluating all slots into temps first and pushing afterwards
+        // left an earlier ref operand stale when a later operand allocated (a heap
+        // ref-slot then held a moved/wild pointer, and the collector traced garbage).
+        // A generic slot pushes only when its witness refMask says ref.
+        let evalAndPush =
+            idx |> List.collect (fun (i, v) ->
+                if isConst v then []
+                else
+                    let tr = tregOf i
+                    let ev = [ LSet (wReg tr, v) ]
+                    let push =
+                        if staticRef i then gcPushStmts (LGet (wReg tr))
+                        elif List.contains i genIdx then [ LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]), [], gcPushStmts (LGet (wReg tr))) ]
+                        else []
+                    ev @ push)
+        // pops mirror the pushes in descending slot order (LIFO). A raw slot (static
+        // or a generic one whose witness said raw) was never pushed — store its temp.
+        let popsAndStores =
+            [ 0 .. n - 1 ] |> List.rev |> List.collect (fun i ->
+                if isConst (List.item i slots) then []
+                elif staticRef i then gcPopInto (LGet (wReg b)) (HDR + 4 * i)
+                elif List.contains i genIdx then
+                    [ LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]),
+                           [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ],
+                           gcPopInto (LGet (wReg b)) (HDR + 4 * i)) ]
+                else [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ])
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
-        LDo (evals @ selTid 0 0 @ staticRefPush @ genPush
+        LDo (evalAndPush @ selTid 0 0
              @ [ LSet (wReg b, LCall ("$fpalloc", [ LGet (wReg tidTmp) ])) ]
-             @ genPop @ staticRefPop @ rawStores @ consts, LGet (wReg b))
+             @ popsAndStores @ consts, LGet (wReg b))
     elif gc then
         // every slot's ref-kind known and none generic -> FK_STRUCT with a ref-
         // map. Otherwise the uniform tagged form (scan by low-bit tag from the
@@ -3698,6 +3799,9 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
 // CELL POINTER; for an ordinary var it is the value itself.
 and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     let st = ctx.LSt
+    match dictTryFind ctx.Slotted k with
+    | Some addr -> LLoad (W, addr, 0)   // a shadow-stack-rooted ref local: read the current (post-GC) value
+    | None ->
     match dictTryFind ctx.Regs k with
     | Some id -> LGet (wReg id)
     | None ->
@@ -3808,14 +3912,49 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
         (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: capVals)
         (Some (RKRaw :: RKRaw :: capKinds)) capGenWits
 
+// Root ref-typed call ARGUMENTS across the evaluation of later args. Evaluating
+// `f(a, b)` leaves a's pointer on the wasm operand stack — which the GC never
+// scans — so if b's evaluation allocates and collects, a is left stale before
+// the call lands. Each ref arg that is followed by another arg is pushed to the
+// shadow stack across the remaining evaluations and popped back into its temp;
+// the last arg (consumed immediately by the call) and raw args ride a temp
+// directly. Returns (setup stmts, per-arg value exprs) — emit the call inside an
+// LDo over the setup. This is the n-ary form of `evalRooted`.
+and private lowRootedArgs (ctx : LowCtx) (args : (bool * LTy * LExpr) list) : LStmt list * LExpr list =
+    let n = List.length args
+    // (root-across-later, register, regTy). Only a WORD arg can be a pointer to
+    // root; a scalar (f64/i64) rides its own typed local and is never rooted.
+    let ts = args |> List.mapi (fun i (isRef, ty, e) -> (gc && isRef && ty = W && i < n - 1), { Id = freshTmpT ctx ty; RTy = ty }, e)
+    let eval = ts |> List.collect (fun (root, r, e) ->
+        LSet (r, e) :: (if root then gcPushStmts (LGet r) else []))
+    let pops =
+        ts |> List.filter (fun (root, _, _) -> root) |> List.rev
+        |> List.collect (fun (_, r, _) ->
+            [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
+              LSet (r, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ])
+    (eval @ pops, ts |> List.map (fun (_, r, _) -> LGet r))
+
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
     | [] -> cloE
     | a :: rest ->
         // bind the closure to a register so LCallIndirect can read it twice
-        // (as env and to load the code index) without re-evaluating it
+        // (as env and to load the code index) without re-evaluating it. GC: root
+        // the closure across the argument's (possibly allocating) evaluation — a
+        // collection there would relocate/collect it and leave tclo stale, so the
+        // call would read a moved-away env and code index (a wild pointer that the
+        // callee then stores, corrupting the heap).
         let tclo = freshTmp ctx
-        let step = LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
+        let step =
+            if gc then
+                let argReg = freshTmp ctx
+                LDo ([ LSet (wReg tclo, cloE) ]
+                     @ gcPushStmts (LGet (wReg tclo))
+                     @ [ LSet (wReg argReg, coreToLowE ctx a)
+                         LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
+                         LSet (wReg tclo, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ],
+                     LCallIndirect ([ W ], LGet (wReg tclo), [ LGet (wReg argReg) ]))
+            else LDo ([ LSet (wReg tclo, cloE) ], LCallIndirect ([ W ], LGet (wReg tclo), [ coreToLowE ctx a ]))
         lowApply ctx step rest
 
 // `failwith msg` raises Failure(msg) so `with Failure m` catches it; if the
@@ -4063,8 +4202,8 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (body : Expr) (finish : Fn -> unit) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; NReg = 0 }
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -4105,13 +4244,36 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             List.iter2 (fun pv ty -> match ty with W -> () | _ -> let id = ctx.Regs.[key pv] in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty) ps paramTys
             ret
         | None -> W
+    // GC: root each ref-typed (non-scalar) parameter on the shadow stack for the
+    // body's duration — a param is a wasm local the collector never scans, so a
+    // pointer param used after an allocating call would go stale (the tokenizer's
+    // `loop` cons'd onto its `acc` after an allocating scan moved it). Reads go
+    // through the slot's stable address (ctx.Slotted). Witness-pointer params are
+    // static, never rooted.
+    let rootParams =
+        if gc then
+            List.zip ps paramTypes
+            |> List.filter (fun (pv, ty) -> refKindOfTy ty = RKRef && (scalarLTy ty).IsNone && (dictTryFind ctx.VarScalar (key pv)).IsNone)
+            |> List.map (fun (pv, _) -> pv, freshTmp ctx)
+        else []
+    for pv, slotReg in rootParams do dictSet ctx.Slotted (key pv) (LGet (wReg slotReg))
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
     let bodyLow1 = coreToLowE ctx body
     let preamble = selfPreamble @ constPreamble
     let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
-    let bodyLow = match retTy with W -> bodyLow0 | _ -> flatUnbox retTy bodyLow0
+    let bodyLow2 =
+        if List.isEmpty rootParams then bodyLow0
+        else
+            let resReg = freshTmp ctx
+            let pushes = rootParams |> List.collect (fun (pv, slotReg) ->
+                [ LSet (wReg slotReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+                  LStore (W, LGet (wReg slotReg), 0, LGet (wReg ctx.Regs.[key pv]))
+                  LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
+            let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
+            LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
+    let bodyLow = match retTy with W -> bodyLow2 | _ -> flatUnbox retTy bodyLow2
     st.GapSink <- None
     let f = beginFn m pnames
     if vecLen sink > 0 then
@@ -4136,37 +4298,44 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // a lifted lambda body: params are (env, arg); captured free variables read
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
-let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (body : Expr) : unit =
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; NReg = 0 }
+let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (psch : Scheme) (body : Expr) : unit =
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
-    // GC: root the env on the shadow stack for the body's duration when the body
-    // reads captures. A collection triggered by any allocation in the body can
-    // relocate the env; the wasm-local `envId` is then stale, so every capture
-    // read (`[env+8+4*slot]`) would hit a moved/collected object. Storing the env
-    // in a scanned root slot lets the collector update it in place; capture reads
-    // go through the slot's stable address (ctx.EnvAddr). Self-host blam14: the
-    // recursive closure `go` rebuilt its env by re-reading its own captured
-    // `triviaOne` AFTER a lex allocation, capturing a stale pointer.
+    // GC: root the env AND a ref-typed argument on the shadow stack for the body's
+    // duration. A collection triggered by any allocation in the body can relocate
+    // either; the wasm-locals `envId`/`argId` are then stale, so a capture read
+    // (`[env+8+4*slot]`) or a use of the arg after a call would hit a moved object.
+    // Storing them in scanned root slots lets the collector update them in place;
+    // reads go through each slot's stable address (ctx.EnvAddr / ctx.Slotted).
+    // Self-host: blam14 rebuilt its env from a stale env; the tokenizer's `loop`
+    // consed onto its `acc` arg after an allocating scan that had moved it.
     let rootEnv = gc && not (dictPairs st.Captures |> List.isEmpty)
     let envSlotReg = if rootEnv then Some (freshTmp ctx) else None
     (match envSlotReg with Some r -> ctx.EnvAddr <- Some (LGet (wReg r)) | None -> ())
+    let rootArg = gc && refKindOfTy psch.Body = RKRef && (scalarLTy psch.Body).IsNone
+    let argSlotReg = if rootArg then Some (freshTmp ctx) else None
+    (match argSlotReg with Some r -> dictSet ctx.Slotted (key pv) (LGet (wReg r)) | None -> ())
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
     let bodyLow0 = coreToLowE ctx body
     st.GapSink <- None
+    // roots to establish at entry: (slot register, initial value). Pushed in
+    // order (distinct slots), all popped together at the single fall-through exit.
+    let entryRoots =
+        (match envSlotReg with Some r -> [ r, LGet (wReg envId) ] | None -> [])
+        @ (match argSlotReg with Some r -> [ r, LGet (wReg argId) ] | None -> [])
     let bodyLow =
-        match envSlotReg with
-        | Some r ->
+        if List.isEmpty entryRoots then bodyLow0
+        else
             let resReg = freshTmp ctx
-            LDo ([ LSet (wReg r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
-                   LStore (W, LGet (wReg r), 0, LGet (wReg envId))
-                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ]))
-                   LSet (wReg resReg, bodyLow0)
-                   LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ],
-                 LGet (wReg resReg))
-        | None -> bodyLow0
+            let pushes = entryRoots |> List.collect (fun (r, v) ->
+                [ LSet (wReg r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
+                  LStore (W, LGet (wReg r), 0, v)
+                  LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
+            let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length entryRoots) ]))
+            LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
         vecAdd st.Warnings ("stubbed lambda " + lamName + " (" + vecGet sink 0 + ")")
@@ -4728,7 +4897,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 | Some pairs ->
                     pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
                 | None -> []
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) body (fun _ -> ())
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) (ps |> List.map (fun (_, s) -> s.Body)) body (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -4736,7 +4905,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m (gl v) true None [] [] [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) true None [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the spare
                 // $hp global, then store into the global's root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
@@ -4756,10 +4925,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // lifted lambda bodies: (environment, argument) -> result — declared LAST.
     // st.Captures maps each captured (path:offset) to its env slot; the LowIR
     // lowering reads them from the env register.
-    for name, (pv, _), body, caps in vecToList st.Lams do
+    for name, (pv, psch), body, caps in vecToList st.Lams do
         st.Captures <- dictNew ()
         caps |> List.iteri (fun i (p, o, _) -> dictSet st.Captures (p + ":" + string o) i)
-        emitLambdaLow st m name pv body
+        emitLambdaLow st m name pv psch body
     // GC: emit $fpreg_all LAST — every shape's tid is known now. Each shape is
     // registered as (tid, size, kind, start, refoffs=0, name=0); `start` is the
     // TAGGED tracer's first-payload word (0 for a no-ref STRUCT box).
