@@ -1597,26 +1597,28 @@ let private emitCmpv (m : Mod) : unit =
         lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
         lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
         lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
-        lg f "$r"; ic f 10; ins f "i32.shr_u"; ic f 0x3FF; ins f "i32.and"; ls f "$st"
-        lg f "$st"; ic f 1; ins f "i32.lt_s"; ifE f; ic f 1; ls f "$st"; endB f
+        // tid -> info: low 10 bits = nword count, the high bits a REF BITMASK (bit
+        // w set = word w is a pointer). ONE walk over words [1, nwords): a ref word
+        // recurses through $cmpv; a raw word (a union tag, or a tuple/record's
+        // inline int) orders as a signed int. The bitmask replaces a
+        // raw-prefix/ref-suffix split, which could not describe a ref field BEFORE
+        // a raw one (a `(string, int)` dict key) — that made $cmpv deref the int as
+        // a pointer, so every generic Dict keyed by such a tuple mis-compared.
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
-        // raw metadata words [1, start): int compare (union tag)
+        lg f "$r"; ic f 10; ins f "i32.shr_u"; ls f "$st"
         ic f 1; ls f "$w"
-        blockE f "$rd"; loopE f "$rgo"
-        lg f "$w"; lg f "$st"; ins f "i32.ge_s"; brIf f "$rd"
-        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$x"
-        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$y"
-        lg f "$x"; lg f "$y"; ins f "i32.ne"
-        ifE f; lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
-        lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
-        br f "$rgo"; endB f; endB f
-        // payload words [start, tot): recurse
-        lg f "$st"; ls f "$w"
         blockE f "$td"; loopE f "$tgo"
         lg f "$w"; lg f "$tot"; ins f "i32.ge_s"; brIf f "$td"
+        lg f "$st"; lg f "$w"; ins f "i32.shr_u"; ic f 1; ins f "i32.and"
+        ifE f
         lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
         lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
         callf f "$cmpv"; ls f "$r"
+        elseB f
+        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$x"
+        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$y"
+        lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ls f "$r"
+        endB f
         lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
         lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
         br f "$tgo"; endB f; endB f
@@ -5269,7 +5271,22 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
             gg rf "$roots"; ic rf (4 * st.CmpTblSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
             for tid, size, kind, start in vecToList st.TidRegs do
-                let info = (kind <<< 20) ||| (start <<< 10) ||| ((size / 4) &&& 0x3FF)
+                let nwords = size / 4
+                // ref bitmask (bit w set = word w is a pointer), packed above the
+                // 10-bit word count. FK_STRUCT knows its exact ref OFFSETS, so a raw
+                // scalar anywhere (a tuple's trailing int) is marked raw; every other
+                // kind keeps the old contiguous [start, nwords) ref suffix (a union
+                // tag prefix stays raw). Words past 21 don't fit the mask -> raw.
+                let mask =
+                    if kind = FK_STRUCT then
+                        match dictTryFind st.TidRefoffs tid with
+                        | Some offs -> offs |> List.fold (fun m b -> let w = b / 4 in if w < 22 then m ||| (1 <<< w) else m) 0
+                        | None -> 0
+                    else
+                        let mutable m = 0
+                        for w in (max 1 start) .. (min (nwords - 1) 21) do m <- m ||| (1 <<< w)
+                        m
+                let info = (mask <<< 10) ||| (nwords &&& 0x3FF)
                 lg rf "$t"; ic rf (8 + 4 * tid); ins rf "i32.add"; ic rf info; mem rf "i32.store"
         // scratch buffer (iovec + PRINTBUF + FMTBUF) -> root slot 0; $sbuf points
         // past its [tag][len] header so the fixed offsets apply unchanged. Kept
