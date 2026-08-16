@@ -5103,13 +5103,6 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
                 sub
             | _ -> id
         let ps = List.init need (fun i -> let s0 = peelArg sch (List.length pre) i in fresh { s0 with Body = instSub s0.Body })
-        (if System.Environment.GetEnvironmentVariable "FPP_WDROP" = "1" then
-            for _, s in ps do
-                match prune s.Body with
-                | TVar _ ->
-                    let hn = match hd with EVar (v, _) | EVarI (v, _, _) -> v.Path + "." + v.Name + ":" + string v.Offset | _ -> "?"
-                    eprintfn "ETADROP head=%s" hn
-                | _ -> ())
         let call = EApp (hd, pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
         List.foldBack (fun p body -> ELam ([ p ], body)) ps call
     let rec go (e : Expr) : Expr =
@@ -5130,9 +5123,15 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
         | (EVar (v, sch) | EVarI (v, sch, _)) as hd when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
             // operands take compare's ARGUMENT type, not its whole `'a -> 'a -> int`
             // scheme — else a raw operand rode the shadow stack as a wild pointer.
+            // When the peeled operand type is still compare's own quantified
+            // var (unlinked — an eta param neither rootable nor skippable,
+            // the (eta):$eN WDROP class), go through `wrap` instead: its
+            // instSub resolves the param from an EVarI head's instantiation.
             let av, asch = fresh (peelArg sch 0 0)
             let bv, bsch = fresh (peelArg sch 0 1)
-            ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (hd, [ EVar (av, asch); EVar (bv, bsch) ])))
+            (match prune asch.Body with
+             | TVar _ -> wrap hd sch [] 2
+             | _ -> ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (hd, [ EVar (av, asch); EVar (bv, bsch) ]))))
         | (EVar (v, sch) | EVarI (v, sch, _)) as hd ->
             match dictTryFind funcs (key v) with Some n when n > 0 -> wrap hd sch [] n | _ -> e
         // `compare` used as a VALUE (List.sortWith compare, …): eta to

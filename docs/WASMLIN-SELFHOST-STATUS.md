@@ -303,3 +303,45 @@ CHAINS (`v1519@1>v0@1` was the smoking gun); LINK1524 in Types.unifySeen's
 TVar-other arm; SEL in Classes.select. printfn only — eprintfn STUBS under
 self-host. The driver hex-dumps its emit (`HX` lines) for wasm-tools
 objdump/name-section diffing against /tmp/oracle.wasm.
+
+## 10. §9 SUPERSEDED — the real root, measured to an 8-line repro
+
+§9's stale-Var theory was WRONG in mechanism (right in observable). The
+full measured chain, each step forced by an experiment:
+
+1. The `Id=0` Var is not GC staleness: it reproduces IDENTICALLY at 16/24/
+   48 MB growable AND 900 MB fixed (no collection at all). A `prune`
+   watchdog (fire on `v.Id = 0` — ids start at 1, so 0 is impossible)
+   fires first at prelude decl 209 = `type IEnumerator<'a>`, right after
+   fresh var 1173 (= the decl's 'a), .NET-side never.
+2. `tyParams` (the decl's param vec) provably holds the REAL tv1173
+   immediately after the fill (probe read it back), and provably holds an
+   all-zero "Var" by the first member's end: **a wild store zeroes the vec
+   slot** during `inferMember` of `MoveNext`. Canary bracketing (a global
+   `canaryCheck` at unifyAt/Fresh/setScheme/recordDef) pins the clobber
+   INSIDE the `setScheme` argument at prelude offset 26010 — i.e. during
+   `freeVars defTy |> List.distinctBy …` + the quantifier Level-writes.
+3. Minimal repros (user prelude, `run-gc.sh`, no compiler involved):
+   - `/tmp/t12.fpp`: `List.ofSeq (ResizeArray<Ty> :> seq<Ty>)` returns
+     **len=0** with Count=1 — silently empty.
+   - `/tmp/t17.fpp` (8 lines): the same `ofSeq` result piped through
+     `List.distinctBy` → **wasm trap: indirect call type mismatch**.
+   The enumerator-protocol lowering for a monomorphized ResizeArray
+   subclass under wasm-linear `--gc` produces a corrupt/empty list, and
+   walking it makes wild indirect calls — wild stores from the same class
+   are what zero the neighboring vec slot in the compiler.
+4. Also fixed en route (committed): the bare-`compare` eta now routes
+   through `wrap` when its peeled operand scheme is unresolved, so an
+   EVarI head's instantiation types the operands ((eta):$eN WDROP entry).
+   Byte-exact.
+5. KNOWN PRE-EXISTING (measured, distinct): `List.sortWith compare` on
+   INTS returns wrong order (`[3;1;2]` → `1,3,2`) under `--gc` while
+   strings/tuples sort right — /tmp/t9.fpp; present on committed HEAD.
+
+NEXT (the fix): debug the enumerator/`ofSeq` lowering with /tmp/t17.fpp —
+it is 8 lines, crashes loudly, needs no self-host build. When it and t12
+pass, rebuild the self-host: the Num defaulting should match (.NET), the
+2 stubs and the ~4K byte surplus should collapse toward
+`DONE bytes=77860 hash=39471061`. Probe recipes for re-instrumenting the
+compiler: §9 + task #69 metadata (printfn only; `grep -c` exits 1 on zero
+matches and silently kills `&&` chains — bitten twice).
