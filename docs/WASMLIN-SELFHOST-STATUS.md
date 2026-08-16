@@ -447,3 +447,32 @@ then "DIFFERS at byte 0". Probe with stderr-free care or not at all there.
 Status: wasm-linear `--gc` self-host is BYTE-EXACT vs the .NET oracle at
 the default heap with real collections. §6 items 1–4 all done. Next phase
 (§6 item 5): the F# conformance differential harness.
+
+## 14. Conformance phase — the differential harness is live
+
+`tests/conformance/` (see its README): curated ports of dotnet/fsharp's
+`tests/fsharp/core` suites, gated as `dotnet fsi` (real F#) vs
+`fpp build --gc` + wasmtime, stdout byte-diffed, test COUNT part of the
+contract (a stubbed init shows as a count mismatch). First tier — smoke,
+letrec, apporder, int32 — all green, and the ports drove NINE language
+fixes in one sitting:
+
+- `!` deref and `:=` on plain ref cells (never wired outside byref params;
+  `!x` lowered to the CELL POINTER). Parser still needs parens for `!x` in
+  argument position (`g (!x)`).
+- `let rec … and` VALUE members now evaluate in dependency order (stable
+  topo sort in Lower over value-member references; acyclic groups match
+  F#'s initialization graph, true cycles remain unsupported).
+- record literals evaluate effectful fields in WRITTEN order (typed temps
+  in Lower; backends store by slot order unaffected).
+- `absl` (int64) and `absf` (f64, new AbsF LowIR op) implemented.
+- uint32 ops honour unsignedness: `/w` `%w` `>>>w` and `<w >w <=w >=w`
+  route to the i32 *_u forms (new DivUW/RemUW/GtUW/LeUW LowIR ops).
+- conversions: `byte#f/l`, `int64#f/l`, `uint32#f/l/-`, `uint64#f/l/-`,
+  `int#w` (identity), and `u~~~` complement (i32 + i64 forms).
+
+Known next chunks: byte/sbyte(/int16/uint16) arithmetic WRAP needs kind
+letters through Lower + both backends (dropped tests marked in int32.fpp);
+cyclic value recursion (delayed refs) is a feature decision. Suite ports
+to continue: patterns, map, seq (subset), comprehensions (subset), innerpoly,
+subtype (subset), syntax, longnames.

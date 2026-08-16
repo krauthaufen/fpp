@@ -37,13 +37,14 @@ type LOp =
     // word (i32 / intptr) integer ops
     | AddW | SubW | MulW | DivSW | RemSW
     | AndW | OrW  | XorW | ShlW  | ShrSW | ShrUW
-    | EqW  | NeW  | LtSW | GtSW  | LeSW  | GeSW | LtUW | GeUW
+    | EqW  | NeW  | LtSW | GtSW  | LeSW  | GeSW | LtUW | GeUW | GtUW | LeUW
+    | DivUW | RemUW
     // 64-bit integer ops
     | AddL | SubL | MulL | DivSL | RemSL
     | AndL | OrL  | XorL | ShlL  | ShrSL | ShrUL
     | EqL  | NeL  | LtSL | GtSL  | LeSL  | GeSL
     // double ops
-    | AddF | SubF | MulF | DivF | NegF
+    | AddF | SubF | MulF | DivF | NegF | AbsF
     | EqF  | NeF  | LtF  | GtF   | LeF | GeF
     // conversions between machine types
     | WToL | LToW | WToF | FToW | LToF | FToL

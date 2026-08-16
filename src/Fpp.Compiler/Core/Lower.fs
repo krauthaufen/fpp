@@ -1502,7 +1502,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind), tokensOf n with
                  | [ l; r ], [ op ] ->
                      (match op.Text with
-                      | "<-" ->
+                      // `:=` is `<-` through a ref CELL: inference already
+                      // marked an ident target whose type is ByRefCell (the
+                      // byrefTarget path below), so the same lowering serves
+                      | "<-" | ":=" ->
                           // `recv.[i] <- v` calls the indexer's setter, bound
                           // at the bracket's synthetic offset. Decided FIRST:
                           // the property path keys on the last identifier in
@@ -1757,6 +1760,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match dictTryFind fieldOwners op.Offset with
                       | Some "ByRefCell" -> lowered
                       | _ -> EApp (EUnknown "$addr", [ lowered ]))
+                 // `!x` dereferences a ref cell (`(!) : 'a ref -> 'a`); the
+                 // prefix fell through to the bare operand before, so the
+                 // CELL POINTER came out where the value should
+                 | Some op, [ a ] when op.Text = "!" ->
+                     EField (lowerExpr (GNode a), "Value", "ByRefCell")
                  | Some op, [] when op.Text = "not" ->
                      // the function, not the operation: `f >> not`
                      let bsch = mono (TCon ("bool", []))
@@ -2459,8 +2467,38 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         nodesOf n
                         |> List.filter (fun m -> m.NodeKind <> RecordExprField && isExprish m.NodeKind)
                         |> List.tryHead
+                // F# evaluates a record literal's fields in WRITTEN order;
+                // the backends store by DECLARED slot order. An effectful
+                // field expr therefore binds to a temp here, in written
+                // order, so `{ B = eff1; A = eff2 }` runs eff1 first however
+                // the slots are laid out. Atoms stay in place — the common
+                // all-atom literal lowers exactly as before. Temps take the
+                // FIELD's declared type (a `?`-typed temp is the backend's
+                // type-lost hazard).
+                let isAtom (e : Expr) = match e with ELit _ | EVar (_, _) | EVarI (_, _, _) -> true | _ -> false
+                let bindWritten (fs : (string * Expr) list) (build : (string * Expr) list -> Expr) : Expr =
+                    let off = offsetOf n
+                    let bound =
+                        fs |> List.mapi (fun i (fn, e) ->
+                            if isAtom e then (fn, e, None)
+                            else
+                                let sch =
+                                    match dictTryFind fieldsTable (owner + "." + fn) with
+                                    | Some fi -> mono fi.FieldType
+                                    | None -> anonScheme
+                                let v = { Path = path; Offset = 120000000 + i * 1000000 + off; Name = "_rf" + string i }
+                                (fn, EVar (v, sch), Some (v, sch, e)))
+                    let inner = build (bound |> List.map (fun (fn, e, _) -> (fn, e)))
+                    List.foldBack
+                        (fun (_, _, b) acc ->
+                            match b with
+                            | Some (v, sch, e) -> ELet (false, v, sch, e, acc)
+                            | None -> acc)
+                        bound inner
                 (match baseExpr with
-                 | Some b -> ERecordExt (owner, lowerExpr (GNode b), fields)
+                 | Some b ->
+                     let lb = lowerExpr (GNode b)
+                     bindWritten fields (fun fs -> ERecordExt (owner, lb, fs))
                  | None ->
                      // an omitted OPTIONAL field IS None — fill it, so the
                      // backends still see every declared field
@@ -2473,7 +2511,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  if List.contains fn written then None
                                  else Some (fn, ECtor ("None", anonOpt, []))
                              else None)
-                     ERecord (owner, fields @ fills))
+                     bindWritten fields (fun fs -> ERecord (owner, fs @ fills)))
             | ArrayExpr ->
                 let elemName =
                     match dictTryFind arrKinds (offsetOf n) with
@@ -4238,10 +4276,83 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      Body = TFun (TCon ("Rand", []), TCon ("?", [])) },
                    ELam ([ rv, rsch ], body)))
 
+    // `let rec a = … and b = …` VALUE members evaluate in DEPENDENCY order
+    // in F# (the initialization graph); source order ran `a2 = b2 + 1` before
+    // `b2 = 2` and read a zero. A maximal run of recursive DLets is reordered
+    // by a STABLE topological sort over value-member references: everything
+    // keeps source order except a member forced later by a dependency, so
+    // effect order matches F# for acyclic groups. Function members need no
+    // init and are ignored as dependencies; a true value CYCLE (F#'s delayed
+    // references) stays in source order — unsupported, as before.
+    let reorderRecValues (ds : Decl list) : Decl list =
+        let rec varRefs (e : Expr) (acc : Vec<string>) : unit =
+            match e with
+            | EVar (v, _) | EVarI (v, _, _) -> vecAdd acc (v.Path + ":" + string v.Offset)
+            | EAssign (v, x) -> vecAdd acc (v.Path + ":" + string v.Offset); varRefs x acc
+            | ELet (_, _, _, a, b) | EWhile (a, b) | EIndex (_, a, b) | EArrayCreate (_, a, b) -> varRefs a acc; varRefs b acc
+            | ELam (_, b) -> varRefs b acc
+            | EApp (f, xs) -> varRefs f acc; for x in xs do varRefs x acc
+            | EIf (a, b, c) | EIndexSet (_, a, b, c) -> varRefs a acc; varRefs b acc; varRefs c acc
+            | EMatch (sc, cs) | ETry (sc, cs) ->
+                varRefs sc acc
+                for _, g, b in cs do
+                    (match g with Some x -> varRefs x acc | None -> ())
+                    varRefs b acc
+            | ESeq xs | EPrim (_, xs) | ETuple xs | EListLit xs | ECtor (_, _, xs) | EArray (_, xs) -> for x in xs do varRefs x acc
+            | ERecord (_, fs) -> for _, x in fs do varRefs x acc
+            | ERecordExt (_, b, fs) -> varRefs b acc; (for _, x in fs do varRefs x acc)
+            | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) | EArrayPin (_, r) | EArrayUnpin (_, r) | EArrayBytes (_, r) -> varRefs r acc
+            | EFieldSet (r, _, _, x) -> varRefs r acc; varRefs x acc
+            | EIfaceCall (_, _, r, xs) -> varRefs r acc; for x in xs do varRefs x acc
+            | _ -> ()
+        let isValueMember (d : Decl) =
+            match d with DLet (true, _, _, ELam (_, _)) -> false | DLet (true, _, _, _) -> true | _ -> false
+        let reorderRun (run : Decl list) : Decl list =
+            let valueKeys =
+                run |> List.choose (fun d ->
+                    match d with
+                    | DLet (true, v, _, _) when isValueMember d -> Some (v.Path + ":" + string v.Offset)
+                    | _ -> None)
+            if List.length valueKeys < 2 then run
+            else
+                let keyOf (d : Decl) = match d with DLet (_, v, _, _) -> v.Path + ":" + string v.Offset | _ -> ""
+                let depsOf (d : Decl) =
+                    match d with
+                    | DLet (true, _, _, rhs) when isValueMember d ->
+                        let a = vecNew<string> ()
+                        varRefs rhs a
+                        vecToList a |> List.filter (fun k -> List.contains k valueKeys && k <> keyOf d) |> List.distinct
+                    | _ -> []
+                let placed = dictNew<string, bool> ()
+                let out = vecNew<Decl> ()
+                let mutable remaining = run
+                let mutable guard = List.length run * List.length run + 4
+                while not (List.isEmpty remaining) && guard > 0 do
+                    guard <- guard - 1
+                    let ready =
+                        remaining |> List.tryFind (fun d ->
+                            depsOf d |> List.forall (fun k -> (dictTryFind placed k).IsSome))
+                    let pick = match ready with Some d -> d | None -> List.head remaining
+                    vecAdd out pick
+                    (if isValueMember pick then dictSet placed (keyOf pick) true)
+                    remaining <- remaining |> List.filter (fun d -> not (System.Object.ReferenceEquals (d, pick)))
+                vecToList out @ remaining
+        let out = vecNew<Decl> ()
+        let run = vecNew<Decl> ()
+        let flush () =
+            for d in reorderRun (vecToList run) do vecAdd out d
+            vecClear run
+        for d in ds do
+            match d with
+            | DLet (true, _, _, _) -> vecAdd run d
+            | _ -> flush (); vecAdd out d
+        flush ()
+        vecToList out
     { Decls =
         vecToList decls
         |> List.map (fun d ->
             match d with
             | DLet (r, v, sch, body) -> DLet (r, v, sch, fixRanges (fixAddrs body))
             | other -> other)
+        |> reorderRecValues
       Notes = vecToList notes }

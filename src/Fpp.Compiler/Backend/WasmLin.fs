@@ -3117,6 +3117,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EPrim (("u-f" | "u-s"), [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
     | EPrim ("u-l", [ a ]) -> lowBoxI ctx (LPrim (SubL, [ LConstL 0L; lowUnboxI (coreToLowE ctx a) ]))
     | EPrim (("u-" | "u-i"), [ a ]) -> LPrim (SubW, [ LConstW 0; coreToLowE ctx a ])
+    // `~~~` bitwise complement: i32 forms flip every bit; the i64 form rides
+    // the boxed payload
+    | EPrim (("u~~~" | "u~~~i" | "u~~~w"), [ a ]) -> LPrim (XorW, [ coreToLowE ctx a; LConstW (-1) ])
+    | EPrim (("u~~~l" | "u~~~v"), [ a ]) -> lowBoxI ctx (LPrim (XorL, [ lowUnboxI (coreToLowE ctx a); LConstL (-1L) ]))
     | EPrim (("unot" | "not"), [ a ]) -> LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ])
     | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
@@ -3160,11 +3164,22 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // reached nil (0). Mirrors the GC backend's `$append`.
     | EPrim ("@", [ a; b ]) -> LCall ("$lappend", [ coreToLowE ctx a; coreToLowE ctx b ])
     // |n| on a raw int, branchless: (n ^ (n>>31)) - (n>>31)
-    | EPrim ("abs", [ a ]) ->
+    | EPrim (("abs" | "absi"), [ a ]) ->
         let t = freshTmp ctx
         let n = LGet (wReg t)
         let m = LPrim (ShrSW, [ n; LConstW 31 ])
         LDo ([ LSet (wReg t, coreToLowE ctx a) ], LPrim (SubW, [ LPrim (XorW, [ n; m ]); m ]))
+    // |x| on a boxed float: the wasm instruction (clears the sign bit, so
+    // abs -0.0 = 0.0 and abs nan keeps the payload, as .NET does)
+    | EPrim ("absf", [ a ]) ->
+        lowBoxF ctx (LPrim (AbsF, [ lowUnboxF (coreToLowE ctx a) ]))
+    // |n| on a boxed int64, same identity at 64 bits
+    | EPrim ("absl", [ a ]) ->
+        let t = freshTmpT ctx I64
+        let n = LGet { Id = t; RTy = I64 }
+        let m = LPrim (ShrSL, [ n; LConstL 63L ])
+        LDo ([ LSet ({ Id = t; RTy = I64 }, lowUnboxI (coreToLowE ctx a)) ],
+             lowBoxI ctx (LPrim (SubL, [ LPrim (XorL, [ n; m ]); m ])))
     // the builtin `compare a b` (an unbound EVar in the unoptimised core):
     // -1/0/1 by the operands' static shape
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
@@ -3199,11 +3214,22 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EPrim (op, [ a; b ]) ->
         // int is RAW i32: plain wasm arithmetic, no tag juggling. A comparison
         // yields a raw 0/1 bool, which is also the raw representation.
+        // The `w` kind suffix (uint32) picks the UNSIGNED division/remainder/
+        // shift/comparison forms — the stripped route ran them signed, so
+        // `4294967295u / 2u` and `4000000000u > 2u` were simply wrong.
         let bop = baseOp op
+        let unsignedW = strLen op >= 2 && charAt op (strLen op - 1) = 'w' && not (op.Contains "@")
         let ta = coreToLowE ctx a
         let tb = coreToLowE ctx b
         match bop with
-        | "<" | ">" | "<=" | ">=" | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
+        | "<" -> LPrim ((if unsignedW then LtUW else LtSW), [ ta; tb ])
+        | ">" -> LPrim ((if unsignedW then GtUW else GtSW), [ ta; tb ])
+        | "<=" -> LPrim ((if unsignedW then LeUW else LeSW), [ ta; tb ])
+        | ">=" -> LPrim ((if unsignedW then GeUW else GeSW), [ ta; tb ])
+        | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
+        | "/" when unsignedW -> LPrim (DivUW, [ ta; tb ])
+        | "%" when unsignedW -> LPrim (RemUW, [ ta; tb ])
+        | ">>>" when unsignedW -> LPrim (ShrUW, [ ta; tb ])
         | _ -> LPrim (intArithOp bop, [ ta; tb ])
     | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map (refKindOfExprC st) xs)) (genWitsOf ctx 0 xs)
     | EListLit xs -> lowList ctx xs
@@ -3564,6 +3590,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
         (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
+    // int64-of-FLOAT truncates the double; int64-of-int64 is the identity;
+    // anything else sign-extends the i32 word (the old single form widened a
+    // boxed-double POINTER for `int64 0.0`)
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#f" || n.StartsWith "int64#s" ->
+        lowBoxI ctx (LPrim (FToL, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#l" || n.StartsWith "int64#v" -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
         lowBoxI ctx (LPrim (WToL, [ (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
@@ -3571,6 +3603,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // char and int share the tagged-int representation, so `int c` / `char i`
     // are the identity
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#c" || n.StartsWith "char" -> coreToLowE ctx a
+    // uint32 shares the raw i32 word: int<->uint32 are identities; from a
+    // float it truncates; from int64 it wraps the low word
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint32#f" || n.StartsWith "uint32#s" ->
+        LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint32#l" || n.StartsWith "uint32#v" ->
+        LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+    | EApp (EUnknown n, [ a ]) when n = "uint32#" || n.StartsWith "uint32#" -> coreToLowE ctx a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#w" -> coreToLowE ctx a
+    // uint64 rides the boxed i64: from float truncates, from ints widens
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#f" || n.StartsWith "uint64#s" ->
+        lowBoxI ctx (LPrim (FToL, [ lowUnboxF (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#l" || n.StartsWith "uint64#v" -> coreToLowE ctx a
+    | EApp (EUnknown n, [ a ]) when n = "uint64#" || n.StartsWith "uint64#" ->
+        lowBoxI ctx (LPrim (WToL, [ coreToLowE ctx a ]))
     // int from float: unbox, truncate, tag
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     // int from int (widen/identity in the tagged model) and int truncations
@@ -3581,6 +3627,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#t" -> LCall ("$atoi", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#i" -> coreToLowE ctx a
     // byte / narrow: mask the tagged value's payload to 8 bits
+    // byte-of-FLOAT truncates first ('f'/'s' operand kind); the plain mask
+    // AND'd a boxed-double POINTER before
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#f" || n.StartsWith "byte#s" ->
+        LPrim (AndW, [ LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]); LConstW 0xFF ])
+    // byte-of-int64 wraps the low 8 of the wide payload
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#l" || n.StartsWith "byte#v" ->
+        LPrim (AndW, [ LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]); LConstW 0xFF ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> (LPrim (AndW, [ (coreToLowE ctx a); LConstW 0xFF ]))
     // the raw bits of a double, as int64 — read the boxed payload as i64
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
@@ -4728,6 +4781,10 @@ let private lowOpIns (op : LOp) : string =
     | LeSW -> "i32.le_s"
     | GeSW -> "i32.ge_s"
     | LtUW -> "i32.lt_u"
+    | GtUW -> "i32.gt_u"
+    | LeUW -> "i32.le_u"
+    | DivUW -> "i32.div_u"
+    | RemUW -> "i32.rem_u"
     | GeUW -> "i32.ge_u"
     | AddL -> "i64.add"
     | SubL -> "i64.sub"
@@ -4751,6 +4808,7 @@ let private lowOpIns (op : LOp) : string =
     | MulF -> "f64.mul"
     | DivF -> "f64.div"
     | NegF -> "f64.neg"
+    | AbsF -> "f64.abs"
     | EqF -> "f64.eq"
     | NeF -> "f64.ne"
     | LtF -> "f64.lt"

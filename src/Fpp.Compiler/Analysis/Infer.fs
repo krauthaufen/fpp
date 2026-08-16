@@ -3980,6 +3980,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            | TCon ("ByRefCell", _) -> i
                            | other -> TCon ("ByRefCell", [ other ]))
                       | _ -> st.Fresh ())
+                 | Some t when t.Text = "!" ->
+                     // `!x` reads through a ref cell: operand ByRefCell<'a>,
+                     // result 'a (the deref itself is lowered as .Value)
+                     (match inner with
+                      | [ i ] ->
+                          let a = st.Fresh ()
+                          unifyAt t.Offset i (TCon ("ByRefCell", [ a ]))
+                          a
+                      | _ -> st.Fresh ())
                  | Some t when t.Text = "~~~" ->
                      // bitwise complement keeps its operand's integer type
                      (match inner with

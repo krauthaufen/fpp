@@ -1,0 +1,30 @@
+test1232 - test1: OK
+test1232 - test2: OK
+test1232 - test3: OK
+test1232 - test4: OK
+test1232 - test5: OK
+test1232 - test6: OK
+test1232 - test7: OK
+test1233 - test1: OK
+test1233 - test2: OK
+test1233 - test3: OK
+test1233 - test4: OK
+test1233 - test5: OK
+(two args at a time) test1: OK
+(two args at a time) test2: OK
+(two args at a time) test3: OK
+(two args at a time) test1top: OK
+(one arg at a time) test1: OK
+(one arg at a time) test2: OK
+(one arg at a time) test3: OK
+(rec two args) test1: OK
+(rec two args) test2: OK
+cnclewlecp2: OK
+ceiewoi: OK
+cd33289e0ewn1: OK
+ewlknewv90we2: OK
+cewekcjnwe3: OK
+cewekcjnwe4: OK
+cewekcjnwe7: OK
+cewekcjnwe8: OK
+DONE tests=29 failures=0
