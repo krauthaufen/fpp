@@ -1558,16 +1558,45 @@ let private emitCmpv (m : Mod) : unit =
     let arrH = hv CID_ARRAY gcArrTid
     let both h = (lg f "$ca"; ic f h; ins f "i32.eq"; lg f "$cb"; ic f h; ins f "i32.eq"; ins f "i32.and")
     lg f "$a"; lg f "$b"; ins f "i32.eq"; ifE f; ic f 0; ins f "return"; endB f
+    // both odd: compare the WORDS directly. For the tagged pairs a FK_TAGGED
+    // walk recurses on, sign(2x+1 - (2y+1)) = sign(x - y), so the unshifted
+    // compare orders identically; for RAW full-width ints (an unwitnessed
+    // `compare` eta's operands) it is the CORRECT compare, where the old
+    // shifted form mis-ordered odd-vs-even raw pairs (compare 3 2 gave -1
+    // and List.sort of ints — including the emitter's own vArities sort —
+    // came out wrong).
     lg f "$a"; ic f 1; ins f "i32.and"; lg f "$b"; ic f 1; ins f "i32.and"; ins f "i32.and"
     ifE f
-    lg f "$a"; ic f 1; ins f "i32.shr_s"; ls f "$x"
-    lg f "$b"; ic f 1; ins f "i32.shr_s"; ls f "$y"
-    lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+    lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
     endB f
     lg f "$a"; ins f "i32.eqz"; ifE f; ic f -1; ins f "return"; endB f
     lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
-    lg f "$a"; ic f 1; ins f "i32.and"; ifE f; ic f -1; ins f "return"; endB f
-    lg f "$b"; ic f 1; ins f "i32.and"; ifE f; ic f 1; ins f "return"; endB f
+    // one odd, one even: the even side is a POINTER only if it looks like a
+    // managed object (in-memory, odd header, tid inside the shape table) —
+    // then ints order before pointers, arbitrarily but consistently. An even
+    // side that fails the test is a raw EVEN int: compare the words.
+    memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+    (if gc then (gg f "$roots"; ic f (4 * gcCmpTblSlot); ins f "i32.add"; mem f "i32.load"; ls f "$tbl"))
+    let rawCmp () = (lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return")
+    // isPtr(reg): even && < msz && header odd && tid < table count
+    let isPtr (r : string) =
+        lg f r; lg f "$msz"; ins f "i32.lt_u"
+        (if gc then (
+            lg f r; mem f "i32.load"; ls f "$x"
+            lg f "$x"; ic f 1; ins f "i32.and"; ins f "i32.and"
+            lg f "$x"; ic f 1; ins f "i32.shr_u"; lg f "$tbl"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.lt_u"; ins f "i32.and"))
+    lg f "$a"; ic f 1; ins f "i32.and"
+    ifE f
+    isPtr "$b"
+    ifE f; ic f -1; ins f "return"; endB f
+    rawCmp ()
+    endB f
+    lg f "$b"; ic f 1; ins f "i32.and"
+    ifE f
+    isPtr "$a"
+    ifE f; ic f 1; ins f "return"; endB f
+    rawCmp ()
+    endB f
     // both even and non-zero here. A generic comparison is UNWITNESSED, so a RAW
     // scalar payload word (a large `int` tuple field — the compiler's synthetic
     // 5e8-range offsets) is indistinguishable from a pointer by value alone.
@@ -5156,15 +5185,16 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
         | (EVar (v, sch) | EVarI (v, sch, _)) as hd when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
             // operands take compare's ARGUMENT type, not its whole `'a -> 'a -> int`
             // scheme — else a raw operand rode the shadow stack as a wild pointer.
-            // When the peeled operand type is still compare's own quantified
-            // var (unlinked — an eta param neither rootable nor skippable,
-            // the (eta):$eN WDROP class), go through `wrap` instead: its
-            // instSub resolves the param from an EVarI head's instantiation.
-            let av, asch = fresh (peelArg sch 0 0)
-            let bv, bsch = fresh (peelArg sch 0 1)
-            (match prune asch.Body with
-             | TVar _ -> wrap hd sch [] 2
-             | _ -> ELam ([ (av, asch) ], ELam ([ (bv, bsch) ], EApp (hd, [ EVar (av, asch); EVar (bv, bsch) ]))))
+            // Route through `wrap`: it peels each operand's own type AND
+            // substitutes an EVarI head's instantiation into it, so the
+            // applied-compare handler sees typed operands and picks the
+            // scalar/string/shape comparator. The old direct eta left the
+            // params at compare's own quantified var — the body fell to the
+            // generic $cmpv, whose odd/even int-vs-pointer discrimination is
+            // WRONG for raw full-width ints (compare 3 2 = -1), which
+            // mis-sorted every `List.sort` of ints — including the
+            // emitter's own vArities sort, the last 881 bytes vs the oracle.
+            wrap hd sch [] 2
         | (EVar (v, sch) | EVarI (v, sch, _)) as hd ->
             match dictTryFind funcs (key v) with Some n when n > 0 -> wrap hd sch [] n | _ -> e
         // `compare` used as a VALUE (List.sortWith compare, …): eta to

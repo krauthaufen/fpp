@@ -408,3 +408,42 @@ call_indirect-use intern in a scratch pass). Probe: instrument `tyFunc`
 (print name + caller tag on first intern of $v2/$v3) on both sides and
 diff the two traces. That one flip should zero the cmp:
 target `DONE bytes=77860 hash=39471061`.
+
+## 13. ★ BYTE-EXACT ★ — the goal of this document is achieved
+
+    self-host (16 MB growable, real collections): DONE bytes=77860 hash=39471061
+    oracle (.NET):                                DONE bytes=77860 hash=39471061
+    cmp /tmp/selfemit5.wasm /tmp/oracle_new.wasm  → CLEAN
+
+The last 881 bytes were ONE ordering flip with a beautiful cause: the
+emitter's own `vArities |> List.sort` mis-sorted INTS when the compiler ran
+as wasm. `List.sort` = `sortWith compare`; a bare `compare` eta's operands
+are untyped (Lower records `TCon "?"` — the known frontier), so the body
+falls to the generic `$cmpv` — whose int discrimination was still the
+TAGGED-era model: both-odd compared `>>1`-shifted values and any odd/even
+mix was declared int-vs-pointer. Under raw full-width ints, `compare 3 2`
+answered -1, and every unwitnessed int sort — including vArities — came
+out wrong (v1,v3,v5,v2), reordering the type section and renumbering 881
+bytes downstream.
+
+Fix (in `$cmpv`, ordering-safe for BOTH worlds):
+- both-odd compares the WORDS unshifted — for tagged pairs
+  `sign((2x+1)-(2y+1)) = sign(x-y)`, so FK_TAGGED walks order identically;
+  for raw ints it is simply correct.
+- an odd/even mix first asks whether the even side LOOKS like a managed
+  object (in-memory, odd header, tid inside the shape table — the $hashv
+  discrimination): a real pointer keeps the int<pointer order, a raw even
+  int gets the direct signed compare.
+- the bare-compare eta also routes through `wrap` now (typed operands
+  whenever the head carries an instantiation).
+
+This also fixes the user-visible `List.sort [3;1;2] = [1;3;2]` bug (§12's
+"known pre-existing"; /tmp/t23.fpp now prints 123 on all three forms).
+
+Gate trap for posterity: a `printfn` probe in EmitBin/BinDriver pollutes
+STDOUT, which carries the fixpoint compiledrive protocol — fixpoint-self
+then "DIFFERS at byte 0". Probe with stderr-free care or not at all there.
+
+Status: wasm-linear `--gc` self-host is BYTE-EXACT vs the .NET oracle at
+the default heap with real collections. §6 items 1–4 all done. Next phase
+(§6 item 5): the F# conformance differential harness.
