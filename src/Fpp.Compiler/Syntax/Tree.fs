@@ -74,6 +74,8 @@ type NodeKind =
     | ListPat
     | AsPat
     | TypeTestPat
+    /// `{ F1 = p1; F2 = p2 }` in pattern position
+    | RecordPat
     // types
     /// `%t` in TYPE position inside a quotation
     | SpliceType

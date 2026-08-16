@@ -567,7 +567,7 @@ let parse (src : string) : ParseResult =
         else head
 
     and canStartAtomPat () =
-        s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket
+        s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket || s.Is LBrace
         // `| %p ->` — a spliced PATTERN, inside a quotation only
         || isSpliceHere ()
         || (s.IsKw "struct" && (s.Peek 1).Kind = LParen) || s.IsOp ":?"
@@ -643,6 +643,23 @@ let parse (src : string) : ParseResult =
                 if s.Mark = mark then go <- false
             if s.Is RBracket then vecAdd acc (s.Bump ())
             Green.node ListPat (vecToList acc)
+        elif s.Is LBrace then
+            // record pattern: `{ F1 = p1; F2 = p2 }` — each field is an
+            // IdentPat (the NAME), the `=`, and the field's own pattern
+            let acc = vecNew<Green> ()
+            vecAdd acc (s.Bump ())
+            let mutable go = true
+            while go && not s.AtEof && not (s.Is RBrace) do
+                let mark = s.Mark
+                if s.Is Semicolon then vecAdd acc (s.Bump ())
+                elif s.Is Ident then
+                    vecAdd acc (Green.node IdentPat [ s.Bump () ])
+                    (if s.IsOp "=" then vecAdd acc (s.Bump ()) else s.Diag "expected '=' in record pattern")
+                    vecAdd acc (parseAsSuffix (parseConsPat ctx))
+                else vecAdd acc (s.Bump ())
+                if s.Mark = mark then go <- false
+            if s.Is RBrace then vecAdd acc (s.Bump ()) else s.Diag "expected '}' in record pattern"
+            Green.node RecordPat (vecToList acc)
         else
             s.Diag "expected a pattern"
             Green.node ErrorNode [ s.Bump () ]

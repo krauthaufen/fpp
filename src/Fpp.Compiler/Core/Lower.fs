@@ -301,7 +301,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat || k = RecordPat
         || k = SplicePat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -602,13 +602,70 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 | other -> other
             List.map rename alts
 
+    // Record patterns lower by BINDING the record whole and reading the
+    // matched fields out around the clause: lowerPat replaces the node with
+    // a fresh binder and stashes (binder, owner, fields) here; the clause /
+    // destructure builders drain the stash — refutable field sub-patterns
+    // fold into the GUARD (so a mismatch falls to the next clause), binders
+    // re-match in the BODY. Nesting works because an inner record pattern's
+    // binder sits inside the outer one's field sub-pattern.
+    let pendingRecPats = vecNew<VarId * string * (string * Pat) list> ()
+    let anonPatScheme = mono (TCon ("?", []))
+    let drainRecPats () : (VarId * string * (string * Pat) list) list =
+        let obs = vecToList pendingRecPats
+        vecClear pendingRecPats
+        obs
+    let rec irrefutablePat (p : Pat) : bool =
+        match p with
+        | PVar (_, _) | PWild -> true
+        | PAs (inner, _, _) -> irrefutablePat inner
+        | PTuple ps -> ps |> List.forall irrefutablePat
+        | _ -> false
+    let wrapRecPatBody (obs : (VarId * string * (string * Pat) list) list) (body : Expr) : Expr =
+        List.foldBack
+            (fun (tmp, owner, fps) acc ->
+                List.foldBack
+                    (fun (fn, sub) acc2 ->
+                        if (match sub with PWild -> true | _ -> false) then acc2
+                        else EMatch (EField (EVar (tmp, anonPatScheme), fn, owner), [ sub, None, acc2 ]))
+                    fps acc)
+            obs body
+    let wrapRecPatGuard (obs : (VarId * string * (string * Pat) list) list) (guard : Expr option) : Expr option =
+        let refutable =
+            obs |> List.exists (fun (_, _, fps) -> fps |> List.exists (fun (_, sub) -> not (irrefutablePat sub)))
+        if not refutable && guard.IsNone then None
+        else
+            let g0 = match guard with Some g -> g | None -> ELit (LBool true)
+            // refutable fields TEST (false falls to the next clause);
+            // irrefutable ones still BIND — the guard may read the binders
+            Some
+                (List.foldBack
+                    (fun (tmp, owner, fps) acc ->
+                        List.foldBack
+                            (fun (fn, sub) acc2 ->
+                                match sub with
+                                | PWild -> acc2
+                                | _ when irrefutablePat sub ->
+                                    EMatch (EField (EVar (tmp, anonPatScheme), fn, owner), [ sub, None, acc2 ])
+                                | _ ->
+                                    EMatch (EField (EVar (tmp, anonPatScheme), fn, owner),
+                                            [ sub, None, acc2
+                                              PWild, None, ELit (LBool false) ]))
+                            fps acc)
+                    obs g0)
+
     let rec lowerPat (n : GreenNode) : Pat =
         match n.NodeKind with
         | WildcardPat -> PWild
         | LiteralPat ->
             (match tokensOf n |> List.tryLast |> Option.bind litOf with
              | Some l -> PLit l
-             | None -> PWild)
+             | None ->
+                 // `null` is a keyword, not a literal token, so litOf misses
+                 // it — falling to PWild made the null arm match EVERYTHING
+                 match tokensOf n |> List.tryLast with
+                 | Some t when t.Text = "null" -> PLit LNull
+                 | _ -> PWild)
         | IdentPat ->
             (match patHeadToken n with
              | Some t ->
@@ -659,6 +716,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [ h; t ] -> PCons (lowerPat h, lowerPat t)
              | _ -> PWild)
         | ListPat -> PListLit (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
+        | RecordPat ->
+            let owner =
+                match Green.tokens (GNode n) |> List.tryHead |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset) with
+                | Some o -> o
+                | None -> "?"
+            let kids = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
+            let rec pairs (ks : GreenNode list) : (GreenNode * GreenNode) list =
+                match ks with
+                | nm :: sub :: rest -> (nm, sub) :: pairs rest
+                | _ -> []
+            let fps =
+                pairs kids
+                |> List.choose (fun (nm, sub) ->
+                    match tokensOf nm |> List.tryHead with
+                    | Some t -> Some (t.Text, lowerPat sub)
+                    | None -> None)
+            let tmp = { Path = path; Offset = 160000000 + offsetOf n; Name = "_rp" }
+            vecAdd pendingRecPats (tmp, owner, fps)
+            PVar (tmp, anonPatScheme)
         | ParenPat ->
             let hasBar = tokensOf n |> List.exists (fun t -> t.Kind = Operator && t.Text = "|")
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
@@ -2415,7 +2491,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             | [ p ] -> lowerPat p, guard, body
                             | [] -> PWild, guard, body
                             | ps -> POr (alignOrBinders (List.map lowerPat ps)), guard, body   // bar-separated alternatives
-                        pat, guard, body)
+                        let obs = drainRecPats ()
+                        pat, wrapRecPatGuard obs guard, wrapRecPatBody obs body)
                 (match scrut with
                  | Some s -> EMatch (lowerExpr (GNode s), cases)
                  // `function | A -> .. | B -> ..` is the lambda whose body
@@ -2432,7 +2509,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
                      ELet (isRec, v, sch, rhs, (match cont with Some c -> c | None -> ELit LUnit))
                  | Some (DestructureLet (pat, rhs, cont)) ->
-                     EMatch (rhs, [ pat, None, (match cont with Some c -> c | None -> ELit LUnit) ])
+                     let obs = drainRecPats ()
+                     EMatch (rhs, [ pat, None, wrapRecPatBody obs (match cont with Some c -> c | None -> ELit LUnit) ])
                  | Some (StructLet (bs, tn, rhs, cont)) ->
                      structLetElems bs tn rhs (match cont with Some c -> c | None -> ELit LUnit)
                  | None -> note (offsetOf n) "let shape")
@@ -3284,12 +3362,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          let rhs = if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then EApp (EUnknown "$forcecell", [ rhs ]) else rhs
                          ELet (isRec, v, sch, rhs, disposeOf v sch tail))
                 | Some (DestructureLet (pat, rhs, cont)) ->
+                    let obs = drainRecPats ()
                     let tail =
                         match cont, rest with
                         | Some c, [] -> c
                         | Some c, _ -> ESeq [ c; lowerBlock rest ]
                         | None, _ -> lowerBlock rest
-                    EMatch (rhs, [ pat, None, tail ])
+                    EMatch (rhs, [ pat, None, wrapRecPatBody obs tail ])
                 | Some (StructLet (bs, tn, rhs, cont)) ->
                     let tail =
                         match cont, rest with
@@ -3547,8 +3626,34 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match c with
                         // the parens hold a FLAT comma-separated pattern
                         | GToken t -> t.Kind = Comma
-                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat)
-                | [ p ] -> p.NodeKind = StructTuplePat
+                        // `let (Some v) = …` (AppPat) and or-alternatives
+                        // (`let (This a | That a) = …`, the bar token) are
+                        // destructures, not simple bindings
+                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat || inner.NodeKind = AppPat)
+                    || (p.Children
+                        |> List.exists (fun c ->
+                            match c with
+                            | GToken t -> t.Kind = Operator && t.Text = "|"
+                            | _ -> false))
+                    || (match p.Children |> List.choose (fun c -> match c with GNode m when isPatKind m.NodeKind -> Some m | _ -> None) with
+                        // `let () = ()` — empty parens are the unit pattern
+                        | [] -> true
+                        // `let (1) = (1)` — a literal asserts, binds nothing
+                        | [ one ] when one.NodeKind = LiteralPat -> true
+                        // `let (None) = None` — a bare name that RESOLVES to
+                        // a union case matches the case, it does not bind
+                        | [ one ] when one.NodeKind = IdentPat ->
+                            (match Green.tokens (GNode one) |> List.tryHead with
+                             | Some t ->
+                                 (match dictTryFind useDefs t.Offset with
+                                  | Some d -> d.Kind = Resolve.DefCase
+                                  | None -> false)
+                             | None -> false)
+                        | _ -> false)
+                // a BARE list/cons pattern (`let [v] = …`, `let h :: t = …`)
+                // is a destructure too: as a "simple" let it bound the name
+                // to the WHOLE list
+                | [ p ] -> p.NodeKind = WildcardPat || p.NodeKind = LiteralPat || p.NodeKind = StructTuplePat || p.NodeKind = ListPat || p.NodeKind = ConsPat || p.NodeKind = RecordPat
                 | _ -> false)
         let bodyExprs =
             vecToList after
@@ -3573,14 +3678,24 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | _ ->
         if isDestructure then
             // `let (k, v) = e` carries ONE flat ParenPat; the tuple pattern
-            // is its comma-separated inner pats
-            let flat =
+            // is its comma-separated inner pats. A BAR in the parens is
+            // ALTERNATION, not a tuple — flattening `(This a | That a)` into
+            // PTuple matched nothing and the binding trapped; lower the whole
+            // ParenPat instead, which builds the POr.
+            let parenHasBar =
                 match pats with
                 | [ p ] when p.NodeKind = ParenPat ->
+                    tokensOf p |> List.exists (fun t -> t.Kind = Operator && t.Text = "|")
+                | _ -> false
+            let flat =
+                match pats with
+                | [ p ] when p.NodeKind = ParenPat && not parenHasBar ->
                     p.Children |> List.choose (fun c -> match c with GNode m when isPatKind m.NodeKind -> Some m | _ -> None)
                 | ps -> ps
             match flat with
-            | [] -> None
+            // `let () = ()` — the parens held no sub-pattern; the paren
+            // pattern ITSELF is the unit pattern (binds nothing, asserts)
+            | [] -> Some (DestructureLet (lowerPat (List.head pats), lowerBlock rhsExprs, cont))
             | [ one ] -> Some (DestructureLet (lowerPat one, lowerBlock rhsExprs, cont))
             | ps -> Some (DestructureLet (PTuple (List.map lowerPat ps), lowerBlock rhsExprs, cont))
         else
@@ -4194,6 +4309,43 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
                      vecAdd decls (DLet (isRec, v, sch, rhs))
                      if pendingExport then vecAdd decls (DExport (v, v.Name))
+                 | Some (DestructureLet (pat, rhs, _)) ->
+                     // a top-level destructure: bind the RHS once (effects run
+                     // once, in place), then give every pattern binder its own
+                     // global that re-matches the bound value. A binder-free
+                     // pattern (`let (1, 2) = e`) keeps just the bound match,
+                     // whose failure traps — the assertion F# expresses with
+                     // a MatchFailureException. Record-pattern binders live in
+                     // the drained obligations, whose field reads wrap each
+                     // binder's re-match.
+                     let obs = drainRecPats ()
+                     let off = offsetOf n
+                     let tmp = { Path = path; Offset = 150000000 + off; Name = "_dtor" }
+                     let rec patBinders (p : Pat) : (VarId * Scheme) list =
+                         match p with
+                         | PVar (v2, sch2) -> [ v2, sch2 ]
+                         | PAs (inner, v2, sch2) -> (v2, sch2) :: patBinders inner
+                         | PCtor (_, _, ps) | PTuple ps | PListLit ps -> List.collect patBinders ps
+                         | POr ps -> (match ps with p0 :: _ -> patBinders p0 | [] -> [])
+                         | PCons (h, t) -> patBinders h @ patBinders t
+                         | PWild | PLit _ | PTypeTest _ -> []
+                     let recBinders =
+                         obs |> List.collect (fun (_, _, fps) -> fps |> List.collect (fun (_, sub) -> patBinders sub))
+                     let recTmps = obs |> List.map (fun (t2, _, _) -> t2.Path + ":" + string t2.Offset) |> Set.ofList
+                     let bs =
+                         (patBinders pat @ recBinders)
+                         |> List.filter (fun (v2, _) -> not (Set.contains (v2.Path + ":" + string v2.Offset) recTmps))
+                     (match bs with
+                      | [] ->
+                          vecAdd decls
+                              (DLet (false, tmp, anonScheme,
+                                     EMatch (rhs, [ pat, None, wrapRecPatBody obs (ELit LUnit) ])))
+                      | _ ->
+                          vecAdd decls (DLet (false, tmp, anonScheme, rhs))
+                          for bv, bsch in bs do
+                              vecAdd decls
+                                  (DLet (false, bv, bsch,
+                                         EMatch (EVar (tmp, anonScheme), [ pat, None, wrapRecPatBody obs (EVar (bv, bsch)) ]))))
                  | _ -> vecAdd notes (offsetOf n, "top-level let shape"))
                 pendingExport <- false
             | TypeDecl ->

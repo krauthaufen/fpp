@@ -1479,6 +1479,18 @@ let deadCodeEliminate (decls : Decl list) : Decl list =
         | ELet (_, _, _, r, b) -> walk r; walk b
         | EIf (a, b, c) -> walk a; walk b; walk c
         | EMatch (s, cs) ->
+            // a match with no unguarded irrefutable arm can TRAP — the
+            // MatchFailureException F# raises is the effect an assert-only
+            // binding (`let (1, 2) = e`) exists to deliver
+            let rec irref (p : Pat) =
+                match p with
+                | PWild | PVar _ -> true
+                | PLit LUnit -> true
+                | PAs (i, _, _) -> irref i
+                | PTuple ps -> List.forall irref ps
+                | _ -> false
+            if not (cs |> List.exists (fun (p, g, _) -> g.IsNone && irref p)) then
+                sawEffect <- true
             walk s
             for _, g, b in cs do
                 (match g with Some g -> walk g | None -> ())

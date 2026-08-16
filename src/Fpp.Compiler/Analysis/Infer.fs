@@ -1295,7 +1295,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat || k = RecordPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -2616,6 +2616,48 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             for m in nodesOf n do
                 if isPatKind m.NodeKind then unify (patType pvars m) elem |> ignore
             tList elem
+        | RecordPat ->
+            // `{ F1 = p1; F2 = p2 }`: resolve the record from the written
+            // labels (a PATTERN may name a SUBSET of the fields), type each
+            // sub-pattern at its field's declared type, and remember the
+            // owner at the brace token for lowering's field reads.
+            let kids = nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind)
+            let rec pairs (ks : GreenNode list) : (GreenNode * GreenNode) list =
+                match ks with
+                | nm :: sub :: rest -> (nm, sub) :: pairs rest
+                | _ -> []
+            let fps = pairs kids
+            let fieldNames =
+                fps |> List.choose (fun (nm, _) -> tokensOf nm |> List.tryHead |> Option.map (fun t -> t.Text))
+            let owner =
+                match fieldNames with
+                | first :: _ ->
+                    dictPairs fields
+                    |> List.choose (fun (k, fi) ->
+                        if k = fi.TypeName + "." + first && not (k.Contains "$") && fi.DefKey.IsNone && not fi.IsStatic
+                        then Some fi else None)
+                    |> List.filter (fun fi -> fieldNames |> List.forall (fun m -> (dictTryFind fields (fi.TypeName + "." + m)).IsSome))
+                    |> List.tryLast
+                | [] -> None
+            (match owner with
+             | Some info ->
+                 let subst = dictNew<int, Type> ()
+                 for pv in info.Params do dictSet subst pv.Id (st.Fresh ())
+                 let recTy = TCon (info.TypeName, info.Params |> List.map (fun pv -> substVars subst (TVar pv)))
+                 (match Green.tokens (GNode n) |> List.tryHead with
+                  | Some t -> vecAdd fieldOwnersRaw (t.Offset, info.TypeName)
+                  | None -> ())
+                 for nm, sub in fps do
+                     (match tokensOf nm |> List.tryHead with
+                      | Some t0 ->
+                          (match dictTryFind fields (info.TypeName + "." + t0.Text) with
+                           | Some fi -> unifyAt t0.Offset (patType pvars sub) (substVars subst fi.FieldType)
+                           | None -> patType pvars sub |> ignore)
+                      | None -> ())
+                 recTy
+             | None ->
+                 for _, sub in fps do patType pvars sub |> ignore
+                 st.Fresh ())
         | AsPat ->
             // `pat as name` — the name gets the pattern's type
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
@@ -5223,8 +5265,33 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         match c with
                         // the parens hold a FLAT comma-separated pattern
                         | GToken t -> t.Kind = Comma
-                        | GNode inner -> inner.NodeKind = ConsPat || inner.NodeKind = ListPat)
-                | [ p ] -> p.NodeKind = StructTuplePat
+                        // `let (Some v) = …` / or-alternatives are
+                        // destructures too — keep in sync with Lower
+                        | GNode inner ->
+                            inner.NodeKind = ConsPat || inner.NodeKind = ListPat || inner.NodeKind = AppPat)
+                    || (p.Children
+                        |> List.exists (fun c ->
+                            match c with
+                            | GToken t -> t.Kind = Operator && t.Text = "|"
+                            | _ -> false))
+                    || (match p.Children |> List.choose (fun c -> match c with GNode m when isPatKind m.NodeKind -> Some m | _ -> None) with
+                        // `let () = ()` — empty parens are the unit pattern
+                        | [] -> true
+                        // `let (1) = (1)` — a literal asserts, binds nothing
+                        | [ one ] when one.NodeKind = LiteralPat -> true
+                        // `let (None) = None` — a bare name that RESOLVES to
+                        // a union case matches the case, it does not bind
+                        | [ one ] when one.NodeKind = IdentPat ->
+                            (match Green.tokens (GNode one) |> List.tryHead with
+                             | Some t ->
+                                 (match dictTryFind useDefs t.Offset with
+                                  | Some d -> d.Kind = Resolve.DefCase
+                                  | None -> false)
+                             | None -> false)
+                        | _ -> false)
+                | [ p ] ->
+                    p.NodeKind = WildcardPat || p.NodeKind = LiteralPat || p.NodeKind = StructTuplePat || p.NodeKind = ListPat
+                    || p.NodeKind = ConsPat || p.NodeKind = RecordPat
                 | _ -> false)
         match pats with
         | [] ->
@@ -5255,6 +5322,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // flag — ordinary unification is unchanged, and the flag is
             // cleared before generalization.
             let rigidHere = setRigid vars true
+            // with `in`, ONLY the binding body types inside the binding's
+            // level: the continuation has to see the GENERALIZED scheme, or
+            // `let f x = x in f 1, f "a"` pins f to its first use — so it
+            // types after the setScheme below
+            let afterAll = vecToList after
+            let bodyGreens, contGreens =
+                if hasIn then
+                    match afterAll with
+                    | b :: rest -> [ b ], rest
+                    | [] -> [], []
+                else afterAll, []
             let bodyTys =
                 // the ASCRIPTION is the body's expectation — it is what lets
                 // `let x : GPUTexelCopyTextureInfo = { Texture = t }` pick
@@ -5262,7 +5340,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match ascription, paramTys with
                  | Some at, [] -> exprExpect <- Some at
                  | _ -> ())
-                try vecToList after |> List.map exprType
+                try bodyGreens |> List.map exprType
                 finally
                     // cleared HERE, not at the end of the branch: a rigid
                     // variable that outlives its binding poisons every later
@@ -5359,8 +5437,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  if isMutable || expansiveValue then setScheme t.Offset (mono funTy)
                  else setScheme t.Offset (generalizeBinding declared funTy)
              | _ -> ())
-            // `let x = e in body` evaluates to the continuation
-            if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
+            // `let x = e in body` evaluates to the continuation, typed HERE
+            // — after generalization — so every use in it instantiates the
+            // scheme afresh
+            if hasIn then
+                (match contGreens |> List.map exprType |> List.tryLast with
+                 | Some t -> t
+                 | None -> tUnit)
             else tUnit
         | _ ->
             // destructuring: bind all pattern names, unify with the body.
@@ -5372,12 +5455,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "in")
             st.EnterLevel ()
             let patTys = pats |> List.map (patType vars)
-            let bodyTys = vecToList after |> List.map exprType
+            // with `in`, ONLY the value types inside the binding's level: the
+            // continuation must see the binders' GENERALIZED schemes, so it
+            // types after the unify-and-generalize below
+            let afterList = vecToList after
+            let valueTy, contGreens =
+                if hasIn then
+                    match afterList with
+                    | v :: rest -> Some (exprType v), rest
+                    | [] -> None, []
+                else
+                    (afterList |> List.map exprType |> List.tryLast), []
             st.ExitLevel ()
-            let valueTy =
-                match bodyTys, hasIn with
-                | v :: _, true -> Some v
-                | _, _ -> List.tryLast bodyTys
             // REPORTED, not discarded. `let (p, q) = struct(1, "x")` is an
             // error in F# — one tuple is a struct, the other is not — and
             // swallowing it here let the binding compile and then trap,
@@ -5390,7 +5479,61 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [ single ], Some b -> unifyAt at single b
              | many, Some b -> unifyAt at (TTuple many) b
              | _ -> ())
-            if hasIn then (match List.tryLast bodyTys with Some t -> t | None -> tUnit)
+            // pattern binders GENERALIZE, as F#'s let-polymorphism for
+            // non-trivial patterns demands: `let (R2 (a, b)) = R2 ([], [[]])`
+            // leaves a and b polymorphic. patType gave each binder a mono
+            // scheme; overwrite it now that the value has been unified in —
+            // unless the value restriction withholds it (an application
+            // COMPUTES; its result is one value at one type)
+            let rec nonExpansiveP (c : Green) =
+                match c with
+                | GToken _ -> true
+                | GNode m ->
+                    match m.NodeKind with
+                    | LiteralExpr | IdentExpr | LambdaExpr -> true
+                    | ListExpr | ArrayExpr | TupleExpr | StructTupleExpr | ParenExpr
+                    | AppExpr | RecordExpr ->
+                        // an application head that RESOLVES to a union case
+                        // is a constructor, not a computation — `Some 1` and
+                        // `R2 ([], [])` generalize, `f ()` does not
+                        (match m.NodeKind with
+                         | AppExpr ->
+                             (match Green.tokens (GNode m) |> List.tryFind (fun t -> t.Kind = Ident) with
+                              | Some t ->
+                                  (match dictTryFind useDefs t.Offset with
+                                   | Some d -> d.Kind = Resolve.DefCase
+                                   | None -> false)
+                              | None -> false)
+                         | _ -> true)
+                        && m.Children |> List.forall nonExpansiveP
+                    | _ -> false
+            let valueGreen =
+                match afterList, hasIn with
+                | b :: _, true -> Some b
+                | xs, _ -> List.tryLast xs
+            let expansive =
+                match valueGreen with
+                | Some b -> not (nonExpansiveP b)
+                | None -> false
+            if not expansive then
+                let rec binderToks (g : Green) : Token list =
+                    match g with
+                    | GToken _ -> []
+                    | GNode m when m.NodeKind = IdentPat ->
+                        (Green.tokens g
+                         |> List.filter (fun t ->
+                             t.Kind = Ident && t.Text <> "_" && (dictTryFind defsAt t.Offset).IsSome))
+                    | GNode m -> m.Children |> List.collect binderToks
+                for p in pats do
+                    for t in binderToks (GNode p) do
+                        (match dictTryFind defSchemes t.Offset with
+                         | Some sch when sch.Quantified.IsEmpty ->
+                             setScheme t.Offset (generalizeBinding [] sch.Body)
+                         | _ -> ())
+            if hasIn then
+                (match contGreens |> List.map exprType |> List.tryLast with
+                 | Some t -> t
+                 | None -> tUnit)
             else tUnit
 
     and inferTypeDecl (n : GreenNode) : unit =

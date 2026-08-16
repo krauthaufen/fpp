@@ -476,3 +476,62 @@ letters through Lower + both backends (dropped tests marked in int32.fpp);
 cyclic value recursion (delayed refs) is a feature decision. Suite ports
 to continue: patterns, map, seq (subset), comprehensions (subset), innerpoly,
 subtype (subset), syntax, longnames.
+
+## 15. Patterns, records and all — the pattern surface is complete
+
+The `patterns` suite port drove a full-stack pattern upgrade, all diffed
+against real F# and green (5/5 conformance suites):
+
+- **Record patterns end-to-end** (new): `RecordPat` parse node
+  (`{ F1 = p; F2 = q }` in any pattern position), Infer typing (owner
+  resolved from the written labels — a pattern may name a SUBSET of the
+  fields — sub-patterns typed at field types), and a Lower desugar with NO
+  Core/backend changes: the record binds whole to a fresh binder;
+  refutable field sub-patterns fold into the clause GUARD (mismatch falls
+  to the next clause), all binding fields wrap the guard and body as
+  nested field-read matches. Works in match clauses (literals, guards
+  reading record binders, fallthrough), local and TOP-LEVEL destructures,
+  and nests.
+- **Top-level destructure lets** (new): `let a, b = …`, `let [v] = …`,
+  `let (Some v) = …`, `let (This a | That a) = …`, and binder-free
+  asserts (`let (1, 2, 3) = …`) — bind the RHS once, one global per
+  binder re-matching it; zero binders keep just the match (trap =
+  MatchFailureException analogue).
+- Bare list/cons patterns in ANY let now destructure (they bound the
+  whole list before); `isDestructure` synced between Lower and Infer.
+- Or-alternation in let parens no longer flattens to a PTuple.
+- `null` in pattern position is a keyword, not a literal — it lowered to
+  PWild and the null arm matched EVERYTHING (bug438 tests).
+- Remaining parser gaps: NONE — see §16.
+
+Self-host still byte-exact (77930 == 77930 with the regenerated oracle).
+
+## 16. Full let-pattern parity and let-polymorphism (innerpoly)
+
+"i want full parity here. even on senseless things like let 1 = 1."
+
+- **Every top-level let-pattern spelling** now works: `let () = ()`,
+  `let 1 = 1`, `let (1) = (1)`, unparenthesised `let 1, 2, 3 = …`,
+  `let (None) = None`, `let _ = e` at module level. The parser always
+  accepted them — `isDestructure` (both copies) had to learn that empty
+  parens are the unit pattern, a literal asserts, and a parenthesised
+  ident that RESOLVES to a union case matches rather than binds. An empty
+  flat-extraction (`let () = …`) now keeps the paren pattern itself.
+- **Assert-lets actually assert**: `let 2 = 1` must trap
+  (MatchFailureException), and it silently passed — Link's dead-code
+  effect analysis judged a refutable match pure, so the unread assert
+  global was eliminated. A match with no unguarded irrefutable arm now
+  counts as an effect. (`tests/tooling/gc` parity matrix: ok/trap in all
+  eight directions.)
+- **Local `let … in` generalizes before its continuation** (innerpoly
+  suite): both inferLet arms typed the continuation INSIDE the binding's
+  level, so `let f x y = () in f 1 "a"; f 1 1` pinned f to its first
+  use — inner lets effectively never generalized. The continuation now
+  types after setScheme. Destructure binders also generalize
+  (`let (R2 (a, b)) = R2 ([], [[]])` leaves a and b polymorphic), under
+  the value restriction: a computed RHS stays monomorphic, constructor
+  applications (`Some 1`, `R2 (…)`) and literals/tuples/records of them
+  generalize.
+
+Suites now: smoke, letrec, apporder, int32, patterns, lift, nested,
+innerpoly — all diffed byte-for-byte against dotnet fsi.
