@@ -3172,11 +3172,26 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              LDo ([ LSet ({ Id = fv; RTy = vty }, storUnbox kind (coreToLowE ctx v))
                     LSet (wReg rr, coreToLowE ctx r)
                     LStore (sty, LGet (wReg rr), off, LGet { Id = fv; RTy = vty }) ], lowInt 0)
-         | None -> LDo ([ LStore (W, coreToLowE ctx r, off, coreToLowE ctx v) ], lowInt 0))
+         | None ->
+             // ref field of a (scalars-first) record: same stale-address hazard
+             // as the general EFieldSet — root the receiver across an
+             // allocating value (prune's `v.Link <- Some r` lives HERE).
+             if gc then
+                 let ra, rb, pre = evalRooted ctx r v
+                 LDo (pre @ [ LStore (W, LGet (wReg ra), off, LGet (wReg rb)) ], lowInt 0)
+             else LDo ([ LStore (W, coreToLowE ctx r, off, coreToLowE ctx v) ], lowInt 0))
     | EField (r, fname, owner) ->
         LLoad (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname)
     | EFieldSet (r, fname, owner, v) ->
-        LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname, coreToLowE ctx v) ], lowInt 0)
+        // an LStore evaluates its ADDRESS before its VALUE. When the value can
+        // allocate, that collection MOVES the receiver and the store writes the
+        // field into the dead copy — the live object keeps its old (soon stale)
+        // ref. Root the receiver across the value and store through the
+        // GC-updated pointer. (This was prune's path compression going stale.)
+        if gc then
+            let ra, rb, pre = evalRooted ctx r v
+            LDo (pre @ [ LStore (W, LGet (wReg ra), HDR + 4 * recFieldIdx st owner fname, LGet (wReg rb)) ], lowInt 0)
+        else LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname, coreToLowE ctx v) ], lowInt 0)
     // ---- arrays of inline value-type records (all-scalar elements) ----
     // elements are contiguous & HEADERLESS at ARRHDR + i*stride. A whole-element
     // read copies out to a fresh headed record; a whole-element write copies the
@@ -3308,6 +3323,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LLoad (W, addr, HDR)
     | EIndexSet (_, arr, i, v) ->
+        // same stale-address hazard as EFieldSet: root the array across an
+        // allocating value; the index is a raw int and needs no root.
+        if gc then
+            let ir = freshTmp ctx
+            let rv = freshTmp ctx
+            let ra = freshTmp ctx
+            LDo ([ LCallVoidS ("$spush", [ coreToLowE ctx arr ])
+                   LSet (wReg ir, coreToLowE ctx i)
+                   LSet (wReg rv, coreToLowE ctx v)
+                   LSet (wReg ra, LCall ("$spop", []))
+                   LStore (W, LPrim (AddW, [ LGet (wReg ra); LPrim (MulW, [ LPrim (AddW, [ LGet (wReg ir); LConstW 1 ]); LConstW 4 ]) ]), HDR, LGet (wReg rv)) ], lowInt 0)
+        else
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> (LLoad (W, coreToLowE ctx arr, HDR))
@@ -3410,7 +3437,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // reads through it; $cellset writes; $forcecell is a marker
     | EApp (EUnknown "$cellof", [ (EVar (v, _) | EVarI (v, _, _)) ]) -> lowVarStore ctx (key v)
     | EApp (EUnknown "$cellget", [ c ]) -> LLoad (W, coreToLowE ctx c, cellOff ())
-    | EApp (EUnknown "$cellset", [ c; v ]) -> LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
+    | EApp (EUnknown "$cellset", [ c; v ]) ->
+        // stale-address hazard (see EFieldSet): root the cell across an
+        // allocating value.
+        if gc then
+            let ra, rb, pre = evalRooted ctx c v
+            LDo (pre @ [ LStore (W, LGet (wReg ra), cellOff (), LGet (wReg rb)) ], lowInt 0)
+        else LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
     | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
     | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
     | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
