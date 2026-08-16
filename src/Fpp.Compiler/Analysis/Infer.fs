@@ -5927,7 +5927,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  (match tokensOf sa |> List.tryFind (fun t -> t.Kind = Ident) with
                   | Some kt when (dictTryFind defsAt kt.Offset).IsSome ->
                       let defTy = TFun (selfTy, setTy)
-                      setScheme kt.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
+                      // hoisted, not the one-line arg form: see the member
+                      // setScheme below (wasm-linear self-host shape hazard)
+                      let accSch =
+                          let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                          for v in qs do (if v.Level > st.Level then v.Level <- 0)
+                          { Quantified = qs; Constraints = []; Body = defTy }
+                      setScheme kt.Offset accSch
                       (match nameTok with
                        | Some pn ->
                            // registerField, not a raw set: an overloaded
@@ -5948,7 +5954,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  recordDef t propTy
                  let defTy = TFun (selfTy, propTy)
                  if (dictTryFind defsAt t.Offset).IsSome then
-                     setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = []; Body = defTy })
+                     // hoisted, not the one-line arg form: see the member
+                     // setScheme below (wasm-linear self-host shape hazard)
+                     let propSch =
+                         let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                         for v in qs do (if v.Level > st.Level then v.Level <- 0)
+                         { Quantified = qs; Constraints = []; Body = defTy }
+                     setScheme t.Offset propSch
                  let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
                  registerField (tyName + "." + t.Text)
                      { TypeName = tyName; Params = classParams
@@ -6070,7 +6082,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // quantify explicitly: the class' own type parameters live at
                 // the type-declaration level, which level-based
                 // generalization would refuse to close over
-                setScheme t.Offset (let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id) in (for v in qs do (if v.Level > st.Level then v.Level <- 0)); { Quantified = qs; Constraints = memberCons; Body = defTy })
+                // NOT the one-line `(let qs = … in (for …); { … })` form: that
+                // exact argument shape MISCOMPILES under the wasm-linear
+                // self-host — the for-loop's write landed on a neighboring
+                // heap object (IEnumerator's tyParams slot read back as an
+                // all-zero Var). Hoisted statements compile correctly; see
+                // docs/WASMLIN-SELFHOST-STATUS.md §11.
+                let memberSch =
+                    let qs = freeVars defTy |> List.distinctBy (fun v -> v.Id)
+                    for v in qs do (if v.Level > st.Level then v.Level <- 0)
+                    { Quantified = qs; Constraints = memberCons; Body = defTy }
+                setScheme t.Offset memberSch
             let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
             let quantified =
                 freeVars memberTy

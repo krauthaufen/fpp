@@ -79,6 +79,7 @@ let private noteVar (trial : Trial option) (v : Var) : unit =
     | None -> ()
 
 /// Follow links to the representative.
+
 let rec prune (t : Type) : Type =
     match t with
     | TVar v ->

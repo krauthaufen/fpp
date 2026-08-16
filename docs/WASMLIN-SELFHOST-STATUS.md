@@ -345,3 +345,34 @@ pass, rebuild the self-host: the Num defaulting should match (.NET), the
 `DONE bytes=77860 hash=39471061`. Probe recipes for re-instrumenting the
 compiler: §9 + task #69 metadata (printfn only; `grep -c` exits 1 on zero
 matches and silently kills `&&` chains — bitten twice).
+
+## 11. ZERO STUBS — both root causes fixed (this session)
+
+Self-host now: `DONE bytes=82356 hash=2195680, NWARN 0`, exit 0 at 16 MB.
+Function sets IDENTICAL to the oracle (695/695). Two fixes:
+
+1. **Prelude iface impls are now DCE roots** (WasmLin reachability seed):
+   they are reached only through the vtable, so excluding them (an old
+   "later concern" guard) dropped the stamped `ResizeArray.GetEnumerator`,
+   left its vtable row 0, and every `List.ofSeq (r :> seq)` dispatched
+   through index 0 — empty list at best, WILD indirect call at worst.
+   Repros t12/t17/t18 all pass now. Found via FPP_VTDBG=1 (kept): prints
+   each vtable row decision; the smoking line was
+   `VT ResizeArray$int cid=91 slot=7 … MISS-func GetEnumerator_…`.
+2. **The `(let qs = … in (for v in qs do v.Level <- 0); { … })`
+   ARGUMENT-POSITION shape miscompiles under the wasm-linear self-host** —
+   the loop's field write scribbled a NEIGHBORING heap object (IEnumerator's
+   tyParams slot read back as an all-zero Var, which flipped Num defaulting
+   and produced the last 2 stubs). Not reproducible small (t14/t15 pass);
+   the three sites in Infer (member/get-accessor/property setScheme) are
+   HOISTED into named lets, which compiles correctly — the same class of
+   shape workaround as tests/known-issues/let-rec-and-group-self-host.fpp.
+   The backend bug is still latent for this shape; a future repro should
+   start from the original one-liner in a member-scheme-sized context.
+
+REMAINING for byte-exactness (the last item): 82356 vs 77860 — the
+compiled compiler keeps 37 literal top-level lets as mutable globals +
+data segments (135/47 vs the oracle's 98/10) where .NET's Optimize folds
+them. Diff `wasm-tools print` globals of /tmp/selfemit2.wasm vs
+/tmp/oracle.wasm to name the 37, then trace the compiled Optimize's
+literal-fold decision for one of them. Everything else matches.

@@ -5290,14 +5290,17 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // a class' interface-method implementations are reached only through a
     // vtable at run time, never by a static reference — so seed them as roots,
     // or the reachability filter would drop the very functions dispatch calls.
-    // Restricted to user impls: prelude class dispatch (and the prelude methods
-    // it would pull in, some not yet lowerable) is a later concern.
+    // Prelude impls included: leaving them out dropped the stamped
+    // ResizeArray.GetEnumerator, its vtable row stayed 0, and every
+    // `List.ofSeq (r :> seq)` dispatched through index 0 — an empty list at
+    // best and a WILD indirect call at worst (the self-host's inference-time
+    // heap scribble). A prelude method a gap still can't lower stubs loudly.
     for d in decls0 do
         match d with
         | DClass (_, _, _, impls) ->
             for _, ms in impls do
                 for _, v in ms do
-                    if v.Path <> Fpp.Analysis.Classes.builtinPath then visit (v.Path + ":" + string v.Offset)
+                    visit (v.Path + ":" + string v.Offset)
         | _ -> ()
     // keep decls0 order (prelude before user — inits sequence correctly),
     // filtered to what is reachable
@@ -5604,6 +5607,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // slotImpl (walking its inheritance chain); every impl function joins the
     // call table here. Rows for types with no impls stay 0.
     let vtRows = Array.zeroCreate (nCid * st.NSlots)
+    let vtdbg = System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1"
     for cn, _, _, _ in classDecls do
         match dictTryFind st.ClassId cn with
         | Some cid ->
@@ -5613,9 +5617,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 // impl that never became one (not reachable / not a plain
                 // function) leaves the slot 0
                 | Some v when (dictTryFind st.Funcs (key v)).IsSome ->
+                    (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s -> %s" cn cid slot ifn mn v.Name)
                     vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
-                | _ -> ())
-        | None -> ()
+                | Some v -> (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s MISS-func %s" cn cid slot ifn mn v.Name)
+                | None -> (if vtdbg then eprintfn "VT %s cid=%d slot=%d %s.%s no-impl" cn cid slot ifn mn))
+        | None -> (if vtdbg then eprintfn "VT %s NO-CID" cn)
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
         match d with DLet (_, _, _, e) -> scanConsts st e | _ -> ()
