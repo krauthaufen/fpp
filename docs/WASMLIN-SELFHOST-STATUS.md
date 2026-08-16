@@ -96,8 +96,16 @@ Where the types get lost (measured, WDROP/WDROP2 probes):
    **Covered for witnessed args** (`b123fe9`): witness-conditional arg
    rooting via SlottedGen when the lambda's captured witnesses include the
    arg's tvar.
-4. **Remaining instances** — the crash still fires (fault last seen
-   `0x12dd5a00`-class, frames in the substVars/mapExpr walk lambdas
+4. **Eta-expansion params** (`fun $eN -> f $eN` for functions-as-values):
+   peeled types left `'a` unresolved when the wrapped head carried an
+   instantiation. **Covered** (`f35c67c`): `wrap` substitutes `EVarI.inst`
+   into the peeled param schemes (14 uncovered args → 6).
+5. **Remaining instances** — the crash still fires (fault last seen
+   `0x12853030`-class, frames blam1145/1148; NOT their args — the final 6
+   uncovered args (probe WDROP3: blam1350 $e501 / blam1555 f2 / blam3961 item /
+   blam4661/4664/4665 sch) are elsewhere, so the crashing lambdas hold the
+   stale value in some OTHER slot category (next: WAT-breadcrumb blam1145's
+   locals at the fault, recipe §5). Frames in the substVars/mapExpr walk lambdas
    `blam1145/1148/1570/1587`). Suspects, in order: lambda args whose tvar
    has **no** captured witness (case 3's residue); multi-param lambda
    chains; `?`-typed values reaching aggregates outside the covered
