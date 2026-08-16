@@ -2501,6 +2501,7 @@ let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
 // slotWitness; a resolved (RKRaw/RKRef) slot needs none. `base_` is the slot
 // index of exprs.[0] (0 for a tuple/record, 1 past a union's raw tag).
 let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * LExpr) list =
+    if not gc then [] else
     exprs
     |> List.mapi (fun j e ->
         match refKindOfExprC ctx.LSt e with
@@ -3633,7 +3634,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 // each from its register into a shadow-stack slot, read through the
                 // slot in the body, pop on the matching path (a mismatch/guard-fail
                 // exits above the pushes).
-                let slotRegs = patRefBinders ctx pat |> List.map (fun (v, _) -> v, freshTmp ctx)
+                let slotRegs = (if gc then patRefBinders ctx pat else []) |> List.map (fun (v, _) -> v, freshTmp ctx)
                 let pushes = slotRegs |> List.collect (fun (v, addrReg) ->
                     [ LSet (wReg addrReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
                       LStore (W, LGet (wReg addrReg), 0, LGet (wReg ctx.Regs.[key v]))
@@ -5420,7 +5421,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             // a stamped generic-class member: constant witnesses for its class
             // type params (Link forwards the enclosingSubst it already computes).
             let constWits =
-                match dictTryFind Fpp.Core.Link.stampedClassWits (v.Path, v.Offset) with
+                match (if gc then dictTryFind Fpp.Core.Link.stampedClassWits (v.Path, v.Offset) else None) with
                 | Some pairs ->
                     pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
                 | None -> []
