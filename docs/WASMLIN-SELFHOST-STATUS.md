@@ -251,3 +251,49 @@ Diagnosis recipe that found all of these (fast, reusable): reproduce with
 instruction, breadcrumb the trapping function (store locals to scratch 224
 before the fault), decode the coredump's data segments, walk the fpprt type
 table (`types_ @4368`, stride 20) + `FPP_TID_DUMP=1` for tid names.
+
+## 9. The last divergence, fully traced (2 stubs, `$class:Num:One:#1524`)
+
+The chain of custody, each link measured (probe recipes below):
+
+1. The stubs are `RangeOps.Seq`'s template body + its inner lambda. Inside
+   it, `i - One` pools `Sub<'a, 'one>` + `Num<'one>` ('one = tvar 1524,
+   IDENTICAL id both sides — inference is deterministic).
+2. .NET: both wanteds survive to Infer's NUMERIC DEFAULTING pass → 'one
+   defaults to int → `One` resolves to the int instance → oracle emits
+   `b725_2333_One` and the call. Wasm-side: at the defaulting checkpoint
+   the pool no longer holds them — resolveClassUse sees `#1524` unresolved
+   → marker → Link can't substitute (subst empty) → EUnknown → stub.
+3. WHY the pool differs: the `Sub` constraint's first arg chain is
+   `v1519 -> v1525@0` on .NET but `v1519 -> Var{Id=0,Level=1}` on wasm —
+   a Var record READ THROUGH A STALE POINTER (the memory was reused after
+   a semi-space flip, so the collector's edge-integrity check cannot see
+   it). The declLevel filter then classifies differently and the
+   defaulting never fires.
+4. The stale Var pointer is written into the link chain by one of the SIX
+   still-uncovered unresolved lambda args (FPP_WDROP=1 on the gchost build
+   lists them): `$blam1367 $e512 (eta):512`, `$blam1572 f2
+   Infer.fs:305084` (line 5103), `$blam3990 item Plugins.fs:58122`,
+   `$blam4692/4695/4696 sch WasmLin.fs:2846/2864/2867` (the `keep`
+   lambdas in patRefBinders/patGenBinders/patCondBinders — note the
+   emitter ones cannot corrupt INFERENCE; the eta one is the live
+   suspect, and ETADROP printed nothing for it, so its param type was
+   resolved at eta time and lost later — instrument `fresh` next).
+5. Fix directions, in order: (a) cover the eta arg — find why its
+   post-`fresh` scheme prunes to TVar at emitLambdaLow when it did not at
+   wrap time (the `fresh` renaming creates NEW unlinked vars — thread the
+   pre-fresh resolved Body through); (b) the frontend inst-recording for
+   lambda params (§3's structural option); (c) after the crash-free root
+   cause is fixed, the remaining byte diff is the +37 globals/+37 data
+   segments (emitted-vs-oracle objdump) and the synthetic-offset drift
+   (blit_int 500000023 vs 500000020) — both expected to collapse once
+   the stub pair resolves like the oracle.
+
+Probe recipes (all were reverted; re-add as needed): ONEUSE in
+Infer.resolveClassUse (print constraint head raw+pruned for name="One");
+DFLT before the defaulting `while` (constraints mentioning the tvar, with
+levels); GEN1524 at generalizeBinding's moved-filter printing the arg LINK
+CHAINS (`v1519@1>v0@1` was the smoking gun); LINK1524 in Types.unifySeen's
+TVar-other arm; SEL in Classes.select. printfn only — eprintfn STUBS under
+self-host. The driver hex-dumps its emit (`HX` lines) for wasm-tools
+objdump/name-section diffing against /tmp/oracle.wasm.

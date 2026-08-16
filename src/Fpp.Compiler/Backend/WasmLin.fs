@@ -5011,7 +5011,10 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
             match prune psch.Body with
             | TVar tv -> (match dictTryFind ctx.Witness tv.Id with
                           | Some witR -> Some (witR, freshTmp ctx)
-                          | None -> None)
+                          | None ->
+                              (if System.Environment.GetEnvironmentVariable "FPP_WDROP" = "1" then
+                                  eprintfn "WDROP %s %s %s:%d" lamName pv.Name pv.Path pv.Offset)
+                              None)
             | _ -> None
         else None
     (match condArg with
@@ -5100,6 +5103,13 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
                 sub
             | _ -> id
         let ps = List.init need (fun i -> let s0 = peelArg sch (List.length pre) i in fresh { s0 with Body = instSub s0.Body })
+        (if System.Environment.GetEnvironmentVariable "FPP_WDROP" = "1" then
+            for _, s in ps do
+                match prune s.Body with
+                | TVar _ ->
+                    let hn = match hd with EVar (v, _) | EVarI (v, _, _) -> v.Path + "." + v.Name + ":" + string v.Offset | _ -> "?"
+                    eprintfn "ETADROP head=%s" hn
+                | _ -> ())
         let call = EApp (hd, pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
         List.foldBack (fun p body -> ELam ([ p ], body)) ps call
     let rec go (e : Expr) : Expr =
