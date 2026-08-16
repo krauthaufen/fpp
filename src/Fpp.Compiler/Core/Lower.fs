@@ -3241,6 +3241,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        EMatch (c, [ p, None, loopBody body ])
                                ELet (false, enV, anon, g, EWhile (m, inner))
                            | _ -> note (offsetOf n) "for-in (no GetEnumerator on the source)"))
+                 // `for i = lo to hi do body` (and `downto`): the classic
+                 // counted loop, one bound each side
+                 | [ ip ], [ lo; hi; body ] when
+                       tokensOf n
+                       |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "to" || t.Text = "downto")) ->
+                     let down =
+                         tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "downto")
+                     let iv, isch =
+                         match lowerPat ip with
+                         | PVar (v, sch) -> v, sch
+                         | _ ->
+                             { Path = path; Offset = offsetOf n + 19000000; Name = "_i" },
+                             mono (TCon ("int", []))
+                     let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
+                     ELet (false, iv, isch, lowerExpr (GNode lo),
+                       ELet (false, hiV, isch, lowerExpr (GNode hi),
+                         EWhile (EPrim ((if down then ">=" else "<="), [ EVar (iv, isch); EVar (hiV, isch) ]),
+                           ESeq [ loopBody body
+                                  EAssign (iv, EPrim ((if down then "-" else "+"), [ EVar (iv, isch); ELit (LInt "1") ])) ])))
                  | _ -> note (offsetOf n) "for loop shape")
             | WhileExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

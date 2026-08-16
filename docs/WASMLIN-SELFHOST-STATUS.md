@@ -533,5 +533,10 @@ Self-host still byte-exact (77930 == 77930 with the regenerated oracle).
   applications (`Some 1`, `R2 (…)`) and literals/tuples/records of them
   generalize.
 
+- **`for i = lo to hi do` / `downto`** (map suite): the parser produced
+  the three-expression ForExpr but Infer routed the first bound into the
+  enumerator protocol and Lower had no arm for it — both now recognise
+  the `to`/`downto` keyword and desugar to the counted while loop.
+
 Suites now: smoke, letrec, apporder, int32, patterns, lift, nested,
-innerpoly — all diffed byte-for-byte against dotnet fsi.
+innerpoly, map, tlr — all diffed byte-for-byte against dotnet fsi.

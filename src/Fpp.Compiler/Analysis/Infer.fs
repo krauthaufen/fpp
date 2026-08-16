@@ -4937,7 +4937,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let mutable handled : GreenNode list = []
                 // `for x in arr do`: bind x to the element type and record
                 // the collection's element name for lowering
+                let hasToKw =
+                    tokensOf n
+                    |> List.exists (fun t -> t.Kind = Keyword && (t.Text = "to" || t.Text = "downto"))
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 // `for i = lo to hi do` / `downto`: both bounds and the
+                 // counter are ints; no collection, no protocol
+                 | lo :: hi :: _ when n.NodeKind = ForExpr && hasToKw ->
+                     handled <- lo :: hi :: handled
+                     (match Green.tokens (GNode lo) |> List.tryHead with
+                      | Some t -> unifyAt t.Offset (exprType (GNode lo)) tInt
+                      | None -> unify (exprType (GNode lo)) tInt |> ignore)
+                     (match Green.tokens (GNode hi) |> List.tryHead with
+                      | Some t -> unifyAt t.Offset (exprType (GNode hi)) tInt
+                      | None -> unify (exprType (GNode hi)) tInt |> ignore)
+                     (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
+                      | Some ip ->
+                          handled <- ip :: handled
+                          unify (patType fvars ip) tInt |> ignore
+                      | None -> ())
                  | coll :: _ when n.NodeKind = ForExpr ->
                      handled <- coll :: handled
                      (match nodesOf n |> List.tryFind (fun m -> isPatKind m.NodeKind) with
