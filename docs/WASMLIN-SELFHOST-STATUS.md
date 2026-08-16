@@ -111,16 +111,17 @@ lambda params (the lambda/desugar analogue of `EVarI.inst`). Gated by
 fixpoint-self byte-exactness since Lower/Infer are shared; if bytes move,
 scope to a WasmLin-only side channel (the `stampedClassWits` pattern).
 
-## 4. NEW: pre-existing non-gc regression (must bisect)
+## 4. RESOLVED: the non-gc regression (was: pre-existing, must bisect)
 
-`tests/tooling/cback/wasmlin-gate.sh` (non-gc `--linear`) **aborts** with a
-NullReferenceException in `EmitBin.gg` (a global-name lookup) at emission —
-at `19b8cc0` **and** at `619047b`, i.e. it predates 2026-08-16's work and
-crept in somewhere in the `413eab1..619047b` fix chain, whose gate runs
-must have hit stale binaries. Small programs pass; the gate's program
-(unions + `for x in` + options) crashes the compiler itself. **Bisect
-this** (fast: build + `fpp build --linear` on the gate program per commit)
-before trusting non-gc; it is independent of the gc work above.
+Bisected to `7c73223` (the 8-category rooting commit) and fixed in `cada6d8`:
+three emission paths ran ungated by `gc` and emitted `$roots`/`$witnesses`
+into non-gc `--linear` modules, which do not declare them (NRE in
+`EmitBin.gg`): the `EMatch` ref-binder slot pushes (`patRefBinders`),
+`genWitsOf` (generic-aggregate witness exprs), and `constWits`
+(`stampedClassWits`, which Link populates for ALL linear builds via
+`stampScalars`, not just gc). All non-gc gates green again (wasmlin,
+lowir-typetest/exn/str), fixpoint-self + corpus byte-exact. Debug technique
+that cracked it: make `EmitBin.gg` print the missing global's NAME.
 
 ## 5. Recipes
 
