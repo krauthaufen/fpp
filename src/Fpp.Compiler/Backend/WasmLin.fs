@@ -295,6 +295,7 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_tid2cid_base" "$t2cbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_refoffs_base" "$refoffsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_witness_base" "$witnessbase" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_tid_scans" "$tidscans" [ "i32"; "i32" ] [ "i32" ]
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -2690,11 +2691,19 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
 // own rooting) and NOT an unboxed scalar (those ride typed locals the GC never
 // scans). Its value is even/pointer, so the odd-tag-skipping root scanner traces
 // it correctly. Gated on gc — the standalone backend has no collector.
+// Lower's desugar temps whose values are HEAP REFS by construction: the
+// list-walk cursor/tail, the for-in array, the pattern-lambda scrutinee, the
+// slice/range temporaries. Their schemes are the anonymous `?` (the desugar
+// has no type to write), which classifies RKGen — but the values are always
+// pointers, so they must be rooted like any other ref let-binder.
+let private desugarRefTemps =
+    Set.ofList [ "_rest"; "_tail"; "_arr"; "_arg"; "_ssrc"; "_sdst"; "_wdst"; "_wsrc"; "_rout" ]
 let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
     gc
     && (dictTryFind ctx.LSt.CellVars (key v)).IsNone
     && (scalarLTy sch.Body).IsNone
-    && (refKindOfTy sch.Body = RKRef)
+    && (refKindOfTy sch.Body = RKRef
+        || (desugarRefTemps.Contains v.Name && refKindOfTy sch.Body <> RKRaw))
 
 // The element-witness register of a generic (`'a`) variable, when the enclosing
 // function threads one. A cell var carries a pointer already (Slotted-covered);
@@ -2802,6 +2811,31 @@ let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
     | PAs (p, v, sch) -> (if keep v sch then [ v, witOf sch ] else []) @ patGenBinders ctx p
     | PCtor (_, _, subs) | PTuple subs | PListLit subs -> List.collect (patGenBinders ctx) subs
     | PCons (h, tl) -> patGenBinders ctx h @ patGenBinders ctx tl
+    | _ -> []
+
+// Pattern binders whose static type is UNRESOLVED — not provably raw, not
+// provably ref, and no witness in scope (a desugar lost the type; see the
+// list-walk / pattern-lambda desugars in Lower). The binder's value came from
+// a slot of the SCRUTINEE object, so the object's own scan map answers
+// ref-vs-raw at runtime ($tidscans): each is rooted conditionally through the
+// SlottedGen machinery with a fabricated 1-word witness. Top-level positions
+// only — each carries its byte offset within the scrutinee.
+let private patCondBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
+    let st = ctx.LSt
+    let dropped (v : VarId) (s : Scheme) =
+        (dictTryFind st.CellVars (key v)).IsNone
+        && (scalarLTy s.Body).IsNone
+        && refKindOfTy s.Body <> RKRaw
+        && refKindOfTy s.Body <> RKRef
+        && (match prune s.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).IsNone | _ -> true)
+    let pick (off : int) (p : Pat) =
+        match p with
+        | PVar (v, sch) when dropped v sch -> Some (v, off)
+        | _ -> None
+    match pat with
+    | PCons (h, t) -> List.choose id [ pick HDR h; pick (HDR + 4) t ]
+    | PTuple subs -> subs |> List.mapi (fun i p -> pick (HDR + 4 * i) p) |> List.choose id
+    | PCtor (_, _, subs) -> subs |> List.mapi (fun i p -> pick (HDR + 4 * (i + 1)) p) |> List.choose id
     | _ -> []
 
 let private isSafepointNode (e : Expr) : bool =
@@ -3608,13 +3642,32 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 // generic (RKGen) binders: active across the arm body, rooted
                 // conditionally at each safepoint via their element witness.
                 let genB = patGenBinders ctx pat |> List.map (fun (v, w) -> ctx.Regs.[key v], w)
+                // UNRESOLVED binders: ask the scrutinee object's scan map at
+                // runtime and root conditionally (see patCondBinders)
+                let condB =
+                    if gc then
+                        patCondBinders ctx pat |> List.map (fun (v, off) ->
+                            v, off, freshTmp ctx, freshTmp ctx, freshTmp ctx)
+                    else []
+                let condSetup =
+                    condB |> List.collect (fun (v, off, flagR, witR, slotR) ->
+                        let w0 = witnessPtrRM ctx.LSt 4 4 0
+                        let w1 = witnessPtrRM ctx.LSt 4 4 1
+                        [ LSet (wReg flagR, LCall ("$tidscans", [ LPrim (ShrUW, [ LLoad (W, LGet (wReg sc), 0); LConstW 1 ]); LConstW off ]))
+                          // wit = flag ? w1 : w0, branchless
+                          LSet (wReg witR, LPrim (XorW, [ w0; LPrim (AndW, [ LPrim (XorW, [ w0; w1 ]); LPrim (SubW, [ LConstW 0; LGet (wReg flagR) ]) ]) ]))
+                          gcSlotPush ctx.Regs.[key v] witR slotR ])
                 let savedGen = ctx.ActiveGen
                 ctx.ActiveGen <- genB @ ctx.ActiveGen
+                let savedSG = ctx.SlottedGen
+                ctx.SlottedGen <- (condB |> List.map (fun (v, _, _, witR, slotR) -> ctx.Regs.[key v], witR, slotR)) @ ctx.SlottedGen
                 let bodyLow = coreToLowE ctx body
+                ctx.SlottedGen <- savedSG
                 ctx.ActiveGen <- savedGen
                 for v, _ in slotRegs do dictRemove ctx.Slotted (key v)
+                let condPop = condB |> List.rev |> List.map (fun (_, _, _, witR, _) -> gcSlotPop witR)
                 let pop = if List.isEmpty slotRegs then [] else [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length slotRegs) ])) ]
-                LBlock ("$mnext", tests @ guardStmt @ pushes @ [ LSet (wReg mr, bodyLow) ] @ pop @ [ LBreak "$mdone" ]))
+                LBlock ("$mnext", tests @ guardStmt @ pushes @ condSetup @ [ LSet (wReg mr, bodyLow) ] @ condPop @ pop @ [ LBreak "$mdone" ]))
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut)
                LBlock ("$mdone", clauseStmts @ [ LTrap ]) ], LGet (wReg mr))
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
@@ -4737,6 +4790,21 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
         match dictTryFind st.LamWits lamName with
         | Some wits -> wits |> List.map (fun (tvId, slot) -> let r = freshTmp ctx in dictSet ctx.Witness tvId r; LSet (wReg r, LLoad (W, LGet (wReg envId), HDR + 8 + 4 * slot)))
         | None -> []
+    // an UNRESOLVED (`'a`-typed) arg with a captured witness in scope: root it
+    // conditionally on the witness refMask, exactly like a generic let (a raw
+    // `'a` must NOT be pushed; a ref `'a` unrooted goes stale across the
+    // body's safepoints — the substVars-walk lambdas hit this).
+    let condArg =
+        if gc && not rootArg && (scalarLTy psch.Body).IsNone && refKindOfTy psch.Body <> RKRaw then
+            match prune psch.Body with
+            | TVar tv -> (match dictTryFind ctx.Witness tv.Id with
+                          | Some witR -> Some (witR, freshTmp ctx)
+                          | None -> None)
+            | _ -> None
+        else None
+    (match condArg with
+     | Some (witR, slotR) -> ctx.SlottedGen <- (argId, witR, slotR) :: ctx.SlottedGen
+     | None -> ())
     let bodyLow0 = coreToLowE ctx body
     st.GapSink <- None
     // roots to establish at entry: (slot register, initial value). Pushed in
@@ -4745,15 +4813,17 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
         (match envSlotReg with Some r -> [ r, LGet (wReg envId) ] | None -> [])
         @ (match argSlotReg with Some r -> [ r, LGet (wReg argId) ] | None -> [])
     let bodyLow =
-        if List.isEmpty entryRoots then bodyLow0
+        if List.isEmpty entryRoots && condArg.IsNone then bodyLow0
         else
             let resReg = freshTmp ctx
             let pushes = entryRoots |> List.collect (fun (r, v) ->
                 [ LSet (wReg r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
                   LStore (W, LGet (wReg r), 0, v)
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
-            let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length entryRoots) ]))
-            LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
+            let condPush = match condArg with Some (witR, slotR) -> [ gcSlotPush argId witR slotR ] | None -> []
+            let condPop = match condArg with Some (witR, _) -> [ gcSlotPop witR ] | None -> []
+            let pop = if List.isEmpty entryRoots then [] else [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length entryRoots) ])) ]
+            LDo (pushes @ condPush @ [ LSet (wReg resReg, bodyLow0) ] @ condPop @ pop, LGet (wReg resReg))
     let bodyLow = if List.isEmpty witLoads then bodyLow else LDo (witLoads, bodyLow)
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
