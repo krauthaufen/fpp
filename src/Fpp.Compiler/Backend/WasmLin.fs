@@ -4865,7 +4865,30 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
     // default, so a raw-scalar type param (distinctBy's 'k = int) was consed
     // onto a REF-scanned list and the collector chased the raw ints.
     let wrap (hd : Expr) (sch : Scheme) (pre : Expr list) (need : int) : Expr =
-        let ps = List.init need (fun i -> fresh (peelArg sch (List.length pre) i))
+        // an EVarI head carries the INSTANTIATION: substitute it into the eta
+        // params' peeled types so a `'a`-typed param resolves concrete and the
+        // lambda machinery can classify (root/skip) it — an unresolved param
+        // can be neither rooted nor skipped and goes stale across the body.
+        let instSub : (Type -> Type) =
+            match hd with
+            | EVarI (_, hsch, inst) when not (List.isEmpty inst) && not (List.isEmpty hsch.Quantified) ->
+                let m = dictNew<int, Type> ()
+                (List.zip (List.truncate (List.length inst) hsch.Quantified)
+                          (List.truncate (List.length hsch.Quantified) inst)
+                 |> List.iter (fun (qv, nm) ->
+                        if nm <> "" && not (nm.StartsWith "#") && nm <> "obj" then
+                            dictSet m qv.Id (TCon (nm, []))
+                            dictSet m (prunedId qv) (TCon (nm, []))))
+                let rec sub t =
+                    match prune t with
+                    | TVar v -> (match dictTryFind m v.Id with Some c -> c | None -> TVar v)
+                    | TCon (n, args) -> TCon (n, List.map sub args)
+                    | TFun (x, y) -> TFun (sub x, sub y)
+                    | TTuple ts -> TTuple (List.map sub ts)
+                    | TApp (h, args) -> TApp (sub h, List.map sub args)
+                sub
+            | _ -> id
+        let ps = List.init need (fun i -> let s0 = peelArg sch (List.length pre) i in fresh { s0 with Body = instSub s0.Body })
         let call = EApp (hd, pre @ (ps |> List.map (fun (p, s) -> EVar (p, s))))
         List.foldBack (fun p body -> ELam ([ p ], body)) ps call
     let rec go (e : Expr) : Expr =
