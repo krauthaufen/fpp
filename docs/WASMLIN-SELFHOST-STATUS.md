@@ -1,4 +1,10 @@
-# WasmLin `--gc` self-host — status (2026-08-16)
+# WasmLin `--gc` self-host — status (2026-08-16, evening)
+
+**MILESTONE: the 16 MB growable self-host RUNS TO COMPLETION** (`DONE
+bytes=65219 hash=703075731`, exit 0, real collections firing). The crash
+class of §3 is closed. What remains is task #69: the 65219-byte emit vs the
+oracle's 77860 (the ~105 silently-stubbed member bodies), then the byte-exact
+cmp. See §3.6/§3.7 for the two fixes that ended the crash hunt.
 
 Goal: the wasm-linear backend self-hosts the F++ compiler byte-exactly under
 `--gc` at the **default 16 MB growable heap**, with real collections firing.
@@ -61,10 +67,20 @@ resolution through base.
   stubs where .NET stubs none ("unbound variable" / "capture not in scope"
   in prelude enumerator members) — task #69, a capture/resolution
   divergence to bisect (shrink with `FPP_PRELUDE_TRUNC`).
-- **`--gc` linear self-host at 16 MB growable** (the honest target): still
-  traps. The crash class is fully understood — see §3 — and has been
-  driven through many instances; each fix moves the fault to the next
-  unrooted holder. Remaining instances exist.
+- **`--gc` linear self-host at 16 MB growable** (the honest target):
+  **RUNS TO COMPLETION** — `DONE bytes=65219 hash=703075731`, exit 0.
+  Same emit as the fixed-heap run, so the remaining work is task #69's
+  divergence, not GC. NOTE: `/tmp/bakeddrive.fpp` was stale (referenced a
+  stripped probe vec `wildLog`); those driver lets became CONSTANT 0.
+  That IS recorded — a stubbed INIT stores 0 by design and adds a
+  `stubbed` entry to `st.Warnings` — but two accounting gaps hid it:
+  `EmitProgramWasmLinearWith` never copies `st.Warnings` into
+  `Workspace.EmitWarnings` (BinDriver's path does), and gchost counted
+  that empty list. `FPP_LINWARN=1` prints the real list. The driver now
+  prints `DONE bytes=<n> hash=<djb2 & 0x3fffffff>`; to ENUMERATE task
+  #69's 105 stubs from inside the wasm run, print `ws.EmitWarnings` in
+  the driver (the self-host compiles the corpus with its wasm-GC
+  backend, which DOES populate it).
 
 ## 3. The 16 MB crash class: values whose static type was lost
 
@@ -100,24 +116,42 @@ Where the types get lost (measured, WDROP/WDROP2 probes):
    peeled types left `'a` unresolved when the wrapped head carried an
    instantiation. **Covered** (`f35c67c`): `wrap` substitutes `EVarI.inst`
    into the peeled param schemes (14 uncovered args → 6).
-5. **Remaining instances** — the crash still fires (fault last seen
-   `0x12853030`-class, frames blam1145/1148; NOT their args — the final 6
-   uncovered args (probe WDROP3: blam1350 $e501 / blam1555 f2 / blam3961 item /
-   blam4661/4664/4665 sch) are elsewhere, so the crashing lambdas hold the
-   stale value in some OTHER slot category (next: WAT-breadcrumb blam1145's
-   locals at the fault, recipe §5). Frames in the substVars/mapExpr walk lambdas
-   `blam1145/1148/1570/1587`). Suspects, in order: lambda args whose tvar
-   has **no** captured witness (case 3's residue); multi-param lambda
-   chains; `?`-typed values reaching aggregates outside the covered
-   binder positions. Method: same probes (add a WDROP-style counter for
-   the uncovered category, enumerate, cover with the same conditional
-   machinery or thread the type).
+5. ~~Remaining instances~~ — RESOLVED; they were not type-lost lambda args
+   at all. The final 6 uncovered args (WDROP3: blam1350 $e501 / blam1555
+   f2 / blam3961 item / blam4661/4664/4665 sch) were never in a crashing
+   frame and are still uncovered — benign so far.
+6. **The match SCRUTINEE across clause guards** (the actual blam1145/1148
+   fault): the scrutinee register was never rooted. A clause guard can
+   allocate; a FAILED guard falls to the next clause's tests, which re-read
+   the stale register (mapExpr's `| P when g e -> …` chain — offset-print
+   `wasm-tools print --print-offsets` showed the faulting `t2c +
+   (hdr>>1)*4` load right after a guard-fail `br_if`). **Fixed**: when any
+   clause pattern dereferences the scrutinee (ctor/tuple/cons/list/
+   type-test/string/null patterns — then it is a pointer at runtime
+   whatever its static type), the scrutinee lives in a shadow-stack slot
+   for the whole match and the register is reloaded at each clause entry.
+   Ref/gen/cond binders are now slotted BEFORE the guard runs (they were
+   seeded from registers after it — same staleness on the matched path),
+   and a failing guard pops what its clause pushed.
+7. **Local cell vars (captured mutables) were never rooted** (the
+   collector's edge-integrity `unreachable` after §3.6 landed): a `let
+   mutable` that a closure captures becomes a heap cell, but the LOCAL
+   holding the cell's pointer was excluded from every rooting category
+   ("cells have their own rooting" — true only for env-RESIDENT cells,
+   which read through the rooted env). A GC between cell creation and
+   closure construction moved the cell; the closure captured the stale
+   pointer; a LATER collection's scan hit it (coredump: a CID_CLOSURE env
+   `s:3:8:2:ssrrrrrr` whose first ref slot pointed at an unforwarded
+   `cell$s`). **Fixed**: cell binders go through the shouldSlot
+   write-through slot like any ref binder (`lowSlotInit` builds the cell
+   into the slot); the `let rec … and` closure-group cells are slotted the
+   same way (their registers went stale across the SIBLING cell allocs and
+   closure fills); the cell-assign path evaluates the VALUE before
+   re-reading the cell pointer (store-order rule).
 
-The **structural** fix that ends this class outright: make the frontend
-never lose these types — record instantiated types for desugar temps and
-lambda params (the lambda/desugar analogue of `EVarI.inst`). Gated by
-fixpoint-self byte-exactness since Lower/Infer are shared; if bytes move,
-scope to a WasmLin-only side channel (the `stampedClassWits` pattern).
+The **structural** fix (frontend inst-recording for desugar temps and
+lambda params) was never needed — kept here as the option of record if a
+new type-lost holder category ever surfaces.
 
 ## 4. RESOLVED: the non-gc regression (was: pre-existing, must bisect)
 
@@ -157,13 +191,63 @@ that cracked it: make `EmitBin.gg` print the missing global's NAME.
 
 ## 6. Order of work from here
 
-1. Bisect + fix the non-gc `wasmlin-gate` regression (§4).
-2. Enumerate + cover the remaining unresolved-value instances (§3.4) until
-   the 16 MB self-host runs; prefer the structural frontend fix if the
-   instance count keeps growing.
-3. Task #69: the 105-stub capture/resolution divergence → byte-exact cmp
-   at the fixed heap.
-4. Byte-exact cmp at 16 MB growable = done.
+1. ~~Bisect + fix the non-gc `wasmlin-gate` regression~~ (§4, done).
+2. ~~Cover the remaining unresolved-value instances until the 16 MB
+   self-host runs~~ (§3.6/§3.7, done — runs to completion).
+3. Task #69: the stub divergence → byte-exact cmp. 65219 vs 77860; the
+   compiled compiler stubs 105 member bodies ("unbound variable" /
+   "capture not in scope") that .NET does not. Enumerate them from the
+   wasm run by printing `ws.EmitWarnings` in the driver (§2), diff
+   against the .NET-side list (`FPP_LINWARN=1` on gchost / the oracle
+   build), then shrink the first divergent body with `FPP_PRELUDE_TRUNC`.
+4. Byte-exact cmp at 16 MB growable = done. Target line:
+   `DONE bytes=77860 hash=39471061` (the driver's djb2-&-0x3fffffff over
+   `/tmp/oracle.wasm`; current self-host: `bytes=65219 hash=703075731`).
 5. Then: port a curated tier of F#'s conformance tests via a differential
    harness (dotnet fsi oracle vs `fpp --gc`/`--linear`) as the hardening
    phase.
+
+## 7. The 105-stub divergence: tuple hashing + tid interning (FIXED)
+
+The self-hosted compiler stubbed 105 prelude enumerator members ("unbound
+variable"/"capture not in scope") that .NET compiles clean. All were misses
+in `(string, int)`-keyed dicts (VarId keys). Three independent bugs:
+
+1. **`$hashv` predated the raw-int/tid world**: its odd-check treated raw
+   ints as tagged (`hash 3 = 1`), and its CID dispatch compared `(tid<<1)|1`
+   headers against CID constants — never matched, so every string hashed to
+   the constant string-tid header and every heap object to its raw header.
+   Rewritten on $cmpv's skeleton: raw scalars hash to themselves (agreeing
+   with the witnessed fast path), known tids dispatch (string sampled-FNV,
+   f64/i64 fold, array length), everything else walks payload words via the
+   tid table's ref bitmask (`h = h*31 + (ref ? $hashv w : w)`). Only
+   CONSISTENCY matters — dicts are insertion-ordered, hash values never
+   reach output bytes.
+2. **Equal tuples interned under DIFFERENT tids**: the witness-selected
+   generic-aggregate path used its own `"sg:…:mask"` shape keys, so a
+   `(string, int)` tuple built generically and one built concretely got two
+   tids — and `$cmpv` orders differing headers as unequal. `tidForMask` now
+   interns the RESOLVED shape under the concrete path's canonical
+   `"s:cid:n:raw:pat"` key.
+3. Repro kept: `/tmp/t5.fpp` (Dictionary), `/tmp/t7.fpp` (generic eq/hash).
+
+## 8. §3 addenda: two more emitter rooting gaps (FIXED)
+
+- **§3.8 Or-pattern binders**: `patRefBinders`/`patGenBinders` fell through
+  `POr` to `[]` — `| TVar v, other | other, TVar v ->` left `other`
+  unrooted across the arm's allocating `occurs` call (measured fault:
+  prune-under-adjustLevels). Binders are identical in every alternative and
+  ride registers, so collect from the first alternative.
+- **§3.9 Curried-apply mid-chain reads**: every step of `f x y` allocates a
+  partial closure; `rootActiveGen` reloads registers only after the WHOLE
+  outer safepoint node, so the chain's later-arg register reads saw pre-GC
+  addresses (measured fault: prune-under-compatible via forall2). `lowApply`
+  now evaluates the closure and all args up front — slotting the closure,
+  ref args, and witnessed generic args — and the chain reads through the
+  GC-updated slots.
+
+Diagnosis recipe that found all of these (fast, reusable): reproduce with
+`-D coredump=`, `wasm-tools print --print-offsets` to name the faulting
+instruction, breadcrumb the trapping function (store locals to scratch 224
+before the fault), decode the coredump's data segments, walk the fpprt type
+table (`types_ @4368`, stride 20) + `FPP_TID_DUMP=1` for tid names.
