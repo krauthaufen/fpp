@@ -277,8 +277,14 @@ The chain of custody, each link measured (probe recipes below):
    `$blam4692/4695/4696 sch WasmLin.fs:2846/2864/2867` (the `keep`
    lambdas in patRefBinders/patGenBinders/patCondBinders — note the
    emitter ones cannot corrupt INFERENCE; the eta one is the live
-   suspect, and ETADROP printed nothing for it, so its param type was
-   resolved at eta time and lost later — instrument `fresh` next).
+   suspect). ETADROP silent + WDROP firing means: the param type WAS
+   concrete when `wrap` built the eta lambda, and the emitted copy's
+   scheme prunes to an unlinked TVar — `fresh` does NOT rename tvars, so
+   the loss is in monomorphization's Canon/stamp scheme rebuild (the
+   documented fpp-lowir-witness-canon hazard: stamped copies get fresh
+   unlinked scheme vars). Fix there: make the stamped ELam param schemes
+   keep (or re-substitute) the resolved Body, WasmLin-gated like
+   stampScalars if oracle bytes move.
 5. Fix directions, in order: (a) cover the eta arg — find why its
    post-`fresh` scheme prunes to TVar at emitLambdaLow when it did not at
    wrap time (the `fresh` renaming creates NEW unlinked vars — thread the
