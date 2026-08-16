@@ -376,3 +376,35 @@ data segments (135/47 vs the oracle's 98/10) where .NET's Optimize folds
 them. Diff `wasm-tools print` globals of /tmp/selfemit2.wasm vs
 /tmp/oracle.wasm to name the 37, then trace the compiled Optimize's
 literal-fold decision for one of them. Everything else matches.
+
+## 12. LENGTH-EXACT: 77860 == 77860, 881 bytes of type-intern ordering left
+
+Two more root causes fixed (this session, after §11):
+
+1. **bootstrap `bytesString` was `unbox (box bs)`** — a byte[]→string
+   representation pun, valid on wasm-GC (both packed i8) but WRONG on
+   wasm-linear (strings are 16-bit units): the punned "string" read past
+   its object, equal byte arrays keyed the literal-intern Dict differently,
+   and 37 duplicate string globals/data segments were emitted. Now a real
+   per-byte build (only the emitter's interning calls it).
+2. **`int#t` (int-of-STRING) lowered to the IDENTITY in WasmLin** — the
+   self-hosted BinDriver's `int (l.Substring 5)` env-slot parse emitted
+   string POINTERS as slot indices (145 diverging bodies). New `$atoi`
+   runtime (signed decimal over the 16-bit-unit layout), `int#t` routed
+   through it; `int#`/`int#i` stay identity.
+
+Self-host now: `DONE bytes=77860, NWARN 0` — LENGTH-IDENTICAL to the
+oracle, 695/695 functions, 98/98 globals, 10/10 data segs, identical
+section boundaries except code/type content. REMAINING: 881 differing
+bytes in 322 ranges, ALL downstream of ONE reorder: the self-host interns
+closure-arity type `$v3` at index 33 where the oracle interns `$v2`
+(same SET of types, same per-function type assignments, first-USE
+functions identical — b725_30159_Equals(#115) for $v2 before
+b725_226739_set_Item(#212) for $v3). So something on the wasm side
+interns $v3 BEFORE function #115's declFn — a pre-decl-walk intern site
+whose ORDER diverges (suspects: lambda discovery through the
+`refMapNew shallowLamHash` map, an emission-order dict, or a
+call_indirect-use intern in a scratch pass). Probe: instrument `tyFunc`
+(print name + caller tag on first intern of $v2/$v3) on both sides and
+diff the two traces. That one flip should zero the cmp:
+target `DONE bytes=77860 hash=39471061`.

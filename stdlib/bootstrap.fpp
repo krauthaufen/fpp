@@ -593,12 +593,18 @@ let halfBits (v : float) : int = float16Bits (float16 v)
 /// source is read as bytes, so there is nothing left to encode.
 let byteLength (s : string) : int = s.Length
 
-/// Bytes as the string they already are. A byte array and a string share
-/// ONE runtime representation here (packed i8 array), so this is the
-/// identity — box/unbox lower to nothing. Building it char-by-char instead
-/// cost a string allocation PER BYTE and took the self-compile from 57s to
-/// 94s the day this function appeared.
-let bytesString (bs : byte[]) : string = unbox (box bs)
+/// Bytes as a latin1 string. NOT the `unbox (box bs)` identity pun any
+/// more: that assumed a byte array and a string share one representation,
+/// which holds on wasm-GC (both packed i8) but NOT on wasm-linear, where a
+/// string is 16-bit units — the punned "string" read past its object into
+/// neighboring heap, so equal byte arrays keyed a Dict differently and the
+/// string-literal intern never deduped (37 duplicate globals in the
+/// self-host emit). Only the emitter's literal interning calls this now,
+/// so the per-byte append is off any hot path.
+let bytesString (bs : byte[]) : string =
+    let sb = sbNew ()
+    for b in bs do sbAdd sb (string (char (int b)))
+    sbText sb
 
 /// a warning to stderr — self-hosted this is a NO-OP: stdout carries the
 /// compiledrive protocol and must stay clean, and there is no stderr FFI

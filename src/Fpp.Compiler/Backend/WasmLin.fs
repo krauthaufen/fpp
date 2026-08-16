@@ -602,6 +602,34 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$literNew" "$lt_i2i"
     declFn m "$literNext" "$lt_i2i"
     declFn m "$literCur" "$lt_i2i"
+    declFn m "$atoi" "$lt_i2i"
+
+// $atoi(s): signed decimal string -> raw i32, over the linear string layout
+// (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
+// optional leading '-', then digits; no error path (the compiler parses only
+// numerals it printed itself — "@env:N" slot suffixes, offsets).
+let private emitAtoi (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$n" "i32"; local f "$i" "i32"; local f "$acc" "i32"; local f "$neg" "i32"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    ic f 0; ls f "$i"; ic f 0; ls f "$acc"; ic f 0; ls f "$neg"
+    lg f "$n"; ic f 0; ins f "i32.gt_s"
+    ifE f
+    lg f "$s"; ic f 8; ins f "i32.add"; mem f "i32.load16_u"; ic f 45; ins f "i32.eq"
+    ifE f; ic f 1; ls f "$neg"; ic f 1; ls f "$i"; endB f
+    endB f
+    blockE f "$ad"; loopE f "$ago"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ad"
+    lg f "$acc"; ic f 10; ins f "i32.mul"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ic f 48; ins f "i32.sub"; ins f "i32.add"; ls f "$acc"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$ago"; endB f; endB f
+    lg f "$neg"
+    ifE f; ic f 0; lg f "$acc"; ins f "i32.sub"; ls f "$acc"; endB f
+    lg f "$acc"
+    endFn f
 
 // %f: .NET's fixed-six-decimals form, ported to the linear string layout.
 // Takes a boxed f64 pointer, returns a string pointer. Handles NaN, sign,
@@ -3517,7 +3545,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // int from float: unbox, truncate, tag
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     // int from int (widen/identity in the tagged model) and int truncations
-    | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#t" || n.StartsWith "int#i" -> coreToLowE ctx a
+    // int-of-STRING parses ('t' is the string kind letter): the identity here
+    // returned the string POINTER — the self-hosted BinDriver's
+    // `int (l.Substring 5)` env-slot parse emitted heap addresses as slot
+    // indices (145 diverging bodies vs the oracle)
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#t" -> LCall ("$atoi", [ coreToLowE ctx a ])
+    | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#i" -> coreToLowE ctx a
     // byte / narrow: mask the tagged value's payload to 8 bits
     | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> (LPrim (AndW, [ (coreToLowE ctx a); LConstW 0xFF ]))
     // the raw bits of a double, as int64 — read the boxed payload as i64
@@ -5647,7 +5680,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m
+    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
