@@ -1536,6 +1536,8 @@ module Array =
     let length (xs : 'a[]) = xs.Length
     let isEmpty (xs : 'a[]) = xs.Length = 0
     let item (i : int) (xs : 'a[]) = xs.[i]
+    let get (xs : 'a[]) (i : int) = xs.[i]
+    let set (xs : 'a[]) (i : int) (v : 'a) = xs.[i] <- v
     let copy (xs : 'a[]) : 'a[] =
         let n = xs.Length
         let r = zeroCreate n
@@ -1912,6 +1914,7 @@ module Array =
             i <- i + 1
         r
     let mapi2 (f : int -> 'a -> 'b -> 'c) (a : 'a[]) (b : 'b[]) : 'c[] =
+        if length a <> length b then failwith "Arrays had different lengths"
         let r = zeroCreate (length a)
         let mutable i = 0
         while i < length a do

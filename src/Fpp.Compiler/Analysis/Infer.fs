@@ -5229,11 +5229,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | TCon ("array", [ e ]) -> Some e
                          | _ -> None)
                     | None -> None
-                for m in nodesOf n do
-                    if isExprish m.NodeKind then
+                // comprehension items (for/while/let) yield through the
+                // rewrite, not through their own type — a ForExpr types as
+                // unit, and unifying THAT with elem froze every array
+                // comprehension's element to unit (keep in sync with
+                // ListExpr's addItems)
+                let rec addItems (m : GreenNode) =
+                    if m.NodeKind = BlockExpr then
+                        for c in nodesOf m do addItems c
+                    elif m.NodeKind = LetDecl || m.NodeKind = ForExpr || m.NodeKind = WhileExpr then
+                        exprType (GNode m) |> ignore
+                    elif isExprish m.NodeKind then
                         exprExpect <- elemExpect
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
-                        unifyAt off (exprType (GNode m)) elem
+                        // `[| a .. b |]` splices, exactly as in a list
+                        let isRange =
+                            m.NodeKind = BinaryExpr
+                            && (m.Children |> List.exists (fun c ->
+                                    match c with
+                                    | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
+                                    | _ -> false))
+                        if isRange then unifyAt off (exprType (GNode m)) (tList elem)
+                        else unifyAt off (exprType (GNode m)) elem
+                for m in nodesOf n do addItems m
                 exprExpect <- savedA
                 (match Green.tokens (GNode n) |> List.tryHead with
                  | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("array", [ elem ]))
@@ -7150,9 +7168,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // branch would have used — the lowering derives them from the loop and
     // reads what they bound to. `for kv in dict` was silently unlowerable
     // because the Dictionary ctor's result resolves late.
-    for fo, _, ct, bt in vecToList lateLoopSources do
+    for fo, co, ct, bt in vecToList lateLoopSources do
         match prune ct with
-        | TCon ("list", _) | TCon ("array", _) | TCon ("string", []) -> ()
+        // the source resolved to a DIRECT shape after the loop typed: wire
+        // the same markers the eager path records, or the lowering falls
+        // through to the enumerator protocol and reports "no GetEnumerator"
+        | TCon ("list", [ e ]) | TCon ("array", [ e ]) ->
+            vecAdd arrKindsRaw (co, prune ct)
+            unify bt e |> ignore
+        | TCon ("string", []) ->
+            vecAdd arrKindsRaw (co, TCon ("$str", []))
+            unify bt tChar |> ignore
         | TCon (_, _) ->
             let enTy = st.Fresh ()
             let gTy = st.Fresh ()

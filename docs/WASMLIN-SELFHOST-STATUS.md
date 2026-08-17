@@ -540,3 +540,32 @@ Self-host still byte-exact (77930 == 77930 with the regenerated oracle).
 
 Suites now: smoke, letrec, apporder, int32, patterns, lift, nested,
 innerpoly, map, tlr — all diffed byte-for-byte against dotnet fsi.
+
+## 17. Array comprehensions, array ranges, string for-in (forexpression, array)
+
+Three more wrong-CODE bugs the differential suites flushed out — all
+compiled cleanly and produced wrong values:
+
+- **`[| for … |]` array comprehensions**: Infer unified the ForExpr's
+  unit type with the element (every array comprehension froze to
+  `array<unit>`), and Lower's `EArray` compiled the loop as ONE
+  unit-valued element. Infer now mirrors ListExpr's addItems; Lower
+  builds the LIST with the existing comprehension machinery (same node
+  retagged) and converts through `listToArrayInline` — count, seed
+  `Array.create` with the head, fill by cons walk; plain Core constructs
+  only, so every backend lowers it.
+- **`[| a .. b |]` array ranges**: same shape — the range spliced in a
+  list but stored its CONS CELL as the single array element. Both sides
+  now treat it as a splice and convert.
+- **`for c in s` over a string (wasm-linear)**: the loop's receiver is an
+  anon-typed temp, so WasmLin's ShStr shape test missed it and the read
+  used the 4-byte ref-array stride — two UTF-16 units packed per "char"
+  (0x00620061 from "ab"). The "$str" KIND now selects the load16_u read.
+- The conformance runner gives ported originals a 128 MB fpprt heap: the
+  .NET-scale allocations (forexpression holds ~500k cons cells live) are
+  a runtime knob, not a language limit; the 16 MB default is a self-host
+  tuning choice.
+- Prelude additions for parity: `Array.get`/`Array.set` (they were
+  silently stubbed), `Array.mapi2` raises on length mismatch as F# does.
+
+Suites after this batch: + forexpression, recordres, array — 13 total.

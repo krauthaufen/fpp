@@ -52,7 +52,10 @@ for f in "$here"/suites/*.fpp; do
   if ! "$fpp" build --gc -o "$out/$b.wasm" "$f" >"$out/$b.buildlog" 2>&1; then
     echo "BUILDERR $b"; sed -n '1,5p' "$out/$b.buildlog"; fail=$((fail+1)); continue
   fi
-  if ! timeout 180 "$wt" run -W gc=y,exceptions=y "$out/$b.wasm" >"$out/$b.act" 2>"$out/$b.trap"; then
+  # 128 MB heap: the ported originals allocate at .NET scale (forexpression
+  # builds ~500k cons cells live), and the default 16 MB is a self-host
+  # tuning choice, not a language limit
+  if ! timeout 180 "$wt" run -W gc=y,exceptions=y --env FPPRT_HEAP_MB=128 "$out/$b.wasm" >"$out/$b.act" 2>"$out/$b.trap"; then
     echo "TRAP    $b"; tail -4 "$out/$b.trap"; fail=$((fail+1)); continue
   fi
   if diff -q "$here/expected/$b.out" "$out/$b.act" >/dev/null; then

@@ -560,6 +560,52 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let anonScheme = mono (TCon ("?", []))
 
+    /// Materialise a LIST expression as an array: count, seed Array.create
+    /// with the head (no zero value of the element type needed), fill by
+    /// walking the conses. Plain Core constructs only — every backend
+    /// lowers them. Used by array comprehensions and `[| a .. b |]`.
+    let listToArrayInline (off : int) (elemName : string) (lst : Expr) : Expr =
+        let anon = anonScheme
+        let ish = mono (TCon ("int", []))
+        let lstV = { Path = path; Offset = off + 16000000; Name = "_cl" }
+        let cntV = { Path = path; Offset = off + 16100000; Name = "_cn" }
+        let r1V = { Path = path; Offset = off + 16200000; Name = "_cr1" }
+        let h0V = { Path = path; Offset = off + 16300000; Name = "_ch0" }
+        let arrV = { Path = path; Offset = off + 16400000; Name = "_car" }
+        let r2V = { Path = path; Offset = off + 16500000; Name = "_cr2" }
+        let ixV = { Path = path; Offset = off + 16600000; Name = "_cix" }
+        let hV = { Path = path; Offset = off + 16700000; Name = "_chd" }
+        let tV = { Path = path; Offset = off + 16800000; Name = "_ctl" }
+        let notNull (e : Expr) =
+            EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+        let countLoop =
+            EWhile (notNull (EVar (r1V, anon)),
+              EMatch (EVar (r1V, anon),
+                [ PCons (PWild, PVar (tV, anon)), None,
+                    ESeq [ EAssign (cntV, EPrim ("+", [ EVar (cntV, ish); ELit (LInt "1") ]))
+                           EAssign (r1V, EVar (tV, anon)) ]
+                  PWild, None, ELit LUnit ]))
+        let fillLoop =
+            EWhile (notNull (EVar (r2V, anon)),
+              EMatch (EVar (r2V, anon),
+                [ PCons (PVar (hV, anon), PVar (tV, anon)), None,
+                    ESeq [ EIndexSet (elemName, EVar (arrV, anon), EVar (ixV, ish), EVar (hV, anon))
+                           EAssign (ixV, EPrim ("+", [ EVar (ixV, ish); ELit (LInt "1") ]))
+                           EAssign (r2V, EVar (tV, anon)) ]
+                  PWild, None, ELit LUnit ]))
+        let build =
+            EMatch (EVar (lstV, anon),
+              [ PCons (PVar (h0V, anon), PWild), None,
+                  ELet (false, arrV, anon, EArrayCreate (elemName, EVar (cntV, ish), EVar (h0V, anon)),
+                    ELet (false, r2V, anon, EVar (lstV, anon),
+                      ELet (false, ixV, ish, ELit (LInt "0"),
+                        ESeq [ fillLoop; EVar (arrV, anon) ])))
+                PWild, None, EArray (elemName, []) ])
+        ELet (false, lstV, anon, lst,
+          ELet (false, cntV, ish, ELit (LInt "0"),
+            ELet (false, r1V, anon, EVar (lstV, anon),
+              ESeq [ countLoop; build ])))
+
     /// Every alternative of an or-pattern binds the SAME variables (F#
     /// requires the same names in each), but each writes its own binder, so
     /// each got its own VarId — and the body, which resolves to the FIRST,
@@ -2595,7 +2641,25 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match dictTryFind arrKinds (offsetOf n) with
                     | Some nm -> nm
                     | None -> ""
-                EArray (elemName, nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m)))
+                // `[| for … |]` (and the yield/let statement forms): build
+                // the LIST with the ListExpr comprehension machinery — same
+                // children, same node offsets — then convert. EArray of the
+                // raw loop compiled the loop as one unit-valued ELEMENT.
+                let rec hasComp (m : GreenNode) =
+                    m.NodeKind = ForExpr || m.NodeKind = WhileExpr || m.NodeKind = LetDecl
+                    || (m.NodeKind = BlockExpr && nodesOf m |> List.exists hasComp)
+                if nodesOf n |> List.exists hasComp then
+                    listToArrayInline (offsetOf n) elemName (lowerExpr (GNode { n with NodeKind = ListExpr }))
+                else
+                let items = nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) |> List.map (fun m -> lowerExpr (GNode m))
+                // `[| a .. b |]`: the range splices, exactly as in a list —
+                // materialise the list and convert (EArray of the range expr
+                // stored the CONS CELL as the single element)
+                match items with
+                | [ EPrim (op2, [ lo; hi ]) ] when (rangeElem op2).IsSome ->
+                    listToArrayInline (offsetOf n) elemName (rangeMaterialize (offsetOf n) (rangeElem op2).Value lo hi)
+                | _ ->
+                EArray (elemName, items)
             | DotExpr when (match nodesOf n with [ _; ix ] -> ix.NodeKind = ListExpr | _ -> false) ->
                 // index access: a.[i]
                 (match nodesOf n with

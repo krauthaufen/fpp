@@ -3518,6 +3518,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // would read a 4-byte WORD (two units) as a pointer — garbage char codes,
     // which broke every charAt and the whole lexer. A string's UTF-16 units sit
     // at HDR+4 with stride 2; read one, zero-extended (load16_u), and tag it.
+    // `for c in s` marks its reads with the "$str" sentinel — the receiver
+    // is a synthetic anon-typed loop temp, so shapeOfExpr cannot see the
+    // string; the KIND says it
+    | EIndex ("$str", arr, i) ->
+        let ir = freshTmp ctx
+        LDo ([ LSet (wReg ir, (coreToLowE ctx i)) ],
+             (LLoad (I16, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW 2 ]) ]), HDR + 4)))
     | EIndex (_, arr, i) when shapeOfExpr arr = ShStr ->
         let ir = freshTmp ctx
         LDo ([ LSet (wReg ir, (coreToLowE ctx i)) ],
