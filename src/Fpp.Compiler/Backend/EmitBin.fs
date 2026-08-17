@@ -546,8 +546,8 @@ let mem (f : Fn) (name : string) : unit =
     emitByte f.B (memByte name)
     let al =
         match name with
-        | "i32.store8" | "i32.load8_u" -> 0
-        | "i32.store16" | "i32.load16_u" -> 1
+        | "i32.store8" | "i32.load8_u" | "i32.load8_s" -> 0
+        | "i32.store16" | "i32.load16_u" | "i32.load16_s" -> 1
         | "i32.load" | "i32.store" | "f32.store" | "f32.load" -> 2
         | _ -> 3
     emitU32 f.B al

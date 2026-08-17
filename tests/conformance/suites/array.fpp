@@ -16,6 +16,16 @@ let test (s : string) (b : bool) : unit =
         failures <- failures + 1
         printfn "NO: %s" s
 
+// array `=` is REFERENCE equality in F++ (a chosen divergence,
+// DIVERGENCES.md) — content checks go through this element-wise helper,
+// which means the same thing in both languages
+let aeq (a : 'a[]) (b : 'a[]) : bool =
+    a.Length = b.Length
+    && (let mutable ok = true
+        for i in 0 .. a.Length - 1 do
+            if a.[i] <> b.[i] then ok <- false
+        ok)
+
 let evens = Array.init 51 (fun i -> i * 2)          // 0..+2..100
 let odds = Array.init 50 (fun i -> i * 2 + 1)       // 1..+2..100
 
@@ -72,17 +82,17 @@ let test_concat () =
     // shapes), so the sources are lists here
     let make n = [| for i in n .. n + 9 -> i |]
     let arr = [ for i in 0 .. 5 -> make (i * 10) ]
-    test "concat a" (Array.concat arr = [| 0 .. 59 |])
+    test "concat a" (aeq (Array.concat arr) [| 0 .. 59 |])
     let arr2 = [ for i in 0 .. 50 -> ([||] : int[]) ]
-    test "concat b" (Array.concat arr2 = [| |])
+    test "concat b" (aeq (Array.concat arr2) [| |])
     let arr3 = [ [||]; [||]; [| 1; 2 |]; [||] ]
-    test "concat c" (Array.concat arr3 = [| 1; 2 |])
+    test "concat c" (aeq (Array.concat arr3) [| 1; 2 |])
 
 let test_sub () =
-    test "sub a" (Array.sub [| 0 .. 100 |] 10 20 = [| 10 .. 29 |])
-    test "sub b" (Array.sub [| 0 .. 100 |] 0 101 = [| 0 .. 100 |])
-    test "sub c" (Array.sub [| 0 .. 100 |] 0 1 = [| 0 |])
-    test "sub d" (Array.sub [| 0 .. 100 |] 0 0 = [||])
+    test "sub a" (aeq (Array.sub [| 0 .. 100 |] 10 20) [| 10 .. 29 |])
+    test "sub b" (aeq (Array.sub [| 0 .. 100 |] 0 101) [| 0 .. 100 |])
+    test "sub c" (aeq (Array.sub [| 0 .. 100 |] 0 1) [| 0 |])
+    test "sub d" (aeq (Array.sub [| 0 .. 100 |] 0 0) [||])
 
 let test_fold2 () =
     test "fold2 a" (Array.fold2 (fun i j k -> i + j + k) 100 [| 1; 2; 3 |] [| 1; 2; 3 |] = 112)
@@ -93,8 +103,8 @@ let test_foldBack2 () =
     test "foldBack2_b" (Array.foldBack2 (fun i j k -> k - i - j) [| 1; 2; 3 |] [| 1; 2; 3 |] 100 = 100 - 12)
 
 let test_scan () =
-    test "scan" (Array.scan (+) 0 [| 1 .. 5 |] = [| 0; 1; 3; 6; 10; 15 |])
-    test "scanBack" (Array.scanBack (+) [| 1 .. 5 |] 0 = [| 15; 14; 12; 9; 5; 0 |])
+    test "scan" (aeq (Array.scan (+) 0 [| 1 .. 5 |]) [| 0; 1; 3; 6; 10; 15 |])
+    test "scanBack" (aeq (Array.scanBack (+) [| 1 .. 5 |] 0) [| 15; 14; 12; 9; 5; 0 |])
 
 let test_iter2 () =
     let c = ref -1
@@ -107,10 +117,10 @@ let test_iteri2 () =
     test "iteri2" (!c = 6 + 60 + 3)
 
 let test_map2 () =
-    test "map2" (Array.map2 (+) [| 0 .. 100 |] [| 0 .. 100 |] = Array.init 101 (fun i -> i * 2))
+    test "map2" (aeq (Array.map2 (+) [| 0 .. 100 |] [| 0 .. 100 |]) (Array.init 101 (fun i -> i * 2)))
 
 let test_mapi2 () =
-    test "mapi2 a" (Array.mapi2 (fun i j k -> i + j + k) [| 1 .. 10 |] [| 1 .. 10 |] = Array.init 10 (fun i -> 2 + i * 3))
+    test "mapi2 a" (aeq (Array.mapi2 (fun i j k -> i + j + k) [| 1 .. 10 |] [| 1 .. 10 |]) (Array.init 10 (fun i -> 2 + i * 3)))
     test "mapi2_b"
         (try Array.mapi2 (fun i j k -> i + j + k) [||] [| 1 .. 10 |] |> ignore; false
          with _ -> true)
@@ -132,16 +142,16 @@ let test_forall2 () =
     test "forall2_b" (not (Array.forall2 (=) [| 1; 2; 3; 4; 5 |] [| 1; 2; 3; 0; 5 |]))
 
 let test_filter () =
-    test "filter a" (Array.filter (fun x -> x % 2 = 0) [| 0 .. 100 |] = evens)
-    test "filter b" (Array.filter (fun x -> false) [| 0 .. 100 |] = [||])
-    test "filter c" (Array.filter (fun x -> true) [| 0 .. 100 |] = [| 0 .. 100 |])
+    test "filter a" (aeq (Array.filter (fun x -> x % 2 = 0) [| 0 .. 100 |]) evens)
+    test "filter b" (aeq (Array.filter (fun x -> false) [| 0 .. 100 |]) [||])
+    test "filter c" (aeq (Array.filter (fun x -> true) [| 0 .. 100 |]) [| 0 .. 100 |])
 
 let test_partition () =
     let p1, p2 = Array.partition (fun x -> x % 2 = 0) [| 0 .. 100 |]
-    test "partition" (p1 = evens && p2 = odds)
+    test "partition" (aeq p1 evens && aeq p2 odds)
 
 let test_choose () =
-    test "choose" (Array.choose (fun x -> if x % 2 = 0 then Some (x / 2) else None) [| 0 .. 100 |] = [| 0 .. 50 |])
+    test "choose" (aeq (Array.choose (fun x -> if x % 2 = 0 then Some (x / 2) else None) [| 0 .. 100 |]) [| 0 .. 50 |])
 
 let test_find () =
     test "find a" ([| 1 .. 100 |] |> Array.find (fun x -> x > 50) = 51)
@@ -167,31 +177,31 @@ let test_first () =
     test "first c" (([||] : int[]) |> Array.tryPick (fun _ -> Some 42) = None)
 
 let test_sort () =
-    test "sort a" (Array.sort ([||] : int[]) = [||])
-    test "sort b" (Array.sort [| 1 |] = [| 1 |])
-    test "sort c" (Array.sort [| 1; 2 |] = [| 1; 2 |])
-    test "sort d" (Array.sort [| 2; 1 |] = [| 1; 2 |])
-    test "sort e" (Array.sort [| 1 .. 1000 |] = [| 1 .. 1000 |])
-    test "sort f" (Array.sort (Array.ofList (List.rev [ 1 .. 1000 ])) = [| 1 .. 1000 |])
+    test "sort a" (aeq (Array.sort ([||] : int[])) [||])
+    test "sort b" (aeq (Array.sort [| 1 |]) [| 1 |])
+    test "sort c" (aeq (Array.sort [| 1; 2 |]) [| 1; 2 |])
+    test "sort d" (aeq (Array.sort [| 2; 1 |]) [| 1; 2 |])
+    test "sort e" (aeq (Array.sort [| 1 .. 1000 |]) [| 1 .. 1000 |])
+    test "sort f" (aeq (Array.sort (Array.ofList (List.rev [ 1 .. 1000 ]))) [| 1 .. 1000 |])
 
 let test_sort_by () =
-    test "Array.sortBy d" (Array.sortBy (fun (x : int) -> x) [| 2; 1 |] = [| 1; 2 |])
-    test "Array.sortBy e" (Array.sortBy (fun (x : int) -> x) [| 1 .. 1000 |] = [| 1 .. 1000 |])
-    test "Array.sortBy f" (Array.sortBy (fun (x : int) -> x) (Array.ofList (List.rev [ 1 .. 1000 ])) = [| 1 .. 1000 |])
-    test "Array.sortBy neg" (Array.sortBy (fun (x : int) -> -x) [| 1 .. 10 |] = Array.ofList (List.rev [ 1 .. 10 ]))
+    test "Array.sortBy d" (aeq (Array.sortBy (fun (x : int) -> x) [| 2; 1 |]) [| 1; 2 |])
+    test "Array.sortBy e" (aeq (Array.sortBy (fun (x : int) -> x) [| 1 .. 1000 |]) [| 1 .. 1000 |])
+    test "Array.sortBy f" (aeq (Array.sortBy (fun (x : int) -> x) (Array.ofList (List.rev [ 1 .. 1000 ]))) [| 1 .. 1000 |])
+    test "Array.sortBy neg" (aeq (Array.sortBy (fun (x : int) -> -x) [| 1 .. 10 |]) (Array.ofList (List.rev [ 1 .. 10 ])))
 
 let test_zip () =
-    test "zip" (Array.zip [| 1; 2; 3 |] [| "a"; "b"; "c" |] = [| 1, "a"; 2, "b"; 3, "c" |])
+    test "zip" (aeq (Array.zip [| 1; 2; 3 |] [| "a"; "b"; "c" |]) [| 1, "a"; 2, "b"; 3, "c" |])
     let u1, u2 = Array.unzip [| 1, "a"; 2, "b"; 3, "c" |]
-    test "unzip" (u1 = [| 1; 2; 3 |] && u2 = [| "a"; "b"; "c" |])
+    test "unzip" (aeq u1 [| 1; 2; 3 |] && aeq u2 [| "a"; "b"; "c" |])
 
 let test_zip3 () =
-    test "zip3" (Array.zip3 [| 1; 2 |] [| "a"; "b" |] [| true; false |] = [| 1, "a", true; 2, "b", false |])
+    test "zip3" (aeq (Array.zip3 [| 1; 2 |] [| "a"; "b" |] [| true; false |]) [| 1, "a", true; 2, "b", false |])
 
 let test_rev () =
-    test "rev a" (Array.rev [| 1; 2; 3 |] = [| 3; 2; 1 |])
-    test "rev b" (Array.rev ([||] : int[]) = [||])
-    test "rev c" (Array.rev [| 1 |] = [| 1 |])
+    test "rev a" (aeq (Array.rev [| 1; 2; 3 |]) [| 3; 2; 1 |])
+    test "rev b" (aeq (Array.rev ([||] : int[])) [||])
+    test "rev c" (aeq (Array.rev [| 1 |]) [| 1 |])
 
 let test_sum () =
     test "sum a" (Array.sum ([||] : int[]) = 0)
@@ -207,25 +217,25 @@ let test_min () =
     test "maxBy" (Array.maxBy (fun (x : int) -> -x) [| 1 .. 10 |] = 1)
 
 let test_zero_create () =
-    test "zeroCreate a" (Array.zeroCreate 3 = [| 0; 0; 0 |])
-    test "zeroCreate b" ((Array.zeroCreate 0 : int[]) = [||])
+    test "zeroCreate a" (aeq (Array.zeroCreate 3) [| 0; 0; 0 |])
+    test "zeroCreate b" (aeq (Array.zeroCreate 0 : int[]) [||])
 
 let test_init () =
     let arr = Array.init 10 (fun i -> i * i)
     test "init" (arr.[3] = 9 && arr.[9] = 81 && arr.Length = 10)
 
 let test_init_empty () =
-    test "init empty" ((Array.init 0 (fun i -> i) : int[]) = [||])
+    test "init empty" (aeq (Array.init 0 (fun i -> i) : int[]) [||])
 
 let test_append () =
-    test "append a" (Array.append [| 1; 2 |] [| 3; 4 |] = [| 1; 2; 3; 4 |])
-    test "append b" (Array.append [||] [| 3; 4 |] = [| 3; 4 |])
-    test "append c" (Array.append [| 1; 2 |] [||] = [| 1; 2 |])
+    test "append a" (aeq (Array.append [| 1; 2 |] [| 3; 4 |]) [| 1; 2; 3; 4 |])
+    test "append b" (aeq (Array.append [||] [| 3; 4 |]) [| 3; 4 |])
+    test "append c" (aeq (Array.append [| 1; 2 |] [||]) [| 1; 2 |])
 
 let test_fill () =
     let arr = Array.create 10 0
     Array.fill arr 2 3 7
-    test "fill" (arr = [| 0; 0; 7; 7; 7; 0; 0; 0; 0; 0 |])
+    test "fill" (aeq arr [| 0; 0; 7; 7; 7; 0; 0; 0; 0; 0 |])
 
 let test_copy () =
     let arr = [| 1; 2; 3 |]
@@ -237,11 +247,11 @@ let test_blit () =
     let src = [| 1; 2; 3; 4; 5 |]
     let dst = Array.create 5 0
     Array.blit src 1 dst 2 3
-    test "blit" (dst = [| 0; 0; 2; 3; 4 |])
+    test "blit" (aeq dst [| 0; 0; 2; 3; 4 |])
 
 let test_of_list () =
-    test "ofList" (Array.ofList [ 1; 2; 3 ] = [| 1; 2; 3 |])
-    test "ofList empty" ((Array.ofList [] : int[]) = [||])
+    test "ofList" (aeq (Array.ofList [ 1; 2; 3 ]) [| 1; 2; 3 |])
+    test "ofList empty" (aeq (Array.ofList [] : int[]) [||])
 
 let test_to_list () =
     test "toList" (Array.toList [| 1; 2; 3 |] = [ 1; 2; 3 ])

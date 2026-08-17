@@ -710,3 +710,13 @@ Porting the `ranges` suite (16th) against real F# flushed three more:
   does not — that asymmetry is why the linear self-host tolerated the
   same lines). Probes go in function position, and never in BinDriver's
   own emit paths.
+- `int u` on uint64 (`int#v`) was an unported linear conversion — the
+  whole init containing it stubbed SILENTLY (stored 0, printed nothing).
+  Wraps to the low 32 bits now, as .NET does.
+- KNOWN ISSUE (pre-existing, investigated): UNSIGNED GENERICS on
+  wasm-linear. `when Num<'a>` members at uint32 run the Canon template's
+  class-instance ops with raw semantics on TAGGED operands (garbage);
+  at uint64 the stamp exists but traps downstream. Note for the next
+  session: these members stamp through the member-constraint machinery,
+  NOT Link.classify — adding uint32 to classify's scalar list changed
+  nothing. FPP_LINWARN=1 surfaces the silent stub inits.

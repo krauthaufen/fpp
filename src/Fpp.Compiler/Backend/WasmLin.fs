@@ -1632,19 +1632,9 @@ let private emitCmpv (m : Mod) : unit =
     endB f
     both arrH
     ifE f
-    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$n"
-    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
-    ic f 0; ls f "$i"
-    blockE f "$ad"; loopE f "$ago"
-    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ad"
-    lg f "$i"; lg f "$mm"; ins f "i32.ge_s"; brIf f "$ad"
-    lg f "$a"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
-    lg f "$b"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
-    callf f "$cmpv"; ls f "$r"
-    lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f
-    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
-    br f "$ago"; endB f; endB f
-    lg f "$n"; lg f "$mm"; ins f "i32.gt_s"; lg f "$n"; lg f "$mm"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+    // arrays compare by IDENTITY (DIVERGENCES.md): same pointer returned 0
+    // at entry, different arrays order by ADDRESS — never element-wise
+    lg f "$a"; lg f "$b"; ins f "i32.gt_u"; lg f "$a"; lg f "$b"; ins f "i32.lt_u"; ins f "i32.sub"; ins f "return"
     endB f
     // remaining compound shapes: under GC walk the payload words structurally via
     // the tid->info table (tuples/records/lists/cons/closures, uniform); raw
@@ -1669,6 +1659,15 @@ let private emitCmpv (m : Mod) : unit =
         lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
         lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
         lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
+        // PACKED SCALAR ARRAY sentinel (nwords = 0x3FF): arrays compare by
+        // IDENTITY (DIVERGENCES.md) — same pointer already returned 0 above,
+        // so different arrays order by ADDRESS. The sentinel exists so the
+        // compound word walk below never reads packed f64 payload halves as
+        // refs (that faulted at the double's bit pattern).
+        lg f "$r"; ic f 0x3FF; ins f "i32.and"; ic f 0x3FF; ins f "i32.eq"
+        ifE f
+        lg f "$a"; lg f "$b"; ins f "i32.gt_u"; lg f "$a"; lg f "$b"; ins f "i32.lt_u"; ins f "i32.sub"; ins f "return"
+        endB f
         // tid -> info: low 10 bits = nword count, the high bits a REF BITMASK (bit
         // w set = word w is a pointer). ONE walk over words [1, nwords): a ref word
         // recurses through $cmpv; a raw word (a union tag, or a tuple/record's
@@ -2777,27 +2776,12 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
                LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
                     [ LSet (wReg r, LPrim (SubW, [ notNil pa; notNil pb ])) ], []) ],
              LGet (wReg r))
-    | ShArr esh ->
-        // element-wise over the shorter length (len@HDR, elem i @ 8+4*i); on a
-        // common prefix the shorter array is the smaller
-        let ra = freshTmp ctx
-        let rb = freshTmp ctx
-        let na = freshTmp ctx
-        let nb = freshTmp ctx
-        let i = freshTmp ctx
-        let r = freshTmp ctx
-        let elemAt reg = LLoad (W, LPrim (AddW, [ LGet (wReg reg); LPrim (AddW, [ LConstW 8; LPrim (MulW, [ LGet (wReg i); LConstW 4 ]) ]) ]), 0)
-        let cond = LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg na) ]); LPrim (AndW, [ LPrim (LtSW, [ LGet (wReg i); LGet (wReg nb) ]); LPrim (EqW, [ LGet (wReg r); LConstW 0 ]) ]) ])
-        let body =
-            [ LSet (wReg r, structCmpW ctx esh (elemAt ra) (elemAt rb) None)
-              LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]), [ LSet (wReg i, LPrim (AddW, [ LGet (wReg i); LConstW 1 ])) ], []) ]
-        LDo ([ LSet (wReg ra, wa); LSet (wReg rb, wb)
-               LSet (wReg na, LLoad (W, LGet (wReg ra), HDR)); LSet (wReg nb, LLoad (W, LGet (wReg rb), HDR))
-               LSet (wReg i, LConstW 0); LSet (wReg r, LConstW 0)
-               LWhile (cond, body)
-               LIf (LPrim (EqW, [ LGet (wReg r); LConstW 0 ]),
-                    [ LSet (wReg r, LPrim (SubW, [ LPrim (GtSW, [ LGet (wReg na); LGet (wReg nb) ]); LPrim (LtSW, [ LGet (wReg na); LGet (wReg nb) ]) ])) ], []) ],
-             LGet (wReg r))
+    | ShArr _ ->
+        // ARRAYS compare by IDENTITY — a chosen divergence (DIVERGENCES.md):
+        // equal only to themselves, ordered by address. The old element-wise
+        // walk here both violated that and mis-strode packed arrays (a float
+        // array's f64 halves read as 4-byte elements faulted).
+        LPrim (SubW, [ LPrim (GtUW, [ wa; wb ]); LPrim (LtUW, [ wa; wb ]) ])
 
 // Should this `let`-bound var be rooted on the shadow stack for its scope? Only
 // a genuine pointer (RKRef) that is NOT a cell (cells are heap boxes with their
@@ -3630,6 +3614,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EUnknown n when n.StartsWith "$zero" -> lowInt 0
     | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
+        (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
+    // uint64 shares int64's i64 box: `int u` wraps to the low 32 bits
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#v" ->
         (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
     // int64-of-FLOAT truncates the double; int64-of-int64 is the identity;
     // anything else sign-extends the i32 word (the old single form widened a
@@ -5957,6 +5944,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         if st.TidNext > 0 then
             ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
             gg rf "$roots"; ic rf (4 * st.CmpTblSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+            // tid -> its shape key, for naming a SCALAR ARRAY's element kind
+            let keyOfTid = dictNew<int, string> ()
+            for k2, t2 in dictPairs st.Tids do dictSet keyOfTid t2 k2
             for tid, size, kind, start in vecToList st.TidRegs do
                 let nwords = size / 4
                 // ref bitmask (bit w set = word w is a pointer), packed above the
@@ -5964,16 +5954,46 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 // scalar anywhere (a tuple's trailing int) is marked raw; every other
                 // kind keeps the old contiguous [start, nwords) ref suffix (a union
                 // tag prefix stays raw). Words past 21 don't fit the mask -> raw.
-                let mask =
-                    if kind = FK_STRUCT then
-                        match dictTryFind st.TidRefoffs tid with
-                        | Some offs -> offs |> List.fold (fun m b -> let w = b / 4 in if w < 22 then m ||| (1 <<< w) else m) 0
-                        | None -> 0
+                //
+                // A PACKED SCALAR ARRAY cannot ride that encoding at all: its
+                // "size" is the ELEMENT width and its length is per-object.
+                // Sentinel: nwords = 0x3FF (no real object has 1022 fields) with
+                // the element-compare CODE above it — $cmpv's scalar-array
+                // branch reads len from the object and compares elements at the
+                // right width/signedness (a float array's f64 payload words
+                // walked as refs faulted at the double's bit pattern).
+                let scalarCode =
+                    if kind <> FK_SCALAR_ARRAY then 0
                     else
-                        let mutable m = 0
-                        for w in (max 1 start) .. (min (nwords - 1) 21) do m <- m ||| (1 <<< w)
-                        m
-                let info = (mask <<< 10) ||| (nwords &&& 0x3FF)
+                        match dictTryFind keyOfTid tid with
+                        | Some k2 ->
+                            let en = if k2.StartsWith "sa:" then k2.Substring 3 elif k2.StartsWith "pa:" then k2.Substring 3 else k2
+                            (match en with
+                             | "float" | "double" -> 1
+                             | "int64" -> 2
+                             | "uint64" -> 3
+                             | "int" | "int32" | "nativeint" | "bool" -> 4
+                             | "uint32" | "unativeint" -> 5
+                             | "int16" -> 6
+                             | "uint16" | "str" | "char" -> 7
+                             | "byte" -> 8
+                             | "sbyte" -> 9
+                             | "float32" | "single" -> 10
+                             | _ -> 0)
+                        | None -> 0
+                let info =
+                    if scalarCode <> 0 then (scalarCode <<< 10) ||| 0x3FF
+                    else
+                        let mask =
+                            if kind = FK_STRUCT then
+                                match dictTryFind st.TidRefoffs tid with
+                                | Some offs -> offs |> List.fold (fun m b -> let w = b / 4 in if w < 22 then m ||| (1 <<< w) else m) 0
+                                | None -> 0
+                            else
+                                let mutable m = 0
+                                for w in (max 1 start) .. (min (nwords - 1) 21) do m <- m ||| (1 <<< w)
+                                m
+                        (mask <<< 10) ||| (nwords &&& 0x3FF)
                 lg rf "$t"; ic rf (8 + 4 * tid); ins rf "i32.add"; ic rf info; mem rf "i32.store"
         // scratch buffer (iovec + PRINTBUF + FMTBUF) -> root slot 0; $sbuf points
         // past its [tag][len] header so the fixed offsets apply unchanged. Kept

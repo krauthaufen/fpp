@@ -27,10 +27,17 @@ test "coic23g" ([ 1.0 .. 3.0 ] = [ 1.0; 2.0; 3.0 ])
 test "coic23g2" ([ 1.0 .. 2.5 ] = [ 1.0; 2.0 ])
 test "coic23g3" ([ 3.0 .. 1.0 ] = [])
 
-// the same ranges as ARRAYS
-test "coar1" ([| 1 .. 3 |] = [| 1; 2; 3 |])
-test "coar2" ([| 1 .. 0 |] = [||])
-test "coar3" ([| 'a' .. 'c' |] = [| 'a'; 'b'; 'c' |])
+// the same ranges as ARRAYS — content-checked element-wise: array `=` is
+// REFERENCE equality in F++ (chosen divergence, DIVERGENCES.md)
+let aeq (a : 'a[]) (b : 'a[]) : bool =
+    a.Length = b.Length
+    && (let mutable ok = true
+        for i in 0 .. a.Length - 1 do
+            if a.[i] <> b.[i] then ok <- false
+        ok)
+test "coar1" (aeq [| 1 .. 3 |] [| 1; 2; 3 |])
+test "coar2" (aeq [| 1 .. 0 |] [||])
+test "coar3" (aeq [| 'a' .. 'c' |] [| 'a'; 'b'; 'c' |])
 // element-wise, not `=`: packed float/int64 ARRAY equality is a known
 // wasm-linear $cmpv gap (no scalar-array branch; the compound walk reads
 // f64 payload words as refs) — pre-existing, recorded in the status doc
