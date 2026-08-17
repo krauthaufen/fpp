@@ -783,7 +783,9 @@ them surfaced and fixed a chain of real compiler gaps:
   with `fpp: no vtable entry (tid 0 slot 742)` (wasm-linear leg untested
   past it). The wasm-GC leg (unit suite "adaptive suite" test) is green,
   so the break is cback-specific and predates this round: HEAD (0c82084)
-  fails identically with an unmodified compiler. A git bisect against
-  c897f15 (last recorded full-battery green, 2026-08-09) is running; the
-  fast repro is gcc -O0 over the generated suite.c (~5 min instead of the
-  gate's ~9).
+  fails identically with an unmodified compiler. BISECTED to f1e3680
+  ("a class member called at a concrete non-uniform instantiation stamps
+  — the canonical template paired obj enumerators with packed fields",
+  2026-08-09, a 26-line Link.fs change): the stamped class member
+  evidently loses its vtable wiring on the C backend. Fast repro: gcc -O0
+  over the generated suite.c (~5 min instead of the gate's ~9).
