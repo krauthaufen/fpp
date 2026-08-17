@@ -46,6 +46,10 @@ type InstMember =
       MOffset : int
       MName : string
       MTakesUnit : bool
+      /// The body is a `static member (+) (a, b)` on a type — one TUPLE
+      /// parameter, where an instance member written in class syntax is
+      /// curried. A call site must build the tuple.
+      MTupled : bool
       /// The selected instance's OWN type arguments at this use site, named
       /// the way an instantiation is named everywhere else. Empty when the
       /// instance is not generic.
@@ -212,6 +216,7 @@ let wrapperMember (i : InstanceDef) (index : int) (memberName : string) : InstMe
       MOffset = 2000000 + i.Offset * 8 + index
       MName = memberName
       MTakesUnit = false
+      MTupled = false
       MInst = [] }
 
 // ---- matching -------------------------------------------------------------

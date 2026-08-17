@@ -295,7 +295,7 @@ let stampRecords (decls : Decl list) : Decl list =
 /// never reads it, so its Core/output is unchanged.
 let stampedClassWits = dictNew<string * int, (int * string) list> ()
 
-let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool>)
+let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (instanceFns : Dict<string, VarId * bool * bool>)
                      (decls : Decl list) : Decl list * string list =
     let errors = vecNew<string> ()
     let bodies = dictNew<string * int, bool * VarId * Scheme * Expr> ()
@@ -697,9 +697,22 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                           let mem = Classes.operatorMemberName baseOp
                           let key2 = instanceKey cls mem [ tn; tn ]
                           let key1 = instanceKey cls mem [ tn ]
-                          let asCall (fnp : VarId * bool) =
-                              let fn, _ = fnp
-                              let call = EApp (EVar (fn, mono (TCon ("?", []))), xs)
+                          let asCall (fnp : VarId * bool * bool) =
+                              let fn, _, tupled = fnp
+                              // a `static member (+)` body takes ONE tuple
+                              let callArgs = if tupled then [ ETuple xs ] else xs
+                              // a member on a GENERIC head is a template —
+                              // stamp it at the head's own arguments, the
+                              // way the $class path below does
+                              let _, hdArgs = splitInstName tn
+                              let sch0 = mono (TCon ("?", []))
+                              let ref0 = EVar (fn, sch0)
+                              let ref1 =
+                                  if (dictTryFind layoutDependent (fn.Path, fn.Offset)) = Some true
+                                     && not (List.isEmpty hdArgs)
+                                  then stampRef fn sch0 hdArgs ref0
+                                  else ref0
+                              let call = EApp (ref1, callArgs)
                               // ordering has one operation; the predicates
                               // test its result
                               if cls = "Ordered" then EPrim (baseOp, [ call; ELit (LInt "0") ]) else call
@@ -710,9 +723,15 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                           // for it the primitive stands, and a type the
                           // backend cannot spell is reported at emission
                           // rather than looping forever at runtime.
-                          let notSelf (fnp : VarId * bool) =
-                              let fn, _ = fnp
+                          let notSelf (fnp : VarId * bool * bool) =
+                              let fn, _, _ = fnp
                               (fn.Path, fn.Offset) <> ownerKey
+                          // an instantiated head (`GV$<float>`) registers
+                          // under its CONSTRUCTOR, exactly as in the $class
+                          // resolver below — fall back to the stripped name
+                          let hd0, _ = splitInstName tn
+                          let keyh2 = instanceKey cls mem [ hd0; hd0 ]
+                          let keyh1 = instanceKey cls mem [ hd0 ]
                           (match dictTryFind instanceFns key2 with
                            | Some fn when notSelf fn -> asCall fn
                            | Some _ -> EPrim (resolved, xs)
@@ -720,7 +739,17 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                match dictTryFind instanceFns key1 with
                                | Some fn when notSelf fn -> asCall fn
                                | Some _ -> EPrim (resolved, xs)
-                               | None -> EPrim (resolved, xs))
+                               | None ->
+                                   if hd0 = tn then EPrim (resolved, xs)
+                                   else
+                                       match dictTryFind instanceFns keyh2 with
+                                       | Some fn when notSelf fn -> asCall fn
+                                       | Some _ -> EPrim (resolved, xs)
+                                       | None ->
+                                           match dictTryFind instanceFns keyh1 with
+                                           | Some fn when notSelf fn -> asCall fn
+                                           | Some _ -> EPrim (resolved, xs)
+                                           | None -> EPrim (resolved, xs))
                       | None -> EPrim (resolved, xs))
                  | None -> EPrim (op, xs))
             | EUnknown n when n.StartsWith "$zero:" ->
@@ -777,7 +806,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                      // most-specific rule the checker used.
                      let byPattern () =
                          let prefix = cls + "|" + memberName + "|"
-                         let hits = vecNew<int * (VarId * bool)> ()
+                         let hits = vecNew<int * (VarId * bool * bool)> ()
                          for key, value in dictPairs instanceFns do
                              if key.StartsWith prefix then
                                  let heads = key.Substring(strLen prefix).Split '@' |> Array.toList
@@ -801,7 +830,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                              | Some _ -> byTwo
                              | None -> (match byHead with Some _ -> byHead | None -> byPattern ())
                      (match chosen with
-                      | Some (fn, takesUnit) ->
+                      | Some (fn, takesUnit, _) ->
                           // "@k" placeholders expand to the chosen head's
                           // own arguments (empty for a ground head like
                           // `list`), yielding the member fn's instantiation
@@ -1645,8 +1674,8 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
 /// instance wrote, plus the wrappers generated for the primitive ones. This
 /// is what a use site resolves against once monomorphization has made the
 /// type concrete.
-let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
-    let table = dictNew<string, VarId * bool> ()
+let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool * bool> =
+    let table = dictNew<string, VarId * bool * bool> ()
     for cls, insts in dictPairs classes.Instances do
         match dictTryFind classes.Classes cls with
         | None -> ()
@@ -1658,12 +1687,12 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
                     match i.Members |> List.tryPick (fun (mn, im) -> if mn = m then Some im else None) with
                     | Some im ->
                         dictSet table key
-                            ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit)
+                            ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit, im.MTupled)
                     | None ->
                         if i.Builtin then
                             let im = Classes.wrapperMember i index m
                             dictSet table key
-                                ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit)
+                                ({ Path = im.MPath; Offset = im.MOffset; Name = im.MName }, im.MTakesUnit, im.MTupled)
     // A GENERIC instance head registers under its mangled name — `list$<#28>`,
     // `Map$<#31.#32>` — because that is what the head type prints as. A
     // constraint discharged inside a generic function knows only the head
@@ -1675,7 +1704,7 @@ let instanceFunctions (classes : Classes.Tables) : Dict<string, VarId * bool> =
         let i = n.IndexOf "$<"
         if i <= 0 then n else n.Substring (0, i)
     let altCount = dictNew<string, int> ()
-    let altValue = dictNew<string, VarId * bool> ()
+    let altValue = dictNew<string, VarId * bool * bool> ()
     for key, value in dictPairs table do
         let parts = key.Split '|'
         if parts.Length = 3 then

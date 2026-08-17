@@ -137,6 +137,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// (loop offset, collection-token offset, collection type, binder type)
     let lateLoopSources = vecNew<int * int * Type * Type> ()
     let instRaw = vecNew<int * Type list> ()
+    // types whose constructors are EXPLICIT (`val` fields + `new(...)`):
+    // the one ctor family whose overload calls must carry a specialization
+    // demand (the generic ctor body's element representation otherwise
+    // disagrees with concrete readers). Kept THIS narrow on purpose:
+    // demanding every overloaded ctor call re-poisoned StructTuple stamps
+    // into unbounded instantiation growth (the old `&& false`).
+    let explicitCtorTypes = dictNew<string, bool> ()
     // index expressions whose RECEIVER is an array: `a.[i] <- v` may tie the
     // value to the element type, which a member setter's shape may not
     let arrIndexTargets = dictNew<int, bool> ()
@@ -1783,7 +1790,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               Head = [ TCon (tn, headArgs) ]
                               Assoc = []
                               Context = ctx
-                              Members = [ "arbitrary", { MPath = path; MOffset = off; MName = name2; MTakesUnit = false; MInst = [] } ]
+                              Members = [ "arbitrary", { MPath = path; MOffset = off; MName = name2; MTakesUnit = false; MTupled = false; MInst = [] } ]
                               Builtin = false; Path = path; Offset = off }
                         true
 
@@ -3397,7 +3404,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // template the stamper drops, leaving the
                                    // call to name nothing
                                    (match prune res with
-                                    | TCon (_, ras) when not (List.isEmpty ras) && false ->
+                                    | TCon (_, ras) when
+                                        not (List.isEmpty ras)
+                                        && (dictTryFind explicitCtorTypes ht.Text).IsSome ->
                                         vecAdd instRaw (ht.Offset, ras)
                                     | _ -> ())
                                    // widen per argument, not on the tuple
@@ -4024,7 +4033,46 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
                               unifyArg op.Offset lt rt
                           tUnit
-                      | _ -> st.Fresh ())
+                      | _ ->
+                          // `a >>>> b` where `>>>>` is a STATIC MEMBER of an
+                          // operand's type — F#'s custom operator members.
+                          // Neither a binding nor a class-owned symbol, so
+                          // find `(op)` on the left operand's head type (then
+                          // the right's) and type the use as a call to it;
+                          // the owner rides memberSites for lowering.
+                          let mname = "(" + op.Text + ")"
+                          let ownerOf (t : Type) : string option =
+                              match prune t with
+                              | TCon (tn, _) when (dictTryFind fields (tn + "." + mname)).IsSome -> Some tn
+                              | _ -> None
+                          (match (match ownerOf lt with Some o -> Some o | None -> ownerOf rt) with
+                           | Some tn ->
+                               let fi = (dictTryFind fields (tn + "." + mname)).Value
+                               let subst = dictNew<int, Type> ()
+                               for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                               for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
+                               for fv in freeVars fi.FieldType do
+                                   if (dictTryFind subst (prunedId fv)).IsNone then
+                                       dictSet subst (prunedId fv) (st.Fresh ())
+                               let res = st.Fresh ()
+                               (match prune (substVars subst fi.FieldType) with
+                                | TFun (d, r) ->
+                                    (match prune d, prune r with
+                                     | TTuple [ a; b ], _ ->
+                                         unifyArg op.Offset a lt
+                                         unifyArg op.Offset b rt
+                                         unifyAt op.Offset res r
+                                     | a, TFun (b, r2) ->
+                                         unifyArg op.Offset a lt
+                                         unifyArg op.Offset b rt
+                                         unifyAt op.Offset res r2
+                                     | a, r2 ->
+                                         unifyArg op.Offset a lt
+                                         unifyAt op.Offset res r2)
+                                | _ -> ())
+                               vecAdd memberSitesRaw (op.Offset, tn)
+                               res
+                           | None -> st.Fresh ()))
                  | _ ->
                      for m in nodesOf n do exprType (GNode m) |> ignore
                      st.Fresh ())
@@ -6008,6 +6056,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some off ->
                      setScheme off csch
                      dictSet ctors name (prior @ [ off, csch ])
+                     dictSet explicitCtorTypes name true
                  | None -> ())
             | MemberDecl ->
                 let wasMember = inMemberBody
@@ -6069,6 +6118,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // receiver and the argument, which is exactly `compare`'s shape, so
         // the instance points straight at it and no code is synthesized.
         deriveOrdered name
+        deriveOperators name
 
     and deriveOrdered (tn : string) : unit =
         match dictTryFind fields (tn + ".CompareTo") with
@@ -6103,11 +6153,98 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // — `a < b` becomes `compare a b < 0` only for a
                           // member called `compare`
                           { MPath = path; MOffset = off; MName = "compare"
-                            MTakesUnit = false; MInst = [] } ]
+                            MTakesUnit = false; MTupled = false; MInst = [] } ]
                       Builtin = false
                       Path = path
                       Offset = off }
         | _ -> ()
+
+    /// `static member (+)` on a type is sugar for a free-standing instance
+    /// (DESIGN.md): the member IS the instance body, nothing is synthesized
+    /// — the same move deriveOrdered makes for CompareTo. The operand types
+    /// are read off the member's inferred signature, so the heterogeneous
+    /// spelling (`static member (+) (x : C, y : float)`) registers the head
+    /// it wrote. F# op members are tupled where a class-syntax instance
+    /// member is curried; MTupled tells the call sites to build the tuple.
+    and deriveOperators (tn : string) : unit =
+        for sym in [ "+"; "-"; "*"; "/"; "%"; "~-" ] do
+            let cls = (Classes.operatorClass sym).Value
+            let mname = Classes.operatorMemberName sym
+            match dictTryFind classes.Classes cls with
+            | None -> ()
+            | Some cd ->
+                for _, fi in fieldCandidates (tn + "." + mname) do
+                    if fi.DefKey.IsSome && fi.IsStatic then
+                        let unary = sym = "~-"
+                        let shape =
+                            match prune fi.FieldType with
+                            | TFun (d, r) when unary -> Some ([ d ], r, false)
+                            | TFun (d, r) ->
+                                (match prune d, prune r with
+                                 | TTuple [ a; b ], _ -> Some ([ a; b ], r, true)
+                                 | a, TFun (b, r2) -> Some ([ a; b ], r2, false)
+                                 | _ -> None)
+                            | _ -> None
+                        match shape with
+                        | Some (args, res, tupled) when
+                            // an operand must be structure, and one of them
+                            // this type — a bare variable head would shadow
+                            // every instance of the class
+                            args |> List.forall (fun a ->
+                                match prune a with TVar _ -> false | _ -> true)
+                            && args |> List.exists (fun a ->
+                                match prune a with
+                                | TCon (n2, _) -> n2 = tn
+                                | _ -> false) ->
+                            let already =
+                                Classes.instancesOf classes cls
+                                |> List.exists (fun i ->
+                                    i.Head.Length = args.Length
+                                    && List.forall2 (fun h a -> typeString h = typeString a) i.Head args)
+                            if not already then
+                                // the instance must NOT hold the member's
+                                // live inference variables: later unification
+                                // prunes those away and selection's
+                                // substitution misses, so the instantiation
+                                // came out empty. Clone with fresh
+                                // declaration-level variables, exactly what
+                                // inferInstanceDecl's own head has.
+                                let cloned = dictNew<int, Type> ()
+                                let rec cp (t : Type) : Type =
+                                    match prune t with
+                                    | TVar v ->
+                                        (match dictTryFind cloned v.Id with
+                                         | Some nv -> nv
+                                         | None ->
+                                             let nv = st.Fresh ()
+                                             (match nv with TVar vv -> vv.Level <- 0 | _ -> ())
+                                             dictSet cloned v.Id nv
+                                             nv)
+                                    | TCon (n2, xs) -> TCon (n2, List.map cp xs)
+                                    | TFun (a2, b2) -> TFun (cp a2, cp b2)
+                                    | TTuple xs -> TTuple (List.map cp xs)
+                                    | TApp (h2, xs) -> TApp (cp h2, List.map cp xs)
+                                    | other -> other
+                                let args = List.map cp args
+                                let res = cp res
+                                let ps =
+                                    args @ [ res ] |> List.collect freeVars
+                                    |> List.distinctBy (fun v -> v.Id)
+                                let path2, off = fi.DefKey.Value
+                                Classes.addInstance classes
+                                    { Class = cls
+                                      Params = ps
+                                      Head = args
+                                      Assoc = (if List.isEmpty cd.Assoc then [] else [ "Result", res ])
+                                      Context = fi.Constraints
+                                      Members =
+                                        [ mname,
+                                          { MPath = path2; MOffset = off; MName = mname
+                                            MTakesUnit = false; MTupled = tupled; MInst = [] } ]
+                                      Builtin = false
+                                      Path = path2
+                                      Offset = off }
+                        | _ -> ()
 
     and inferMember (tyName : string) (tyVars : Dict<string, Type>) (classParams : Var list) (selfTy : Type) (ifacePin : Type option) (n : GreenNode) : unit =
         // member scope: the class type variables plus the member's own
@@ -6701,7 +6838,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                             dictSet instMemberDefs (path, t.Offset) true
                             t.Text,
                             { Classes.MPath = path; MOffset = t.Offset
-                              MName = t.Text; MTakesUnit = takesUnit; MInst = [] }))
+                              MName = t.Text; MTakesUnit = takesUnit; MTupled = false; MInst = [] }))
                   Builtin = builtin; Path = path; Offset = offset }
             // a WRITTEN Arb instance beats a derived one even when it is
             // written LATER: eager derivation ran at the end of an earlier
@@ -7457,6 +7594,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         |> List.map (fun (off, ty) ->
             off,
             match prune ty with
+            // an APPLIED head keeps its arguments (`GV$<#39>`): the operand
+            // type of a class operator on a generic type carries the
+            // element, and stamping substitutes the `#id` per copy — a bare
+            // head resolved every specialized caller to ONE shared body
+            | TCon (n, targs) when not (List.isEmpty targs) ->
+                (match Types.instConName (prune ty) with
+                 | "" -> n
+                 | inm -> inm)
             | TCon (n, _) -> n
             // a variable of the enclosing binding: named so that stamping
             // substitutes the caller's argument and the operator resolves

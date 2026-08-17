@@ -720,3 +720,70 @@ Porting the `ranges` suite (16th) against real F# flushed three more:
   session: these members stamp through the member-constraint machinery,
   NOT Link.classify — adding uint32 to classify's scalar list changed
   nothing. FPP_LINWARN=1 surfaces the silent stub inits.
+
+## 21. Operator members, `lazy`, `:=` through fields; ops/lazy/ctree suites
+
+Three more fsc suites ported (18 green): `ops` (members/ops — operator
+members, overloading, the generic-vector dictionary pattern), `lazy`, and
+`ctree` (explicit-field generic classes with several constructors). Porting
+them surfaced and fixed a chain of real compiler gaps:
+
+- **`static member (+)` is now the designed sugar** (DESIGN.md): it
+  registers a free-standing instance of the operator's class whose body IS
+  the member — `deriveOperators`, the same move `deriveOrdered` makes for
+  CompareTo. Heterogeneous spellings register the head they wrote
+  (`(x : C, y : float)` → `Add<C, float>`). The head/result types are
+  CLONED with fresh declaration-level variables — holding the member's
+  live inference vars broke selection later (pruning moved them, the
+  substitution missed, the instantiation came out empty).
+- **F# op members are tupled where class-syntax instance members curry** —
+  `InstMember.MTupled` carries that to every call site (Lower's operator
+  arm, Link's stamped-op `asCall`), which builds the tuple.
+- **Custom operator members (`>>>>`) resolve now.** They are neither
+  bindings nor class symbols; inference finds `(op)` on an operand's head
+  type, types the use as that member call, and parks the owner in
+  memberSites for lowering. Before, the use typed FRESH and lowered to a
+  stubbed prim that recursed at runtime.
+- **Generic heads keep their arguments in op suffixes**: `+@GV$<#39>`
+  instead of `+@GV`, so stamping substitutes the element per copy and the
+  stamped operator resolves the STAMPED member (Link falls back to the
+  stripped constructor key exactly like the $class resolver; asCall
+  stampRefs a layout-dependent member at the head's own arguments).
+- **Overloaded ctor calls kept losing their instantiation**: the
+  ctor-overload arm in Infer had its specialization demand DISABLED
+  (`&& false`) and Lower's overloaded arm emitted a bare EVar. Enabled and
+  EVarI'd — `new ctree<int>(42)` now stamps the ctor, so a Some payload
+  stored by the shared generic body no longer disagrees with the concrete
+  reader (ct2/ct7 were exactly this).
+- **`lazy e` is `Lazy (fun () -> e)`**, rewritten POST-parse in Desugar
+  (Workspace.ParseRaw applies it) — the parse stays lossless for the
+  round-trip tests; a first in-parser attempt failed exactly that gate.
+  Memoization, IsValueCreated, nesting all behave.
+- **`x.field := v` silently VANISHED** — the general `<-`/`:=` arm treated
+  the ref-cell store as a field assignment (or a $cellset of the field),
+  so the write replaced the FIELD instead of going through the cell. `:=`
+  now always stores into the cell the target evaluates to. This affected
+  EVERY ref held in a record/class field.
+- **`type R = { ... } with member ...`** (same-line or standalone `with`,
+  optional `end`) now parses — the record-with-members spelling fsc tests
+  use everywhere.
+- KNOWN ISSUE (pre-existing): type EXTENSIONS on a GENERIC type
+  miscompile — a named static member traps with runtime recursion, an
+  operator member dies at "cannot specialize" (the ops suite declares the
+  augmentation's member with the type instead, see its comment).
+- KNOWN ISSUE (pre-existing): `member val P = init` never runs `init`
+  (reads default 0/null); `with get, set` on it does not parse.
+- KNOWN ISSUE (pre-existing): `%A` printing is a silent stub on wasm-GC —
+  the whole statement's init vanishes (no output, exit 0).
+- Debug lesson: a probe type named `box` collides with the boxing builtin
+  — `new box<int>(42)` lowers to the IDENTITY on its argument and every
+  "field read" then faults. Half this session's ghost bugs were that name.
+- KNOWN ISSUE (pre-existing, found by re-running a long-dormant gate): the
+  adaptive C-BACKEND legs are red — the native/mmc suite aborts at startup
+  with `fpp: no vtable entry (tid 0 slot 742)` (wasm-linear leg untested
+  past it). The wasm-GC leg (unit suite "adaptive suite" test) is green,
+  so the break is cback-specific and predates this round: HEAD (0c82084)
+  fails identically with an unmodified compiler. A git bisect against
+  c897f15 (last recorded full-battery green, 2026-08-09) is running; the
+  fast repro is gcc -O0 over the generated suite.c (~5 min instead of the
+  gate's ~9).

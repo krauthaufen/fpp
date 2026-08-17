@@ -1441,8 +1441,13 @@ let parse (src : string) : ParseResult =
             elif looksLikeInlineUnion () then parseUnionCases acc typeCol
             elif canStartTypeAtom () then vecAdd acc (parseType typeCol)
             else s.Diag "expected a type representation"
-            // members may follow any representation (or be the whole body)
+            // members may follow any representation (or be the whole body),
+            // optionally introduced by `with` (`type R = { ... } with
+            // member ...`) and closed by a matching `end`
+            let hadWith = s.IsKw "with" && (s.SameLine || s.CurCol > typeCol)
+            if hadWith then vecAdd acc (s.Bump ())
             parseTypeBody acc typeCol
+            if hadWith && s.IsKw "end" && s.CurCol > typeCol then s.Bump () |> ignore
         // nested `let`s in the body reset this, but a following `and`
         // continues the TYPE, not those lets
         lastMajor <- "type"

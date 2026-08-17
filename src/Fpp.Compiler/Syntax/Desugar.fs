@@ -861,3 +861,41 @@ let desugarWith (lookup : int -> CeBuilder) (root : GreenNode) : GreenNode =
 /// could not be typed.
 let desugar (root : GreenNode) : GreenNode =
     desugarWithStatements (fun _ -> unknownBuilder "?") (fun _ -> false) root
+
+/// Does the tree contain a `lazy` keyword at all? Cheap gate for the
+/// rewrite below, mirroring hasComp.
+let rec hasLazy (g : Green) : bool =
+    match g with
+    | GToken t -> t.Kind = Keyword && t.Text = "lazy"
+    | GNode n -> List.exists hasLazy n.Children
+
+/// `lazy e` IS `Lazy (fun () -> e)` — rewritten AFTER parsing (the parse
+/// stays lossless) so the prelude ctor resolves, types and lowers exactly
+/// like the call the source could have written. The synthetic offsets sit
+/// INSIDE the 4-char keyword, where no real token can start.
+let rec desugarLazy (n : GreenNode) : GreenNode =
+    let mapped =
+        n.Children |> List.map (fun c ->
+            match c with
+            | GNode m -> GNode (desugarLazy m)
+            | t -> t)
+    let rebuilt =
+        match Green.node n.NodeKind mapped with
+        | GNode m -> m
+        | _ -> n
+    if rebuilt.NodeKind <> PrefixExpr then rebuilt
+    else
+        match rebuilt.Children with
+        | [ GToken kw; (GNode _ as arg) ] when kw.Kind = Keyword && kw.Text = "lazy" ->
+            let tok (k : TokenKind) (txt : string) (off : int) : Green =
+                GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = off }
+            let unitPat =
+                Green.node ParenPat [ tok LParen "(" (kw.Offset + 2); tok RParen ")" (kw.Offset + 3) ]
+            let lam =
+                Green.node LambdaExpr
+                    [ tok Keyword "fun" (kw.Offset + 1); unitPat
+                      tok Operator "->" (kw.Offset + 3); arg ]
+            match Green.node AppExpr [ Green.node IdentExpr [ tok Ident "Lazy" kw.Offset ]; lam ] with
+            | GNode m -> m
+            | _ -> rebuilt
+        | _ -> rebuilt

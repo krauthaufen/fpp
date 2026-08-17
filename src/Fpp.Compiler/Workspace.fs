@@ -369,7 +369,12 @@ type Workspace() =
     /// The parse EXACTLY as written — the tree the round-trip gate and the
     /// editor's view of the text are about.
     member this.ParseRaw (path : string) : Parser.ParseResult =
-        db.MemoT "parse" path (fun () -> Parser.parse (this.FileText path))
+        db.MemoT "parse" path (fun () ->
+            let p = Parser.parse (this.FileText path)
+            // `lazy e` -> `Lazy (fun () -> e)`, here so EVERY consumer of a
+            // parse sees the rewritten form (the raw parse stays lossless
+            // for the round-trip tests, which call the parser directly)
+            if Desugar.hasLazy (GNode p.Root) then { p with Root = Desugar.desugarLazy p.Root } else p)
 
     /// The tree everything semantic runs on: computation expressions are
     /// rewritten into ordinary syntax first, so resolution, inference and

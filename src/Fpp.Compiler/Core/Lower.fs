@@ -1425,7 +1425,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              match tokensOf head |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
                              | Some ht ->
                                  (match dictTryFind ctorSites ht.Offset with
-                                  | Some coff -> dictTryFind defsAt coff
+                                  | Some coff ->
+                                      (match dictTryFind defsAt coff with
+                                       | Some d -> Some (ht, d)
+                                       | None -> None)
                                   | None -> None)
                              | None -> None
                      // a BUILTIN member on `string`: no definition to call,
@@ -1455,7 +1458,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          EApp (EUnknown prim, recv :: flat)
                      | None ->
                      match overloaded with
-                     | Some cd -> EApp (EVar (varIdOf cd, schemeOf cd), loweredArgs)
+                     | Some (ht, cd) ->
+                         // a GENERIC class' ctor is a template: the demanded
+                         // instantiation rides the head token (a plain EVar
+                         // here called the SHARED body, whose element
+                         // representation disagrees with every concrete use)
+                         (match dictTryFind instSites ht.Offset with
+                          | Some inst when not (List.isEmpty inst) && inst |> List.forall (fun i -> i <> "") ->
+                              EApp (EVarI (varIdOf cd, schemeOf cd, inst), loweredArgs)
+                          | _ -> EApp (EVar (varIdOf cd, schemeOf cd), loweredArgs))
                      | None ->
                      (match f, loweredArgs with
                       // `recv.M args`: the member access already applied the
@@ -1629,14 +1640,33 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | BinaryExpr when
                     (match tokensOf n with
                      | [ op ] ->
-                         (dictTryFind useDefs op.Offset).IsSome
+                         ((dictTryFind useDefs op.Offset).IsSome
+                          || (dictTryFind memberSites op.Offset).IsSome)
                          && (Fpp.Analysis.Classes.operatorClass op.Text).IsNone
                      | _ -> false) ->
                 (match nodesOf n, tokensOf n with
                  | [ l; r ], [ op ] ->
                      (match dictTryFind useDefs op.Offset with
                       | Some d -> EApp (memberFn op d, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
-                      | None -> note (offsetOf n) "operator")
+                      | None ->
+                          // a CUSTOM OPERATOR MEMBER: inference put the
+                          // owning type in memberSites; the member is named
+                          // `(op)` and F#'s spelling takes one TUPLE
+                          let mt = { op with Text = "(" + op.Text + ")" }
+                          (match memberAt mt with
+                           | Some (owner, d) ->
+                               let tupled =
+                                   match dictTryFind fieldsTable (owner + "." + mt.Text) with
+                                   | Some fi ->
+                                       (match prune fi.FieldType with
+                                        | TFun (dm, _) ->
+                                            (match prune dm with TTuple [ _; _ ] -> true | _ -> false)
+                                        | _ -> false)
+                                   | None -> false
+                               let args = [ lowerExpr (GNode l); lowerExpr (GNode r) ]
+                               if tupled then EApp (memberFn mt d, [ ETuple args ])
+                               else EApp (memberFn mt d, args)
+                           | None -> note (offsetOf n) "operator"))
                  | _ -> note (offsetOf n) "operator shape")
             | BinaryExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind), tokensOf n with
@@ -1710,6 +1740,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                EIf (ETypeTest ("ByRefView", cell),
                                     EApp (EField (cell, "Set", "ByRefView"), [ rv ]),
                                     EFieldSet (cell, "Value", "ByRefCell", rv))
+                           // `:=` on anything else — a field, an element, a
+                           // call — is a store INTO the cell the target
+                           // evaluates to, never an assignment of the target
+                           // itself. Falling through wrote the FIELD:
+                           // `x.numCalls := 5` silently replaced the ref.
+                           | None when op.Text = ":=" ->
+                               EFieldSet (lowerExpr (GNode l), "Value", "ByRefCell", lowerExpr (GNode r))
                            | None ->
                           match indexSetter with
                            | Some (fn, recv, i) -> EApp (fn, [ recv; i; lowerExpr (GNode r) ])
@@ -1855,7 +1892,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           match dictTryFind classUses op.Offset with
                           | Some im ->
                               let call =
-                                  EApp (classRef im, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
+                                  // a `static member (+)` body takes ONE
+                                  // tuple where class syntax curries
+                                  if im.MTupled then
+                                      EApp (classRef im, [ ETuple [ lowerExpr (GNode l); lowerExpr (GNode r) ] ])
+                                  else
+                                      EApp (classRef im, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
                               // ordering has ONE operation: the predicates are
                               // notation for a test on its result
                               if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
