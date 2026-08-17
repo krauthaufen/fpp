@@ -34,7 +34,12 @@ let adaptiveSuiteTests =
     // the parallel batch starves it — three unrelated tests flaked when
     // this ran alongside them
     testSequenced <| testList "adaptive suite" [
-        if not (System.IO.Directory.Exists adaptiveRoot) then
+        // the parallel gate driver (tests/run-gates.sh --full) runs this
+        // eight-minute compile as its OWN concurrent job and skips it here,
+        // so the rest of the suite finishes in half the wall clock
+        if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GATE_SKIP_ADAPTIVE")) then
+            ptest "the ported library's test suite runs green (SKIPPED: FPP_GATE_SKIP_ADAPTIVE, run separately)" { () }
+        elif not (System.IO.Directory.Exists adaptiveRoot) then
             ptest "the ported library's test suite runs green (SKIPPED: no FSharp.Data.Adaptive checkout)" { () }
         else
             test "the ported library's test suite runs green" {
