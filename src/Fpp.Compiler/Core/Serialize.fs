@@ -366,7 +366,7 @@ let private decDef (x : Sx) : (string * Resolve.Definition) option =
             | "l" -> Resolve.DefLet | "t" -> Resolve.DefType | "c" -> Resolve.DefCase
             | "f" -> Resolve.DefField | "m" -> Resolve.DefModule | _ -> Resolve.DefLet
         let d : Resolve.Definition =
-            { Name = name; Kind = k; Path = path; Offset = int off; Length = int len }
+            { Name = name; Kind = k; Path = path; Offset = int off; Length = int len; Access = 0 }
         Some (full, d)
     | _ -> None
 

@@ -265,7 +265,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  Some (plainOwner,
                        { Resolve.Definition.Name = t.Text
                          Kind = Resolve.DefMember
-                         Path = dp; Offset = doff; Length = strLen t.Text })
+                         Path = dp; Offset = doff; Length = strLen t.Text; Access = 0 })
              | _ ->
                  match dictTryFind memberIndex key with
                  | Some d -> Some (plainOwner, d)
@@ -541,7 +541,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// A range at its ELEMENT: int stays on the inline builder, anything
     /// else calls the prelude's RangeOps.Seq, stamped per element
     let rangeMaterialize (off : int) (elem : string) (lo : Expr) (hi : Expr) : Expr =
-        if elem = "" || elem = "int" then rangeList off lo hi
+        // char is ordinal: the raw-scalar countdown steps it like an int
+        if elem = "" || elem = "int" || elem = "char" then rangeList off lo hi
         else
             match dictTryFind memberIndex "RangeOps.Seq" with
             | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ elem ]), [ ETuple [ lo; hi ] ])
@@ -565,6 +566,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// walking the conses. Plain Core constructs only — every backend
     /// lowers them. Used by array comprehensions and `[| a .. b |]`.
     let listToArrayInline (off : int) (elemName : string) (lst : Expr) : Expr =
+        // A POD element needs its packed layout: the stamped prelude
+        // generic builds it (hand-built IR stored anyref into POD arrays on
+        // the wasm-GC backend). A REFERENCE element ("$ref"/unknown) is a
+        // uniform array on both backends — the hand-built walk is correct
+        // there, and "$ref" is no stampable type name anyway.
+        match (if elemName <> "" && not (elemName.StartsWith "#") && elemName <> "$ref"
+               then dictTryFind memberIndex "ArrayOps.OfList" else None) with
+        | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ elemName ]), [ lst ])
+        | None ->
         let anon = anonScheme
         let ish = mono (TCon ("int", []))
         let lstV = { Path = path; Offset = off + 16000000; Name = "_cl" }
@@ -1663,7 +1673,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                    Some ({ Name = "set_" + t.Text
                                                            Kind = Resolve.DefMember
                                                            Path = dp; Offset = doff
-                                                           Length = strLen t.Text } : Resolve.Definition)
+                                                           Length = strLen t.Text
+                                                           Access = 0 } : Resolve.Definition)
                                                | _ -> dictTryFind memberIndex (owner + ".set_" + t.Text)
                                            (match sd with
                                             | Some sd ->

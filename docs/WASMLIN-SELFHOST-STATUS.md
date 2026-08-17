@@ -569,3 +569,78 @@ compiled cleanly and produced wrong values:
   silently stubbed), `Array.mapi2` raises on length mismatch as F# does.
 
 Suites after this batch: + forexpression, recordres, array — 13 total.
+
+## 18. Given-match by unification; float/char ranges; access modifiers
+
+- **Given-match by unification: built, gated, then DISABLED** (the
+  guarded code stays in Infer behind `elif false`, ready). The journey:
+  equality-only matching let `x - One` default One's type to int behind
+  a `Num<'a>` given, so float stamps unboxed an int One and trapped —
+  matching by unification fixes that. Unrestricted, it also let a fully
+  concrete given (`Ordered<string>`) capture an underdetermined wanted
+  (`Ordered<?v>`) — 14 wrong string-vs-int bindings in the corpus — so
+  it is gated to givens SHARING a variable with the wanted. With the
+  gate it types correctly everywhere, but the changed emission shape
+  surfaces a latent wasm-linear hazard (a ref TEMP across an allocating
+  subexpression is un-rooted — named locals are Slotted, temporaries
+  are not) and the 16 MB self-host traps in ToString→concat→str_cat.
+  Re-enable together with temp rooting. History of the finding:
+  `Num<'a>` entails `Sub<'a,'a> = 'a`; the wanted from `x - One` is
+  `Sub<'a, ?v>`, and the equality-only match let ?v numeric-default to
+  int behind the given's back — the float stamp then unboxed an int One
+  and trapped in $tof. Rigid variables stay rigid in the matching trial,
+  so a given never grounds the binding's own parameter. This also cured
+  the pre-existing wasm-linear range traps (int64/float ranges).
+- **Char ranges** (`[ 'a' .. 'c' ]`) work: char is ordinal and takes
+  the inline raw-scalar builder, no instances needed. **Float ranges
+  stay a compile error** (Integral demand kept): with given-match off,
+  a float One wrongly defaults to int and the stamp traps — refusing
+  the program beats trapping. Flip to Num+Ordered when given-match
+  returns.
+- **Access modifiers are enforced** ("make the compiler understand and
+  respect these"):
+  - `let private` / `type private` (cases included): resolvable inside
+    the declaring module and its nested modules, an access error
+    elsewhere in the file, and never exported across files.
+  - `member private` (static and instance, properties included): visible
+    from source positions inside the declaring type's own declaration
+    spans (extensions add their spans) — judged by USE offset, so
+    deferred retry-loop resolution judges the original site. Definition
+    and FieldInfo both carry an Access field.
+  - `internal`: assembly-wide today, recorded so the package boundary
+    can exclude it later. `public` is the default, accepted everywhere.
+  - New diagnostic: a dotted use whose PREFIX names a module but whose
+    full path resolves to nothing is "module X does not export 'y'" —
+    before, the use silently lowered to ZERO (this is also how a
+    cross-file use of a private binding used to vanish).
+    Two exemptions, learned the hard way: emission-owned names
+    (doubleBits & co — the backend resolves them by NAME under the
+    self-host, where bootstrap.fpp never declares them), and PRELUDE
+    modules entirely (Array.empty, String.Format — lowering owns extras
+    the prelude source never declares). User modules stay strict.
+  - `type EmptySet<'T> private() = ...` marks the CONSTRUCTOR private,
+    not the type — the type-level access scan is positional (before the
+    name only); the adaptive port's three private-ctor singletons caught
+    the conflation.
+  - access.fpp ported (14th suite); negative tests in WorkspaceTests.
+- A stub whose first error is a SYMBOLIC class marker ("$class:...#N")
+  is an unstamped template, not a porting gap — the warning is now
+  quiet on both backends (the trap on reaching it stays loud). Before
+  the given-match fix these templates emitted a wrongly-defaulted int
+  One instead of stubbing, which is why they never warned.
+- KNOWN ISSUE (latent): the wasm-hosted compiler TRAPS in $str_cat while
+  printing a WARN line (seen when the self-host briefly emitted two stub
+  warnings; masked again now that they are quiet). The warn-printing
+  path on wasm-linear needs a look before warnings become routine there.
+- The list->array conversion now routes through a stamped prelude
+  generic (`ArrayOps.OfList`) for POD elements — the hand-built IR
+  stored anyref into POD arrays and failed wasm-GC VALIDATION
+  (`[| a .. b |]` never worked on the wasm-GC backend; only the
+  wasm-linear path was gated). Reference elements keep the inline walk.
+- KNOWN ISSUE (pre-existing at 34d022a): NESTED array comprehensions
+  (`[| for i in … -> [| … |] |]`) trap at runtime on the wasm-GC
+  backend (the inline ref-element conversion). wasm-linear is correct
+  and conformance-gated; the wasm-GC side needs its own gate.
+- Known issue found while testing (pre-existing, unchanged): a
+  member-only `type C = member ...` with no constructor accepts `C ()`
+  and stubs; write `type C() = ...`.

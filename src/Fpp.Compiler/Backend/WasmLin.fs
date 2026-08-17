@@ -5082,7 +5082,11 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         // a gap in this body: emit an unreachable STUB (mirrors the wasm-GC
         // driver's per-function probe). The gap becomes a warning; the function
         // traps if ever reached. Dead prelude/backend members survive DCE.
-        vecAdd st.Warnings ("stubbed " + dbgName + " (" + vecGet sink 0 + ")")
+        // A SYMBOLIC class marker ("#N") sits only in an unstamped TEMPLATE
+        // whose stamps carry the real instantiation — expected, kept quiet.
+        let e0 = vecGet sink 0
+        if not (e0.Contains "$class:" && e0.Contains "#") then
+            vecAdd st.Warnings ("stubbed " + dbgName + " (" + e0 + ")")
         localsDone f
         // a stubbed INIT (a .NET-only top-level `let`, e.g. an Encoding object)
         // must NOT trap: _start runs every init at startup, so store a harmless

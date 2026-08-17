@@ -67,6 +67,55 @@ let workspaceTests =
                 Expect.equal l.Name "outer" "top-level let"
             | items -> failtestf "unexpected outline: %A" items
         }
+        test "private let is invisible outside its module" {
+            let ws = Workspace()
+            ws.SetFileText "a.fpp"
+                "module M\nmodule A =\n    let private secret = 41\n    let visible = secret + 1\nlet bad = A.secret\n"
+            match ws.Diagnostics "a.fpp" with
+            | [ d ] -> Expect.stringContains d.Message "private to module M.A" "names the module"
+            | ds -> failtestf "expected one diagnostic, got %A" ds
+        }
+        test "private type's constructor is invisible outside its module" {
+            let ws = Workspace()
+            ws.SetFileText "a.fpp"
+                "module M\nmodule A =\n    type private H = | HA of int\n    let mk = HA 1\nlet bad = A.HA 5\n"
+            match ws.Diagnostics "a.fpp" with
+            | [ d ] -> Expect.stringContains d.Message "private to module M.A" "names the module"
+            | ds -> failtestf "expected one diagnostic, got %A" ds
+        }
+        test "private binding never crosses the file boundary" {
+            let ws = Workspace()
+            ws.SetProjectFiles [ "a.fpp"; "b.fpp" ]
+            ws.SetFileText "a.fpp" "module Lib\nlet private secret = 41\nlet internal sharedv = 2\nlet visible = secret + 1\n"
+            ws.SetFileText "b.fpp" "module Use\nlet x = Lib.visible + Lib.sharedv\nlet y = Lib.secret\n"
+            match ws.Diagnostics "b.fpp" with
+            | [ d ] -> Expect.stringContains d.Message "does not export 'secret'" "module has no such export"
+            | ds -> failtestf "expected one diagnostic, got %A" ds
+        }
+        test "private members bind inside the type and refuse outside" {
+            let ws = Workspace()
+            ws.SetFileText "a.fpp"
+                ("module M\ntype C() =\n    static member private SP = 12\n    static member SPub = C.SP + 1\n"
+                 + "    member private x.MP = 5\n    member x.MPub = x.MP + 1\nlet c = C ()\nlet ok = C.SPub + c.MPub\n")
+            Expect.isEmpty (ws.Diagnostics "a.fpp") "inside the type is allowed"
+            ws.SetFileText "a.fpp"
+                ("module M\ntype C() =\n    static member private SP = 12\n    member private x.MP = 5\n"
+                 + "let bads = C.SP\nlet c = C ()\nlet badi = c.MP\n")
+            match ws.Diagnostics "a.fpp" with
+            | [ d1; d2 ] ->
+                Expect.stringContains d1.Message "SP of C is private" "static"
+                Expect.stringContains d2.Message "MP of C is private" "instance"
+            | ds -> failtestf "expected two diagnostics, got %A" ds
+        }
+        test "module-with-no-such-export names the module" {
+            let ws = Workspace()
+            ws.SetProjectFiles [ "a.fpp"; "b.fpp" ]
+            ws.SetFileText "a.fpp" "module Lib\nlet visible = 1\n"
+            ws.SetFileText "b.fpp" "module Use\nlet z = Lib.nonexistent\n"
+            match ws.Diagnostics "b.fpp" with
+            | [ d ] -> Expect.stringContains d.Message "module Lib does not export 'nonexistent'" "message"
+            | ds -> failtestf "expected one diagnostic, got %A" ds
+        }
     ]
 
 [<Tests>]

@@ -106,7 +106,9 @@ type FieldInfo =
       /// then demanded there. Also what ranks an overload set: a candidate
       /// whose context cannot hold is rejected, a strictly stronger
       /// context wins.
-      Constraints : Constraint list }
+      Constraints : Constraint list
+      /// 0 = public, 1 = private (declaring type only), 2 = internal
+      Access : int }
 
 /// `shared` carries generalized schemes of earlier files keyed
 /// "path:offset" (and receives this file's); `aliases` carries type
@@ -477,10 +479,45 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Discharge a wanted against the declared context, if the context
     /// entails it. Returns the associated-type bindings the given fixes.
-    let byGiven (c : Constraint) : (string * Type) list option =
-        givens
+    /// A given matches by UNIFICATION, not equality: `Num<'a>` entails
+    /// `Sub<'a,'a> = 'a`, and the wanted from `x - One` is `Sub<'a, ?v>` —
+    /// the match must tie ?v to 'a, or ?v numeric-defaults to int behind
+    /// the given's back and the float stamp unboxes an int One. Rigid
+    /// variables stay rigid in the trial, so a given never matches by
+    /// GROUNDING the binding's own parameter.
+    let givenMatch (gs : Constraint list) (c : Constraint) : (string * Type) list option =
+        gs
         |> List.collect (Classes.entailed classes)
-        |> List.tryPick (fun g -> if Classes.sameHead g c then Some g.Assoc else None)
+        |> List.tryPick (fun g ->
+            if Classes.sameHead g c then Some g.Assoc
+            // DISABLED pending the wasm-linear temp-rooting fix: with this
+            // on, prelude generics type CORRECTLY (`x - One` keeps 'a, so
+            // float stamps stop unboxing an int One) — but the changed
+            // emission shape surfaces a latent wasm-linear hazard (a ref
+            // TEMP across an allocating subexpression is un-rooted; named
+            // locals are Slotted, temporaries are not) and the 16 MB
+            // self-host traps in ToString->concat->str_cat. Re-enable
+            // together with temp rooting; the guarded shape below is
+            // correct (shared-variable gate, rigid trial).
+            elif false && g.Class = c.Class && g.Args.Length = c.Args.Length
+                 // only when the given and the wanted already SHARE a
+                 // variable: `Sub<'a,'a> = 'a` completing `Sub<'a, ?v>` is
+                 // the given finishing its own entanglement. A fully
+                 // concrete given capturing `Ordered<?v>` would be a pure
+                 // guess — the first matching given won over whatever
+                 // instance selection would have chosen once ?v grounded
+                 // (14 wrong string-vs-int bindings in the self-host).
+                 && (let gvs =
+                         g.Args |> List.collect freeVars
+                         |> List.map (fun v -> v.Id) |> Set.ofList
+                     not (Set.isEmpty gvs)
+                     && (c.Args |> List.collect freeVars
+                         |> List.exists (fun v -> Set.contains v.Id gvs)))
+                 && (Types.unifyTrial true (TTuple g.Args) (TTuple c.Args)).IsNone then
+                List.iter2 (fun ga ca -> unify ga ca |> ignore) g.Args c.Args
+                Some g.Assoc
+            else None)
+    let byGiven (c : Constraint) : (string * Type) list option = givenMatch givens c
     /// computation-expression offset -> the builder expression's type. Only
     /// the PROBE pass fills this: by the time the rewrite has run there is
     /// no CompExpr left to see.
@@ -549,7 +586,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         if (dictTryFind fields "string.Substring").IsNone then
             let m (ty : Type) =
                 { TypeName = "string"; Params = []; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
             let strArr = TCon ("array", [ tString ])
             let charArr = TCon ("array", [ tChar ])
             // the 1-arg form first: ordinal order IS declaration order
@@ -598,7 +635,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "Option"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
             registerField "Option.IsSome" (m tBool)
             registerField "Option.IsNone" (m tBool)
             registerField "Option.Value" (m (TVar elem))
@@ -613,7 +650,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
             let m (ty : Type) =
                 { TypeName = "list"; Params = [ elem ]; Quantified = []
-                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
             registerField "list.IsEmpty" (m tBool)
             registerField "list.Length" (m tInt)
             registerField "list.Head" (m (TVar elem))
@@ -622,6 +659,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// A member's overload set, with the ordinal that reaches each entry
     /// (0 = the plain key).
+    /// source spans of every declaration of a type (the declaration and
+    /// its extensions): what a PRIVATE member's accessibility is judged
+    /// against — by the USE's offset, so deferred (retry-loop) resolution
+    /// judges the original site, not whatever is being inferred later
+    let ownerRanges = dictNew<string, (int * int) list> ()
+    let memberVisible (offset : int) (fi : FieldInfo) : bool =
+        fi.Access <> 1
+        || (match dictTryFind ownerRanges fi.TypeName with
+            | Some rs -> rs |> List.exists (fun (lo, hi) -> offset >= lo && offset <= hi)
+            | None -> false)
+
     let fieldCandidates (key : string) : (int * FieldInfo) list =
         match dictTryFind fields key with
         | None -> []
@@ -710,7 +758,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let rec declaringOwner (tn : string) (args : Type list) : ((int * FieldInfo) list * string * Type list) option =
             if (dictTryFind seenOwners tn).IsSome then None else
             dictSet seenOwners tn true
-            match fieldCandidates (tn + "." + name) with
+            match fieldCandidates (tn + "." + name)
+                  |> List.filter (fun (_, fi) -> memberVisible offset fi) with
             | (_ :: _) as cs -> Some (cs, tn, args)
             | [] ->
                 match dictTryFind bases tn with
@@ -735,7 +784,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match dictTryFind impls tn with
                     | Some ifs ->
                         ifs |> List.tryPick (fun i ->
-                            match fieldCandidates (i + "." + name) with
+                            match fieldCandidates (i + "." + name)
+                                  |> List.filter (fun (_, fi) -> memberVisible offset fi) with
                             | (_ :: _) as cs -> Some (cs, i, [])
                             | [] -> None)
                     | None -> None
@@ -1762,10 +1812,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                    | Some a -> Some a
                    | None ->
                        match dictTryFind seatGivens offset with
-                       | Some gs ->
-                           gs
-                           |> List.collect (Classes.entailed classes)
-                           |> List.tryPick (fun g -> if Classes.sameHead g c then Some g.Assoc else None)
+                       | Some gs -> givenMatch gs c
                        | None -> None) with
             | Some assoc ->
                 progress <- true
@@ -3785,8 +3832,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // where a constraint could never be discharged
                           (match prune elem with
                            | TVar _ -> ()
+                           // a char range is ordinal: the inline builder
+                           // steps it as a raw scalar, no instances needed
+                           | TCon ("char", []) -> ()
                            | _ when (dictTryFind classes.Classes "Integral").IsNone -> ()
                            | _ ->
+                               // Integral, not Num, until the given-match
+                               // fallback can re-enable float stepping: with
+                               // it off, a float One wrongly defaults to int
+                               // and the stamp traps unboxing it — refusing
+                               // the program beats trapping at run time
                                addWanted op.Offset { Class = "Integral"; Args = [ elem ]; Assoc = [] }
                                addWanted op.Offset { Class = "Ordered"; Args = [ elem ]; Assoc = [] }
                                solveWanted ())
@@ -4677,7 +4732,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | None -> None
                 match staticOwner, lastIdent with
                 | Some tn, Some name when (dictTryFind fields (tn + "." + name.Text)).IsSome ->
-                    (match fieldCandidates (tn + "." + name.Text) with
+                    (match fieldCandidates (tn + "." + name.Text)
+                           |> List.filter (fun (_, fi) -> memberVisible name.Offset fi) with
                      | [ (_, fi) ] ->
                          let subst = dictNew<int, Type> ()
                          for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
@@ -4735,7 +4791,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          let recv = TCon (tn, first.Params |> List.map (fun _ -> st.Fresh ()))
                          vecAdd pendingDots (name.Offset, recv, result, name.Text)
                          result
-                     | [] -> st.Fresh ())
+                     | [] ->
+                         // the RAW table has this member (the guard above
+                         // hit), so an empty candidate list means the
+                         // visibility filter removed it
+                         vecAdd diags (name.Offset, "member " + name.Text + " of " + tn + " is private")
+                         st.Fresh ())
                 | _ ->
                 (match qualified with
                  | Some d ->
@@ -5684,6 +5745,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match dictTryFind bases name with
             | Some (_, bt) -> Some bt
             | None -> None
+        // this declaration's source span: uses inside it may reach the
+        // type's private members (extensions included — each `type X with`
+        // block adds its own span)
+        (match Green.tokens (GNode n) with
+         | (first :: _) as ts ->
+             let last = List.last ts
+             let prev = match dictTryFind ownerRanges name with Some l -> l | None -> []
+             dictSet ownerRanges name ((first.Offset, last.Offset + strLen last.Text) :: prev)
+         | [] -> ())
         // Any abstract member declares a dispatch slot — on a pure interface
         // (all members abstract) or on a base class with overridable methods.
         let memberDecls = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
@@ -5797,7 +5867,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              recordDef t ft
                              let info =
                                  { TypeName = name; Params = paramVarList (); Quantified = []
-                                   FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                                   FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
                              // bare name: last declaration wins (F# shadowing);
                              // qualified key: dot-access on a known record type
                              dictSet fields t.Text info
@@ -5910,7 +5980,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      recordDef nameTok ft
                      let info =
                          { TypeName = name; Params = paramVarList (); Quantified = []
-                           FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                           FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
                      dictSet fields nameTok.Text info
                      dictSet fields (name + "." + nameTok.Text) info
                  | _ -> ())
@@ -6132,7 +6202,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                { TypeName = tyName; Params = classParams
                                  Quantified = []
                                  FieldType = setTy
-                                 DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                                 DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
                        | None -> ())
                   | _ -> ())
              | None -> ())
@@ -6157,7 +6227,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            |> List.filter (fun v -> not (Set.contains v.Id classIds))
                        FieldType = propTy
                        DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
-                       IsStatic = false; Optionals = 0; ParamNames = []; Constraints = [] }
+                       IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []
+                       Access = (match dictTryFind defsAt t.Offset with Some d -> d.Access | None -> 0) }
              | None -> ())
         else
 
@@ -6291,7 +6362,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   FieldType = memberTy
                   DefKey = (if (dictTryFind defsAt t.Offset).IsSome then Some (path, t.Offset) else None)
                   IsStatic = isStatic; Optionals = optionalArity n; ParamNames = paramNames n
-                  Constraints = memberCons }
+                  Constraints = memberCons
+                  Access = (match dictTryFind defsAt t.Offset with Some d -> d.Access | None -> 0) }
         | None -> ()
 
     /// An instance member is an ordinary function; the only extra work is
@@ -7162,6 +7234,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   && not (dictPairs fields
                           |> List.exists (fun (k, _) -> k.EndsWith ("." + name))) ->
                 vecAdd diags (offset, tn + " has no member " + name)
+            // the member EXISTS on the receiver's type but is private: the
+            // visibility filter kept it out of every candidate list, and
+            // silence here would leave the access an unbound guess
+            | TCon (tn, _) when
+                  offset < 30000000
+                  && (match dictTryFind fields (tn + "." + name) with
+                      | Some fi -> not (memberVisible offset fi)
+                      | None -> false) ->
+                vecAdd diags (offset, "member " + name + " of " + tn + " is private")
             | _ -> ()
     // a loop whose source's type only settled during the fixpoint: wire the
     // enumerator protocol NOW, at the same synthetic offsets the eager

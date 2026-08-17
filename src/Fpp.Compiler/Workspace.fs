@@ -551,6 +551,10 @@ type Workspace() =
                (this.Resolve path).Missing
                |> List.filter (fun (off, _) -> Set.contains off fresh)
                |> List.map (fun (off, msg) -> at off msg))
+            // access violations always surface: the use RESOLVED, the
+            // definition just forbids it from here
+            @ ((this.Resolve path).AccessErrors
+               |> List.map (fun (off, msg) -> at off msg))
             // by (Line, Col), spelled out: `Ordered` has no instance at a
             // TUPLE type, so a tuple key cannot drive `sortBy` (see PLAN.md)
             |> List.sortWith (fun a b ->

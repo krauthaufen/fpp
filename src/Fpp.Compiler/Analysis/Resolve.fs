@@ -26,7 +26,11 @@ type Definition =
       /// file (workspace path/uri) this definition lives in
       Path : string
       Offset : int
-      Length : int }
+      Length : int
+      /// 0 = public, 1 = private, 2 = internal. Mutable so the declaring
+      /// walk can stamp it after `define` built the record; never
+      /// serialized — a package surface is public by construction.
+      mutable Access : int }
 
 type Resolution =
     { UseOffset : int
@@ -39,6 +43,10 @@ type BindResult =
       /// (use offset, message). Silently inferring fresh for these hid a
       /// missing `open` behind an emission-time "unbound variable".
       Missing : (int * string) list
+      /// access violations: a use of a `private` definition from outside
+      /// its declaring module. Always diagnostics — unlike Missing, these
+      /// uses RESOLVE, so no inference cross-check applies.
+      AccessErrors : (int * string) list
       Resolutions : Resolution list
       /// full dotted path -> definition, for later files to import
       Exports : (string * Definition) list
@@ -75,18 +83,44 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     let mutable modulePath = ""
 
     let define (kind : DefKind) (t : Token) : Definition =
-        let d = { Name = t.Text; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text }
+        let d = { Name = t.Text; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text; Access = 0 }
         vecAdd defs d
         d
 
     /// Define under a name other than the token's text (property accessors:
     /// the `set` token declares a member called `set_Prop`).
     let defineAs (kind : DefKind) (nm : string) (t : Token) : Definition =
-        let d = { Name = nm; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text }
+        let d = { Name = nm; Kind = kind; Path = path; Offset = t.Offset; Length = strLen t.Text; Access = 0 }
         vecAdd defs d
         d
 
+    /// def offset -> the module path that declared it `private`. A use
+    /// whose module path is not that module (or nested inside it) is an
+    /// access error. Same-file only by construction: a private definition
+    /// is never exported, so other files cannot resolve it at all.
+    let privateOf = dictNew<int, string> ()
+    /// def offsets declared `internal`: visible everywhere in this
+    /// compilation (the assembly), excluded from a package's surface
+    let internalOf = dictNew<int, bool> ()
+    let accessErrs = vecNew<int * string> ()
+    let missing = vecNew<int * string> ()
+    /// The access keyword written DIRECTLY on this declaration, if any —
+    /// direct children only, so a member's own modifier never reads as its
+    /// enclosing type's
+    let accessOf (children : Green list) : string option =
+        children |> List.tryPick (fun c ->
+            match c with
+            | GToken t when t.Kind = Keyword && (t.Text = "private" || t.Text = "internal" || t.Text = "public") -> Some t.Text
+            | _ -> None)
+
     let record (t : Token) (d : Definition) : unit =
+        (match dictTryFind privateOf d.Offset with
+         | Some declMod when d.Path = path ->
+             if not (modulePath = declMod || declMod = "" || (modulePath + ".").StartsWith (declMod + ".")) then
+                 vecAdd accessErrs
+                     (t.Offset,
+                      "'" + d.Name + "' is private to module " + (if declMod = "" then "(file top level)" else declMod))
+         | _ -> ())
         vecAdd uses { UseOffset = t.Offset; UseLength = strLen t.Text; Def = d }
 
     let exportUnder (name : string) (d : Definition) : unit =
@@ -101,6 +135,14 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             dictSet ownExports ("type " + full) d
 
     let exportDef (d : Definition) : unit = exportUnder d.Name d
+
+    /// A PRIVATE definition still resolves inside its own file — the access
+    /// check in `record` is what rejects out-of-module uses with a real
+    /// message — but never reaches the exports another file imports.
+    let exportOwnOnly (d : Definition) : unit =
+        let full = if modulePath = "" then d.Name else modulePath + "." + d.Name
+        dictSet ownExports full d
+        if d.Kind = DefType then dictSet ownExports ("type " + full) d
 
     /// Bases to try when qualifying a name. F# shadowing: the LAST `open`
     /// wins among competing candidates, so opens are consulted in reverse
@@ -275,7 +317,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                                 (match tok with
                                  | Some t ->
                                      Some (t.Text, { Name = t.Text; Kind = defKind; Path = path
-                                                     Offset = t.Offset; Length = strLen t.Text })
+                                                     Offset = t.Offset; Length = strLen t.Text; Access = 0 })
                                  | None -> None)
                             | GToken _ -> None)
                     dictSet m i binds
@@ -665,6 +707,47 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      (match dictTryFind typeCases (ty.Text + "." + last.Text) with
                       | Some cd -> record last cd
                       | None -> ())
+                 | Some spine when
+                        List.length spine >= 2
+                        && (let prefix =
+                                spine |> List.take (List.length spine - 1)
+                                |> List.map (fun t -> t.Text) |> String.concat "."
+                            (Map.tryFind (List.head spine).Text env).IsNone
+                            && (match findQualified prefix with
+                                | Some d -> d.Kind = DefModule
+                                | None -> false)) ->
+                     // the PREFIX names a module, and no arm above found the
+                     // full path a meaning: the module has no such export.
+                     // Without this the use silently lowered to zero — a
+                     // wrong VALUE, not even a stub — which is also how a
+                     // cross-file use of a `private` binding disappeared.
+                     let last = List.last spine
+                     let prefix =
+                         spine |> List.take (List.length spine - 1)
+                         |> List.map (fun t -> t.Text) |> String.concat "."
+                     // EMISSION-OWNED names are exempt: the backend
+                     // resolves `Fpp.Prelude.doubleBits` by NAME under the
+                     // self-host, where the module never declares it. The
+                     // list mirrors CEmit's builtinNames (plus its `mem`
+                     // prefix rule); everything else is a real error —
+                     // before this diagnostic the use silently lowered to
+                     // ZERO, which is also how a cross-file use of a
+                     // `private` binding disappeared.
+                     let emissionOwned =
+                         List.contains last.Text
+                             [ "box"; "unbox"; "float16Bits"; "doubleBits"
+                               "singleBits"; "stackDepth"; "stackFrame" ]
+                         || last.Text.StartsWith "mem"
+                     // a PRELUDE module also carries names the LOWERING owns
+                     // (Array.empty, String.Format, ...) that its source
+                     // never declares — only USER modules are judged
+                     let preludeModule =
+                         match findQualified prefix with
+                         | Some d -> d.Path = "(builtin)"
+                         | None -> false
+                     if not emissionOwned && not preludeModule then
+                         vecAdd accessErrs
+                             (last.Offset, "module " + prefix + " does not export '" + last.Text + "'")
                  | _ ->
                      // member access on a value: resolve the lhs, and walk
                      // any index expression (a.[i])
@@ -829,10 +912,23 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                             | GToken t when t.Kind = Keyword && t.Text = "in" -> here <- envWithName
                             | c -> walkExpr here c |> ignore)
                     envWithName
+        (match accessOf n.Children with
+         | Some "private" ->
+             // register BEFORE the export decision: a private binding stays
+             // resolvable inside its module (ownExports untouched via env),
+             // and never crosses the file boundary
+             for i in defsBefore .. defsBound - 1 do
+                 dictSet privateOf (vecGet defs i).Offset modulePath
+         | Some "internal" ->
+             for i in defsBefore .. defsBound - 1 do
+                 dictSet internalOf (vecGet defs i).Offset true
+         | _ -> ())
         if exportHere then
             for i in defsBefore .. defsBound - 1 do
                 let d = vecGet defs i
-                if d.Kind = DefLet then exportDef d
+                if d.Kind = DefLet then
+                    if (dictTryFind privateOf d.Offset).IsSome then exportOwnOnly d
+                    else exportDef d
         result
 
     and walkMember (owner : string) (env : Env) (n : GreenNode) : unit =
@@ -865,9 +961,14 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         // member namespace — `x.X` is a field read, not a call
         let isValDecl =
             n.Children |> List.exists (fun c -> match c with GToken t -> t.Kind = Keyword && t.Text = "val" | _ -> false)
+        let mAccess = accessOf n.Children
         let declareMember (name : Token) =
             if isValDecl then define DefField name |> ignore else
             let d = define DefMember name
+            (match mAccess with
+             | Some "private" -> d.Access <- 1
+             | Some "internal" -> d.Access <- 2
+             | _ -> ())
             // an OVERLOAD keeps its own entry under an ordinal suffix; the
             // plain key stays with the first declaration, so everything that
             // knows nothing of overloading keeps working
@@ -930,12 +1031,32 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             && not (n.Children |> List.exists (fun c ->
                 match c with GToken t -> t.Kind = Operator && t.Text = "=" | _ -> false))
         let mutable outer = env
+        // `type private T = ...`: the type AND its constructors are private
+        // to the enclosing module, as in F#. Positional: an access keyword
+        // AFTER the name (`type EmptySet<'T> private() = ...`) marks the
+        // primary CONSTRUCTOR, not the type
+        let declAccess =
+            let rec scan (cs : Green list) =
+                match cs with
+                | GToken t :: _ when t.Kind = Ident -> None
+                | GToken t :: _ when t.Kind = Keyword && (t.Text = "private" || t.Text = "internal" || t.Text = "public") -> Some t.Text
+                | _ :: rest -> scan rest
+                | [] -> None
+            scan n.Children
+        let markAccess (d : Definition) : unit =
+            match declAccess with
+            | Some "private" -> dictSet privateOf d.Offset modulePath
+            | Some "internal" -> dictSet internalOf d.Offset true
+            | _ -> ()
+        let exportAcc (d : Definition) : unit =
+            if declAccess = Some "private" then exportOwnOnly d else exportDef d
         match nameTok with
         | Some t when not isExtension ->
             let d = define DefType t
+            markAccess d
             outer <- Map.add t.Text d outer
             outer <- Map.add (typeKey t.Text) d outer
-            if exportHere then exportDef d
+            if exportHere then exportAcc d
         | _ -> ()
         for c in n.Children do
             match c with
@@ -955,12 +1076,14 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      let d =
                          if isEnumMember then defineAs DefCase (typeName + "." + t.Text) t
                          else define DefCase t
+                     markAccess d
                      if not isEnumMember then
                          outer <- Map.add t.Text d outer
                      dictSet typeCases (typeName + "." + t.Text) d
-                     if exportHere then
+                     if exportHere && declAccess <> Some "private" then
                          if isEnumMember then exportUnder (typeName + "." + t.Text) d
                          else exportDef d
+                     elif exportHere then exportOwnOnly d
                  | None -> ())
                 for x in u.Children do
                     match x with
@@ -1156,7 +1279,12 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 let nameToks =
                     n.Children |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
                 (match nameToks with
-                 | t :: _ -> define DefModule t |> ignore
+                 | t :: _ ->
+                     let d = define DefModule t
+                     // export the top-level module NAME itself: the
+                     // module-has-no-such-export diagnostic keys on the
+                     // prefix resolving to a module
+                     vecAdd exports (nameToks |> List.map (fun x -> x.Text) |> String.concat ".", d)
                  | [] -> ())
                 modulePath <- nameToks |> List.map (fun t -> t.Text) |> String.concat "."
                 env
@@ -1206,7 +1334,6 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     // known module does export is a real error with a real fix; a name
     // found nowhere stays silent (an empty-prelude check, a member bound
     // later by its receiver's type, a builtin the backend owns)
-    let missing = vecNew<int * string> ()
     (if vecLen unresolvedValues > 0 then
         let owners = dictNew<string, string list> ()
         let note (full : string) (d : Definition) =
@@ -1232,6 +1359,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
 
     { Definitions = vecToList defs
       Missing = vecToList missing
+      AccessErrors = vecToList accessErrs
       Resolutions = vecToList uses
       Exports = vecToList exports
       Members = dictPairs memberDefs }

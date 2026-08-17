@@ -4149,7 +4149,13 @@ and private emitWithLocalsK (st : St) (f : Fn) (lv : Dict<string * int, string>)
     let probe = { st with Errors = vecNew () }
     emitNode probe scratch lv0 body
     if vecLen probe.Errors > 0 then
-        vecAdd st.Warnings ("stubbed " + owner + " (" + vecGet probe.Errors 0 + ")")
+        // a SYMBOLIC class marker ("#N" — an uninstantiated variable) can
+        // only sit in an unstamped TEMPLATE, whose stamps carry the real
+        // instantiation; the stub is expected, not a porting gap, so it
+        // stays quiet (the trap on reaching it is still loud)
+        let e0 = vecGet probe.Errors 0
+        if not (e0.Contains "$class:" && e0.Contains "#") then
+            vecAdd st.Warnings ("stubbed " + owner + " (" + e0 + ")")
         localsDone f
         ins f "unreachable"
         false

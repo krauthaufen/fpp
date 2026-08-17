@@ -2253,6 +2253,13 @@ module Array =
         elif length a > length b then 1
         else 0
 
+/// The lowering's list->array seam: `[| for … |]` and `[| a .. b |]` build
+/// their LIST with the comprehension machinery and convert through here —
+/// a stamped generic, so every element kind gets its own correct layout
+/// (hand-built IR stored anyref into POD arrays on the wasm-GC backend).
+type ArrayOps =
+    static member OfList (xs : list<'a>) : 'a[] = Array.ofList xs
+
 /// Scoped pinning: `use p = fixed arr` pins for the binding's scope and
 /// unpins on every exit path. Instances decide what pinning MEANS; the
 /// array instance demands unmanaged elements, so a ref-holding array
