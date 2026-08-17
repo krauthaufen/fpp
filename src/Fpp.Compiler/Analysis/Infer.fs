@@ -499,7 +499,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // self-host traps in ToString->concat->str_cat. Re-enable
             // together with temp rooting; the guarded shape below is
             // correct (shared-variable gate, rigid trial).
-            elif false && g.Class = c.Class && g.Args.Length = c.Args.Length
+            elif g.Class = c.Class && g.Args.Length = c.Args.Length
                  // only when the given and the wanted already SHARE a
                  // variable: `Sub<'a,'a> = 'a` completing `Sub<'a, ?v>` is
                  // the given finishing its own entanglement. A fully
@@ -3835,14 +3835,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            // a char range is ordinal: the inline builder
                            // steps it as a raw scalar, no instances needed
                            | TCon ("char", []) -> ()
-                           | _ when (dictTryFind classes.Classes "Integral").IsNone -> ()
+                           | _ when (dictTryFind classes.Classes "Num").IsNone -> ()
                            | _ ->
-                               // Integral, not Num, until the given-match
-                               // fallback can re-enable float stepping: with
-                               // it off, a float One wrongly defaults to int
-                               // and the stamp traps unboxing it — refusing
-                               // the program beats trapping at run time
-                               addWanted op.Offset { Class = "Integral"; Args = [ elem ]; Assoc = [] }
+                               // stepping needs One and subtraction, nothing
+                               // integral — float ranges step by 1.0, as F#
+                               addWanted op.Offset { Class = "Num"; Args = [ elem ]; Assoc = [] }
                                addWanted op.Offset { Class = "Ordered"; Args = [ elem ]; Assoc = [] }
                                solveWanted ())
                           vecAdd instRaw (op.Offset, [ elem ])

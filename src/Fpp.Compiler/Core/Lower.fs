@@ -524,6 +524,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         elif op.StartsWith "..@" then Some (op.Substring 3)
         else None
 
+    /// element kinds the INLINE i32 count loop is correct for — raw 32-bit
+    /// ordinals stepping by literal 1. A float/int64/unsigned range stepped
+    /// as an i32 word compares garbage (`for x in 1.0 .. 10.0` HUNG); those
+    /// materialize through RangeOps.Seq and cons-walk instead.
+    let rangeInline (elem : string) : bool =
+        elem = "" || elem = "int" || elem = "char" || elem = "bool"
+        || elem = "int16" || elem = "uint16" || elem = "byte" || elem = "sbyte"
+
     let rangeList (off : int) (lo : Expr) (hi : Expr) : Expr =
         let ish = mono (TCon ("int", []))
         let anonScheme = mono (TCon ("?", []))
@@ -541,8 +549,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// A range at its ELEMENT: int stays on the inline builder, anything
     /// else calls the prelude's RangeOps.Seq, stamped per element
     let rangeMaterialize (off : int) (elem : string) (lo : Expr) (hi : Expr) : Expr =
-        // char is ordinal: the raw-scalar countdown steps it like an int
-        if elem = "" || elem = "int" || elem = "char" then rangeList off lo hi
+        // ordinal elements step as raw i32 words inline
+        if rangeInline elem then rangeList off lo hi
         else
             match dictTryFind memberIndex "RangeOps.Seq" with
             | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ elem ]), [ ETuple [ lo; hi ] ])
@@ -3220,7 +3228,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 EWhile (cond,
                                   ESeq [ loopBody body
                                          EAssign (iv, EPrim ("+", [ EVar (iv, isch); EVar (stV, isch) ])) ]))))
-                      | (PVar _ | PWild), EPrim (rop1, [ lo; hi ]) when (rangeElem rop1).IsSome ->
+                      | (PVar _ | PWild), EPrim (rop1, [ lo; hi ]) when
+                            (rangeElem rop1).IsSome && rangeInline (rangeElem rop1).Value ->
                           let iv, isch =
                               match lowerPat ip with
                               | PVar (v, sch) -> v, sch
@@ -3233,6 +3242,24 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
                                 ESeq [ loopBody body
                                        EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                      | pat, EPrim (rop1, [ lo; hi ]) when (rangeElem rop1).IsSome ->
+                          // a NON-ordinal range source (`for x in 1.0 .. 10.0`):
+                          // the inline i32 count loop stepped a float's word as
+                          // an int and HUNG — materialize through RangeOps.Seq
+                          // and cons-walk the list instead
+                          let elem = (rangeElem rop1).Value
+                          let anon = mono (TCon ("?", []))
+                          let restV = { Path = path; Offset = offsetOf n + 5000000; Name = "_rest" }
+                          let tailV = { Path = path; Offset = offsetOf n + 6000000; Name = "_tail" }
+                          let notNull (e : Expr) =
+                              EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+                          ELet (false, restV, anon, rangeMaterialize (offsetOf n) elem lo hi,
+                            EWhile (notNull (EVar (restV, anon)),
+                              EMatch (EVar (restV, anon),
+                                [ PCons (pat, PVar (tailV, anon)), None,
+                                    ESeq [ loopBody body
+                                           EAssign (restV, EVar (tailV, anon)) ]
+                                  PWild, None, ELit LUnit ])))
                       | pat, coll when (dictTryFind arrKinds (offsetOf range)) = Some "list" ->
                           // for x in xs (a LIST): a cons walk. The binder may
                           // destructure, so the element binds through the

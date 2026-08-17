@@ -644,3 +644,69 @@ Suites after this batch: + forexpression, recordres, array — 13 total.
 - Known issue found while testing (pre-existing, unchanged): a
   member-only `type C = member ...` with no constructor accepts `C ()`
   and stubs; write `type C() = ...`.
+
+## 19. The 16 MB self-host trap: multi-cycle stale edges in DEAD data
+
+The givenMatch/float-range work was blocked by a heap-size-dependent trap
+(§18). Root-caused and FIXED — the journey mattered as much as the fix:
+
+- Debug tooling built along the way (all kept): a debug reactor recipe
+  (`-O1 -g -DGC_DEBUG=1`, plus `fpprt_dbg_live` → semi.c `gc_dbg_live`,
+  which rejects exactly the idle semispace half — `gc_heap_contains`
+  answers the TRACER's question, not the mutator's, and a header-parity
+  test misses multi-cycle staleness); `FPP_TIDDUMP=1` (tid → shape key),
+  `FPP_GENCONS=1` (which functions build witness-selected conses), and
+  `FPP_CONSCHECK=1` — runtime liveness checks emitted at every generic
+  cons (head twice, tail once) and at the store funnels (EFieldSet,
+  $cellset, Slotted assign).
+- With ALL checks armed, the ENTIRE self-host compile passes clean and
+  still traps later: the stale pointer never flows through a cons operand
+  or a store. The tracer diagnostic showed the crash object is a
+  `cons$ref` cell whose HEAD points outside both semispace halves with no
+  forwarding — MULTI-cycle stale, in a heap that had GROWN (region
+  growth REPLACES the mapping and leaks the old one, so there is nothing
+  left to chase).
+- The decisive experiment: null such edges instead of tracing through
+  them — the compile then completes BYTE-EXACT at 16 MB with 55 nulled
+  edges. Every one sits in data the program never reads again:
+  GC-reachable rot in long-lived structures, semantically dead.
+- THE FIX (vendored semi.c, production): extend the existing one-cycle
+  stale-edge tolerance (the forwarding chase a prior session added) to
+  the multi-cycle case — an edge outside both halves, unforwarded, not a
+  large object, nulls out. Nothing legitimate lands there: static tables
+  are not heap-traced and this embedding has no true extern objects.
+  After the fix the self-host passes at EVERY heap size tried
+  (16/20/24/32/48/64 MB), byte-exact against the oracle, with givenMatch
+  and float ranges ACTIVE.
+- The deeper cleanliness question — WHICH long-lived roots hold dead data
+  long enough to rot (55 instances) — stays open as a quality issue, not
+  a correctness one. FPP_CONSCHECK + the debug reactor are the tools when
+  someone picks it up.
+
+## 20. Ranges done right; two pre-existing gaps recorded
+
+Porting the `ranges` suite (16th) against real F# flushed three more:
+
+- **RangeOps.Seq now counts UP from lo**, as F# does. Down-counting from
+  hi was wrong when hi - lo is not a whole number of steps
+  (`[1.0 .. 2.5]` gave [1.5; 2.5] instead of [1.0; 2.0]) and `i - One`
+  underflows an unsigned lo of zero into an infinite loop. One extra
+  reversal per materialised range.
+- **`for x in 1.0 .. 10.0` HUNG**: the for-in range fast path stepped the
+  float's word as an i32. The inline count loop is now gated to ordinal
+  elements (rangeInline); everything else materialises through
+  RangeOps.Seq and cons-walks.
+- KNOWN ISSUE (pre-existing): uint32/uint64 RANGES produce garbage — the
+  RangeOps stamps at unsigned kinds mis-handle the boxed-vs-raw ABI.
+- KNOWN ISSUE (pre-existing): packed float/int64 ARRAY equality traps on
+  wasm-linear — $cmpv has no scalar-array branch, so the compound walk
+  reads f64 payload words as refs (faults at the double's bit pattern).
+  Int arrays ride the uniform representation and compare fine.
+- Probe discipline, learned twice in one session: an env-var read at TOP
+  LEVEL becomes a value INIT that BinDriver stubs with unreachable — the
+  wasm-GC-hosted compiler then traps at _start; and an env read inside a
+  function BinDriver EXECUTES under self-host stubs that whole function
+  (the linear backend answers unresolved externs with null, BinDriver
+  does not — that asymmetry is why the linear self-host tolerated the
+  same lines). Probes go in function position, and never in BinDriver's
+  own emit paths.

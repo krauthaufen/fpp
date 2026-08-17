@@ -1051,13 +1051,27 @@ instance Arb<'a * 'b * 'c> when Arb<'a> when Arb<'b> when Arb<'c>
 /// VALUE both lower to this, at every Integral element. For-loops keep
 /// their direct while lowering and never allocate the list.
 type RangeOps =
-    static member Seq (lo : 'a, hi : 'a) : list<'a> when Integral<'a> when Ordered<'a> =
-        let mutable i = hi
+    static member Seq (lo : 'a, hi : 'a) : list<'a> when Num<'a> when Ordered<'a> =
+        // count UP from lo, as F# does: down-counting from hi is wrong when
+        // hi - lo is not a whole number of steps ([1.0 .. 2.5] must be
+        // [1.0; 2.0], not [1.5; 2.5]) and `i - One` underflows an unsigned
+        // lo of zero into an infinite loop. Built by prepending, so the
+        // ascending order needs one reversal.
+        let mutable i = lo
         let mutable out : list<'a> = []
-        while i >= lo do
+        while i <= hi do
             out <- i :: out
-            i <- i - One
-        out
+            i <- i + One
+        let mutable r : list<'a> = []
+        let mutable rest = out
+        let mutable go = true
+        while go do
+            match rest with
+            | x :: t ->
+                r <- x :: r
+                rest <- t
+            | [] -> go <- false
+        r
 
 /// it is in .NET, not a float.
 module Math =

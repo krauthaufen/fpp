@@ -260,6 +260,7 @@ let mutable private gcArrIterTid = 0
 // FK_STRUCT cons tids selected at a GENERIC cons site by the element witness's
 // refMask: RAW head (scan tail only) vs REF head (scan head+tail). Both map to
 // CID_LIST so $isBuiltinSeq still recognises them.
+let mutable private curFnDbg = "?"
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
@@ -284,6 +285,8 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "_initialize" "$fpinit" [] []
     importFn m "fpprt" "fpprt_init" "$fpheap" [ "i32" ] []
     importFn m "fpprt" "fpprt_alloc" "$fpalloc" [ "i32" ] [ "i32" ]
+    if System.Environment.GetEnvironmentVariable "FPP_CONSCHECK" = "1" then
+        importFn m "fpprt" "fpprt_dbg_live" "$fpdbglive" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_alloc_array" "$fpallocn" [ "i32"; "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_register_type_s" "$fpreg" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i32" ] []
     importFn m "fpprt" "fpprt_add_static_roots" "$fproots" [ "i32"; "i32" ] []
@@ -317,6 +320,8 @@ let private gcTid (st : St) (shapeKey : string) (sizeBytes : int) (kind : int) (
         st.TidNext <- t + 1
         dictSet st.Tids shapeKey t
         vecAdd st.TidRegs (t, sizeBytes, kind, start)
+        if System.Environment.GetEnvironmentVariable "FPP_TIDDUMP" = "1" then
+            eprintfn "TID %d = %s (kind %d)" t shapeKey kind
         t
 
 // intern a FK_STRUCT tid with an explicit ref-offset map (byte offsets of the
@@ -333,6 +338,8 @@ let private gcTidRef (st : St) (shapeKey : string) (sizeBytes : int) (refoffs : 
         dictSet st.Tids shapeKey t
         vecAdd st.TidRegs (t, sizeBytes, FK_STRUCT, List.length refoffs)
         dictSet st.TidRefoffs t refoffs
+        if System.Environment.GetEnvironmentVariable "FPP_TIDDUMP" = "1" then
+            eprintfn "TID %d = %s (refoffs %s)" t shapeKey (String.concat "," (List.map string refoffs))
         t
 
 // intern a packed-scalar array tid AND map it to CID_ARRAY on first creation,
@@ -2804,6 +2811,20 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
 // pointers, so they must be rooted like any other ref let-binder.
 let private desugarRefTemps =
     Set.ofList [ "_rest"; "_tail"; "_arr"; "_arg"; "_ssrc"; "_sdst"; "_wdst"; "_wsrc"; "_rout" ]
+/// FPP_CONSCHECK debug: trap when a REF-looking value (even, nonzero) about
+/// to be STORED is not in the current allocation space — catches a stale
+/// pointer at the write that resurrects it, with the writer in the backtrace.
+// function-position on purpose: a TOP-LEVEL env read became a trapping
+// stub INIT on the wasm-GC backend under self-host (BinDriver stubs value
+// inits with unreachable; every probe precedent reads the env inline)
+let private consCheckOn () = System.Environment.GetEnvironmentVariable "FPP_CONSCHECK" = "1"
+let private chkStoreStmts (reg : int) : LStmt list =
+    if consCheckOn () then
+        [ LIf (LPrim (EqW, [ LPrim (AndW, [ LGet (wReg reg); LConstW 1 ]); LConstW 0 ]),
+               [ LIf (LPrim (EqW, [ LCall ("$fpdbglive", [ LGet (wReg reg) ]); LConstW 0 ]),
+                      [ LTrap ], []) ], []) ]
+    else []
+
 let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
     gc
     && ((dictTryFind ctx.LSt.CellVars (key v)).IsSome
@@ -3090,7 +3111,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     [ LSet (wReg r, coreToLowE ctx b) ]) ],
              LGet (wReg r))
     | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
-    | EPrim ("+t", [ a; b ]) -> LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
+    | EPrim ("+t", [ a; b ]) ->
+        // GC: root `a` across `b`'s evaluation — `"x" + string n` allocates
+        // in $itoa while a's pointer waits un-rooted in a temp, and a
+        // collection there hands $str_cat a stale string. $str_cat guards
+        // its own alloc; the caller's window is this one. Exception-safe:
+        // the ETry lowering restores $sp at every handler entry.
+        if gc then
+            let ra = freshTmp ctx
+            let rb = freshTmp ctx
+            LDo ([ LCallVoidS ("$spush", [ coreToLowE ctx a ])
+                   LSet (wReg rb, coreToLowE ctx b)
+                   LSet (wReg ra, LCall ("$spop", [])) ],
+                 LCall ("$str_cat", [ LGet (wReg ra); LGet (wReg rb) ]))
+        else LCall ("$str_cat", [ coreToLowE ctx a; coreToLowE ctx b ])
     // `&&`/`||` MUST short-circuit: the right operand can have effects or THROW
     // (e.g. `n = xs.Length && List.zip xs ys …` — the zip must not run when the
     // lengths differ). Lowering them to AndW/OrW evaluated both sides and made
@@ -3393,7 +3427,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // GC-updated pointer. (This was prune's path compression going stale.)
         if gc then
             let ra, rb, pre = evalRooted ctx r v
-            LDo (pre @ [ LStore (W, LGet (wReg ra), HDR + 4 * recFieldIdx st owner fname, LGet (wReg rb)) ], lowInt 0)
+            LDo (pre @ chkStoreStmts rb @ [ LStore (W, LGet (wReg ra), HDR + 4 * recFieldIdx st owner fname, LGet (wReg rb)) ], lowInt 0)
         else LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname, coreToLowE ctx v) ], lowInt 0)
     // ---- arrays of inline value-type records (all-scalar elements) ----
     // elements are contiguous & HEADERLESS at ARRHDR + i*stride. A whole-element
@@ -3684,7 +3718,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // allocating value.
         if gc then
             let ra, rb, pre = evalRooted ctx c v
-            LDo (pre @ [ LStore (W, LGet (wReg ra), cellOff (), LGet (wReg rb)) ], lowInt 0)
+            LDo (pre @ chkStoreStmts rb @ [ LStore (W, LGet (wReg ra), cellOff (), LGet (wReg rb)) ], lowInt 0)
         else LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
     | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
     | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
@@ -4095,6 +4129,12 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
           LStore (W, lowVarStore ctx (key v), cellOff (), LGet (wReg t)) ]
     | EAssign (v, rhs) when (dictTryFind ctx.Slotted (key v)).IsSome ->
         // a shadow-stack-rooted ref local: write the new value into its root slot
+        if consCheckOn () then
+            let t = freshTmp ctx
+            [ LSet (wReg t, coreToLowE ctx rhs) ]
+            @ chkStoreStmts t
+            @ [ LStore (W, (dictTryFind ctx.Slotted (key v)).Value, 0, LGet (wReg t)) ]
+        else
         [ LStore (W, (dictTryFind ctx.Slotted (key v)).Value, 0, coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
@@ -4137,6 +4177,8 @@ and private lowObj (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) :
 // shadow-stacked); a REF head uses CONS_REF and is rooted across the alloc. The
 // tail is a list pointer, rooted in both. Head/tail are evaluated ONCE.
 and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tExpr : LExpr) : LExpr =
+    if System.Environment.GetEnvironmentVariable "FPP_GENCONS" = "1" then
+        eprintfn "GENCONS in %s" curFnDbg
     let b = freshTmp ctx
     let ht = freshTmp ctx
     let tt = freshTmp ctx
@@ -4162,12 +4204,25 @@ and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tEx
     let popHt =
         [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
           LSet (wReg ht, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
+    // FPP_CONSCHECK=1 debug: a REF head whose target header word is EVEN is a
+    // FORWARDING pointer — the head went stale (its object moved while the
+    // value sat un-rooted). Trap HERE, at the cons, with the guilty function
+    // in the backtrace — instead of at the next collection's trace.
+    let chk =
+        if System.Environment.GetEnvironmentVariable "FPP_CONSCHECK" = "1" then
+            fun (guarded : bool) (reg : int) ->
+                let t = [ LIf (LPrim (EqW, [ LCall ("$fpdbglive", [ LGet (wReg reg) ]); LConstW 0 ]), [ LTrap ], []) ]
+                if guarded then [ LIf (LPrim (EqW, [ LGet (wReg mreg); LConstW 0 ]), [], t) ] else t
+        else fun _ _ -> []
     LDo ([ LSet (wReg mreg, refMask)
-           LSet (wReg ht, hExpr)
-           LIf (LPrim (EqW, [ LGet (wReg mreg); LConstW 0 ]),
-                [ LSet (wReg tt, tExpr) ],
-                gcPushStmts (LGet (wReg ht)) @ [ LSet (wReg tt, tExpr) ] @ popHt)
-           LIf (LPrim (EqW, [ LGet (wReg mreg); LConstW 0 ]), rawBuild, refBuild) ], LGet (wReg r))
+           LSet (wReg ht, hExpr) ]
+         @ chk true ht
+         @ [ LIf (LPrim (EqW, [ LGet (wReg mreg); LConstW 0 ]),
+                  [ LSet (wReg tt, tExpr) ],
+                  gcPushStmts (LGet (wReg ht)) @ [ LSet (wReg tt, tExpr) ] @ popHt) ]
+         @ chk true ht
+         @ chk false tt
+         @ [ LIf (LPrim (EqW, [ LGet (wReg mreg); LConstW 0 ]), rawBuild, refBuild) ], LGet (wReg r))
 // as lowObj, but with a per-slot ref-kind classification (when every slot's
 // kind is statically known). A fully-concrete shape registers FK_STRUCT with a
 // ref-map: raw scalar slots are stored inline and NEVER pushed to the shadow
@@ -4992,6 +5047,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | _ -> ()
 
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+    curFnDbg <- dbgName
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
