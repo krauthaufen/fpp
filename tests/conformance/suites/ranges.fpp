@@ -38,9 +38,8 @@ let aeq (a : 'a[]) (b : 'a[]) : bool =
 test "coar1" (aeq [| 1 .. 3 |] [| 1; 2; 3 |])
 test "coar2" (aeq [| 1 .. 0 |] [||])
 test "coar3" (aeq [| 'a' .. 'c' |] [| 'a'; 'b'; 'c' |])
-// element-wise, not `=`: packed float/int64 ARRAY equality is a known
-// wasm-linear $cmpv gap (no scalar-array branch; the compound walk reads
-// f64 payload words as refs) — pre-existing, recorded in the status doc
+// element-wise, not `=`: arrays compare by REFERENCE (chosen divergence,
+// DIVERGENCES.md), so content is checked through the elements
 let fr = [| 1.0 .. 3.0 |]
 test "coar4" (fr.Length = 3 && fr.[0] = 1.0 && fr.[1] = 2.0 && fr.[2] = 3.0)
 let lr = [| 1L .. 3L |]
