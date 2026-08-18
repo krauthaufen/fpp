@@ -1646,6 +1646,17 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (s.Bump ())
                 if s.AtEof || (not s.SameLine && s.CurCol <= mcol) then s.Diag "expected a member body"
                 else vecAdd acc (parseBlock mcol)
+                // `member val P = init with get, set`: accessor NAMES after
+                // an auto-property initializer — names only, no bodies; the
+                // member-val desugar reads them off
+                if s.IsKw "with"
+                   && (let p = s.Peek 1 in p.Text = "get" || p.Text = "set") then
+                    vecAdd acc (s.Bump ())
+                    let mutable moreAcc = true
+                    while moreAcc && s.Is Ident && (s.Cur.Text = "get" || s.Cur.Text = "set") do
+                        vecAdd acc (Green.node AccessorDecl [ s.Bump () ])
+                        if s.Is Comma || s.IsKw "and" then vecAdd acc (s.Bump ())
+                        else moreAcc <- false
         Green.node MemberDecl (vecToList acc)
 
     /// `type T = A | B of int` — an identifier directly followed by `|`/`of`.

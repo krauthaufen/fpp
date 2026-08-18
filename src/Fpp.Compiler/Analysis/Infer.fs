@@ -1735,6 +1735,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// union name -> (its parameters, cases as (name, payload components))
     let unionCasesReg = dictNew<string, Var list * (string * Type list) list> ()
+    /// `C()` sites whose head named a type with no visible constructor at
+    /// the moment of typing — judged AFTER the walk, when every `new`
+    /// member has registered
+    let noCtorSitesRaw = vecNew<int * string> ()
     /// a GADT declares per-case signatures; deriving those would be wrong
     let unionGadt = dictNew<string, bool> ()
     /// types declared as RECORDS — classes never derive (their constructor
@@ -3161,9 +3165,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some (TCon (t.Text, []))
-                              | Some t when t.Text = "int64" && (dictTryFind useDefs t.Offset).IsNone ->
+                              // uint64 was ABSENT here (a second int64 arm sat
+                              // in its place): `uint64 s` typed as a fresh
+                              // variable, and a later `int64 b` kind-detected
+                              // "" and widened the box POINTER
+                              | Some t when t.Text = "uint64" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
-                                  Some (TCon ("int64", []))
+                                  Some (TCon ("uint64", []))
                               | Some t when t.Text = "string" && (dictTryFind useDefs t.Offset).IsNone ->
                                   exprType (GNode onlyArg) |> ignore
                                   Some tString
@@ -3308,6 +3316,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        // on its `new` members, and the TYPE
                                        // definition itself carries none
                                        | [ _ ] when (hasVariants || (schemeOfDef d).IsNone) && hopOk () -> Some (ht, cands)
+                                       | [] when
+                                            // `C()` on a class with NO ctor in
+                                            // sight: remembered, not judged —
+                                            // a struct-block type's `new`
+                                            // members register only when the
+                                            // walk REACHES them, so a use
+                                            // inside an earlier member body
+                                            // sees an empty set transiently.
+                                            // The verdict comes after the walk
+                                            ctorName = d.Name
+                                            && (args |> List.exists (fun a -> isExprish a.NodeKind)) ->
+                                           vecAdd noCtorSitesRaw (ht.Offset, ctorName)
+                                           None
                                        | _ -> None)
                                   | _ -> None)
                              | None -> None
@@ -7472,6 +7493,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // declared by the end of this file — the same reasoning as the orphan
     // rule's). One still holding a variable belongs to a conditional
     // instance and is discharged at its uses instead.
+    // `C()` on a type that STILL has no constructor: a member-only class,
+    // a union/record head, an interface — F# rejects each (FS1133 for the
+    // class), and the silent path built a ghost object whose every member
+    // read zero. Ifaces/abstract already errored at the site; unions,
+    // records, aliases and arity variants construct through their own paths
+    for coff, cname in vecToList noCtorSitesRaw do
+        if (arityVariants cname |> List.forall (fun v -> (dictTryFind ctors v).IsNone))
+           && (dictTryFind abstractTypes cname).IsNone
+           && (dictTryFind ifaces cname).IsNone
+           && (dictTryFind unionCasesReg cname).IsNone
+           && (dictTryFind aliases cname).IsNone
+           && (dictTryFind recordsReg cname).IsNone then
+            vecAdd diags (coff, "no constructors are available for the type '" + cname + "'")
+
     for soff, sname, sc in vecToList pendingSuperChecks do
         if sc.Args |> List.forall (fun a -> List.isEmpty (freeVars a)) then
             match Classes.select classes true sc.Class sc.Args sc.Assoc with

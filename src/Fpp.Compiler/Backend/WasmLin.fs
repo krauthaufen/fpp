@@ -567,6 +567,8 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$exntag" [ "i32" ] []
     // GC shadow stack: push a value (i32->void), pop one (void->i32)
     tyFunc m "$lt_v2i" [] [ "i32" ]
+    // $atol: string pointer -> raw i64
+    tyFunc m "$lt_i2j" [ "i32" ] [ "i64" ]
 
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -610,6 +612,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$literNext" "$lt_i2i"
     declFn m "$literCur" "$lt_i2i"
     declFn m "$atoi" "$lt_i2i"
+    declFn m "$atol" "$lt_i2j"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -635,6 +638,31 @@ let private emitAtoi (m : Mod) : unit =
     br f "$ago"; endB f; endB f
     lg f "$neg"
     ifE f; ic f 0; lg f "$acc"; ins f "i32.sub"; ls f "$acc"; endB f
+    lg f "$acc"
+    endFn f
+
+// $atol(s): $atoi's i64 twin — signed decimal string -> raw i64, so
+// `int64 "123"` parses instead of handing the string POINTER out widened
+let private emitAtol (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$n" "i32"; local f "$i" "i32"; local f "$neg" "i32"; local f "$acc" "i64"
+    localsDone f
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    ic f 0; ls f "$i"; lc f 0L; ls f "$acc"; ic f 0; ls f "$neg"
+    lg f "$n"; ic f 0; ins f "i32.gt_s"
+    ifE f
+    lg f "$s"; ic f 8; ins f "i32.add"; mem f "i32.load16_u"; ic f 45; ins f "i32.eq"
+    ifE f; ic f 1; ls f "$neg"; ic f 1; ls f "$i"; endB f
+    endB f
+    blockE f "$ald"; loopE f "$algo"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$ald"
+    lg f "$acc"; lc f 10L; ins f "i64.mul"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ic f 48; ins f "i32.sub"; ins f "i64.extend_i32_s"; ins f "i64.add"; ls f "$acc"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$algo"; endB f; endB f
+    lg f "$neg"
+    ifE f; lc f 0L; lg f "$acc"; ins f "i64.sub"; ls f "$acc"; endB f
     lg f "$acc"
     endFn f
 
@@ -3639,6 +3667,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#f" || n.StartsWith "int64#s" ->
         lowBoxI ctx (LPrim (FToL, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#l" || n.StartsWith "int64#v" -> coreToLowE ctx a
+    // int64-of-STRING parses ('t' is the string kind letter): the catchall
+    // widened the string POINTER before
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#t" ->
+        lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
         lowBoxI ctx (LPrim (WToL, [ (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
@@ -3658,6 +3690,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#f" || n.StartsWith "uint64#s" ->
         lowBoxI ctx (LPrim (FToL, [ lowUnboxF (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#l" || n.StartsWith "uint64#v" -> coreToLowE ctx a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#t" ->
+        lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
     | EApp (EUnknown n, [ a ]) when n = "uint64#" || n.StartsWith "uint64#" ->
         lowBoxI ctx (LPrim (WToL, [ coreToLowE ctx a ]))
     // int from float: unbox, truncate, tag
@@ -5892,7 +5926,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m
+    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

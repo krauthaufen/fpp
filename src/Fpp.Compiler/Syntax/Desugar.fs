@@ -899,3 +899,98 @@ let rec desugarLazy (n : GreenNode) : GreenNode =
             | GNode m -> m
             | _ -> rebuilt
         | _ -> rebuilt
+
+/// Does the tree contain a `member val` auto-property? Cheap gate,
+/// mirroring hasLazy. Explicit fields (`val mutable x : int`) carry no
+/// `member` keyword and do not fire this.
+let rec hasMemberVal (n : GreenNode) : bool =
+    (n.NodeKind = MemberDecl
+     && (tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val"))
+     && (tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "member")))
+    || (nodesOf n |> List.exists hasMemberVal)
+
+/// `member val P = init [with get[, set]]` IS a backing field plus an
+/// accessor property:
+///
+///   let mutable __mv_P = init
+///   member __mvself.P with get () = __mv_P [and set v = __mv_P <- v]
+///
+/// — rewritten AFTER parsing, like `lazy`, so the shapes that already work
+/// (class lets, accessor members) carry the semantics: init runs ONCE at
+/// construction, bare form is get-only, `with get, set` adds the setter.
+/// `static member val` with a getter only drops to `static member P = init`;
+/// a static SETTER needs static state and is left alone (it will not bind).
+/// Synthetic offsets are deterministic per declaration — a 32-slot block
+/// keyed by the name token's offset, above Desugar's own synthesis base.
+let rec desugarMemberVal (n : GreenNode) : GreenNode =
+    let expand (c : Green) : Green list =
+        match c with
+        | GNode m when
+              m.NodeKind = MemberDecl
+              && (tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val"))
+              && (tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "member")) ->
+            let isStatic = tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")
+            let nameTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
+            let init = nodesOf m |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryHead
+            let accessors =
+                nodesOf m
+                |> List.filter (fun x -> x.NodeKind = AccessorDecl)
+                |> List.choose (fun x -> tokensOf x |> List.tryHead |> Option.map (fun t -> t.Text))
+            let hasSet = List.contains "set" accessors
+            match nameTok, init with
+            | Some nt, Some ie when not isStatic ->
+                let mutable k = 600000000 + nt.Offset * 32
+                let tok (kd : TokenKind) (txt : string) : Green =
+                    let g = GToken { Kind = kd; Text = txt; Leading = []; Trailing = []; Offset = k }
+                    k <- k + 1
+                    g
+                let back = "__mv_" + nt.Text
+                let backing =
+                    Green.node LetDecl
+                        [ tok Keyword "let"; tok Keyword "mutable"
+                          Green.node IdentPat [ tok Ident back ]
+                          tok Operator "="; GNode ie ]
+                let getter =
+                    Green.node AccessorDecl
+                        [ tok Ident "get"
+                          Green.node ParenPat [ tok LParen "("; tok RParen ")" ]
+                          tok Operator "="
+                          Green.node IdentExpr [ tok Ident back ] ]
+                let setterParts =
+                    if not hasSet then []
+                    else
+                        [ tok Keyword "and"
+                          Green.node AccessorDecl
+                              [ tok Ident "set"
+                                Green.node IdentPat [ tok Ident "__mvv" ]
+                                tok Operator "="
+                                Green.node BinaryExpr
+                                    [ Green.node IdentExpr [ tok Ident back ]
+                                      tok Operator "<-"
+                                      Green.node IdentExpr [ tok Ident "__mvv" ] ] ] ]
+                let prop =
+                    Green.node MemberDecl
+                        ([ tok Keyword "member"; tok Ident "__mvself"; tok Operator "."
+                           GToken nt; tok Keyword "with"; getter ] @ setterParts)
+                [ backing; prop ]
+            | Some _, Some _ when isStatic && not hasSet ->
+                // re-evaluating init per read is observably identical for the
+                // pure initializers a get-only static carries in this subset
+                [ GNode
+                    { m with
+                        Children =
+                            m.Children
+                            |> List.filter (fun c2 ->
+                                match c2 with
+                                | GToken t -> not (t.Kind = Keyword && t.Text = "val")
+                                | GNode x -> x.NodeKind <> AccessorDecl)
+                            |> List.filter (fun c2 ->
+                                match c2 with
+                                | GToken t -> not (t.Kind = Keyword && t.Text = "with")
+                                | _ -> true) } ]
+            | _ -> [ c ]
+        | GNode m -> [ GNode (desugarMemberVal m) ]
+        | t -> [ t ]
+    match Green.node n.NodeKind (n.Children |> List.collect expand) with
+    | GNode r -> r
+    | _ -> n

@@ -1042,3 +1042,39 @@ starting with `=` after a multi-line comprehension (FS0010) — bind first.
 Battery: 29/29, conformance 25 suites / 1348 positive, 45 neg, fixpoint
 self byte-exact, gchost byte-exact at the new prelude (bytes=82064
 hash=451751650, oracle identical).
+
+## §30 autoprops suite + three known issues fixed (2026-08-18)
+
+Three open known issues closed, exercised by the 26th suite (`autoprops`,
+20 asserts) and NEG case 46 (`noctor`).
+
+* **`member val P = init [with get, set]`** now parses and works: the
+  parser accepts accessor NAMES after an auto-property initializer, and a
+  post-parse desugar (Desugar.desugarMemberVal, hooked in ParseRaw beside
+  the lazy rewrite) expands the declaration into a `let mutable __mv_P =
+  init` backing field plus a get/set accessor property — shapes that
+  already carried the semantics. Init runs ONCE at construction, bare form
+  is get-only. `static member val` get-only drops the `val` (re-evaluating
+  a pure init per read); a static SETTER is left alone (needs static
+  state).
+* **`int64 "s"` / `uint64 "s"` on wasm-linear** parse instead of handing
+  the string pointer out widened: WasmLin grew `$atol` ($atoi's i64 twin)
+  and `int64#t`/`uint64#t` arms ahead of the widening catchalls. The
+  second half of the bug was in INFER: `uint64` was absent from the
+  conversion result-type table (a duplicate `int64` arm sat in its place),
+  so `uint64 s` typed as a fresh variable and a later `int64 b`
+  kind-detected "" and widened the box pointer.
+* **`C()` on a member-only class** errors ("no constructors are available
+  for the type 'C'", F#'s FS1133) instead of building a ghost object whose
+  members read zero. The site is REMEMBERED during the walk and judged
+  after it — a struct-block type's `new` members register only when the
+  walk reaches them, so a use inside an earlier member body sees an empty
+  candidate set transiently (AdaptiveToken does exactly this). Guards:
+  abstract/iface (own diags), unions, records, aliases, arity variants.
+
+Trap relearned the expensive way: a `dotnet build ... -v q | grep -c` that
+prints 0 on a FAILED build leaves the old binary in place — the "still
+failing" adaptive gate was a stale compiler, not the fix.
+
+Battery: 29/29, conformance 26 suites / 1368 positive, 46 neg, fixpoint
+self byte-exact, gchost byte-exact (bytes=82064 hash=451751650).
