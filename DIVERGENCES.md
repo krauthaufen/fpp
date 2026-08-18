@@ -577,3 +577,21 @@ JS-interop surface (WebGPU descriptors are dictionaries of mostly-optional
 members) is exactly the world it is for. `[<Struct>]` records refuse
 optional fields (an option is a reference). Sources using `?fields` are NOT
 compilable by fsc — keep them out of dual-compiled files.
+
+## An unknown uppercase pattern identifier is an ERROR
+
+F#: `| C -> ...` where no case `C` exists compiles with warning FS0049 —
+the identifier BINDS, and the arm matches everything.
+F++: it is an error (`unknown case 'C'`).
+
+**Reason.** An uppercase identifier in a case pattern never binds here
+(the binder rule is: binders are lowercase), so there is nothing the
+pattern could mean. F#'s fallback silently turns a typo'd case name into
+an irrefutable match that swallows every value — the exact class of bug
+the warning exists to flag. This compiler's own source once shipped that
+bug (`[ inner; GNodePat ]`); the error is the version of the rule that
+would have caught it.
+
+The negative-conformance case `tests/conformance/neg/unknown-union-case.fpp`
+asserts our behaviour directly (`//? fsc-accepts` excludes it from the
+fsi oracle run, per rule 1 above).

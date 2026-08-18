@@ -823,3 +823,46 @@ Trap re-confirmed the hard way AGAIN: a `GetEnvironmentVariable` probe
 inside capInst made stage-1 trap (BinDriver stubs it, the self-hosted
 compiler executes capInst) and masqueraded as a wasm-GC regression of the
 gate for one whole cycle. Probes NEVER go in code the fixpoint executes.
+
+## 23. NEGATIVE conformance: programs F# rejects must be rejected
+
+New gate: `tests/conformance/neg.sh` over `tests/conformance/neg/*.fpp` —
+31 illegal programs in the common subset, modeled on the fsc
+ComponentTests `E_*.fs` cases. Each file carries its expectations inline
+(`//! <line> <substring>` against OUR diagnostics — fsc's wording cannot
+be the oracle, per DIVERGENCES.md rule 1); `./neg.sh --oracle` separately
+proves `dotnet fsi` rejects every case (`//? fsc-accepts` marks a chosen
+divergence). Wired into run-gates.sh.
+
+Building the suite found ELEVEN silent-acceptance holes — programs that
+compiled cleanly and ran as garbage — all fixed:
+
+- record literal with an UNKNOWN field (built a phantom record) and one
+  MISSING a required field (the bare-name owner rule accepted `{ a = 1 }`
+  for a two-field record; the field ran as null)
+- `x <- 2` on an immutable let, and `r.a <- 2` on a non-`mutable` field
+  (the write vanished or misrouted; mutability now rides the project-wide
+  fields table under `$mut:`-prefix keys — a SUFFIX key read as a real
+  field and broke the cback struct layouts, a per-file dict lost
+  cross-file declarations)
+- an or-pattern binding different names per alternative (`Some v | None
+  -> v` read an unwritten local)
+- a duplicate union case name (last silently won)
+- `inherit` from a union/record (the "subclass" ran baseless)
+- an interface implementation leaving a member out (empty vtable slot —
+  this one immediately caught tests/tooling/genericenum.fpp omitting the
+  Dispose that prelude IEnumerator declares)
+- `while 1 do` (condition never tied to bool)
+- `s.[true]` AND `a.[true]` (index types never tied to int)
+- an unbound identifier (`nosuchthing + 1` printed 0). Reported through
+  Resolve's Missing channel with the FreshIdents cross-check, so bare
+  single-file inference stays quiet; the emission-owned print/fail
+  families are exempt by name.
+- unknown case in a pattern (`| C ->` matched everything) — a chosen
+  DIVERGENCE: F# binds it with warning FS0049, F++'s uppercase-never-
+  binds rule makes it an error (new DIVERGENCES.md entry).
+
+Lesson from wiring it up: marker keys in the shared `fields` table must
+be PREFIX-shaped (`$mut:R.f`) — every layout consumer scans by
+`TypeName + "."` prefix, so a suffix marker (`R.f$mut`) surfaced as a
+phantom field in zero-init records and aborted the C backend.

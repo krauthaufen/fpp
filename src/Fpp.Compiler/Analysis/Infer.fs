@@ -443,6 +443,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// never a member with a body). Assigning to one is as safe to unify
     /// through as assigning to a variable — see the `assign` case.
     let recordFieldTargets = dictNew<int, bool> ()
+    /// field-ident offset -> the record type it resolved to, for the
+    /// assignment mutability check
+    let recordFieldOwnerAt = dictNew<int, string> ()
+    /// definition offsets of `let mutable` binders (this file) — the only
+    /// idents `<-` may target
+    let mutableLets = dictNew<int, bool> ()
+
     let ctorSitesRaw = vecNew<int * int> ()
     /// record literals, resolved after solving so the instantiation is known
     let pendingRecords = vecNew<int * Type> ()
@@ -1221,6 +1228,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // instantiation — two representations for one value
                          vecAdd pendingOwners (offset, recvTy)
                          dictSet recordFieldTargets offset true
+                         dictSet recordFieldOwnerAt offset fi.TypeName
                      // a SAME-FILE member is a generic function once lifted:
                      // this use is a specialization demand like any other,
                      // recorded in the definition scheme's own variable
@@ -1716,6 +1724,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// types declared as RECORDS — classes never derive (their constructor
     /// is the only sanctioned builder)
     let recordsReg = dictNew<string, bool> ()
+    /// types declared as UNIONS, for the inherit check below (same-file
+    /// resolution only, like recordsReg)
+    let unionsReg = dictNew<string, bool> ()
     let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
     /// type name -> the synthesized instance's offset, so a WRITTEN instance
     /// arriving later (a generated file lands after the type it derives for)
@@ -2544,7 +2555,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                match instantiateFor d with
                                | Some (t2, _) -> t2
                                | None -> st.Fresh ())
-                      | None -> st.Fresh ())
+                      | None ->
+                          // an UNRESOLVED case head: remembered exactly like
+                          // an unbound expression ident, so the resolver's
+                          // unknown-case candidate can become an error (the
+                          // FreshIdents cross-check in Workspace)
+                          vecAdd freshIdentsRaw t.Offset
+                          st.Fresh ())
              | None -> st.Fresh ())
         | AppPat ->
             (match nodesOf n with
@@ -4032,6 +4049,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           if op.Text = "<-" && byrefTarget.IsNone
                              && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
                               unifyArg op.Offset lt rt
+                          // assignability. A plain ident target must be a
+                          // `let mutable`; a record/val field target must be
+                          // declared `mutable`. Silence here compiled
+                          // `x <- 2` against an immutable binding and the
+                          // write vanished or corrupted.
+                          (if op.Text = "<-" && byrefTarget.IsNone && l.NodeKind = IdentExpr then
+                              match Green.tokens (GNode l) |> List.tryFind (fun t -> t.Kind = Ident) with
+                              | Some t ->
+                                  (match dictTryFind useDefs t.Offset with
+                                   | Some d when d.Path = path && not ((dictTryFind mutableLets d.Offset).IsSome) ->
+                                       vecAdd diags (t.Offset, "'" + t.Text + "' is not mutable")
+                                   | _ -> ())
+                              | None -> ())
+                          (if op.Text = "<-" && isRecordField then
+                              match Green.tokens (GNode l) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                              | Some t ->
+                                  (match dictTryFind recordFieldOwnerAt t.Offset with
+                                   | Some tn when not ((dictTryFind fields ("$mut:" + tn + "." + t.Text)).IsSome) ->
+                                       vecAdd diags (t.Offset, "the field '" + t.Text + "' of " + tn + " is not mutable")
+                                   | _ -> ())
+                              | None -> ())
                           tUnit
                       | _ ->
                           // `a >>>> b` where `>>>>` is a STATIC MEMBER of an
@@ -4455,6 +4493,26 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     let pt = patType cvars m
                                     patExpect <- None
                                     unifyArg barOff scrut pt
+                        // bar-separated ALTERNATIVES (several pattern nodes
+                        // in one clause) must bind the same names: a binder
+                        // missing from the matching alternative read a local
+                        // that nothing ever wrote
+                        (let alts = nodesOf cl |> List.filter (fun m -> isPatKind m.NodeKind)
+                         if List.length alts > 1 then
+                             let nameSet (a : GreenNode) : string list =
+                                 Green.tokens (GNode a)
+                                 |> List.filter (fun t ->
+                                     t.Kind = Ident && t.Text <> "_"
+                                     && (dictTryFind defsAt t.Offset).IsSome)
+                                 |> List.map (fun t -> t.Text)
+                                 |> List.distinct |> List.sort
+                             let sets = alts |> List.map nameSet
+                             let inter =
+                                 sets |> List.reduce (fun a b -> a |> List.filter (fun x -> List.contains x b))
+                             let uni = List.concat sets |> List.distinct
+                             for nm2 in uni do
+                                 if not (List.contains nm2 inter) then
+                                     vecAdd diags (barOff, "'" + nm2 + "' is not bound in every alternative of this pattern"))
                         // existential patterns in THIS clause: their
                         // constraints are givens while the body types, and
                         // their fresh args are the clause's skolems
@@ -4682,6 +4740,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some t ->
                           vecAdd arrKindsRaw (t.Offset, TCon ("array", [ e ]))
                           dictSet arrIndexTargets t.Offset true
+                          // an array index IS an int — free, `a.[true]`
+                          // read whatever the bit pattern addressed
+                          unifyAt t.Offset idxTy tInt
                       | None -> ())
                      e
                  | Some (TCon ("string", [])) ->
@@ -4689,7 +4750,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // not the same thing as an array whose ELEMENTS are
                      // strings — a sentinel keeps the two apart
                      (match Green.tokens (GNode n) |> List.tryHead with
-                      | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
+                      | Some t ->
+                          vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
+                          // a string index IS an int, like an array's
+                          unifyAt t.Offset idxTy tInt
                       | None -> ())
                      tChar
                  | _ ->
@@ -5138,6 +5202,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  Green.tokens (GNode coll) |> List.tryHead with
                            | Some t, Some c -> vecAdd lateLoopSources (t.Offset, c.Offset, ct, bt)
                            | _ -> ()))
+                 // `while c do`: the condition IS a bool — leaving it free
+                 // compiled `while 1 do` and looped on the bit pattern
+                 | cond :: _ when n.NodeKind = WhileExpr ->
+                     handled <- cond :: handled
+                     (match Green.tokens (GNode cond) |> List.tryHead with
+                      | Some t -> unifyAt t.Offset (exprType (GNode cond)) tBool
+                      | None -> unify (exprType (GNode cond)) tBool |> ignore)
                  | _ -> ())
                 for m in nodesOf n do
                     if List.exists (fun h -> System.Object.ReferenceEquals (h, m)) handled then ()
@@ -5199,6 +5270,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              dictTryFind fields (en + "." + first)
                          | _ -> None)
                     | _ -> None
+                let recFieldsOf (tn : string) =
+                    dictPairs fields
+                    |> List.choose (fun (k, fi) ->
+                        if fi.TypeName = tn && k.StartsWith (tn + ".")
+                           && not (k.Contains "$") && fi.DefKey.IsNone && not fi.IsStatic
+                           && not ((k.Substring (tn.Length + 1)).Contains ".")
+                           && not ((k.Substring (tn.Length + 1)).Contains "#")
+                        then Some (k.Substring (tn.Length + 1)) else None)
                 let owner =
                     match expectOwner with
                     | Some i -> Some i
@@ -5212,14 +5291,6 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         // base's labels too, and a literal writing only base
                         // labels means the BASE.
                         let first = List.head fieldNames
-                        let recFieldsOf (tn : string) =
-                            dictPairs fields
-                            |> List.choose (fun (k, fi) ->
-                                if fi.TypeName = tn && k.StartsWith (tn + ".")
-                                   && not (k.Contains "$") && fi.DefKey.IsNone && not fi.IsStatic
-                                   && not ((k.Substring (tn.Length + 1)).Contains ".")
-                                   && not ((k.Substring (tn.Length + 1)).Contains "#")
-                                then Some (k.Substring (tn.Length + 1)) else None)
                         let cands =
                             dictPairs fields
                             |> List.choose (fun (k, fi) ->
@@ -5313,9 +5384,44 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    else unifyAt t.Offset vt declared
                                | None -> ())
                           | _ -> ())
+                     // a full literal (no `with` base) must WRITE every
+                     // field the record declares, optionals aside — the
+                     // bare-name owner rule accepted `{ a = 1 }` for a
+                     // two-field record and the missing field ran as null
+                     (match baseExpr with
+                      | None ->
+                          let noff = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
+                          for f2 in recFieldsOf info.TypeName do
+                              if not (List.contains f2 fieldNames)
+                                 && not ((dictTryFind fields (info.TypeName + "." + f2 + "$opt")).IsSome) then
+                                  vecAdd diags (noff, "the record literal for " + info.TypeName + " leaves field '" + f2 + "' out")
+                      | Some _ -> ())
                      recTy
                  | None ->
-                     // unknown record type: walk values, stay unconstrained
+                     // no type covers ALL the written labels. If some record
+                     // knows at least one of them, the literal MEANT a type
+                     // and the stray label deserves a name — silence here
+                     // built a phantom record and every read of it was
+                     // garbage. A literal whose labels no known type
+                     // declares stays quiet: bare single-file inference
+                     // legitimately sees types it cannot resolve.
+                     let nearest =
+                         fieldNames
+                         |> List.tryPick (fun m ->
+                             dictPairs fields
+                             |> List.tryPick (fun (k, fi) ->
+                                 if k = fi.TypeName + "." + m && not (k.Contains "$")
+                                    && fi.DefKey.IsNone && not fi.IsStatic
+                                 then Some fi.TypeName else None))
+                     (match nearest with
+                      | Some tn ->
+                          let known = recFieldsOf tn
+                          let noff = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
+                          for m in fieldNames do
+                              if not (List.contains m known) then
+                                  vecAdd diags (noff, "the record " + tn + " has no field '" + m + "'")
+                      | None -> ())
+                     // walk values, stay unconstrained
                      for f in fieldNodes do
                          for m in nodesOf f do
                              if isExprish m.NodeKind then exprType (GNode m) |> ignore
@@ -5435,6 +5541,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     p.NodeKind = WildcardPat || p.NodeKind = LiteralPat || p.NodeKind = StructTuplePat || p.NodeKind = ListPat
                     || p.NodeKind = ConsPat || p.NodeKind = RecordPat
                 | _ -> false)
+        // every binder of a `let mutable` pattern is assignable —
+        // `let mutable struct(h, t) = ...` binds two, through the
+        // DESTRUCTURE arm below, not the plain one
+        (if tokensOf n |> List.exists (fun t -> t.Kind = Keyword && t.Text = "mutable") then
+            for p in pats do
+                for t in Green.tokens (GNode p) do
+                    if t.Kind = Ident && (dictTryFind defsAt t.Offset).IsSome then
+                        dictSet mutableLets t.Offset true)
         match pats with
         | [] ->
             for c in vecToList after do exprType c |> ignore
@@ -5783,6 +5897,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                   // type its own base and the member walk would never end.
                   match prune baseTy with
                   | TCon (b, _) when b = name -> ()
+                  | TCon (b, _) when (dictTryFind unionsReg b).IsSome || (dictTryFind recordsReg b).IsSome ->
+                      // a union or record is not a base class — recording it
+                      // silently accepted `inherit DiscUnion` and the
+                      // "subclass" ran with no base at all
+                      (match Green.tokens (GNode tn) |> List.tryHead with
+                       | Some t -> vecAdd diags (t.Offset, "cannot inherit from '" + b + "': it is not a class")
+                       | None -> ())
                   | _ -> dictSet bases name (ownParams, baseTy)
               | None -> ())
          | None -> ())
@@ -5873,6 +5994,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                    tokensOf m |> List.exists (fun t -> t.Kind = Operator && t.Text = "=")) then
              vecAdd unmanagedCands (name, [], [])
              deriveUnmanaged name [] [])
+        (if nodesOf n |> List.exists (fun m -> m.NodeKind = UnionCase) then
+            dictSet unionsReg name true)
+        // one union, one name per case — a duplicate silently registered
+        // the LAST declaration and every construction/match of the first
+        // meant the other
+        (let caseSeen = dictNew<string, bool> ()
+         for m in nodesOf n do
+             if m.NodeKind = UnionCase then
+                 match tokensOf m |> List.tryFind (fun t -> t.Kind = Ident) with
+                 | Some t ->
+                     if (dictTryFind caseSeen t.Text).IsSome then
+                         vecAdd diags (t.Offset, "the union " + name + " declares the case '" + t.Text + "' twice")
+                     dictSet caseSeen t.Text true
+                 | None -> ())
         // union cases become constructor schemes
         //
         // everything in a TYPE body — members, let fields, do blocks —
@@ -5918,6 +6053,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              dictSet fields t.Text info
                              dictSet fields (name + "." + t.Text) info
                              if isOpt then dictSet fields (name + "." + t.Text + "$opt") info
+                             // mutability rides the PROJECT-WIDE fields
+                             // table under a prefix key no field scan can
+                             // match (a suffix key read as a real field and
+                             // broke the struct layouts; a local dict lost
+                             // cross-file declarations)
+                             if tokensOf f |> List.exists (fun tk -> tk.Kind = Keyword && tk.Text = "mutable") then
+                                 dictSet fields ("$mut:" + name + "." + t.Text) info
                          | _ -> ())
             | UnionCase ->
                 let caseTok = tokensOf m |> List.tryFind (fun t -> t.Kind = Ident)
@@ -6028,6 +6170,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                            FieldType = ft; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
                      dictSet fields nameTok.Text info
                      dictSet fields (name + "." + nameTok.Text) info
+                     if tokensOf m |> List.exists (fun tk -> tk.Kind = Keyword && tk.Text = "mutable") then
+                         dictSet fields ("$mut:" + name + "." + nameTok.Text) info
                  | _ -> ())
             | MemberDecl when tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "new") ->
                 // an explicit constructor determines how the type is built
@@ -6085,6 +6229,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some inm ->
                      let prior = match dictTryFind impls name with Some l -> l | None -> []
                      dictSet impls name (inm :: prior)
+                     // the block must implement EVERY member the interface
+                     // declares — a missing one compiled to an empty vtable
+                     // slot that trapped (or answered garbage) at dispatch
+                     let declared =
+                         match dictTryFind ifaces inm with
+                         | Some ms -> Some ms
+                         | None ->
+                             let bare =
+                                 match inm.IndexOf "`" with
+                                 | i when i > 0 -> inm.Substring (0, i)
+                                 | _ -> inm
+                             dictTryFind ifaces bare
+                     (match declared with
+                      | Some ms ->
+                          let given =
+                              nodesOf m |> List.filter (fun x -> x.NodeKind = MemberDecl)
+                              |> List.choose memberNameOf
+                              |> List.map (fun t -> t.Text)
+                          let ioff = match tokensOf m |> List.tryHead with Some t -> t.Offset | None -> 0
+                          for mn2, _ in ms do
+                              if not (List.contains mn2 given) then
+                                  vecAdd diags (ioff, "this " + inm + " implementation leaves '" + mn2 + "' out")
+                      | None -> ())
                  | None -> ())
                 for x in nodesOf m do
                     if x.NodeKind = MemberDecl then

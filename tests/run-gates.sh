@@ -36,6 +36,7 @@ gates+=("hkt-gate|$here/tooling/hkt-gate.sh")
 gates+=("pkg-gate|$here/tooling/pkg-gate.sh")
 [ -x "$here/tooling/jsinterop/jsinterop-gate.sh" ] && gates+=("jsinterop-gate|$here/tooling/jsinterop/jsinterop-gate.sh")
 gates+=("conformance|$here/conformance/run.sh")
+gates+=("conformance-neg|$here/conformance/neg.sh")
 if [ "$full" = 1 ]; then
   # heaviest first, so they overlap the whole small-gate tail. The unit
   # suite's sequenced adaptive test (an 8-minute in-process compile) runs

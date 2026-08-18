@@ -12,6 +12,7 @@ type BoxEn<'a>(items : 'a[], count : int) =
             i <- i + 1
             i < count
         member _.Current = items.[i]
+        member _.Dispose () = ()
 
 type Box<'a>(cap : int) =
     let mutable items : 'a[] = Array.zeroCreate cap

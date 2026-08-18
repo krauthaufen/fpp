@@ -484,6 +484,15 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                              // resolved, which is the dogfooding gate exactly.
                              elif inCase && strLen t.Text > 0
                                   && charAt t.Text 0 >= 'A' && charAt t.Text 0 <= 'Z' then
+                                 // it names a case NOTHING declares. Silence
+                                 // here made `| C ->` an irrefutable match
+                                 // that swallowed every value. Reported
+                                 // through the Missing channel: an error only
+                                 // when inference also failed to resolve it
+                                 // (the FreshIdents cross-check), so a lone
+                                 // file inferred without its prelude stays
+                                 // quiet.
+                                 vecAdd missing (t.Offset, "unknown case '" + t.Text + "'")
                                  env
                              else
                                  let d = define kind t
@@ -1355,7 +1364,22 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      "unbound value '" + t.Text + "' — module " + m + " exports it"
                      + (if List.isEmpty rest then "" else " (so do " + String.concat ", " rest + ")")
                      + "; open " + m + " or write " + m + "." + t.Text)
-            | _ -> ())
+            | _ ->
+                // found NOWHERE. Names emission owns (the print/fail
+                // families) stay silent — every program uses them and no
+                // resolver entry exists on purpose. Everything else is
+                // almost certainly a typo, and the Missing channel is safe
+                // to say so: a use only becomes an ERROR when inference
+                // ALSO bottomed out at a fresh variable (the FreshIdents
+                // cross-check in Workspace.Diagnostics), so a name a later
+                // stage resolves never false-positives. Silence here ran
+                // `nosuchthing + 1` as 0.
+                if not (List.contains t.Text
+                            [ "printfn"; "printf"; "eprintfn"; "eprintf"; "sprintf"
+                              "failwith"; "failwithf"; "raise"; "reraise"
+                              "invalidArg"; "invalidOp"; "print"; "obj"; "exit"
+                              "ignore"; "not"; "id"; "fst"; "snd" ]) then
+                    vecAdd missing (t.Offset, "unbound value '" + t.Text + "'"))
 
     { Definitions = vecToList defs
       Missing = vecToList missing
