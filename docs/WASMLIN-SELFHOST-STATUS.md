@@ -1078,3 +1078,31 @@ failing" adaptive gate was a stale compiler, not the fix.
 
 Battery: 29/29, conformance 26 suites / 1368 positive, 46 neg, fixpoint
 self byte-exact, gchost byte-exact (bytes=82064 hash=451751650).
+
+## §31 syntax suite + two parser conformance fixes (2026-08-18)
+
+27th suite: `syntax` (58 asserts) — the portable core of fsc's syntax
+test as self-checking asserts: bit operators across int/int64/uint64/byte
+(17-hex-digit literals wrap mod 2^64 exactly as F#), Failure raise/catch,
+for-to/downto/nested/while-over-ref loops, prefix-sum and letter-count
+array samples, tuple plumbing, the List/Option samples, generic
+comparison over tuples/lists/strings, records, unions, escape chars,
+negative-sign precedence.
+
+Two parser fixes it forced:
+
+* **Prefix minus binds LOOSER than application**, as in F#: `-R 3` is
+  `-(R 3)`. The prefix-position operand was parsePostfix, so `-idf 3`
+  parsed as `(-idf) 3` and errored `no instance Neg<int -> int>`.
+  Leading-position `-`/`+` now take a whole application; argument-position
+  minus (`f -x`) keeps the tight postfix operand.
+* **Only `[<` opens an attribute list** at declaration position: a bare
+  `[` is a list-literal statement. `[ ... ] |> List.iter ...` at top
+  level used to die as "unexpected token at top level".
+
+Known gap noted: `max`/`min` (MinMax) have no tuple instances — F# allows
+max over any comparable; the suite dropped that assert.
+
+Battery: 29/29 on the settled tree, conformance 27 suites / 1426
+positive, 46 neg, fixpoint self byte-exact, gchost byte-exact
+(bytes=82064 hash=451751650).

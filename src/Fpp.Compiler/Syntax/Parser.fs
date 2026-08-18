@@ -1079,8 +1079,13 @@ let parse (src : string) : ParseResult =
             let arg = parseApp ctx
             Green.node PrefixExpr [ kw; arg ]
         elif s.Is Operator && (s.IsText "-" || s.IsText "+" || s.IsText "!" || s.IsText "~~~") then
+            // the operand is a whole APPLICATION: F# reads `-f x` as
+            // `-(f x)` — prefix minus binds looser than application (the
+            // syntax test's `-R 3` shape). Argument-position minus
+            // (`f -x`, parsed elsewhere) keeps the tight postfix operand.
+            let wide = s.IsText "-" || s.IsText "+"
             let op = s.Bump ()
-            let arg = parsePostfix ctx
+            let arg = if wide then parseApp ctx else parsePostfix ctx
             Green.node PrefixExpr [ op; arg ]
         else
             errorUntilRecovery ctx "expected an expression"
@@ -1896,7 +1901,10 @@ let parse (src : string) : ParseResult =
             vecAdd acc (s.Bump ())
             while not s.AtEof && s.SameLine do vecAdd acc (s.Bump ())
             Green.node BlockExpr (vecToList acc)
-        elif s.Is LBracket then parseAttributeList ()
+        // only `[<` opens an attribute list — a bare `[` at declaration
+        // position is a LIST-LITERAL statement (`[ ... ] |> List.iter ...`),
+        // which used to die as "unexpected token at top level"
+        elif s.Is LBracket && (let p = s.Peek 1 in p.Kind = Operator && p.Text = "<") then parseAttributeList ()
         elif s.IsKw "do" then
             let d = s.Bump ()
             let body = if canStartExpr () then parseBlock ctx else Green.node ErrorNode []
