@@ -262,6 +262,7 @@ let mutable private gcArrIterTid = 0
 // refMask: RAW head (scan tail only) vs REF head (scan head+tail). Both map to
 // CID_LIST so $isBuiltinSeq still recognises them.
 let mutable private curFnDbg = "?"
+let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
@@ -2280,6 +2281,16 @@ type private LowCtx =
       mutable SlottedGen : (int * int * int) list
       mutable NReg : int }
 
+/// ctx.Regs read WITHOUT the Dictionary indexer: under the linear
+/// self-host the get_Item member call returned garbage at several
+/// EMatch/binder sites while dictTryFind at the same keys answered
+/// correctly (see the linear-fixpoint arc); every internal read goes
+/// through this until that miscompile is found
+let private regOf (ctx : LowCtx) (k : string) : int =
+    match dictTryFind ctx.Regs k with
+    | Some i -> i
+    | None -> failwith ("regOf: no register for " + k)
+
 let private freshReg (ctx : LowCtx) (k : string) : int =
     match dictTryFind ctx.Regs k with
     | Some id -> id
@@ -3239,7 +3250,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // witness decides ref vs raw). The register is its home; reads are LGet.
         // A REASSIGNED generic mutable is excluded (assignsTo) — see genWitOf.
         let bind = lowLetBind ctx v sch rhs
-        let reg = ctx.Regs.[key v]
+        let reg = regOf ctx (key v)
         let saved = ctx.ActiveGen
         ctx.ActiveGen <- (reg, (genWitOf ctx v sch).Value) :: ctx.ActiveGen
         let bodyLow = coreToLowE ctx body
@@ -3251,7 +3262,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // witness-conditional slot instead — push once, write-through on `<-`,
         // reload from the GC-updated slot after each safepoint, pop at scope end.
         let bind = lowLetBind ctx v sch rhs
-        let reg = ctx.Regs.[key v]
+        let reg = regOf ctx (key v)
         let wit = (genWitOf ctx v sch).Value
         let slotReg = freshTmp ctx
         let saved = ctx.SlottedGen
@@ -4045,8 +4056,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
          | Some (paramTys, retTy) ->
              let argVals = List.map2 (fun ty a ->
                              let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
-                             ((ty = W) && refKindOfExprC st a = RKRef), ty, lowered) paramTys args
-             let setup, argGets = lowRootedArgs ctx argVals
+                             let kind = refKindOfExprC st a
+                             let wit = if kind = RKGen then slotWitness ctx a else None
+                             kind, wit, ty, lowered) paramTys args
+             let setup, argGets = lowRootedArgsK ctx argVals
              let loweredArgs = witnessArgs @ argGets
              let callE =
                  match retTy with
@@ -4058,7 +4071,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                  | _ -> let r = freshTmpT ctx retTy in LDo ([ LSet ({ Id = r; RTy = retTy }, LCall (fn v, loweredArgs)) ], flatBox ctx retTy (LGet { Id = r; RTy = retTy }))
              (if List.isEmpty setup then callE else LDo (setup, callE))
          | None ->
-             let setup, argGets = lowRootedArgs ctx (args |> List.map (fun a -> refKindOfExprC st a = RKRef, W, coreToLowE ctx a))
+             let setup, argGets =
+                 lowRootedArgsK ctx (args |> List.map (fun a ->
+                     let kind = refKindOfExprC st a
+                     let wit = if kind = RKGen then slotWitness ctx a else None
+                     kind, wit, W, coreToLowE ctx a))
              let callE = LCall (fn v, witnessArgs @ argGets)
              (if List.isEmpty setup then callE else LDo (setup, callE)))
     | ELam (_, _) ->
@@ -4104,12 +4121,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 let slotRegs = (if gc then patRefBinders ctx pat else []) |> List.map (fun (v, _) -> v, freshTmp ctx)
                 let pushes = slotRegs |> List.collect (fun (v, addrReg) ->
                     [ LSet (wReg addrReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
-                      LStore (W, LGet (wReg addrReg), 0, LGet (wReg ctx.Regs.[key v]))
+                      LStore (W, LGet (wReg addrReg), 0, LGet (wReg (regOf ctx (key v))))
                       LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
                 for v, addrReg in slotRegs do dictSet ctx.Slotted (key v) (LGet (wReg addrReg))
                 // generic (RKGen) binders: active across the arm body, rooted
                 // conditionally at each safepoint via their element witness.
-                let genB = patGenBinders ctx pat |> List.map (fun (v, w) -> ctx.Regs.[key v], w)
+                let genB = patGenBinders ctx pat |> List.map (fun (v, w) -> regOf ctx (key v), w)
                 // UNRESOLVED binders: ask the scrutinee object's scan map at
                 // runtime and root conditionally (see patCondBinders)
                 let condB =
@@ -4124,13 +4141,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                         [ LSet (wReg flagR, LCall ("$tidscans", [ LPrim (ShrUW, [ LLoad (W, LGet (wReg sc), 0); LConstW 1 ]); LConstW off ]))
                           // wit = flag ? w1 : w0, branchless
                           LSet (wReg witR, LPrim (XorW, [ w0; LPrim (AndW, [ LPrim (XorW, [ w0; w1 ]); LPrim (SubW, [ LConstW 0; LGet (wReg flagR) ]) ]) ]))
-                          gcSlotPush ctx.Regs.[key v] witR slotR ])
+                          gcSlotPush (regOf ctx (key v)) witR slotR ])
                 let condPop = condB |> List.rev |> List.map (fun (_, _, _, witR, _) -> gcSlotPop witR)
                 let pop = if List.isEmpty slotRegs then [] else [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length slotRegs) ])) ]
                 let savedGen = ctx.ActiveGen
                 ctx.ActiveGen <- genB @ ctx.ActiveGen
                 let savedSG = ctx.SlottedGen
-                ctx.SlottedGen <- (condB |> List.map (fun (v, _, _, witR, slotR) -> ctx.Regs.[key v], witR, slotR)) @ ctx.SlottedGen
+                ctx.SlottedGen <- (condB |> List.map (fun (v, _, _, witR, slotR) -> regOf ctx (key v), witR, slotR)) @ ctx.SlottedGen
                 // the guard runs AFTER the binder slots are live (its safepoints
                 // are covered); a failing guard pops what this clause pushed
                 // before breaking to the next clause's tests.
@@ -4216,7 +4233,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 // one. This was the wandering `ctx.Regs.[key v]` garbage-
                 // register corruption in the self-hosted linear emitter.
                 let setup, gets =
-                    lowRootedArgs ctx ((true, W, coreToLowE ctx recv) :: (args |> List.map (fun a -> true, W, coreToLowE ctx a)))
+                    lowRootedArgsK ctx ((RKRef, None, W, coreToLowE ctx recv)
+                                        :: (args |> List.map (fun a ->
+                                                let kind = refKindOfExprC st a
+                                                let wit = if kind = RKGen then slotWitness ctx a else None
+                                                kind, wit, W, coreToLowE ctx a)))
                 (match gets with
                  | recvG :: argGs -> LDo (setup @ [ LSet (wReg t, recvG) ], vtDispatchWith argGs)
                  | [] -> LDo ([ LSet (wReg t, coreToLowE ctx recv) ], vtDispatch ()))
@@ -4328,7 +4349,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         // a REASSIGNED generic mutable: persistent witness-conditional slot with
         // write-through (ActiveGen's snapshot/restore would undo its `<-`).
         let bind = lowLetBind ctx v sch rhs
-        let reg = ctx.Regs.[key v]
+        let reg = regOf ctx (key v)
         let wit = (genWitOf ctx v sch).Value
         let slotReg = freshTmp ctx
         let saved = ctx.SlottedGen
@@ -4339,7 +4360,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | ELet (_, v, sch, rhs, body) when (genWitOf ctx v sch).IsSome ->
         let bind = lowLetBind ctx v sch rhs
         let saved = ctx.ActiveGen
-        ctx.ActiveGen <- (ctx.Regs.[key v], (genWitOf ctx v sch).Value) :: ctx.ActiveGen
+        ctx.ActiveGen <- (regOf ctx (key v), (genWitOf ctx v sch).Value) :: ctx.ActiveGen
         let bodyStmts = coreToLowS ctx body
         ctx.ActiveGen <- saved
         bind :: bodyStmts
@@ -4801,20 +4822,39 @@ and private lowCallR (ctx : LowCtx) (fn : string) (args : Expr list) : LExpr =
              @ (head |> List.rev |> List.map (fun (_, r) -> LSet (wReg r, LCall ("$spop", [])))),
              LCall (fn, regs |> List.map (fun r -> LGet (wReg r))))
 
+/// FPP_CONSCHECK debug: validate a LOADED ref-looking value at the READ —
+/// a stale env/slot/register edge traps HERE, the reader in the backtrace,
+/// after naming the variable and site on stderr
+and private chkReadE (ctx : LowCtx) (tag : string) (e : LExpr) : LExpr =
+    if consCheckOn () then
+        let t = freshTmp ctx
+        chkSite <- chkSite + 1
+        let site = chkSite
+        eprintfn "CCHKSITE %d = %s in %s" site tag curFnDbg
+        let fail =
+            [ LCallVoidS ("$eprints", [ LCall ("$str_of_int", [ LConstW site ]) ])
+              LTrap ]
+        LDo ([ LSet (wReg t, e)
+               LIf (LPrim (EqW, [ LPrim (AndW, [ LGet (wReg t); LConstW 1 ]); LConstW 0 ]),
+                    [ LIf (LPrim (NeW, [ LGet (wReg t); LConstW 0 ]),
+                           [ LIf (LPrim (EqW, [ LCall ("$fpdbglive", [ LGet (wReg t) ]); LConstW 0 ]), fail, []) ], []) ], []) ],
+             LGet (wReg t))
+    else e
+
 and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     let st = ctx.LSt
     match dictTryFind ctx.Slotted k with
-    | Some addr -> LLoad (W, addr, 0)   // a shadow-stack-rooted ref local: read the current (post-GC) value
+    | Some addr -> chkReadE ctx ("slot:" + k) (LLoad (W, addr, 0))   // a shadow-stack-rooted ref local: read the current (post-GC) value
     | None ->
     match dictTryFind ctx.Regs k with
-    | Some id -> LGet (wReg id)
+    | Some id -> chkReadE ctx ("reg:" + k) (LGet (wReg id))
     | None ->
         match dictTryFind st.Captures k with
         | Some slot when ctx.EnvReg >= 0 ->
             // read the env through its rooted slot when the body roots it, so a
             // GC that relocated the env mid-body is reflected; else the wasm-local.
-            let envPtr = match ctx.EnvAddr with Some a -> LLoad (W, a, 0) | None -> LGet (wReg ctx.EnvReg)
-            LLoad (W, envPtr, HDR + 8 + 4 * slot)
+            let envPtr = chkReadE ctx ("envp:" + k) (match ctx.EnvAddr with Some a -> LLoad (W, a, 0) | None -> LGet (wReg ctx.EnvReg))
+            chkReadE ctx ("env:" + k) (LLoad (W, envPtr, HDR + 8 + 4 * slot))
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
@@ -4954,23 +4994,47 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
 // directly. Returns (setup stmts, per-arg value exprs) — emit the call inside an
 // LDo over the setup. This is the n-ary form of `evalRooted`.
 and private lowRootedArgs (ctx : LowCtx) (args : (bool * LTy * LExpr) list) : LStmt list * LExpr list =
+    lowRootedArgsK ctx (args |> List.map (fun (isRef, ty, e) -> (if isRef then RKRef else RKRaw), None, ty, e))
+
+/// kind-aware operand rooting for a call: each operand is rooted across the
+/// LATER operands' (possibly allocating) evaluations. A REF roots
+/// unconditionally; a GENERIC with a WITNESS roots conditionally on its
+/// refMask (a raw 'a must never reach the pointer scanner); a GENERIC with
+/// no witness is on the canonical TAGGED form and roots unconditionally; a
+/// RAW value never roots — W lanes DO carry raw evens in stamped code (the
+/// hash argument of dictSlotH), so root-everything scanned raw ints as
+/// pointers and the stale-edge tolerance NULLED them.
+and private lowRootedArgsK (ctx : LowCtx) (args : (RefKind * LExpr option * LTy * LExpr) list) : LStmt list * LExpr list =
     let n = List.length args
-    // (root-across-later, register, regTy). Only a WORD arg can be a pointer to
-    // root; a scalar (f64/i64) rides its own typed local and is never rooted.
-    // EVERY W-lane value is scan-safe (uniform words are tagged-or-pointer;
-    // the scanner skips odd words), so root them ALL — the isRef gate left
-    // RKGen-classified args (field reads, member-call results) UNROOTED
-    // across allocating siblings, the wandering stale-read corrupting the
-    // self-hosted linear emitter. isRef stays only as documentation.
-    let ts = args |> List.mapi (fun i (_isRef, ty, e) -> (gc && ty = W && i < n - 1), { Id = freshTmpT ctx ty; RTy = ty }, e)
-    let eval = ts |> List.collect (fun (root, r, e) ->
-        LSet (r, e) :: (if root then gcPushStmts (LGet r) else []))
+    let ts =
+        args |> List.mapi (fun i (kind, wit, ty, e) ->
+            let mode =
+                if not gc || ty <> W || i = n - 1 then 0
+                elif kind = RKRef then 1
+                elif kind = RKGen then (match wit with Some _ -> 2 | None -> 1)
+                else 0
+            mode, wit, { Id = freshTmpT ctx ty; RTy = ty }, e,
+            (if mode = 2 then Some (freshTmp ctx, freshTmp ctx) else None))
+    let eval = ts |> List.collect (fun (mode, wit, r, e, aux) ->
+        LSet (r, e)
+        :: (match mode, wit, aux with
+            | 1, _, _ -> gcPushStmts (LGet r)
+            | 2, Some wexpr, Some (wR, slotR) ->
+                [ LSet (wReg wR, wexpr); gcSlotPush r.Id wR slotR ]
+            | _ -> []))
     let pops =
-        ts |> List.filter (fun (root, _, _) -> root) |> List.rev
-        |> List.collect (fun (_, r, _) ->
-            [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
-              LSet (r, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ])
-    (eval @ pops, ts |> List.map (fun (_, r, _) -> LGet r))
+        ts |> List.rev
+        |> List.collect (fun (mode, _, r, _, aux) ->
+            match mode, aux with
+            | 1, _ ->
+                [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ]))
+                  LSet (r, LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]), 0)) ]
+            | 2, Some (wR, slotR) ->
+                [ LIf (slotGenRaw wR, [],
+                       [ LSet (r, LLoad (W, LGet (wReg slotR), 0))
+                         LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ]) ]
+            | _ -> [])
+    (eval @ pops, ts |> List.map (fun (_, _, r, _, _) -> LGet r))
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -5336,7 +5400,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let selfPreamble =
         match ps with
         | self0 :: _ when not (List.isEmpty selfWits) ->
-            let selfReg = ctx.Regs.[key self0]
+            let selfReg = regOf ctx (key self0)
             selfWits |> List.map (fun (vid, off) ->
                 let r = freshTmp ctx
                 dictSet ctx.Witness vid r
@@ -5358,7 +5422,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let retTy =
         match sig_ with
         | Some (paramTys, ret) ->
-            List.iter2 (fun pv ty -> match ty with W -> () | _ -> let id = ctx.Regs.[key pv] in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty) ps paramTys
+            List.iter2 (fun pv ty -> match ty with W -> () | _ -> let id = regOf ctx (key pv) in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty) ps paramTys
             ret
         | None -> W
     // GC: root each ref-typed (non-scalar) parameter on the shadow stack for the
@@ -5370,7 +5434,20 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let rootParams =
         if gc then
             List.zip ps paramTypes
-            |> List.filter (fun (pv, ty) -> refKindOfTy ty = RKRef && (scalarLTy ty).IsNone && (dictTryFind ctx.VarScalar (key pv)).IsNone)
+            // a REF param roots in a plain slot; a GENERIC param with NO
+            // witness is on the canonical TAGGED form and roots the same
+            // way (the Dictionary's dictSlotH key went stale un-rooted);
+            // a GENERIC with a witness stays on ActiveGen's conditional
+            // rooting (at a raw stamp its W lane holds a raw even int the
+            // scanner must never chase); RAW/scalar params never root.
+            |> List.filter (fun (pv, ty) ->
+                (scalarLTy ty).IsNone && (dictTryFind ctx.VarScalar (key pv)).IsNone
+                && (match refKindOfTy ty with
+                    | RKRef -> true
+                    | RKGen -> (match prune ty with
+                                | TVar tv -> (dictTryFind ctx.Witness tv.Id).IsNone
+                                | _ -> true)
+                    | RKRaw -> false))
             |> List.map (fun (pv, _) -> pv, freshTmp ctx)
         else []
     for pv, slotReg in rootParams do dictSet ctx.Slotted (key pv) (LGet (wReg slotReg))
@@ -5384,7 +5461,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             |> List.choose (fun (pv, ty) ->
                 match prune ty with
                 | TVar tv when (dictTryFind ctx.VarScalar (key pv)).IsNone && (dictTryFind ctx.LSt.CellVars (key pv)).IsNone ->
-                    (match dictTryFind ctx.Witness tv.Id with Some w -> Some (ctx.Regs.[key pv], w) | None -> None)
+                    (match dictTryFind ctx.Witness tv.Id with Some w -> Some (regOf ctx (key pv), w) | None -> None)
                 | _ -> None)
          else [])
     let sink = vecNew ()
@@ -5404,6 +5481,22 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
             LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
+    // FPP_CONSCHECK: the shadow-stack pointer must be BALANCED across the
+    // body (pushes = pops on every path) — an imbalance desyncs every later
+    // frame's slots and the collector scans junk
+    let bodyLow2 =
+        if consCheckOn () then
+            let spSave = freshTmp ctx
+            let r2 = freshTmp ctx
+            chkSite <- chkSite + 1
+            let site = chkSite
+            eprintfn "SPSITE %d = %s" site dbgName
+            LDo ([ LSet (wReg spSave, LGetGlobal "$sp")
+                   LSet (wReg r2, bodyLow2)
+                   LIf (LPrim (NeW, [ LGetGlobal "$sp"; LGet (wReg spSave) ]),
+                        [ LCallVoidS ("$eprints", [ LCall ("$str_of_int", [ LConstW site ]) ]); LTrap ], []) ],
+                 LGet (wReg r2))
+        else bodyLow2
     let bodyLow = match retTy with W -> bodyLow2 | _ -> flatUnbox retTy bodyLow2
     // TEMP DEBUG: validate the freshly-lowered tree — every register it
     // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
@@ -5482,6 +5575,8 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             eprintfn "GAP %s (%s)" dbgName e0
         if not (e0.Contains "$class:" && e0.Contains "#") then
             vecAdd st.Warnings ("stubbed " + dbgName + " (" + e0 + ")")
+        else
+            vecAdd st.Warnings ("quietstub " + dbgName + " (" + e0 + ")")
         localsDone f
         // a stubbed INIT (a .NET-only top-level `let`, e.g. an Encoding object)
         // must NOT trap: _start runs every init at startup, so store a harmless

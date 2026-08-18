@@ -1226,3 +1226,39 @@ store funnel — the stale edge enters through an unchecked path; the
 resume plan is in the fpp-linear-fixpoint memory.
 
 Battery: 29/29, gchost byte-exact (bytes=82064 hash=451751650, 0 stubs).
+
+## §35 linear fixpoint arc, part 3 (2026-08-18/19)
+
+The corruption is SOLVED; the corpus fixpoint is 404 bytes from closing.
+
+* **Read-side conscheck** (FPP_CONSCHECK=1): every Slotted/register/env
+  variable read validates ref-looking values against fpprt_dbg_live
+  (numeric site ids; the emit prints a CCHKSITE side table on stderr),
+  plus a per-function shadow-$sp balance check. This pinned each hole in
+  minutes where tree-diffing took hours.
+* **Kind-aware operand rooting (lowRootedArgsK)** replaces both the old
+  isRef gate AND part-2's root-everything: a REF operand roots
+  unconditionally; a GENERIC operand with a witness roots CONDITIONALLY
+  on its refMask; a GENERIC without a witness is on the canonical tagged
+  form and roots unconditionally; RAW never roots. Root-everything was
+  UNSOUND: W lanes DO carry raw evens in stamped code (dictSlotH's hash
+  argument), and scanning them let the stale-edge tolerance NULL live
+  ints. rootParams follows the same rule (gen-with-witness stays on
+  ActiveGen).
+* **The Dictionary INDEXER is miscompiled under the linear self-host**:
+  `ctx.Regs.[key v]` returned garbage register ids at the EMatch
+  arm-binder/gen-binder/ActiveGen sites while dictTryFind at the same
+  keys answered correctly — every WasmLin-internal read now goes through
+  `regOf` (dictTryFind + loud failure). Standalone repros (string and
+  int keys, closures, fresh contexts) do NOT trigger it — the miscompile
+  needs its original context and is STILL OPEN as its own bug; regOf is
+  the workaround and the emitter is clean of the indexer.
+
+Corpus fixpoint state: stage-1 emits 55150 vs stage-0's 55554 — ZERO
+stubs, zero errors; 4 functions differ only in their witness-conditional
+slot blocks (stage-1's patGenBinders sees CONCRETE schemes and an empty
+ctx.Witness where .NET sees TVar-with-witness — a deterministic
+stamp-vs-canonical classification divergence in the self-hosted front
+half, the next session's target).
+
+Battery: 29/29; gchost byte-exact (82064/451751650, 0 stubs).
