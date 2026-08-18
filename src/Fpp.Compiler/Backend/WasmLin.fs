@@ -22,6 +22,7 @@ open Fpp.Prelude
 open Fpp.Analysis.Types
 open Fpp.Core.Ir
 open Fpp.Core.LowIR
+open Fpp.Core.Link
 open Fpp.Backend.WasmBinary
 open Fpp.Backend.EmitBin
 
@@ -339,7 +340,9 @@ let private gcTidRef (st : St) (shapeKey : string) (sizeBytes : int) (refoffs : 
         vecAdd st.TidRegs (t, sizeBytes, FK_STRUCT, List.length refoffs)
         dictSet st.TidRefoffs t refoffs
         if System.Environment.GetEnvironmentVariable "FPP_TIDDUMP" = "1" then
-            eprintfn "TID %d = %s (refoffs %s)" t shapeKey (String.concat "," (List.map string refoffs))
+            // (fun r -> string r), never bare `string`: a builtin conversion
+            // is not a first-class function under self-host
+            eprintfn "TID %d = %s (refoffs %s)" t shapeKey (String.concat "," (List.map (fun r -> string r) refoffs))
         t
 
 // intern a packed-scalar array tid AND map it to CID_ARRAY on first creation,
@@ -569,10 +572,18 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_v2i" [] [ "i32" ]
     // $atol: string pointer -> raw i64
     tyFunc m "$lt_i2j" [ "i32" ] [ "i64" ]
+    // WASI path_open: (dirfd, dirflags, path, len, oflags, rights, rights_inh, fdflags, retptr)
+    tyFunc m "$lt_po" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i64"; "i64"; "i32"; "i32" ] [ "i32" ]
 
 
 let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_write" "$fd_write" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+    // host FILE READS (readTextRaw/existsRaw): WASI against the preopened
+    // dir (fd 3) — what lets the SELF-HOSTED compiler load real sources
+    importFn m "wasi_snapshot_preview1" "path_open" "$path_open" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i64"; "i64"; "i32"; "i32" ] [ "i32" ]
+    importFn m "wasi_snapshot_preview1" "fd_read" "$fd_read" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
+    importFn m "wasi_snapshot_preview1" "fd_close" "$fd_close" [ "i32" ] [ "i32" ]
+    importFn m "wasi_snapshot_preview1" "fd_filestat_get" "$fd_filestat_get" [ "i32"; "i32" ] [ "i32" ]
     // GC mode imports fpprt's memory + API (all imports must precede declared
     // functions in the index space); the standalone path defines+exports its own
     if gc then importFpprt m else exportMem m "memory"
@@ -584,6 +595,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_of_char" "$lt_i2i"
     declFn m "$str_cat" "$lt_ii2i"
     declFn m "$prints" "$lt_i2v"
+    declFn m "$eprints" "$lt_i2v"
     declFn m "$ftoa6" "$lt_i2i"
     declFn m "$streq" "$lt_ii2i"
     declFn m "$str_starts" "$lt_ii2i"
@@ -613,6 +625,8 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$literCur" "$lt_i2i"
     declFn m "$atoi" "$lt_i2i"
     declFn m "$atol" "$lt_i2j"
+    declFn m "$readfile" "$lt_i2i"
+    declFn m "$fexists" "$lt_i2i"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -703,6 +717,95 @@ let private saddr (f : Fn) (n : int) : unit =
         gg f "$sbuf"
         if n <> 0 then (ic f n; ins f "i32.add")
     else ic f n
+
+// ---- WASI file reading (readTextRaw/existsRaw) ----------------------------
+// Scratch layout inside FMTBUF's 512 bytes (never live while formatting):
+// path UTF-8 at +0..199, the opened fd at +200, the filestat at +208 (64 B,
+// 8-aligned since FMTBUF is). The iovec staging reuses fd_write's slots.
+
+/// stage the path string `$s` as UTF-8 at FMTBUF (ASCII paths — a unit is a
+/// byte), leaving its length in `$n`
+let private stagePath (f : Fn) : unit =
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
+    ic f 0; ls f "$i"
+    blockE f "$spd"; loopE f "$spg"
+    lg f "$i"; lg f "$n"; ins f "i32.ge_s"; brIf f "$spd"
+    saddr f FMTBUF; lg f "$i"; ins f "i32.add"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store8"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$spg"; endB f; endB f
+
+/// path_open on the preopened dir (fd 3), rights = fd_read|fd_filestat_get;
+/// leaves the WASI errno on the stack, the fd at scratch FMTBUF+200
+let private emitPathOpen (f : Fn) : unit =
+    ic f 3; ic f 0
+    saddr f FMTBUF; lg f "$n"
+    ic f 0; lc f 0x200002L; lc f 0L; ic f 0
+    saddr f (FMTBUF + 200)
+    callf f "$path_open"
+
+// $readfile(s): read the file named by string s (relative to the preopened
+// dir) into a fresh Latin-1 string — one byte, one unit. 0 on any failure
+// (readTextRaw null -> None upstream). The bytes are read INTO the string's
+// own data area and widened in place back-to-front, so there is exactly one
+// allocation and nothing to root across it.
+let private emitReadFile (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$n" "i32"; local f "$i" "i32"; local f "$fd" "i32"; local f "$sz" "i32"
+    local f "$p" "i32"; local f "$got" "i32"; local f "$tot" "i32"
+    localsDone f
+    lg f "$s"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
+    stagePath f
+    emitPathOpen f
+    ifE f; ic f 0; ins f "return"; endB f
+    saddr f (FMTBUF + 200); mem f "i32.load"; ls f "$fd"
+    lg f "$fd"; saddr f (FMTBUF + 208); callf f "$fd_filestat_get"
+    ifE f; lg f "$fd"; callf f "$fd_close"; ins f "drop"; ic f 0; ins f "return"; endB f
+    saddr f (FMTBUF + 208); ic f 32; ins f "i32.add"; mem f "i64.load"; ins f "i32.wrap_i64"; ls f "$sz"
+    // a fresh string of $sz units; the alloc may move the scratch buffer
+    strAllocN f (fun () -> lg f "$sz")
+    emitSbufRefresh f
+    // read $sz bytes into the string's data area, in as many reads as WASI takes
+    ic f 0; ls f "$tot"
+    blockE f "$rfd"; loopE f "$rfg"
+    lg f "$tot"; lg f "$sz"; ins f "i32.ge_s"; brIf f "$rfd"
+    saddr f IOV_PTR; lg f "$p"; ic f 8; ins f "i32.add"; lg f "$tot"; ins f "i32.add"; mem f "i32.store"
+    saddr f IOV_LEN; lg f "$sz"; lg f "$tot"; ins f "i32.sub"; mem f "i32.store"
+    lg f "$fd"; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN; callf f "$fd_read"
+    brIf f "$rfd"
+    saddr f NWRITTEN; mem f "i32.load"; ls f "$got"
+    lg f "$got"; ins f "i32.eqz"; brIf f "$rfd"
+    lg f "$tot"; lg f "$got"; ins f "i32.add"; ls f "$tot"
+    br f "$rfg"; endB f; endB f
+    lg f "$fd"; callf f "$fd_close"; ins f "drop"
+    lg f "$tot"; lg f "$sz"; ins f "i32.ne"
+    ifE f; ic f 0; ins f "return"; endB f
+    // widen in place, back to front: unit i's write (bytes 2i, 2i+1) never
+    // lands on a byte j <= i still to be read
+    lg f "$sz"; ls f "$i"
+    blockE f "$rwd"; loopE f "$rwg"
+    lg f "$i"; ins f "i32.eqz"; brIf f "$rwd"
+    lg f "$i"; ic f 1; ins f "i32.sub"; ls f "$i"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ins f "i32.add"; mem f "i32.load8_u"
+    mem f "i32.store16"
+    br f "$rwg"; endB f; endB f
+    lg f "$p"
+    endFn f
+
+// $fexists(s): path_open succeeds -> 1, else 0 (bools are RAW words here)
+let private emitFexists (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$n" "i32"; local f "$i" "i32"
+    localsDone f
+    lg f "$s"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
+    stagePath f
+    emitPathOpen f
+    ifE f; ic f 0; ins f "return"; endB f
+    saddr f (FMTBUF + 200); mem f "i32.load"; callf f "$fd_close"; ins f "drop"
+    ic f 1
+    endFn f
 
 let private emitFtoa6 (m : Mod) : unit =
     let f = beginFn m [ "$x" ]
@@ -1049,7 +1152,7 @@ let private emitListIter (m : Mod) : unit =
 // $prints(s): UTF-16 -> UTF-8 into PRINTBUF, then fd_write(1). Handles the
 // BMP (1/2/3-byte forms); surrogate pairs are written as their raw units
 // (adequate for slice 1's ASCII-and-Latin output).
-let private emitPrints (m : Mod) : unit =
+let private emitPrintsFd (m : Mod) (fd : int) : unit =
     let f = beginFn m [ "$s" ]
     local f "$len" "i32"; local f "$i" "i32"; local f "$w" "i32"; local f "$u" "i32"
     localsDone f
@@ -1084,12 +1187,15 @@ let private emitPrints (m : Mod) : unit =
     endB f
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$pl"; endB f; endB f
-    // iovec = (PRINTBUF, w - PRINTBUF); fd_write(1, IOV, 1, NWRITTEN)
+    // iovec = (PRINTBUF, w - PRINTBUF); fd_write(fd, IOV, 1, NWRITTEN)
     saddr f IOV_PTR; saddr f PRINTBUF; mem f "i32.store"
     saddr f IOV_LEN; lg f "$w"; saddr f PRINTBUF; ins f "i32.sub"; mem f "i32.store"
-    ic f 1; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN
+    ic f fd; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN
     callf f "$fd_write"; ins f "drop"
     endFn f
+
+let private emitPrints (m : Mod) : unit = emitPrintsFd m 1
+let private emitEprints (m : Mod) : unit = emitPrintsFd m 2
 
 // $streq(a, b): value equality of two strings. 1 when equal, 0 otherwise —
 // same pointer short-circuits, then length, then unit-by-unit. String
@@ -2305,7 +2411,17 @@ let rec private refKindOfExprC (st : St) (e : Expr) : RefKind =
         // field mis-traced as a pointer in a tuple/record's tagged slot.
         (match recFieldTy st owner f with
          | Some ty when rawScalarName (if ty.StartsWith "&" then ty.Substring 1 else ty) -> RKRaw
-         | _ -> refKindOfExpr e)
+         | Some ty0 ->
+             // a CONCRETE non-scalar field is a ref (or an odd-tagged word,
+             // which the shadow-stack scanner skips) — classifying it RKGen
+             // left `x.Field` call arguments UNROOTED across allocating
+             // sibling arguments, the wandering stale-read that corrupted
+             // the self-hosted linear emitter's own lowering (ctx.Regs reads
+             // through a moved dict gave garbage register ids)
+             let ty = if ty0.StartsWith "&" then ty0.Substring 1 else ty0
+             if ty <> "" && not (ty.StartsWith "#") && not (ty.StartsWith "'") && not (ty.StartsWith "?") then RKRef
+             else refKindOfExpr e
+         | None -> refKindOfExpr e)
     | _ -> refKindOfExpr e
 
 // the element witness register for a comparison of two operands whose static
@@ -2933,7 +3049,8 @@ let private reloadSlottedGen (ctx : LowCtx) (inner : LExpr) : LExpr =
 // ref `kind` live across the allocating `scanTrailing e`). Raw/scalar binders
 // and cells are excluded, as in shouldSlot.
 let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list =
-    let keep v sch = (dictTryFind ctx.LSt.CellVars (key v)).IsNone && (scalarLTy sch.Body).IsNone && refKindOfTy sch.Body = RKRef
+    let keep (v : VarId) (sch : Scheme) =
+        (dictTryFind ctx.LSt.CellVars (key v)).IsNone && (scalarLTy sch.Body).IsNone && refKindOfTy sch.Body = RKRef
     match pat with
     | PVar (v, sch) -> if keep v sch then [ v, sch ] else []
     | PAs (p, v, sch) -> (if keep v sch then [ v, sch ] else []) @ patRefBinders ctx p
@@ -3831,6 +3948,17 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let msg = match List.rev args with m :: _ -> coreToLowE ctx m | [] -> LConstW 0
         LDo ([ LThrow (lowFailure ctx msg) ], lowInt 0)
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
+    // the DEBUG channel: Lower expands eprintf/eprintfn to `eprints` (fd 2)
+    | EApp (EUnknown "eprints", [ a ]) -> LDo ([ LCallVoidS ("$eprints", [ coreToLowE ctx a ]) ], lowInt 0)
+    // a bare/unexpanded eprintfn reference still no-ops rather than gapping
+    | EApp (EUnknown ("eprintfn" | "eprintf"), args) ->
+        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
+    // System.Environment.GetEnvironmentVariable: the debug-probe gate. A
+    // null answer turns every probe OFF instead of stubbing the whole
+    // function that carries it (which silently trap-stubbed the ENTIRE
+    // linear emitter under self-host — gcTid, emitLowE, emitLinearImpl)
+    | EApp (EField (EField (EUnknown "System", "Environment", _), "GetEnvironmentVariable", _), args) ->
+        LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     // string of a char: a fresh one-unit string (NOT the decimal of its code)
     | EApp (EUnknown "string#c", [ a ]) -> LCall ("$str_of_char", [ (coreToLowE ctx a) ])
     // string of a string is the identity
@@ -3843,6 +3971,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // being emitted); other host externs still answer null.
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when v.Name = "preludeSourceRaw" && preludeSrc <> "" ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowStrConstRaw st preludeSrc)
+    // the FILE externs are real now, over WASI against the preopened dir —
+    // what lets the SELF-HOSTED compiler load sources (the linear fixpoint)
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when v.Name = "readTextRaw" ->
+        LCall ("$readfile", [ coreToLowE ctx a ])
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when v.Name = "existsRaw" ->
+        LCall ("$fexists", [ coreToLowE ctx a ])
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when v.Name = "canonicalizeRaw" ->
+        coreToLowE ctx a
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp (((EVar (v, _) | EVarI (v, _, _)) as hd), args)
@@ -4002,7 +4138,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // row, the slot the column; the word there is the impl's table index.
         // Under GC the vtable is a fpprt array in a root slot (data past the
         // [tag][len] header), read fresh so a collection's move is seen.
-        let vtDispatch () =
+        let vtDispatchWith (argEs : LExpr list) =
             let slot = match dictTryFind st.SlotOf (bi + "|" + method) with Some s -> s | None -> 0
             let cid = lowHeaderCid (wReg t)
             let vtBase =
@@ -4011,7 +4147,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let idxAddr =
                 LPrim (AddW, [ vtBase
                                LPrim (MulW, [ LPrim (AddW, [ LPrim (MulW, [ cid; LConstW st.NSlots ]); LConstW slot ]); LConstW 4 ]) ])
-            LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), LGet (wReg t) :: List.map (coreToLowE ctx) args)
+            LCallIdx (1 + List.length args, LLoad (W, idxAddr, 0), LGet (wReg t) :: argEs)
+        let vtDispatch () = vtDispatchWith (List.map (coreToLowE ctx) args)
         // a list has no IEnumerable vtable row, so route the enumerator protocol
         // to the built-in iterator when the receiver IS a built-in seq / iterator,
         // else fall through to the vtable (an object-expression IEnumerator).
@@ -4034,6 +4171,19 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 branch (LCall ("$literNext", [ LGet (wReg t) ])) (isBuiltinIter ())
              elif bi = "IEnumerator" && method = "Current" then
                 branch (LCall ("$literCur", [ LGet (wReg t) ])) (isBuiltinIter ())
+             elif gc && not (List.isEmpty args) then
+                // ROOT the receiver and every argument across each other's
+                // (possibly allocating) evaluations: register t and the wasm
+                // operand stack are invisible to the collector, so the old
+                // shape (set t, then evaluate args) read a STALE receiver —
+                // and an earlier arg went stale across a later allocating
+                // one. This was the wandering `ctx.Regs.[key v]` garbage-
+                // register corruption in the self-hosted linear emitter.
+                let setup, gets =
+                    lowRootedArgs ctx ((true, W, coreToLowE ctx recv) :: (args |> List.map (fun a -> true, W, coreToLowE ctx a)))
+                (match gets with
+                 | recvG :: argGs -> LDo (setup @ [ LSet (wReg t, recvG) ], vtDispatchWith argGs)
+                 | [] -> LDo ([ LSet (wReg t, coreToLowE ctx recv) ], vtDispatch ()))
              else
                 LDo ([ LSet (wReg t, coreToLowE ctx recv) ], vtDispatch ()))
     | ETry (body, clauses) ->
@@ -4754,7 +4904,12 @@ and private lowRootedArgs (ctx : LowCtx) (args : (bool * LTy * LExpr) list) : LS
     let n = List.length args
     // (root-across-later, register, regTy). Only a WORD arg can be a pointer to
     // root; a scalar (f64/i64) rides its own typed local and is never rooted.
-    let ts = args |> List.mapi (fun i (isRef, ty, e) -> (gc && isRef && ty = W && i < n - 1), { Id = freshTmpT ctx ty; RTy = ty }, e)
+    // EVERY W-lane value is scan-safe (uniform words are tagged-or-pointer;
+    // the scanner skips odd words), so root them ALL — the isRef gate left
+    // RKGen-classified args (field reads, member-call results) UNROOTED
+    // across allocating siblings, the wandering stale-read corrupting the
+    // self-hosted linear emitter. isRef stays only as documentation.
+    let ts = args |> List.mapi (fun i (_isRef, ty, e) -> (gc && ty = W && i < n - 1), { Id = freshTmpT ctx ty; RTy = ty }, e)
     let eval = ts |> List.collect (fun (root, r, e) ->
         LSet (r, e) :: (if root then gcPushStmts (LGet r) else []))
     let pops =
@@ -4977,7 +5132,10 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     match e with
     | LConstW n -> ic f n
     | LConstL n -> lc f n
-    | LConstF x -> fc f (Fpp.Prelude.doubleBits x)
+    // bare `doubleBits`, not the Fpp.Prelude path: the name is BACKEND-OWNED
+    // under self-host and only the unqualified use lowers to the builtin
+    | LConstF x -> fc f (doubleBits x)
+    | LGet r when r.Id > 100000000 -> failwith ("bad reg " + string r.Id + " while emitting " + curFnDbg)
     | LGet r -> lg f (regNm r)
     | LGetGlobal g ->
         // GC: a top-level global lives in the root table — load its slot
@@ -5187,12 +5345,77 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         else
             let resReg = freshTmp ctx
             let pushes = rootParams |> List.collect (fun (pv, slotReg) ->
+                let pvReg = match dictTryFind ctx.Regs (key pv) with Some i -> i | None -> 0 - 1
                 [ LSet (wReg slotReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
-                  LStore (W, LGet (wReg slotReg), 0, LGet (wReg ctx.Regs.[key pv]))
+                  LStore (W, LGet (wReg slotReg), 0, LGet (wReg pvReg))
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
             LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
     let bodyLow = match retTy with W -> bodyLow2 | _ -> flatUnbox retTy bodyLow2
+    // TEMP DEBUG: validate the freshly-lowered tree — every register it
+    // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
+    let mutable maxReg = -1
+    let seeR (r : LReg) = if r.Id > maxReg then maxReg <- r.Id
+    let rec seeE (e : LExpr) : unit =
+        match e with
+        | LConstW _ | LConstL _ | LConstF _ | LGetGlobal _ -> ()
+        | LGet r -> seeR r
+        | LLoad (_, a, _) -> seeE a
+        | LPrim (_, xs) | LCall (_, xs) -> for x in xs do seeE x
+        | LAlloc a -> seeE a
+        | LCallIndirect (_, a, xs) | LCallIdx (_, a, xs) -> seeE a; (for x in xs do seeE x)
+        | LDo (ss, e2) -> (for st2 in ss do seeS st2); seeE e2
+    and seeS (st2 : LStmt) : unit =
+        match st2 with
+        | LStore (_, a, _, b) -> seeE a; seeE b
+        | LSet (r, e2) -> seeR r; seeE e2
+        | LSetGlobal (_, e2) | LEval e2 | LBreakIf (_, e2) | LThrow e2 | LReturn e2 -> seeE e2
+        | LCallVoidS (_, xs) -> for x in xs do seeE x
+        | LIf (c, a, b) -> seeE c; (for x in a do seeS x); (for x in b do seeS x)
+        | LWhile (c, b) -> seeE c; for x in b do seeS x
+        | LBlock (_, b) -> for x in b do seeS x
+        | LBreak _ | LTrap -> ()
+        | LTryStmt (b, r1, r2, hs) -> seeE b; seeR r1; seeR r2; for x in hs do seeS x
+    seeE bodyLow
+    let rec dumpE (e : LExpr) : string =
+        match e with
+        | LConstW n -> "w" + string n
+        | LConstL _ -> "l"
+        | LConstF _ -> "f"
+        | LGet r -> "g" + string r.Id
+        | LGetGlobal n -> "G(" + n + ")"
+        | LLoad (_, a, o) -> "ld[" + dumpE a + "+" + string o + "]"
+        | LPrim (_, xs) -> "p(" + String.concat " " (List.map dumpE xs) + ")"
+        | LCall (n, xs) -> "c:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
+        | LAlloc a -> "al(" + dumpE a + ")"
+        | LCallIndirect (_, a, xs) -> "ci(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
+        | LCallIdx (i, a, xs) -> "cx" + string i + "(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
+        | LDo (ss, e2) -> "do{" + String.concat "; " (List.map dumpS ss) + "}" + dumpE e2
+    and dumpS (st2 : LStmt) : string =
+        match st2 with
+        | LStore (_, a, o, b) -> "st[" + dumpE a + "+" + string o + "]=" + dumpE b
+        | LSet (r, e2) -> "s" + string r.Id + "=" + dumpE e2
+        | LSetGlobal (n, e2) -> "SG(" + n + ")=" + dumpE e2
+        | LEval e2 -> "ev " + dumpE e2
+        | LCallVoidS (n, xs) -> "cv:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
+        | LIf (c, a, b) -> "if(" + dumpE c + "){" + String.concat "; " (List.map dumpS a) + "}{" + String.concat "; " (List.map dumpS b) + "}"
+        | LWhile (c, b) -> "wh(" + dumpE c + "){" + String.concat "; " (List.map dumpS b) + "}"
+        | LBlock (n, b) -> "bl:" + n + "{" + String.concat "; " (List.map dumpS b) + "}"
+        | LBreakIf (n, e2) -> "bi:" + n + "(" + dumpE e2 + ")"
+        | LBreak n -> "br:" + n
+        | LTrap -> "trap"
+        | LReturn e2 -> "ret " + dumpE e2
+        | LThrow e2 -> "th " + dumpE e2
+        | LTryStmt (b, r1, r2, hs) -> "try{" + dumpE b + "}r" + string r1.Id + ",r" + string r2.Id + "{" + String.concat "; " (List.map dumpS hs) + "}"
+    if maxReg >= ctx.NReg then
+        // corrupt-at-build sanity: a register the lowering never allocated
+        // in this function's tree means state corruption (the self-host GC
+        // staleness class) — fail LOUDLY, never emit a bad module
+        err st ("lowered tree of " + dbgName + " names register " + string maxReg
+                + " of " + string ctx.NReg + " — corrupt lowering state; tree: "
+                + (let d = dumpE bodyLow in if d.Length > 2000 then d.Substring (0, 2000) else d))
+    if System.Environment.GetEnvironmentVariable "FPP_TREE_DUMP" = dbgName then
+        eprintfn "TREE %s %s" dbgName (dumpE bodyLow)
     st.GapSink <- None
     let f = beginFn m pnames
     if vecLen sink > 0 then
@@ -5202,6 +5425,8 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         // A SYMBOLIC class marker ("#N") sits only in an unstamped TEMPLATE
         // whose stamps carry the real instantiation — expected, kept quiet.
         let e0 = vecGet sink 0
+        if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GAP_DUMP")) then
+            eprintfn "GAP %s (%s)" dbgName e0
         if not (e0.Contains "$class:" && e0.Contains "#") then
             vecAdd st.Warnings ("stubbed " + dbgName + " (" + e0 + ")")
         localsDone f
@@ -5290,6 +5515,8 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     let bodyLow = if List.isEmpty witLoads then bodyLow else LDo (witLoads, bodyLow)
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
+        if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GAP_DUMP")) then
+            eprintfn "GAPLAM %s (%s)" lamName (vecGet sink 0)
         vecAdd st.Warnings ("stubbed lambda " + lamName + " (" + vecGet sink 0 + ")")
         localsDone f
         ins f "unreachable"
@@ -5948,10 +6175,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
-    emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitFtoa6 m; emitStreq m
+    emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m
+    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
@@ -5974,7 +6201,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             // a stamped generic-class member: constant witnesses for its class
             // type params (Link forwards the enclosingSubst it already computes).
             let constWits =
-                match (if gc then dictTryFind Fpp.Core.Link.stampedClassWits (v.Path, v.Offset) else None) with
+                match (if gc then dictTryFind stampedClassWits (v.Path, v.Offset) else None) with
                 | Some pairs ->
                     pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
                 | None -> []

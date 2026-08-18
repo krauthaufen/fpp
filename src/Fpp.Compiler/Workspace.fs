@@ -997,6 +997,13 @@ type Workspace() =
     member this.EmitProgramWasmLinear () : byte[] * string list =
         this.EmitProgramWasmLinearWith false
 
+    /// LowIR wasm-linear in REACTOR mode (the `--gc` flavor: fpprt imports,
+    /// Whippet heap). One method so the linear-fixpoint DRIVER and harness
+    /// cannot disagree about the flag.
+    member this.EmitProgramWasmReactor () : byte[] * string list =
+        Fpp.Backend.WasmLin.gc <- true
+        this.EmitProgramWasmLinearWith true
+
     /// `low = true` routes function bodies through the shared LowIR
     /// (Core/LowIR.fs) where the subset covers them, else the hand-lowering.
     member this.EmitProgramWasmLinearWith (low : bool) : byte[] * string list =

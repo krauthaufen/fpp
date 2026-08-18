@@ -895,6 +895,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         stmt f ("fpp_prints(" + sref x + ");")
         unitV ()
+    | EApp (EUnknown "eprints", [ a ]) ->
+        let x = emitE st f a
+        stmt f ("fpp_eprints(" + sref x + ");")
+        unitV ()
     | EApp (EUnknown "printb", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_print(fpp_bool_to_string(" + sref x + "));")

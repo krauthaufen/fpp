@@ -2822,6 +2822,12 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         gcT f "ref.cast" "$str"
         callf f "$prints"
         pushUnit f
+    // the eprintf/eprintfn channel: dropped on this backend (stdout is the
+    // fixpoint's data channel; debug output was never visible here)
+    | EApp (EUnknown "eprints", [ a ]) ->
+        emitNode st f lv a
+        ins f "drop"
+        pushUnit f
     | EApp (EUnknown "monoms", [ u ]) ->
         // the monotonic clock, milliseconds as f64 — WASI on this backend
         emitNode st f lv u

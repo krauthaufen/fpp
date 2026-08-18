@@ -152,11 +152,19 @@ let generateHost (files : (string * string) list) : string =
 // the BINARY backend is the only backend: every fixpoint is a byte fixpoint
 let binMode = true
 
+/// `linear` moves the whole fixpoint onto the wasm-LINEAR backend: stage-0
+/// emits through LowIR/WasmLin, stage-1 is that module merged with the fpprt
+/// reactor running under wasmtime, its sources served as real FILES through
+/// the WASI preopen (readTextRaw is path_open/fd_read there), and it must
+/// re-emit the same LINEAR bytes. Composes with `self`.
+let linMode = System.Environment.GetCommandLineArgs () |> Array.contains "linear"
+
 let emit (label : string) (files : (string * string) list) : string =
     let ws = Workspace()
     for path, text in files do ws.SetFileText path text
     let wat, errs =
-        let bytes, errs = ws.EmitProgramWasm ()
+        let bytes, errs =
+            if linMode then ws.EmitProgramWasmReactor () else ws.EmitProgramWasm ()
         System.Text.Encoding.Latin1.GetString bytes, errs
     if not (List.isEmpty errs) then
         printfn "%s: %d emit errors" label errs.Length
@@ -237,7 +245,9 @@ let report (expected : string) (actual : string) =
 /// two stages on a program neither of them is.
 let selfHost = System.Environment.GetCommandLineArgs () |> Array.contains "self"
 
-let driverPath = root + "/tests/bootstrap/compiledrive-bin.fpp"
+let driverPath =
+    if linMode then root + "/tests/bootstrap/compiledrive-lin.fpp"
+    else root + "/tests/bootstrap/compiledrive-bin.fpp"
 
 /// The names the corpus is SERVED under. In self mode they are the
 /// compiler's own files, which is what the driver must name too.
@@ -284,10 +294,20 @@ if binMode then System.IO.File.WriteAllBytes (stage1Path, System.Text.Encoding.L
 else System.IO.File.WriteAllText (stage1Path, stage1)
 printfn "stage-1: %d bytes of %s" stage1.Length (if binMode then "wasm" else "wat")
 
-// the host serves the corpus AND the prelude the compiler reads at startup
+// the host serves the corpus AND the prelude the compiler reads at startup.
+// In LINEAR mode the "host" is the filesystem itself: the corpus is written
+// into a served directory and stage-1 reads it over WASI (the prelude is
+// baked into the module by the linear emitter, so it is not served).
 let hostPath = scratch + "/env.wat"
-System.IO.File.WriteAllText (hostPath,
-    generateHost (corpusFiles @ [ "prelude.fpp", readSource (root + "/stdlib/prelude.fpp") ]))
+let srvDir = scratch + "/srv"
+if linMode then
+    System.IO.Directory.CreateDirectory srvDir |> ignore
+    for name, text in corpusFiles do
+        System.IO.File.WriteAllBytes (System.IO.Path.Combine (srvDir, name),
+                                      System.Text.Encoding.Latin1.GetBytes text)
+else
+    System.IO.File.WriteAllText (hostPath,
+        generateHost (corpusFiles @ [ "prelude.fpp", readSource (root + "/stdlib/prelude.fpp") ]))
 
 // 64 MB of wasm stack: the compiler is recursive-descent throughout (parser,
 // type walks, emission), and wasmtime's 1 MB default is not a statement about
@@ -298,7 +318,29 @@ let out, err, code =
     // nearly half the run was CopyingHeap::forward/scan_field. Sizing the
     // heap to the job took the wasm side from 63s to 36s and changes nothing
     // about the answer.
-    run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864"
+    if linMode then
+        // merge the module with the fpprt reactor (Whippet GC + runtime) the
+        // way the gchost check does, then run it against the served corpus
+        let reactor =
+            match System.Environment.GetEnvironmentVariable "FPPRT_REACTOR" with
+            | null | "" -> "/tmp/bigreactor/fpprt_reactor.wasm"
+            | p -> p
+        let wasmMerge =
+            let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
+            home + "/emsdk/upstream/bin/wasm-merge"
+        let mergedWat = scratch + "/stage1-merged.wat"
+        let mergedWasm = scratch + "/stage1-merged.wasm"
+        let _, merr, mcode =
+            run wasmMerge ("-all " + reactor + " fpprt " + stage1Path + " mutator -S -o " + mergedWat)
+        if mcode <> 0 then (printfn "wasm-merge failed: %s" (merr.Substring (0, min 800 merr.Length)); exit 1)
+        let _, perr, pcode = run "wasm-tools" ("parse " + mergedWat + " -o " + mergedWasm)
+        if pcode <> 0 then (printfn "wasm-tools parse failed: %s" (perr.Substring (0, min 800 perr.Length)); exit 1)
+        run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=536870912"
+                      + " --env FPPRT_HEAP_MB=1024"
+                      + " --dir " + srvDir + "::."
+                      + " " + mergedWasm)
+    else
+        run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864"
                   + " -O gc-heap-initial-size=1073741824 -O gc-heap-reservation=4294967296"
                   + " --preload env=" + hostPath + " " + stage1Path)
 if code <> 0 then

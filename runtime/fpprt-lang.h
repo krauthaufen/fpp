@@ -123,6 +123,7 @@ V fpp_str_concat(V a, V b);
 V fpp_str_method(const char *m, V recv, V *args, size_t nargs);
 int fpp_str_cmp(V a, V b);
 void fpp_prints(V s);   /* NO newline — printfn-formatted text carries its own */
+void fpp_eprints(V s);  /* same, to stderr — the eprintf/eprintfn channel */
 
 /* ---- boxes ------------------------------------------------------------- */
 

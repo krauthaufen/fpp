@@ -1186,7 +1186,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some h ->
                      (match tokensOf h |> List.tryHead with
                       | Some t ->
-                          List.contains t.Text [ "sprintf"; "printf"; "printfn"; "failwithf" ]
+                          List.contains t.Text [ "sprintf"; "printf"; "printfn"; "failwithf"; "eprintf"; "eprintfn" ]
                           && (dictTryFind useDefs t.Offset).IsNone
                       | None -> false)
                  | None -> false) ->
@@ -1333,6 +1333,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    | "sprintf" -> total
                                    | "printf" -> EApp (EUnknown "prints", [ total ])
                                    | "printfn" -> EApp (EUnknown "prints", [ EPrim ("+t", [ total; ELit (LString "\"\\n\"") ]) ])
+                                   | "eprintf" -> EApp (EUnknown "eprints", [ total ])
+                                   | "eprintfn" -> EApp (EUnknown "eprints", [ EPrim ("+t", [ total; ELit (LString "\"\\n\"") ]) ])
                                    | _ -> EApp (EUnknown "failwith", [ total ])
                                if missing = 0 then whole else ELam (lamBinds, whole)
                            | Error msg -> note ft.Offset msg)

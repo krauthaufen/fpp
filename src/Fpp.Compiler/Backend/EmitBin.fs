@@ -270,7 +270,7 @@ let freshLocal (f : Fn) (prefix : string) (ty : string) : string =
 let localIdx (f : Fn) (name : string) : int =
     match dictTryFind f.LocalIdx name with
     | Some i -> i
-    | None -> -1
+    | None -> failwith ("unknown local " + name + " (a -1 here became emitU32's negative-index failure, nameless)")
 
 /// close the body: the locals vector is PREPENDED logically — since the size
 /// patch wraps everything, we emitted instructions into a scratch? No: we

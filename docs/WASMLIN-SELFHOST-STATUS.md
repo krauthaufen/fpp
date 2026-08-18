@@ -1147,3 +1147,58 @@ print "?" for structures today.
 
 Battery: 29/29, conformance 28 suites / 1478 positive, 46 neg, fixpoint
 self byte-exact, gchost byte-exact (bytes=82064 hash=451751650).
+
+## §33 linear fixpoint arc, part 1 (2026-08-18)
+
+Goal: THE fixpoint on the linear backend — the compiler compiled to
+linear (reactor mode) re-emits itself byte-exactly. Harness and a large
+bug-tail chunk shipped; the last blocker is an open GC-staleness hunt.
+
+Shipped:
+* **WASI file reads on wasm-linear**: path_open/fd_read/fd_close/
+  fd_filestat_get imports, $readfile (reads into the fresh string's own
+  data area, widens back-to-front — one alloc, nothing rooted across
+  it), $fexists. The readTextRaw/existsRaw/canonicalizeRaw externs are
+  REAL now (`wasmtime --dir srv::.`), which makes the self-hosted
+  compiler able to load actual sources.
+* **eprintf/eprintfn work under self-host**: Lower expands them through
+  the printf machinery to `eprints`; WasmLin emits $eprints (the
+  $prints body parameterized by fd); C runtime grew fpp_eprints;
+  BinDriver evaluates-and-drops. stderr debugging inside stage-1 works.
+* **fixpoint.fsx `linear` mode** (composes with `self`): stage-0 emits
+  via the new Workspace.EmitProgramWasmReactor (gc<-true + LowIR — ONE
+  method so driver and harness cannot disagree); corpus served as real
+  files; wasm-merge with the fpprt reactor; compiledrive-lin.fpp.
+* **The silently-stubbed emitter**: WasmLin/CEmit/parts of Workspace —
+  14 functions including emitLinearImpl and emitLowE — were trap-stubs
+  under self-host, killed by their own debug env probes (GetEnvironment-
+  Variable → whole-function gap) and eprintfn. Env reads now answer
+  null on linear; probes live. Also: `List.map string` in gcTidRef, the
+  `Fpp.Prelude.doubleBits`/`Fpp.Core.Link.stampedClassWits` qualified
+  paths (backend-owned/unresolvable under self-host — now bare + open).
+* **Three GC rooting holes fixed** (the class: values in unscanned wasm
+  locals/operand stack across allocating siblings; every semi-space
+  collection in the window corrupts them): (1) refKindOfExprC classifies
+  concrete non-scalar FIELD reads RKRef (was RKGen = never rooted);
+  (2) lowRootedArgs roots ALL W-lane args (uniform words are tagged-or-
+  pointer, always scan-safe — the isRef gate was the hole); (3)
+  EIfaceCall roots the receiver and every argument across each other's
+  evaluations (the old shape read a stale receiver register after
+  allocating args, and args off the unscanned operand stack).
+* **Hardening**: a lowered tree naming a register the function never
+  allocated is now a loud ERROR with a tree dump (corrupt-lowering
+  sanity walk in emitFuncLow); localIdx failures carry the local's name;
+  FPP_TREE_DUMP=<fn> dumps a function's lowered tree.
+* The deployed fpprt reactor (/tmp/bigreactor) was STALE — predated the
+  gc-stale-edge fix (fpp runtime 46e037d); rebuilt and redeployed.
+  TODO: the reactor build should be a repo make target, not a /tmp
+  artifact.
+
+OPEN (the blocker): stage-1 still corrupts one lowering deterministically
+(fn $f2029100283, a conditional witness-slot push naming register 609 of
+22). Deterministic ≠ not-GC: the corpus's allocation schedule is
+deterministic, so stale windows repeat exactly. The debug loop, tree
+dumps, and suspect list (lowApply infos slotWitness path, EMatch arm
+slotting, freshTmp-through-stale-ctx) are in the fpp-linear-fixpoint
+memory. Battery stays 29/29 and gchost byte-exact (bytes=82064
+hash=451751650, 0 stubs — the stub fixes also cleaned the wasm-GC leg).

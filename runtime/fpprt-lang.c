@@ -131,7 +131,7 @@ V fpp_str_c16(const char *b, size_t units) {
   return s;
 }
 
-void fpp_prints(V s) {
+static void fpp_prints_to(V s, FILE *out) {
   uint16_t *u = fpp_str_units(s);
   size_t n = fpp_str_len(s);
   for (size_t i = 0; i < n; i++) {
@@ -141,22 +141,25 @@ void fpp_prints(V s) {
       cp = 0x10000 + ((cp - 0xd800) << 10) + (u[i + 1] - 0xdc00);
       i++;
     }
-    if (cp < 0x80) fputc((int)cp, stdout);
+    if (cp < 0x80) fputc((int)cp, out);
     else if (cp < 0x800) {
-      fputc(0xc0 | (cp >> 6), stdout);
-      fputc(0x80 | (cp & 0x3f), stdout);
+      fputc(0xc0 | (cp >> 6), out);
+      fputc(0x80 | (cp & 0x3f), out);
     } else if (cp < 0x10000) {
-      fputc(0xe0 | (cp >> 12), stdout);
-      fputc(0x80 | ((cp >> 6) & 0x3f), stdout);
-      fputc(0x80 | (cp & 0x3f), stdout);
+      fputc(0xe0 | (cp >> 12), out);
+      fputc(0x80 | ((cp >> 6) & 0x3f), out);
+      fputc(0x80 | (cp & 0x3f), out);
     } else {
-      fputc(0xf0 | (cp >> 18), stdout);
-      fputc(0x80 | ((cp >> 12) & 0x3f), stdout);
-      fputc(0x80 | ((cp >> 6) & 0x3f), stdout);
-      fputc(0x80 | (cp & 0x3f), stdout);
+      fputc(0xf0 | (cp >> 18), out);
+      fputc(0x80 | ((cp >> 12) & 0x3f), out);
+      fputc(0x80 | ((cp >> 6) & 0x3f), out);
+      fputc(0x80 | (cp & 0x3f), out);
     }
   }
 }
+
+void fpp_prints(V s) { fpp_prints_to(s, stdout); }
+void fpp_eprints(V s) { fpp_prints_to(s, stderr); }
 
 void fpp_print(V s) {
   fpp_prints(s);
