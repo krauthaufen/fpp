@@ -6641,6 +6641,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                        | None -> ())
                   | _ -> ())
              | None -> ())
+            // the GETTER registers like the setter does: `get_P` is what the
+            // static-through-type check reads to exempt a property — with only
+            // a `set_P` entry, a GET-ONLY static property (`static member val
+            // RO = 7`) was flagged "instance member — call it on an instance"
+            (match accOf "get", nameTok with
+             | Some ga, Some pn ->
+                 (match tokensOf ga |> List.tryFind (fun t -> t.Kind = Ident) with
+                  | Some kt ->
+                      registerField (tyName + ".get_" + pn.Text)
+                          { TypeName = tyName; Params = classParams; Quantified = []
+                            FieldType = propTy
+                            DefKey = Some (path, kt.Offset); IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
+                  | None -> ())
+             | _ -> ())
             st.ExitLevel ()
             (match nameTok with
              | Some t ->

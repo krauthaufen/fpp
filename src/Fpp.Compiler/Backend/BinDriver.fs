@@ -2154,12 +2154,29 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
                 lg f t
                 gcT f "ref.test" "$obj"
                 ins f "i32.or"
+            elif List.contains tn [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ] then
+                lg f t
+                gcAbs f "ref.test" "i31"
+                lg f t
+                gcT f "ref.test" "$boxi"
+                ins f "i32.or"
+            elif tn = "float" then
+                lg f t
+                gcT f "ref.test" "$boxf"
+            elif tn = "int64" || tn = "uint64" then
+                lg f t
+                gcAbs f "ref.test" "i31"
+                lg f t
+                gcT f "ref.test" "$boxl"
+                ins f "i32.or"
             elif (dictTryFind st.IfaceName tn).IsSome then
                 classIdTest (match dictTryFind st.ImplsOf tn with Some s -> s | None -> [])
             else
                 classIdTest (match dictTryFind st.SubsOf tn with Some s -> s | None -> [ tn ])
         if not ((dictTryFind st.ObjRec tn).IsSome || (dictTryFind st.IfaceName tn).IsSome
-                || tn = "list" || tn = "array" || tn = "string" || tn = "seq" || tn = "IEnumerable") then
+                || tn = "list" || tn = "array" || tn = "string" || tn = "seq" || tn = "IEnumerable"
+                || List.contains tn [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32"
+                                      "float"; "int64"; "uint64" ]) then
             err st ("binary: cannot downcast to " + tn + ": not a class")
             refNull f "any"
         else
@@ -2539,7 +2556,7 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         (match target, src with
          | "string", "t" -> emitA ()
          | "int", "t" | "uint32", "t" -> strA (); callf f "$atoi"; callf f "$ofi"
-         | "int64", "t" -> strA (); callf f "$atol"; callf f "$ofl"
+         | "int64", "t" | "uint64", "t" -> strA (); callf f "$atol"; callf f "$ofl"
          | "byte", "t" -> strA (); callf f "$atoi"; mask8 (); callf f "$ofi"
          | "sbyte", "t" -> strA (); callf f "$atoi"; sext8 (); callf f "$ofi"
          | "float", "t" -> strA (); callf f "$atof"; callf f "$off"
@@ -4112,6 +4129,28 @@ and private emitPat (st : St) (f : Fn) (lv : Dict<string * int, string>)
         elif tn = "string" then
             lg f slot
             gcT f "ref.test" "$str"
+        // boxed SCALARS: an int is an i31 or its spill box; floats and the
+        // 64-bit ints have their own boxes. bool/char/byte ride the int
+        // representation, so `box true :? int` is true here where F# says
+        // false — the shared-scalar-box divergence, DIVERGENCES.md
+        elif List.contains tn [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ] then
+            lg f slot
+            gcAbs f "ref.test" "i31"
+            lg f slot
+            gcT f "ref.test" "$boxi"
+            ins f "i32.or"
+        elif tn = "float" then
+            lg f slot
+            gcT f "ref.test" "$boxf"
+        elif tn = "int64" || tn = "uint64" then
+            // a SMALL int64 rides the i31 like an int does (uniform boxing),
+            // so the test accepts both — int-vs-small-int64 is the same
+            // shared-repr divergence as bool-vs-int
+            lg f slot
+            gcAbs f "ref.test" "i31"
+            lg f slot
+            gcT f "ref.test" "$boxl"
+            ins f "i32.or"
         elif (dictTryFind st.ObjRec tn).IsSome then
             classIdTest (match dictTryFind st.SubsOf tn with Some s -> s | None -> [ tn ])
         elif (dictTryFind st.IfaceName tn).IsSome then

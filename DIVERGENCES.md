@@ -595,3 +595,13 @@ would have caught it.
 The negative-conformance case `tests/conformance/neg/unknown-union-case.fpp`
 asserts our behaviour directly (`//? fsc-accepts` excludes it from the
 fsi oracle run, per rule 1 above).
+
+* **Boxed scalars share representations under type tests.** `:? int` /
+  `:?> int` on a boxed scalar work (both backends), but bool, char, byte
+  and the small ints all ride the int representation: `box true :? int`
+  is `true` where F# says `false`, and `box 1 :? bool` is `true`. Same
+  for `int64` vs `uint64` (one box). Distinguishing them needs typed
+  boxes — a representation decision deferred on purpose. float, string
+  and user classes test exactly; int64 tests exactly on wasm-linear, while
+  the wasm-GC leg keeps SMALL int64s in the i31 the ints use, so there
+  `box 9L :? int` is also true.

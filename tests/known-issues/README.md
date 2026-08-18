@@ -19,6 +19,9 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   record of a shape to avoid, not a live defect.
 
 Fixed and removed (see git history for the repros):
+`generic-array-field-length` (a generic class' `'a[]` field read Length = 0;
+fixed by the raw-int/inline-scalar arcs — re-verified 2026-08-18, and the
+ResizeArray/Dictionary hangs it caused are gone),
 `member-applied-dot-chain` (the forced dot pass conceded success on any
 known receiver with no candidate — `universal () || true` — so every
 misspelled member sailed through check and stubbed; the concession now

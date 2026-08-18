@@ -364,6 +364,14 @@ static inline V fpp_to_i64(V x) {
   if (x & 1) return fpp_box_i64((int64_t)UNTAGI(x));
   if (fpp_is_tid(x, FPP_TID_I64)) return x;
   if (fpp_is_tid(x, FPP_TID_F64)) return fpp_box_i64((int64_t)fpp_unbox_f64(x));
+  if (fpp_is_tid(x, FPP_TID_STR)) {
+    /* int64 "123": parse, as fpp_to_int does — this arm silently gave 0 */
+    char buf[32];
+    size_t n = fpp_str_len(x) < 31 ? fpp_str_len(x) : 31;
+    for (size_t i = 0; i < n; i++) buf[i] = (char)fpp_str_units(x)[i];
+    buf[n] = 0;
+    return fpp_box_i64((int64_t)strtoll(buf, NULL, 10));
+  }
   return fpp_box_i64(0);
 }
 

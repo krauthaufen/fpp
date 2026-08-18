@@ -973,22 +973,77 @@ let rec desugarMemberVal (n : GreenNode) : GreenNode =
                         ([ tok Keyword "member"; tok Ident "__mvself"; tok Operator "."
                            GToken nt; tok Keyword "with"; getter ] @ setterParts)
                 [ backing; prop ]
-            | Some _, Some _ when isStatic && not hasSet ->
-                // re-evaluating init per read is observably identical for the
-                // pure initializers a get-only static carries in this subset
-                [ GNode
-                    { m with
-                        Children =
-                            m.Children
-                            |> List.filter (fun c2 ->
-                                match c2 with
-                                | GToken t -> not (t.Kind = Keyword && t.Text = "val")
-                                | GNode x -> x.NodeKind <> AccessorDecl)
-                            |> List.filter (fun c2 ->
-                                match c2 with
-                                | GToken t -> not (t.Kind = Keyword && t.Text = "with")
-                                | _ -> true) } ]
             | _ -> [ c ]
+        | GNode m when
+              // a TYPE with `static member val` members: their backing state
+              // is PER TYPE, so the field hoists to module level, BEFORE the
+              // type, and the member becomes a static accessor property over
+              // it — init runs once at module init, F#'s static-init order
+              nodesOf m |> List.exists (fun d ->
+                  d.NodeKind = MemberDecl
+                  && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val"))
+                  && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "member"))
+                  && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static"))) ->
+            let tyName =
+                match tokensOf m |> List.tryFind (fun t -> t.Kind = Ident) with
+                | Some t -> t.Text
+                | None -> "T"
+            let hoisted = vecNew<Green> ()
+            let newKids =
+                m.Children |> List.map (fun c2 ->
+                    match c2 with
+                    | GNode d when
+                          d.NodeKind = MemberDecl
+                          && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val"))
+                          && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "member"))
+                          && (tokensOf d |> List.exists (fun t -> t.Kind = Keyword && t.Text = "static")) ->
+                        let nameTok = tokensOf d |> List.tryFind (fun t -> t.Kind = Ident)
+                        let init = nodesOf d |> List.filter (fun x -> isExprish x.NodeKind) |> List.tryHead
+                        let hasSet =
+                            nodesOf d
+                            |> List.filter (fun x -> x.NodeKind = AccessorDecl)
+                            |> List.exists (fun x -> (tokensOf x |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "set")
+                        (match nameTok, init with
+                         | Some nt, Some ie ->
+                             let mutable k = 700000000 + nt.Offset * 32
+                             let tok (kd : TokenKind) (txt : string) : Green =
+                                 let g = GToken { Kind = kd; Text = txt; Leading = []; Trailing = []; Offset = k }
+                                 k <- k + 1
+                                 g
+                             let back = "__mv_" + tyName + "_" + nt.Text
+                             vecAdd hoisted
+                                 (Green.node LetDecl
+                                     [ tok Keyword "let"; tok Keyword "mutable"
+                                       Green.node IdentPat [ tok Ident back ]
+                                       tok Operator "="; GNode ie ])
+                             let getter =
+                                 Green.node AccessorDecl
+                                     [ tok Ident "get"
+                                       Green.node ParenPat [ tok LParen "("; tok RParen ")" ]
+                                       tok Operator "="
+                                       Green.node IdentExpr [ tok Ident back ] ]
+                             let setterParts =
+                                 if not hasSet then []
+                                 else
+                                     [ tok Keyword "and"
+                                       Green.node AccessorDecl
+                                           [ tok Ident "set"
+                                             Green.node IdentPat [ tok Ident "__mvv" ]
+                                             tok Operator "="
+                                             Green.node BinaryExpr
+                                                 [ Green.node IdentExpr [ tok Ident back ]
+                                                   tok Operator "<-"
+                                                   Green.node IdentExpr [ tok Ident "__mvv" ] ] ] ]
+                             Green.node MemberDecl
+                                 ([ tok Keyword "static"; tok Keyword "member"
+                                    GToken nt; tok Keyword "with"; getter ] @ setterParts)
+                         | _ -> c2)
+                    | _ -> c2)
+            let rebuilt =
+                match Green.node m.NodeKind newKids with
+                | GNode r -> desugarMemberVal r
+                | _ -> m
+            vecToList hoisted @ [ GNode rebuilt ]
         | GNode m -> [ GNode (desugarMemberVal m) ]
         | t -> [ t ]
     match Green.node n.NodeKind (n.Children |> List.collect expand) with

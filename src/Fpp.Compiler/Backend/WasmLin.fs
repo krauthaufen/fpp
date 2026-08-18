@@ -3980,7 +3980,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut) ] @ scPush
              @ [ LBlock ("$mdone", clauseStmts @ [ LTrap ]) ] @ scPop, LGet (wReg mr))
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
-    | ECast (tn, e2, true) when not (List.isEmpty (typeTestIds st tn)) ->
+    | ECast (tn, e2, true) when
+          not (List.isEmpty (typeTestIds st tn))
+          || (let b = (if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn) in
+              List.contains b [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32"
+                                "float"; "int64"; "uint64"; "string" ]) ->
         // `:?>` downcast to a type we carry a class-id for: check the header
         // and trap on a mismatch, then yield the value unchanged
         let t = freshTmp ctx
@@ -4845,7 +4849,22 @@ and private lowFailure (ctx : LowCtx) (msg : LExpr) : LExpr =
 // behind an even-and-nonzero pointer test, so a tagged int or a null answers 0
 // without dereferencing.
 and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
-    let ids = typeTestIds ctx.LSt tn
+    let bare = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
+    // boxed SCALARS: an odd word IS a tagged 31-bit int (bool/char/byte
+    // share the tag — `box true :? int` is true here where F# says false,
+    // the shared-scalar divergence); floats, 64-bit ints and strings are
+    // heap boxes with their own class-id headers
+    if List.contains bare [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ] then
+        let t = freshTmp ctx
+        LDo ([ LSet (wReg t, v) ], LPrim (AndW, [ LGet (wReg t); LConstW 1 ]))
+    else
+    let scalarCids =
+        match bare with
+        | "float" -> [ CID_FLOAT ]
+        | "int64" | "uint64" -> [ CID_INT64 ]
+        | "string" -> [ CID_STRING ]
+        | _ -> []
+    let ids = if List.isEmpty scalarCids then typeTestIds ctx.LSt tn else scalarCids
     let t = freshTmp ctx
     let r = freshTmp ctx
     let h = freshTmp ctx
@@ -5805,6 +5824,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         vecAdd st.TidCid (gcArrTid, CID_ARRAY)
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
+        // map the scalar-box tids so `:? float` / `:? int64` / `:? string`
+        // read their class-ids through $t2c under the reactor — unmapped
+        // tids read cid 0 and every scalar type test answered false
+        vecAdd st.TidCid (gcStrTid, CID_STRING)
+        vecAdd st.TidCid (gcFloatTid, CID_FLOAT)
+        vecAdd st.TidCid (gcInt64Tid, CID_INT64)
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
         // map the uniform cons tid to CID_LIST so $isBuiltinSeq recognises it
         // (the FK_STRUCT per-refmap cons variants register their own mapping)

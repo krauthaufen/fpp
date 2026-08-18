@@ -733,16 +733,22 @@ let parse (src : string) : ParseResult =
         let isAddrArg () =
             s.IsOp "&" && (let n = s.Peek 1 in
                            List.isEmpty n.Leading && (n.Kind = Ident || n.Kind = LParen))
+        // `f !x` — a DEREF as a curried argument, same adjacency rule
+        // (`max !x 3` passes the cell's value; `!` is never binary in F#)
+        let isDerefArg () =
+            s.IsOp "!" && s.GapBefore
+            && (let n = s.Peek 1 in
+                n.Offset = s.Cur.Offset + 1 && (n.Kind = Ident || n.Kind = LParen))
         let parseArg () =
-            if isNegArg () || isAddrArg () then
+            if isNegArg () || isAddrArg () || isDerefArg () then
                 let op = s.Bump ()
                 Green.node PrefixExpr [ op; parsePostfix ctx ]
             else parsePostfix ctx
         let head = parsePostfix ctx
-        if (canStartAtom () || isNegArg () || isAddrArg ()) && (s.SameLine || s.CurCol > ctx) then
+        if (canStartAtom () || isNegArg () || isAddrArg () || isDerefArg ()) && (s.SameLine || s.CurCol > ctx) then
             let acc = vecNew<Green> ()
             vecAdd acc head
-            while (canStartAtom () || isNegArg () || isAddrArg ()) && (s.SameLine || s.CurCol > ctx) do
+            while (canStartAtom () || isNegArg () || isAddrArg () || isDerefArg ()) && (s.SameLine || s.CurCol > ctx) do
                 vecAdd acc (parseArg ())
             Green.node AppExpr (vecToList acc)
         else head

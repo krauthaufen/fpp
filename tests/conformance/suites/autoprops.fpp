@@ -44,12 +44,19 @@ test "av11" (q.Half = 6)
 q.Bump 8
 test "av12" (q.Level = 20)
 
-// static auto-property, get-only
+// static auto-properties: get-only and get/set, init once at module init
+let mutable staticInits = 0
 type S() =
     static member val Origin = 7
+    static member val Counter = (staticInits <- staticInits + 1; 50) with get, set
     member val Tag = "t" with get, set
 
 test "av13" (S.Origin = 7)
+test "av15" (staticInits = 1)
+test "av16" (S.Counter = 50)
+S.Counter <- S.Counter + 5
+test "av17" (S.Counter = 55)
+test "av18" (staticInits = 1)
 let s1 = S()
 s1.Tag <- "u"
 test "av14" (s1.Tag = "u")

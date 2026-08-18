@@ -1106,3 +1106,44 @@ max over any comparable; the suite dropped that assert.
 Battery: 29/29 on the settled tree, conformance 27 suites / 1426
 positive, 46 neg, fixpoint self byte-exact, gchost byte-exact
 (bytes=82064 hash=451751650).
+
+## §32 clear-cut known issues fixed; boxtests suite (2026-08-18)
+
+The "fix everything with a clear right or wrong" sweep. 28th suite:
+`boxtests` (26 asserts); autoprops grew to 24.
+
+* **Boxed-scalar `:?` / `:?>` work on every backend.** wasm-GC
+  (BinDriver): int tests i31-or-$boxi, float tests $boxf, int64/uint64
+  test i31-or-$boxl, both at the pattern-test and the checked-downcast
+  sites. wasm-linear: an odd word IS a tagged int; float/int64/string
+  test by class-id — and the scalar-box tids (str/f64/i64) are now
+  MAPPED in $t2c (unmapped tids read cid 0 under the reactor, so every
+  scalar test answered false). Shared representations stay divergences
+  (DIVERGENCES.md): bool/char/byte ride the int; wasm-GC keeps small
+  int64s in the i31.
+* **`!x` in argument position parses** (`max !cell 3`): a gap-before,
+  adjacent `!` is a deref argument, the same adjacency rule as `f -x`.
+* **`int64 "s"` parses on the remaining backends too**: BinDriver's
+  uint64-of-string arm (was "cannot convert"), and fpp_to_i64 in the C
+  runtime grew the string arm fpp_to_int already had (returned 0).
+* **`static member val P = init [with get, set]`**: the backing field
+  hoists to MODULE level (state is per type), the member becomes a
+  static accessor property; init runs once at module init. Get-only
+  statics stopped re-evaluating per read.
+* **Get accessors register `get_P`** like setters register `set_P`: the
+  static-through-type check exempts properties via those entries, so a
+  get-only static accessor property was flagged "instance member".
+
+Verified fixed, notes retired: generic-class `'a[]` field Length=0
+(tests/known-issues file removed), wasm-GC nested array comprehensions,
+extensions on generic types (named static + operator members both work).
+
+Still open by DESIGN (not clear-cut): typed boxes for bool/char/int64
+sharing; MinMax tuple instances (componentwise vs lexicographic, user
+call pending). Still open as its OWN ARC: `%A` structural formatting —
+the right design is static-type-driven expansion in Lower (the hole's
+Type threaded from Infer), not a runtime walker; both backends' showv
+print "?" for structures today.
+
+Battery: 29/29, conformance 28 suites / 1478 positive, 46 neg, fixpoint
+self byte-exact, gchost byte-exact (bytes=82064 hash=451751650).
