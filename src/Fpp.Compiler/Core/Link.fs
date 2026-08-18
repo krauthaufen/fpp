@@ -571,6 +571,53 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             for _, v in own do dictSet classMemberDef (v.Path, v.Offset) true
         | _ -> ()
 
+    // member names a CLASS can be asked for through DISPATCH — its own
+    // interface impls, abstract/override slots anywhere in its base chain,
+    // and the by-name protocols the backends wire (three-way compare, the
+    // duck-typed seq protocol, the object overrides). A stamped subclass
+    // must answer these the moment it exists; every OTHER own member is
+    // only ever called directly, and the call site stamps it itself (same
+    // mangled name, deduplicated by `seen`).
+    let dispImplNames = dictNew<string, string list> ()
+    let dispBaseOf = dictNew<string, string> ()
+    for d in decls do
+        match d with
+        | DClass (n, b, _, impls) ->
+            dictSet dispImplNames n (impls |> List.collect (fun (_, ms) -> ms |> List.map fst))
+            (match b with Some bb when bb <> n -> dictSet dispBaseOf n bb | _ -> ())
+        | _ -> ()
+    // names the program ACTUALLY dispatches virtually somewhere: every
+    // vtable call is an EIfaceCall (interface AND abstract-through-class),
+    // so one scan names them all. DMembers alone is no signal — Lower
+    // registers every class's member set there too.
+    let dispatchedNames = dictNew<string, bool> ()
+    for d in decls do
+        match d with
+        | DLet (_, _, _, e) ->
+            mapExpr
+                (fun x ->
+                    (match x with
+                     | EIfaceCall (_, mn, _, _) -> dictSet dispatchedNames mn true
+                     | _ -> ())
+                    x)
+                e |> ignore
+        | _ -> ()
+    let dispSpecials =
+        [ "CompareTo"; "MoveNext"; "Current"; "Dispose"; "GetEnumerator"
+          "ToString"; "GetHashCode"; "Equals" ]
+    let dispatchable (cls : string) (mn : string) : bool =
+        List.contains mn dispSpecials
+        || (dictTryFind dispatchedNames mn).IsSome
+        || (let rec up (c : string) (d : int) : bool =
+                d < 16
+                && ((match dictTryFind dispImplNames c with
+                     | Some ns -> List.contains mn ns
+                     | None -> false)
+                    || (match dictTryFind dispBaseOf c with
+                        | Some b -> up b (d + 1)
+                        | None -> false))
+            up cls 0)
+
     let rewrite (owner : string) (ownerKey : string * int) (subst : Dict<string, string>) (isTemplate : bool) (e : Expr) : Expr =
         e |> mapExpr (fun x ->
             match x with
@@ -1130,8 +1177,20 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                              | Some xs -> xs |> List.map (fun (ifn, ms) -> ifn, ms |> List.map (fun (mn, mv) -> mn, stampMember mv))
                              | None -> []
                          let own =
+                             // only DISPATCH-reachable members ride the
+                             // subclass eagerly. Stamping the WHOLE set
+                             // amplified self-recursive members (PairwiseV
+                             // returns IndexList<struct('T,'T)>, whose stamp
+                             // demands the next ctor...) into an unbounded
+                             // chain the depth cap had to cut five dead
+                             // subclasses deep. A direct call stamps its own
+                             // member on demand and lands on the same name.
                              match dictTryFind classOwnOf cn with
-                             | Some xs -> xs |> List.map (fun (mn, mv) -> mn, stampMember mv)
+                             | Some xs ->
+                                 xs |> List.choose (fun (mn, mv) ->
+                                     if dispatchable cn mn
+                                     then Some (mn, stampMember mv)
+                                     else None)
                              | None -> []
                          // INHERITED layout-dependent members (a base body
                          // tests `:? 'T`, reads a packed field...): stamped

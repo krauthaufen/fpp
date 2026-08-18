@@ -792,3 +792,34 @@ them surfaced and fixed a chain of real compiler gaps:
   repro (~5 min/cycle), gdb on the Commit frame, reading the outputs
   buffer element's header, then comparing the stamped
   `TryGetTarget_IAdaptiveObject` body against the canonical intrinsic.
+
+## 22. Lazy own-member stamping: the depth-cap chain was speculative code
+
+The `instantiation depth capped (StructTuple2$<StructTuple2$<...` warning
+was POLYMORPHIC RECURSION, not a poisoned scheme: `IndexList<'T>.PairwiseV`
+returns `IndexList<struct('T,'T)>`, and a stamped subclass eagerly stamped
+its WHOLE member set — whose PairwiseV stamp demands the next ctor, whose
+subclass stamps the set again, five dead levels deep until the cap cut the
+name to `$ref`. Nothing ever called past level 0.
+
+Fix: a stamped subclass eagerly stamps only the own members that DISPATCH
+can reach — its interface impls (own chain), names the program actually
+EIfaceCalls anywhere (one scan; abstract-through-class dispatch lowers to
+EIfaceCall too), and the by-name protocols (CompareTo, the duck-typed seq
+protocol, ToString/GetHashCode/Equals). Every other own member is only
+ever called directly, and the call site stamps it itself — same mangled
+name, deduplicated. `DMembers` names are NO signal: Lower registers every
+class's member set there too (that false signal absorbed the first
+version of this gate).
+
+Effects: the cap warning is gone on the adaptive build; the mini repro's
+generated C shrank 20.4 MB → 3.4 MB and the full adaptive suite.c
+19 → 13.8 MB (the eager sets were mostly dead weight program-wide); the
+full battery dropped ~18.5 → ~12 min wall on the smaller gcc inputs.
+Battery 28/28 green, both fixpoints byte-exact, wasm-linear self-host
+byte-exact (bytes=78531 hash=971705526).
+
+Trap re-confirmed the hard way AGAIN: a `GetEnvironmentVariable` probe
+inside capInst made stage-1 trap (BinDriver stubs it, the self-hosted
+compiler executes capInst) and masqueraded as a wasm-GC regression of the
+gate for one whole cycle. Probes NEVER go in code the fixpoint executes.
