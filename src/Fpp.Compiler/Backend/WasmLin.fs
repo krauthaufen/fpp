@@ -5681,7 +5681,16 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let vtImpls = dictNew<string, bool> ()
     for d in decls0 do
         match d with
-        | DClass (_, _, _, impls) -> for _, ms in impls do (for _, v in ms do dictSet vtImpls (key v) true)
+        | DClass (cn, _, _, impls) ->
+            for _, ms in impls do (for _, v in ms do dictSet vtImpls (key v) true)
+            // any function a class-keyed SLOT can resolve to is vtable-
+            // reachable too (abstract-through-class dispatch, the object-
+            // expression overrides) — it must keep the uniform signature
+            // or the call_indirect type mismatches
+            for ifn, mn in vtableSlots do
+                (match slotImpl cn ifn mn with
+                 | Some v -> dictSet vtImpls (key v) true
+                 | None -> ())
         | _ -> ()
     for d in decls do
         match d with

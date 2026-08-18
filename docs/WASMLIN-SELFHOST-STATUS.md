@@ -930,6 +930,31 @@ The remaining five (ctor arity, literal-pattern type, type-arg count,
 loop-counter assignment, unknown type via usage) already errored through
 existing checks. All 44 fsi-oracle-verified (1 divergence skip). One
 observation parked with a repro: the ad-hoc mini adaptive driver
-(cval→map→transact) now recurses on the wasm-linear+reactor leg under
-wasmtime while the emcc linear leg, the C legs and wasm-GC are all green
-— not covered by any gate, cause unpinned.
+(cval→map→transact) recurses on the wasm-linear+reactor leg under
+wasmtime while the emcc linear leg, the C legs and wasm-GC are all green.
+PINNED SINCE: it is PRE-EXISTING — an old-compiler worktree with the old
+port reproduces it identically; minimal repro = ported lib + `cval 1 |>
+AVal.map ((*) 2) |> AVal.force` (blam0 self-recursion, no output). A
+leg-specific codegen/runtime interaction, not a recent regression; no
+gate covers this lib+leg pair today.
+
+## 26. incremental suite; class-slot targets keep the uniform signature
+
+New suite: `incremental` (15 assertions) — the members/incremental class
+family: primary-ctor classes with computed let-fields, generic classes
+with annotated fields, mutable listener lists (both `ref` and
+`let mutable` spellings), the abstract Wire with its object-expression
+factory, and mutable-record-field writes. Adaptations: IEvent dropped
+(no event surface), WinForms modules dropped, `!listeners` in argument
+position parenthesized (known parser gap).
+
+It caught a fresh linear bug on first run: "indirect call type mismatch"
+— the class-keyed dispatch targets added in §24 (abstract-through-class,
+object-expression overrides) escaped the uniform-vtable-signature rule,
+so a specialized-signature member landed in a slot whose call_indirect
+expected the uniform type. WasmLin's vtImpls now includes every function
+a class-keyed slot can resolve to (the same closure BinDriver's
+ifaceImplKeys computes).
+
+The wasm-linear+reactor adaptive recursion (§25) is confirmed
+PRE-EXISTING via an old-compiler worktree; minimal repro recorded.
