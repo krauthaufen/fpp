@@ -1330,7 +1330,17 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
             if isHex then parseInt64In 16 (s.Substring(2).TrimEnd ([| 'L' |]))
             else
                 let digits = s |> String.filter (fun c -> isDigit c || c = '-')
-                if digits = "" then 0L else int64 digits
+                if digits = "" then 0L
+                else
+                    // parseInt64In + explicit sign, NOT `int64 digits`: the
+                    // conversion-from-string is unported on the wasm-linear
+                    // self-host, and the i64.const became the STRING'S
+                    // POINTER — the first FormatOps literals in the prelude
+                    // made the gchost check diverge by exactly those consts
+                    let neg = digits.StartsWith "-"
+                    let mag = if neg then digits.Substring 1 else digits
+                    let v0 = parseInt64In 10 (if mag = "" then "0" else mag)
+                    if neg then 0L - v0 else v0
         lc f v
         callf f "$ofl"
     | ELit (LFloat s) ->

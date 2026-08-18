@@ -958,3 +958,34 @@ ifaceImplKeys computes).
 
 The wasm-linear+reactor adaptive recursion (§25) is confirmed
 PRE-EXISTING via an old-compiler worktree; minimal repro recorded.
+
+## 27. printf suite: uint64 arithmetic, int64 printing, and a self-host save
+
+New suite: `printf` (49 assertions) from the fsc printf tests — %o/%x/%X
+across 32 and 64 bits with two's-complement negatives, %d/%i/%u to the
+Int64/UInt64 extremes, width/zero/left flags, %s %c %b %%, %f, partial
+application. Porting it unearthed a STACK of wrongness on the
+wasm-linear leg (the conformance backend):
+
+- **`255UL % 16UL` was garbage**: every uint64 ('v'-kind) arithmetic,
+  comparison, bitwise and shift prim fell through to the int32 path and
+  operated on tagged word halves. LowIR grew DivUL/RemUL/LtUL/GtUL/
+  LeUL/GeUL and the WasmLin arms accept 'v' with unsigned selections.
+- **`%d` of an int64 printed the BOX POINTER** — always had, on linear;
+  no suite ever printed one (only compared). Rendering now routes
+  through prelude FormatOps (Int64Str/UInt64Str), ONE implementation for
+  every backend; %x/%X/%o and width padding likewise (Radix/Radix64/
+  Pad) — cback and linear previously had NO radix/pad helpers at all
+  (silent stubs), wasm-GC had its own.
+- Int64Str is SIGNED arithmetic throughout with the MinValue hardcase:
+  the uint64-of-int64 reinterpret resolves by KIND at emission and
+  misdetects inside the generic prelude context on wasm-GC (truncated
+  through 32 bits) — recorded as a known issue.
+- **The gchost byte-exact check caught a real self-host bug**: the first
+  i64 literals in the prelude (FormatOps') made the SELF-HOSTED
+  compiler's `i64.const`s come out as STRING POINTERS — BinDriver's
+  int64-literal arm used `int64 digits`, and int64-of-STRING is unported
+  on wasm-linear. Fixed with parseInt64In + explicit sign, the same
+  lesson the adjacent comment already recorded for i32.
+- KNOWN ISSUE: user-level `int64 "123"` on wasm-linear still yields the
+  pointer (int64#t unimplemented — $atoi is 32-bit); same for uint64.

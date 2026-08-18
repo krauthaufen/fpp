@@ -2274,6 +2274,70 @@ module Array =
 type ArrayOps =
     static member OfList (xs : list<'a>) : 'a[] = Array.ofList xs
 
+/// The printf family's radix and padding renderers. Lowering expands
+/// `%x`/`%X`/`%o` and width flags to calls here, so every backend prints
+/// the same bytes from ONE implementation (each backend had its own — or
+/// silently none). Negative values render two's-complement, as F# does:
+/// the caller hands the BITS (int reinterprets as uint32/uint64 at the
+/// call, which changes nothing at runtime).
+type FormatOps =
+    static member Radix (v : uint32, b : int, upper : bool) : string =
+        if v = 0u then "0"
+        else
+            let digits = if upper then "0123456789ABCDEF" else "0123456789abcdef"
+            let bu = uint32 b
+            let mutable s = ""
+            let mutable x = v
+            while x > 0u do
+                s <- string digits.[int (x % bu)] + s
+                x <- x / bu
+            s
+    static member Radix64 (v : uint64, b : int, upper : bool) : string =
+        if v = 0UL then "0"
+        else
+            let digits = if upper then "0123456789ABCDEF" else "0123456789abcdef"
+            let bu = uint64 b
+            let mutable s = ""
+            let mutable x = v
+            while x > 0UL do
+                // through int64: int-of-uint64 is a backend gap (see the
+                // status doc); the digit is < 16 so the reinterpret is exact
+                s <- string digits.[int (int64 (x % bu))] + s
+                x <- x / bu
+            s
+    static member UInt64Str (v : uint64) : string =
+        if v = 0UL then "0"
+        else
+            let mutable s = ""
+            let mutable x = v
+            while x > 0UL do
+                s <- string "0123456789".[int (int64 (x % 10UL))] + s
+                x <- x / 10UL
+            s
+    static member Int64Str (v : int64) : string =
+        // signed arithmetic throughout — the uint64-of-int64 reinterpret
+        // resolves by KIND at emission and misdetects inside this generic
+        // context on the wasm-GC leg (truncating through 32 bits)
+        if v = 0L then "0"
+        elif v = -9223372036854775807L - 1L then "-9223372036854775808"
+        else
+            let neg = v < 0L
+            let mutable x = if neg then 0L - v else v
+            let mutable s = ""
+            while x > 0L do
+                s <- string "0123456789".[int (x % 10L)] + s
+                x <- x / 10L
+            if neg then "-" + s else s
+    static member Pad (s : string, width : int, zero : bool, left : bool) : string =
+        if s.Length >= width then s
+        else
+            let mutable p = ""
+            let mutable n = width - s.Length
+            while n > 0 do
+                p <- p + (if zero then "0" else " ")
+                n <- n - 1
+            if left then s + p else p + s
+
 /// Scoped pinning: `use p = fixed arr` pins for the binding's scope and
 /// unpins on every exit path. Instances decide what pinning MEANS; the
 /// array instance demands unmanaged elements, so a ref-holding array

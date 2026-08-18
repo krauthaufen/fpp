@@ -1233,14 +1233,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        let tw, fw = boolWords true
                                        EIf (e, ELit (LString tw), ELit (LString fw))
                                    | 'x' | 'X' | 'o' ->
-                                       let fn =
-                                           (if c = 'x' then "hexlower" elif c = 'X' then "hexupper" else "octal")
-                                           + (if k = "l" then "64" else "")
-                                       EApp (EUnknown fn, [ e ])
+                                       // ONE implementation for every
+                                       // backend: the prelude's radix
+                                       // renderer (each backend had its own
+                                       // hand impl — or, on wasm-linear and
+                                       // C, silently none)
+                                       let b = if c = 'o' then "8" else "16"
+                                       let upper = ELit (LBool (c = 'X'))
+                                       let wide = (k = "l" || k = "v")
+                                       (match dictTryFind memberIndex ("FormatOps." + (if wide then "Radix64" else "Radix")) with
+                                        | Some d ->
+                                            EApp (EVar (varIdOf d, schemeOf d),
+                                                  [ ETuple [ e; ELit (LInt b); upper ] ])
+                                        | None ->
+                                            // bare inference without the
+                                            // prelude: the old backend name
+                                            let fn =
+                                                (if c = 'x' then "hexlower" elif c = 'X' then "hexupper" else "octal")
+                                                + (if k = "l" then "64" else "")
+                                            EApp (EUnknown fn, [ e ]))
                                    | 'f' -> EApp (EUnknown "fixed6", [ e ])
                                    | 'u' ->
                                        (match k with
-                                        | "l" -> EApp (EUnknown "string#l", [ e ])
+                                        | "l" | "v" ->
+                                            (match dictTryFind memberIndex "FormatOps.UInt64Str" with
+                                             | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ e ])
+                                             | None -> EApp (EUnknown "string#l", [ e ]))
                                         | _ -> EApp (EUnknown "string#w", [ e ]))
                                    | 'A' ->
                                        (match k with
@@ -1256,7 +1274,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         // the runtime dispatch answers both
                                         | _ -> EApp (EUnknown "showv", [ e ]))
                                    | _ ->   // d, i
-                                       EApp (EUnknown ("string#" + k), [ e ])
+                                       // int64/uint64 through the prelude's
+                                       // renderer: the linear backend's
+                                       // string# fallthrough is the 32-bit
+                                       // printer, which printed the BOX
+                                       // POINTER for every %d of an int64
+                                       (match (if k = "l" then dictTryFind memberIndex "FormatOps.Int64Str"
+                                               elif k = "v" then dictTryFind memberIndex "FormatOps.UInt64Str"
+                                               else None) with
+                                        | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ e ])
+                                        | None -> EApp (EUnknown ("string#" + k), [ e ]))
                                let mutable hi = 0
                                let pieces =
                                    segs |> List.map (fun seg ->
@@ -1273,14 +1300,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                            hi <- hi + 1
                                            if width = 0 then r
                                            else
-                                               // pad to the minimum width;
-                                               // zeros only make sense on the
-                                               // right-justified numeric side
-                                               let mode =
-                                                   if left then "padl"
-                                                   elif zero then "pad0"
-                                                   else "padr"
-                                               EApp (EUnknown (mode + "#" + string width), [ r ]))
+                                               // pad to the minimum width,
+                                               // through the prelude's ONE
+                                               // renderer where available
+                                               (match dictTryFind memberIndex "FormatOps.Pad" with
+                                                | Some d ->
+                                                    EApp (EVar (varIdOf d, schemeOf d),
+                                                          [ ETuple [ r; ELit (LInt (string width))
+                                                                     ELit (LBool zero); ELit (LBool left) ] ])
+                                                | None ->
+                                                    let mode =
+                                                        if left then "padl"
+                                                        elif zero then "pad0"
+                                                        else "padr"
+                                                    EApp (EUnknown (mode + "#" + string width), [ r ])))
                                let total =
                                    match pieces with
                                    | [] -> ELit (LString "\"\"")

@@ -3140,31 +3140,46 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EPrim (("u~~~" | "u~~~i" | "u~~~w"), [ a ]) -> LPrim (XorW, [ coreToLowE ctx a; LConstW (-1) ])
     | EPrim (("u~~~l" | "u~~~v"), [ a ]) -> lowBoxI ctx (LPrim (XorL, [ lowUnboxI (coreToLowE ctx a); LConstL (-1L) ]))
     | EPrim (("unot" | "not"), [ a ]) -> LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ])
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
+    | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/"; "%" ] ->
+        // uint64 ('v') shares the boxed-i64 representation; div/rem are the
+        // ops where signedness matters. Falling through to the int32 path
+        // made `255UL % 16UL` arithmetic on TAGGED word halves.
+        let unsigned = op.EndsWith "v"
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
-        let iop = match op.Substring (0, op.Length - 1) with | "+" -> AddL | "-" -> SubL | "*" -> MulL | "/" -> DivSL | _ -> RemSL
+        let iop =
+            match op.Substring (0, op.Length - 1) with
+            | "+" -> AddL | "-" -> SubL | "*" -> MulL
+            | "/" -> (if unsigned then DivUL else DivSL)
+            | _ -> (if unsigned then RemUL else RemSL)
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
     // int64 BITWISE — both operands are boxed i64. Without this `&&&l`/`|||l`/…
     // fell to the int32 path (or intArithOp's `%` default -> `i64 >>> n` became
     // an i32 `rem` and DIVIDED BY ZERO), which trapped the self-hosted emitter's
     // `emitF64Bits`.
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^" ] ->
+    | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "&&&"; "|||"; "^^^" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
         let iop = match op.Substring (0, op.Length - 1) with | "&&&" -> AndL | "|||" -> OrL | _ -> XorL
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
     // int64 SHIFT — `int64 <<< int` / `>>>`: the amount is a tagged i32, widened
     // to i64 for the wasm shift (whose count operand must match the value type).
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<<<"; ">>>" ] ->
+    | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "<<<"; ">>>" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = LPrim (WToL, [ (coreToLowE ctx b) ])
         let iop = if op.Substring (0, op.Length - 1) = "<<<" then ShlL else ShrSL
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
-    | EPrim (op, [ a; b ]) when op.EndsWith "l" && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+    | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        let unsigned = op.EndsWith "v"
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = lowUnboxI (coreToLowE ctx b)
-        let iop = match op.Substring (0, op.Length - 1) with | "<" -> LtSL | ">" -> GtSL | "<=" -> LeSL | ">=" -> GeSL | "=" -> EqL | _ -> NeL
+        let iop =
+            match op.Substring (0, op.Length - 1) with
+            | "<" -> (if unsigned then LtUL else LtSL)
+            | ">" -> (if unsigned then GtUL else GtSL)
+            | "<=" -> (if unsigned then LeUL else LeSL)
+            | ">=" -> (if unsigned then GeUL else GeSL)
+            | "=" -> EqL | _ -> NeL
         (LPrim (iop, [ ia; ib ]))
     | EPrim ("::", [ h; t ]) ->
         // concrete head: skip/scan by compile-time ref-kind. GENERIC head: pick
@@ -4840,6 +4855,8 @@ let private lowOpIns (op : LOp) : string =
     | MulL -> "i64.mul"
     | DivSL -> "i64.div_s"
     | RemSL -> "i64.rem_s"
+    | DivUL -> "i64.div_u"
+    | RemUL -> "i64.rem_u"
     | AndL -> "i64.and"
     | OrL -> "i64.or"
     | XorL -> "i64.xor"
@@ -4852,6 +4869,10 @@ let private lowOpIns (op : LOp) : string =
     | GtSL -> "i64.gt_s"
     | LeSL -> "i64.le_s"
     | GeSL -> "i64.ge_s"
+    | LtUL -> "i64.lt_u"
+    | GtUL -> "i64.gt_u"
+    | LeUL -> "i64.le_u"
+    | GeUL -> "i64.ge_u"
     | AddF -> "f64.add"
     | SubF -> "f64.sub"
     | MulF -> "f64.mul"
