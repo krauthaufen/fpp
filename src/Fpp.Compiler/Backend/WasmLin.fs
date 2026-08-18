@@ -3115,7 +3115,7 @@ let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list
 // analogue of a generic let. Each is rooted conditionally across the arm's
 // safepoints (a `h::t` head held across a later allocation, say).
 let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
-    let keep v sch =
+    let keep (v : VarId) (sch : Scheme) =
         (dictTryFind ctx.LSt.CellVars (key v)).IsNone
         && (match prune sch.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).IsSome | _ -> false)
     let witOf sch = match prune sch.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).Value | _ -> 0
