@@ -556,6 +556,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ elem ]), [ ETuple [ lo; hi ] ])
             | None -> rangeList off lo hi
 
+    /// A STEPPED range as a VALUE: `[ lo .. step .. hi ]` materializes
+    /// through the prelude's RangeOps.Step — the direction is the step's
+    /// sign at run time. Every element kind takes this path: the inline i32
+    /// loop is only correct for literal +1 steps.
+    let rangeMaterializeStep (elem : string) (lo : Expr) (step : Expr) (hi : Expr) : Expr =
+        let inst = if elem = "" then "int" else elem
+        match dictTryFind memberIndex "RangeOps.Step" with
+        | Some d -> EApp (EVarI (varIdOf d, schemeOf d, [ inst ]), [ ETuple [ lo; step; hi ] ])
+        | None -> ELit LUnit
+
     // ---- patterns ---------------------------------------------------------
 
     /// The identifier a pattern is NAMED by. A qualified case
@@ -2368,10 +2378,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // DOWNWARDS so the conses come out in order and nothing has to
                 // be reversed; both ends are bound first, so each is evaluated
                 // once.
+                // `[ a .. s .. b ]` parses as a NESTED `..` — check it before
+                // the two-part shape, whose pattern also matches the outer prim
+                let stepItems =
+                    match vecToList items with
+                    | [ EPrim (rop1, [ EPrim (rop2, [ lo; st ]); hi ]) ] when
+                          (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
+                        Some ((rangeElem rop1).Value, lo, st, hi)
+                    | _ -> None
                 let rangeItems =
                     match vecToList items with
+                    | _ when stepItems.IsSome -> None
                     | [ EPrim (op2, [ lo; hi ]) ] when (rangeElem op2).IsSome -> Some ((rangeElem op2).Value, lo, hi)
                     | _ -> None
+                match stepItems with
+                | Some (el, lo, st, hi) -> rangeMaterializeStep el lo st hi
+                | None ->
                 match rangeItems with
                 | Some (el, lo, hi) -> rangeMaterialize (offsetOf n) el lo hi
                 | None ->
@@ -2760,6 +2782,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // materialise the list and convert (EArray of the range expr
                 // stored the CONS CELL as the single element)
                 match items with
+                | [ EPrim (rop1, [ EPrim (rop2, [ lo; st ]); hi ]) ] when
+                      (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
+                    listToArrayInline (offsetOf n) elemName (rangeMaterializeStep (rangeElem rop1).Value lo st hi)
                 | [ EPrim (op2, [ lo; hi ]) ] when (rangeElem op2).IsSome ->
                     listToArrayInline (offsetOf n) elemName (rangeMaterialize (offsetOf n) (rangeElem op2).Value lo hi)
                 | _ ->
@@ -3294,7 +3319,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // nests the first `..`, and the direction follows the
                       // STEP's sign at run time, as in F#
                       | (PVar _ | PWild), EPrim (rop1, [ EPrim (rop2, [ lo; step ]); hi ]) when
-                            (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
+                            (rangeElem rop1).IsSome && (rangeElem rop2).IsSome
+                            && rangeInline (rangeElem rop1).Value ->
                           let iv, isch =
                               match lowerPat ip with
                               | PVar (v, sch) -> v, sch
@@ -3327,6 +3353,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
                                 ESeq [ loopBody body
                                        EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                      | pat, EPrim (rop1, [ EPrim (rop2, [ lo; st ]); hi ]) when
+                            (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
+                          // a NON-ordinal STEPPED source (`for x in 3.0 .. -1.0 .. 0.0`):
+                          // the inline i32 loop steps the word as an int —
+                          // materialize through RangeOps.Step and cons-walk
+                          let anon = mono (TCon ("?", []))
+                          let restV = { Path = path; Offset = offsetOf n + 5000000; Name = "_rest" }
+                          let tailV = { Path = path; Offset = offsetOf n + 6000000; Name = "_tail" }
+                          let notNull (e : Expr) =
+                              EIf (EApp (EUnknown "isNull", [ e ]), ELit (LBool false), ELit (LBool true))
+                          ELet (false, restV, anon, rangeMaterializeStep (rangeElem rop1).Value lo st hi,
+                            EWhile (notNull (EVar (restV, anon)),
+                              EMatch (EVar (restV, anon),
+                                [ PCons (pat, PVar (tailV, anon)), None,
+                                    ESeq [ loopBody body
+                                           EAssign (restV, EVar (tailV, anon)) ]
+                                  PWild, None, ELit LUnit ])))
                       | pat, EPrim (rop1, [ lo; hi ]) when (rangeElem rop1).IsSome ->
                           // a NON-ordinal range source (`for x in 1.0 .. 10.0`):
                           // the inline i32 count loop stepped a float's word as

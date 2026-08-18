@@ -1073,6 +1073,33 @@ type RangeOps =
             | [] -> go <- false
         r
 
+    /// `[ lo .. step .. hi ]`: the direction follows the STEP's sign at run
+    /// time, as in F#. A zero step raises in F#; here it yields [] — the
+    /// subset keeps totals rather than a range-specific exception.
+    static member Step (lo : 'a, step : 'a, hi : 'a) : list<'a> when Num<'a> when Ordered<'a> =
+        let zero = step - step
+        let mutable out : list<'a> = []
+        if step > zero then
+            let mutable i = lo
+            while i <= hi do
+                out <- i :: out
+                i <- i + step
+        elif step < zero then
+            let mutable i = lo
+            while i >= hi do
+                out <- i :: out
+                i <- i + step
+        let mutable r : list<'a> = []
+        let mutable rest = out
+        let mutable go = true
+        while go do
+            match rest with
+            | x :: t ->
+                r <- x :: r
+                rest <- t
+            | [] -> go <- false
+        r
+
 /// it is in .NET, not a float.
 module Math =
     let PI : float = 3.141592653589793

@@ -1012,3 +1012,33 @@ expression a first, discarded time (side-effect-table pollution risk).
 
 Battery: 29/29 gates, conformance 23 suites / 1307 positive asserts,
 44 neg, fixpoint self byte-exact, gchost DONE bytes=81368 hash=853970823.
+
+## §29 longnames + comprehensions suites (2026-08-18)
+
+Two more fsc ports. `longnames` (16 asserts): long-path access to values,
+constructors, fields and members through nested modules; qualified pattern
+matches; the bug-1218 shapes (union static member vs case on one head;
+value-vs-type precedence) and bug-4379 ctor shadowing. All passed first
+try. One NEG case added (shadowctor, 45 total): a later `type foo()`
+shadows an earlier value `foo` ENTIRELY — F# rejects `foo 1` with FS0501,
+F++ rejects via ctor-arity unification.
+
+`comprehensions` (25 asserts): list/array comprehension bodies — nested
+for, filters, if/else double-yield, match-with-yield, tuple binders, the
+while form, stepped ranges. Compiler haul: the stepped range VALUE form
+`[ a .. s .. b ]` had NO lowering anywhere — it fell through as a
+one-element list holding a raw `..` prim (garbage on linear, `toi` cast
+trap on wasm-GC). Prelude grew RangeOps.Step (direction = step's sign at
+run time; zero step yields [] where F# raises); Lower materializes the
+stepped shape in list and array literals — checked BEFORE the two-part
+pattern, which also matches the nested prim — and the for-loop stepped
+inline arm is now guarded to ordinal elements, with non-ordinal stepped
+sources (float steps) cons-walking RangeOps.Step.
+
+Suite-authoring traps: array `=` is reference equality (chosen
+divergence) — compare via Array.toList; fsi refuses a continuation line
+starting with `=` after a multi-line comprehension (FS0010) — bind first.
+
+Battery: 29/29, conformance 25 suites / 1348 positive, 45 neg, fixpoint
+self byte-exact, gchost byte-exact at the new prelude (bytes=82064
+hash=451751650, oracle identical).
