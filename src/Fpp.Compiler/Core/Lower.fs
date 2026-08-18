@@ -2321,13 +2321,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      ERecord (o, elems |> List.mapi (fun i m -> "Item" + string (i + 1), lowerExpr (GNode m)))
                  | _ -> ETuple (elems |> List.map (fun m -> lowerExpr (GNode m))))
             | ListExpr ->
-                let items = vecNew<Expr> ()
-                let mutable comprehension = false
-                let rec add (m : GreenNode) =
-                    if m.NodeKind = BlockExpr then nodesOf m |> List.iter add
-                    elif m.NodeKind = ForExpr || m.NodeKind = WhileExpr || m.NodeKind = LetDecl then comprehension <- true
-                    elif isExprish m.NodeKind then vecAdd items (lowerExpr (GNode m))
-                nodesOf n |> List.iter add
                 // `[ for x in src -> e ]`: the loop's body is the element.
                 // The loop itself lowers by the ordinary rules — range, cons
                 // walk, indexed array or enumerator — with the body consing
@@ -2351,9 +2344,26 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         || (m.NodeKind <> ListExpr && (nodesOf m |> List.exists go))
                     nodesOf n |> List.exists go
                 let stmtFor =
-                    match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
-                    | [ f ] when (f.NodeKind = ForExpr || f.NodeKind = WhileExpr) && hasYield -> Some f
-                    | _ -> None
+                    // ANY yield-bearing body is the statement form — not
+                    // just a single loop: `[ for .. do yield ..; yield x ]`
+                    // mixes a loop with trailing yields, and requiring one
+                    // ForExpr refused it ("not lowerable")
+                    if hasYield && arrowFor.IsNone then
+                        match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                        | [] -> None
+                        | xs -> Some xs
+                    else None
+                // plain elements lower ONLY when no comprehension form
+                // claimed the body — eager lowering here ran every yield's
+                // inner expression a first, discarded time
+                let items = vecNew<Expr> ()
+                let mutable comprehension = false
+                (if arrowFor.IsNone && stmtFor.IsNone then
+                    let rec add (m : GreenNode) =
+                        if m.NodeKind = BlockExpr then nodesOf m |> List.iter add
+                        elif m.NodeKind = ForExpr || m.NodeKind = WhileExpr || m.NodeKind = LetDecl then comprehension <- true
+                        elif isExprish m.NodeKind then vecAdd items (lowerExpr (GNode m))
+                    nodesOf n |> List.iter add)
                 // `[ a .. b ]` — a range as a VALUE, not a loop source. Built
                 // DOWNWARDS so the conses come out in order and nothing has to
                 // be reversed; both ends are bound first, so each is evaluated
@@ -2394,7 +2404,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     ELet (false, acc, anon, EListLit [], ESeq [ loop; reverse ])
                 | None ->
                 match stmtFor with
-                | Some f ->
+                | Some fs ->
                     let off = offsetOf n
                     let acc = { Path = path; Offset = off + 11000000; Name = "_acc" }
                     let restV = { Path = path; Offset = off + 12000000; Name = "_crest" }
@@ -2405,10 +2415,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let savedAcc = compAcc
                     let savedYield = yieldInto
                     compAcc <- Some acc
-                    // the loop body is a STATEMENT sequence here, not the
+                    // the body is a STATEMENT sequence here, not the
                     // element: the arrow-form sink must not also fire
                     yieldInto <- None
-                    let loop = lowerExpr (GNode f)
+                    let loop = ESeq (fs |> List.map (fun f -> lowerExpr (GNode f)))
                     compAcc <- savedAcc
                     yieldInto <- savedYield
                     let notNull (e : Expr) =

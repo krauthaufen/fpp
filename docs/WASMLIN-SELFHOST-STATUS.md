@@ -989,3 +989,26 @@ wasm-linear leg (the conformance backend):
   lesson the adjacent comment already recorded for i32.
 - KNOWN ISSUE: user-level `int64 "123"` on wasm-linear still yields the
   pointer (int64#t unimplemented — $atoi is 32-bit); same for uint64.
+
+## §28 numbers + mutrec suites (2026-08-18)
+
+Two more fsc ports: `numbers` (11 asserts — 2^n boundary tables for
+int32/int64 both signs, naive pow recomputation via comprehensions, wrap
+edges MinValue/MaxValue mul/div/rem) and `mutrec` (12 asserts — the
+portable core of letrec-mutrec: inner rec groups closing over a captured
+ref, partially-TLR odd/even, recursion through ref cells, polymorphic
+inner letrec). Dropped from mutrec, documented: `module rec` (unsupported,
+errors via the Missing hint) and cyclic VALUE recursion (`let rec x = {
+f2 = x }` — FS0040-style delayed init not implemented).
+
+Compiler fix the port forced: Lower's ListExpr statement-form
+comprehension required EXACTLY ONE ForExpr/WhileExpr child, so
+`[ for i in .. do yield e; yield a; yield b ]` (a loop plus trailing
+yields) fell to "not lowerable: list comprehension". Any yield-bearing
+non-arrow body is now the statement form: all exprish children lower in
+sequence under the accumulator. The eager plain-element lowering was also
+moved AFTER form detection — it used to lower every yield's inner
+expression a first, discarded time (side-effect-table pollution risk).
+
+Battery: 29/29 gates, conformance 23 suites / 1307 positive asserts,
+44 neg, fixpoint self byte-exact, gchost DONE bytes=81368 hash=853970823.
