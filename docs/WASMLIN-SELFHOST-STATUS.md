@@ -900,3 +900,36 @@ the conformance suites (they run on `--gc` = wasm-linear + reactor, fsi
 as oracle) — but wasm-GC is the DEFAULT build, the browser/JS-interop
 target, the second emitter of every differential gate, and the definition
 of the fixpoint gates. Removing it is a migration, not a deletion.
+
+## 25. Negative batch 3: the class/member surface (44 must-reject cases)
+
+Thirteen more negative cases; EIGHT were silent-acceptance holes, fixed:
+
+- instantiating an [<AbstractClass>] (the attribute was entirely unread)
+  or an INTERFACE (`IThing()` compiled and trapped at first dispatch)
+- `inherit` of an interface from a CLASS (interfaces inheriting
+  interfaces stay legal)
+- `override` with nothing to override (base chain + iface search,
+  object-override names exempt)
+- duplicate member signatures IN ONE DECLARATION BLOCK — scoped that
+  narrowly on purpose: `type X with` extensions may re-spell an intrinsic
+  member (F# prefers the intrinsic), abstract/default pairs coexist, and
+  F++ overloads may differ by `when`-CONSTRAINTS alone, so the signature
+  key includes the constraint set. This check found REAL duplicates the
+  adaptive port was generating: rewriting OptimizedClosures.FSharpFunc
+  parameters to plain functions collapsed each perf-adapter overload into
+  an exact copy of the implementation it wrapped — port-adaptive.py now
+  drops the degenerate self-delegating adapters.
+- a record PATTERN naming an unknown field (the scrutinee's type names
+  the record when the labels cannot)
+- a STATIC member called through a value (`c.S()` — trapped at runtime;
+  properties exempt, their value entry does not carry IsStatic), and an
+  INSTANCE member called through the type (`C.M()`)
+
+The remaining five (ctor arity, literal-pattern type, type-arg count,
+loop-counter assignment, unknown type via usage) already errored through
+existing checks. All 44 fsi-oracle-verified (1 divergence skip). One
+observation parked with a repro: the ad-hoc mini adaptive driver
+(cval→map→transact) now recurses on the wasm-linear+reactor leg under
+wasmtime while the emcc linear leg, the C legs and wasm-GC are all green
+— not covered by any gate, cause unpinned.

@@ -436,6 +436,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // Every access therefore returns a fresh variable immediately and parks
     // here; the parked set is retried to fixpoint once the file is inferred.
     let mutable pendingStructAttr = false
+    let mutable pendingAbstractAttr = false
+    /// member signatures seen in the CURRENT type-declaration block, for
+    /// the duplicate check — reset per TypeDecl
+    let mutable curBlockMemberSigs = dictNew<string, int> ()
+    /// types declared [<AbstractClass>] — constructing one is an error
+    let abstractTypes = dictNew<string, bool> ()
     let memberSitesRaw = vecNew<int * string> ()
     let fieldOwnersRaw = vecNew<int * string> ()
     let pendingOwners = vecNew<int * Type> ()
@@ -449,6 +455,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// definition offsets of `let mutable` binders (this file) — the only
     /// idents `<-` may target
     let mutableLets = dictNew<int, bool> ()
+    /// dot-use offsets that reached a member THROUGH THE TYPE (`C.S`) or a
+    /// synthetic static park — a static member resolved at any OTHER dot
+    /// offset was called through a value, which F# rejects
+    let staticAccessOk = dictNew<int, bool> ()
 
     let ctorSitesRaw = vecNew<int * int> ()
     /// record literals, resolved after solving so the instantiation is known
@@ -1216,6 +1226,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let result2 = optJoinDemand chosen demanded2 appOff2 result
                      unifyMemberAt offset result2 chosen
                      vecAdd memberSitesRaw (offset, ownerTag)
+                     // a STATIC member reached through a VALUE receiver: the
+                     // call compiled against a receiver the member does not
+                     // take, and trapped
+                     (if fi.IsStatic && fi.DefKey.IsSome
+                        && not ((dictTryFind staticAccessOk offset).IsSome) then
+                         vecAdd diags (offset, "'" + name + "' is a static member of " + fi.TypeName + " — call it through the type"))
                      // the declared context, under the same substitution the
                      // type took — this use owes it
                      for c in fi.Constraints do
@@ -2727,6 +2743,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | None -> ())
                  recTy
              | None ->
+                 // no record covers ALL the labels: if one knows at least
+                 // one of them, the stray label deserves a name — silence
+                 // bound nothing and the arm matched on garbage
+                 (let nearest =
+                     // the SCRUTINEE names the record when the labels
+                     // cannot: `match (r : R) with { zz = x }` should say
+                     // R has no zz, not stay quiet
+                     match patExpect |> Option.map prune with
+                     | Some (TCon (sn, _)) when (dictTryFind recordsReg sn).IsSome -> Some sn
+                     | _ ->
+                         fieldNames
+                         |> List.tryPick (fun m ->
+                             dictPairs fields
+                             |> List.tryPick (fun (k, fi) ->
+                                 if k = fi.TypeName + "." + m && not (k.Contains "$")
+                                    && fi.DefKey.IsNone && not fi.IsStatic
+                                 then Some fi.TypeName else None))
+                  match nearest with
+                  | Some tn ->
+                      for nm, _ in fps do
+                          (match tokensOf nm |> List.tryHead with
+                           | Some t0 when not ((dictTryFind fields (tn + "." + t0.Text)).IsSome) ->
+                               vecAdd diags (t0.Offset, "the record " + tn + " has no field '" + t0.Text + "'")
+                           | _ -> ())
+                  | None -> ())
                  for _, sub in fps do patType pvars sub |> ignore
                  st.Fresh ())
         | AsPat ->
@@ -3199,6 +3240,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       // constructors compete and the argument
                                       // fit decides — the same trial that
                                       // separates ordinary overloads
+                                      // constructing what CANNOT be
+                                      // constructed: silence here built a
+                                      // stub object whose first dispatch
+                                      // trapped
+                                      (if (dictTryFind abstractTypes ctorName).IsSome then
+                                          vecAdd diags (ht.Offset, "cannot instantiate '" + ctorName + "': it is abstract")
+                                       elif (dictTryFind ctors ctorName).IsNone
+                                            && (dictTryFind ifaces ctorName).IsSome then
+                                          vecAdd diags (ht.Offset, "cannot instantiate the interface '" + ctorName + "'"))
                                       let written = writtenCount
                                       let cands =
                                           match written with
@@ -4839,11 +4889,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some d when d.Kind = Resolve.DefType -> Some (arityNameOfDef d)
                          | _ -> None)
                     | None -> None
+                (match staticOwner, lastIdent with
+                 | Some _, Some name -> dictSet staticAccessOk name.Offset true
+                 | _ -> ())
                 match staticOwner, lastIdent with
                 | Some tn, Some name when (dictTryFind fields (tn + "." + name.Text)).IsSome ->
                     (match fieldCandidates (tn + "." + name.Text)
                            |> List.filter (fun (_, fi) -> memberVisible name.Offset fi) with
                      | [ (_, fi) ] ->
+                         // `C.M` where M is an INSTANCE member: there is no
+                         // receiver to call it on — accepting it ran the
+                         // body against garbage. Properties are exempt: a
+                         // static property registers through the accessor
+                         // pair and its value entry does not carry IsStatic
+                         (if not fi.IsStatic && fi.DefKey.IsSome
+                             && not ((dictTryFind fields (tn + ".get_" + name.Text)).IsSome)
+                             && not ((dictTryFind fields (tn + ".set_" + name.Text)).IsSome) then
+                             vecAdd diags (name.Offset, "'" + name.Text + "' is an instance member of " + tn + " — call it on an instance"))
                          let subst = dictNew<int, Type> ()
                          for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
                          for qv in fi.Quantified do dictSet subst (prunedId qv) (st.Fresh ())
@@ -5798,6 +5860,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | Some t -> dictSet structTypes t.Text true
              | None -> ())
         pendingStructAttr <- false
+        if pendingAbstractAttr then
+            (match tokensOf n |> List.tryFind (fun t -> t.Kind = Ident) with
+             | Some t -> dictSet abstractTypes t.Text true
+             | None -> ())
+        pendingAbstractAttr <- false
+        curBlockMemberSigs <- dictNew<string, int> ()
         // declared type parameters
         let vars = dictNew<string, Type> ()
         tyScope <- vars
@@ -5903,6 +5971,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // "subclass" ran with no base at all
                       (match Green.tokens (GNode tn) |> List.tryHead with
                        | Some t -> vecAdd diags (t.Offset, "cannot inherit from '" + b + "': it is not a class")
+                       | None -> ())
+                  | TCon (b, _) when
+                        (dictTryFind ifaces b).IsSome && (dictTryFind ctors b).IsNone
+                        // an INTERFACE inheriting an interface is the normal
+                        // spelling — only a CLASS may not `inherit` one
+                        && not (let ms = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
+                                not (List.isEmpty ms)
+                                && ms |> List.forall (fun m ->
+                                       tokensOf m |> List.exists (fun tk -> tk.Kind = Keyword && tk.Text = "abstract"))) ->
+                      (match Green.tokens (GNode tn) |> List.tryHead with
+                       | Some t -> vecAdd diags (t.Offset, "'" + b + "' is an interface — implement it with `interface " + b + " with`, not `inherit`")
                        | None -> ())
                   | _ -> dictSet bases name (ownParams, baseTy)
               | None -> ())
@@ -6207,6 +6286,40 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 inMemberBody <- true
                 inferMember name vars (paramVarList ()) selfTy None m
                 inMemberBody <- wasMember
+                // `override` must OVERRIDE something: a base-chain member
+                // of the same name (same-file resolution, like the inherit
+                // checks). The object overrides are always overridable.
+                (if tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "override") then
+                    match memberNameOf m with
+                    | Some nt when
+                        not (List.contains nt.Text [ "ToString"; "GetHashCode"; "Equals"; "Finalize" ]) ->
+                        let rec chainHas (c : string) (d : int) : bool =
+                            d < 16
+                            && ((dictTryFind fields (c + "." + nt.Text)).IsSome
+                                || (match dictTryFind ifaces c with
+                                    | Some ms -> ms |> List.exists (fun (mn, _) -> mn = nt.Text)
+                                    | None -> false)
+                                || (match dictTryFind bases c with
+                                    | Some (_, bt) ->
+                                        (match prune bt with
+                                         | TCon (bn, _) when bn <> c -> chainHas bn (d + 1)
+                                         | _ -> false)
+                                    | None -> false))
+                        let baseHas =
+                            (match dictTryFind bases name with
+                             | Some (_, bt) ->
+                                 (match prune bt with
+                                  | TCon (bn, _) -> chainHas bn 0
+                                  | _ -> true)
+                             | None -> false)
+                            // an abstract member declared on THIS type may
+                            // carry a `default`-style override next to it
+                            || (match dictTryFind ifaces name with
+                                | Some ms -> ms |> List.exists (fun (mn, _) -> mn = nt.Text)
+                                | None -> false)
+                        if not baseHas then
+                            vecAdd diags (nt.Offset, "'" + nt.Text + "' overrides nothing: no base member of that name")
+                    | _ -> ())
             | InterfaceImpl ->
                 // implementations live under "Class.Interface.Method": they
                 // are not accessible as members of the class itself
@@ -6521,6 +6634,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          { Quantified = qs; Constraints = []; Body = defTy }
                      setScheme t.Offset propSch
                  let classIds = classParams |> List.map (fun v -> v.Id) |> Set.ofList
+                 // the same name at the SAME signature is a duplicate, not
+                 // an overload: the second silently shadowed the first
+                 (let dupSig = typeString (prune propTy)
+                  if fieldCandidates (tyName + "." + t.Text)
+                     |> List.exists (fun (_, ofi) ->
+                         ofi.TypeName = tyName && typeString (prune ofi.FieldType) = dupSig) then
+                      vecAdd diags (t.Offset, tyName + " already declares '" + t.Text + "' with this signature"))
                  registerField (tyName + "." + t.Text)
                      { TypeName = tyName; Params = classParams
                        Quantified =
@@ -6658,6 +6778,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 freeVars memberTy
                 |> List.distinctBy (fun v -> v.Id)
                 |> List.filter (fun v -> not (Set.contains v.Id classIds))
+            // the same name at the SAME signature IN ONE DECLARATION BLOCK
+            // is a duplicate, not an overload: the second silently shadowed
+            // the first. Scoped to the block on purpose — a `type X with`
+            // extension may legitimately re-spell an existing member (F#
+            // prefers the intrinsic), and abstract/default pairs and
+            // interface impl blocks are different declarations too.
+            (let isPlain =
+                not (tokensOf n |> List.exists (fun tk ->
+                        tk.Kind = Keyword
+                        && (tk.Text = "abstract" || tk.Text = "default" || tk.Text = "override")))
+             if isPlain && not (tyName.Contains ".") then
+                 // the member's `when` context is part of the signature:
+                 // F++ overloads legitimately differ by CONSTRAINTS alone
+                 let consSig =
+                     memberCons
+                     |> List.map (fun c -> c.Class + "<" + String.concat "," (List.map typeString c.Args) + ">")
+                     |> List.sort |> String.concat "&"
+                 let dupSig = t.Text + "|" + typeString (prune memberTy) + "|" + consSig
+                 (match dictTryFind curBlockMemberSigs dupSig with
+                  | Some prevOff when prevOff <> t.Offset ->
+                      vecAdd diags (t.Offset, tyName + " already declares '" + t.Text + "' with this signature")
+                  | Some _ -> ()
+                  | None -> dictSet curBlockMemberSigs dupSig t.Offset))
             registerField (tyName + "." + t.Text)
                 { TypeName = tyName; Params = classParams; Quantified = quantified
                   FieldType = memberTy
@@ -6864,6 +7007,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | AttributeList ->
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
                     pendingStructAttr <- true
+                if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "AbstractClass") then
+                    pendingAbstractAttr <- true
             | ModuleHeader | OpenDecl -> ()
             // the tables are read before any body; only the bodies are
             // typed here, in declaration order like everything else

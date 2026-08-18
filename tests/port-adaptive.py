@@ -130,6 +130,14 @@ def dotnet_hashset(src):
     return re.sub(r"\bHashSet\s*<", "MutableHashSet<", src)
 
 
+def drop_selfdelegating_adapters(src):
+    import re as _re
+    pat = _re.compile(
+        r"\n([ \t]*)((?:///[^\n]*\n\1)*)member\s+(\w+)\.(\w+)\(([A-Za-z_]\w*)\s*:[^=\n]*\)\s*(?::[^=\n]*)?=\s*\n"
+        r"\1[ \t]+let\s+\5\s*=\s*\(\5\)\s*\n"
+        r"\1[ \t]+\3\.\4\([^)\n]*\)\s*\n")
+    return pat.sub("\n", src)
+
 def port(path, first):
     src = open(path, encoding="utf-8-sig").read()
     # The .NET branch, not the Fable one: Fable's WeakReference never dies,
@@ -138,6 +146,12 @@ def port(path, first):
     # reflection, and the point of this port is that the heart survives.
     src = pick_branch(src, defined=())
     src = port_closures(src)
+    # port_closures rewrites OptimizedClosures.FSharpFunc parameters to plain
+    # function types, which collapses each perf-adapter overload
+    # (`member x.M(f) = let f = (f) in x.M(f)`) into an exact DUPLICATE of
+    # the implementation it wrapped — and F++ now rejects duplicate member
+    # signatures. Drop the degenerate self-delegating adapters.
+    src = drop_selfdelegating_adapters(src)
     src = strip_attrs(src)
     src = dotnet_exception_ctors(src)
     src = drop_fsharp_core_set_bridges(src)
