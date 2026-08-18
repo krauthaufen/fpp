@@ -45,7 +45,9 @@ if [ "$full" = 1 ]; then
   # the two fixpoint modes share GetTempPath()/fpp-fixpoint — give each
   # its own TMPDIR so they can run concurrently
   mkdir -p "$logs/tmp-self" "$logs/tmp-corpus"
-  gates=("fixpoint-self|TMPDIR=$logs/tmp-self dotnet fsi $root/tests/bootstrap/fixpoint.fsx self"
+  mkdir -p "$logs/tmp-linself"
+  gates=("fixpoint-linself|TMPDIR=$logs/tmp-linself dotnet fsi $root/tests/bootstrap/fixpoint.fsx linear self"
+         "fixpoint-self|TMPDIR=$logs/tmp-self dotnet fsi $root/tests/bootstrap/fixpoint.fsx self"
          "unit-adaptive|dotnet run -c Release --no-build --project $root/tests/Fpp.Tests -- --filter-test-list 'adaptive suite'"
          "unit-suite|FPP_GATE_SKIP_ADAPTIVE=1 dotnet run -c Release --no-build --project $root/tests/Fpp.Tests"
          "fixpoint|TMPDIR=$logs/tmp-corpus dotnet fsi $root/tests/bootstrap/fixpoint.fsx"

@@ -1262,3 +1262,42 @@ stamp-vs-canonical classification divergence in the self-hosted front
 half, the next session's target).
 
 Battery: 29/29; gchost byte-exact (82064/451751650, 0 stubs).
+
+## §36 THE LINEAR FIXPOINT IS GREEN (2026-08-19)
+
+**`fixpoint.fsx linear self`: stage-1 reproduces stage-0 byte for byte
+(11,093,143 bytes).** The compiler, compiled to wasm-linear (LowIR +
+Whippet reactor), running under wasmtime, reads its own sources over
+WASI and re-emits ITSELF byte-exactly. The corpus mode
+(`fixpoint.fsx linear`) is equally exact (55,554 bytes). Wired into the
+battery as `fixpoint-linself` — 30 gates now.
+
+The last two defects:
+
+* **patGenBinders' keep/witOf pair disagreed under self-host**: two
+  textually-identical prune+lookup passes over the same scheme — the
+  second (witOf) answered 0 where the first hit, pairing every generic
+  match binder with witness register 0 (a 4-byte diff; runtime-correct
+  only by accident when the witnesses agreed). Rewritten as ONE lookup
+  (`pick`) deciding both keep and witness. The same session replaced
+  every `.Value` in WasmLin with a matched `optGet` — Option.get_Value
+  is the same stamped-generic member-access family as the Dictionary
+  indexer, both still OPEN as a self-host miscompile to hunt (regOf and
+  optGet are the workarounds; the emitter no longer uses either member).
+* **bytesString at 11MB**: building the whole emitted module as one
+  string overflowed the string machinery under self-host (OOB in
+  StringBuilder/concat) — the driver now prints 64K slices.
+
+Housekeeping: the fpprt reactor is a REPO artifact now
+(tests/tooling/gc/fpprt_reactor.wasm, built from ~/projects/fpp/runtime
+@46e037d by tests/tooling/gc/build-reactor.sh; FPPRT_REACTOR overrides);
+the driver's debug catch/W-dump removed.
+
+wasm-GC's remaining roles after this: default `fpp build`, the
+browser/jsinterop target, and the fsi-oracle gates that run through it.
+The linear backend now carries its own self-host proof — the interop
+arc is what remains before the default flips and wasm-GC can be dropped
+wholesale.
+
+Battery: 30/30 (fixpoint-linself included), both wasm-GC fixpoints
+byte-exact, gchost byte-exact, conformance 28 suites / 46 neg.

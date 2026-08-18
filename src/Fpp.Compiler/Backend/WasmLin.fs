@@ -2286,6 +2286,16 @@ type private LowCtx =
 /// EMatch/binder sites while dictTryFind at the same keys answered
 /// correctly (see the linear-fixpoint arc); every internal read goes
 /// through this until that miscompile is found
+/// Option.Value WITHOUT the member access: the stamped generic get_Value
+/// (like Dictionary's get_Item) returns garbage in some linear self-host
+/// contexts — patGenBinders' witOf got 0 instead of the witness register,
+/// the 4-byte fixpoint diff. Plain match until the member-call miscompile
+/// is found.
+let private optGet (o : 'a option) : 'a =
+    match o with
+    | Some v -> v
+    | None -> failwith "optGet: None"
+
 let private regOf (ctx : LowCtx) (k : string) : int =
     match dictTryFind ctx.Regs k with
     | Some i -> i
@@ -3055,6 +3065,8 @@ let private rootActiveGen (ctx : LowCtx) (inner : LExpr) : LExpr =
     match ctx.ActiveGen with
     | [] -> inner
     | gens ->
+        (if List.contains curFnDbg [ "$f2029101207"; "$f658950141" ] then
+            eprintfn "RAG %s %s" curFnDbg (String.concat ";" (gens |> List.map (fun (r, w) -> "r" + string r + ":w" + string w))))
         let refMask w = LLoad (W, LGet (wReg w), 8)
         let res = freshTmp ctx
         let pushes = gens |> List.map (fun (r, w) ->
@@ -3115,13 +3127,23 @@ let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list
 // analogue of a generic let. Each is rooted conditionally across the arm's
 // safepoints (a `h::t` head held across a later allocation, say).
 let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
-    let keep (v : VarId) (sch : Scheme) =
-        (dictTryFind ctx.LSt.CellVars (key v)).IsNone
-        && (match prune sch.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).IsSome | _ -> false)
-    let witOf sch = match prune sch.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).Value | _ -> 0
+    // ONE lookup deciding both the keep and the witness: the old
+    // keep-then-witOf pair (two prune+lookup passes) DISAGREED under the
+    // linear self-host — witOf answered 0 where keep's identical lookup
+    // hit, pairing every gen binder with witness register 0 (the 4-byte
+    // fixpoint diff)
+    let pick (v : VarId) (sch : Scheme) : (VarId * int) list =
+        if (dictTryFind ctx.LSt.CellVars (key v)).IsSome then []
+        else
+            match prune sch.Body with
+            | TVar tv ->
+                (match dictTryFind ctx.Witness tv.Id with
+                 | Some w -> [ v, w ]
+                 | None -> [])
+            | _ -> []
     match pat with
-    | PVar (v, sch) -> if keep v sch then [ v, witOf sch ] else []
-    | PAs (p, v, sch) -> (if keep v sch then [ v, witOf sch ] else []) @ patGenBinders ctx p
+    | PVar (v, sch) -> pick v sch
+    | PAs (p, v, sch) -> pick v sch @ patGenBinders ctx p
     | PCtor (_, _, subs) | PTuple subs | PListLit subs -> List.collect (patGenBinders ctx) subs
     | PCons (h, tl) -> patGenBinders ctx h @ patGenBinders ctx tl
     | POr (p :: _) -> patGenBinders ctx p   // same-binders-per-alternative, see patRefBinders
@@ -3252,7 +3274,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let bind = lowLetBind ctx v sch rhs
         let reg = regOf ctx (key v)
         let saved = ctx.ActiveGen
-        ctx.ActiveGen <- (reg, (genWitOf ctx v sch).Value) :: ctx.ActiveGen
+        ctx.ActiveGen <- (reg, optGet (genWitOf ctx v sch)) :: ctx.ActiveGen
         let bodyLow = coreToLowE ctx body
         ctx.ActiveGen <- saved
         LDo ([ bind ], bodyLow)
@@ -3263,7 +3285,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // reload from the GC-updated slot after each safepoint, pop at scope end.
         let bind = lowLetBind ctx v sch rhs
         let reg = regOf ctx (key v)
-        let wit = (genWitOf ctx v sch).Value
+        let wit = optGet (genWitOf ctx v sch)
         let slotReg = freshTmp ctx
         let saved = ctx.SlottedGen
         ctx.SlottedGen <- (reg, wit, slotReg) :: ctx.SlottedGen
@@ -3460,12 +3482,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EListLit xs -> lowList ctx xs
     // a collapsed one-field record IS its field value — no heap object
     | ERecord (name, fields) when (dictTryFind st.Collapse name).IsSome ->
-        let f = (dictTryFind st.Collapse name).Value
+        let f = optGet (dictTryFind st.Collapse name)
         (match fields |> List.tryPick (fun (fn2, e2) -> if fn2 = f then Some e2 else None) with
          | Some e2 -> coreToLowE ctx e2
          | None -> lowInt 0)
     | ERecordExt (name, baseE, updates) when (dictTryFind st.Collapse name).IsSome ->
-        let f = (dictTryFind st.Collapse name).Value
+        let f = optGet (dictTryFind st.Collapse name)
         (match updates |> List.tryPick (fun (fn2, e2) -> if fn2 = f then Some e2 else None) with
          | Some e2 -> coreToLowE ctx e2
          | None -> coreToLowE ctx baseE)
@@ -3473,11 +3495,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // raw field value rides a typed local before the allocation (GC-invisible),
     // so no shadow rooting; a field read boxes (cancelled by unbox in arithmetic).
     | ERecord (name, fields) when (dictTryFind st.RecPod name).IsSome ->
-        let (layout, _, _) = (dictTryFind st.RecPod name).Value
+        let (layout, _, _) = optGet (dictTryFind st.RecPod name)
         let order = ctorOrder st name (List.map fst fields)
         let items =
             order |> List.map (fun fn ->
-                let (off, kind) = (dictTryFind layout fn).Value
+                let (off, kind) = optGet (dictTryFind layout fn)
                 let ve = fields |> List.tryPick (fun (f, e) -> if f = fn then Some e else None)
                 match storLTy kind with
                 | Some (sty, _) ->
@@ -3486,7 +3508,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | None -> (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)))
         lowPodBuild ctx name items
     | ERecordExt (name, baseE, updates) when (dictTryFind st.RecPod name).IsSome ->
-        let (layout, _, _) = (dictTryFind st.RecPod name).Value
+        let (layout, _, _) = optGet (dictTryFind st.RecPod name)
         let order = ctorOrder st name (List.map fst updates)
         let bl = freshTmp ctx
         // pre-evaluate each update value into a local; then bind base. lowPodBuild
@@ -3494,7 +3516,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // allocation cannot move an as-yet-unstored update value or the base.
         let updInfo =
             updates |> List.map (fun (fn, e) ->
-                let (off, kind) = (dictTryFind layout fn).Value
+                let (off, kind) = optGet (dictTryFind layout fn)
                 match storLTy kind with
                 | Some (sty, _) -> let vty = storValTy sty in let id = freshTmpT ctx vty in (fn, LSet ({ Id = id; RTy = vty }, storUnbox kind (coreToLowE ctx e)), (off, sty, vty, false, LGet { Id = id; RTy = vty }))
                 | None -> let id = freshTmp ctx in (fn, LSet (wReg id, coreToLowE ctx e), (off, W, W, true, LGet (wReg id))))
@@ -3504,7 +3526,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 match updInfo |> List.tryPick (fun (f, _, it) -> if f = fn then Some it else None) with
                 | Some it -> it
                 | None ->
-                    let (off, kind) = (dictTryFind layout fn).Value
+                    let (off, kind) = optGet (dictTryFind layout fn)
                     match storLTy kind with
                     | Some (sty, _) -> (off, sty, storValTy sty, false, LLoad (sty, LGet (wReg bl), off))
                     | None -> (off, W, W, true, LLoad (W, LGet (wReg bl), off)))
@@ -3556,9 +3578,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // plain POD field cases, or a field write would copy the element out and
     // mutate the throwaway. Read fuses to the slot; write hits the slot directly.
     | EField (EIndex (ek, arr, i), fname, _) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
-        let (off, kind) = (dictTryFind layout fname).Value
-        let (sty, _) = (storLTy kind).Value
+        let (layout, stride) = optGet (podArrOf st ek)
+        let (off, kind) = optGet (dictTryFind layout fname)
+        let (sty, _) = optGet (storLTy kind)
         let vty = storValTy sty
         let ar = freshTmp ctx
         let ir = freshTmp ctx
@@ -3568,9 +3590,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
              storBox ctx kind (LGet { Id = fv; RTy = vty }))
     | EFieldSet (EIndex (ek, arr, i), fname, _, v) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
-        let (off, kind) = (dictTryFind layout fname).Value
-        let (sty, _) = (storLTy kind).Value
+        let (layout, stride) = optGet (podArrOf st ek)
+        let (off, kind) = optGet (dictTryFind layout fname)
+        let (sty, _) = optGet (storLTy kind)
         let vty = storValTy sty
         let fv = freshTmpT ctx vty
         let ar = freshTmp ctx
@@ -3581,8 +3603,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
     | EField (r, fname, owner) when (dictTryFind st.RecPod owner).IsSome ->
-        let (layout, _, _) = (dictTryFind st.RecPod owner).Value
-        let (off, kind) = (dictTryFind layout fname).Value
+        let (layout, _, _) = optGet (dictTryFind st.RecPod owner)
+        let (off, kind) = optGet (dictTryFind layout fname)
         (match storLTy kind with
          | Some (sty, _) ->
              let vty = storValTy sty
@@ -3590,8 +3612,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
          | None -> LLoad (W, coreToLowE ctx r, off))
     | EFieldSet (r, fname, owner, v) when (dictTryFind st.RecPod owner).IsSome ->
-        let (layout, _, _) = (dictTryFind st.RecPod owner).Value
-        let (off, kind) = (dictTryFind layout fname).Value
+        let (layout, _, _) = optGet (dictTryFind st.RecPod owner)
+        let (off, kind) = optGet (dictTryFind layout fname)
         (match storLTy kind with
          | Some (sty, _) ->
              let vty = storValTy sty
@@ -3627,30 +3649,30 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // — `arr.[i].f` / `arr.[i].f <- v` — is matched earlier, ahead of the plain
     // POD field cases, so a field write hits the slot instead of a throwaway.)
     | EIndex (ek, arr, i) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
+        let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
         let ar = freshTmp ctx
         let ir = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
         let items = order |> List.map (fun fn ->
-            let (off, kind) = (dictTryFind layout fn).Value
-            let (sty, _) = (storLTy kind).Value
+            let (off, kind) = optGet (dictTryFind layout fn)
+            let (sty, _) = optGet (storLTy kind)
             (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
         LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
     | EIndexSet (ek, arr, i, v) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
+        let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
         let vr = freshTmp ctx
         let ar = freshTmp ctx
         let ir = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
         let copies = order |> List.map (fun fn ->
-            let (off, kind) = (dictTryFind layout fn).Value
-            let (sty, _) = (storLTy kind).Value
+            let (off, kind) = optGet (dictTryFind layout fn)
+            let (sty, _) = optGet (storLTy kind)
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ] @ copies, lowInt 0)
     | EArrayCreate (ek, n, init) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
+        let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
         let cnt = freshTmp ctx
         let vr = freshTmp ctx
@@ -3658,8 +3680,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let it = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW stride ]) ])
         let copies = order |> List.map (fun fn ->
-            let (off, kind) = (dictTryFind layout fn).Value
-            let (sty, _) = (storLTy kind).Value
+            let (off, kind) = optGet (dictTryFind layout fn)
+            let (sty, _) = optGet (storLTy kind)
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
         let stmts =
@@ -3672,14 +3694,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]), copies @ [ LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EArray (ek, xs) when (podArrOf st ek).IsSome ->
-        let (layout, stride) = (podArrOf st ek).Value
+        let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
         let n = List.length xs
         let bs = freshTmp ctx
         let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LConstW n ]) else LAlloc (LConstW (ARRHDR + n * stride))
         let copyFields eb vr = order |> List.map (fun fn ->
-            let (off, kind) = (dictTryFind layout fn).Value
-            let (sty, _) = (storLTy kind).Value
+            let (off, kind) = optGet (dictTryFind layout fn)
+            let (sty, _) = optGet (storLTy kind)
             LStore (sty, eb, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         if gc then
             // materialise + PUSH every element record BEFORE the array alloc (each
@@ -3708,7 +3730,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // write unboxes; storBox/storUnbox carry the per-kind tag / sign-extend /
     // f32-reinterpret. `int`/`char`/`bool`/`nativeint` stay generic tagged words.
     | EArray (k, xs) when (storLTy k).IsSome ->
-        let (sty, w) = (storLTy k).Value
+        let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let n = List.length xs
         let vregs = xs |> List.map (fun _ -> freshTmpT ctx vty)
@@ -3721,7 +3743,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let stores = vregs |> List.mapi (fun i vr -> LStore (sty, LGet (wReg bs), HDR + 4 + i * w, LGet { Id = vr; RTy = vty }))
         LDo (evals @ [ LSet (wReg bs, alloc) ] @ hdr @ stores, LGet (wReg bs))
     | EIndex (k, arr, i) when (storLTy k).IsSome ->
-        let (sty, w) = (storLTy k).Value
+        let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let ir = freshTmp ctx
         let fv = freshTmpT ctx vty
@@ -3729,7 +3751,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4)) ],
              storBox ctx k (LGet { Id = fv; RTy = vty }))
     | EIndexSet (k, arr, i, v) when (storLTy k).IsSome ->
-        let (sty, w) = (storLTy k).Value
+        let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let fv = freshTmpT ctx vty
         let ir = freshTmp ctx
@@ -3774,7 +3796,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> (LLoad (W, coreToLowE ctx arr, HDR))
     | EArrayCreate (k, n, init) when (storLTy k).IsSome ->
-        let (sty, w) = (storLTy k).Value
+        let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let cnt = freshTmp ctx
         let fv = freshTmpT ctx vty
@@ -4350,7 +4372,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         // write-through (ActiveGen's snapshot/restore would undo its `<-`).
         let bind = lowLetBind ctx v sch rhs
         let reg = regOf ctx (key v)
-        let wit = (genWitOf ctx v sch).Value
+        let wit = optGet (genWitOf ctx v sch)
         let slotReg = freshTmp ctx
         let saved = ctx.SlottedGen
         ctx.SlottedGen <- (reg, wit, slotReg) :: ctx.SlottedGen
@@ -4360,7 +4382,7 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
     | ELet (_, v, sch, rhs, body) when (genWitOf ctx v sch).IsSome ->
         let bind = lowLetBind ctx v sch rhs
         let saved = ctx.ActiveGen
-        ctx.ActiveGen <- (regOf ctx (key v), (genWitOf ctx v sch).Value) :: ctx.ActiveGen
+        ctx.ActiveGen <- (regOf ctx (key v), optGet (genWitOf ctx v sch)) :: ctx.ActiveGen
         let bodyStmts = coreToLowS ctx body
         ctx.ActiveGen <- saved
         bind :: bodyStmts
@@ -4380,9 +4402,9 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
             let t = freshTmp ctx
             [ LSet (wReg t, coreToLowE ctx rhs) ]
             @ chkStoreStmts t
-            @ [ LStore (W, (dictTryFind ctx.Slotted (key v)).Value, 0, LGet (wReg t)) ]
+            @ [ LStore (W, optGet (dictTryFind ctx.Slotted (key v)), 0, LGet (wReg t)) ]
         else
-        [ LStore (W, (dictTryFind ctx.Slotted (key v)).Value, 0, coreToLowE ctx rhs) ]
+        [ LStore (W, optGet (dictTryFind ctx.Slotted (key v)), 0, coreToLowE ctx rhs) ]
     | EAssign (v, rhs) ->
         (match dictTryFind ctx.Regs (key v) with
          | Some id ->
@@ -4516,7 +4538,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         // ref-slot sets; intern an FK_STRUCT tid per set and pick it at runtime
         // from the witness refMasks. (This is lowGenericCons generalised past the
         // list-cons binary case to records/tuples/unions with N generic fields.)
-        let ks = refKinds.Value
+        let ks = optGet refKinds
         let isConst e = match e with LConstW _ -> true | _ -> false
         let staticRef i = List.item i ks = RKRef
         let staticRaw i = List.item i ks = RKRaw
@@ -4547,7 +4569,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         let rec selTid (j : int) (accMask : int) : LStmt list =
             if j = g then [ LSet (wReg tidTmp, LConstW (tidForMask accMask)) ]
             else
-                let w = (witOf (List.item j genIdx)).Value
+                let w = optGet (witOf (List.item j genIdx))
                 [ LIf (LPrim (EqW, [ refMaskOf w; LConstW 0 ]),
                        selTid (j + 1) accMask,
                        selTid (j + 1) (accMask ||| (1 <<< j))) ]
@@ -4569,7 +4591,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                     let ev = [ LSet (wReg tr, v) ]
                     let push =
                         if staticRef i then gcPushStmts (LGet (wReg tr))
-                        elif List.contains i genIdx then [ LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]), [], gcPushStmts (LGet (wReg tr))) ]
+                        elif List.contains i genIdx then [ LIf (LPrim (EqW, [ refMaskOf (optGet (witOf i)); LConstW 0 ]), [], gcPushStmts (LGet (wReg tr))) ]
                         else []
                     ev @ push)
         // pops mirror the pushes in descending slot order (LIFO). A raw slot (static
@@ -4579,7 +4601,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
                 if isConst (List.item i slots) then []
                 elif staticRef i then gcPopInto (LGet (wReg b)) (HDR + 4 * i)
                 elif List.contains i genIdx then
-                    [ LIf (LPrim (EqW, [ refMaskOf (witOf i).Value; LConstW 0 ]),
+                    [ LIf (LPrim (EqW, [ refMaskOf (optGet (witOf i)); LConstW 0 ]),
                            [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ],
                            gcPopInto (LGet (wReg b)) (HDR + 4 * i)) ]
                 else [ LStore (W, LGet (wReg b), HDR + 4 * i, tval i) ])
@@ -4597,7 +4619,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
             match refKinds with Some ks when concrete -> (List.item i ks) = RKRef | _ -> true
         let sk =
             if concrete then
-                let pat = refKinds.Value |> List.map (fun k -> if k = RKRef then "r" else "s") |> String.concat ""
+                let pat = optGet refKinds |> List.map (fun k -> if k = RKRef then "r" else "s") |> String.concat ""
                 "s:" + string cid + ":" + string n + ":" + string raw + ":" + pat
             else "s:" + string cid + ":" + string n + ":" + string raw
         // record the tid->cid mapping the first time a shape is allocated, so
@@ -4643,7 +4665,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
 // builds with the scalars unboxed inline and every live pointer correctly rooted.
 and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
     let cid = cidRec ctx.LSt name
-    let (_, size, firstRefWord) = (dictTryFind ctx.LSt.RecPod name).Value
+    let (_, size, firstRefWord) = optGet (dictTryFind ctx.LSt.RecPod name)
     let bs = freshTmp ctx
     let alloc = if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt ("inl:" + string cid) size FK_TAGGED firstRefWord) ]) else LAlloc (LConstW size)
     let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
@@ -5735,7 +5757,7 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
         | EApp ((EVar (v, _) | EVarI (v, _, _)) as h, args) when v.Path = "(builtin)" && v.Name.StartsWith "compare" ->
             EApp (h, List.map go args)
         | EApp ((EVar (v, sch) | EVarI (v, sch, _)) as h, args) when (dictTryFind funcs (key v)).IsSome ->
-            let n = (dictTryFind funcs (key v)).Value
+            let n = optGet (dictTryFind funcs (key v))
             let args = List.map go args
             let k = List.length args
             if k = n then EApp (h, args)
@@ -5773,7 +5795,7 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
         // lifts and lowers like any closure. The ctor value is TUPLED (one
         // arrow); a multi-payload case takes its tuple apart in a match.
         | ECtor (cn, sch, []) when (match dictTryFind caseArity cn with Some ar -> ar > 0 | None -> false) ->
-            let ar = (dictTryFind caseArity cn).Value
+            let ar = optGet (dictTryFind caseArity cn)
             (match prune sch.Body with
              | TFun (dom, _) ->
                  (match prune dom with
@@ -6002,7 +6024,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 let mutable off = HDR
                 for (fn, ty) in scalars do
                     dictSet m fn (off, ty)
-                    off <- off + snd (storLTy ty).Value
+                    off <- off + snd (optGet (storLTy ty))
                 let firstRefWord = off / 4
                 for (fn, ty) in refs do
                     dictSet m fn (off, ty)

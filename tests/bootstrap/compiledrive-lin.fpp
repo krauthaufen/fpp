@@ -33,19 +33,19 @@ let corpus = [ "corpus.fpp" ]
 
 let loaded = loadAll corpus
 
-let result =
-    try ws.EmitProgramWasmReactor () with
-    | Failure m ->
-        print ("EMIT-EXN " + m)
-        ([||], [ "EMIT-EXN " + m ])
-
-let warnDump =
-    for w in ws.EmitWarnings do eprintfn "W %s" w
+let result = ws.EmitProgramWasmReactor ()
 
 let bytes = fst result
 
 let errs = snd result
 
 let report =
-    if List.isEmpty errs then printRaw (bytesString bytes)
+    if List.isEmpty errs then
+        // CHUNKED: one 11MB module as a single string overflowed the
+        // string machinery under self-host; 64K slices print the same bytes
+        let mutable i = 0
+        while i < bytes.Length do
+            let n = min 65536 (bytes.Length - i)
+            printRaw (bytesString (Array.sub bytes i n))
+            i <- i + n
     else print ("ERRORS " + string (List.length errs) + " " + String.concat " | " errs)

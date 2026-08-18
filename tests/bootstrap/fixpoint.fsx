@@ -323,7 +323,10 @@ let out, err, code =
         // way the gchost check does, then run it against the served corpus
         let reactor =
             match System.Environment.GetEnvironmentVariable "FPPRT_REACTOR" with
-            | null | "" -> "/tmp/bigreactor/fpprt_reactor.wasm"
+            | null | "" ->
+                let repoCopy = root + "/tests/tooling/gc/fpprt_reactor.wasm"
+                if System.IO.File.Exists repoCopy then repoCopy
+                else "/tmp/bigreactor/fpprt_reactor.wasm"
             | p -> p
         let wasmMerge =
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
