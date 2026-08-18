@@ -778,14 +778,17 @@ them surfaced and fixed a chain of real compiler gaps:
 - Debug lesson: a probe type named `box` collides with the boxing builtin
   — `new box<int>(42)` lowers to the IDENTITY on its argument and every
   "field read" then faults. Half this session's ghost bugs were that name.
-- KNOWN ISSUE (pre-existing, found by re-running a long-dormant gate): the
-  adaptive C-BACKEND legs are red — the native/mmc suite aborts at startup
-  with `fpp: no vtable entry (tid 0 slot 742)` (wasm-linear leg untested
-  past it). The wasm-GC leg (unit suite "adaptive suite" test) is green,
-  so the break is cback-specific and predates this round: HEAD (0c82084)
-  fails identically with an unmodified compiler. BISECTED to f1e3680
-  ("a class member called at a concrete non-uniform instantiation stamps
-  — the canonical template paired obj enumerators with packed fields",
-  2026-08-09, a 26-line Link.fs change): the stamped class member
-  evidently loses its vtable wiring on the C backend. Fast repro: gcc -O0
-  over the generated suite.c (~5 min instead of the gate's ~9).
+- FIXED (was: adaptive C-backend legs red since f1e3680, found by
+  re-running the long-dormant gate, bisected automatically): f1e3680's
+  class-member stamping cloned members whose CANONICAL def the C backend
+  replaces with runtime intrinsics keyed by def identity (CEmit st.Intrin)
+  — the stamped WeakReference.TryGetTarget missed the intrinsic and
+  emitted the prelude's STRONG source body, handing the fpprt weak
+  WRAPPER out as the target; the first transact then dispatched
+  InputChanged on it (`no vtable entry (tid 0 slot 742)`). Fix:
+  classMemberDef skips WeakReference/ConditionalWeakTable — backend-owned
+  members, never layout-dependent (the payload is a ref). Both adaptive
+  legs PASSED 100 FAILED 0 again. Debug recipe that found it: gcc -O0
+  repro (~5 min/cycle), gdb on the Commit frame, reading the outputs
+  buffer element's header, then comparing the stamped
+  `TryGetTarget_IAdaptiveObject` body against the canonical intrinsic.

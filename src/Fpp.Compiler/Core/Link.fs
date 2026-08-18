@@ -547,13 +547,27 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
     // known-issue Enumerator shape: GetEnumerator itself is not
     // layout-dependent, but the BoxEn it constructs is)
     let classMemberDef = dictNew<string * int, bool> ()
+    // members the C BACKEND replaces with runtime intrinsics, KEYED BY THE
+    // CANONICAL DEF (CEmit's st.Intrin): a stamped clone has a new identity,
+    // misses the intrinsic, and emits the prelude's STRONG source body —
+    // WeakReference.TryGetTarget then handed the weak WRAPPER out as the
+    // target and the adaptive suite died on `no vtable entry (tid 0)`.
+    // These members are not layout-dependent (the payload is a ref), so
+    // never stamping them loses nothing.
+    let backendOwned (n : string) =
+        let bare =
+            let i = n.IndexOf "$<"
+            let n2 = if i > 0 then n.Substring (0, i) else n
+            let j = n2.IndexOf "`"
+            if j > 0 then n2.Substring (0, j) else n2
+        bare = "WeakReference" || bare = "ConditionalWeakTable"
     for d in decls do
         match d with
-        | DClass (_, _, own, impls) ->
+        | DClass (n, _, own, impls) when not (backendOwned n) ->
             for _, v in own do dictSet classMemberDef (v.Path, v.Offset) true
             for _, ms in impls do
                 for _, v in ms do dictSet classMemberDef (v.Path, v.Offset) true
-        | DMembers (_, own) ->
+        | DMembers (n, own) when not (backendOwned n) ->
             for _, v in own do dictSet classMemberDef (v.Path, v.Offset) true
         | _ -> ()
 
