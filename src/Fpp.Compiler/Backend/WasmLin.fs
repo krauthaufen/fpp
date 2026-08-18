@@ -596,6 +596,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_cat" "$lt_ii2i"
     declFn m "$prints" "$lt_i2v"
     declFn m "$eprints" "$lt_i2v"
+    declFn m "$printraw" "$lt_i2v"
     declFn m "$ftoa6" "$lt_i2i"
     declFn m "$streq" "$lt_ii2i"
     declFn m "$str_starts" "$lt_ii2i"
@@ -1196,6 +1197,41 @@ let private emitPrintsFd (m : Mod) (fd : int) : unit =
 
 let private emitPrints (m : Mod) : unit = emitPrintsFd m 1
 let private emitEprints (m : Mod) : unit = emitPrintsFd m 2
+
+// $printraw: each UTF-16 unit becomes ONE byte (the Latin-1 inverse) — the
+// raw-byte channel a binary-emitting driver prints modules through. $prints'
+// UTF-8 encoding DOUBLES bytes >= 0x80 (the linear fixpoint's stage-1 module
+// came out mojibake'd).
+let private emitPrintRaw (m : Mod) : unit =
+    let f = beginFn m [ "$s" ]
+    local f "$len" "i32"; local f "$i" "i32"; local f "$w" "i32"
+    localsDone f
+    if gc then (gg f "$roots"; mem f "i32.load"; ic f 8; ins f "i32.add"; gs f "$sbuf")
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
+    saddr f PRINTBUF; ls f "$w"
+    ic f 0; ls f "$i"
+    blockE f "$qc"; loopE f "$ql"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_u"; brIf f "$qc"
+    // window full -> flush and rewind (a self-sized module dwarfs PRINTCAP)
+    lg f "$w"; saddr f (PRINTBUF + PRINTCAP - 4); ins f "i32.ge_u"
+    ifE f
+    saddr f IOV_PTR; saddr f PRINTBUF; mem f "i32.store"
+    saddr f IOV_LEN; lg f "$w"; saddr f PRINTBUF; ins f "i32.sub"; mem f "i32.store"
+    ic f 1; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN
+    callf f "$fd_write"; ins f "drop"
+    saddr f PRINTBUF; ls f "$w"
+    endB f
+    lg f "$w"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store8"
+    lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$ql"; endB f; endB f
+    saddr f IOV_PTR; saddr f PRINTBUF; mem f "i32.store"
+    saddr f IOV_LEN; lg f "$w"; saddr f PRINTBUF; ins f "i32.sub"; mem f "i32.store"
+    ic f 1; saddr f IOV_PTR; ic f 1; saddr f NWRITTEN
+    callf f "$fd_write"; ins f "drop"
+    endFn f
 
 // $streq(a, b): value equality of two strings. 1 when equal, 0 otherwise —
 // same pointer short-circuits, then length, then unit-by-unit. String
@@ -3340,7 +3376,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // EPrim arithmetic path and `intArithOp`'s `%` default — `a @ b` compiled as
     // `a rem b` on two list POINTERS, trapping (divide-by-zero) the moment a spine
     // reached nil (0). Mirrors the GC backend's `$append`.
-    | EPrim ("@", [ a; b ]) -> LCall ("$lappend", [ coreToLowE ctx a; coreToLowE ctx b ])
+    | EPrim ("@", [ a; b ]) -> lowCallR ctx "$lappend" [ a; b ]
     // |n| on a raw int, branchless: (n ^ (n>>31)) - (n>>31)
     | EPrim (("abs" | "absi"), [ a ]) ->
         let t = freshTmp ctx
@@ -3845,7 +3881,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // '\n'); `printraw`/`printRaw` are the newline-free form.
     | EApp (EUnknown "print", [ a ]) ->
         LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
-    | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
+    | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
     | EApp (EUnknown ("hash" | "$hash"), [ a ]) ->
@@ -3874,16 +3910,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             LDo (pre @ chkStoreStmts rb @ [ LStore (W, LGet (wReg ra), cellOff (), LGet (wReg rb)) ], lowInt 0)
         else LDo ([ LStore (W, coreToLowE ctx c, cellOff (), coreToLowE ctx v) ], lowInt 0)
     | EApp (EUnknown "$forcecell", [ r ]) -> coreToLowE ctx r
-    | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> (LCall ("$str_starts", [ coreToLowE ctx s; coreToLowE ctx p ]))
-    | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> (LCall ("$str_ends", [ coreToLowE ctx s; coreToLowE ctx p ]))
+    | EApp (EUnknown "$str.StartsWith", [ s; p ]) -> lowCallR ctx "$str_starts" [ s; p ]
+    | EApp (EUnknown "$str.EndsWith", [ s; p ]) -> lowCallR ctx "$str_ends" [ s; p ]
     | EApp (EUnknown "$str.Contains", [ s; p ]) ->
-        (LPrim (GeSW, [ LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]); LConstW 0 ]))
+        (LPrim (GeSW, [ lowCallR ctx "$str_find" [ s; p; ELit (LInt "0") ]; LConstW 0 ]))
     | EApp (EUnknown "$str.IndexOf", [ s; p ]) ->
-        (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; LConstW 0 ]))
+        (lowCallR ctx "$str_find" [ s; p; ELit (LInt "0") ])
     | EApp (EUnknown "$str.IndexOf#2", [ s; c ]) ->
         (LCall ("$str_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]))
     | EApp (EUnknown "$str.IndexOf#3", [ s; p; from ]) ->
-        (LCall ("$str_find", [ coreToLowE ctx s; coreToLowE ctx p; (coreToLowE ctx from) ]))
+        (lowCallR ctx "$str_find" [ s; p; from ])
     | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
         (LCall ("$str_last_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]))
     | EApp (EUnknown "$str.Split", [ s; c ]) ->
@@ -3909,17 +3945,17 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LCall ("$str_pad", [ coreToLowE ctx s; (coreToLowE ctx w); LConstW 32; LConstW 1 ])
     | EApp (EUnknown ("$str.TrimStart" | "$str.TrimStart#2"), [ s; cs ]) ->
         // cs is either a tagged char or a tagged-char array — the helper tests the low bit
-        LCall ("$str_trim_start_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
+        lowCallR ctx "$str_trim_start_chars" [ s; cs ]
     | EApp (EUnknown ("$str.TrimEnd" | "$str.TrimEnd#2"), [ s; cs ]) ->
-        LCall ("$str_trim_end_chars", [ coreToLowE ctx s; coreToLowE ctx cs ])
+        lowCallR ctx "$str_trim_end_chars" [ s; cs ]
     | EApp (EUnknown "$str.Insert", [ s; i; v ]) ->
-        LCall ("$str_insert", [ coreToLowE ctx s; (coreToLowE ctx i); coreToLowE ctx v ])
+        lowCallR ctx "$str_insert" [ s; i; v ]
     | EApp (EUnknown "$str.Remove", [ s; i ]) ->
         LCall ("$strsub", [ coreToLowE ctx s; LConstW 0; (coreToLowE ctx i) ])
     | EApp (EUnknown "$str.Remove#2", [ s; i; n ]) ->
         LCall ("$str_remove2", [ coreToLowE ctx s; (coreToLowE ctx i); (coreToLowE ctx n) ])
     | EApp (EUnknown "$str.Trim", [ s ]) -> LCall ("$str_trim", [ coreToLowE ctx s ])
-    | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> LCall ("$str_replace", [ coreToLowE ctx s; coreToLowE ctx a; coreToLowE ctx b ])
+    | EApp (EUnknown "$str.Replace", [ s; a; b ]) -> lowCallR ctx "$str_replace" [ s; a; b ]
     | EApp (EUnknown ("$str.Substring#2" | "strsub"), [ s; start; len ]) ->
         LCall ("$strsub", [ coreToLowE ctx s; (coreToLowE ctx start); (coreToLowE ctx len) ])
     | EApp (EUnknown "$str.Substring", [ s; start ]) ->
@@ -4748,6 +4784,23 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
 // the raw STORAGE a variable occupies: a local/param register, an env slot (in
 // a lifted lambda body), or a module global. For a cell var this content is the
 // CELL POINTER; for an ordinary var it is the value itself.
+/// a runtime call whose operands are refs: root every operand across the
+/// LATER operands' (possibly allocating) evaluations — operand-stack values
+/// and plain registers are invisible to the collector. The generalized `+t`
+/// shape; tagged scalars are scan-safe, so uniform args root unconditionally.
+and private lowCallR (ctx : LowCtx) (fn : string) (args : Expr list) : LExpr =
+    let n = List.length args
+    if not gc || n <= 1 then LCall (fn, args |> List.map (coreToLowE ctx))
+    else
+        let regs = args |> List.map (fun _ -> freshTmp ctx)
+        let pairs = List.zip args regs
+        let head = List.truncate (n - 1) pairs
+        let lastA, lastR = List.item (n - 1) pairs
+        LDo ((head |> List.map (fun (a, _) -> LCallVoidS ("$spush", [ coreToLowE ctx a ])))
+             @ [ LSet (wReg lastR, coreToLowE ctx lastA) ]
+             @ (head |> List.rev |> List.map (fun (_, r) -> LSet (wReg r, LCall ("$spop", [])))),
+             LCall (fn, regs |> List.map (fun r -> LGet (wReg r))))
+
 and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     let st = ctx.LSt
     match dictTryFind ctx.Slotted k with
@@ -6175,7 +6228,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     exportFn m "_start" "$_start"
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
-    emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitFtoa6 m; emitStreq m
+    emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitPrintRaw m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
     emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m

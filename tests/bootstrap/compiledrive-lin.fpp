@@ -39,6 +39,9 @@ let result =
         print ("EMIT-EXN " + m)
         ([||], [ "EMIT-EXN " + m ])
 
+let warnDump =
+    for w in ws.EmitWarnings do eprintfn "W %s" w
+
 let bytes = fst result
 
 let errs = snd result

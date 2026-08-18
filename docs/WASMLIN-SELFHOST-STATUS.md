@@ -1202,3 +1202,27 @@ dumps, and suspect list (lowApply infos slotWitness path, EMatch arm
 slotting, freshTmp-through-stale-ctx) are in the fpp-linear-fixpoint
 memory. Battery stays 29/29 and gchost byte-exact (bytes=82064
 hash=451751650, 0 stubs — the stub fixes also cleaned the wasm-GC leg).
+
+## §34 linear fixpoint arc, part 2 (2026-08-18)
+
+* **lowCallR**: the `+t` operand bracket generalized — a runtime call
+  roots every operand across the LATER operands' (possibly allocating)
+  evaluations. Applied to `@`/$lappend and the string-method family
+  (StartsWith/EndsWith/IndexOf/Contains/trims/Insert/Replace), which all
+  had ref operands waiting un-rooted on the wasm value stack.
+* **$printraw on linear**: each UTF-16 unit becomes ONE byte (the
+  Latin-1 inverse), flushing when the 256KB window fills. printRaw used
+  to route to $prints, whose UTF-8 encoding DOUBLED every byte >= 0x80 —
+  the fixpoint's stage-1 module came out mojibake'd.
+
+Linear fixpoint state after part 2: the self-hosted linear compiler
+compiles the FULL fixcorpus and emits ~48KB of VALID wasm; stage-0 and
+stage-1 agree byte-for-byte through the type/import sections; the gap is
+~20 function bodies that stage-1 quiet-stubs because the corrupt-lowering
+sanity check catches garbage register ids in their fresh trees (the
+match-arm gen-binder slot machinery). The FPP_CONSCHECK + debug-reactor
+run (fpprt_dbg_live must be in EXPORTED_FUNCTIONS) passes every checked
+store funnel — the stale edge enters through an unchecked path; the
+resume plan is in the fpp-linear-fixpoint memory.
+
+Battery: 29/29, gchost byte-exact (bytes=82064 hash=451751650, 0 stubs).
