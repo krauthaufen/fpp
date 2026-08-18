@@ -4085,6 +4085,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let isInterface =
             not isExtension
             && not (List.isEmpty memberNodes) && memberNodes |> List.forall isAbstract
+            // a CONSTRUCTOR makes it a class however abstract its members:
+            // `[<AbstractClass>] type Shape() = abstract Area : ...` must
+            // still emit its ctor — a subclass's `inherit Shape()` calls it,
+            // and classifying it as an interface stubbed every subclass ctor
+            && ctorPat.IsNone
         // a class is anything with instance storage or a constructor
         let isClass =
             not isExtension

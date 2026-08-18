@@ -866,3 +866,37 @@ Lesson from wiring it up: marker keys in the shared `fields` table must
 be PREFIX-shaped (`$mut:R.f`) — every layout consumer scans by
 `TypeName + "."` prefix, so a suffix marker (`R.f$mut`) surfaced as a
 phantom field in zero-init records and aborted the C backend.
+
+## 24. casts suite; abstract-class dispatch and type tests fixed on linear
+
+New suite: `casts` (18 assertions) — up/downcasts, `:?` patterns, boxing,
+abstract base classes, object expressions over classes AND interfaces,
+subclass-aware class tests, over USER types (the fsc subtype suite itself
+is BCL-bound). Writing it surfaced and fixed THREE linear-side bugs:
+
+- **abstract-through-class dispatch trapped on wasm-linear** (`(sq :>
+  Shape).Area()` — wasm-GC was fine): a missing vtable slot silently
+  dispatched through SLOT 0. WasmLin now allocates class-keyed slots from
+  DMembers (as CEmit does), answers them from the nearest own member in
+  the base chain, and the casts suite pins the behaviour.
+- **`:? AbstractBase` answered false for every subclass on linear**: an
+  abstract class is both a DClass and a DInterface, and the interface
+  TestIds loop OVERWROTE the class loop's subclass set with the (empty)
+  impl-clause set. The sets now merge.
+- **a ctor'd class whose members are ALL abstract lost its constructor**:
+  Lower's isInterface test (`every member abstract`) claimed it, no ctor
+  DLet was emitted, and every subclass's `inherit Shape()` stubbed to an
+  unreachable that trapped at construction — on BOTH backends. A
+  constructor now makes it a class regardless of member abstractness.
+
+KNOWN ISSUE (recorded, both backends): a TYPE TEST on a boxed SCALAR
+(`match box 1 with :? int`) answers false — F++ scalars share one boxed
+representation, so the exact scalar type is not testable at runtime.
+Distinguishing them needs typed boxes (a representation decision, not a
+patch); the suite tests reference types only.
+
+Also answered this session: dropping the wasm-GC backend would NOT lose
+the conformance suites (they run on `--gc` = wasm-linear + reactor, fsi
+as oracle) — but wasm-GC is the DEFAULT build, the browser/JS-interop
+target, the second emitter of every differential gate, and the definition
+of the fixpoint gates. Removing it is a migration, not a deletion.

@@ -5606,15 +5606,40 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         let derived = classDecls |> List.filter (fun (cn, _, _, _) -> List.contains n (chainOf cn)) |> List.map (fun (cn, _, _, _) -> cn)
         if List.isEmpty derived then [ n ] else derived
     let slotImpl (cn : string) (owner : string) (mn : string) : VarId option =
-        chainOf cn
-        |> List.tryPick (fun c ->
-            classDecls
-            |> List.tryPick (fun (n2, _, _, impls) ->
-                if n2 <> c then None
-                else impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+        let fromIface =
+            chainOf cn
+            |> List.tryPick (fun c ->
+                classDecls
+                |> List.tryPick (fun (n2, _, _, impls) ->
+                    if n2 <> c then None
+                    else impls |> List.tryPick (fun (i, ms) -> if bareIface i = owner then ms |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) else None)))
+        match fromIface with
+        | Some v -> Some v
+        | None ->
+            // ABSTRACT dispatch through a base CLASS: the nearest own
+            // member anywhere in the chain answers the slot (mirrors
+            // BinDriver/CEmit — without this the slot lookup silently
+            // dispatched through slot 0 and read a garbage table index)
+            if List.contains owner (chainOf cn) then
+                chainOf cn
+                |> List.tryPick (fun c ->
+                    classDecls
+                    |> List.tryPick (fun (n2, _, own, _) ->
+                        if n2 <> c then None
+                        else own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
+            else None
+    let declaredMemberSlots =
+        decls0
+        |> List.collect (fun d ->
+            match d with
+            | DMembers (n, own) -> own |> List.map (fun (mn, _) -> bareIfaceOf n, mn)
+            | _ -> [])
     let vtableSlots =
         ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
-         @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))))
+         @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn))))
+         // abstract/override members dispatched through the CLASS: a slot
+         // per declared member name, keyed by the declaring class
+         @ declaredMemberSlots)
         |> List.distinct |> List.sort
     st.NSlots <- List.length vtableSlots
     vtableSlots |> List.iteri (fun i (ifn, mn) -> dictSet st.SlotOf (ifn + "|" + mn) i)
@@ -5622,10 +5647,25 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // subclasses; an interface matches its implementors; anything else is exact
     let cidsOf (names : string list) = names |> List.choose (fun n -> dictTryFind st.ClassId n)
     for cn, _, _, _ in classDecls do dictSet st.TestIds cn (cidsOf (subclassesOf cn))
+    // an ABSTRACT base has no DClass of its own (nothing constructs it),
+    // but `:? Base` must still answer for every subclass — without this
+    // the test id set was simply absent and the test was always false
+    for _, b, _, _ in classDecls do
+        match b with
+        | Some bn when not ((dictTryFind st.TestIds bn).IsSome) ->
+            dictSet st.TestIds bn (cidsOf (subclassesOf bn))
+        | _ -> ()
     for ifn, _ in interfaceDecls do
         let impls = classDecls |> List.filter (fun (_, _, _, impls) -> impls |> List.exists (fun (i, _) -> bareIface i = bareIface ifn)) |> List.collect (fun (cn, _, _, _) -> subclassesOf cn) |> List.distinct
-        dictSet st.TestIds ifn (cidsOf impls)
-        dictSet st.TestIds (bareIface ifn) (cidsOf impls)
+        // MERGE with what the class loop recorded: an abstract class is
+        // both a DClass and a DInterface, and overwriting here replaced
+        // its subclass set with the (empty) impl-clause set — `:? Shape`
+        // answered false for every Shape subclass
+        let merged (key : string) =
+            let prior = match dictTryFind st.TestIds key with Some xs -> xs | None -> []
+            (prior @ cidsOf impls) |> List.distinct
+        dictSet st.TestIds ifn (merged ifn)
+        dictSet st.TestIds (bareIface ifn) (merged (bareIface ifn))
     rtTypesLin m
     // classify top-level bindings. A lambda-valued binding that is REASSIGNED
     // is a mutable global holding a closure, not a fixed function. GC: each
