@@ -1157,9 +1157,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match tokensOf head |> List.tryHead with
                       | Some t ->
                           t.Text = "print"
-                          && (match dictTryFind opKinds t.Offset with
-                              | Some "w" | Some "h" | Some "b" | Some "c" -> true
-                              | _ -> false)
+                          && (dictTryFind opKinds t.Offset).IsSome
                       | None -> false)
                  | _ -> false) ->
                 // an unsigned value prints unsigned
@@ -1171,7 +1169,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some "h" -> "printh"
                          | Some "b" -> "printb"
                          | Some "c" -> "printc"
-                         | _ -> "printu"
+                         | Some "w" -> "printu"
+                         // the rest carry the kind for the backend's
+                         // formatter pick ("print#i", "print#f", ...)
+                         | Some k -> "print#" + k
+                         | None -> "print"
                      EApp (EUnknown fn, [ lowerExpr (GNode a) ])
                  | _ -> note (offsetOf n) "print shape")
             | AppExpr when
@@ -1903,7 +1905,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       | Some "l" -> "l"
                                       | Some "f" -> "f"
                                       | Some "s" -> "s"
-                                      | Some "w" | Some "b" | Some "c" -> "i"
+                                      | Some "w" | Some "b" | Some "c" | Some "i" -> "i"
                                       | _ ->
                                           match dictTryFind opTypes op.Offset with
                                           | Some "int" | Some "bool" | Some "char" -> "i"
@@ -1919,7 +1921,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   match dictTryFind opKinds op.Offset with
                                   // bool and char exist for conversions and
                                   // print only; as operands they are ints
-                                  | Some "b" | Some "c" -> ""
+                                  | Some "b" | Some "c" | Some "i" -> ""
                                   | Some k -> k
                                   | None ->
                                       // no primitive kind: either a type
@@ -2004,7 +2006,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | Some op, [ a ] when op.Text = "-" || op.Text = "not" || op.Text = "~~~" ->
                      let suffix =
                          match dictTryFind opKinds op.Offset with
-                         | Some "b" | Some "c" -> ""
+                         | Some "b" | Some "c" | Some "i" -> ""
                          | Some k -> k
                          | None ->
                              // as for a binary operator: a type variable or a
@@ -2305,7 +2307,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          if not suffixable then ""
                          else
                              match dictTryFind opKinds op.Offset with
-                             | Some "b" | Some "c" -> ""
+                             | Some "b" | Some "c" | Some "i" -> ""
                              | Some k -> k
                              | None ->
                                  match dictTryFind opTypes op.Offset with

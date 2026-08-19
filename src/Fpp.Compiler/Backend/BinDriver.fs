@@ -1714,7 +1714,10 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
          | _ ->
              err st ("binary: ctor shape not ported: " + name)
              refNull f "any")
-    | EApp (EUnknown "print", [ a ]) ->
+    | EApp (EUnknown n, [ a ]) when n = "print" || n.StartsWith "print#" ->
+        // the "#k" suffix names the STATIC kind for backends that need a
+        // formatter pick; this backend's runtime dispatch ignores it
+        let a = a
         emitNode st f lv a
         callf f "$printval"
         ic f 10

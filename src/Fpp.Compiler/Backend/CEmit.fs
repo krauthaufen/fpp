@@ -884,7 +884,10 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                          stmt f (sref d + " = TAGI(" + string ev + ");")
                          d
                      | None -> trap ("free var " + v.Name))
-    | EApp (EUnknown "print", [ a ]) ->
+    | EApp (EUnknown n, [ a ]) when n = "print" || n.StartsWith "print#" ->
+        // the "#k" suffix names the STATIC kind for backends that need a
+        // formatter pick; this backend's runtime dispatch ignores it
+        let a = a
         // the GENERIC print: a string prints raw, anything else through the
         // value renderer — the oracle's $showv path
         let x = emitE st f a

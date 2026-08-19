@@ -119,6 +119,9 @@ type private St =
       /// belong to the base it was stamped from (Dictionary). subclass -> base,
       /// so a field access on the subclass resolves its offset THROUGH the base's
       /// RecFields rather than defaulting to index 0.
+      /// every DClass name: classes compare and hash by IDENTITY
+      /// (DIVERGENCES.md), unlike records' structural fold
+      ClassNames : Dict<string, bool>
       RecBase : Dict<string, string>
       /// record/class name -> its fields as (name, declared-type-string), ALL
       /// records (RecFieldTys is [<Struct>]-only). Lets a `$cellget` of a
@@ -342,6 +345,7 @@ let private importFpprt (m : Mod) : unit =
     // deterministic cleanup: watch an object, drain its tag once dead,
     // force a collection (GC.OnCleanup / GC.Collect / Js.watch)
     importFn m "fpprt" "fpprt_watch" "$fpwatch" [ "i32"; "i32"; "i32" ] []
+    importFn m "fpprt" "fpprt_idhash" "$fpidh" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_drain1" "$fpdrain1" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_collect" "$fpcollect" [] []
     // per-object pinning: real under the mmc reactor, aborts under semi —
@@ -2169,8 +2173,9 @@ let private emitStrTrimChars (m : Mod) (atStart : bool) : unit =
     ifV f "i32"
     lg f "$cs"; ic f 1; ins f "i32.shr_s"
     elseB f
-    // char arrays are PACKED 2-byte units (storKindRes), not tagged words
-    lg f "$cs"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    // char-array ELEMENTS are raw 4-byte words (chars are raw i32 at rest);
+    // the old >>1 "untag" halved every set element and nothing ever matched
+    lg f "$cs"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
     endB f
     lg f "$c"; ins f "i32.eq"
     ifE f; ic f 1; ls f "$hit"; br f "$sd"; endB f
@@ -2465,6 +2470,11 @@ let private emitHashv (m : Mod) : unit =
         ifE f; lg f "$v"; ins f "return"; endB f
         lg f "$cid"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
         lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
+        // PACKED SCALAR ARRAY sentinel: an array's hash is its LENGTH
+        // (DIVERGENCES.md) — the walk below would hash the contents (a
+        // mutated array then changed its hash) or read f64 payload halves
+        lg f "$r"; ic f 0x3FF; ins f "i32.and"; ic f 0x3FF; ins f "i32.eq"
+        ifE f; lg f "$v"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "return"; endB f
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
         lg f "$r"; ic f 10; ins f "i32.shr_u"; ls f "$st"
         ic f 0; ls f "$h"
@@ -4093,6 +4103,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // (`=t`/`<t` — the `t` type suffix), or a STRUCTURAL `=@Type`/`<>@Type`
     // (records/unions): the tagged-int fast path below would compare heap
     // POINTERS, so route it through a structural comparison.
+    // `=@Class` / `<>@Class`: a CLASS compares by REFERENCE (DIVERGENCES.md)
+    // — the structural route below would fold its fields and call two
+    // distinct-but-equal instances equal
+    | EPrim (op, [ a; b ]) when
+        op.Contains "@"
+        && (match op.Substring (0, op.IndexOf "@") with "=" | "<>" -> true | _ -> false)
+        && (dictTryFind st.ClassNames (op.Substring (op.IndexOf "@" + 1))).IsSome ->
+        let cb = op.Substring (0, op.IndexOf "@")
+        let ra, rb, pre = evalRooted ctx a b
+        LDo (pre, LPrim ((if cb = "=" then EqW else NeW), [ LGet (wReg ra); LGet (wReg rb) ]))
     | EPrim (op, [ a; b ]) when
         (let hasAt = op.Contains "@"
          let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
@@ -4625,12 +4645,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // on the compiler's error paths, which the fixpoint success path never hits)
     // `print` writes the string THEN a newline (matching the GC backend's putc
     // '\n'); `printraw`/`printRaw` are the newline-free form.
-    | EApp (EUnknown "print", [ a ]) ->
+    | EApp (EUnknown pn, [ a ]) when pn = "print" || pn.StartsWith "print#" ->
         // linear has no runtime value dispatch ($printval): a raw int is
         // indistinguishable from a pointer. Pick the path from the argument's
         // STATIC type — ints through $str_of_int, floats through the
         // shortest-form $ftoa_s, anything else prints as the string it must be.
+        // the routed kind (Lower's "print#k") beats the local classifier
+        let routed =
+            if pn.StartsWith "print#" then
+                match pn.Substring 6 with
+                | "i" -> "int" | "f" -> "float" | "s" -> "float32" | "t" -> "string"
+                | "l" -> "int64" | "v" -> "uint64" | "w" -> "uint32" | "b" -> "bool"
+                | "c" -> "char" | "p" -> "nativeint" | _ -> ""
+            else ""
         let con =
+            if routed <> "" then routed else
             match printConOf ctx.LSt a with
             | "" -> (if refKindOfExpr a = RKRaw then "int" else "")
             | c -> c
@@ -4639,6 +4668,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let v =
             match con with
             | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
+            | "char" -> LCall ("$str_of_char", [ coreToLowE ctx a ])
             | "bool" ->
                 let t = freshTmp ctx
                 LDo ([ LIf (LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ]),
@@ -4672,6 +4702,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
+    // a CLASS instance hashes by IDENTITY (DIVERGENCES.md): stable across
+    // mutation and moves (fpprt keeps the table), distinct per object
+    | EApp (EUnknown ("hash" | "$hash"), [ a ]) when
+        (dictTryFind st.ClassNames (printConOf ctx.LSt a)).IsSome ->
+        if gc then LCall ("$fpidh", [ coreToLowE ctx a ])
+        else coreToLowE ctx a
     | EApp (EUnknown ("hash" | "$hash"), [ a ]) ->
         // route by the operand's witness when it is a type parameter: a RAW
         // element (refMask 0 — int/char/bool) IS its own hash (matches $hashv's
@@ -4732,10 +4768,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "$str.PadRight", [ s; w ]) ->
         LCall ("$str_pad", [ coreToLowE ctx s; (coreToLowE ctx w); LConstW 32; LConstW 1 ])
     | EApp (EUnknown ("$str.TrimStart" | "$str.TrimStart#2"), [ s; cs ]) ->
-        // cs is either a tagged char or a tagged-char array — the helper tests the low bit
-        lowCallR ctx "$str_trim_start_chars" [ s; cs ]
+        // the helper tells a char from an array by the LOW BIT — a raw char
+        // is an even word, so a statically-char argument must arrive tagged
+        (match printConOf ctx.LSt cs with
+         | "char" ->
+             let ts = freshTmp ctx
+             LDo ([ LSet (wReg ts, coreToLowE ctx s) ],
+                  LCall ("$str_trim_start_chars", [ LGet (wReg ts); lowTag (coreToLowE ctx cs) ]))
+         | _ -> lowCallR ctx "$str_trim_start_chars" [ s; cs ])
     | EApp (EUnknown ("$str.TrimEnd" | "$str.TrimEnd#2"), [ s; cs ]) ->
-        lowCallR ctx "$str_trim_end_chars" [ s; cs ]
+        (match printConOf ctx.LSt cs with
+         | "char" ->
+             let ts = freshTmp ctx
+             LDo ([ LSet (wReg ts, coreToLowE ctx s) ],
+                  LCall ("$str_trim_end_chars", [ LGet (wReg ts); lowTag (coreToLowE ctx cs) ]))
+         | _ -> lowCallR ctx "$str_trim_end_chars" [ s; cs ])
     | EApp (EUnknown "$str.Insert", [ s; i; v ]) ->
         lowCallR ctx "$str_insert" [ s; i; v ]
     | EApp (EUnknown "$str.Remove", [ s; i ]) ->
@@ -6914,7 +6961,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
-          RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
+          RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
@@ -6948,7 +6995,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // class has a vtable + its storage is a DRecord, so it also lands in
     // RecFields — but its instance-field reads and dispatch need the object).
     let noCollapse = scanNoCollapse decls0
-    let classNames = dictNew<string, bool> ()
+    let classNames = st.ClassNames
     for d in decls0 do match d with DClass (n, _, _, _) -> dictSet classNames n true | _ -> ()
     // a stamped subclass resolves its fields through the base it was stamped
     // from (DClass carries `Some base`); record subclass -> base for EField.

@@ -7912,6 +7912,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // conversions and print need these; operator suffixes filter them
         | TCon ("bool", []) -> "b"
         | TCon ("char", []) -> "c"
+        // print routing wants the plain cases named too — a `print
+        // ((s :> IShape).Area)` had no static classification left by the
+        // time the linear backend picked a formatter
+        | TCon ("int", []) -> "i"
+        | TCon (("byte" | "sbyte" | "int16" | "uint16"), []) -> "i"
         | _ -> ""
 
     { Diagnostics = vecToList diags
