@@ -132,7 +132,7 @@ FPP
 "$wt" run "$out/low.wasm" > "$out/low.txt"
 
 # the wasm-GC oracle for the same program
-"$fpp" build -o "$out/gc.wasm" "$out/p.fpp"
+"$fpp" build --wasmgc -o "$out/gc.wasm" "$out/p.fpp"
 "$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
 
 if diff -u "$out/gc.txt" "$out/low.txt"; then

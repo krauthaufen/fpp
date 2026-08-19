@@ -17,6 +17,9 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
 fpp="${FPP:-$root/src/Fpp.Cli/bin/Release/net10.0/fpp}"
+# the shakeout collector: semi moves EVERYTHING every collection — keep
+# conformance on it (the default build resolves the mmc product reactor)
+export FPP_REACTOR="${FPP_REACTOR:-$root/tests/tooling/gc/fpprt_reactor.wasm}"
 wt="${WASMTIME:-$HOME/.wasmtime/bin/wasmtime}"
 out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
 

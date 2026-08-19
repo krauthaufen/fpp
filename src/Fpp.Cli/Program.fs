@@ -77,7 +77,18 @@ let private mergeGcModule (moduleBytes : byte[]) (out : string) : int =
         match System.Environment.GetEnvironmentVariable name with
         | null | "" -> dflt
         | p -> p
-    let reactor = envOr "FPP_REACTOR" (home + "/projects/fpp/runtime/build/wasm/fpprt_reactor.wasm")
+    // reactor resolution: env override, then the copy SHIPPED beside the
+    // fpp binary (mmc — real pinning, the product collector), then the dev
+    // checkouts. Semi (the shakeout collector) is an FPP_REACTOR choice.
+    let reactor =
+        let candidates =
+            [ System.Environment.GetEnvironmentVariable "FPP_REACTOR"
+              System.IO.Path.Combine (System.AppContext.BaseDirectory, "fpprt_reactor_mmc.wasm")
+              home + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
+              home + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
+        match candidates |> List.tryFind (fun c -> not (isNull c) && c <> "" && System.IO.File.Exists c) with
+        | Some r -> r
+        | None -> home + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm"
     let wasmMerge = envOr "FPP_WASM_MERGE" (home + "/emsdk/upstream/bin/wasm-merge")
     let wasmTools = envOr "FPP_WASM_TOOLS" "wasm-tools"
     let tmp = System.IO.Path.GetTempPath() + System.IO.Path.GetRandomFileName()
@@ -543,13 +554,20 @@ let private isProject (f : string) = f.EndsWith Project.extension
 let main argv =
     let argl0 = List.ofArray argv
     let strict = argl0 |> List.exists (fun a -> a = "--strict")
-    // --gc routes through the LowIR wasm-linear backend with fpprt/Whippet as
-    // the collector (imported reactor, wasm-merge at link time)
-    let useGc = argl0 |> List.exists (fun a -> a = "--gc")
+    // BACKEND SELECTION. The DEFAULT is wasm-linear with the fpprt/Whippet
+    // reactor as its collector (wasm-merge at link time): the configuration
+    // that self-hosts byte-exactly, runs every browser leg, and carries
+    // deterministic cleanup. `--wasmgc` keeps the legacy wasm-GC backend
+    // available as a cross-check for one release; `--linear` is the
+    // standalone bump-allocator module (no collector — emitter debugging
+    // and short-lived programs only); `--gc` is the default spelled out.
+    let useWasmGc = argl0 |> List.exists (fun a -> a = "--wasmgc")
+    let standalone = argl0 |> List.exists (fun a -> a = "--linear" || a = "--lowir")
+    let useGc = not useWasmGc && (not standalone || argl0 |> List.exists (fun a -> a = "--gc"))
     Fpp.Backend.WasmLin.gc <- useGc
     lowirBackend <- (argl0 |> List.exists (fun a -> a = "--lowir")) || useGc
-    linearBackend <- (argl0 |> List.exists (fun a -> a = "--linear")) || lowirBackend
-    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc") with
+    linearBackend <- standalone || useGc
+    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc" && a <> "--wasmgc") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _, defs) -> check strict defs files

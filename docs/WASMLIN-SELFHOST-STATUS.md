@@ -1374,3 +1374,29 @@ order, liveness, forceability, exact output. The cleanup externs are
 backend INTRINSICS in all three backends (wasm-GC and native no-op /
 collect-only for now); GC.Collect also accepts .NET's 4-argument overload
 (the adaptive port calls it). Full details: docs/PLAN-JSLIN.md.
+
+## §39 THE FLIP: linear+reactor is the default backend (2026-08-19)
+
+M3 and the flip in one arc. Two reactor artifacts now (build-reactor.sh):
+semi (the shakeout collector, fixpoints/conformance pin it via FPP_REACTOR)
+and mmc (Immix mark-region, REAL per-object pinning — the product
+collector, shipped beside the fpp binary and resolved by default).
+Array.pin under gc = fpprt_pin + data address (permanent, mmc); the
+jsinterop gate runs NINETEEN legs: six wasm-GC, six standalone --linear,
+six reactor-gc in headed Chrome (all byte-identical to their linear
+wants), plus the gc-churn leg — 500 short-lived watched wrappers through
+real collections: 500 cleanups fired exactly once, 500 JS handle-table
+entries reclaimed by the glue drain, boundary alive after.
+
+`fpp build` now DEFAULTS to wasm-linear + fpprt/Whippet reactor (merged at
+link time; needs wasm-merge + wasm-tools). `--wasmgc` keeps the legacy
+wasm-GC backend for one release as a cross-check (every gate that used it
+as an oracle pins the flag explicitly); `--linear` remains the standalone
+bump-allocator module for emitter debugging. Battery: 31/31 green under
+the new default; linear self-fixpoint byte-exact at 11,274,590 bytes.
+
+Remaining before deleting BinDriver: one release of cross-check soak, the
+stamped-generic member-access miscompile hunt, and the dom-layer handle
+strategy (dom wrappers wrap-per-access, so they cannot Js.watch like the
+webgl/webgpu layers do — needs an interning wrap cache or handle
+refcounts; dom handles are glue-registered and currently uncollected).

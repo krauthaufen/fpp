@@ -112,7 +112,7 @@ FPP
     || "$HOME/.wasmtime/bin/wasmtime" run "$out/lin.wasm" > "$out/lin.txt"
 
 # the wasm-GC oracle for the same program
-"$fpp" build -o "$out/gc.wasm" "$out/p.fpp"
+"$fpp" build --wasmgc -o "$out/gc.wasm" "$out/p.fpp"
 "$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
 
 if diff -u "$out/gc.txt" "$out/lin.txt"; then

@@ -10,7 +10,7 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
 
-"$fpp" build -o "$out/p.wasm" "$prog"
+"$fpp" build --wasmgc -o "$out/p.wasm" "$prog"
 "$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/p.wasm" > "$out/wasm.txt"
 
 "$fpp" build -o "$out/p.c" "$prog"

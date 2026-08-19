@@ -17,5 +17,10 @@
 
   <ItemGroup>
     <None Include="native/*.c" CopyToOutputDirectory="PreserveNewest" LinkBase="native" />
+    <!-- the fpprt reactors ship beside the binary: mmc (the default build's
+         collector — real pinning) and semi (the shakeout collector, picked
+         via FPP_REACTOR) -->
+    <None Include="../../tests/tooling/gc/fpprt_reactor_mmc.wasm" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../tests/tooling/gc/fpprt_reactor.wasm" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

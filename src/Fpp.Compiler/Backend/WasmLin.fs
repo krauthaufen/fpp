@@ -329,6 +329,9 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_watch" "$fpwatch" [ "i32"; "i32"; "i32" ] []
     importFn m "fpprt" "fpprt_drain1" "$fpdrain1" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_collect" "$fpcollect" [] []
+    // per-object pinning: real under the mmc reactor, aborts under semi —
+    // Array.pin's zero-copy contract needs the object to stop moving
+    importFn m "fpprt" "fpprt_pin" "$fppin" [ "i32" ] []
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -4202,13 +4205,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> (LLoad (W, coreToLowE ctx arr, HDR))
-    // Array.pin: on standalone linear the elements ALREADY live at a stable
-    // address — pin answers the data address (elements start after
-    // [hdr][len]) and unpin is a no-op. Under the moving collector pinning
-    // needs fpprt_pin/mmc — not wired yet (M3 of docs/PLAN-JSLIN.md), so gc
-    // mode falls through to the informative gap.
-    | EArrayPin (_, arr) when not gc -> LPrim (AddW, [ coreToLowE ctx arr; LConstW (HDR + 4) ])
-    | EArrayUnpin (_, arr) when not gc -> LDo ([ LEval (coreToLowE ctx arr) ], lowInt 0)
+    // Array.pin answers the element-data address (elements start after
+    // [hdr][len]). Standalone: storage never moves, the address IS stable.
+    // GC: fpprt_pin first — real under the mmc reactor (Immix per-object
+    // pinning, the browser/product collector), an abort under semi (the
+    // shakeout collector; a pin-using program belongs on mmc). The pin is
+    // PERMANENT — mmc pins for the object's whole life — so unpin is a
+    // no-op in both modes; pin long-lived buffers once, not per call.
+    | EArrayPin (_, arr) ->
+        if gc then
+            let r = freshTmp ctx
+            LDo ([ LSet (wReg r, coreToLowE ctx arr); LCallVoidS ("$fppin", [ LGet (wReg r) ]) ],
+                 LPrim (AddW, [ LGet (wReg r); LConstW (HDR + 4) ]))
+        else LPrim (AddW, [ coreToLowE ctx arr; LConstW (HDR + 4) ])
+    | EArrayUnpin (_, arr) -> LDo ([ LEval (coreToLowE ctx arr) ], lowInt 0)
     | EArrayBytes (nm, arr) ->
         let w =
             match storLTy (storKindRes ctx.LSt nm) with

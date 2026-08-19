@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><body><script type="module">
+import { instantiateLinear } from '/stdlib/fpp-js.mjs';
+window.log = [];
+try {
+  const ex = await instantiateLinear('gcchurn.wasm', { sink: s => window.log.push(s.trimEnd()) });
+  const before = ex.__handleStats();
+  ex._start();
+  ex.__drainDead();
+  const after = ex.__handleStats();
+  window.results = {
+    log: window.log.filter(x => x !== ''),
+    cleanups: ex.cleanupCount(0),
+    // 500 divs were registered; after the drain almost all must be gone
+    reclaimed: before.live + (after.next - before.next) - after.live,
+    liveAfter: after.live,
+  };
+} catch (e) { window.results = { error: String(e && e.stack || e) }; }
+window.ready = true;
+</script>

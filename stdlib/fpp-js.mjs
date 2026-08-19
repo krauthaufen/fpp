@@ -115,7 +115,13 @@ export const jsLinImports = (getExports) => {
     if (!ex.fpprt_drain1) return;
     for (let id; (id = ex.fpprt_drain1(0)) !== 0;) table[id] = undefined;
   };
-  return { internals: { mem, h, reg, lstr, sout, drainDead },
+  // observability for tests: how many table entries are still live
+  const handleStats = () => {
+    let live = 0;
+    for (let i = 1; i < nextId; i++) if (table[i] !== undefined) live++;
+    return { next: nextId, live };
+  };
+  return { internals: { mem, h, reg, lstr, sout, drainDead, handleStats },
     jslin: {
       global: (k) => reg(globalThis[lstr(k)]),
       get: (o, k) => reg(h(o)[lstr(k)]),
@@ -211,7 +217,9 @@ export const instantiateLinear = async (url, { jsx = {}, sink = null, vms = [] }
     fetch(url),
     { jslin, jsxl: jsxlProxy(jsxAll, internals), wasi_snapshot_preview1: wasiAll });
   exports = instance.exports;
-  return exports;
+  // hand the page the drain and the table stats beside the wasm exports
+  // (spread: wasm export functions are unbound plain functions, safe to copy)
+  return { ...exports, __drainDead: internals.drainDead, __handleStats: internals.handleStats };
 };
 
 /// Instantiate an F++ module with the whole boundary wired: the "js"

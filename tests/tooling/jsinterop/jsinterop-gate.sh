@@ -9,17 +9,28 @@ root=$(cd "$here/../../.." && pwd)
 command -v node >/dev/null || { echo "JSINTEROP SKIPPED (no node)"; exit 0; }
 [ -e /home/schorsch/.headed-chrome/index.js ] || { echo "JSINTEROP SKIPPED (no headed-chrome)"; exit 0; }
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
-"$fpp" build -o "$here/jsdemo.wasm" "$here/jsdemo.fpp"
-"$fpp" build -o "$here/webgl.wasm" "$here/webgl.fpp"
-"$fpp" build --strict -o "$here/webgl-typed.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgl.fpp" "$here/webgl-typed.fpp"
-"$fpp" build -o "$here/domdemo.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
-"$fpp" build --strict -o "$here/gpu-triangle.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgpu.fpp" "$here/gpu-triangle.fpp"
-"$fpp" build --strict -o "$here/gpu-compute.wasm" "$root/stdlib/webgpu.fpp" "$here/gpu-compute.fpp"
+"$fpp" build --wasmgc -o "$here/jsdemo.wasm" "$here/jsdemo.fpp"
+"$fpp" build --wasmgc -o "$here/webgl.wasm" "$here/webgl.fpp"
+"$fpp" build --strict --wasmgc -o "$here/webgl-typed.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgl.fpp" "$here/webgl-typed.fpp"
+"$fpp" build --wasmgc -o "$here/domdemo.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
+"$fpp" build --strict --wasmgc -o "$here/gpu-triangle.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgpu.fpp" "$here/gpu-triangle.fpp"
+"$fpp" build --strict --wasmgc -o "$here/gpu-compute.wasm" "$root/stdlib/webgpu.fpp" "$here/gpu-compute.fpp"
 # the same six programs on the wasm-LINEAR backend (the jslin boundary):
 # semantics must match the wasm-GC legs byte for byte; only print WRITE
 # chunking differs (linear prints a number in one fd_write, GC per digit),
 # so the -lin legs carry their own want strings
 "$fpp" build --linear -o "$here/jsdemo-lin.wasm" "$here/jsdemo.fpp"
+# the REACTOR (gc) legs: the same programs under the mmc collector — real
+# collections, real pinning, handle reclamation. This is the config the
+# default build flips to.
+export FPP_REACTOR="$here/../gc/fpprt_reactor_mmc.wasm"
+"$fpp" build --gc -o "$here/jsdemo-gc.wasm" "$here/jsdemo.fpp"
+"$fpp" build --gc -o "$here/webgl-gc.wasm" "$here/webgl.fpp"
+"$fpp" build --strict --gc -o "$here/webgl-typed-gc.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgl.fpp" "$here/webgl-typed.fpp"
+"$fpp" build --gc -o "$here/domdemo-gc.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
+"$fpp" build --strict --gc -o "$here/gpu-triangle-gc.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgpu.fpp" "$here/gpu-triangle.fpp"
+"$fpp" build --strict --gc -o "$here/gpu-compute-gc.wasm" "$root/stdlib/webgpu.fpp" "$here/gpu-compute.fpp"
+"$fpp" build --gc -o "$here/gcchurn.wasm" "$here/gcchurn.fpp"
 "$fpp" build --linear -o "$here/webgl-lin.wasm" "$here/webgl.fpp"
 "$fpp" build --strict --linear -o "$here/webgl-typed-lin.wasm" "$root/stdlib/dom.fpp" "$root/stdlib/webgl.fpp" "$here/webgl-typed.fpp"
 "$fpp" build --linear -o "$here/domdemo-lin.wasm" "$root/stdlib/dom.fpp" "$here/domdemo.fpp"
@@ -127,4 +138,54 @@ if [ "$got" = "$want" ]; then
     echo "WEBGL-TYPED LINEAR OK (generated GLenum surface renders)"
 else
     echo "WEBGL-TYPED LINEAR MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
+fi
+# ---- the REACTOR (gc) legs: mmc collector, same want strings as -lin -------
+got=$(node "$here/drive-gc.js")
+want='{"log":["7","","made","","café €","","1970","","407","","ready",""],"madeText":"hello from F++","viewY1":4.5,"clicks":2,"x0AfterJsWrite":95}'
+if [ "$got" = "$want" ]; then
+    echo "JS INTEROP GC OK"
+else
+    echo "JS INTEROP GC MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
+fi
+got=$(node "$here/domdrive-gc.js")
+want='{"log":["typed","hello typed café","t€xt","5","123px","BUTTON","hello typed café","big","BUTTON","4","canvas 32","span SPAN","dom-ready"],"text":"hello typed café","cls":"big","width":"123px","clicks":2,"lastX":77}'
+if [ "$got" = "$want" ]; then
+    echo "DOM GC OK"
+else
+    echo "DOM GC MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
+fi
+got=$(node "$here/gpudrive-gc.js")
+case "$got" in
+  *'"skip":true'*) echo "WEBGPU-TRIANGLE GC SKIPPED (no navigator.gpu)" ;;
+  *'"ok":1'*) echo "WEBGPU GC OK (hello-triangle renders, readback verified)" ;;
+  *) echo "WEBGPU GC MISMATCH"; echo "got: $got"; exit 1 ;;
+esac
+got=$(node "$here/gpucdrive-gc.js")
+case "$got" in
+  *'"skip":true'*) echo "WEBGPU-COMPUTE GC SKIPPED (no navigator.gpu)" ;;
+  *'"ok":1'*) echo "COMPUTE GC OK (dispatch verified via readback)" ;;
+  *) echo "COMPUTE GC MISMATCH"; echo "got: $got"; exit 1 ;;
+esac
+got=$(node "$here/gldrive-gc.js")
+want='{"log":["255","127","0","gl-done"]}'
+if [ "$got" = "$want" ]; then
+    echo "WEBGL GC OK (zero-copy upload and readback)"
+else
+    echo "WEBGL GC MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
+fi
+got=$(node "$here/gltdrive-gc.js")
+want='{"log":["255","127","0","ext-lose-context","255","gl-typed-done"]}'
+if [ "$got" = "$want" ]; then
+    echo "WEBGL-TYPED GC OK (generated GLenum surface renders)"
+else
+    echo "WEBGL-TYPED GC MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
+fi
+# the churn leg: 500 short-lived wrappers through REAL collections — every
+# cleanup fires once, every JS table entry is reclaimed by the drain
+got=$(node "$here/gcchurndrive.js")
+want='{"log":["spawned","cleanups 500","SPAN","churn-done"],"cleanups":500,"reclaimed":500,"liveAfter":504}'
+if [ "$got" = "$want" ]; then
+    echo "GC-CHURN OK (500 cleanups, 500 handles reclaimed under real collections)"
+else
+    echo "GC-CHURN MISMATCH"; echo "want: $want"; echo "got:  $got"; exit 1
 fi
