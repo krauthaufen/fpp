@@ -2355,6 +2355,17 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         emitNode st f lv clo
         callf f "$js_mkFn"
         toAny f
+    // deterministic cleanup is a wasm-LINEAR gc capability: this backend
+    // rides the engine's collector, which offers neither forced collection
+    // nor synchronous finalizers — evaluate and drop
+    | EApp (EUnknown "gcOnCleanup", [ o; fn2 ]) ->
+        emitNode st f lv o
+        ins f "drop"
+        emitNode st f lv fn2
+        ins f "drop"
+        pushUnit f
+    | EApp (EUnknown "gcCollect", [ _ ]) ->
+        pushUnit f
     | EApp (EUnknown "jsNull", [ _ ]) ->
         refNull f "any"
     | EApp (EUnknown "jsIsNull", [ a ]) ->
@@ -3331,6 +3342,16 @@ and private emitNode (st : St) (f : Fn) (lv : Dict<string * int, string>) (e : E
         for x in xs do emitNode st f lv x
         refNull f "any"
         for _ in xs do gcT f "struct.new" "$cons"
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ o; fn2 ]) when v.Name = "gcOnCleanup" ->
+        emitNode st f lv o
+        ins f "drop"
+        emitNode st f lv fn2
+        ins f "drop"
+        pushUnit f
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcCollect" ->
+        emitNode st f lv u1
+        ins f "drop"
+        pushUnit f
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.ArityOf (v.Path, v.Offset)) = Some (List.length args) ->
         let fn = (dictTryFind st.FnOf (v.Path, v.Offset)).Value
@@ -4682,6 +4703,10 @@ let emitBinaryWithPositions (mapUrl : string) (decls : Decl list)
             dictSet st.FnOf (v.Path, v.Offset) fn
             dictSet st.ArityOf (v.Path, v.Offset) (List.length pks)
             dictSet st.Externs (v.Path, v.Offset) (pks, "$jsx:" + rk)
+        // the cleanup externs are backend INTRINSICS (no-ops here — the
+        // engine's collector has no forced collection or finalizers), never
+        // env imports: an import would break every instantiation
+        | DExtern (v, _) when v.Name = "gcOnCleanup" || v.Name = "gcCollect" -> ()
         | DExtern (v, sch) ->
             let pks, rk = abiSig sch.Body
             let fn = mangle v

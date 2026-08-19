@@ -324,6 +324,11 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "fpprt_wasm_refoffs_base" "$refoffsbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_wasm_witness_base" "$witnessbase" [] [ "i32" ]
     importFn m "fpprt" "fpprt_tid_scans" "$tidscans" [ "i32"; "i32" ] [ "i32" ]
+    // deterministic cleanup: watch an object, drain its tag once dead,
+    // force a collection (GC.OnCleanup / GC.Collect / Js.watch)
+    importFn m "fpprt" "fpprt_watch" "$fpwatch" [ "i32"; "i32"; "i32" ] []
+    importFn m "fpprt" "fpprt_drain1" "$fpdrain1" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_collect" "$fpcollect" [] []
     importMem m "fpprt" "memory" 258 32768
 
 // the slot key for an interface method uses the interface's BARE name: the
@@ -758,10 +763,14 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$memcopy" "$lt_iii2v"
     // shortest-form float formatting (print <float>, string <float>)
     declFn m "$ftoa_s" "$lt_i2i"
-    // JS interop helpers: callback registration, the JS->wasm call bridge,
-    // and the string-shell allocator the glue fills (utf-16 units at +8)
+    // callback/cleanup-closure registration: needed by JS callbacks AND by
+    // GC.OnCleanup (gc mode parks cleanup closures in the same slot area)
+    if jsUsed || gc then declFn m "$cbreg" "$lt_i2i"
+    // gc: drain the dead cleanup queue, invoking each parked closure
+    if gc then (declFn m "$gcdrain" "$lt_v2v"; declFn m "$rootswipe" "$lt_v2v")
+    // JS interop helpers: the JS->wasm call bridge and the string-shell
+    // allocator the glue fills (utf-16 units at +8)
     if jsUsed then
-        declFn m "$cbreg" "$lt_i2i"
         declFn m "$jscall" "$lt_ii2i"
         declFn m "$lin_salloc" "$lt_i2i"
 
@@ -971,13 +980,61 @@ let private emitCbreg (m : Mod) : unit =
     local f "$p" "i32"
     localsDone f
     if gc then
+        // pop a recycled slot (content = next | 1) or bump a fresh one;
+        // $p is a zeroed wasm local, so "no recycled slot" reads as 0
+        gg f "$cbfree"
+        ifE f
+        gg f "$cbfree"; ls f "$p"
+        lg f "$p"; mem f "i32.load"; ic f -2; ins f "i32.and"; gs f "$cbfree"
+        endB f
+        lg f "$p"; ins f "i32.eqz"
+        ifE f
         gg f "$roots"; ic f (cbBase * 4); ins f "i32.add"
         gg f "$cbnext"; ic f 2; ins f "i32.shl"; ins f "i32.add"; ls f "$p"
         gg f "$cbnext"; ic f 1; ins f "i32.add"; gs f "$cbnext"
+        endB f
     else
         ic f 4; callf f "$lalloc"; ls f "$p"
     lg f "$p"; lg f "$clo"; mem f "i32.store"
     lg f "$p"
+    endFn f
+
+// $gcdrain(): pop dead cleanup tags (kind 1 = closure slot addresses) and
+// invoke each parked closure once. The slot is recycled onto the $cbfree
+// freelist BEFORE the call — the closure pointer already rides a local, and
+// a cleanup that registers new cleanups may reuse the slot. A cleanup can
+// allocate and so trigger further collections; the loop drains whatever
+// they queue too, until the queue reads empty.
+let private emitGcdrain (m : Mod) : unit =
+    let f = beginFn m []
+    local f "$t" "i32"; local f "$clo" "i32"
+    localsDone f
+    blockE f "$dend"; loopE f "$dgo"
+    ic f 1; callf f "$fpdrain1"; ls f "$t"
+    lg f "$t"; ins f "i32.eqz"; brIf f "$dend"
+    lg f "$t"; mem f "i32.load"; ls f "$clo"
+    lg f "$t"; gg f "$cbfree"; ic f 1; ins f "i32.or"; mem f "i32.store"
+    lg f "$t"; gs f "$cbfree"
+    lg f "$clo"; ic f 0
+    lg f "$clo"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+    callIndirect f "$lclo"
+    ins f "drop"
+    br f "$dgo"; endB f; endB f
+    endFn f
+
+// $rootswipe(): zero the shadow-stack region above $sp. Pops leave their
+// values behind and the WHOLE registered range is scanned, so the residue
+// acts like conservative roots — objects stay alive until their stale slot
+// is overwritten. GC.Collect wipes first, which is what makes it the
+// deterministic cleanup point. 2097152 slots = FPPRT_WASM_NROOTS.
+let private emitRootswipe (m : Mod) : unit =
+    let f = beginFn m []
+    localsDone f
+    gg f "$roots"; gg f "$sp"; ins f "i32.add"
+    ic f 0
+    ic f (2097152 * 4); gg f "$sp"; ins f "i32.sub"
+    // memory.fill
+    emitByte f.B 0xFC; emitU32 f.B 0x0B; emitByte f.B 0
     endFn f
 
 // $jscall(slot, h): the JS->wasm bridge — load the closure's CURRENT pointer
@@ -4464,8 +4521,31 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "jsHandle", [ i ]) -> coreToLowE ctx i
     | EApp (EUnknown "jsRegister", [ o ]) -> coreToLowE ctx o
     | EApp (EUnknown "jsWatch", [ w; i ]) ->
-        // no finalizers on linear — handles held by wrappers leak (residue)
-        LDo ([ LEval (coreToLowE ctx w); LEval (coreToLowE ctx i) ], lowInt 0)
+        // gc: watch the wrapper; its handle id queues (kind 0) when a
+        // collection proves it dead, and the glue's drain frees the JS
+        // table entry. Standalone has no collector — handles leak there.
+        if gc then
+            lowJsi ctx "$fpwatch" "u"
+                [ RKRef, W, coreToLowE ctx w; RKRaw, W, coreToLowE ctx i; RKRaw, W, LConstW 0 ]
+        else LDo ([ LEval (coreToLowE ctx w); LEval (coreToLowE ctx i) ], lowInt 0)
+    // ---- deterministic cleanup (GC.OnCleanup / GC.Collect) -----------------
+    | EApp (EUnknown "gcOnCleanup", [ o; f ]) ->
+        // park the cleanup closure in a rooted slot, watch the object with
+        // the SLOT as its tag (kind 1); $gcdrain invokes and recycles it
+        if gc then
+            lowJsi ctx "$fpwatch" "u"
+                [ RKRef, W, coreToLowE ctx o
+                  RKRaw, W, LCall ("$cbreg", [ coreToLowE ctx f ])
+                  RKRaw, W, LConstW 1 ]
+        else LDo ([ LEval (coreToLowE ctx o); LEval (coreToLowE ctx f) ], lowInt 0)
+    | EApp (EUnknown "gcCollect", [ _ ]) ->
+        // zero the shadow-stack REGION above $sp first: every popped slot
+        // keeps its last value and the whole registered range is scanned,
+        // so residue would keep just-dead objects alive one collection
+        // longer — the fill is what makes GC.Collect the DETERMINISTIC
+        // point. (Natural collections skip it: eventual cleanup is fine.)
+        if gc then LDo ([ LCallVoidS ("$rootswipe", []); LCallVoidS ("$fpcollect", []); LCallVoidS ("$gcdrain", []) ], lowInt 0)
+        else lowInt 0
     | EApp (EUnknown "jsNull", [ _ ]) -> lowInt 0
     | EApp (EUnknown "jsIsNull", [ a ]) -> LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ])
     | EApp (EUnknown vn, [ p; n ]) when vn.StartsWith "jsView" ->
@@ -4503,6 +4583,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | _ -> RKRaw, W, coreToLowE ctx a)
         let call = lowJsi ctx fnm rk ops
         if List.isEmpty unitEvals then call else LDo (unitEvals, call)
+    // the cleanup externs referenced from the prelude MEMBERS arrive as
+    // EVars (same shape as readTextRaw) — route to the EUnknown lowering
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ o; f ]) when v.Name = "gcOnCleanup" ->
+        coreToLowE ctx (EApp (EUnknown "gcOnCleanup", [ o; f ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcCollect" ->
+        coreToLowE ctx (EApp (EUnknown "gcCollect", [ u1 ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind envSigs (key v)).IsSome ->
         let fnm, _, pks, rk = optGet (dictTryFind envSigs (key v))
         let unitEvals =
@@ -6773,9 +6859,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             jsxN <- jsxN + 1
             dictSet envSigs (key v) (fnm, v.Name, pks, rk)
         | _ -> ()
-    // GC: reserve a fixed area of root slots for $cbreg (callback closures
-    // live there, below the shadow stack) — handed out at runtime by $cbnext
-    if gc && jsUsed then
+    // GC: reserve a fixed area of root slots for $cbreg (callback and
+    // cleanup closures live there, below the shadow stack) — handed out at
+    // runtime by $cbnext, recycled through the $cbfree freelist when a
+    // cleanup has run
+    if gc then
         cbBase <- st.RootNext
         st.RootNext <- st.RootNext + 1024
     // the host FILE-I/O externs have no WasmLin implementation (DExterns are
@@ -6930,8 +7018,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // GC: base of the tid->class-id table (fixed static memory in the shim)
     if gc then globalI32Mut m "$t2c" 0
     if gc then globalI32Mut m "$witnesses" 0
-    // JS callbacks (GC): the next free slot in the cbBase root area
-    if gc && jsUsed then globalI32Mut m "$cbnext" 0
+    // callbacks/cleanups (GC): the next free slot in the cbBase root area,
+    // and the freelist of recycled one-shot cleanup slots (odd-tagged links
+    // threaded through the free slots themselves — odd, so the root scanner
+    // skips them)
+    if gc then (globalI32Mut m "$cbnext" 0; globalI32Mut m "$cbfree" 0)
     exportFn m "_start" "$_start"
     if jsUsed then
         exportFn m "jscall" "$jscall"
@@ -6950,7 +7041,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
     emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
     emitMemsize m; emitMemcopy m; emitFtoaS m
-    if jsUsed then (emitCbreg m; emitJscall m; emitLinSalloc m)
+    if jsUsed || gc then emitCbreg m
+    if gc then (emitGcdrain m; emitRootswipe m)
+    if jsUsed then (emitJscall m; emitLinSalloc m)
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

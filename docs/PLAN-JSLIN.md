@@ -80,3 +80,41 @@ Representations at the import/export boundary — all raw, no shifts:
 
 Null: glue maps JS null → id 0 and `h(0)` → null; `undefined` gets a real id
 (parity with GC-mode externref, where only null is ref.null).
+
+## Deterministic cleanup (shipped, 2026-08-19)
+
+The handle-lifetime hole is closed by a WATCH TABLE in fpprt (runtime repo
+@9951bba, branch gc-stale-edge-fix): `fpprt_watch(obj, tag, kind)` pairs a
+weak edge (ephemeron, key = value = obj) with a tag; the death scan runs in
+the same world-stopped restarting-mutators window as the idhash rehash and
+only QUEUES tags — cleanup runs at a mutator-side drain (`fpprt_drain1`),
+never inside a collection. Verified under semi, pcc AND mmc (test_watch.c).
+
+Surface: `GC.OnCleanup x f` parks f in a $cbreg slot (recycled through the
+$cbfree freelist after firing) and watches x with the slot as tag (kind 1);
+`GC.Collect()` = $rootswipe + fpprt_collect + $gcdrain. The rootswipe zeroes
+the shadow-stack region above $sp first — popped slots keep their values and
+the whole registered range is scanned, so without it residue kept just-dead
+objects alive one collection longer. That wipe is what makes GC.Collect the
+DETERMINISTIC point (gate: tests/tooling/gc/cleanup-gate.sh — order,
+liveness, force). `Js.watch wrapper id` now queues the wrapper's handle id
+under kind 0 in gc mode, and the glue's `drainDead` (run after every
+callback dispatch) frees the JS table entries — the linear handle leak is
+gone the moment reactor mode reaches the browser.
+
+The wasm-GC backend lowers both as no-ops (its engine offers neither forced
+collection nor synchronous finalizers) — one more reason it retires. The
+cleanup externs are backend intrinsics, never env imports. Rules: a cleanup
+closure must not capture its watched object (rooted ⇒ alive ⇒ never fires —
+leak, not corruption); closures get no reference to the dead object, so
+resurrection is impossible by construction.
+
+Housekeeping: fpp-lowir/runtime is a second, drifting copy of fpprt used by
+the C/native leg — it lacks the watch table (native GC.OnCleanup is
+eval-drop for now). Consolidate when the native cleanup leg is wired.
+
+On `--linear` (standalone, no collector): agreed that it stops being a
+product config once reactor mode is default — nothing dies, so watch/cleanup
+are no-ops there. It stays for now only as the substrate of existing gates
+and as the emitter-debug mode; the jsinterop legs move to reactor mode with
+M3 and the flag then demotes or goes.

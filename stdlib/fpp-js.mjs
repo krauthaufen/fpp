@@ -106,7 +106,16 @@ export const jsLinImports = (getExports) => {
     for (let i = 0; i < s.length; i++) u16[i] = s.charCodeAt(i);
     return p;
   };
-  return { internals: { mem, h, reg, lstr, sout },
+  // gc (reactor) modules: free the table entries of wrappers a collection
+  // proved dead (Js.watch queues their handle ids under kind 0). Called
+  // after every callback dispatch; standalone modules have no drain export
+  // and skip. This is what makes the handle table leak-free under gc.
+  const drainDead = () => {
+    const ex = getExports();
+    if (!ex.fpprt_drain1) return;
+    for (let id; (id = ex.fpprt_drain1(0)) !== 0;) table[id] = undefined;
+  };
+  return { internals: { mem, h, reg, lstr, sout, drainDead },
     jslin: {
       global: (k) => reg(globalThis[lstr(k)]),
       get: (o, k) => reg(h(o)[lstr(k)]),
@@ -139,7 +148,11 @@ export const jsLinImports = (getExports) => {
       toStr: (v) => sout(String(h(v))),
       // an F++ closure as a JS function: the token is a SLOT the wasm side
       // keeps current across collections; call back through exported jscall
-      mkFn: (slot) => reg((...a) => getExports().jscall(slot, reg(a.length ? a[0] : undefined))),
+      mkFn: (slot) => reg((...a) => {
+        const r = getExports().jscall(slot, reg(a.length ? a[0] : undefined));
+        drainDead();
+        return r;
+      }),
       undef: () => reg(undefined),
       obj: () => reg({}),
       arr: () => reg([]),

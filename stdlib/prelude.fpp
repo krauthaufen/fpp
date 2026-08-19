@@ -6287,6 +6287,17 @@ extern let gcHeapRefs : obj -> int
 /// every live reference is a frame slot, a static or a heap field. The
 /// oracle backend cannot ask its host GC, so it answers CONSERVATIVELY:
 /// never unique, and callers take their copying fallback.
+
+/// Deterministic cleanup over the runtime's own collector: watch an object,
+/// run a closure once when a collection proves it dead. The collector only
+/// RECORDS the death; the closure runs at the next drain — which `gcCollect`
+/// performs after forcing a full collection, so cleanup is forceable and
+/// testable. Real on the wasm-linear gc leg (fpprt's watch table); the
+/// wasm-GC backend rides the engine's collector, which offers neither forced
+/// collection nor synchronous finalizers — there these are no-ops.
+extern let gcOnCleanup : obj -> (unit -> unit) -> unit
+extern let gcCollect : unit -> unit
+
 type GC =
 #if NATIVE
     /// no heap object or static points at x: the caller's stack holds the
@@ -6299,3 +6310,20 @@ type GC =
     static member ReuseIfUnique (x : 'a) (f : 'a -> 'b) : option<'b> = None
     static member HeapRefs (x : 'a) : int = 2
 #endif
+    /// run `f` once, at the first drain after a collection proves `x` dead.
+    /// f must NOT capture x — a cleanup closure is rooted until it runs, so
+    /// capturing the watched object keeps it alive and the cleanup never
+    /// fires (a leak, never corruption)
+    static member OnCleanup (x : 'a) (f : unit -> unit) : unit = gcOnCleanup (box x) f
+    /// force a full collection, then run every pending cleanup — the
+    /// deterministic point
+    static member Collect () : unit = gcCollect ()
+    /// .NET's tuned overload (generation, mode, blocking, compacting):
+    /// every collection here is already full and compacting, so the
+    /// arguments are accepted and ignored
+    static member Collect (generation : int, mode : 'm, blocking : bool, compacting : bool) : unit =
+        ignore generation
+        ignore mode
+        ignore blocking
+        ignore compacting
+        gcCollect ()

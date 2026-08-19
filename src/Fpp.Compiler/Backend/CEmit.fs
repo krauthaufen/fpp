@@ -899,6 +899,16 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let x = emitE st f a
         stmt f ("fpp_eprints(" + sref x + ");")
         unitV ()
+    // deterministic cleanup: the native leg has fpprt underneath too, but
+    // its closure-slot registry is not wired yet — evaluate and drop, so a
+    // program using GC.OnCleanup still compiles (cleanups never fire here)
+    | EApp (EUnknown "gcOnCleanup", [ o; fn2 ]) ->
+        emitE st f o |> ignore
+        emitE st f fn2 |> ignore
+        unitV ()
+    | EApp (EUnknown "gcCollect", [ _ ]) ->
+        stmt f "fpprt_collect();"
+        unitV ()
     | EApp (EUnknown "printb", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_print(fpp_bool_to_string(" + sref x + "));")
@@ -1226,6 +1236,17 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         let d = slot f
         stmt f (sref d + " = TAGI(" + sref x + " == 0);")
         d
+    // deterministic-cleanup intrinsics (prelude members reference the
+    // externs as vars): native's closure-slot registry is not wired yet —
+    // OnCleanup evaluates and drops, Collect forces a real collection
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ o; fn2 ]) when v.Name = "gcOnCleanup" ->
+        emitE st f o |> ignore
+        emitE st f fn2 |> ignore
+        unitV ()
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcCollect" ->
+        emitE st f u1 |> ignore
+        stmt f "fpprt_collect();"
+        unitV ()
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
         let fn = (dictTryFind st.FnName (v.Path, v.Offset)).Value
@@ -3168,7 +3189,9 @@ let emitC (decls : Decl list) : string * string list =
             // builtins never call through here.
             let builtinNames =
                 [ "box"; "unbox"; "float16Bits"; "doubleBits"; "singleBits"
-                  "stackDepth"; "stackFrame" ]
+                  "stackDepth"; "stackFrame"
+                  // cleanup intrinsics: lowered in emitE, never raw C externs
+                  "gcOnCleanup"; "gcCollect" ]
             if not (List.contains v.Name builtinNames)
                && not (v.Name.StartsWith "mem") then
                 let rec peel (t : Type) (acc : Type list) =

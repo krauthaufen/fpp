@@ -35,6 +35,7 @@ done
 gates+=("hkt-gate|$here/tooling/hkt-gate.sh")
 gates+=("pkg-gate|$here/tooling/pkg-gate.sh")
 [ -x "$here/tooling/jsinterop/jsinterop-gate.sh" ] && gates+=("jsinterop-gate|$here/tooling/jsinterop/jsinterop-gate.sh")
+[ -x "$here/tooling/gc/cleanup-gate.sh" ] && gates+=("cleanup-gate|$here/tooling/gc/cleanup-gate.sh")
 gates+=("conformance|$here/conformance/run.sh")
 gates+=("conformance-neg|$here/conformance/neg.sh")
 if [ "$full" = 1 ]; then

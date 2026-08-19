@@ -1356,3 +1356,21 @@ distinct causes, all fixed:
   (fsc rejects those too; IEnumerator<'T> is IDisposable); the five test
   programs and the HashCollections port (whose interface blocks also never
   delegated MoveNext) now implement the full surface.
+
+## §38 deterministic cleanup: GC.OnCleanup / GC.Collect (2026-08-19)
+
+fpprt grew a WATCH TABLE (runtime @9951bba): fpprt_watch(obj, tag, kind)
+pairs an ephemeron weak edge with a tag; deaths are recorded in the same
+world-stopped window as the idhash rehash and QUEUED — cleanup runs at a
+mutator-side drain, never inside a collection. Green under semi, pcc and
+mmc. Surface: GC.OnCleanup x f (closure parked in a recycled $cbreg slot,
+kind 1), GC.Collect() = $rootswipe + fpprt_collect + $gcdrain — the
+rootswipe zeroes the shadow-stack region above $sp, because popped slots
+keep their values and the whole registered range is scanned; without it,
+residue kept just-dead objects alive one collection longer. Js.watch now
+queues handle ids (kind 0) for the glue's drainDead — the linear handle
+leak dies with the browser-reactor arc. Battery gate 31 (cleanup-gate):
+order, liveness, forceability, exact output. The cleanup externs are
+backend INTRINSICS in all three backends (wasm-GC and native no-op /
+collect-only for now); GC.Collect also accepts .NET's 4-argument overload
+(the adaptive port calls it). Full details: docs/PLAN-JSLIN.md.
