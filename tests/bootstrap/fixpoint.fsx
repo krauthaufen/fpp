@@ -159,12 +159,23 @@ let binMode = true
 /// re-emit the same LINEAR bytes. Composes with `self`.
 let linMode = System.Environment.GetCommandLineArgs () |> Array.contains "linear"
 
+// stage-0 lowering recurses per expression node; the compiler's own biggest
+// functions overflow fsi's default thread stack, so emission runs on a
+// 512MB-stack thread (stage-1's wasmtime already gets --max-wasm-stack)
+let onBigStack (f : unit -> 'a) : 'a =
+    let mutable r = Unchecked.defaultof<'a>
+    let mutable err : exn option = None
+    let t = System.Threading.Thread((fun () -> (try r <- f () with e -> err <- Some e)), 1 <<< 29)
+    t.Start ()
+    t.Join ()
+    match err with Some e -> raise e | None -> r
+
 let emit (label : string) (files : (string * string) list) : string =
     let ws = Workspace()
     for path, text in files do ws.SetFileText path text
     let wat, errs =
         let bytes, errs =
-            if linMode then ws.EmitProgramWasmReactor () else ws.EmitProgramWasm ()
+            onBigStack (fun () -> if linMode then ws.EmitProgramWasmReactor () else ws.EmitProgramWasm ())
         System.Text.Encoding.Latin1.GetString bytes, errs
     if not (List.isEmpty errs) then
         printfn "%s: %d emit errors" label errs.Length

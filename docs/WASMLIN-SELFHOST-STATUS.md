@@ -1301,3 +1301,32 @@ wholesale.
 
 Battery: 30/30 (fixpoint-linself included), both wasm-GC fixpoints
 byte-exact, gchost byte-exact, conformance 28 suites / 46 neg.
+
+## §37 JS interop on linear — all six browser legs green (2026-08-19)
+
+The interop arc (docs/PLAN-JSLIN.md) M1+M2: the whole browser surface —
+`Js.*` primitives, `[<JsImport>]`/jsxl typed externs, `[<Export>]`, plain
+`extern let` env FFI, callbacks, zero-copy TypedArray views, the
+dom/webgl/webgpu stdlib layers, future{} async, the WebGPU VM command
+stream — works on `fpp build --linear`. jsinterop-gate.sh now runs twelve
+legs: the six wasm-GC legs and the same six programs built `--linear`
+(module "jslin"; JsObj = raw handle id, strings as linear pointers,
+`lin_salloc` for JS→wasm strings, `$cbreg`/`jscall` for callbacks,
+`instantiateLinear` in stdlib/fpp-js.mjs).
+
+Compiler bugs flushed out and fixed (details in PLAN-JSLIN.md M2): pattern-
+only string literals interned past $hp (scanPatConsts); enums as heap
+objects (EnumConst); optional record fields losing their `?` and packing a
+None pointer as raw f64 (Option$<> in Lower's recordFields); collapsed
+newtype-struct arrays boxing instead of packing (storKindRes); print of
+int/float on linear (printConOf static dispatch + $ftoa_s shortest-form
+float formatting, also behind `string <float>`); int#s/int#p/nativeint#;
+memLoadFloat/memStoreFloat/memAlloc/memSize/memCopy; $lalloc 8-aligns.
+
+Remaining for the wasm-GC drop (M3/M4): the reactor (gc) mode in the
+browser — WASI shims for the merged module, pinning under the moving
+collector (fpprt_pin needs an mmc-built reactor; semi-space cannot pin),
+callback root slots are already gc-aware ($cbreg/cbBase) — then flip the
+default and retire BinDriver. Known residue: JS-held handles leak on
+linear (no finalizers); print of int64/uint64 still takes the string path;
+Js.watch is a no-op.

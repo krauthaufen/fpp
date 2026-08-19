@@ -144,6 +144,8 @@ type private St =
       /// union case name -> its tag (index) and its payload arity
       UnionTag : Dict<string, int>
       UnionArity : Dict<string, int>
+      /// enum case name -> its RAW integer value (an enum IS its int)
+      EnumConst : Dict<string, int>
       /// the descriptor word stored at every object's offset 0: a type's
       /// class-id. type name -> class-id, and a union CASE -> its union's id
       ClassId : Dict<string, int>
@@ -239,6 +241,27 @@ let mutable gc = false
 // it as a string constant lets a WasmLin-hosted compiler load its prelude (a real
 // end-to-end self-compile) without an external host. Empty for ordinary programs.
 let mutable preludeSrc = ""
+
+// JS interop (browser host): set when the program touches a `Js.*` primitive
+// or declares a [<JsImport>] extern. Turns on the "jslin" boundary imports,
+// the $cbreg/$jscall callback bridge and the lin_salloc string-in allocator.
+// The ABI: JsObj = raw handle id (0 = null), int/bool raw i32, float f64,
+// string = its linear pointer (len at +4, utf-16 units at +8).
+let mutable private jsUsed = false
+// [<JsImport>] externs: "path:offset" -> (wasm fn name, import name, param
+// kinds, ret kind) with kinds as in the wasm-GC jsx ABI (e=JsObj s=string
+// d=float b=bool i=int u=unit). The import NAME carries the kinds
+// ("mix#di:d") so the JS glue's Proxy can wrap the user's plain function
+// with the per-kind conversions.
+let mutable private jsxSigs : Dict<string, string * string * string list * string> = dictNew ()
+// plain `extern let` FFI (module "env", the wasm-GC backend's other import
+// class): "path:offset" -> (wasm fn name, param kinds, ret kind), raw ABI —
+// int/bool raw i32, float f64, string as its linear pointer, JsObj handle.
+// The page supplies { env: { name: fn } } with no glue conversions.
+let mutable private envSigs : Dict<string, string * string * string list * string> = dictNew ()
+// GC mode: base slot of the callback root area (fixed slots the collector
+// scans; $cbreg hands them out through the $cbnext global)
+let mutable private cbBase = 0
 
 // GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
 // raw SCALAR byte buffer, resolved by the driver before the runtime string and
@@ -361,7 +384,60 @@ let private rawScalarName (n : string) : bool =
     match n with
     | "int" | "int32" | "uint32" | "nativeint" | "unativeint"
     | "bool" | "char" | "int16" | "uint16" | "byte" | "sbyte" -> true
+    // a JsObj is a raw HANDLE id into the JS glue's table (linear memory
+    // cannot hold externref) — never a heap pointer, never scanned or rooted
+    | "JsObj" -> true
     | _ -> false
+
+// the concrete type-constructor a value expression statically denotes, ""
+// when underivable. Bare `print` has no runtime value dispatch on linear (a
+// raw int is indistinguishable from a pointer), so the backend picks the
+// int / float / string path from this.
+let rec private printConOf (st : St) (e : Expr) : string =
+    match e with
+    | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then "int64" else "int"
+    | ELit (LFloat _) -> "float"
+    | ELit (LBool _) -> "bool"
+    | ELit (LChar _) -> "char"
+    | ELit (LString _) -> "string"
+    | EVar (_, sch) | EVarI (_, sch, _) ->
+        (match prune sch.Body with TCon (n, []) -> n | _ -> "")
+    | EApp (EUnknown n, _) ->
+        // a builtin conversion names its RESULT before the '#'
+        let i = n.IndexOf "#"
+        if i > 0 then n.Substring (0, i) else ""
+    | EApp _ ->
+        let rec flat e acc = match e with EApp (h, a) -> flat h (a @ acc) | _ -> (e, acc)
+        let head, args = flat e []
+        (match head with
+         | EVar (_, sch) | EVarI (_, sch, _) ->
+             let rec peel t k = if k <= 0 then t else (match prune t with TFun (_, r) -> peel r (k - 1) | _ -> t)
+             (match prune (peel sch.Body (List.length args)) with TCon (n, []) -> n | _ -> "")
+         | ELam (ps, body) when List.length args >= List.length ps -> printConOf st body
+         | _ -> "")
+    | EField (_, fname, owner) ->
+        (match dictTryFind st.RecFieldTypes owner with
+         | Some fs -> (match fs |> List.tryPick (fun (n, t) -> if n = fname then Some t else None) with Some t -> t | None -> "")
+         | None -> "")
+    | ECast (tn, _, _) -> tn
+    | EPrim (op, _) ->
+        // arithmetic carries its operand type as the op suffix (+f, -l, …)
+        let n = strLen op
+        let sfx = if n > 1 then op.Substring (n - 1) else ""
+        let b = if sfx = "f" || sfx = "s" || sfx = "l" then op.Substring (0, n - 1) else op
+        (match b with
+         | "+" | "-" | "*" | "/" | "%" | "u-" when b <> op ->
+             (if sfx = "l" then "int64" elif sfx = "s" then "float32" else "float")
+         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u-" | "u~~~" -> "int"
+         | _ -> "")
+    | EIf (_, a, b) -> (let x = printConOf st a in if x <> "" then x else printConOf st b)
+    | ELet (_, _, _, _, b) -> printConOf st b
+    | ESeq xs -> (match List.tryLast xs with Some b -> printConOf st b | None -> "")
+    | EMatch (_, cs) ->
+        (match cs |> List.map (fun (_, _, b) -> printConOf st b) |> List.filter (fun s -> s <> "") with
+         | x :: _ -> x
+         | [] -> "")
+    | _ -> ""
 
 let rec private refKindOfTy (t : Type) : RefKind =
     match prune t with
@@ -408,7 +484,7 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
     | ETuple _ | EListLit _ | EArray _ | EArrayCreate _ | ERecord _ | ERecordExt _ | ECtor _ | ELam _ -> RKRef
     // an array length / type test is always a raw scalar (int / bool), never a
     // pointer — a generic aggregate storing one must exclude it from its scan
-    | EArrayLen _ | ETypeTest _ -> RKRaw
+    | EArrayLen _ | ETypeTest _ | EArrayPin _ | EArrayUnpin _ | EArrayBytes _ -> RKRaw
     | EPrim (op, _) ->
         let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
         (match b with
@@ -575,6 +651,8 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_i2j" [ "i32" ] [ "i64" ]
     // WASI path_open: (dirfd, dirflags, path, len, oflags, rights, rights_inh, fdflags, retptr)
     tyFunc m "$lt_po" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i64"; "i64"; "i32"; "i32" ] [ "i32" ]
+    // $memcopy: (dst, src, n) -> ()
+    tyFunc m "$lt_iii2v" [ "i32"; "i32"; "i32" ] []
 
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -585,6 +663,52 @@ let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_read" "$fd_read" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
     importFn m "wasi_snapshot_preview1" "fd_close" "$fd_close" [ "i32" ] [ "i32" ]
     importFn m "wasi_snapshot_preview1" "fd_filestat_get" "$fd_filestat_get" [ "i32"; "i32" ] [ "i32" ]
+    // the JS boundary (browser host): one import per Js.* primitive, module
+    // "jslin". Handles/ints/bools cross raw, floats f64, strings as linear
+    // pointers. Registered ONLY when the program touches Js.* — an unused
+    // import set would break plain wasmtime programs at instantiation.
+    if jsUsed then
+        importFn m "jslin" "global" "$jsi_global" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "get" "$jsi_get" [ "i32"; "i32" ] [ "i32" ]
+        importFn m "jslin" "set" "$jsi_set" [ "i32"; "i32"; "i32" ] []
+        importFn m "jslin" "getNum" "$jsi_getNum" [ "i32"; "i32" ] [ "f64" ]
+        importFn m "jslin" "setNum" "$jsi_setNum" [ "i32"; "i32"; "f64" ] []
+        importFn m "jslin" "item" "$jsi_item" [ "i32"; "i32" ] [ "i32" ]
+        importFn m "jslin" "itemSet" "$jsi_itemSet" [ "i32"; "i32"; "i32" ] []
+        for a in 0 .. 12 do
+            importFn m "jslin" ("call" + string a) ("$jsi_call" + string a) (List.replicate (2 + a) "i32") [ "i32" ]
+        for a in 0 .. 2 do
+            importFn m "jslin" ("new" + string a) ("$jsi_new" + string a) (List.replicate (1 + a) "i32") [ "i32" ]
+        importFn m "jslin" "num" "$jsi_num" [ "f64" ] [ "i32" ]
+        importFn m "jslin" "toNum" "$jsi_toNum" [ "i32" ] [ "f64" ]
+        importFn m "jslin" "bool" "$jsi_bool" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "toBool" "$jsi_toBool" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "str" "$jsi_str" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "toStr" "$jsi_tostr" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "mkFn" "$jsi_mkFn" [ "i32" ] [ "i32" ]
+        importFn m "jslin" "undef" "$jsi_undef" [] [ "i32" ]
+        importFn m "jslin" "obj" "$jsi_obj" [] [ "i32" ]
+        importFn m "jslin" "arr" "$jsi_arr" [] [ "i32" ]
+        importFn m "jslin" "push" "$jsi_push" [ "i32"; "i32" ] []
+        for sfx in [ "U8"; "U16"; "I32"; "F32"; "F64" ] do
+            importFn m "jslin" ("view" + sfx) ("$jsi_view" + sfx) [ "i32"; "i32" ] [ "i32" ]
+        // [<JsImport>] typed externs: module "jsxl", the kind signature
+        // mangled into the import name so the glue's Proxy can wrap the
+        // user's plain function with the per-kind conversions
+        for _, (fnm, nm, pks, rk) in dictPairs jsxSigs do
+            let vt k = if k = "d" then "f64" else "i32"
+            importFn m "jsxl" nm fnm
+                (pks |> List.filter (fun k -> k <> "u") |> List.map vt)
+                (if rk = "u" then [] else [ vt rk ])
+    // plain user externs: module "env", raw ABI, registered whenever declared
+    // (an unreferenced extern is DCE-safe: nothing calls it, but the import
+    // only exists when the program declared it, so wasmtime programs without
+    // externs stay import-free)
+    for _, (fnm, nm, pks, rk) in dictPairs envSigs do
+        let vt k = if k = "d" then "f64" else "i32"
+        importFn m "env" nm fnm
+            (pks |> List.filter (fun k -> k <> "u") |> List.map vt)
+            (if rk = "u" then [] else [ vt rk ])
     // GC mode imports fpprt's memory + API (all imports must precede declared
     // functions in the index space); the standalone path defines+exports its own
     if gc then importFpprt m else exportMem m "memory"
@@ -629,6 +753,17 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$atol" "$lt_i2j"
     declFn m "$readfile" "$lt_i2i"
     declFn m "$fexists" "$lt_i2i"
+    // raw linear-memory access (the Mem module): size probe and block copy
+    declFn m "$memsize" "$lt_v2i"
+    declFn m "$memcopy" "$lt_iii2v"
+    // shortest-form float formatting (print <float>, string <float>)
+    declFn m "$ftoa_s" "$lt_i2i"
+    // JS interop helpers: callback registration, the JS->wasm call bridge,
+    // and the string-shell allocator the glue fills (utf-16 units at +8)
+    if jsUsed then
+        declFn m "$cbreg" "$lt_i2i"
+        declFn m "$jscall" "$lt_ii2i"
+        declFn m "$lin_salloc" "$lt_i2i"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -809,6 +944,64 @@ let private emitFexists (m : Mod) : unit =
     ic f 1
     endFn f
 
+// $memsize(): the linear memory's current byte size (memory.size pages << 16)
+let private emitMemsize (m : Mod) : unit =
+    let f = beginFn m []
+    localsDone f
+    emitByte f.B 0x3F; emitByte f.B 0
+    ic f 16; ins f "i32.shl"
+    endFn f
+
+// $memcopy(dst, src, n): a raw block move over linear memory
+let private emitMemcopy (m : Mod) : unit =
+    let f = beginFn m [ "$d"; "$s"; "$n" ]
+    localsDone f
+    lg f "$d"; lg f "$s"; lg f "$n"
+    memCopy f
+    endFn f
+
+// $cbreg(clo): park a closure where JS can call back into it — the returned
+// SLOT ADDRESS is the callback token the glue holds (it never sees the
+// closure pointer itself, which a collection may move). Standalone: a
+// $lalloc'd word, nothing moves. GC: a fixed root slot from the cbBase area,
+// scanned and relocated with the heap; slots are handed out by $cbnext and
+// never reclaimed (a JS-held callback has no observable death on linear).
+let private emitCbreg (m : Mod) : unit =
+    let f = beginFn m [ "$clo" ]
+    local f "$p" "i32"
+    localsDone f
+    if gc then
+        gg f "$roots"; ic f (cbBase * 4); ins f "i32.add"
+        gg f "$cbnext"; ic f 2; ins f "i32.shl"; ins f "i32.add"; ls f "$p"
+        gg f "$cbnext"; ic f 1; ins f "i32.add"; gs f "$cbnext"
+    else
+        ic f 4; callf f "$lalloc"; ls f "$p"
+    lg f "$p"; lg f "$clo"; mem f "i32.store"
+    lg f "$p"
+    endFn f
+
+// $jscall(slot, h): the JS->wasm bridge — load the closure's CURRENT pointer
+// from its slot and call it with the raw handle as its one argument
+let private emitJscall (m : Mod) : unit =
+    let f = beginFn m [ "$slot"; "$h" ]
+    local f "$clo" "i32"
+    localsDone f
+    lg f "$slot"; mem f "i32.load"; ls f "$clo"
+    lg f "$clo"; lg f "$h"
+    lg f "$clo"; ic f (HDR + 4); ins f "i32.add"; mem f "i32.load"
+    callIndirect f "$lclo"
+    endFn f
+
+// $lin_salloc(units): a fresh string SHELL for the JS glue to fill (utf-16
+// units at +8) — how a JS string crosses INTO linear memory
+let private emitLinSalloc (m : Mod) : unit =
+    let f = beginFn m [ "$n" ]
+    local f "$p" "i32"
+    localsDone f
+    strAllocN f (fun () -> lg f "$n")
+    lg f "$p"
+    endFn f
+
 let private emitFtoa6 (m : Mod) : unit =
     let f = beginFn m [ "$x" ]
     local f "$v" "f64"; local f "$w" "i32"; local f "$ip" "f64"; local f "$frac" "f64"
@@ -887,14 +1080,138 @@ let private emitFtoa6 (m : Mod) : unit =
     lg f "$p"
     endFn f
 
-// $lalloc(n): 4-align the bump pointer, reserve n bytes, grow memory as
-// needed, return the aligned start.
+// $ftoa_s(x): the SHORTEST-form float -> string (mirrors the wasm-GC $ftoa):
+// NaN, sign, ∞ (U+221E, .NET's spelling), >=1e18 normalizes to <10 with an
+// E+ exponent, integer digits, then up to 15 fraction digits stopping when
+// the residue hits zero — f64 rounding makes 0.1 come out as "0.1" and 5.0
+// as "5". Backs `print <float>` and `string <float>`, which have no
+// fixed-width form ($ftoa6 is %f's fixed six decimals).
+let private emitFtoaS (m : Mod) : unit =
+    let f = beginFn m [ "$x" ]
+    local f "$v" "f64"; local f "$w" "i32"; local f "$ip" "f64"; local f "$frac" "f64"
+    local f "$ipi" "i64"; local f "$tmp" "i64"; local f "$d" "i32"; local f "$k" "i32"
+    local f "$cur" "i32"; local f "$p" "i32"; local f "$len" "i32"; local f "$i" "i32"
+    local f "$e" "i32"
+    localsDone f
+    let put (code : unit -> unit) =
+        lg f "$w"; code (); mem f "i32.store16"; lg f "$w"; ic f 2; ins f "i32.add"; ls f "$w"
+    emitSbufRefresh f
+    lg f "$x"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$v"
+    saddr f FMTBUF; ls f "$w"
+    blockE f "$fin"
+    // NaN
+    lg f "$v"; lg f "$v"; ins f "f64.ne"
+    ifE f
+    for c in [ 78; 97; 78 ] do put (fun () -> ic f c)
+    br f "$fin"
+    endB f
+    // sign
+    lg f "$v"; fc f 0L; ins f "f64.lt"
+    ifE f
+    put (fun () -> ic f 45)
+    lg f "$v"; ins f "f64.neg"; ls f "$v"
+    endB f
+    // infinity
+    lg f "$v"; fc f 9218868437227405312L; ins f "f64.eq"
+    ifE f
+    put (fun () -> ic f 0x221E)
+    br f "$fin"
+    endB f
+    // >= 1e18: scale below 10, counting the exponent
+    lg f "$v"; fc f 4876203697187506176L; ins f "f64.ge"
+    ifE f
+    blockE f "$sc"; loopE f "$sgo"
+    lg f "$v"; fc f 4621819117588971520L; ins f "f64.lt"; brIf f "$sc"
+    lg f "$v"; fc f 4621819117588971520L; ins f "f64.div"; ls f "$v"
+    lg f "$e"; ic f 1; ins f "i32.add"; ls f "$e"
+    br f "$sgo"; endB f; endB f
+    endB f
+    lg f "$v"; ins f "f64.floor"; ls f "$ip"
+    lg f "$ip"; ins f "i64.trunc_f64_s"; ls f "$ipi"
+    // integer digits: count, then write back-to-front
+    ic f 1; ls f "$d"
+    lg f "$ipi"; ls f "$tmp"
+    blockE f "$dc"; loopE f "$dl"
+    lg f "$tmp"; lc f 10L; ins f "i64.lt_u"; brIf f "$dc"
+    lg f "$tmp"; lc f 10L; ins f "i64.div_u"; ls f "$tmp"
+    lg f "$d"; ic f 1; ins f "i32.add"; ls f "$d"
+    br f "$dl"; endB f; endB f
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$cur"
+    lg f "$ipi"; ls f "$tmp"
+    blockE f "$wc"; loopE f "$wl"
+    lg f "$cur"
+    lg f "$tmp"; lc f 10L; ins f "i64.rem_u"; ins f "i32.wrap_i64"; ic f 48; ins f "i32.add"
+    mem f "i32.store16"
+    lg f "$cur"; ic f 2; ins f "i32.sub"; ls f "$cur"
+    lg f "$tmp"; lc f 10L; ins f "i64.div_u"; ls f "$tmp"
+    lg f "$tmp"; lc f 0L; ins f "i64.eq"; brIf f "$wc"
+    br f "$wl"; endB f; endB f
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$w"
+    // fraction: only when non-zero; stop the moment the residue is exact
+    lg f "$v"; lg f "$ip"; ins f "f64.sub"; ls f "$frac"
+    lg f "$frac"; fc f 0L; ins f "f64.gt"
+    ifE f
+    put (fun () -> ic f 46)
+    ic f 0; ls f "$k"
+    blockE f "$fc2"; loopE f "$fl2"
+    lg f "$k"; ic f 15; ins f "i32.ge_s"; brIf f "$fc2"
+    lg f "$frac"; fc f 4621819117588971520L; ins f "f64.mul"; ls f "$frac"
+    lg f "$frac"; ins f "f64.floor"; ins f "i32.trunc_f64_s"; ls f "$d"
+    put (fun () -> ic f 48; lg f "$d"; ins f "i32.add")
+    lg f "$frac"; lg f "$frac"; ins f "f64.floor"; ins f "f64.sub"; ls f "$frac"
+    lg f "$frac"; fc f 0L; ins f "f64.eq"; brIf f "$fc2"
+    lg f "$k"; ic f 1; ins f "i32.add"; ls f "$k"
+    br f "$fl2"; endB f; endB f
+    endB f
+    // E+<e>
+    lg f "$e"; ic f 0; ins f "i32.ne"
+    ifE f
+    put (fun () -> ic f 69)
+    put (fun () -> ic f 43)
+    ic f 1; ls f "$d"
+    lg f "$e"; ls f "$i"
+    blockE f "$ec"; loopE f "$el"
+    lg f "$i"; ic f 10; ins f "i32.lt_u"; brIf f "$ec"
+    lg f "$i"; ic f 10; ins f "i32.div_u"; ls f "$i"
+    lg f "$d"; ic f 1; ins f "i32.add"; ls f "$d"
+    br f "$el"; endB f; endB f
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.sub"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$cur"
+    lg f "$e"; ls f "$i"
+    blockE f "$ewc"; loopE f "$ewl"
+    lg f "$cur"
+    lg f "$i"; ic f 10; ins f "i32.rem_u"; ic f 48; ins f "i32.add"
+    mem f "i32.store16"
+    lg f "$cur"; ic f 2; ins f "i32.sub"; ls f "$cur"
+    lg f "$i"; ic f 10; ins f "i32.div_u"; ls f "$i"
+    lg f "$i"; ic f 0; ins f "i32.eq"; brIf f "$ewc"
+    br f "$ewl"; endB f; endB f
+    lg f "$w"; lg f "$d"; ic f 1; ins f "i32.shl"; ins f "i32.add"; ls f "$w"
+    endB f
+    endB f  // $fin
+    // build the string [hdr][len][units] from FMTBUF
+    lg f "$w"; saddr f FMTBUF; ins f "i32.sub"; ic f 1; ins f "i32.shr_u"; ls f "$len"
+    strAllocN f (fun () -> lg f "$len")
+    emitSbufRefresh f
+    ic f 0; ls f "$i"
+    blockE f "$cc"; loopE f "$cl"
+    lg f "$i"; lg f "$len"; ins f "i32.ge_u"; brIf f "$cc"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    saddr f FMTBUF; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$cl"; endB f; endB f
+    lg f "$p"
+    endFn f
+
+// $lalloc(n): 8-align the bump pointer, reserve n bytes, grow memory as
+// needed, return the aligned start. Eight, not four: `Mem.alloc` promises
+// 8-aligned blocks (the WebGPU command stream is a Float64Array over one).
 let private emitLalloc (m : Mod) : unit =
     let f = beginFn m [ "$n" ]
     local f "$p" "i32"
     localsDone f
     gg f "$hp"
-    ic f 3; ins f "i32.add"; ic f -4; ins f "i32.and"
+    ic f 7; ins f "i32.add"; ic f -8; ins f "i32.and"
     ls f "$p"
     // grow if $p + n exceeds current memory
     lg f "$p"; lg f "$n"; ins f "i32.add"
@@ -2183,6 +2500,19 @@ let rec private discover (st : St) (e : Expr) : unit =
 // intern EVERY string literal reachable in a body — a literal missed here
 // is baked at an address the heap pointer already claimed, so $hp must
 // only settle once every constant is counted
+// a string literal in a match PATTERN interns like one in an expression:
+// lowPatTest compares through lowStrConst, and a constant first seen at
+// LOWERING time lands past the baked $hp — the first allocation overwrites
+// it and the pattern silently stops matching (found by the dom gate's
+// `match tagName with "CANVAS"`, whose literal appears ONLY in patterns)
+let rec private scanPatConsts (st : St) (p : Pat) : unit =
+    match p with
+    | PLit (LString s) -> (if gc then internStrGc st s else internStr st s) |> ignore
+    | PAs (q, _, _) -> scanPatConsts st q
+    | PCtor (_, _, subs) | PTuple subs | PListLit subs | POr subs -> for q in subs do scanPatConsts st q
+    | PCons (a, b) -> scanPatConsts st a; scanPatConsts st b
+    | _ -> ()
+
 let rec private scanConsts (st : St) (e : Expr) : unit =
     match e with
     | ELit (LString s) -> (if gc then internStrGc st s else internStr st s) |> ignore
@@ -2196,11 +2526,11 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
     | EAssign (_, r) | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) -> scanConsts st r
     | EFieldSet (r, _, _, v) -> scanConsts st r; scanConsts st v
     | ELam (_, b) -> scanConsts st b
-    | EMatch (s, cs) -> scanConsts st s; for _, g, b in cs do (match g with Some x -> scanConsts st x | None -> ()); scanConsts st b
+    | EMatch (s, cs) -> scanConsts st s; for p, g, b in cs do scanPatConsts st p; (match g with Some x -> scanConsts st x | None -> ()); scanConsts st b
     | ERecord (_, fs) -> for _, v in fs do scanConsts st v
     | ERecordExt (_, b, fs) -> scanConsts st b; for _, v in fs do scanConsts st v
     | EIfaceCall (_, _, r, xs) -> scanConsts st r; for x in xs do scanConsts st x
-    | ETry (b, cs) -> scanConsts st b; for _, g, x in cs do (match g with Some y -> scanConsts st y | None -> ()); scanConsts st x
+    | ETry (b, cs) -> scanConsts st b; for p, g, x in cs do scanPatConsts st p; (match g with Some y -> scanConsts st y | None -> ()); scanConsts st x
     | _ -> ()
 
 // a reference-map hash over lambda nodes, keyed by the bound param's offset
@@ -2341,6 +2671,20 @@ let private storLTy (k : string) : (LTy * int) option =
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
 let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | _ -> W
+// resolve an array-element KIND through the newtype collapse: a collapsed
+// single-field record IS its field, so `F1[]` (F1 = { V : float32 }) stores
+// PACKED float32 — which is what lets Array.pin + zero-copy views alias real
+// scalar data (matching the wasm-GC backend's packed representations).
+let rec private storKindRes (st : St) (k : string) : string =
+    match dictTryFind st.Collapse k with
+    | Some f ->
+        (match dictTryFind st.RecFieldTypes k with
+         | Some fs ->
+             (match fs |> List.tryPick (fun (n, t) -> if n = f then Some t else None) with
+              | Some t when t <> k -> storKindRes st t
+              | _ -> k)
+         | None -> k)
+    | None -> k
 let private storShape (k : string) : string = "sa:" + k
 
 // an array whose element is an ALL-SCALAR inline record stores the elements
@@ -3567,6 +3911,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | Some e2 -> coreToLowE ctx e2
                 | None -> LLoad (W, LGet (wReg b), HDR + 4 * i))
         LDo ([ LSet (wReg b, coreToLowE ctx baseE) ], lowObj ctx (cidRec st name) 0 slots)
+    // an enum case IS its raw integer value — no heap object
+    | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
+        LConstW (optGet (dictTryFind st.EnumConst case))
     | ECtor (case, _, args) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         // slot 0 is the raw tag word; the payload follows. A concrete payload
@@ -3729,7 +4076,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // shadow-stack rooting). A read boxes (cancelled by unbox in arithmetic), a
     // write unboxes; storBox/storUnbox carry the per-kind tag / sign-extend /
     // f32-reinterpret. `int`/`char`/`bool`/`nativeint` stay generic tagged words.
-    | EArray (k, xs) when (storLTy k).IsSome ->
+    | EArray (k, xs) when (storLTy (storKindRes ctx.LSt k)).IsSome ->
+        let k = storKindRes ctx.LSt k
         let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let n = List.length xs
@@ -3742,7 +4090,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LConstW n) ]
         let stores = vregs |> List.mapi (fun i vr -> LStore (sty, LGet (wReg bs), HDR + 4 + i * w, LGet { Id = vr; RTy = vty }))
         LDo (evals @ [ LSet (wReg bs, alloc) ] @ hdr @ stores, LGet (wReg bs))
-    | EIndex (k, arr, i) when (storLTy k).IsSome ->
+    | EIndex (k, arr, i) when (storLTy (storKindRes ctx.LSt k)).IsSome ->
+        let k = storKindRes ctx.LSt k
         let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let ir = freshTmp ctx
@@ -3750,7 +4099,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LSet (wReg ir, (coreToLowE ctx i))
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LGet (wReg ir); LConstW w ]) ]), HDR + 4)) ],
              storBox ctx k (LGet { Id = fv; RTy = vty }))
-    | EIndexSet (k, arr, i, v) when (storLTy k).IsSome ->
+    | EIndexSet (k, arr, i, v) when (storLTy (storKindRes ctx.LSt k)).IsSome ->
+        let k = storKindRes ctx.LSt k
         let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let fv = freshTmpT ctx vty
@@ -3795,7 +4145,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ coreToLowE ctx arr; LPrim (MulW, [ LPrim (AddW, [ (coreToLowE ctx i); LConstW 1 ]); LConstW 4 ]) ])
         LDo ([ LStore (W, addr, HDR, coreToLowE ctx v) ], lowInt 0)
     | EArrayLen (_, arr) -> (LLoad (W, coreToLowE ctx arr, HDR))
-    | EArrayCreate (k, n, init) when (storLTy k).IsSome ->
+    // Array.pin: on standalone linear the elements ALREADY live at a stable
+    // address — pin answers the data address (elements start after
+    // [hdr][len]) and unpin is a no-op. Under the moving collector pinning
+    // needs fpprt_pin/mmc — not wired yet (M3 of docs/PLAN-JSLIN.md), so gc
+    // mode falls through to the informative gap.
+    | EArrayPin (_, arr) when not gc -> LPrim (AddW, [ coreToLowE ctx arr; LConstW (HDR + 4) ])
+    | EArrayUnpin (_, arr) when not gc -> LDo ([ LEval (coreToLowE ctx arr) ], lowInt 0)
+    | EArrayBytes (nm, arr) ->
+        let w =
+            match storLTy (storKindRes ctx.LSt nm) with
+            | Some (_, ww) -> ww
+            | None -> (match dictTryFind ctx.LSt.RecPod nm with Some (_, size, _) -> size | None -> 4)
+        LPrim (MulW, [ LLoad (W, coreToLowE ctx arr, HDR); LConstW w ])
+    | EArrayCreate (k, n, init) when (storLTy (storKindRes ctx.LSt k)).IsSome ->
+        let k = storKindRes ctx.LSt k
         let (sty, w) = optGet (storLTy k)
         let vty = storValTy sty
         let cnt = freshTmp ctx
@@ -3881,7 +4245,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n = "uint64#" || n.StartsWith "uint64#" ->
         lowBoxI ctx (LPrim (WToL, [ coreToLowE ctx a ]))
     // int from float: unbox, truncate, tag
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" -> (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
+    // int of float OR float32 — a float32 value rides the same boxed f64
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#f" || n.StartsWith "int#s" -> (LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ]))
     // int from int (widen/identity in the tagged model) and int truncations
     // int-of-STRING parses ('t' is the string kind letter): the identity here
     // returned the string POINTER — the self-hosted BinDriver's
@@ -3913,7 +4278,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `print` writes the string THEN a newline (matching the GC backend's putc
     // '\n'); `printraw`/`printRaw` are the newline-free form.
     | EApp (EUnknown "print", [ a ]) ->
-        LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
+        // linear has no runtime value dispatch ($printval): a raw int is
+        // indistinguishable from a pointer. Pick the path from the argument's
+        // STATIC type — ints through $str_of_int, floats through the
+        // shortest-form $ftoa_s, anything else prints as the string it must be.
+        let con =
+            match printConOf ctx.LSt a with
+            | "" -> (if refKindOfExpr a = RKRaw then "int" else "")
+            | c -> c
+        let v =
+            match con with
+            | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
+            | "float" | "float32" | "double" | "single" -> LCall ("$ftoa_s", [ coreToLowE ctx a ])
+            | _ -> coreToLowE ctx a
+        LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
@@ -4032,6 +4410,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown "string#c", [ a ]) -> LCall ("$str_of_char", [ (coreToLowE ctx a) ])
     // string of a string is the identity
     | EApp (EUnknown "string#t", [ a ]) -> coreToLowE ctx a
+    // string of a float/float32: the shortest form, matching .NET ToString
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string#f" || n.StartsWith "string#d" || n.StartsWith "string#s" ->
+        LCall ("$ftoa_s", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
@@ -4048,6 +4429,94 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LCall ("$fexists", [ coreToLowE ctx a ])
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when v.Name = "canonicalizeRaw" ->
         coreToLowE ctx a
+    // ---- the JS boundary (Js.* primitives; module "jslin") -----------------
+    // Handles are raw i32 ids (JsObj is a raw scalar), ints/bools cross raw,
+    // floats unbox to f64 at the boundary, strings cross as linear pointers
+    // the glue decodes. Mirrors the wasm-GC jsx/js ABI minus externref.
+    // String (REF) operands route through lowRootedArgsK: an import call can
+    // re-enter wasm through a callback and collect mid-argument-list.
+    | EApp (EUnknown "jsGlobal", [ k ]) -> lowJsi ctx "$jsi_global" "h" [ RKRef, W, coreToLowE ctx k ]
+    | EApp (EUnknown "jsGet", [ o; k ]) -> lowJsi ctx "$jsi_get" "h" [ RKRaw, W, coreToLowE ctx o; RKRef, W, coreToLowE ctx k ]
+    | EApp (EUnknown "jsSet", [ o; k; v ]) -> lowJsi ctx "$jsi_set" "u" [ RKRaw, W, coreToLowE ctx o; RKRef, W, coreToLowE ctx k; RKRaw, W, coreToLowE ctx v ]
+    | EApp (EUnknown "jsGetNum", [ o; k ]) -> lowJsi ctx "$jsi_getNum" "d" [ RKRaw, W, coreToLowE ctx o; RKRef, W, coreToLowE ctx k ]
+    | EApp (EUnknown "jsSetNum", [ o; k; v ]) -> lowJsi ctx "$jsi_setNum" "u" [ RKRaw, W, coreToLowE ctx o; RKRef, W, coreToLowE ctx k; RKRaw, F64, flatUnbox F64 (coreToLowE ctx v) ]
+    | EApp (EUnknown "jsItem", [ o; i ]) -> lowJsi ctx "$jsi_item" "h" [ RKRaw, W, coreToLowE ctx o; RKRaw, W, coreToLowE ctx i ]
+    | EApp (EUnknown "jsItemSet", [ o; i; v ]) -> lowJsi ctx "$jsi_itemSet" "u" [ RKRaw, W, coreToLowE ctx o; RKRaw, W, coreToLowE ctx i; RKRaw, W, coreToLowE ctx v ]
+    | EApp (EUnknown "jsCallback", [ clo ]) -> lowJsi ctx "$jsi_mkFn" "h" [ RKRaw, W, LCall ("$cbreg", [ coreToLowE ctx clo ]) ]
+    | EApp (EUnknown n, (o :: k :: rest)) when n.StartsWith "jsCall" ->
+        lowJsi ctx ("$jsi_call" + n.Substring 6) "h"
+            ((RKRaw, W, coreToLowE ctx o) :: (RKRef, W, coreToLowE ctx k)
+             :: (rest |> List.map (fun a -> RKRaw, W, coreToLowE ctx a)))
+    | EApp (EUnknown n, (c :: rest)) when (n = "jsNew0" || n = "jsNew1" || n = "jsNew2") ->
+        lowJsi ctx ("$jsi_new" + n.Substring 5) "h"
+            ((RKRaw, W, coreToLowE ctx c) :: (rest |> List.map (fun a -> RKRaw, W, coreToLowE ctx a)))
+    | EApp (EUnknown "jsOfNum", [ a ]) -> lowJsi ctx "$jsi_num" "h" [ RKRaw, F64, flatUnbox F64 (coreToLowE ctx a) ]
+    | EApp (EUnknown "jsToNum", [ a ]) -> lowJsi ctx "$jsi_toNum" "d" [ RKRaw, W, coreToLowE ctx a ]
+    | EApp (EUnknown "jsOfBool", [ a ]) -> lowJsi ctx "$jsi_bool" "h" [ RKRaw, W, coreToLowE ctx a ]
+    | EApp (EUnknown "jsToBool", [ a ]) -> lowJsi ctx "$jsi_toBool" "h" [ RKRaw, W, coreToLowE ctx a ]
+    | EApp (EUnknown "jsOfString", [ a ]) -> lowJsi ctx "$jsi_str" "h" [ RKRef, W, coreToLowE ctx a ]
+    | EApp (EUnknown "jsToString", [ a ]) -> lowJsi ctx "$jsi_tostr" "h" [ RKRaw, W, coreToLowE ctx a ]
+    | EApp (EUnknown "jsUndefined", [ _ ]) -> LCall ("$jsi_undef", [])
+    | EApp (EUnknown "jsNewObj", [ _ ]) -> LCall ("$jsi_obj", [])
+    | EApp (EUnknown "jsNewArr", [ _ ]) -> LCall ("$jsi_arr", [])
+    | EApp (EUnknown "jsPush", [ a; v ]) -> lowJsi ctx "$jsi_push" "u" [ RKRaw, W, coreToLowE ctx a; RKRaw, W, coreToLowE ctx v ]
+    // a handle IS its id on linear: to/from int is the identity
+    | EApp (EUnknown "jsHandle", [ i ]) -> coreToLowE ctx i
+    | EApp (EUnknown "jsRegister", [ o ]) -> coreToLowE ctx o
+    | EApp (EUnknown "jsWatch", [ w; i ]) ->
+        // no finalizers on linear — handles held by wrappers leak (residue)
+        LDo ([ LEval (coreToLowE ctx w); LEval (coreToLowE ctx i) ], lowInt 0)
+    | EApp (EUnknown "jsNull", [ _ ]) -> lowInt 0
+    | EApp (EUnknown "jsIsNull", [ a ]) -> LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ])
+    | EApp (EUnknown vn, [ p; n ]) when vn.StartsWith "jsView" ->
+        lowJsi ctx ("$jsi_view" + vn.Substring 6) "h" [ RKRaw, W, coreToLowE ctx p; RKRaw, W, coreToLowE ctx n ]
+    // ---- raw linear-memory access (the Mem module) -------------------------
+    | EApp (EUnknown "memAlloc", [ n ]) -> LAlloc (coreToLowE ctx n)
+    | EApp (EUnknown "memSize", [ _ ]) -> LCall ("$memsize", [])
+    | EApp (EUnknown "memCopy", [ d; s; n ]) ->
+        LDo ([ LCallVoidS ("$memcopy", [ coreToLowE ctx d; coreToLowE ctx s; coreToLowE ctx n ]) ], lowInt 0)
+    | EApp (EUnknown "memLoadByte", [ p ]) -> LLoad (I8, coreToLowE ctx p, 0)
+    | EApp (EUnknown "memStoreByte", [ p; v ]) -> LDo ([ LStore (I8, coreToLowE ctx p, 0, coreToLowE ctx v) ], lowInt 0)
+    | EApp (EUnknown "memLoadInt", [ p ]) -> LLoad (W, coreToLowE ctx p, 0)
+    | EApp (EUnknown "memStoreInt", [ p; v ]) -> LDo ([ LStore (W, coreToLowE ctx p, 0, coreToLowE ctx v) ], lowInt 0)
+    | EApp (EUnknown "memLoadInt64", [ p ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx p, 0))
+    | EApp (EUnknown "memStoreInt64", [ p; v ]) -> LDo ([ LStore (I64, coreToLowE ctx p, 0, lowUnboxI (coreToLowE ctx v)) ], lowInt 0)
+    | EApp (EUnknown "memLoadFloat", [ p ]) -> lowBoxF ctx (LLoad (F64, coreToLowE ctx p, 0))
+    | EApp (EUnknown "memStoreFloat", [ p; v ]) -> LDo ([ LStore (F64, coreToLowE ctx p, 0, flatUnbox F64 (coreToLowE ctx v)) ], lowInt 0)
+    // nativeint <-> int are the same raw word
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "nativeint#" || n = "nativeint" || n.StartsWith "int#p" ->
+        coreToLowE ctx a
+    // ---- [<JsImport>] typed externs (module "jsxl") ------------------------
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind jsxSigs (key v)).IsSome ->
+        let fnm, _, pks, rk = optGet (dictTryFind jsxSigs (key v))
+        // a unit param is evaluated for effect and dropped from the import's
+        // argument list (matching the import signature's u-filter)
+        let unitEvals =
+            List.zip pks args |> List.filter (fun (k, _) -> k = "u")
+            |> List.map (fun (_, a) -> LEval (coreToLowE ctx a))
+        let ops =
+            List.zip pks args |> List.filter (fun (k, _) -> k <> "u")
+            |> List.map (fun (k, a) ->
+                match k with
+                | "s" -> RKRef, W, coreToLowE ctx a
+                | "d" -> RKRaw, F64, flatUnbox F64 (coreToLowE ctx a)
+                | _ -> RKRaw, W, coreToLowE ctx a)
+        let call = lowJsi ctx fnm rk ops
+        if List.isEmpty unitEvals then call else LDo (unitEvals, call)
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind envSigs (key v)).IsSome ->
+        let fnm, _, pks, rk = optGet (dictTryFind envSigs (key v))
+        let unitEvals =
+            List.zip pks args |> List.filter (fun (k, _) -> k = "u")
+            |> List.map (fun (_, a) -> LEval (coreToLowE ctx a))
+        let ops =
+            List.zip pks args |> List.filter (fun (k, _) -> k <> "u")
+            |> List.map (fun (k, a) ->
+                match k with
+                | "s" -> RKRef, W, coreToLowE ctx a
+                | "d" -> RKRaw, F64, flatUnbox F64 (coreToLowE ctx a)
+                | _ -> RKRaw, W, coreToLowE ctx a)
+        let call = lowJsi ctx fnm rk ops
+        if List.isEmpty unitEvals then call else LDo (unitEvals, call)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
     | EApp (((EVar (v, _) | EVarI (v, _, _)) as hd), args)
@@ -4117,6 +4586,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // register at each clause entry.
         let rec derefPat (p : Pat) =
             match p with
+            // an enum case compares the RAW scrutinee value — never slotted
+            // (a raw even int in a scanned root slot reads as a pointer)
+            | PCtor (c, _, []) when (dictTryFind st.EnumConst c).IsSome -> false
             | PCtor _ | PTuple _ | PCons _ | PListLit _ | PTypeTest _ -> true
             | PLit (LString _) | PLit LNull -> true
             | PAs (p, _, _) -> derefPat p
@@ -4774,6 +5246,9 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PLit (LInt s) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (parseI32Lit s) ])) ]
     | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (if b then 1 else 0) ])) ]
     | PLit LUnit -> []
+    // an enum case pattern is a raw integer compare — no heap object to tag-test
+    | PCtor (case, _, []) when (dictTryFind ctx.LSt.EnumConst case).IsSome ->
+        [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (optGet (dictTryFind ctx.LSt.EnumConst case)) ])) ]
     | PCtor (case, _, subs) ->
         let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
         // a union case is [cid/tid][tag][payload…]. A union's cases do not all
@@ -5057,6 +5532,24 @@ and private lowRootedArgsK (ctx : LowCtx) (args : (RefKind * LExpr option * LTy 
                          LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ]) ]
             | _ -> [])
     (eval @ pops, ts |> List.map (fun (_, _, r, _, _) -> LGet r))
+
+/// one JS-boundary import call: operands as (kind, lane, lowered) triples,
+/// routed through the rooted-args machinery (a string operand is a heap
+/// pointer live across the LATER operands' evaluations — and the import
+/// itself can re-enter wasm through a callback and collect). `ret` is the
+/// jsx kind of the result: "d" boxes the f64 through a temp (the box
+/// allocation is a safepoint), "u" answers unit, anything else passes the
+/// raw i32 (handle / string pointer / int / bool) straight through.
+and private lowJsi (ctx : LowCtx) (fname : string) (ret : string) (args : (RefKind * LTy * LExpr) list) : LExpr =
+    let setup, vals = lowRootedArgsK ctx (args |> List.map (fun (k, ty, e) -> k, None, ty, e))
+    let call =
+        match ret with
+        | "u" -> LDo ([ LCallVoidS (fname, vals) ], lowInt 0)
+        | "d" ->
+            let r = freshTmpT ctx F64
+            LDo ([ LSet ({ Id = r; RTy = F64 }, LCall (fname, vals)) ], flatBox ctx F64 (LGet { Id = r; RTy = F64 }))
+        | _ -> LCall (fname, vals)
+    if List.isEmpty setup then call else LDo (setup, call)
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -5962,7 +6455,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
-          RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew ()
+          RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
@@ -5985,6 +6478,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.UnionTag cn i
                 dictSet st.UnionArity cn ar
                 dictSet st.CaseClass cn cid)
+        | DEnum (_, cs) -> for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
     // single-field-collapse (repr(T)): a one-field record travels as its field
     // (no heap object), UNLESS it is mutated, type-tested/cast, or a CLASS (a
@@ -6190,6 +6684,100 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet gcGlobalSlots (gl v) slot
         | DExtern (v, _) -> dictSet st.Externs v.Name true
         | _ -> ()
+    // JS interop detection: any Js.* primitive use (EUnknown "js<Upper>…") or
+    // a [<JsImport>] extern turns on the "jslin" boundary imports. Runs before
+    // rtDeclsLin — imports must precede every declared function.
+    jsUsed <- false
+    jsxSigs <- dictNew ()
+    envSigs <- dictNew ()
+    // markers/externs live in decls0 — the reachability filter above keeps
+    // only DLets in `decls`
+    let jsxMarked = dictNew<string, bool> ()
+    for d in decls0 do
+        match d with
+        | DExport (v, "$jsimport") -> dictSet jsxMarked (key v) true
+        | _ -> ()
+    let rec jsScan (e : Expr) : unit =
+        (match e with
+         | EApp (EUnknown n, _) when strLen n > 2 && n.StartsWith "js" && System.Char.IsUpper (charAt n 2) ->
+             jsUsed <- true
+         | _ -> ())
+        match e with
+        | ELet (_, _, _, r, b) -> jsScan r; jsScan b
+        | ELam (_, b) -> jsScan b
+        | EApp (f, args) -> jsScan f; List.iter jsScan args
+        | EIf (a, b, c) -> jsScan a; jsScan b; jsScan c
+        | EMatch (s, cs) | ETry (s, cs) ->
+            jsScan s
+            for _, gd, bb in cs do (match gd with Some g -> jsScan g | None -> ()); jsScan bb
+        | ETuple xs | EListLit xs | ESeq xs | EPrim (_, xs) | ECtor (_, _, xs) | EArray (_, xs) -> List.iter jsScan xs
+        | ERecord (_, fs) -> for _, x in fs do jsScan x
+        | ERecordExt (_, bb, fs) -> jsScan bb; (for _, x in fs do jsScan x)
+        | EField (r, _, _) -> jsScan r
+        | EFieldSet (r, _, _, x) -> jsScan r; jsScan x
+        | EWhile (c, b) -> jsScan c; jsScan b
+        | EAssign (_, x) -> jsScan x
+        | EIndex (_, a, i) -> jsScan a; jsScan i
+        | EIndexSet (_, a, i, x) -> jsScan a; jsScan i; jsScan x
+        | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) | ECast (_, a, _) | ETypeTest (_, a) -> jsScan a
+        | EArrayCreate (_, a, b) -> jsScan a; jsScan b
+        | EIfaceCall (_, _, recv, args) -> jsScan recv; List.iter jsScan args
+        | _ -> ()
+    for d in decls do
+        match d with DLet (_, _, _, e) -> jsScan e | _ -> ()
+    let mutable jsxN = 0
+    for d in decls0 do
+        match d with
+        | DExtern (v, sch) when (dictTryFind jsxMarked (key v)).IsSome ->
+            // kind derivation mirrors BinDriver's jsx ABI exactly
+            let jsKind (t : Type) : string =
+                match prune t with
+                | TCon ("JsObj", []) -> "e"
+                | TCon (("float" | "float32"), []) -> "d"
+                | TCon ("string", []) -> "s"
+                | TCon ("bool", []) -> "b"
+                | TCon ("unit", []) -> "u"
+                | _ -> "i"
+            let rec peel (t : Type) : string list * string =
+                match prune t with
+                | TFun (a, b) ->
+                    let ps, r = peel b
+                    jsKind a :: ps, r
+                | r -> [], jsKind r
+            let pks, rk = peel sch.Body
+            let fnm = "$jsx" + string jsxN
+            jsxN <- jsxN + 1
+            let nm = v.Name + "#" + String.concat "" pks + ":" + rk
+            dictSet jsxSigs (key v) (fnm, nm, pks, rk)
+            jsUsed <- true
+        | DExtern (v, sch) when
+              v.Path <> Fpp.Analysis.Classes.builtinPath
+              && not (List.contains v.Name [ "readTextRaw"; "existsRaw"; "listDirRaw"; "canonicalizeRaw"; "preludeSourceRaw" ]) ->
+            // a USER extern is a real "env" import (prelude externs are
+            // builtins with their own arms; the FILE externs ride WASI)
+            let jsKind (t : Type) : string =
+                match prune t with
+                | TCon ("JsObj", []) -> "e"
+                | TCon (("float" | "float32"), []) -> "d"
+                | TCon ("string", []) -> "s"
+                | TCon ("unit", []) -> "u"
+                | _ -> "i"
+            let rec peel (t : Type) : string list * string =
+                match prune t with
+                | TFun (a, b) ->
+                    let ps, r = peel b
+                    jsKind a :: ps, r
+                | r -> [], jsKind r
+            let pks, rk = peel sch.Body
+            let fnm = "$jsx" + string jsxN
+            jsxN <- jsxN + 1
+            dictSet envSigs (key v) (fnm, v.Name, pks, rk)
+        | _ -> ()
+    // GC: reserve a fixed area of root slots for $cbreg (callback closures
+    // live there, below the shadow stack) — handed out at runtime by $cbnext
+    if gc && jsUsed then
+        cbBase <- st.RootNext
+        st.RootNext <- st.RootNext + 1024
     // the host FILE-I/O externs have no WasmLin implementation (DExterns are
     // stripped before the backend, so they arrive as unresolved refs). Answer
     // their calls with a null default so the pipeline RUNS: readTextRaw null ->
@@ -6342,13 +6930,27 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // GC: base of the tid->class-id table (fixed static memory in the shim)
     if gc then globalI32Mut m "$t2c" 0
     if gc then globalI32Mut m "$witnesses" 0
+    // JS callbacks (GC): the next free slot in the cbBase root area
+    if gc && jsUsed then globalI32Mut m "$cbnext" 0
     exportFn m "_start" "$_start"
+    if jsUsed then
+        exportFn m "jscall" "$jscall"
+        exportFn m "lin_salloc" "$lin_salloc"
+    // [<Export>]: a declared top-level function exported under its own name
+    // (markers live in decls0 — the reachability filter keeps only DLets)
+    for d in decls0 do
+        match d with
+        | DExport (v, nm) when nm <> "$jsimport" && (dictTryFind st.Funcs (key v)).IsSome ->
+            exportFn m nm (fn v)
+        | _ -> ()
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitPrintRaw m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
     emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
+    emitMemsize m; emitMemcopy m; emitFtoaS m
+    if jsUsed then (emitCbreg m; emitJscall m; emitLinSalloc m)
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

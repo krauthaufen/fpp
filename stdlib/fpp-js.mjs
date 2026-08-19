@@ -80,6 +80,127 @@ export const jsImports = (getExports) => {
   } };
 };
 
+// The wasm-LINEAR boundary (module "jslin"): every JsObj is a raw i32 HANDLE
+// into a strong table (0 = null; linear memory cannot hold externref), ints
+// and bools cross raw, floats as f64, and a string crosses as its linear
+// POINTER — length at p+4, utf-16 code units at p+8. JS-made strings enter
+// through the module's exported `lin_salloc`. Handles are never reclaimed
+// (no finalizers on linear yet) — fine for pages, a known leak for
+// long-running apps.
+export const jsLinImports = (getExports) => {
+  const mem = () => getExports().memory.buffer;
+  const table = [null];
+  let nextId = 1;
+  const reg = (v) => (v === null ? 0 : ((table[nextId] = v), nextId++));
+  const h = (id) => table[id];
+  const dec = new TextDecoder('utf-16le');
+  const lstr = (p) => {
+    const dv = new DataView(mem());
+    const n = dv.getUint32(p + 4, true);
+    return dec.decode(new Uint8Array(mem(), p + 8, n * 2));
+  };
+  const sout = (s) => {
+    const ex = getExports();
+    const p = ex.lin_salloc(s.length);
+    const u16 = new Uint16Array(ex.memory.buffer, p + 8, s.length);
+    for (let i = 0; i < s.length; i++) u16[i] = s.charCodeAt(i);
+    return p;
+  };
+  return { internals: { mem, h, reg, lstr, sout },
+    jslin: {
+      global: (k) => reg(globalThis[lstr(k)]),
+      get: (o, k) => reg(h(o)[lstr(k)]),
+      set: (o, k, v) => { h(o)[lstr(k)] = h(v); },
+      getNum: (o, k) => Number(h(o)[lstr(k)]),
+      setNum: (o, k, v) => { h(o)[lstr(k)] = v; },
+      item: (o, i) => reg(h(o)[i]),
+      itemSet: (o, i, v) => { h(o)[i] = h(v); },
+      call0: (o, k) => reg(h(o)[lstr(k)]()),
+      call1: (o, k, a) => reg(h(o)[lstr(k)](h(a))),
+      call2: (o, k, a, b) => reg(h(o)[lstr(k)](h(a), h(b))),
+      call3: (o, k, a, b, c) => reg(h(o)[lstr(k)](h(a), h(b), h(c))),
+      call4: (o, k, a, b, c, d) => reg(h(o)[lstr(k)](h(a), h(b), h(c), h(d))),
+      call5: (o, k, a, b, c, d, e) => reg(h(o)[lstr(k)](h(a), h(b), h(c), h(d), h(e))),
+      call6: (o, k, a0, a1, a2, a3, a4, a5) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5))),
+      call7: (o, k, a0, a1, a2, a3, a4, a5, a6) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6))),
+      call8: (o, k, a0, a1, a2, a3, a4, a5, a6, a7) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6), h(a7))),
+      call9: (o, k, a0, a1, a2, a3, a4, a5, a6, a7, a8) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6), h(a7), h(a8))),
+      call10: (o, k, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6), h(a7), h(a8), h(a9))),
+      call11: (o, k, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6), h(a7), h(a8), h(a9), h(a10))),
+      call12: (o, k, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) => reg(h(o)[lstr(k)](h(a0), h(a1), h(a2), h(a3), h(a4), h(a5), h(a6), h(a7), h(a8), h(a9), h(a10), h(a11))),
+      new0: (C) => reg(new (h(C))()),
+      new1: (C, a) => reg(new (h(C))(h(a))),
+      new2: (C, a, b) => reg(new (h(C))(h(a), h(b))),
+      num: (v) => reg(v),
+      toNum: (v) => Number(h(v)),
+      bool: (v) => reg(!!v),
+      toBool: (v) => (h(v) ? 1 : 0),
+      str: (p) => reg(lstr(p)),
+      toStr: (v) => sout(String(h(v))),
+      // an F++ closure as a JS function: the token is a SLOT the wasm side
+      // keeps current across collections; call back through exported jscall
+      mkFn: (slot) => reg((...a) => getExports().jscall(slot, reg(a.length ? a[0] : undefined))),
+      undef: () => reg(undefined),
+      obj: () => reg({}),
+      arr: () => reg([]),
+      push: (a, v) => { h(a).push(h(v)); },
+      // ZERO-COPY views over linear memory at a pinned address; fresh per
+      // call — memory.grow would detach a cached one
+      viewU8:  (p, n) => reg(new Uint8Array(mem(), p, n)),
+      viewU16: (p, n) => reg(new Uint16Array(mem(), p, n)),
+      viewI32: (p, n) => reg(new Int32Array(mem(), p, n)),
+      viewF32: (p, n) => reg(new Float32Array(mem(), p, n)),
+      viewF64: (p, n) => reg(new Float64Array(mem(), p, n)),
+    } };
+};
+
+// [<JsImport>] under linear: the import NAME carries the kind signature
+// ("mix#di:d"), so a Proxy can wrap the user's plain { jsx: { name: fn } }
+// function with the per-kind conversions (e=handle s=string d=f64 b=bool
+// i=int u=unit-dropped).
+const jsxlProxy = (jsx, internals) => new Proxy({}, {
+  get: (_, prop) => {
+    const [name, sig] = String(prop).split('#');
+    const [ps, r] = sig.split(':');
+    const fn = jsx[name];
+    return (...raw) => {
+      const args = [];
+      let i = 0;
+      for (const k of ps) {
+        if (k === 'u') continue;
+        const v = raw[i++];
+        args.push(k === 'e' ? internals.h(v) : k === 's' ? internals.lstr(v) : k === 'b' ? !!v : v);
+      }
+      const res = fn(...args);
+      return r === 'u' ? undefined
+           : r === 'e' ? internals.reg(res)
+           : r === 's' ? internals.sout(String(res))
+           : r === 'b' ? (res ? 1 : 0)
+           : Number(res);
+    };
+  }
+});
+
+/// Instantiate a `fpp build --linear` module with the linear boundary wired:
+/// the "jslin" primitives, "jsxl" typed imports from { jsx: { name: fn } },
+/// VM plugins as { vms: [gpuVm] } (each contributes jsx entries, sharing the
+/// SAME handle table and memory), and wasi print into `sink`.
+export const instantiateLinear = async (url, { jsx = {}, sink = null, vms = [] } = {}) => {
+  let exports;
+  const { jslin, internals } = jsLinImports(() => exports);
+  const jsxAll = { ...jsx };
+  for (const mk of vms) Object.assign(jsxAll, mk(internals));
+  const wasi = wasiImports(() => exports, sink).wasi_snapshot_preview1;
+  // the linear module always declares the file-read WASI imports (the
+  // self-host path); a browser host answers "no such file"
+  const wasiAll = { ...wasi, path_open: () => 44, fd_read: () => 8, fd_filestat_get: () => 8 };
+  const { instance } = await WebAssembly.instantiateStreaming(
+    fetch(url),
+    { jslin, jsxl: jsxlProxy(jsxAll, internals), wasi_snapshot_preview1: wasiAll });
+  exports = instance.exports;
+  return exports;
+};
+
 /// Instantiate an F++ module with the whole boundary wired: the "js"
 /// primitives, the engine string builtins, wasi print into `sink`, any
 /// app-supplied typed imports as { jsx: { name: fn } }, and any generated

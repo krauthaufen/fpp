@@ -4062,7 +4062,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.choose (fun f ->
                 tokensOf f
                 |> List.tryFind (fun t -> t.Kind = Ident)
-                |> Option.map (fun t -> t.Text, fieldKind f))
+                |> Option.map (fun t ->
+                    // `?F : float` holds an OPTION, not a float — the marker
+                    // must survive into the field's recorded type or a scalar
+                    // inner type classifies the slot as raw packed storage
+                    // (the linear backend then stored a None POINTER as f64)
+                    let k = fieldKind f
+                    let k = if tokensOf f |> List.exists (fun tk -> tk.Text = "?") then "Option$<" + k + ">" else k
+                    t.Text, k))
         let allMemberNodes = nodesOf n |> List.filter (fun m -> m.NodeKind = MemberDecl)
         let isVal (m : GreenNode) =
             tokensOf m |> List.exists (fun t -> t.Kind = Keyword && t.Text = "val")
