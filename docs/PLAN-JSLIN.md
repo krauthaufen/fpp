@@ -118,3 +118,30 @@ product config once reactor mode is default — nothing dies, so watch/cleanup
 are no-ops there. It stays for now only as the substrate of existing gates
 and as the emitter-debug mode; the jsinterop legs move to reactor mode with
 M3 and the flag then demotes or goes.
+
+## Residue closed + the BinDriver-deletion inventory (2026-08-19)
+
+Closed: Infer now applies F#'s RECORD-LABEL rule as a last resolution pass —
+a field access on a receiver nothing grounded (`let get sch = sch.Body`,
+generalized before use) fixes the receiver to the unique in-scope record
+declaring the label (trial-guarded so the empty-prelude dogfood never gains
+a false diagnostic). With it, the lost-owner family resolves at inference
+where possible; anything still ambiguous hits the backend's warned
+site-trap. int64/uint64 print/string and handle interning shipped earlier
+in this pass. The RAG debug probe is gone.
+
+wasm-GC is NOT yet unused. Its remaining dependents, i.e. the deletion
+work list:
+* Fpp.Tests: 41 EmitProgramWasm sites across 12 files. Most helpers can
+  switch to reactor-linear emission + wasmtime (stdout parity now holds);
+  BinBattery, SourceMapTests and parts of OracleTests TEST the wasm-GC
+  backend itself and retire with it.
+* fixpoint + fixpoint-self gates (the wasm-GC fixpoints) — retire; the
+  linear fixpoints carry self-hosting.
+* fpp exe and fpp check --strict internals (EmitProgramWasm) — switch to
+  the reactor-linear path.
+* Gate oracles built with --wasmgc: lowir-*, wasmlin, ifdef, cback/run,
+  pkg wasm legs — switch to golden expected-output files or the fsi oracle.
+* jsinterop's six wasm-GC legs and demo/build.sh — drop.
+Then delete BinDriver.fs and EmitBin's GC-only half (the shared wasm
+assembler stays — WasmLin rides it).
