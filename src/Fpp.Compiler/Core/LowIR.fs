@@ -45,7 +45,7 @@ type LOp =
     | EqL  | NeL  | LtSL | GtSL  | LeSL  | GeSL
     | LtUL | GtUL | LeUL | GeUL
     // double ops
-    | AddF | SubF | MulF | DivF | NegF | AbsF
+    | AddF | SubF | MulF | DivF | NegF | AbsF | SqrtF | TruncF
     | EqF  | NeF  | LtF  | GtF   | LeF | GeF
     // conversions between machine types
     | WToL | LToW | WToF | FToW | LToF | FToL
@@ -82,6 +82,11 @@ type LExpr =
     /// a sequence of statements evaluated for effect, then a result value —
     /// LowIR's let-region; binders are just LSet statements before the value
     | LDo of LStmt list * LExpr
+    /// a SELF call in tail position: evaluates the arguments, then transfers
+    /// to the named function via the wasm tail-call instruction. Never
+    /// returns to the caller; under GC the emitter restores the shadow-stack
+    /// pointer to the function's entry value first.
+    | LTailCall of string * LExpr list
 
 and LStmt =
     | LStore of LTy * LExpr * int * LExpr

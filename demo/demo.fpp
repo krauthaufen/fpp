@@ -1,6 +1,8 @@
 module Demo
 
+[<JsImport>]
 extern let jsRect : int -> int -> int -> int
+[<JsImport>]
 extern let jsStatus : string -> int
 
 let width = 129

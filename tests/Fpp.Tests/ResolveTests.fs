@@ -165,7 +165,7 @@ let exportHygieneTests =
             let ws = Fpp.Workspace()
             ws.SetFileText "t.fpp" src
             Expect.isEmpty (ws.Diagnostics "t.fpp") "clean"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "the spine means the constructor, not the module"
         }
     ]

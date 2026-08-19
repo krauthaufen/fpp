@@ -1,15 +1,15 @@
 module Gpu
 
-let vbase = 4096
 let spokes = 24
+let verts : float32[] = Array.zeroCreate (spokes * 3 * 5)
 
 let putv (i : int) (x : float) (y : float) (r : float) (g : float) (b : float) =
-    let a = vbase + i * 20
-    let s0 = memStoreF32 a x
-    let s1 = memStoreF32 (a + 4) y
-    let s2 = memStoreF32 (a + 8) r
-    let s3 = memStoreF32 (a + 12) g
-    let s4 = memStoreF32 (a + 16) b
+    let a = i * 5
+    verts.[a] <- float32 x
+    verts.[a + 1] <- float32 y
+    verts.[a + 2] <- float32 r
+    verts.[a + 3] <- float32 g
+    verts.[a + 4] <- float32 b
     0
 
 let generate () =
@@ -38,3 +38,5 @@ let generate () =
 
 let count = generate ()
 let report = print count
+// the page builds its Float32Array view at this byte offset
+let addr = print (int (Array.pin verts))

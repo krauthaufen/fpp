@@ -111,12 +111,10 @@ FPP
 "$root/.wasmtime/bin/wasmtime" run "$out/lin.wasm" > "$out/lin.txt" 2>/dev/null \
     || "$HOME/.wasmtime/bin/wasmtime" run "$out/lin.wasm" > "$out/lin.txt"
 
-# the wasm-GC oracle for the same program
-"$fpp" build --wasmgc -o "$out/gc.wasm" "$out/p.fpp"
-"$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
-
-if diff -u "$out/gc.txt" "$out/lin.txt"; then
-    echo "WASMLIN OK (direct linear == wasm-GC oracle, no C compiler, $(wc -l < "$out/lin.txt") lines)"
+# golden oracle: generated from the retired wasm-GC backend's final run
+[ -n "${FPP_WRITE_GOLDEN:-}" ] && cp "$out/lin.txt" "$here/wasmlin-gate.expected"
+if diff -u "$here/wasmlin-gate.expected" "$out/lin.txt"; then
+    echo "WASMLIN OK (direct linear == golden oracle, no C compiler, $(wc -l < "$out/lin.txt") lines)"
 else
     echo "WASMLIN MISMATCH"; exit 1
 fi

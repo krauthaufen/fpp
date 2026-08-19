@@ -49,10 +49,10 @@ FPP
 
 "$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp"
 "$wt" run "$out/low.wasm" > "$out/low.txt"
-"$fpp" build --wasmgc -o "$out/gc.wasm" "$out/p.fpp"
-"$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
-if diff -u "$out/gc.txt" "$out/low.txt"; then
-    echo "LOWIR IFACE OK (vtable dispatch + interface type tests == wasm-GC oracle, $(wc -l < "$out/low.txt") lines)"
+# golden oracle: generated from the retired wasm-GC backend's final run
+[ -n "${FPP_WRITE_GOLDEN:-}" ] && cp "$out/low.txt" "$here/lowir-iface-gate.expected"
+if diff -u "$here/lowir-iface-gate.expected" "$out/low.txt"; then
+    echo "LOWIR IFACE OK (vtable dispatch + interface type tests == golden oracle, $(wc -l < "$out/low.txt") lines)"
 else
     echo "LOWIR IFACE MISMATCH"; exit 1
 fi

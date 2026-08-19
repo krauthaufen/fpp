@@ -16,19 +16,10 @@ let private runProgram (lines : string list) : string =
     let src = String.concat "\n" lines + "\n"
     let ws = Fpp.Workspace ()
     ws.SetFileText "p.fpp" src
-    let bytes, errs = ws.EmitProgramWasm ()
+    let bytes, errs = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errs "compile errors"
-    let path = System.IO.Path.GetTempFileName () + ".wasm"
-    System.IO.File.WriteAllBytes (path, bytes)
-    let psi = System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + path)
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    use p = System.Diagnostics.Process.Start psi
-    let out = p.StandardOutput.ReadToEnd ()
-    let err = p.StandardError.ReadToEnd ()
-    p.WaitForExit ()
-    System.IO.File.Delete path
-    Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+    let code, out, err = Fpp.Tests.WasmRun.run bytes
+    Expect.equal code 0 (sprintf "wasmtime failed: %s" err)
     out
 
 let private expects (name : string) (src : string list) (stdout : string) =
@@ -40,7 +31,7 @@ let private rejects (name : string) (src : string list) (phrase : string) =
     test name {
         let ws = Fpp.Workspace ()
         ws.SetFileText "p.fpp" (String.concat "\n" src + "\n")
-        let _, errs = ws.EmitProgramWasm ()
+        let _, errs = ws.EmitProgramWasmPreload ()
         let joined = String.concat " | " errs
         Expect.isTrue (joined.Contains phrase)
             (sprintf "expected a diagnostic containing %A, got: %s" phrase joined)

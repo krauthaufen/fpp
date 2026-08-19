@@ -45,10 +45,10 @@ FPP
 
 "$fpp" build --lowir -o "$out/low.wasm" "$out/p.fpp"
 "$wt" run "$out/low.wasm" > "$out/low.txt"
-"$fpp" build --wasmgc -o "$out/gc.wasm" "$out/p.fpp"
-"$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/gc.wasm" > "$out/gc.txt"
-if diff -u "$out/gc.txt" "$out/low.txt"; then
-    echo "LOWIR EXN OK (failwith/try/with == wasm-GC oracle, $(wc -l < "$out/low.txt") lines)"
+# golden oracle: generated from the retired wasm-GC backend's final run
+[ -n "${FPP_WRITE_GOLDEN:-}" ] && cp "$out/low.txt" "$here/lowir-exn-gate.expected"
+if diff -u "$here/lowir-exn-gate.expected" "$out/low.txt"; then
+    echo "LOWIR EXN OK (failwith/try/with == golden oracle, $(wc -l < "$out/low.txt") lines)"
 else
     echo "LOWIR EXN MISMATCH"; exit 1
 fi

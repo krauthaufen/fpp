@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Parity gate: compile <prog.fpp> through BOTH backends, run both, diff
-# stdout. The wasm-GC backend is the oracle. Exit 0 only on identical output.
+# stdout. The reactor-linear wasm backend is the oracle. Exit 0 only on
+# identical output.
 set -e
 prog="$1"
 [ -f "$prog" ] || { echo "usage: run.sh <prog.fpp>"; exit 2; }
@@ -10,7 +11,7 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"
 
-"$fpp" build --wasmgc -o "$out/p.wasm" "$prog"
+"$fpp" build -o "$out/p.wasm" "$prog"
 "$HOME/.wasmtime/bin/wasmtime" run -W function-references=y,gc=y,exceptions=y "$out/p.wasm" > "$out/wasm.txt"
 
 "$fpp" build -o "$out/p.c" "$prog"

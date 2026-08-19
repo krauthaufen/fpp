@@ -54,14 +54,20 @@ int main(int argc, char **argv) {
   wasmtime_linker_t *linker = wasmtime_linker_new(engine);
   err = wasmtime_linker_define_wasi(linker);
   if (err) die("defining wasi", err, NULL);
-  err = wasmtime_linker_module(linker, ctx, "", 0, module);
-  if (err) die("linking", err, NULL);
-
-  wasmtime_func_t start;
-  err = wasmtime_linker_get_default(linker, ctx, "", 0, &start);
-  if (err) die("finding the entry point", err, NULL);
+  // instantiate directly: the merged module exports the runtime's
+  // _initialize beside the program's _start, and the linker's
+  // command/reactor classifier refuses that mix. The program calls the
+  // runtime's initializer itself, so only _start is invoked here.
   wasm_trap_t *trap = NULL;
-  err = wasmtime_func_call(ctx, &start, NULL, 0, NULL, 0, &trap);
+  wasmtime_instance_t instance;
+  err = wasmtime_linker_instantiate(linker, ctx, module, &instance, &trap);
+  if (err || trap) die("linking", err, trap);
+
+  wasmtime_extern_t start_ext;
+  if (!wasmtime_instance_export_get(ctx, &instance, "_start", 6, &start_ext)
+      || start_ext.kind != WASMTIME_EXTERN_FUNC)
+    die("finding the entry point", NULL, NULL);
+  err = wasmtime_func_call(ctx, &start_ext.of.func, NULL, 0, NULL, 0, &trap);
   if (err || trap) die("running", err, trap);
 
   wasmtime_module_delete(module);

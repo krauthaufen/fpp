@@ -10,19 +10,10 @@ let private wasmtime =
 let private runProgram (src : string) : string =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" src
-    let bytes, errors = ws.EmitProgramWasm ()
+    let bytes, errors = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errors "emission errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-    System.IO.File.WriteAllBytes(tmp, bytes)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    use p = System.Diagnostics.Process.Start psi
-    let out = p.StandardOutput.ReadToEnd()
-    let err = p.StandardError.ReadToEnd()
-    p.WaitForExit()
-    System.IO.File.Delete tmp
-    Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+    let code, out, err = Fpp.Tests.WasmRun.run bytes
+    Expect.equal code 0 (sprintf "wasmtime failed: %s" err)
     out
 
 [<Tests>]
@@ -478,7 +469,7 @@ let acceptanceProgressTests =
                 "let a = print h.Root.V"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "t.fpp") "clean"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "the second tuple slot widened Leaf to Node"
         }
         test "Array.zeroCreate with an explicit struct-tuple type argument" {
@@ -492,7 +483,7 @@ let acceptanceProgressTests =
                 "let c = print ints.[2]"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "t.fpp") "type application parses, struct included"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "emits"
         }
     ]

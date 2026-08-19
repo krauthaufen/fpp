@@ -10,15 +10,7 @@ let private wasmtime =
     + "/.wasmtime/bin/wasmtime"
 
 let private runBytes (bytes : byte[]) =
-    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-    System.IO.File.WriteAllBytes(tmp, bytes)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    use p = System.Diagnostics.Process.Start psi
-    let o = p.StandardOutput.ReadToEnd()
-    p.WaitForExit()
-    System.IO.File.Delete tmp
+    let _, o, _ = Fpp.Tests.WasmRun.run bytes
     o
 
 /// compile a multi-file program with generators registered, then run it
@@ -26,7 +18,7 @@ let private runGenerated (gens : Fpp.Core.Plugins.Generator list) (files : (stri
     let ws = Workspace()
     for g in gens do ws.AddGenerator g
     for path, lines in files do ws.SetFileText path (String.concat "\n" lines + "\n")
-    let bytes, errs = ws.EmitProgramWasm ()
+    let bytes, errs = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errs "the generated program must compile"
     runBytes bytes
 
@@ -35,7 +27,7 @@ let private generatedText (gens : Fpp.Core.Plugins.Generator list) (files : (str
     let ws = Workspace()
     for g in gens do ws.AddGenerator g
     for path, lines in files do ws.SetFileText path (String.concat "\n" lines + "\n")
-    ws.EmitProgramWasm () |> ignore
+    ws.EmitProgramWasmPreload () |> ignore
     ws.ProjectFiles
     |> List.filter (fun p -> p.StartsWith "(generated)/")
     |> List.map ws.FileText
@@ -230,7 +222,7 @@ let generatorTests =
             ws.SetFileText "main.fpp"
                 (String.concat "\n"
                     [ "module Main"; "open Types"; "let go = print ((genPoint ()).Render { X = 1; Y = 2 })"; "" ])
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "compiles"
             let generated = ws.GeneratedFiles |> List.map (fun (_, _, src) -> src) |> String.concat "\n"
             Expect.stringContains generated "genPoint" "the marked type is derived"
@@ -317,7 +309,7 @@ let generatorTests =
                       "type Holder = { Name : string; Fn : Opaque }"
                       "let go = print 1"
                       "" ])
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isNonEmpty errs "the request cannot be honoured, so it is an error"
             let first = List.head errs
             Expect.stringContains first "t.fpp:4:" "positioned at the type that asked"
@@ -357,7 +349,7 @@ let generatorTests =
             ws.AddGenerator sloppy
             ws.SetFileText "types.fpp" "module Types\ntype Anchor = { A : int }\n"
             ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isNonEmpty errs "broken generated code is an error"
             let first = List.head errs
             Expect.stringContains first "generator 'sloppy'" "the generator is named"
@@ -527,7 +519,7 @@ let generatorTests =
             let ws = Workspace()
             ws.AddGenerator breaker
             ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isNonEmpty errs "the rewritten file does not compile"
             Expect.stringContains (List.head errs) "generator 'breaker'" "and the plugin that rewrote it is named"
         }
@@ -555,7 +547,7 @@ let generatorTests =
             ws.AddFppGenerator "describe" [ "plugin.fpp", plugin ]
             ws.SetFileText "types.fpp" "module Types\ntype Point = { X : int; Y : int }\n"
             ws.SetFileText "main.fpp" "module Main\nopen Types\nlet go = print (describePoint { X = 3; Y = 4 })\n"
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "the generated program compiles"
             let generated = ws.GeneratedFiles |> List.map (fun (_, _, src) -> src) |> String.concat ""
             Expect.stringContains generated "let describePoint" "the F++ plugin wrote the function"
@@ -566,7 +558,7 @@ let generatorTests =
             let ws = Workspace()
             ws.AddFppGenerator "broken" [ "plugin.fpp", "let go = print (1 +\n" ]
             ws.SetFileText "main.fpp" "module Main\nlet go = print 1\n"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isNonEmpty errs "the plugin's own errors surface"
             Expect.isTrue
                 (errs |> List.exists (fun (e : string) -> e.Contains "F++ generator 'broken' does not compile"))
@@ -754,13 +746,13 @@ let pluginTests =
                     "" ]
             let plain = Workspace()
             plain.SetFileText "p.fpp" src
-            let baseBytes, e1 = plain.EmitProgramWasm ()
+            let baseBytes, e1 = plain.EmitProgramWasmPreload ()
             Expect.isEmpty e1 "baseline compiles"
 
             let ws = Workspace()
             ws.AddPlugin Fpp.Core.Plugins.constFold
             ws.SetFileText "p.fpp" src
-            let folded, e2 = ws.EmitProgramWasm ()
+            let folded, e2 = ws.EmitProgramWasmPreload ()
             Expect.isEmpty e2 "plugin run is clean"
 
             // same behaviour, fewer runtime operations
@@ -783,7 +775,7 @@ let pluginTests =
             let ws = Workspace()
             ws.AddPlugin Fpp.Core.Plugins.deriveShallowEquals
             ws.SetFileText "p.fpp" src
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "derive plugin output type-checks (core lint)"
             Expect.equal (runBytes bytes) "1\n" "program behaviour untouched"
             // nobody calls it, so the linker removes it: annotation-free
@@ -803,7 +795,7 @@ let pluginTests =
             let ws = Workspace()
             ws.AddPlugin bad
             ws.SetFileText "p.fpp" "module P\nlet a = print 1\n"
-            let _, errs = ws.EmitProgramWasm ()
+            let _, errs = ws.EmitProgramWasmPreload ()
             Expect.isNonEmpty errs "invalid plugin output rejected"
             Expect.stringContains (List.head errs) "bogus" "error names the plugin"
         }
@@ -820,7 +812,7 @@ let pluginTests =
                     "let n = 6 * 7"
                     "let a = print n"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "pipeline clean"
             Expect.equal (runBytes bytes) "42\n" "both plugins ran, semantics intact"
         }
@@ -896,7 +888,7 @@ let instantiationScopeTests =
                 |> List.map fst
             Expect.isFalse (List.contains "s" names) "the local accumulator is unannotated"
             Expect.isTrue (List.contains "fold2" names) "the top-level generic call is annotated"
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "still compiles"
             Expect.isTrue (bytes.Length > 0) "emits"
         }

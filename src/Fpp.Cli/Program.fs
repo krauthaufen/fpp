@@ -30,7 +30,7 @@ let private check (strict : bool) (defines : string list) (files : string list) 
         // the backend cannot compile traps if reached, and a clean check
         // that hands over a trapping binary was this project's most
         // repeated bug shape
-        let _bytes, eerrs = ws.EmitProgramWasm ()
+        let _bytes, eerrs = ws.EmitProgramWasmReactor ()
         for e in eerrs do eprintfn "error: %s" e
         let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
         for st in stubs do eprintfn "error (strict): %s" st
@@ -224,7 +224,7 @@ let private buildExe (out : string) (files : string list) : int =
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
     for l in libs do ws.AddLibrary l (readSource l)
     for f in srcs do ws.SetFileText f (readSource f)
-    let bytes, errors = ws.EmitProgramWasm ()
+    let bytes, errors = ws.EmitProgramWasmReactor ()
     if not (List.isEmpty errors) then
         for e in errors do eprintfn "error: %s" e
         1
@@ -235,7 +235,8 @@ let private buildExe (out : string) (files : string list) : int =
     let cwasmPath = System.IO.Path.Combine (tmp, "module.cwasm")
     let dataPath = System.IO.Path.Combine (tmp, "module_data.c")
     let aotExe = System.IO.Path.Combine (tmp, "fppaot")
-    System.IO.File.WriteAllBytes (wasmPath, bytes)
+    if mergeGcModule bytes wasmPath <> 0 then 1
+    else
     let inc = "-I" + System.IO.Path.Combine (capi, "include")
     let lib = System.IO.Path.Combine (capi, "lib", "libwasmtime.a")
     // 1. a helper that compiles the module with the SAME engine settings the

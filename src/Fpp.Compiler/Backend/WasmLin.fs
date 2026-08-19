@@ -98,6 +98,11 @@ type private St =
       ConstData : Bytes
       /// a NESTED lambda node -> the lifted function name it became
       LamName : RefMap<Expr, string>
+      /// EApp nodes in TAIL position of the function body being emitted —
+      /// a full-arity SELF call there compiles to return_call (the wasm
+      /// tail-call instruction), so `let rec go n acc = ... go (n-1) ...`
+      /// runs at any depth like the GC backend's marked tails
+      TailApp : RefMap<Expr, bool>
       /// every lifted lambda, in emission order: (name, param, body, captures)
       Lams : Vec<string * (VarId * Scheme) * Expr * (string * int * Type) list>
       /// while emitting a lifted lambda body: captured key -> its env slot
@@ -242,6 +247,10 @@ let private CLO_KIND = 2
 // wasm-merge pass. Off = the standalone bump-allocator path (no collection).
 // Set by the CLI (`--gc`) before emission.
 let mutable gc = false
+// preload linking (wasmtime --preload fpprt=reactor.wasm): the mutator
+// re-exports the imported memory as "memory" so WASI finds it on the main
+// module. OFF under wasm-merge — the merged file would carry two exports.
+let mutable gcExportMem = false
 // the user prelude's source text: the compiler reaches it through the
 // `preludeSourceRaw` host extern, which every other module stubs to null. Baking
 // it as a string constant lets a WasmLin-hosted compiler load its prelude (a real
@@ -422,14 +431,69 @@ let rec private printConOf (st : St) (e : Expr) : string =
     | EApp (EUnknown n, _) ->
         // a builtin conversion names its RESULT before the '#'
         let i = n.IndexOf "#"
-        if i > 0 then n.Substring (0, i) else ""
+        if i > 0 then n.Substring (0, i)
+        // a class-dispatch call carries the operand type as its LAST segment
+        // ("$class:Math:truncate:float") — for the 'a -> 'a members that is
+        // also the result type; without it `print (truncate 5.9)` classified
+        // as "" and printed the boxed float as a (blank) string
+        elif n.StartsWith "$class:" then
+            (match n.LastIndexOf ':' with
+             | j when j > 0 && j < strLen n - 1 -> n.Substring (j + 1)
+             | _ -> "")
+        else ""
     | EApp _ ->
         let rec flat e acc = match e with EApp (h, a) -> flat h (a @ acc) | _ -> (e, acc)
         let head, args = flat e []
         (match head with
-         | EVar (_, sch) | EVarI (_, sch, _) ->
+         // a BUILTIN head whose scheme is just the "?" marker: classify the
+         // type-preserving members by their OPERANDS (truncate/sqrt/abs and
+         // the operator zoo return their operand type; compare/sign/hash
+         // return int) — else `print (truncate 5.9)` printed a blank line
+         | (EVar (v, hsch) | EVarI (v, hsch, _)) when
+               v.Path = "(builtin)" && (match hsch.Body with TCon ("?", []) -> true | _ -> false) ->
+             (match v.Name with
+              | "truncate" | "sqrt" | "abs" | "max" | "min"
+              | "exp" | "log" | "log2" | "log10" | "pow" | "pown"
+              | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+              | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh"
+              | "floor" | "ceil" | "ceiling" | "round"
+              | "(%)" | "(+)" | "(-)" | "(*)" | "(/)" | "(~-)" | "(**)" ->
+                  (match args |> List.map (printConOf st) |> List.filter (fun c -> c <> "" && c <> "?") with
+                   | c :: _ -> c
+                   | [] -> "")
+              | "compare" | "sign" | "hash" -> "int"
+              | _ -> "")
+         | (EVar (_, sch) | EVarI (_, sch, _)) as hd ->
              let rec peel t k = if k <= 0 then t else (match prune t with TFun (_, r) -> peel r (k - 1) | _ -> t)
-             (match prune (peel sch.Body (List.length args)) with TCon (n, []) -> n | _ -> "")
+             (match prune (peel sch.Body (List.length args)) with
+              | TCon (n, []) -> n
+              // a generic result ('a -> 'a members like truncate/sqrt):
+              // resolve the var through the call's instantiation names; an
+              // unresolved "?" falls back to the ARGUMENT declared at the
+              // same var — `print (truncate 5.9)` classified as "" otherwise
+              // and printed the boxed float as a (blank) string
+              | TVar rv ->
+                  let viaInst =
+                      (match hd with
+                       | EVarI (_, _, inst) ->
+                           (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
+                            | Some k -> (match List.tryItem k inst with Some nm -> nm | None -> "")
+                            | None -> "")
+                       | _ -> "")
+                  if viaInst <> "" && viaInst <> "?" && not (viaInst.StartsWith "'") then viaInst
+                  else
+                      let rec pars t k acc =
+                          match prune t with
+                          | TFun (a, r) -> pars r (k + 1) ((k, a) :: acc)
+                          | _ -> acc
+                      (match pars sch.Body 0 []
+                             |> List.tryPick (fun (k, pt) ->
+                                 match prune pt with
+                                 | TVar pv when pv.Id = rv.Id -> List.tryItem k args
+                                 | _ -> None) with
+                       | Some argE -> printConOf st argE
+                       | None -> "")
+              | _ -> "")
          | ELam (ps, body) when List.length args >= List.length ps -> printConOf st body
          | _ -> "")
     | EField (_, fname, owner) ->
@@ -441,11 +505,12 @@ let rec private printConOf (st : St) (e : Expr) : string =
         // arithmetic carries its operand type as the op suffix (+f, -l, …)
         let n = strLen op
         let sfx = if n > 1 then op.Substring (n - 1) else ""
-        let b = if sfx = "f" || sfx = "s" || sfx = "l" then op.Substring (0, n - 1) else op
+        let b = if sfx = "f" || sfx = "s" || sfx = "l" || sfx = "w" then op.Substring (0, n - 1) else op
         (match b with
-         | "+" | "-" | "*" | "/" | "%" | "u-" when b <> op ->
-             (if sfx = "l" then "int64" elif sfx = "s" then "float32" else "float")
-         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u-" | "u~~~" -> "int"
+         | "+" | "-" | "*" | "/" | "%" | "u-" | "sqrt" | "truncate" | "abs"
+         | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~" when b <> op ->
+             (if sfx = "l" then "int64" elif sfx = "s" then "float32" elif sfx = "w" then "uint32" else "float")
+         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u-" | "u~~~" | "abs" -> "int"
          | _ -> "")
     | EIf (_, a, b) -> (let x = printConOf st a in if x <> "" then x else printConOf st b)
     | ELet (_, _, _, _, b) -> printConOf st b
@@ -505,7 +570,9 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
     | EPrim (op, _) ->
         let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
         (match b with
-         // int arithmetic / comparisons / bool ops -> a raw scalar result
+         // int arithmetic / comparisons / bool ops -> a raw scalar result;
+         // the `w` (uint32) forms are raw i32 words too
+         | "+w" | "-w" | "*w" | "/w" | "%w" | "<<<w" | ">>>w" -> RKRaw
          | "+" | "-" | "*" | "/" | "%" when op = b -> RKRaw
          | "<" | ">" | "<=" | ">=" | "=" | "<>" -> RKRaw
          | "&&" | "||" | "not" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" when op = b -> RKRaw
@@ -729,6 +796,7 @@ let private rtDeclsLin (m : Mod) : unit =
     // GC mode imports fpprt's memory + API (all imports must precede declared
     // functions in the index space); the standalone path defines+exports its own
     if gc then importFpprt m else exportMem m "memory"
+    if gc && gcExportMem then exportMem m "memory"
     // GC shadow-stack push/pop for in-flight roots (declared before the string
     // helpers so declaration order matches body-emission order)
     if gc then (declFn m "$spush" "$lt_i2v"; declFn m "$spop" "$lt_v2i")
@@ -2657,6 +2725,12 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
     // the function position matters: an eta-expansion lambda lives there and
     // may hold string literals (a missed one is interned late, past $hp, and
     // the first allocation overwrites it)
+    | EApp (EUnknown "printb", xs) ->
+        // printb spells its booleans out at emission time — intern the two
+        // words HERE or (standalone) they land past the baked $hp
+        (if gc then internStrGc st "\"True\"" |> ignore else internStr st "\"True\"" |> ignore)
+        (if gc then internStrGc st "\"False\"" |> ignore else internStr st "\"False\"" |> ignore)
+        for x in xs do scanConsts st x
     | EApp (g, xs) -> scanConsts st g; for x in xs do scanConsts st x
     | EAssign (_, r) | EField (r, _, _) | EArrayLen (_, r) | ECast (_, r, _) | ETypeTest (_, r) -> scanConsts st r
     | EFieldSet (r, _, _, v) -> scanConsts st r; scanConsts st v
@@ -2669,6 +2743,23 @@ let rec private scanConsts (st : St) (e : Expr) : unit =
     | _ -> ()
 
 // a reference-map hash over lambda nodes, keyed by the bound param's offset
+// the function currently being emitted, for SELF-tail-call detection: its
+// wasm name, its result LTy, and (gc) the register holding the ENTRY $sp —
+// return_call skips every pop between here and the epilogue, so the emitter
+// restores $sp wholesale first
+let mutable private tailFnName : string = ""
+let mutable private tailFnRet : LTy = W
+let mutable private tailSpReg : int = -1
+
+let rec private markTails (st : St) (e : Expr) : unit =
+    match e with
+    | EApp (_, _) -> refMapSet st.TailApp e true
+    | ELet (_, _, _, _, b) -> markTails st b
+    | ESeq xs -> (match List.tryLast xs with Some x -> markTails st x | None -> ())
+    | EIf (_, t, el) -> markTails st t; markTails st el
+    | EMatch (_, cs) -> for _, _, b in cs do markTails st b
+    | _ -> ()
+
 let private shallowLamHash (e : Expr) : int =
     match e with
     | ELam ((pv, _) :: _, _) -> 31 * pv.Offset + 7
@@ -3363,6 +3454,26 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     // ShOther, so `count >= arr.Length` mergeShapes to ShOther and routes to
     // $cmpv on two RAW ints, which the linear backend cannot dereference.
     | EArrayLen _ -> ShScalar
+    // arithmetic on raw ints yields a raw int, comparisons yield a raw bool.
+    // Without this `pos + n > cap` (a class-field sum) was ShOther and went
+    // to $cmpv on two RAW ints — cmpv read the even words as heap headers,
+    // answered garbage, Buffer.Reserve never grew, and the next write ran
+    // past the buffer into the neighbouring allocation.
+    | EPrim (op, _) when not (op.Contains "@") ->
+        // ONLY the raw-scalar results: an unsuffixed comparison yields a raw
+        // bool, unsuffixed/w-suffixed arithmetic a raw int. Suffixed float/
+        // int64/string ops stay ShOther — their operands may ride raw f64/i64
+        // rails, which the ShFloat/ShInt64 struct-compare (a boxed-heap load)
+        // must never see; $cmpv handled them before and still does.
+        (match op with
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" -> ShScalar
+         | "&&" | "||" | "not" -> ShScalar
+         | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" -> ShScalar
+         | _ when strLen op >= 2 && charAt op (strLen op - 1) = 'w' &&
+                  (match baseOp op with
+                   | "+" | "-" | "*" | "/" | "%" | "<<<" | ">>>" | "<" | ">" | "<=" | ">=" | "=" | "<>" -> true
+                   | _ -> false) -> ShScalar
+         | _ -> ShOther)
     | _ -> ShOther
 
 // shapeOfExpr, but resolving a class FIELD's / array ELEMENT's declared type
@@ -3942,6 +4053,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // abs -0.0 = 0.0 and abs nan keeps the payload, as .NET does)
     | EPrim ("absf", [ a ]) ->
         lowBoxF ctx (LPrim (AbsF, [ lowUnboxF (coreToLowE ctx a) ]))
+    // sqrt/truncate on a boxed float — the INSTRUCTION (an `if x < 0`
+    // rewrite gets -0.0 and NaN wrong, mirroring the GC backend's arm). The
+    // float32 variants snap the result to f32: exact for all three ops on an
+    // f32 input, so the narrow-then-widen is the rounding step we owe.
+    | EPrim (("sqrtf" | "sqrts" | "truncatef" | "truncates" | "abss") as op, [ a ]) ->
+        let v = lowUnboxF (coreToLowE ctx a)
+        let r =
+            if op.StartsWith "sqrt" then LPrim (SqrtF, [ v ])
+            elif op.StartsWith "abs" then LPrim (AbsF, [ v ])
+            else LPrim (TruncF, [ v ])
+        let r = if op.EndsWith "s" then LPrim (PromF, [ LPrim (DemF, [ r ]) ]) else r
+        lowBoxF ctx r
     // |n| on a boxed int64, same identity at 64 bits
     | EPrim ("absl", [ a ]) ->
         let t = freshTmpT ctx I64
@@ -3986,8 +4109,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // The `w` kind suffix (uint32) picks the UNSIGNED division/remainder/
         // shift/comparison forms — the stripped route ran them signed, so
         // `4294967295u / 2u` and `4000000000u > 2u` were simply wrong.
-        let bop = baseOp op
         let unsignedW = strLen op >= 2 && charAt op (strLen op - 1) = 'w' && not (op.Contains "@")
+        // baseOp strips a `w` only off the arithmetic/comparison bases; the
+        // shift/bitwise ops (`>>>w`, `<<<w`, `&&&w`, …) kept their suffix and
+        // fell through intArithOp's default — `7u >>> 1` compiled as rem
+        let bop =
+            let b0 = baseOp op
+            if b0 = op && unsignedW then substr op 0 (strLen op - 1) else b0
         let ta = coreToLowE ctx a
         let tb = coreToLowE ctx b
         match bop with
@@ -4354,7 +4482,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let w =
             match storLTy (storKindRes ctx.LSt nm) with
             | Some (_, ww) -> ww
-            | None -> (match dictTryFind ctx.LSt.RecPod nm with Some (_, size, _) -> size | None -> 4)
+            // a packed POD element's stride is its FIELD bytes — RecPod's
+            // size includes the record header that packed elements drop
+            | None -> (match dictTryFind ctx.LSt.RecPod nm with Some (_, size, _) -> size - HDR | None -> 4)
         LPrim (MulW, [ LLoad (W, coreToLowE ctx arr, HDR); LConstW w ])
     | EArrayCreate (k, n, init) when (storLTy (storKindRes ctx.LSt k)).IsSome ->
         let k = storKindRes ctx.LSt k
@@ -4484,14 +4614,36 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             match printConOf ctx.LSt a with
             | "" -> (if refKindOfExpr a = RKRaw then "int" else "")
             | c -> c
+        if System.Environment.GetEnvironmentVariable "FPP_PRINT_DUMP" = "1" then
+            eprintfn "PRINTARG con=%s a=%s raw=%A" con (Fpp.Core.Ir.printExpr a) a
         let v =
             match con with
             | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
             | "float" | "float32" | "double" | "single" -> LCall ("$ftoa_s", [ coreToLowE ctx a ])
             | "int64" -> LCall ("$ltoa_s", [ coreToLowE ctx a ])
             | "uint64" -> LCall ("$ultoa_s", [ coreToLowE ctx a ])
+            // a raw uint32 zero-extends into the unsigned 64-bit formatter
+            | "uint32" ->
+                LCall ("$ultoa_s", [ lowBoxI ctx (LPrim (AndL, [ LPrim (WToL, [ coreToLowE ctx a ]); LConstL 4294967295L ])) ])
             | _ -> coreToLowE ctx a
         LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
+    // an unsigned 32-bit value prints unsigned: zero-extend the raw word
+    // into the unsigned 64-bit formatter (mirrors the GC backend's printu)
+    | EApp (EUnknown "printu", [ a ]) ->
+        let v = LCall ("$ultoa_s", [ lowBoxI ctx (LPrim (AndL, [ LPrim (WToL, [ coreToLowE ctx a ]); LConstL 4294967295L ])) ])
+        LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
+    // Boolean.ToString spells it with a capital
+    | EApp (EUnknown "printb", [ a ]) ->
+        let t = freshTmp ctx
+        LDo ([ LIf (LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ]),
+                    [ LSet (wReg t, lowStrConst ctx.LSt "\"False\"") ],
+                    [ LSet (wReg t, lowStrConst ctx.LSt "\"True\"") ])
+               LCallVoidS ("$prints", [ LGet (wReg t) ])
+               LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
+    // a char prints as the character, not its code
+    | EApp (EUnknown "printc", [ a ]) ->
+        LDo ([ LCallVoidS ("$prints", [ LCall ("$str_of_char", [ coreToLowE ctx a ]) ])
+               LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
     | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
@@ -4775,6 +4927,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                         | Some reg -> LGet (wReg reg)
                         | None -> witnessPtrRM st 4 4 1)
             | None -> []
+        // a SELF call in tail position transfers via return_call: same
+        // function, so the signature matches by construction. The result
+        // needs no re-boxing — it IS this function's result.
+        let isSelfTail =
+            fn v = tailFnName && tailFnName <> ""
+            && (match refMapTryFind st.TailApp e with Some true -> true | _ -> false)
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
              let argVals = List.map2 (fun ty a ->
@@ -4785,6 +4943,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let setup, argGets = lowRootedArgsK ctx argVals
              let loweredArgs = witnessArgs @ argGets
              let callE =
+                 if isSelfTail then LTailCall (fn v, loweredArgs)
+                 else
                  match retTy with
                  | W -> LCall (fn v, loweredArgs)
                  // hold the scalar result in a typed local before boxing: the call
@@ -4799,7 +4959,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                      let kind = refKindOfExprC st a
                      let wit = if kind = RKGen then slotWitness ctx a else None
                      kind, wit, W, coreToLowE ctx a))
-             let callE = LCall (fn v, witnessArgs @ argGets)
+             let callE =
+                 if isSelfTail then LTailCall (fn v, witnessArgs @ argGets)
+                 else LCall (fn v, witnessArgs @ argGets)
              (if List.isEmpty setup then callE else LDo (setup, callE)))
     | ELam (_, _) ->
         (match refMapTryFind st.LamName e with
@@ -5951,6 +6113,8 @@ let private lowOpIns (op : LOp) : string =
     | DivF -> "f64.div"
     | NegF -> "f64.neg"
     | AbsF -> "f64.abs"
+    | SqrtF -> "f64.sqrt"
+    | TruncF -> "f64.trunc"
     | EqF -> "f64.eq"
     | NeF -> "f64.ne"
     | LtF -> "f64.lt"
@@ -6017,6 +6181,13 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     | LCall (sym, args) ->
         for a in args do emitLowE f a
         callf f sym
+    | LTailCall (sym, args) ->
+        // args ride the wasm VALUE stack; restoring $sp after evaluating
+        // them is safe (the shadow stack is memory, not the value stack) and
+        // discharges every push return_call would otherwise skip
+        for a in args do emitLowE f a
+        (if gc && tailSpReg >= 0 then (lg f (regNm (wReg tailSpReg)); gs f "$sp"))
+        retCall f sym
     | LCallIndirect (_, fp, args) ->
         // (env, arg) -> result through table 0: the closure IS the env, and
         // the code index is the word at closure + HDR + 4 (after the class-id
@@ -6214,8 +6385,19 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let sink = vecNew ()
     st.GapSink <- Some sink
     preRecGroups ctx body
+    // SELF-tail-calls: mark the body's tail applications; a full-arity call
+    // to THIS function there lowers to LTailCall (wasm return_call). The
+    // entry $sp is saved (gc) so the transfer can discharge every
+    // outstanding shadow-stack push in one restore.
+    tailFnName <- (if isInit then "" else dbgName)
+    tailSpReg <- -1
+    if not isInit then
+        markTails st body
+        if gc then tailSpReg <- freshTmp ctx
     let bodyLow1 = coreToLowE ctx body
-    let preamble = selfPreamble @ constPreamble
+    let preamble =
+        (if tailSpReg >= 0 then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else [])
+        @ selfPreamble @ constPreamble
     let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
     let bodyLow2 =
         if List.isEmpty rootParams then bodyLow0
@@ -6254,7 +6436,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         | LConstW _ | LConstL _ | LConstF _ | LGetGlobal _ -> ()
         | LGet r -> seeR r
         | LLoad (_, a, _) -> seeE a
-        | LPrim (_, xs) | LCall (_, xs) -> for x in xs do seeE x
+        | LPrim (_, xs) | LCall (_, xs) | LTailCall (_, xs) -> for x in xs do seeE x
         | LAlloc a -> seeE a
         | LCallIndirect (_, a, xs) | LCallIdx (_, a, xs) -> seeE a; (for x in xs do seeE x)
         | LDo (ss, e2) -> (for st2 in ss do seeS st2); seeE e2
@@ -6280,6 +6462,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         | LLoad (_, a, o) -> "ld[" + dumpE a + "+" + string o + "]"
         | LPrim (_, xs) -> "p(" + String.concat " " (List.map dumpE xs) + ")"
         | LCall (n, xs) -> "c:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
+        | LTailCall (n, xs) -> "tc:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
         | LAlloc a -> "al(" + dumpE a + ")"
         | LCallIndirect (_, a, xs) -> "ci(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
         | LCallIdx (i, a, xs) -> "cx" + string i + "(" + dumpE a + ";" + String.concat " " (List.map dumpE xs) + ")"
@@ -6695,7 +6878,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
           Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
-          LamName = refMapNew shallowLamHash; Lams = vecNew ()
+          LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
           RecFields = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
@@ -6736,6 +6919,28 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // a stamped subclass resolves its fields through the base it was stamped
     // from (DClass carries `Some base`); record subclass -> base for EField.
     for d in decls0 do match d with DClass (n, Some b, _, _) when b <> n -> dictSet st.RecBase n b | _ -> ()
+    // a class that INHERITS lays its base's fields out as a PREFIX: the base's
+    // members read their slots at the same offsets through an upcast receiver.
+    // Only classes with OWN fields expand — a stamped clone (own list empty)
+    // keeps resolving through its base and must not claim the field names
+    // (Cat(name, lives) previously registered ["lives"] alone, so the object
+    // dropped `name` and Animal.Name read `lives` as a string).
+    let origFields = dictNew<string, string list> ()
+    for kv in dictPairs st.RecFields do dictSet origFields (fst kv) (snd kv)
+    let rec chainFields (seen : string list) (n : string) : string list =
+        let own = match dictTryFind origFields n with Some o -> o | None -> []
+        match dictTryFind st.RecBase n with
+        | Some b when b <> n && not (List.contains b seen) -> chainFields (n :: seen) b @ own
+        | _ -> own
+    for d in decls0 do
+        match d with
+        | DClass (n, Some b, _, _) when b <> n ->
+            (match dictTryFind origFields n with
+             | Some own when not (List.isEmpty own) ->
+                 let full = chainFields [] n
+                 if List.length full > List.length own then dictSet st.RecFields n full
+             | _ -> ())
+        | _ -> ()
     for kv in dictPairs st.RecFields do
         match snd kv with
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
@@ -7183,6 +7388,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // threaded through the free slots themselves — odd, so the root scanner
     // skips them)
     if gc then (globalI32Mut m "$cbnext" 0; globalI32Mut m "$cbfree" 0)
+    // GC: scratch for stashing an init's result while addressing its root
+    // slot. This must NOT be $hp — $lalloc still bump-allocates Memory.alloc
+    // and lin_salloc from $hp under GC, and stashing a pointer here pointed
+    // the bump heap INTO the live fpprt heap (Buffer data then overwrote
+    // neighbouring objects: cap cells read 0 and Reserve span forever,
+    // union headers read garbage and exhaustive matches fell through).
+    if gc then globalI32Mut m "$gstash" 0
     exportFn m "_start" "$_start"
     if jsUsed then
         exportFn m "jscall" "$jscall"
@@ -7239,10 +7451,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
             emitFuncLow st m (gl v) true None [] [] [] [] [] rhs (fun f ->
-                // GC: the init's result is on the stack — stash it via the spare
-                // $hp global, then store into the global's root slot
+                // GC: the init's result is on the stack — stash it via the
+                // dedicated $gstash global, then store into the root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
-                | Some slot -> gs f "$hp"; gg f "$roots"; ic f (4 * slot); ins f "i32.add"; gg f "$hp"; mem f "i32.store"
+                | Some slot -> gs f "$gstash"; gg f "$roots"; ic f (4 * slot); ins f "i32.add"; gg f "$gstash"; mem f "i32.store"
                 | None -> gs f (gl v))
         | _ -> ()
     // _start: in GC mode bring fpprt up first (reactor ctors, then the heap),

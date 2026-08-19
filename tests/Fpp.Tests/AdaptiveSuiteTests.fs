@@ -55,14 +55,14 @@ let adaptiveSuiteTests =
                     + System.IO.File.ReadAllText (root + "/tests/adaptive-suite/Tests.fpp")
                 let ws = Workspace()
                 ws.SetFileText "adaptive-suite.fpp" suiteSrc
-                let bytes, errs = ws.EmitProgramWasm ()
+                let bytes, errs = ws.EmitProgramWasmPreload ()
                 Expect.isEmpty errs "the suite compiles with zero errors"
                 let wasmPath = tmp + "/suite.wasm"
                 System.IO.File.WriteAllBytes(wasmPath, bytes)
                 let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
                 let out, err, rc =
                     run (home + "/.wasmtime/bin/wasmtime")
-                        ("run -W function-references=y,gc=y,exceptions=y " + wasmPath)
+                        ("run -W function-references=y,gc=y,exceptions=y --env FPPRT_HEAP_MB=256 --preload fpprt=" + Fpp.Tests.WasmRun.reactor + " " + wasmPath)
                 Expect.equal rc 0 ("the suite runs to exit 0: " + err)
                 let last =
                     out.Split '\n'

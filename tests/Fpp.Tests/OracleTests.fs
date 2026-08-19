@@ -24,11 +24,11 @@ let private run (exe : string) (args : string) : string * int =
 let private fppRun (src : string) : string =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" src
-    let bytes, errors = ws.EmitProgramWasm ()
+    let bytes, errors = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errors "emission errors"
     let tmp = System.IO.Path.GetTempFileName() + ".wasm"
     System.IO.File.WriteAllBytes(tmp, bytes)
-    let out, code = run wasmtime ("run -W gc=y,exceptions=y " + tmp)
+    let out, code = run wasmtime ("run -W gc=y,exceptions=y --preload fpprt=" + Fpp.Tests.WasmRun.reactor + " " + tmp)
     System.IO.File.Delete tmp
     Expect.equal code 0 "wasmtime failed"
     out

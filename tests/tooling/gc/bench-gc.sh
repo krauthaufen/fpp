@@ -52,11 +52,10 @@ int main(){long total=0;for(int r=0;r<30;r++){N*acc=0;for(int i=0;i<200000;i++){
 C
 
 emcc -O2 "$out/int.c" -o "$out/ic.wasm" -s STANDALONE_WASM -s PURE_WASI=1 2>/dev/null
-"$fpp" build --wasmgc -o "$out/io.wasm" "$out/int.fpp" 2>/dev/null
 "$fpp" build --lowir -o "$out/il.wasm" "$out/int.fpp" 2>/dev/null
 gcbuild "$out/int.fpp" "$out/ig.wasm"
 echo "=== integer loop (100M data-dependent adds, no allocation) ==="
-bench "$out/ic.wasm" "C (emcc -O2)"; bench "$out/io.wasm" "F++ wasm-GC"
+bench "$out/ic.wasm" "C (emcc -O2)"
 bench "$out/il.wasm" "F++ lowir noGC"; bench "$out/ig.wasm" "F++ --gc/fpprt"
 
 emcc -O2 "$out/alloc.c" -o "$out/ac.wasm" -s STANDALONE_WASM -s PURE_WASI=1 2>/dev/null

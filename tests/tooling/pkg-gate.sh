@@ -13,8 +13,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 reg="$work/registry"
 mkdir -p "$reg"
+realhome=$(getent passwd "$(id -un)" | cut -d: -f6)
 export HOME="$work/home"   # an isolated ~/.fpp cache; the real one stays clean
 mkdir -p "$HOME"
+# the linker tools live in the REAL home, which the cache redirect hides
+export FPP_WASM_MERGE="${FPP_WASM_MERGE:-$realhome/emsdk/upstream/bin/wasm-merge}"
 
 # ---- mathlib 1.2.0 --------------------------------------------------------
 mkdir -p "$work/mathlib"
@@ -65,7 +68,7 @@ EOF
 sed -i "s|REGDIR|$reg|" "$work/app/app.fppproj"
 
 # no lock yet: the build must REFUSE with a pointer at restore
-if "$fpp" build --wasmgc "$work/app/app.fppproj" -o "$work/app.wasm" 2> "$work/refuse.txt"; then
+if "$fpp" build "$work/app/app.fppproj" -o "$work/app.wasm" 2> "$work/refuse.txt"; then
     echo "PKG FAILED: built without a lock"
     exit 1
 fi
@@ -76,7 +79,7 @@ grep -q "package mathlib 1.2.0" "$work/app/fpp.lock" || { echo "PKG FAILED: lock
 
 # wasm leg (HOME is redirected at the cache; wasmtime lives in the REAL one)
 wasmtime=$(getent passwd "$(id -un)" | cut -d: -f6)/.wasmtime/bin/wasmtime
-"$fpp" build --strict --wasmgc "$work/app/app.fppproj" -o "$work/app.wasm"
+"$fpp" build --strict "$work/app/app.fppproj" -o "$work/app.wasm"
 got=$("$wasmtime" run -W function-references=y,gc=y,exceptions=y "$work/app.wasm")
 [ "$got" = "14
 42" ] || { echo "PKG FAILED (wasm): got '$got'"; exit 1; }

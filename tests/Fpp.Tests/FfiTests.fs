@@ -17,7 +17,7 @@ let ffiTests =
                     "let b = print (addmul 3 4)"
                     "let c = print (mul3 (addmul 1 1) + 1)"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "emits"
             Expect.isTrue ((System.Text.Encoding.Latin1.GetString bytes).Contains "mul3") "import emitted"
             let dir = System.IO.Path.GetTempPath()
@@ -27,7 +27,7 @@ let ffiTests =
                 "(module\n  (func (export \"mul3\") (param i32) (result i32) (i32.mul (local.get 0) (i32.const 3)))\n  (func (export \"addmul\") (param i32) (param i32) (result i32) (i32.mul (i32.add (local.get 0) (local.get 1)) (i32.const 10))))")
             System.IO.File.WriteAllBytes(prog, bytes)
             let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W gc=y,exceptions=y --preload env=" + env + " " + prog)
+            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W gc=y,exceptions=y --preload fpprt=" + Fpp.Tests.WasmRun.reactor + " --preload env=" + env + " " + prog)
             psi.RedirectStandardOutput <- true
             use p = System.Diagnostics.Process.Start psi
             let out = p.StandardOutput.ReadToEnd()
@@ -52,7 +52,7 @@ let ffiTests =
                     "let back = Array.unpin pts"
                     "let after = print (pts.[0].X + pts.[0].Y)"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "compiles"
             let dir = System.IO.Path.GetTempPath()
             let envPath = dir + "fppcsum.wat"
@@ -60,7 +60,7 @@ let ffiTests =
             System.IO.File.WriteAllText(envPath,
                 String.concat "\n" [
                     "(module"
-                    "  (import \"mainmem\" \"memory\" (memory 17))"
+                    "  (import \"fpprt\" \"memory\" (memory 17))"
                     "  (func (export \"sumXY\") (param $p i32) (param $n i32) (result i32)"
                     "    (local $i i32) (local $a f64)"
                     "    (block $d (loop $go"
@@ -76,7 +76,7 @@ let ffiTests =
             let psi =
                 System.Diagnostics.ProcessStartInfo(
                     home + "/.wasmtime/bin/wasmtime",
-                    "run -W exceptions=y -W gc=y --preload env=" + envPath + " " + progPath)
+                    "run -W exceptions=y -W gc=y --preload fpprt=" + Fpp.Tests.WasmRun.reactorMmc + " --preload env=" + envPath + " " + progPath)
             psi.RedirectStandardOutput <- true
             psi.RedirectStandardError <- true
             use p = System.Diagnostics.Process.Start psi
@@ -110,7 +110,7 @@ let ffiTests =
                     "let s = print (sum3 ptr 3)"
                     "let live = print (pts.[2].C)"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "compiles"
             let dir = System.IO.Path.GetTempPath()
             let envPath = dir + "fppcsum3.wat"
@@ -119,7 +119,7 @@ let ffiTests =
             System.IO.File.WriteAllText(envPath,
                 String.concat "\n" [
                     "(module"
-                    "  (import \"mainmem\" \"memory\" (memory 17))"
+                    "  (import \"fpprt\" \"memory\" (memory 17))"
                     "  (func (export \"sum3\") (param $p i32) (param $n i32) (result i32)"
                     "    (local $i i32) (local $a f32)"
                     "    (block $d (loop $go"
@@ -136,7 +136,7 @@ let ffiTests =
             let psi =
                 System.Diagnostics.ProcessStartInfo(
                     home + "/.wasmtime/bin/wasmtime",
-                    "run -W exceptions=y -W gc=y --preload env=" + envPath + " " + progPath)
+                    "run -W exceptions=y -W gc=y --preload fpprt=" + Fpp.Tests.WasmRun.reactorMmc + " --preload env=" + envPath + " " + progPath)
             psi.RedirectStandardOutput <- true
             psi.RedirectStandardError <- true
             use p = System.Diagnostics.Process.Start psi
@@ -184,6 +184,9 @@ let hostImportTests =
                 "let r5 = print (string (Array.length (hostListDir \"/empty\")))"
                 "let r6 = print (hostCanonicalize \"/a/./b\")"
                 "" ])
+            // the env-import host contract is the wasm-GC HOSTING seam; the
+            // linear self-host reads files through WASI instead, so this
+            // stays pinned to the legacy emitter and retires with it
             let bytes, errs = ws.EmitProgramWasm ()
             Expect.isEmpty errs "the host surface emits"
             // every import is declared against module "env"

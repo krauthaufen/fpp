@@ -15,7 +15,7 @@ let private wasmtime =
 let private compile (lines : string list) : byte[] * string list =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" (String.concat "\n" ("module M" :: lines) + "\n")
-    ws.EmitProgramWasm ()
+    ws.EmitProgramWasmPreload ()
 
 let private diagnostics (lines : string list) : string list =
     let ws = Workspace()
@@ -25,17 +25,8 @@ let private diagnostics (lines : string list) : string list =
 let private run (lines : string list) : string =
     let bytes, errors = compile lines
     Expect.isEmpty errors "emission errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-    System.IO.File.WriteAllBytes(tmp, bytes)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    use p = System.Diagnostics.Process.Start psi
-    let out = p.StandardOutput.ReadToEnd()
-    p.StandardError.ReadToEnd() |> ignore
-    p.WaitForExit()
-    System.IO.File.Delete tmp
-    Expect.equal p.ExitCode 0 "wasmtime failed"
+    let code, out, err = Fpp.Tests.WasmRun.run bytes
+    Expect.equal code 0 (sprintf "wasmtime failed: %s" err)
     out
 
 let private typeOf (lines : string list) (name : string) : string option =
@@ -1901,16 +1892,9 @@ let resolutionRuleTests =
                 "let useB (m : Mine) = A.useA m"
                 "print (string (useB { X = 1 }))"
                 "" ])
-            let bytes, errors = ws.EmitProgramWasm ()
+            let bytes, errors = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errors "emission errors"
-            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-            System.IO.File.WriteAllBytes(tmp, bytes)
-            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-            psi.RedirectStandardOutput <- true
-            use p = System.Diagnostics.Process.Start psi
-            let out = p.StandardOutput.ReadToEnd()
-            p.WaitForExit()
-            System.IO.File.Delete tmp
+            let _, out, _ = Fpp.Tests.WasmRun.run bytes
             Expect.equal out "999\n" "the specific instance is ranked at the stamp"
         }
         test "a repeated variable in a head only matches equal arguments" {
@@ -1954,16 +1938,9 @@ let resolutionRuleTests =
                 "let b = Box { X = 1 }"
                 "print (string (b.Same { X = 2 }))"
                 "" ])
-            let bytes, errors = ws.EmitProgramWasm ()
+            let bytes, errors = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errors "emission errors"
-            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-            System.IO.File.WriteAllBytes(tmp, bytes)
-            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-            psi.RedirectStandardOutput <- true
-            use p = System.Diagnostics.Process.Start psi
-            let out = p.StandardOutput.ReadToEnd()
-            p.WaitForExit()
-            System.IO.File.Delete tmp
+            let _, out, _ = Fpp.Tests.WasmRun.run bytes
             Expect.equal out "999\n" "the copy at Mine runs Mine's instance"
         }
         test "a context-bound variable is fresh at every use" {

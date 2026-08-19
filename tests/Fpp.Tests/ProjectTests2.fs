@@ -72,7 +72,7 @@ let projectFileTests =
             let dir = scratch "xfile" (("demo.fppproj", manifest) :: sources)
             let ws = Workspace()
             ws.LoadProject (System.IO.Path.Combine (dir, "demo.fppproj")) |> ignore
-            let _, errors = ws.EmitProgramWasm ()
+            let _, errors = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errors "cross-file generic arithmetic emits"
             System.IO.Directory.Delete (dir, true)
         }

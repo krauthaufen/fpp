@@ -24,14 +24,28 @@ try {
       text += dec.decode(new Uint8Array(inst.exports.memory.buffer, p, l)); w += l;
     }
     dv.setUint32(nw, w, true); return 0;
+  },
+  // the linear module always declares the self-host wasi set; a browser
+  // host answers "no such file" / no-ops
+  path_open: () => 44, fd_read: () => 8, fd_filestat_get: () => 8,
+  fd_close: () => 0, fd_seek: () => 0, proc_exit: () => {},
+  environ_get: () => 0,
+  environ_sizes_get: (a, b) => {
+    const dv = new DataView(inst.exports.memory.buffer);
+    dv.setUint32(a, 0, true); dv.setUint32(b, 0, true); return 0;
+  },
+  clock_time_get: (id, prec, p) => {
+    const dv = new DataView(inst.exports.memory.buffer);
+    dv.setBigUint64(p, BigInt(Math.round(performance.now() * 1e6)), true); return 0;
   }};
   const r = await fetch("gpu.wasm");
   ({ instance: inst } = await WebAssembly.instantiate(await r.arrayBuffer(), { wasi_snapshot_preview1, env: {} }));
   inst.exports._start();
-  const nVerts = parseInt(text.trim());
+  const [nVerts, vaddr] = text.trim().split("\n").map(x => parseInt(x));
 
-  // 2. zero-copy view over the F++ module's linear memory
-  const verts = new Float32Array(inst.exports.memory.buffer, 4096, nVerts * 5);
+  // 2. zero-copy view over the F++ module's linear memory, at the address
+  // the module pinned its float32[] to
+  const verts = new Float32Array(inst.exports.memory.buffer, vaddr, nVerts * 5);
 
   // 3. straight into WebGPU
   const adapter = await navigator.gpu.requestAdapter();

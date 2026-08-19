@@ -45,19 +45,10 @@ let private wholeFrontier =
 let private runWasm (files : string list) : string =
     let ws = Workspace()
     for f in files do ws.SetFileText f (System.IO.File.ReadAllText f)
-    let bytes, errors = ws.EmitProgramWasm ()
+    let bytes, errors = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errors "the prefix must emit without errors"
-    let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-    System.IO.File.WriteAllBytes(tmp, bytes)
-    let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-    psi.RedirectStandardOutput <- true
-    psi.RedirectStandardError <- true
-    use p = System.Diagnostics.Process.Start psi
-    let out = p.StandardOutput.ReadToEnd()
-    let err = p.StandardError.ReadToEnd()
-    p.WaitForExit()
-    System.IO.File.Delete tmp
-    Expect.equal p.ExitCode 0 (sprintf "wasmtime failed: %s" err)
+    let code, out, err = Fpp.Tests.WasmRun.run bytes
+    Expect.equal code 0 (sprintf "wasmtime failed: %s" err)
     out
 
 // ---- the oracle for the lexer driver ---------------------------------

@@ -236,6 +236,10 @@ module private BuiltinCache =
             cells <- (key, c) :: cells
             c
 
+// serializes wasm-linear emissions: WasmLin's state is module-global
+module private WasmLinGate =
+    let gate = obj ()
+
 type Workspace() =
     let db = Db()
     // the ORACLE's view by default — the LSP and the tests see #if WASM
@@ -1001,12 +1005,28 @@ type Workspace() =
     /// Whippet heap). One method so the linear-fixpoint DRIVER and harness
     /// cannot disagree about the flag.
     member this.EmitProgramWasmReactor () : byte[] * string list =
-        Fpp.Backend.WasmLin.gc <- true
-        this.EmitProgramWasmLinearWith true
+        lock WasmLinGate.gate (fun () ->
+            Fpp.Backend.WasmLin.gc <- true
+            Fpp.Backend.WasmLin.gcExportMem <- false
+            this.EmitProgramWasmLinearWith true)
+
+    /// reactor mode for PRELOAD linking (wasmtime --preload fpprt=reactor):
+    /// same module, but the imported memory is re-exported as "memory" so
+    /// WASI binds — no wasm-merge in the path. The test harness's emitter.
+    member this.EmitProgramWasmPreload () : byte[] * string list =
+        lock WasmLinGate.gate (fun () ->
+            Fpp.Backend.WasmLin.gc <- true
+            Fpp.Backend.WasmLin.gcExportMem <- true
+            this.EmitProgramWasmLinearWith true)
 
     /// `low = true` routes function bodies through the shared LowIR
     /// (Core/LowIR.fs) where the subset covers them, else the hand-lowering.
     member this.EmitProgramWasmLinearWith (low : bool) : byte[] * string list =
+      // WasmLin keeps its emission state in module-level mutables (the gc
+      // flags, the jslin/jsxl/env registries), so two concurrent emissions
+      // interleave into garbage. Monitor is re-entrant, so the flag-setting
+      // wrappers above can hold the same gate.
+      lock WasmLinGate.gate (fun () ->
         // the linear backend lowers UNOPTIMIZED core: the wasm-GC optimizer's
         // inlining shares and beta-reduces lambda nodes, which the reference-
         // keyed lambda lift is not built for. Slice work first, speed later.
@@ -1015,9 +1035,15 @@ type Workspace() =
         // never touch it, so the constant is not emitted for them.
         Fpp.Backend.WasmLin.preludeSrc <- Fpp.Prelude.preludeSource ()
         let linked, errs = this.LinkedCoreFor false true
+        if System.Environment.GetEnvironmentVariable "FPP_CORE_DUMP" = "1" then
+            for d in linked do
+                match d with
+                | Fpp.Core.Ir.DLet (_, v, _, e) when v.Path <> "(builtin)" ->
+                    eprintfn "COREDECL %s:%d %s = %s" v.Path v.Offset v.Name (Fpp.Core.Ir.printExpr e)
+                | _ -> ()
         if not (List.isEmpty errs) then [||], errs
         elif low then Fpp.Backend.WasmLin.emitLinearLow linked
-        else Fpp.Backend.WasmLin.emitLinear linked
+        else Fpp.Backend.WasmLin.emitLinear linked)
 
     member this.EmitProgramC () : string * string list =
         let linked, errs = this.LinkedCore true

@@ -8,42 +8,21 @@
   #status { color:#d29922; margin-top:.6rem; }
   #log { color:#8b949e; }
 </style>
-<h1>F++ &rarr; wasm-GC: Rule 90, drawn through JS externs</h1>
+<h1>F++ &rarr; wasm: Rule 90, drawn through JS externs</h1>
 <canvas id="cv" width="516" height="256"></canvas>
 <div id="log"></div>
 <div id="status"></div>
 <script type="module">
+import { instantiateLinear } from "../stdlib/fpp-js.mjs";
 const ctx = document.getElementById("cv").getContext("2d");
 ctx.fillStyle = "#58a6ff";
-let text = "", inst;
-const decoder = new TextDecoder();
-
-const wasi_snapshot_preview1 = {
-  fd_write(fd, iovs, iovcnt, nwritten) {
-    const dv = new DataView(inst.exports.memory.buffer);
-    let w = 0;
-    for (let i = 0; i < iovcnt; i++) {
-      const p = dv.getUint32(iovs + i*8, true), l = dv.getUint32(iovs + i*8+4, true);
-      text += decoder.decode(new Uint8Array(inst.exports.memory.buffer, p, l)); w += l;
-    }
-    dv.setUint32(nwritten, w, true); return 0;
-  }
-};
-
-// read an F++ string handle through the module's exported accessors
-const readStr = h => {
-  const n = inst.exports.str_len(h), bytes = new Uint8Array(n);
-  for (let i = 0; i < n; i++) bytes[i] = inst.exports.str_get(h, i);
-  return decoder.decode(bytes);
-};
-
-const env = {
-  jsRect: (x, y, on) => { ctx.fillRect(x*4, y*4, 4, 4); return 0; },
-  jsStatus: h => { document.getElementById("status").textContent = readStr(h); return 0; }
-};
-
-const r = await fetch("demo.wasm");
-({ instance: inst } = await WebAssembly.instantiate(await r.arrayBuffer(), { wasi_snapshot_preview1, env }));
-inst.exports._start();
-document.getElementById("log").textContent = text;
+let text = "";
+const mod = await instantiateLinear("demo.wasm", {
+  sink: s => { text += s; document.getElementById("log").textContent = text; },
+  jsx: {
+    jsRect: (x, y, on) => { ctx.fillRect(x*4, y*4, 4, 4); return 0; },
+    jsStatus: s => { document.getElementById("status").textContent = s; return 0; },
+  },
+});
+mod._start();
 </script>

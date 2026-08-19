@@ -33,7 +33,7 @@ let go =
 #endif
     print "ok"
 SRC
-"$fpp" build --strict --wasmgc -o "$out/dual.wasm" "$out/dual.fpp"
+"$fpp" build --strict -o "$out/dual.wasm" "$out/dual.fpp"
 "$fpp" build --strict -o "$out/dual.c" "$out/dual.fpp"
 grep -q "js_global" "$out/dual.c" && { echo "IFDEF FAILED: js leaked into native"; exit 1; }
 make -C "$rt" GC_COLLECTOR=mmc build/mmc/libwhippet.a build/mmc/fpprt.o >/dev/null 2>&1
