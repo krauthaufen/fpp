@@ -3574,8 +3574,6 @@ let private rootActiveGen (ctx : LowCtx) (inner : LExpr) : LExpr =
     match ctx.ActiveGen with
     | [] -> inner
     | gens ->
-        (if List.contains curFnDbg [ "$f2029101207"; "$f658950141" ] then
-            eprintfn "RAG %s %s" curFnDbg (String.concat ";" (gens |> List.map (fun (r, w) -> "r" + string r + ":w" + string w))))
         let refMask w = LLoad (W, LGet (wReg w), 8)
         let res = freshTmp ctx
         let pushes = gens |> List.map (fun (r, w) ->

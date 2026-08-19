@@ -768,6 +768,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// Try to bind one dot-access. Returns false only when the receiver type
     /// is still unknown — i.e. when retrying later could learn something.
     let rec tryResolveDotCore (force : bool) (offset : int) (recvTy : Type) (result : Type) (name : string) : bool =
+
         // members are inherited: walk up the base chain to the type that
         // actually declares this one, and bind to THAT declaration
         // Walk to the type that declares this member, carrying the receiver's
@@ -7707,6 +7708,39 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             if tryResolveDot false offset recvTy result name then progress <- true
             else vecAdd still (offset, recvTy, result, name)
         parked <- vecToList still
+    // F#'s record-label rule, applied LAST: a field access on a receiver
+    // nothing ever grounded (`let get sch = sch.Body` — generalized before
+    // any use) resolves BY LABEL, fixing the receiver to the record that
+    // declares the field. Only a UNIQUE candidate resolves — the result
+    // type cannot discriminate here (it is the binding's own rigid
+    // variable), and F#'s scoping usually leaves exactly one record with
+    // the label visible per file. A still-ambiguous access stays parked
+    // and the backend's warned site-trap names it (never the old silent
+    // index-0 read). This step just GROUNDS the receiver — the forced pass
+    // below then binds through the ordinary path, which records the owner
+    // the backends need.
+    for offset, recvTy, result, name in parked do
+        match prune recvTy with
+        | TVar _ ->
+            let cands =
+                dictPairs fields
+                |> List.filter (fun (k, fi) ->
+                    k = fi.TypeName + "." + name && fi.DefKey.IsNone && not fi.IsStatic
+                    && not (k.Contains "$")
+                    && (dictTryFind recordsReg fi.TypeName).IsSome)
+                |> List.map snd
+            (match cands with
+             | [ fi ] ->
+                 let subst = dictNew<int, Type> ()
+                 for pv in fi.Params do dictSet subst (prunedId pv) (st.Fresh ())
+                 let target = TCon (fi.TypeName, fi.Params |> List.map (fun pv -> substVars subst (TVar pv)))
+                 // TRIAL first: under the empty-prelude dogfood a receiver
+                 // may be constrained by knowledge this run lacks — a label
+                 // guess must never manufacture a mismatch diagnostic
+                 if (Types.unifyTrial false recvTy target).IsSome then
+                     unifyAt offset recvTy target
+             | _ -> ())
+        | _ -> ()
     // `use x = e` on a type that declares no Dispose. Say it HERE, where the
     // type is known: lowering sees only a member that did not bind, and it
     // falls back to a plain `let` — which is right for a receiver whose type
