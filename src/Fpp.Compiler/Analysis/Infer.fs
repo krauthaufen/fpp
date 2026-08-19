@@ -3014,6 +3014,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         inner
                                     | _ -> ty)
                                | None -> st.Fresh ())
+                      | None when
+                            List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ] ->
+                          // a builtin conversion USED AS A VALUE (`|> int`,
+                          // `List.map int`): F#'s result type is FIXED by the
+                          // name — without this the piped result stayed a
+                          // fresh var and generalized, so downstream code
+                          // (the linear print classifier included) saw '?'
+                          TFun (st.Fresh (), TCon (t.Text, []))
                       | None ->
                           // truly unbound: nothing resolved it, nothing
                           // will — remembered so the resolver's

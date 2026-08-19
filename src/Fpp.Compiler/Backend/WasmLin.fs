@@ -480,7 +480,7 @@ let rec private printConOf (st : St) (e : Expr) : string =
                             | Some k -> (match List.tryItem k inst with Some nm -> nm | None -> "")
                             | None -> "")
                        | _ -> "")
-                  if viaInst <> "" && viaInst <> "?" && not (viaInst.StartsWith "'") then viaInst
+                  if viaInst <> "" && viaInst <> "?" && not (viaInst.StartsWith "'") && not (viaInst.StartsWith "#") then viaInst
                   else
                       let rec pars t k acc =
                           match prune t with
@@ -507,6 +507,11 @@ let rec private printConOf (st : St) (e : Expr) : string =
         let sfx = if n > 1 then op.Substring (n - 1) else ""
         let b = if sfx = "f" || sfx = "s" || sfx = "l" || sfx = "w" then op.Substring (0, n - 1) else op
         (match b with
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" | "&&" | "||" | "not"
+         | "=i" | "<>i" | "=t" | "<>t" | "<t" | ">t" | "<=t" | ">=t" -> "bool"
+         | _ when op.Contains "@" &&
+                  (match op.Substring (0, op.IndexOf "@") with
+                   | "<" | ">" | "<=" | ">=" | "=" | "<>" -> true | _ -> false) -> "bool"
          | "+" | "-" | "*" | "/" | "%" | "u-" | "sqrt" | "truncate" | "abs"
          | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~" when b <> op ->
              (if sfx = "l" then "int64" elif sfx = "s" then "float32" elif sfx = "w" then "uint32" else "float")
@@ -2164,7 +2169,8 @@ let private emitStrTrimChars (m : Mod) (atStart : bool) : unit =
     ifV f "i32"
     lg f "$cs"; ic f 1; ins f "i32.shr_s"
     elseB f
-    lg f "$cs"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ic f 1; ins f "i32.shr_s"
+    // char arrays are PACKED 2-byte units (storKindRes), not tagged words
+    lg f "$cs"; ic f 8; ins f "i32.add"; lg f "$j"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
     endB f
     lg f "$c"; ins f "i32.eq"
     ifE f; ic f 1; ls f "$hit"; br f "$sd"; endB f
@@ -4582,6 +4588,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // indices (145 diverging bodies vs the oracle)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#t" -> LCall ("$atoi", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#i" -> coreToLowE ctx a
+    // BARE `int x` (the operand kind was not recorded — a `|> int` pipe):
+    // route by the argument's static classification; a raw word is already
+    // the int
+    | EApp (EUnknown "int", [ a ]) ->
+        (match printConOf ctx.LSt a with
+         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+         | "string" -> LCall ("$atoi", [ coreToLowE ctx a ])
+         | _ -> coreToLowE ctx a)
+    | EApp (EUnknown "uint32", [ a ]) ->
+        (match printConOf ctx.LSt a with
+         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+         | _ -> coreToLowE ctx a)
     // byte / narrow: mask the tagged value's payload to 8 bits
     // byte-of-FLOAT truncates first ('f'/'s' operand kind); the plain mask
     // AND'd a boxed-double POINTER before
@@ -4619,6 +4639,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let v =
             match con with
             | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
+            | "bool" ->
+                let t = freshTmp ctx
+                LDo ([ LIf (LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ]),
+                            [ LSet (wReg t, lowStrConst ctx.LSt "\"False\"") ],
+                            [ LSet (wReg t, lowStrConst ctx.LSt "\"True\"") ]) ], LGet (wReg t))
             | "float" | "float32" | "double" | "single" -> LCall ("$ftoa_s", [ coreToLowE ctx a ])
             | "int64" -> LCall ("$ltoa_s", [ coreToLowE ctx a ])
             | "uint64" -> LCall ("$ultoa_s", [ coreToLowE ctx a ])
@@ -4768,6 +4793,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // string of an int64/uint64 box: decimal via the i64 digit writer
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string#l" -> LCall ("$ltoa_s", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string#v" -> LCall ("$ultoa_s", [ coreToLowE ctx a ])
+    // string of a bool spells True/False, as .NET's ToString does
+    | EApp (EUnknown "string#b", [ a ]) ->
+        let t = freshTmp ctx
+        LDo ([ LIf (LPrim (EqW, [ coreToLowE ctx a; LConstW 0 ]),
+                    [ LSet (wReg t, lowStrConst ctx.LSt "\"False\"") ],
+                    [ LSet (wReg t, lowStrConst ctx.LSt "\"True\"") ]) ], LGet (wReg t))
+    // string of a raw uint32: zero-extend into the unsigned 64-bit writer
+    | EApp (EUnknown "string#w", [ a ]) ->
+        LCall ("$ultoa_s", [ lowBoxI ctx (LPrim (AndL, [ LPrim (WToL, [ coreToLowE ctx a ]); LConstL 4294967295L ])) ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
@@ -7367,6 +7401,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
         match d with DLet (_, _, _, e) -> scanConsts st e | _ -> ()
+    // bool prints spell True/False at runtime — intern both up front
+    (if gc then internStrGc st "\"True\"" |> ignore else internStr st "\"True\"" |> ignore)
+    (if gc then internStrGc st "\"False\"" |> ignore else internStr st "\"False\"" |> ignore)
     // bake the vtable right after the string constants; $hp starts after it
     st.VtBase <- st.ConstNext
     for w in vtRows do
