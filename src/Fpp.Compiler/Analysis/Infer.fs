@@ -1674,6 +1674,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let pendingSuperChecks = vecNew<int * string * Constraint> ()
     /// bare idents whose whole resolution chain bottomed out at fresh
     let freshIdentsRaw = vecNew<int> ()
+    // name tokens that turned out to be NAMED ARGUMENTS (`recursive = true`
+    // against a callee that declares `recursive`): the overload demand types
+    // the element as an equality first, bottoming the name out at a fresh
+    // variable — but the name is an argument LABEL, not a value use, so it
+    // must not feed the resolver's unbound-value cross-check
+    let namedArgNameOffs = vecNew<int> ()
 
     // ---- derived Arb instances -------------------------------------------
     // A record or union with no written Arb instance GETS one, GENERIC in
@@ -2750,13 +2756,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  // no record covers ALL the labels: if one knows at least
                  // one of them, the stray label deserves a name — silence
                  // bound nothing and the arm matched on garbage
-                 (let nearest =
+                 (let byScrut, nearest =
                      // the SCRUTINEE names the record when the labels
                      // cannot: `match (r : R) with { zz = x }` should say
                      // R has no zz, not stay quiet
                      match patExpect |> Option.map prune with
-                     | Some (TCon (sn, _)) when (dictTryFind recordsReg sn).IsSome -> Some sn
+                     | Some (TCon (sn, _)) when (dictTryFind recordsReg sn).IsSome -> true, Some sn
                      | _ ->
+                         false,
                          fieldNames
                          |> List.tryPick (fun m ->
                              dictPairs fields
@@ -2766,11 +2773,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  then Some fi.TypeName else None))
                   match nearest with
                   | Some tn ->
-                      for nm, _ in fps do
-                          (match tokensOf nm |> List.tryHead with
-                           | Some t0 when not ((dictTryFind fields (tn + "." + t0.Text)).IsSome) ->
-                               vecAdd diags (t0.Offset, "the record " + tn + " has no field '" + t0.Text + "'")
-                           | _ -> ())
+                      // a scrutinee-named record is CERTAIN; a bare-name
+                      // guess must cover MOST of the labels before a stray
+                      // one errors — matching one label of a cross-file
+                      // record (bare single-file inference) stays quiet
+                      let hits = fieldNames |> List.filter (fun m -> (dictTryFind fields (tn + "." + m)).IsSome) |> List.length
+                      if byScrut || hits >= List.length fieldNames - hits then
+                          for nm, _ in fps do
+                              (match tokensOf nm |> List.tryHead with
+                               | Some t0 when not ((dictTryFind fields (tn + "." + t0.Text)).IsSome) ->
+                                   vecAdd diags (t0.Offset, "the record " + tn + " has no field '" + t0.Text + "'")
+                               | _ -> ())
                   | None -> ())
                  for _, sub in fps do patType pvars sub |> ignore
                  st.Fresh ())
@@ -3682,7 +3695,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  let through =
                                      tokensOf l |> List.exists (fun t -> t.Kind = Operator && t.Text = "?")
                                  (match ids with
-                                  | [ nt ] when List.contains nt.Text known -> Some (nt.Text, r, through)
+                                  | [ nt ] when List.contains nt.Text known ->
+                                      vecAdd namedArgNameOffs nt.Offset
+                                      Some (nt.Text, r, through)
                                   | _ -> None)
                              | _ -> None
                      let names =
@@ -5499,10 +5514,20 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      (match nearest with
                       | Some tn ->
                           let known = recFieldsOf tn
+                          let hits = fieldNames |> List.filter (fun m -> List.contains m known) |> List.length
                           let noff = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
-                          for m in fieldNames do
-                              if not (List.contains m known) then
-                                  vecAdd diags (noff, "the record " + tn + " has no field '" + m + "'")
+                          // tn is only a CREDIBLE owner when the literal
+                          // writes most of tn's own fields (a valid literal
+                          // writes all of them, a typo'd one all but one).
+                          // A guess that shares two labels of a ten-field
+                          // record is a cross-file type this bare
+                          // single-file inference cannot see — stay quiet
+                          // (Scheme literals inside the compiler matched
+                          // FieldInfo through Quantified/Constraints).
+                          if hits * 2 >= List.length known && hits >= List.length fieldNames - hits then
+                              for m in fieldNames do
+                                  if not (List.contains m known) then
+                                      vecAdd diags (noff, "the record " + tn + " has no field '" + m + "'")
                       | None -> ())
                      // walk values, stay unconstrained
                      for f in fieldNodes do
@@ -7848,7 +7873,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | _ -> ""
 
     { Diagnostics = vecToList diags
-      FreshIdents = vecToList freshIdentsRaw
+      FreshIdents =
+          (let named = Set.ofList (vecToList namedArgNameOffs)
+           vecToList freshIdentsRaw |> List.filter (fun o -> not (Set.contains o named)))
       DefTypes =
         vecToList defTypes
         |> List.map (fun (off, len, ty) -> off, len, typeString ty)

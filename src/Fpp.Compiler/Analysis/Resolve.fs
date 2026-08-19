@@ -218,6 +218,11 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
         | None -> ()
 
     let unresolvedValues = vecNew<Token> ()
+    // inside a QUOTATION: code as data. A quoted member's parameters and a
+    // quoted let's binders exist only inside the quote, so a name the
+    // environment cannot answer is not an unbound value there — misses stay
+    // silent (splices to enclosing values still resolve and record normally).
+    let mutable inQuote = false
 
     let tryRecord (env : Env) (t : Token) : unit =
         // A bare name in expression position is a value or a constructor,
@@ -239,7 +244,8 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             // BACKEND-OWNED names are never in the value environment: the
             // conversions (`string v`, `int x` — Lower's list) and the
             // structural primitives the emitters answer by name
-            if strLen t.Text > 0 && charAt t.Text 0 >= 'a' && charAt t.Text 0 <= 'z'
+            if not inQuote
+               && strLen t.Text > 0 && charAt t.Text 0 >= 'a' && charAt t.Text 0 <= 'z'
                && not (List.contains t.Text
                            [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
                              "float"; "float32"; "float16"; "string"; "char"; "byte"
@@ -827,6 +833,16 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 env
             | k when isTypeKind k ->
                 walkType env g
+                env
+            | QuoteExpr ->
+                // code as data: quote-local binders are not in this scope's
+                // tables, so misses inside stay silent (see `inQuote`) —
+                // resolved names (splice references) still record normally
+                let saved = inQuote
+                inQuote <- true
+                let mutable e = env
+                for c in n.Children do e <- walkExpr e c
+                inQuote <- saved
                 env
             | _ ->
                 let mutable e = env

@@ -1331,13 +1331,28 @@ default and retire BinDriver. Known residue: JS-held handles leak on
 linear (no finalizers); print of int64/uint64 still takes the string path;
 Js.watch is a no-op.
 
-Post-arc battery note (2026-08-19): 29/30 gates green. fixpoint-linself now
+Post-arc battery note (2026-08-19): 30/30 gates green. fixpoint-linself
 byte-exact at 11,220,934 bytes (the interop code included); its stage-0
 emission runs on a 512MB-stack thread in fixpoint.fsx — the grown compiler
-overflowed fsi's default stack in coreToLowE. The one red gate, unit-suite
-(9 of 704 Expecto tests: enumerator protocol, per-instantiation vtables,
-HashCollections, quotation splice, named-args+optionals, inference
-self-application), fails IDENTICALLY on a pristine 284c3eb worktree — it
-pre-dates this arc (environment drift, likely a dotnet SDK update; the
-Cell<'a>/IEnumerator repro now reports "leaves 'Dispose' out"). Open item,
-not caused here.
+overflowed fsi's default stack in coreToLowE.
+
+The 9 unit-suite failures the battery surfaced were NOT environment drift:
+bisected to 9c09993 (the negative-conformance arc's new diagnostics), they
+had gone unnoticed because no full unit-suite run followed that arc. Four
+distinct causes, all fixed:
+* named arguments (`recursive = true`): the overload demand types the
+  element as an equality first, so the LABEL bottomed out at a fresh
+  variable and fed the unbound-value cross-check — named-arg name offsets
+  are now excluded from FreshIdents.
+* quoted code (`<@ member x.Bla (a : %ty) = a @>`): quote-local binders are
+  not in scope tables; the resolver now records no unbound-value misses
+  inside QuoteExpr (splice references still resolve normally).
+* "record X has no field Y" owner GUESSING: a bare-name guess sharing one
+  label of a cross-file record sprayed misses under single-file inference
+  (Scheme literals matched FieldInfo via Quantified/Constraints). The guess
+  is credible only when the literal writes most of the guessed record's own
+  fields (patterns: majority of written labels, scrutinee-named certain).
+* stale tests: IEnumerator impls without Dispose — the diagnostic is RIGHT
+  (fsc rejects those too; IEnumerator<'T> is IDisposable); the five test
+  programs and the HashCollections port (whose interface blocks also never
+  delegated MoveNext) now implement the full surface.

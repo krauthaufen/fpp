@@ -3054,6 +3054,7 @@ type HashSetEnumerator<'K> =
         x.Value <- Unchecked.defaultof<_>
 
     interface System.Collections.Generic.IEnumerator<'K> with
+        member x.MoveNext() = x.MoveNext()
         member x.Current = x.Current
         member x.Dispose() = x.Dispose()
 
@@ -3119,6 +3120,7 @@ type HashMapEnumerator<'K, 'V, 'T> =
         x.Value <- Unchecked.defaultof<_>
 
     interface System.Collections.Generic.IEnumerator<'T> with
+        member x.MoveNext() = x.MoveNext()
         member x.Current = x.Current
         member x.Dispose() = x.Dispose()
 
