@@ -1330,3 +1330,14 @@ callback root slots are already gc-aware ($cbreg/cbBase) — then flip the
 default and retire BinDriver. Known residue: JS-held handles leak on
 linear (no finalizers); print of int64/uint64 still takes the string path;
 Js.watch is a no-op.
+
+Post-arc battery note (2026-08-19): 29/30 gates green. fixpoint-linself now
+byte-exact at 11,220,934 bytes (the interop code included); its stage-0
+emission runs on a 512MB-stack thread in fixpoint.fsx — the grown compiler
+overflowed fsi's default stack in coreToLowE. The one red gate, unit-suite
+(9 of 704 Expecto tests: enumerator protocol, per-instantiation vtables,
+HashCollections, quotation splice, named-args+optionals, inference
+self-application), fails IDENTICALLY on a pristine 284c3eb worktree — it
+pre-dates this arc (environment drift, likely a dotnet SDK update; the
+Cell<'a>/IEnumerator repro now reports "leaves 'Dispose' out"). Open item,
+not caused here.
