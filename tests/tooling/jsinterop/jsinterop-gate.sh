@@ -183,7 +183,7 @@ fi
 # the churn leg: 500 short-lived wrappers through REAL collections — every
 # cleanup fires once, every JS table entry is reclaimed by the drain
 got=$(node "$here/gcchurndrive.js")
-want='{"log":["spawned","cleanups 500","SPAN","churn-done"],"cleanups":500,"reclaimed":500,"liveAfter":504}'
+want='{"log":["spawned","cleanups 500","SPAN","churn-done"],"cleanups":500,"reclaimed":500,"liveAfter":5}'
 if [ "$got" = "$want" ]; then
     echo "GC-CHURN OK (500 cleanups, 500 handles reclaimed under real collections)"
 else

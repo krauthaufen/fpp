@@ -91,7 +91,22 @@ export const jsLinImports = (getExports) => {
   const mem = () => getExports().memory.buffer;
   const table = [null];
   let nextId = 1;
-  const reg = (v) => (v === null ? 0 : ((table[nextId] = v), nextId++));
+  // INTERNED registration: the same JS object always answers the same id
+  // (WeakMap identity), and strings/numbers/booleans intern by value — so
+  // the table grows with DISTINCT values touched, not with boundary
+  // crossings ("div" once, not once per createElement; an element re-read
+  // reuses its id). A drain may have freed an interned id's entry; a re-reg
+  // simply restores it — the value provably crossed again, so it is live.
+  const objIds = new WeakMap();
+  const valIds = new Map();
+  const reg = (v) => {
+    if (v === null) return 0;
+    const ids = (typeof v === 'object' || typeof v === 'function') ? objIds : valIds;
+    let id = ids.get(v);
+    if (id === undefined) { id = nextId++; ids.set(v, id); }
+    table[id] = v;
+    return id;
+  };
   const h = (id) => table[id];
   const dec = new TextDecoder('utf-16le');
   const lstr = (p) => {

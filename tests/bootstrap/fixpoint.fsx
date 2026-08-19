@@ -357,6 +357,10 @@ let out, err, code =
         run wasmtime ("run -W exceptions=y,gc=y,max-wasm-stack=67108864"
                   + " -O gc-heap-initial-size=1073741824 -O gc-heap-reservation=4294967296"
                   + " --preload env=" + hostPath + " " + stage1Path)
+// stage-1's stderr carries the SELF-HOSTED compiler's diagnostics (RAG,
+// probe prints, warnings) — keep it, mismatch or not; dropping it cost a
+// debugging session once
+System.IO.File.WriteAllText (scratch + "/stage1.stderr", err)
 if code <> 0 then
     printfn "stage-1 failed to run (exit %d)" code
     printfn "%s" (err.Substring (0, min 2000 err.Length))

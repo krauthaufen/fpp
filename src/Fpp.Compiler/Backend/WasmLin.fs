@@ -135,6 +135,12 @@ type private St =
       /// absence means a reference type (one pointer word). Groundwork: written
       /// here, read only by `layoutOf`, which nothing consumes yet.
       RecFieldTys : Dict<string, (string * string) list>
+      /// field name -> every record that declares it: the LAST-RESORT owner
+      /// resolution for a field access whose receiver type inference lost
+      /// (an un-annotated local lambda's param). Only an UNAMBIGUOUS name
+      /// resolves this way; anything else is a hard gap — the old silent
+      /// index-0 default compiled `sch.Body` as a Quantified read
+      FieldOwnerOf : Dict<string, string list>
       /// repr(T) single-field collapse: a record with EXACTLY one field, never
       /// mutated (no EFieldSet), travels AS that field — no heap object. Maps the
       /// record name -> its sole field name. This is the general "any one-field
@@ -403,7 +409,10 @@ let private rawScalarName (n : string) : bool =
 // int / float / string path from this.
 let rec private printConOf (st : St) (e : Expr) : string =
     match e with
-    | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then "int64" else "int"
+    | ELit (LInt s) ->
+        if s.EndsWith "UL" || s.EndsWith "uL" then "uint64"
+        elif s.EndsWith "L" || s.EndsWith "l" then "int64"
+        else "int"
     | ELit (LFloat _) -> "float"
     | ELit (LBool _) -> "bool"
     | ELit (LChar _) -> "char"
@@ -766,6 +775,9 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$memcopy" "$lt_iii2v"
     // shortest-form float formatting (print <float>, string <float>)
     declFn m "$ftoa_s" "$lt_i2i"
+    // int64/uint64 decimal formatting (print <int64>, string <int64>)
+    declFn m "$ltoa_s" "$lt_i2i"
+    declFn m "$ultoa_s" "$lt_i2i"
     // callback/cleanup-closure registration: needed by JS callbacks AND by
     // GC.OnCleanup (gc mode parks cleanup closures in the same slot area)
     if jsUsed || gc then declFn m "$cbreg" "$lt_i2i"
@@ -1260,6 +1272,69 @@ let private emitFtoaS (m : Mod) : unit =
     mem f "i32.store16"
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$cl"; endB f; endB f
+    lg f "$p"
+    endFn f
+
+// $ltoa_s / $ultoa_s: int64/uint64 BOX -> decimal string. Signed handles
+// i64.min by negating in the unsigned domain (0 - v reads back the right
+// magnitude). Digits stage back-to-front in FMTBUF like the other writers.
+let private emitLtoa (m : Mod) (signed : bool) : unit =
+    let f = beginFn m [ "$x" ]
+    local f "$v" "i64"; local f "$w" "i32"; local f "$d" "i32"; local f "$cur" "i32"
+    local f "$p" "i32"; local f "$len" "i32"; local f "$i" "i32"; local f "$neg" "i32"
+    localsDone f
+    emitSbufRefresh f
+    lg f "$x"; ic f HDR; ins f "i32.add"; mem f "i64.load"; ls f "$v"
+    saddr f FMTBUF; ls f "$w"
+    (if signed then
+        lg f "$v"; lc f 0L; ins f "i64.lt_s"
+        ifE f
+        ic f 1; ls f "$neg"
+        lc f 0L; lg f "$v"; ins f "i64.sub"; ls f "$v"
+        endB f)
+    // stage digits back-to-front from the end of a 20-unit window (a u64
+    // has at most 20 decimal digits), remember where the last write landed
+    lg f "$w"; ic f (21 * 2); ins f "i32.add"; ls f "$cur"
+    lg f "$cur"; ls f "$len"
+    blockE f "$lc"; loopE f "$ll"
+    lg f "$cur"; ic f 2; ins f "i32.sub"; ls f "$cur"
+    lg f "$cur"
+    lg f "$v"; lc f 10L; ins f "i64.rem_u"; ins f "i32.wrap_i64"; ic f 48; ins f "i32.add"
+    mem f "i32.store16"
+    lg f "$v"; lc f 10L; ins f "i64.div_u"; ls f "$v"
+    lg f "$v"; lc f 0L; ins f "i64.eq"; brIf f "$lc"
+    br f "$ll"; endB f; endB f
+    // shift the digits down to $w (plus the sign), so the string starts at FMTBUF
+    (if signed then
+        lg f "$neg"
+        ifE f
+        lg f "$w"; ic f 45; mem f "i32.store16"
+        endB f)
+    let signOff () = if signed then (lg f "$neg"; ic f 1; ins f "i32.shl"; ins f "i32.add") else ()
+    // units = (len - cur)/2; copy [cur, len) to [w+sign, ...)
+    ic f 0; ls f "$i"
+    blockE f "$cc"; loopE f "$cl"
+    lg f "$cur"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    lg f "$len"; ins f "i32.ge_u"; brIf f "$cc"
+    lg f "$w"; signOff (); lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    lg f "$cur"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$cl"; endB f; endB f
+    // total units = i + neg
+    lg f "$i"
+    (if signed then (lg f "$neg"; ins f "i32.add") else ())
+    ls f "$d"
+    strAllocN f (fun () -> lg f "$d")
+    emitSbufRefresh f
+    ic f 0; ls f "$i"
+    blockE f "$sc"; loopE f "$sl"
+    lg f "$i"; lg f "$d"; ins f "i32.ge_u"; brIf f "$sc"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"
+    saddr f FMTBUF; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    mem f "i32.store16"
+    lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
+    br f "$sl"; endB f; endB f
     lg f "$p"
     endFn f
 
@@ -2687,6 +2762,12 @@ let private optGet (o : 'a option) : 'a =
     | None -> failwith "optGet: None"
 
 let private regOf (ctx : LowCtx) (k : string) : int =
+    // NOT a workaround: `.[k]` is a SEAM DIVERGENCE. Under .NET, Dict is the
+    // real Dictionary (an Item indexer exists); under self-host it is the
+    // bootstrap RECORD, which has none — the indexer spelling compiled as an
+    // array-style read of record fields and answered garbage register ids
+    // (the historical "get_Item miscompile"). dictTryFind is the seam
+    // surface; use it, never `.[...]`, on bootstrap Dicts.
     match dictTryFind ctx.Regs k with
     | Some i -> i
     | None -> failwith ("regOf: no register for " + k)
@@ -2765,11 +2846,35 @@ let private cidRec (st : St) (name : string) : int = match dictTryFind st.ClassI
 
 // a field's slot index in its owner's layout, resolving a stamped subclass
 // (which owns no field names) through the base it was stamped from.
-let rec private recFieldIdx (st : St) (owner : string) (fname : string) : int =
-    let viaBase () = match dictTryFind st.RecBase owner with Some b when b <> owner -> recFieldIdx st b fname | _ -> 0
+let rec private recFieldIdxOpt (st : St) (owner : string) (fname : string) : int option =
+    let viaBase () = match dictTryFind st.RecBase owner with Some b when b <> owner -> recFieldIdxOpt st b fname | _ -> None
     match dictTryFind st.RecFields owner with
-    | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> i | None -> viaBase ())
+    | Some order -> (match List.tryFindIndex (fun x -> x = fname) order with Some i -> Some i | None -> viaBase ())
     | None -> viaBase ()
+
+let rec private recFieldIdx (st : St) (owner : string) (fname : string) : int =
+    match recFieldIdxOpt st owner fname with Some i -> i | None -> 0
+
+// the slot index with LOST-OWNER recovery: an unresolved owner falls back to
+// the field NAME when exactly one record declares it. Anything else answers
+// None — the ACCESS SITE then compiles to a warned, localized trap, never
+// the old silent index 0 (which compiled `sch.Body` as a Quantified read
+// and made the self-hosted keep/witOf lie; a whole-function gap was tried
+// and too blunt — it stubbed RunGenerators for a `.Message` in a catch arm
+// the self-compile never runs).
+let private recFieldIdxE (st : St) (owner : string) (fname : string) : int option =
+    match recFieldIdxOpt st owner fname with
+    | Some i -> Some i
+    | None ->
+        // several owners are still UNAMBIGUOUS when they all place the field
+        // at the same slot (Scheme and its stamped copies) — the read is
+        // position-based, so any of them yields the same load
+        match dictTryFind st.FieldOwnerOf fname with
+        | Some owners ->
+            (match owners |> List.choose (fun o -> recFieldIdxOpt st o fname) |> List.distinct with
+             | [ i ] -> Some i
+             | _ -> None)
+        | None -> None
 
 // a field's declared type, resolving a stamped subclass through its base — the
 // subclass has no RecFieldTypes of its own, so a mutable scalar field (`&int`)
@@ -3423,7 +3528,7 @@ let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
         // the pointer is slotted like any other ref binder
         || ((scalarLTy sch.Body).IsNone
             && (refKindOfTy sch.Body = RKRef
-                || (desugarRefTemps.Contains v.Name && refKindOfTy sch.Body <> RKRaw))))
+                || (Set.contains v.Name desugarRefTemps && refKindOfTy sch.Body <> RKRaw))))
 
 // The element-witness register of a generic (`'a`) variable, when the enclosing
 // function threads one. A cell var carries a pointer already (Slotted-covered);
@@ -3511,9 +3616,19 @@ let private reloadSlottedGen (ctx : LowCtx) (inner : LExpr) : LExpr =
 // to a PTuple match, and the tokenizer's `let kind, e = scanToken p` leaves the
 // ref `kind` live across the allocating `scanTrailing e`). Raw/scalar binders
 // and cells are excluded, as in shouldSlot.
+// an ANONYMOUS binder type: a desugar that lost the real type writes `?`
+// (Option .Value's payload tmp, the pattern-lambda temps). Its value may be
+// a raw scalar — unconditionally rooting it as a REF let the collector's
+// stale-edge tolerance NULL a live even int (witOf's witness register read
+// 0: the stamped-member miscompile specimen, finally understood). These
+// binders belong to the runtime-scan route (patCondBinders), never here.
+let private isAnonTy (t : Type) : bool =
+    match prune t with TCon ("?", []) -> true | _ -> false
+
 let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list =
     let keep (v : VarId) (sch : Scheme) =
-        (dictTryFind ctx.LSt.CellVars (key v)).IsNone && (scalarLTy sch.Body).IsNone && refKindOfTy sch.Body = RKRef
+        (dictTryFind ctx.LSt.CellVars (key v)).IsNone && (scalarLTy sch.Body).IsNone
+        && refKindOfTy sch.Body = RKRef && not (isAnonTy sch.Body)
     match pat with
     | PVar (v, sch) -> if keep v sch then [ v, sch ] else []
     | PAs (p, v, sch) -> (if keep v sch then [ v, sch ] else []) @ patRefBinders ctx p
@@ -3530,12 +3645,17 @@ let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list
 // GENERIC (`'a`) pattern binders whose element witness is in scope — the arm-body
 // analogue of a generic let. Each is rooted conditionally across the arm's
 // safepoints (a `h::t` head held across a later allocation, say).
+// GENERIC (`'a`) pattern binders whose element witness is in scope — the arm-body
+// analogue of a generic let. Each is rooted conditionally across the arm's
+// safepoints (a `h::t` head held across a later allocation, say).
+// HISTORY: the original keep/witOf two-pass shape here mysteriously
+// misbehaved under the linear self-host. The mystery is SOLVED and the
+// causes are fixed — un-annotated local-lambda params were never rooted
+// across safepoints (emitLambdaLow's rootArgGen), and a field access whose
+// owner inference lost compiled as a SILENT index-0 read (recFieldIdxE).
+// The annotated two-pass shape now fixpoints byte-exactly; this single-
+// lookup form simply stays as the clearer code.
 let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
-    // ONE lookup deciding both the keep and the witness: the old
-    // keep-then-witOf pair (two prune+lookup passes) DISAGREED under the
-    // linear self-host — witOf answered 0 where keep's identical lookup
-    // hit, pairing every gen binder with witness register 0 (the 4-byte
-    // fixpoint diff)
     let pick (v : VarId) (sch : Scheme) : (VarId * int) list =
         if (dictTryFind ctx.LSt.CellVars (key v)).IsSome then []
         else
@@ -3566,7 +3686,7 @@ let private patCondBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
         (dictTryFind st.CellVars (key v)).IsNone
         && (scalarLTy s.Body).IsNone
         && refKindOfTy s.Body <> RKRaw
-        && refKindOfTy s.Body <> RKRef
+        && (refKindOfTy s.Body <> RKRef || isAnonTy s.Body)
         && (match prune s.Body with TVar tv -> (dictTryFind ctx.Witness tv.Id).IsNone | _ -> true)
     let pick (off : int) (p : Pat) =
         match p with
@@ -3607,7 +3727,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // sbyte `y`, byte `uy`, uint32 `u`, nativeint `n` — else Int32.TryParse
         // rejects it and the literal silently becomes 0. (int64 `L` handled above.)
         let digits =
-            match [ "us"; "uy"; "un"; "s"; "y"; "u"; "n" ] |> List.tryFind s.EndsWith with
+            match [ "us"; "uy"; "un"; "s"; "y"; "u"; "n" ] |> List.tryFind (fun sfx -> s.EndsWith sfx) with
             | Some suf -> s.Substring (0, s.Length - suf.Length)
             | None -> s
         lowInt (parseI32Lit digits)
@@ -4038,17 +4158,30 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                  LDo (pre @ [ LStore (W, LGet (wReg ra), off, LGet (wReg rb)) ], lowInt 0)
              else LDo ([ LStore (W, coreToLowE ctx r, off, coreToLowE ctx v) ], lowInt 0))
     | EField (r, fname, owner) ->
-        LLoad (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname)
+        (match recFieldIdxE st owner fname with
+         | Some i -> LLoad (W, coreToLowE ctx r, HDR + 4 * i)
+         | None ->
+             let cands =
+                 match dictTryFind st.FieldOwnerOf fname with
+                 | Some os -> os |> List.map (fun o -> o + "@" + (match recFieldIdxOpt st o fname with Some i -> string i | None -> "?")) |> String.concat ","
+                 | None -> "-"
+             vecAdd st.Warnings ("field-site trap: '" + fname + "' unresolved (owner '" + owner + "', candidates " + cands + ") in " + curFnDbg)
+             LDo ([ LEval (coreToLowE ctx r); LTrap ], lowInt 0))
     | EFieldSet (r, fname, owner, v) ->
         // an LStore evaluates its ADDRESS before its VALUE. When the value can
         // allocate, that collection MOVES the receiver and the store writes the
         // field into the dead copy — the live object keeps its old (soon stale)
         // ref. Root the receiver across the value and store through the
         // GC-updated pointer. (This was prune's path compression going stale.)
-        if gc then
-            let ra, rb, pre = evalRooted ctx r v
-            LDo (pre @ chkStoreStmts rb @ [ LStore (W, LGet (wReg ra), HDR + 4 * recFieldIdx st owner fname, LGet (wReg rb)) ], lowInt 0)
-        else LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * recFieldIdx st owner fname, coreToLowE ctx v) ], lowInt 0)
+        (match recFieldIdxE st owner fname with
+         | Some i ->
+             if gc then
+                 let ra, rb, pre = evalRooted ctx r v
+                 LDo (pre @ chkStoreStmts rb @ [ LStore (W, LGet (wReg ra), HDR + 4 * i, LGet (wReg rb)) ], lowInt 0)
+             else LDo ([ LStore (W, coreToLowE ctx r, HDR + 4 * i, coreToLowE ctx v) ], lowInt 0)
+         | None ->
+             vecAdd st.Warnings ("field-site trap: '" + fname + "' unresolved (owner '" + owner + "') in " + curFnDbg)
+             LDo ([ LEval (coreToLowE ctx r); LEval (coreToLowE ctx v); LTrap ], lowInt 0))
     // ---- arrays of inline value-type records (all-scalar elements) ----
     // elements are contiguous & HEADERLESS at ARRHDR + i*stride. A whole-element
     // read copies out to a fresh headed record; a whole-element write copies the
@@ -4357,6 +4490,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             match con with
             | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
             | "float" | "float32" | "double" | "single" -> LCall ("$ftoa_s", [ coreToLowE ctx a ])
+            | "int64" -> LCall ("$ltoa_s", [ coreToLowE ctx a ])
+            | "uint64" -> LCall ("$ultoa_s", [ coreToLowE ctx a ])
             | _ -> coreToLowE ctx a
         LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
@@ -4480,6 +4615,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // string of a float/float32: the shortest form, matching .NET ToString
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string#f" || n.StartsWith "string#d" || n.StartsWith "string#s" ->
         LCall ("$ftoa_s", [ coreToLowE ctx a ])
+    // string of an int64/uint64 box: decimal via the i64 digit writer
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string#l" -> LCall ("$ltoa_s", [ coreToLowE ctx a ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "string#v" -> LCall ("$ultoa_s", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
@@ -6243,15 +6381,24 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
             match prune psch.Body with
             | TVar tv -> (match dictTryFind ctx.Witness tv.Id with
                           | Some witR -> Some (witR, freshTmp ctx)
-                          | None ->
-                              (if System.Environment.GetEnvironmentVariable "FPP_WDROP" = "1" then
-                                  eprintfn "WDROP %s %s %s:%d" lamName pv.Name pv.Path pv.Offset)
-                              None)
+                          | None -> None)
             | _ -> None
         else None
     (match condArg with
      | Some (witR, slotR) -> ctx.SlottedGen <- (argId, witR, slotR) :: ctx.SlottedGen
      | None -> ())
+    // a GENERIC arg with NO witness in scope rides the canonical TAGGED form
+    // (closure args always do) — root it UNCONDITIONALLY, exactly as
+    // rootParams does for top-level functions. DROPPING it was the
+    // stamped-member miscompile: `keep`'s un-annotated Scheme arg (a TVar
+    // with no captured witness) went stale across $key's allocation, prune
+    // walked a moved object, and every gen binder of the arm vanished —
+    // rootActiveGen sequences missing from the self-hosted output.
+    let rootArgGen =
+        gc && not rootArg && condArg.IsNone
+        && (scalarLTy psch.Body).IsNone && refKindOfTy psch.Body = RKGen
+    let argGenSlotReg = if rootArgGen then Some (freshTmp ctx) else None
+    (match argGenSlotReg with Some r -> dictSet ctx.Slotted (key pv) (LGet (wReg r)) | None -> ())
     let bodyLow0 = coreToLowE ctx body
     st.GapSink <- None
     // roots to establish at entry: (slot register, initial value). Pushed in
@@ -6259,6 +6406,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     let entryRoots =
         (match envSlotReg with Some r -> [ r, LGet (wReg envId) ] | None -> [])
         @ (match argSlotReg with Some r -> [ r, LGet (wReg argId) ] | None -> [])
+        @ (match argGenSlotReg with Some r -> [ r, LGet (wReg argId) ] | None -> [])
     let bodyLow =
         if List.isEmpty entryRoots && condArg.IsNone then bodyLow0
         else
@@ -6556,6 +6704,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          FieldOwnerOf = dictNew ()
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
@@ -6567,6 +6716,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DRecord (n, _, fs, _) ->
             dictSet st.RecFields n (fs |> List.map fst)
             dictSet st.RecFieldTypes n fs
+            for f, _ in fs do
+                let prev = match dictTryFind st.FieldOwnerOf f with Some xs -> xs | None -> []
+                if not (List.contains n prev) then dictSet st.FieldOwnerOf f (n :: prev)
             if (dictTryFind st.ClassId n).IsNone then (dictSet st.ClassId n nextCid; nextCid <- nextCid + 1)
         | DUnion (uname, _, cs) ->
             let cid = match dictTryFind st.ClassId uname with Some c -> c | None -> (let c = nextCid in dictSet st.ClassId uname c; nextCid <- nextCid + 1; c)
@@ -7050,7 +7202,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
     emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
-    emitMemsize m; emitMemcopy m; emitFtoaS m
+    emitMemsize m; emitMemcopy m; emitFtoaS m; emitLtoa m true; emitLtoa m false
     if jsUsed || gc then emitCbreg m
     if gc then (emitGcdrain m; emitRootswipe m)
     if jsUsed then (emitJscall m; emitLinSalloc m)

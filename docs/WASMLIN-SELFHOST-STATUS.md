@@ -1400,3 +1400,44 @@ stamped-generic member-access miscompile hunt, and the dom-layer handle
 strategy (dom wrappers wrap-per-access, so they cannot Js.watch like the
 webgl/webgpu layers do — needs an interning wrap cache or handle
 refcounts; dom handles are glue-registered and currently uncollected).
+
+## §40 the stamped-member miscompile: SOLVED (2026-08-19)
+
+The open self-host mystery (regOf/optGet/pick workarounds) is fully
+understood — it was THREE distinct defects wearing one symptom:
+
+1. **Un-rooted generic lambda args.** emitLambdaLow rooted RKRef args and
+   witness-conditional TVar args, but DROPPED a TVar arg with no captured
+   witness (the WDROP case). `keep`'s un-annotated Scheme param went stale
+   across $key's allocation. Fixed: rootArgGen — a generic arg with no
+   witness rides the canonical tagged form and roots unconditionally,
+   exactly like rootParams does for top-level functions.
+
+2. **Silent field-index-0 on lost owners.** recFieldIdx answered 0 when the
+   owner was unresolved (an un-annotated local lambda's param), so
+   `sch.Body` compiled as a Quantified read — prune walked a LIST, answered
+   non-TVar, and every gen binder of the arm vanished (the missing
+   rootActiveGen sequences). Fixed: recFieldIdxE — unique-field-name
+   fallback, index-agreement across ambiguous owners, and a WARNED
+   SITE-LOCAL TRAP otherwise (a whole-function gap was too blunt: it
+   stubbed RunGenerators for a catch-arm `.Message` the self-compile never
+   runs). The traps exposed four latent silent misreads: two live ones
+   fixed at the source (`List.tryFind s.EndsWith` — a method VALUE, the
+   builtin-not-first-class family; `Set.Contains` as a member), and
+   `.Message`/`.ToString "x4"`/BCL-static dot-accesses remain as warned
+   trap-if-reached sites. The 'Body' ambiguity that blocks bare-name
+   recovery is real: CFn puts Body at slot 0, Scheme at slot 2 — inference
+   owner-recovery is the eventual fix.
+
+3. **The get_Item "miscompile" was a SEAM DIVERGENCE, not a codegen bug.**
+   Under .NET, `Dict` is the real Dictionary (indexer exists); under
+   self-host it is the bootstrap RECORD, which has no Item — `.Regs.[k]`
+   compiled as an array-style read of record fields and answered garbage
+   register ids. dictTryFind is the seam surface; regOf stays, by design.
+
+Validation: the EXACT retired keep/witOf two-pass shape (with .Value),
+annotated, now fixpoints byte-exactly. Also from this arc: fixpoint.fsx
+persists stage-1's stderr (it was silently dropped on byte mismatches,
+which cost half the hunt), and a debug reactor recipe with fpprt_dbg_live
+exists (conscheck needs it; note the checker still false-positives on raw
+even ints like dictSlotH's hash argument). Battery 31/31.
