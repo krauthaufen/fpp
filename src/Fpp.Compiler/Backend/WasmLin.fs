@@ -2645,8 +2645,12 @@ let private emitCmpv (m : Mod) : unit =
         ic f vtNSlots; ins f "i32.mul"; ic f slot; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
         mem f "i32.load"
     if vtNSlots > 0 then
-        // both sides the same class, and that class declares one
+        // both sides the same class, that class has a REAL id (an unmapped
+        // tid reads cid 0, whose row belongs to another type — dispatching
+        // through it compared two equal `Some 0`s by reference), and it
+        // declares one of the trio
         lg f "$ca"; lg f "$cb"; ins f "i32.eq"
+        cidOfHdr "$ca"; ic f CID_FIRST_USER; ins f "i32.ge_s"; ins f "i32.and"
         ifE f
         vtRowAddr 2; ls f "$x"
         lg f "$x"; ifE f
@@ -2699,8 +2703,22 @@ let private emitCmpv (m : Mod) : unit =
         lg f "$ca"; ic f 1; ins f "i32.shr_u"; lg f "$tbl"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.lt_u"
         ins f "i32.and"; ins f "i32.eqz"
         ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+        // DIFFERENT headers are not necessarily different TYPES: one shape can
+        // intern under several tids (a witness-selected raw payload and the
+        // tagged fallback both build `Some 0`), and ordering by header then
+        // called two equal values unequal — `tryFind k m = Some v` was false
+        // for a map built inside the prelude. Order by CLASS-ID, and only when
+        // the ids genuinely differ; equal ids fall through to the word walk,
+        // which reads $a's layout (same shape, so it describes both).
         lg f "$ca"; lg f "$cb"; ins f "i32.ne"
-        ifE f; lg f "$ca"; lg f "$cb"; ins f "i32.gt_s"; lg f "$ca"; lg f "$cb"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+        ifE f
+        cidOfHdr "$ca"; ls f "$x"
+        cidOfHdr "$cb"; ls f "$y"
+        lg f "$x"; lg f "$y"; ins f "i32.ne"
+        ifE f
+        lg f "$x"; lg f "$y"; ins f "i32.gt_s"; lg f "$x"; lg f "$y"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
+        endB f
+        endB f
         lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
         lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
         lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
@@ -2789,13 +2807,18 @@ let private emitHashv (m : Mod) : unit =
     // equal-by-Equals values must hash equal, and the structural fold over a
     // tree's words does not (its shape varies with insertion order)
     if vtNSlots > 0 then
+        let cidOfCur () =
+            if gc then (lg f "$cid"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+            else lg f "$cid"
         (if gc then (gg f "$roots"; ic f (4 * vtRootSlot); ins f "i32.add"; mem f "i32.load"; ic f 8; ins f "i32.add")
          else ic f vtBaseConst)
-        (if gc then (lg f "$cid"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
-         else lg f "$cid")
+        cidOfCur ()
         ic f vtNSlots; ins f "i32.mul"; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
         mem f "i32.load"; ls f "$r"
-        lg f "$r"; ifE f
+        // an unmapped tid reads cid 0 — never dispatch through another type's row
+        lg f "$r"
+        cidOfCur (); ic f CID_FIRST_USER; ins f "i32.ge_s"; ins f "i32.and"
+        ifE f
         // GetHashCode takes (self) but rides the 2-param indirect signature
         // the identity trio shares — the extra word is ignored
         lg f "$v"; ic f 0; lg f "$r"; callIndirect f "$lfn2"; ins f "return"
