@@ -38,7 +38,10 @@ let private HDR = 4           // bytes: the descriptor-pointer header
 let private IOV_PTR = 0        // i32: the write buffer's address
 let private IOV_LEN = 4        // i32: its length
 let private NWRITTEN = 8       // i32: fd_write's out-param
-let private PRINTBUF = 16      // utf-8 staging for one prints
+// 8 bytes for the monotonic clock's out-parameter — WASI writes an i64 and
+// REQUIRES 8-byte alignment, so it sits at 16, not beside the i32 slots
+let private MONO_SCRATCH = 16
+let private PRINTBUF = 24      // utf-8 staging for one prints
 let private PRINTCAP = 262144
 let private FMTBUF = PRINTBUF + PRINTCAP   // u16 staging for float formatting
 let private FMTCAP = 512
@@ -772,6 +775,8 @@ let private rtDeclsLin (m : Mod) : unit =
     importFn m "wasi_snapshot_preview1" "fd_read" "$fd_read" [ "i32"; "i32"; "i32"; "i32" ] [ "i32" ]
     importFn m "wasi_snapshot_preview1" "fd_close" "$fd_close" [ "i32" ] [ "i32" ]
     importFn m "wasi_snapshot_preview1" "fd_filestat_get" "$fd_filestat_get" [ "i32"; "i32" ] [ "i32" ]
+    // the monotonic clock (Time.now): id, precision, out-pointer -> errno
+    importFn m "wasi_snapshot_preview1" "clock_time_get" "$clock_time_get" [ "i32"; "i64"; "i32" ] [ "i32" ]
     // the JS boundary (browser host): one import per Js.* primitive, module
     // "jslin". Handles/ints/bools cross raw, floats f64, strings as linear
     // pointers. Registered ONLY when the program touches Js.* — an unused
@@ -4253,7 +4258,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (LPrim (fop, [ fa; fb ]))
     | EPrim (("u-f" | "u-s"), [ a ]) -> lowBoxF ctx (LPrim (NegF, [ lowUnboxF (coreToLowE ctx a) ]))
     | EPrim ("u-l", [ a ]) -> lowBoxI ctx (LPrim (SubL, [ LConstL 0L; lowUnboxI (coreToLowE ctx a) ]))
-    | EPrim (("u-" | "u-i"), [ a ]) -> LPrim (SubW, [ LConstW 0; coreToLowE ctx a ])
+    // nativeint and uint32 ride the RAW word, so their unary/bitwise forms
+    // are the plain integer ones (`u-p` on a nativeint stubbed the whole
+    // enclosing init before this)
+    | EPrim (("u-" | "u-i" | "u-p" | "u-w"), [ a ]) -> LPrim (SubW, [ LConstW 0; coreToLowE ctx a ])
+    | EPrim (("u~~~" | "u~~~i" | "u~~~p" | "u~~~w"), [ a ]) -> LPrim (XorW, [ coreToLowE ctx a; LConstW -1 ])
     // `~~~` bitwise complement: i32 forms flip every bit; the i64 form rides
     // the boxed payload
     | EPrim (("u~~~" | "u~~~i" | "u~~~w"), [ a ]) -> LPrim (XorW, [ coreToLowE ctx a; LConstW (-1) ])
@@ -4418,12 +4427,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // shift/comparison forms — the stripped route ran them signed, so
         // `4294967295u / 2u` and `4000000000u > 2u` were simply wrong.
         let unsignedW = strLen op >= 2 && charAt op (strLen op - 1) = 'w' && not (op.Contains "@")
-        // baseOp strips a `w` only off the arithmetic/comparison bases; the
-        // shift/bitwise ops (`>>>w`, `<<<w`, `&&&w`, …) kept their suffix and
-        // fell through intArithOp's default — `7u >>> 1` compiled as rem
+        // baseOp strips a kind letter only off the arithmetic/comparison
+        // bases; the shift/bitwise ops (`>>>w`, `&&&p`, …) kept theirs and
+        // fell through intArithOp's default — `7u >>> 1` and `a &&& 24n`
+        // both compiled as REM. Every kind that rides the RAW word (int,
+        // nativeint, uint32) uses the plain integer instruction.
         let bop =
             let b0 = baseOp op
-            if b0 = op && unsignedW then substr op 0 (strLen op - 1) else b0
+            if b0 <> op then b0
+            else
+                let last = charAt op (strLen op - 1)
+                let stripped = substr op 0 (strLen op - 1)
+                if (last = 'i' || last = 'p' || last = 'w')
+                   && List.contains stripped [ "+"; "-"; "*"; "/"; "%"; "&&&"; "|||"; "^^^"; "<<<"; ">>>" ]
+                then stripped else op
         let ta = coreToLowE ctx a
         let tb = coreToLowE ctx b
         match bop with
@@ -4907,7 +4924,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint32#l" || n.StartsWith "uint32#v" ->
         LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
     | EApp (EUnknown n, [ a ]) when n = "uint32#" || n.StartsWith "uint32#" -> coreToLowE ctx a
-    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#w" -> coreToLowE ctx a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int#w" || n.StartsWith "int#p" -> coreToLowE ctx a
+    // nativeint is the raw word: from an int/uint32 it is the identity, from
+    // a float it truncates, from a wide int it wraps
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "nativeint#f" || n.StartsWith "nativeint#s" ->
+        LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "nativeint#l" || n.StartsWith "nativeint#v" ->
+        LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "nativeint#t" -> LCall ("$atoi", [ coreToLowE ctx a ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "nativeint#" -> coreToLowE ctx a
     // uint64 rides the boxed i64: from float truncates, from ints widens
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#f" || n.StartsWith "uint64#s" ->
         lowBoxI ctx (LPrim (FToL, [ lowUnboxF (coreToLowE ctx a) ]))
@@ -5148,6 +5173,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // approximate as Failure(message): the last argument is the message
         let msg = match List.rev args with m :: _ -> coreToLowE ctx m | [] -> LConstW 0
         LDo ([ LThrow (lowFailure ctx msg) ], lowInt 0)
+    // the monotonic clock in MILLISECONDS as a float: WASI writes 64-bit
+    // nanoseconds into the low scratch slot, which nothing else uses between
+    // the call and the read
+    | EApp (EUnknown "monoms", [ u ]) ->
+        LDo ([ LEval (coreToLowE ctx u)
+               LEval (LCall ("$clock_time_get", [ LConstW 1; LConstL 1000000L; LConstW MONO_SCRATCH ])) ],
+             lowBoxF ctx (LPrim (DivF, [ LPrim (LToF, [ LLoad (I64, LConstW MONO_SCRATCH, 0) ]); LConstF 1000000.0 ])))
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     // the DEBUG channel: Lower expands eprintf/eprintfn to `eprints` (fd 2)
     | EApp (EUnknown "eprints", [ a ]) -> LDo ([ LCallVoidS ("$eprints", [ coreToLowE ctx a ]) ], lowInt 0)
