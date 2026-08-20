@@ -2149,10 +2149,10 @@ let rtDecls6 (m : Mod) : unit =
 
 // f64 constants by their bit patterns — the writer speaks bits, and spelled
 // this way the self-hosted compiler needs no host float formatting
-let private F10 = 0x4024000000000000L
-let private FTENTH = 0x3FB999999999999AL
-let private F1E18 = 0x43ABC16D674EC800L
-let private FINF = 0x7FF0000000000000L
+let F10 = 0x4024000000000000L
+let FTENTH = 0x3FB999999999999AL
+let F1E18 = 0x43ABC16D674EC800L
+let FINF = 0x7FF0000000000000L
 
 let rtCore6 (m : Mod) : unit =
     // $strcmp: byte-wise ordinal; shorter sorts first
@@ -4361,33 +4361,22 @@ let rtCore10 (m : Mod) : unit =
 
 // ---- runtime: list append and the half-precision rounder --------------------
 
-let rtTypes11 (m : Mod) : unit =
+let rtTypesHalf (m : Mod) : unit =
     tyFunc m "$rt_f2i" [ "f64" ] [ "i32" ]
+
+let rtTypes11 (m : Mod) : unit =
+    rtTypesHalf m
+
+let rtDeclsHalf (m : Mod) : unit =
+    declFn m "$f2h64" "$rt_f2i"
 
 let rtDecls11 (m : Mod) : unit =
     declFn m "$append" "$u1"
-    declFn m "$f2h64" "$rt_f2i"
+    rtDeclsHalf m
 
-let rtCore11 (m : Mod) : unit =
-    // $append: rebuild the left spine onto the right
-    let f = beginFn m [ "$a"; "$b" ]
-    localsDone f
-    lg f "$a"
-    gcT f "ref.test" "$cons"
-    ifA f
-    lg f "$a"
-    gcT f "ref.cast" "$cons"
-    gcTF f "struct.get" "$cons" 0
-    lg f "$a"
-    gcT f "ref.cast" "$cons"
-    gcTF f "struct.get" "$cons" 1
-    lg f "$b"
-    callf f "$append"
-    gcT f "struct.new" "$cons"
-    elseB f
-    lg f "$b"
-    endB f
-    endFn f
+/// $f2h64 alone: double -> IEEE half bits. Split out of rtCore11 so the
+/// LINEAR backend can emit the half rounder without $append's GC types.
+let rtCoreHalf (m : Mod) : unit =
     // $f2h64: double -> IEEE half bits, correctly rounded (magic-constant
     // trick in the subnormal range, ties-to-even at bit 42 elsewhere)
     let f = beginFn m [ "$v" ]
@@ -4459,6 +4448,28 @@ let rtCore11 (m : Mod) : unit =
     lg f "$o"
     ins f "i32.or"
     endFn f
+
+let rtCore11 (m : Mod) : unit =
+    // $append: rebuild the left spine onto the right
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"
+    gcT f "ref.test" "$cons"
+    ifA f
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 0
+    lg f "$a"
+    gcT f "ref.cast" "$cons"
+    gcTF f "struct.get" "$cons" 1
+    lg f "$b"
+    callf f "$append"
+    gcT f "struct.new" "$cons"
+    elseB f
+    lg f "$b"
+    endB f
+    endFn f
+    rtCoreHalf m
 
 // ---- runtime: half-precision widen/narrow -----------------------------------
 

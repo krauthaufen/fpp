@@ -426,6 +426,7 @@ let rec private printConOf (st : St) (e : Expr) : string =
         if s.EndsWith "UL" || s.EndsWith "uL" then "uint64"
         elif s.EndsWith "L" || s.EndsWith "l" then "int64"
         else "int"
+    | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> "float16"
     | ELit (LFloat _) -> "float"
     | ELit (LBool _) -> "bool"
     | ELit (LChar _) -> "char"
@@ -545,6 +546,7 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
     match e with
     | ELit (LInt s) -> if s.EndsWith "L" || s.EndsWith "l" then RKRef else RKRaw
     | ELit (LBool _) | ELit (LChar _) -> RKRaw
+    | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> RKRaw
     | ELit (LFloat _) | ELit (LString _) -> RKRef
     | ELit (LNull) -> RKRef
     | EVar (_, sch) | EVarI (_, sch, _) -> refKindOfTy sch.Body
@@ -742,10 +744,15 @@ let private rtTypesLin (m : Mod) : unit =
     tyFunc m "$lt_v2i" [] [ "i32" ]
     // $atol: string pointer -> raw i64
     tyFunc m "$lt_i2j" [ "i32" ] [ "i64" ]
+    // $atof: string pointer -> raw f64
+    tyFunc m "$lt_i2d" [ "i32" ] [ "f64" ]
     // WASI path_open: (dirfd, dirflags, path, len, oflags, rights, rights_inh, fdflags, retptr)
     tyFunc m "$lt_po" [ "i32"; "i32"; "i32"; "i32"; "i32"; "i64"; "i64"; "i32"; "i32" ] [ "i32" ]
     // $memcopy: (dst, src, n) -> ()
     tyFunc m "$lt_iii2v" [ "i32"; "i32"; "i32" ] []
+    // half-precision: $h2f (bits -> f32), $f2h (f32 -> bits), $f2h64 (f64 -> bits)
+    rtTypes12 m
+    rtTypesHalf m
 
 
 let private rtDeclsLin (m : Mod) : unit =
@@ -865,11 +872,187 @@ let private rtDeclsLin (m : Mod) : unit =
     if jsUsed then
         declFn m "$jscall" "$lt_ii2i"
         declFn m "$lin_salloc" "$lt_i2i"
+    // half-precision widen/narrow, declared LAST — rtCore12/rtCoreHalf emit
+    // their bodies last too (the function and code sections are positional)
+    rtDecls12 m
+    rtDeclsHalf m
+    declFn m "$atof" "$lt_i2d"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
 // optional leading '-', then digits; no error path (the compiler parses only
 // numerals it printed itself — "@env:N" slot suffixes, offsets).
+
+// $atof: string -> f64, mantissa/fraction/exponent stages. Ported from the
+// GC backend verbatim except the two string reads: a linear string is
+// [cid][len][utf-16 units], so length is a load at +4 and unit i a
+// load16_u at +8 + 2i.
+let private emitAtof (m : Mod) : unit =
+    // $atof: mantissa/fraction/exponent stages
+    let f = beginFn m [ "$s" ]
+    local f "$i" "i32"
+    local f "$n" "i32"
+    local f "$neg" "i32"
+    local f "$v" "f64"
+    local f "$scale" "f64"
+    local f "$stage" "i32"
+    local f "$exp" "i32"
+    local f "$esign" "i32"
+    local f "$c" "i32"
+    local f "$k" "i32"
+    localsDone f
+    lg f "$s"
+    ic f 4; ins f "i32.add"; mem f "i32.load"
+    ls f "$n"
+    fc f FTENTH
+    ls f "$scale"
+    ic f 1
+    ls f "$esign"
+    blockE f "$done"
+    loopE f "$go"
+    lg f "$i"
+    lg f "$n"
+    ins f "i32.ge_u"
+    brIf f "$done"
+    lg f "$s"
+    lg f "$i"
+    ic f 1; ins f "i32.shl"; ins f "i32.add"; ic f 8; ins f "i32.add"; mem f "i32.load16_u"
+    ls f "$c"
+    lg f "$c"
+    ic f 45
+    ins f "i32.eq"
+    lg f "$i"
+    ins f "i32.eqz"
+    ins f "i32.and"
+    ifE f
+    ic f 1
+    ls f "$neg"
+    endB f
+    lg f "$c"
+    ic f 46
+    ins f "i32.eq"
+    ifE f
+    ic f 1
+    ls f "$stage"
+    endB f
+    lg f "$c"
+    ic f 101
+    ins f "i32.eq"
+    lg f "$c"
+    ic f 69
+    ins f "i32.eq"
+    ins f "i32.or"
+    ifE f
+    ic f 2
+    ls f "$stage"
+    endB f
+    lg f "$c"
+    ic f 45
+    ins f "i32.eq"
+    lg f "$stage"
+    ic f 2
+    ins f "i32.eq"
+    ins f "i32.and"
+    ifE f
+    ic f -1
+    ls f "$esign"
+    endB f
+    lg f "$c"
+    ic f 48
+    ins f "i32.ge_u"
+    lg f "$c"
+    ic f 57
+    ins f "i32.le_u"
+    ins f "i32.and"
+    ifE f
+    lg f "$stage"
+    ins f "i32.eqz"
+    ifE f
+    lg f "$v"
+    fc f F10
+    ins f "f64.mul"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "f64.convert_i32_u"
+    ins f "f64.add"
+    ls f "$v"
+    endB f
+    lg f "$stage"
+    ic f 1
+    ins f "i32.eq"
+    ifE f
+    lg f "$v"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "f64.convert_i32_u"
+    lg f "$scale"
+    ins f "f64.mul"
+    ins f "f64.add"
+    ls f "$v"
+    lg f "$scale"
+    fc f FTENTH
+    ins f "f64.mul"
+    ls f "$scale"
+    endB f
+    lg f "$stage"
+    ic f 2
+    ins f "i32.eq"
+    ifE f
+    lg f "$exp"
+    ic f 10
+    ins f "i32.mul"
+    lg f "$c"
+    ic f 48
+    ins f "i32.sub"
+    ins f "i32.add"
+    ls f "$exp"
+    endB f
+    endB f
+    lg f "$i"
+    ic f 1
+    ins f "i32.add"
+    ls f "$i"
+    br f "$go"
+    endB f
+    endB f
+    blockE f "$edone"
+    loopE f "$ego"
+    lg f "$k"
+    lg f "$exp"
+    ins f "i32.ge_s"
+    brIf f "$edone"
+    lg f "$esign"
+    ic f 0
+    ins f "i32.gt_s"
+    ifE f
+    lg f "$v"
+    fc f F10
+    ins f "f64.mul"
+    ls f "$v"
+    elseB f
+    lg f "$v"
+    fc f F10
+    ins f "f64.div"
+    ls f "$v"
+    endB f
+    lg f "$k"
+    ic f 1
+    ins f "i32.add"
+    ls f "$k"
+    br f "$ego"
+    endB f
+    endB f
+    lg f "$neg"
+    ifV f "f64"
+    lg f "$v"
+    ins f "f64.neg"
+    elseB f
+    lg f "$v"
+    endB f
+    endFn f
+
 let private emitAtoi (m : Mod) : unit =
     let f = beginFn m [ "$s" ]
     local f "$n" "i32"; local f "$i" "i32"; local f "$acc" "i32"; local f "$neg" "i32"
@@ -3217,6 +3400,9 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
 // array through the runtime $str_cmp / $cmpv.
 type private CmpShape =
     | ShScalar | ShStr | ShFloat | ShInt64
+    // a float16 is its 16 raw BITS in a word — comparing those bits orders
+    // wrongly (and calls -0.0h <> 0.0h), so it widens before comparing
+    | ShHalf
     | ShList of CmpShape | ShArr of CmpShape | ShTup of CmpShape list | ShOther
 
 let rec private shapeOfType (t : Type) : CmpShape =
@@ -3224,7 +3410,8 @@ let rec private shapeOfType (t : Type) : CmpShape =
     | TTuple ts -> ShTup (List.map shapeOfType ts)
     | TCon (n, _) when n.StartsWith "$tup" -> ShOther
     | TCon ("string", _) -> ShStr
-    | TCon (("float" | "double" | "single" | "float32" | "float16"), _) -> ShFloat
+    | TCon ("float16", _) -> ShHalf
+    | TCon (("float" | "double" | "single" | "float32"), _) -> ShFloat
     | TCon (("int64" | "uint64"), _) -> ShInt64
     | TCon (("int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint"), _) -> ShScalar
     | TCon (("list" | "[]" | "seq"), (e :: _)) -> ShList (shapeOfType e)
@@ -3453,6 +3640,7 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     match e with
     | ETuple xs -> ShTup (List.map shapeOfExpr xs)
     | ELit (LString _) -> ShStr
+    | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> ShHalf
     | ELit (LFloat _) -> ShFloat
     | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" -> ShInt64
     | ELit (LInt _ | LChar _ | LBool _) -> ShScalar
@@ -3520,7 +3708,7 @@ let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
 
 let private needsStructCmp (sh : CmpShape) : bool =
     match sh with
-    | ShStr | ShFloat | ShInt64 | ShList _ | ShArr _ | ShTup _ -> true
+    | ShStr | ShFloat | ShInt64 | ShHalf | ShList _ | ShArr _ | ShTup _ -> true
     // ShOther is an unknown/generic type variable ('k in a generic function, e.g.
     // dictSlotH's `d.Keys.[e-1] = k`). The tagged-int/pointer fast path below is
     // correct ONLY for a statically-known tagged scalar; a compound held in a
@@ -3554,7 +3742,8 @@ let rec private shapeOfName (nm : string) : CmpShape =
         let bare = if nm.Contains "$<" then nm.Substring (0, nm.IndexOf "$<") else nm
         match bare with
         | "string" -> ShStr
-        | "float" | "double" | "single" | "float32" | "float16" -> ShFloat
+        | "float16" -> ShHalf
+        | "float" | "double" | "single" | "float32" -> ShFloat
         | "int64" | "uint64" -> ShInt64
         | "int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint" -> ShScalar
         | "list" | "seq" | "[]" -> ShList ShOther
@@ -3589,6 +3778,10 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
         LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
     | ShInt64 ->
         LPrim (SubW, [ LPrim (GtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
+    | ShHalf ->
+        let da = LPrim (PromF, [ LCall ("$h2f", [ wa ]) ])
+        let db = LPrim (PromF, [ LCall ("$h2f", [ wb ]) ])
+        LPrim (SubW, [ LPrim (GtF, [ da; db ]); LPrim (LtF, [ da; db ]) ])
     | ShTup shapes ->
         let ra = freshTmp ctx
         let rb = freshTmp ctx
@@ -3860,6 +4053,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | Some suf -> s.Substring (0, s.Length - suf.Length)
             | None -> s
         lowInt (parseI32Lit digits)
+    // a HALF literal is rounded ONCE, here, into its 16 raw bits — a half
+    // value IS those bits at rest, not a boxed double
+    | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> LConstW (halfBits (parseFloatLit s))
     | ELit (LFloat s) -> lowBoxF ctx (LConstF (parseFloatLit s))
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
     | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
@@ -4103,6 +4299,32 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
         LDo (pre, (structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)))
+    // float16 arithmetic and comparison: widen both operands to f32, operate
+    // there, round ONCE back to half — that single rounding is what makes the
+    // result the correctly-rounded half. Comparison is IEEE on the widened
+    // values, so -0.0h = 0.0h and a NaN half equals nothing.
+    | EPrim (op, [ a; b ]) when
+        strLen op > 1 && charAt op (strLen op - 1) = 'h' && not (op.Contains "@")
+        && List.contains (substr op 0 (strLen op - 1)) [ "+"; "-"; "*"; "/"; "<"; ">"; "<="; ">="; "="; "<>" ] ->
+        let bop = substr op 0 (strLen op - 1)
+        let da = LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ])
+        let db = LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx b ]) ])
+        (match bop with
+         | "+" | "-" | "*" | "/" ->
+             let fop = match bop with "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
+             LCall ("$f2h64", [ LPrim (fop, [ da; db ]) ])
+         | _ ->
+             let cop = match bop with "<" -> LtF | ">" -> GtF | "<=" -> LeF | ">=" -> GeF | "=" -> EqF | _ -> NeF
+             LPrim (cop, [ da; db ]))
+    | EPrim (("sqrth" | "absh" | "truncateh" | "u-h") as op, [ a ]) ->
+        let d = LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ])
+        let r =
+            match op with
+            | "sqrth" -> LPrim (SqrtF, [ d ])
+            | "absh" -> LPrim (AbsF, [ d ])
+            | "truncateh" -> LPrim (TruncF, [ d ])
+            | _ -> LPrim (NegF, [ d ])
+        LCall ("$f2h64", [ r ])
     // a comparison whose operands are a COMPOUND value (tuple/list/...), a STRING
     // (`=t`/`<t` — the `t` type suffix), or a STRUCTURAL `=@Type`/`<>@Type`
     // (records/unions): the tagged-int fast path below would compare heap
@@ -4564,6 +4786,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, _) when n.StartsWith "$zero" -> lowInt 0
     | EUnknown n when n.StartsWith "$zero" -> lowInt 0
     | EApp (EUnknown "fixed6", [ a ]) -> LCall ("$ftoa6", [ coreToLowE ctx a ])
+    // OUT of a half: widen the bits, then narrow to the target
+    | EApp (EUnknown n, [ a ]) when
+        strLen n > 2 && n.EndsWith "#h" && not (n.StartsWith "$") && not (n.StartsWith "print") ->
+        let wide = LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ])
+        (match substr n 0 (strLen n - 2) with
+         | "float" | "double" -> lowBoxF ctx wide
+         | "float32" | "single" -> lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ wide ]) ]))
+         | "string" -> LCall ("$ftoa_s", [ lowBoxF ctx wide ])
+         | "int64" | "uint64" -> lowBoxI ctx (LPrim (FToL, [ wide ]))
+         | "byte" -> LPrim (AndW, [ LPrim (FToW, [ wide ]); LConstW 0xFF ])
+         | "sbyte" -> LPrim (ShrSW, [ LPrim (ShlW, [ LPrim (FToW, [ wide ]); LConstW 24 ]); LConstW 24 ])
+         | "uint16" -> LPrim (AndW, [ LPrim (FToW, [ wide ]); LConstW 0xFFFF ])
+         | "int16" -> LPrim (ShrSW, [ LPrim (ShlW, [ LPrim (FToW, [ wide ]); LConstW 16 ]); LConstW 16 ])
+         | _ -> LPrim (FToW, [ wide ]))
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#l" || n = "int#l" ->
         (LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]))
     // uint64 shares int64's i64 box: `int u` wraps to the low 32 bits
@@ -4577,6 +4813,28 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#l" || n.StartsWith "int64#v" -> coreToLowE ctx a
     // int64-of-STRING parses ('t' is the string kind letter): the catchall
     // widened the string POINTER before
+    // parse FROM a string: float/float32 through $atof, char = its first unit
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float#t" || n.StartsWith "double#t" ->
+        lowBoxF ctx (LCall ("$atof", [ coreToLowE ctx a ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float32#t" || n.StartsWith "single#t" ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ LCall ("$atof", [ coreToLowE ctx a ]) ]) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "char#t" ->
+        LLoad (I16, coreToLowE ctx a, 8)
+    | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#i" -> coreToLowE ctx a
+    // BARE `int x` (the operand kind was not recorded — a `|> int` pipe):
+    // route by the argument's static classification; a raw word is already
+    // the int
+    | EApp (EUnknown "int", [ a ]) ->
+        (match printConOf ctx.LSt a with
+         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+         | "string" -> LCall ("$atoi", [ coreToLowE ctx a ])
+         | _ -> coreToLowE ctx a)
+    | EApp (EUnknown "uint32", [ a ]) ->
+        (match printConOf ctx.LSt a with
+         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+         | _ -> coreToLowE ctx a)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#t" ->
         lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
@@ -4611,21 +4869,6 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `int (l.Substring 5)` env-slot parse emitted heap addresses as slot
     // indices (145 diverging bodies vs the oracle)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int#t" -> LCall ("$atoi", [ coreToLowE ctx a ])
-    | EApp (EUnknown n, [ a ]) when n = "int#" || n.StartsWith "int#i" -> coreToLowE ctx a
-    // BARE `int x` (the operand kind was not recorded — a `|> int` pipe):
-    // route by the argument's static classification; a raw word is already
-    // the int
-    | EApp (EUnknown "int", [ a ]) ->
-        (match printConOf ctx.LSt a with
-         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
-         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
-         | "string" -> LCall ("$atoi", [ coreToLowE ctx a ])
-         | _ -> coreToLowE ctx a)
-    | EApp (EUnknown "uint32", [ a ]) ->
-        (match printConOf ctx.LSt a with
-         | "float" | "float32" | "double" | "single" -> LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
-         | "int64" | "uint64" -> LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
-         | _ -> coreToLowE ctx a)
     // byte / narrow: mask the tagged value's payload to 8 bits
     // byte-of-FLOAT truncates first ('f'/'s' operand kind); the plain mask
     // AND'd a boxed-double POINTER before
@@ -4655,8 +4898,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `float32 x`/`float16 x` FROM a float: round to f32 precision and keep the
     // value in its f64 box (demote then promote). Half rides the same box; f32
     // rounding is the closest we do without a dedicated f16 path.
-    | EApp (EUnknown ("float32#f" | "float16#f" | "single#f"), [ a ]) ->
+    | EApp (EUnknown ("float32#f" | "single#f"), [ a ]) ->
         lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
+    // ---- float16: a half IS its 16 raw bits in a word ---------------------
+    // INTO a half: round the value to half precision, keep the bits
+    | EApp (EUnknown "float16#f", [ a ]) -> LCall ("$f2h64", [ lowUnboxF (coreToLowE ctx a) ])
+    | EApp (EUnknown "float16#s", [ a ]) -> LCall ("$f2h64", [ lowUnboxF (coreToLowE ctx a) ])
+    | EApp (EUnknown "float16#h", [ a ]) -> coreToLowE ctx a
+    | EApp (EUnknown "float16#l", [ a ]) -> LCall ("$f2h64", [ LPrim (LToF, [ lowUnboxI (coreToLowE ctx a) ]) ])
+    | EApp (EUnknown "float16#t", [ a ]) -> LCall ("$f2h64", [ LCall ("$atof", [ coreToLowE ctx a ]) ])
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float16#" ->
+        LCall ("$f2h64", [ LPrim (WToF, [ coreToLowE ctx a ]) ])
+    // printh: a half prints as the f64 its bits widen to
+    | EApp (EUnknown "printh", [ a ]) ->
+        let v = LCall ("$ftoa_s", [ lowBoxF ctx (LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ])) ])
+        LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     // print / printraw: write a string to stdout (print's newline matters only
     // on the compiler's error paths, which the fixpoint success path never hits)
     // `print` writes the string THEN a newline (matching the GC backend's putc
@@ -7523,6 +7779,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if jsUsed || gc then emitCbreg m
     if gc then (emitGcdrain m; emitRootswipe m)
     if jsUsed then (emitJscall m; emitLinSalloc m)
+    // half-precision widen/narrow — pure i32/f32 arithmetic, shared verbatim
+    // with the GC backend (a float16 IS its 16 raw bits in a word). LAST,
+    // matching where rtDecls12/rtDeclsHalf declare them: the function and
+    // code sections are positional and must agree.
+    rtCore12 m
+    rtCoreHalf m
+    emitAtof m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
