@@ -2815,10 +2815,11 @@ let private emitHashv (m : Mod) : unit =
         cidOfCur ()
         ic f vtNSlots; ins f "i32.mul"; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
         mem f "i32.load"; ls f "$r"
-        // an unmapped tid reads cid 0 — never dispatch through another type's row
-        lg f "$r"
-        cidOfCur (); ic f CID_FIRST_USER; ins f "i32.ge_s"; ins f "i32.and"
-        ifE f
+        // a row is written only for a real class/record/union id, so a
+        // nonzero row IS the guard — requiring cid >= CID_FIRST_USER here
+        // ALSO rejected a class whose tid the t2c map does not carry, and the
+        // structural walk then recursed forever on a recursive class graph
+        lg f "$r"; ifE f
         // GetHashCode takes (self) but rides the 2-param indirect signature
         // the identity trio shares — the extra word is ignored
         lg f "$v"; ic f 0; lg f "$r"; callIndirect f "$lfn2"; ins f "return"
