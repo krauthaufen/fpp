@@ -891,6 +891,9 @@ let private rtDeclsLin (m : Mod) : unit =
     rtDecls12 m
     rtDeclsHalf m
     declFn m "$atof" "$lt_i2d"
+    declFn m "$clseq" "$lt_ii2i"
+    declFn m "$clshash" "$lt_ii2i"
+    declFn m "$showv" "$lt_i2i"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -1264,6 +1267,55 @@ let private emitMemcopy (m : Mod) : unit =
 // $lalloc'd word, nothing moves. GC: a fixed root slot from the cbBase area,
 // scanned and relocated with the heap; slots are handed out by $cbnext and
 // never reclaimed (a JS-held callback has no observable death on linear).
+// $clseq / $clshash: the DEFAULT identity trio for a CLASS. A class compares
+// and hashes by REFERENCE (DIVERGENCES.md), so they sit in every class' vtable
+// row unless the class declares its own — without them $cmpv/$hashv walked a
+// class structurally and a genuinely RECURSIVE one (`{ value; nodes : cset<T> }`)
+// recursed until the stack ran out.
+let private emitClsEq (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    lg f "$a"; lg f "$b"; ins f "i32.eq"
+    endFn f
+
+let private emitClsHash (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    // under the moving collector the ADDRESS is not stable — fpprt keeps a
+    // side table keyed by object identity; standalone never moves, so the
+    // pointer itself is the hash
+    if gc then (lg f "$a"; callf f "$fpidh") else lg f "$a"
+    endFn f
+
+// $showv: `%A` at a hole whose type is not known statically. Mirrors the GC
+// backend's: a raw int prints decimal, the wide boxes print their value, a
+// string prints QUOTED as F# does, anything else is "?" (the GC backend's
+// answer too — the parity bar is exactly this).
+let private emitShowv (m : Mod) : unit =
+    let f = beginFn m [ "$v" ]
+    local f "$c" "i32"; local f "$msz" "i32"
+    localsDone f
+    let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
+    // not a pointer (odd, zero, or beyond memory) -> a raw int
+    memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+    lg f "$v"; ic f 1; ins f "i32.and"
+    lg f "$v"; ins f "i32.eqz"; ins f "i32.or"
+    lg f "$v"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+    ifE f; lg f "$v"; callf f "$str_of_int"; ret f; endB f
+    lg f "$v"; mem f "i32.load"; ls f "$c"
+    lg f "$c"; ic f (hv CID_FLOAT gcFloatTid); ins f "i32.eq"
+    ifE f; lg f "$v"; callf f "$ftoa_s"; ret f; endB f
+    lg f "$c"; ic f (hv CID_INT64 gcInt64Tid); ins f "i32.eq"
+    ifE f; lg f "$v"; callf f "$ltoa_s"; ret f; endB f
+    lg f "$c"; ic f (hv CID_STRING gcStrTid); ins f "i32.eq"
+    ifE f
+    ic f 34; callf f "$str_of_char"; lg f "$v"; callf f "$str_cat"
+    ic f 34; callf f "$str_of_char"; callf f "$str_cat"
+    ret f
+    endB f
+    ic f 63; callf f "$str_of_char"
+    endFn f
+
 let private emitCbreg (m : Mod) : unit =
     let f = beginFn m [ "$clo" ]
     local f "$p" "i32"
@@ -5180,6 +5232,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LEval (coreToLowE ctx u)
                LEval (LCall ("$clock_time_get", [ LConstW 1; LConstL 1000000L; LConstW MONO_SCRATCH ])) ],
              lowBoxF ctx (LPrim (DivF, [ LPrim (LToF, [ LLoad (I64, LConstW MONO_SCRATCH, 0) ]); LConstF 1000000.0 ])))
+    | EApp (EUnknown "showv", [ a ]) -> LCall ("$showv", [ coreToLowE ctx a ])
+    // enum HasFlag: (a &&& b) = b on the raw int representation
+    | EApp (EUnknown "$hasflag", [ a; b ]) ->
+        let t = freshTmp ctx
+        LDo ([ LSet (wReg t, coreToLowE ctx b) ],
+             LPrim (EqW, [ LPrim (AndW, [ coreToLowE ctx a; LGet (wReg t) ]); LGet (wReg t) ]))
+    // the REFERENCE hash: stable per object across collections (fpprt keeps
+    // the side table); standalone never moves, so the address serves
+    | EApp (EUnknown ("$idhash" | "idhash"), [ a ]) ->
+        if gc then LCall ("$fpidh", [ coreToLowE ctx a ]) else coreToLowE ctx a
     | EApp (EUnknown "prints", [ a ]) -> LDo ([ LCallVoidS ("$prints", [ coreToLowE ctx a ]) ], lowInt 0)
     // the DEBUG channel: Lower expands eprintf/eprintfn to `eprints` (fd 2)
     | EApp (EUnknown "eprints", [ a ]) -> LDo ([ LCallVoidS ("$eprints", [ coreToLowE ctx a ]) ], lowInt 0)
@@ -7896,6 +7958,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     for cn, _, _, _ in classDecls do
         match dictTryFind st.ClassId cn with
         | Some cid ->
+            // the DEFAULTS first: reference equality and identity hash, the
+            // semantics a class has unless it says otherwise
+            if st.NSlots > 0 then
+                vtRows.[cid * st.NSlots + 0] <- tblIdx m "$clseq"
+                vtRows.[cid * st.NSlots + 1] <- tblIdx m "$clshash"
             [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
             |> List.iter (fun (slot, mn) ->
                 match ownMemberNamed cn mn with
@@ -7980,6 +8047,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     rtCore12 m
     rtCoreHalf m
     emitAtof m
+    emitClsEq m
+    emitClsHash m
+    emitShowv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
