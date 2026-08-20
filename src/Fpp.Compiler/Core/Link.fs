@@ -1064,14 +1064,21 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
              // map the callee's quantified vars to this instantiation so
              // demands nested in the body specialize too
              let subst = dictNew<string, string> ()
-             if sch.Quantified.Length = inst.Length then
-                 List.zip sch.Quantified inst
-                 |> List.iter (fun (qv, n) ->
-                        // keyed by BOTH spellings: a late parked-member
-                        // retry can re-link a quantified var after one
-                        // channel rendered its id and before another did
-                        dictSet subst ("#" + string (prunedId qv)) n
-                        dictSet subst ("#" + string qv.Id) n)
+             // POSITIONAL over the common prefix, not all-or-nothing: a member
+             // of an instance with a CONTEXT-BOUND variable (`instance
+             // Add<V2<'a>, V2<'b>> when Add<'a,'b> = 'c`) quantifies one more
+             // var than the head instantiates, and the old length guard then
+             // substituted NOTHING — the body kept `+@#7` and the linear
+             // backend, which has no runtime operator dispatch, compiled it
+             // as the intArithOp default (rem: `1 + 3` answered 1).
+             List.zip (List.truncate (min sch.Quantified.Length inst.Length) sch.Quantified)
+                      (List.truncate (min sch.Quantified.Length inst.Length) inst)
+             |> List.iter (fun (qv, n) ->
+                    // keyed by BOTH spellings: a late parked-member
+                    // retry can re-link a quantified var after one
+                    // channel rendered its id and before another did
+                    dictSet subst ("#" + string (prunedId qv)) n
+                    dictSet subst ("#" + string qv.Id) n)
              // an OBJECT EXPRESSION member: monomorphic in its own scheme,
              // generic through its captures — the enclosing stamp's
              // substitution rides along explicitly

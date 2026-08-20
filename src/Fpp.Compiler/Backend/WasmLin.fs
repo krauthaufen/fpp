@@ -894,6 +894,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$clseq" "$lt_ii2i"
     declFn m "$clshash" "$lt_ii2i"
     declFn m "$showv" "$lt_i2i"
+    declFn m "$strv" "$lt_i2i"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -1301,6 +1302,9 @@ let private emitShowv (m : Mod) : unit =
     lg f "$v"; ic f 1; ins f "i32.and"
     lg f "$v"; ins f "i32.eqz"; ins f "i32.or"
     lg f "$v"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+    // BELOW the constant base is the fixed scratch area, never an object:
+    // a small even int (12) would otherwise read a "header" at address 12
+    lg f "$v"; ic f CONST_BASE; ins f "i32.lt_u"; ins f "i32.or"
     ifE f; lg f "$v"; callf f "$str_of_int"; ret f; endB f
     lg f "$v"; mem f "i32.load"; ls f "$c"
     lg f "$c"; ic f (hv CID_FLOAT gcFloatTid); ins f "i32.eq"
@@ -1313,6 +1317,32 @@ let private emitShowv (m : Mod) : unit =
     ic f 34; callf f "$str_of_char"; callf f "$str_cat"
     ret f
     endB f
+    ic f 63; callf f "$str_of_char"
+    endFn f
+
+// $strv: `string x` where the operand type is NOT statically known (a
+// generic function's `string x.V`). Same dispatch as $showv, but a string
+// renders as ITSELF — `string` is not `%A`.
+let private emitStrv (m : Mod) : unit =
+    let f = beginFn m [ "$v" ]
+    local f "$c" "i32"; local f "$msz" "i32"
+    localsDone f
+    let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
+    memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+    lg f "$v"; ic f 1; ins f "i32.and"
+    lg f "$v"; ins f "i32.eqz"; ins f "i32.or"
+    lg f "$v"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+    // BELOW the constant base is the fixed scratch area, never an object:
+    // a small even int (12) would otherwise read a "header" at address 12
+    lg f "$v"; ic f CONST_BASE; ins f "i32.lt_u"; ins f "i32.or"
+    ifE f; lg f "$v"; callf f "$str_of_int"; ret f; endB f
+    lg f "$v"; mem f "i32.load"; ls f "$c"
+    lg f "$c"; ic f (hv CID_FLOAT gcFloatTid); ins f "i32.eq"
+    ifE f; lg f "$v"; callf f "$ftoa_s"; ret f; endB f
+    lg f "$c"; ic f (hv CID_INT64 gcInt64Tid); ins f "i32.eq"
+    ifE f; lg f "$v"; callf f "$ltoa_s"; ret f; endB f
+    lg f "$c"; ic f (hv CID_STRING gcStrTid); ins f "i32.eq"
+    ifE f; lg f "$v"; ret f; endB f
     ic f 63; callf f "$str_of_char"
     endFn f
 
@@ -5087,6 +5117,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // a raw uint32 zero-extends into the unsigned 64-bit formatter
             | "uint32" ->
                 LCall ("$ultoa_s", [ lowBoxI ctx (LPrim (AndL, [ LPrim (WToL, [ coreToLowE ctx a ]); LConstL 4294967295L ])) ])
+            // an unclassified operand is decided at RUNTIME by shape — a
+            // generic `print x` handed $prints a boxed float otherwise
+            | "" -> LCall ("$strv", [ coreToLowE ctx a ])
             | _ -> coreToLowE ctx a
         LDo ([ LCallVoidS ("$prints", [ v ]); LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     // an unsigned 32-bit value prints unsigned: zero-extend the raw word
@@ -5273,6 +5306,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // string of a raw uint32: zero-extend into the unsigned 64-bit writer
     | EApp (EUnknown "string#w", [ a ]) ->
         LCall ("$ultoa_s", [ lowBoxI ctx (LPrim (AndL, [ LPrim (WToL, [ coreToLowE ctx a ]); LConstL 4294967295L ])) ])
+    // `string x` with NO static kind (a generic body's `string x.V`): decide
+    // at RUNTIME from the representation. Answering $str_of_int printed the
+    // POINTER of a boxed float.
+    | EApp (EUnknown ("string#" | "string"), [ a ]) -> LCall ("$strv", [ coreToLowE ctx a ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "string" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
     // a call to an `extern` host import: no host env yet, so answer the null
     // default (readTextRaw null -> None), letting the pipeline RUN instead of
@@ -8050,6 +8087,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitClsEq m
     emitClsHash m
     emitShowv m
+    emitStrv m
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
