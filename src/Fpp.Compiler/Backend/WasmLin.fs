@@ -519,10 +519,24 @@ let rec private printConOf (st : St) (e : Expr) : string =
          | None -> "")
     | ECast (tn, _, _) -> tn
     | EPrim (op, _) ->
-        // arithmetic carries its operand type as the op suffix (+f, -l, …)
+        // arithmetic carries its operand type as the op suffix (+f, -l, …).
+        // EVERY kind letter must strip: `v` (uint64) did not, so `x >>> 58`
+        // classified as "" and `|> int` fell through to the identity — the
+        // BOX POINTER came back as the count (DeltaOperationList64's 6-bit
+        // count, which drove the Myers diff into an endless churn).
         let n = strLen op
         let sfx = if n > 1 then op.Substring (n - 1) else ""
-        let b = if sfx = "f" || sfx = "s" || sfx = "l" || sfx = "w" then op.Substring (0, n - 1) else op
+        let b0 = if n > 1 then op.Substring (0, n - 1) else op
+        // `not` also ends in a kind letter — strip only when what remains is
+        // itself an operator
+        let stripped =
+            (sfx = "f" || sfx = "s" || sfx = "l" || sfx = "w" || sfx = "v" || sfx = "p" || sfx = "h" || sfx = "t")
+            && (match b0 with
+                | "+" | "-" | "*" | "/" | "%" | "u-" | "sqrt" | "truncate" | "abs"
+                | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~"
+                | "<" | ">" | "<=" | ">=" | "=" | "<>" -> true
+                | _ -> false)
+        let b = if stripped then b0 else op
         (match b with
          | "<" | ">" | "<=" | ">=" | "=" | "<>" | "&&" | "||" | "not"
          | "=i" | "<>i" | "=t" | "<>t" | "<t" | ">t" | "<=t" | ">=t" -> "bool"
@@ -530,8 +544,16 @@ let rec private printConOf (st : St) (e : Expr) : string =
                   (match op.Substring (0, op.IndexOf "@") with
                    | "<" | ">" | "<=" | ">=" | "=" | "<>" -> true | _ -> false) -> "bool"
          | "+" | "-" | "*" | "/" | "%" | "u-" | "sqrt" | "truncate" | "abs"
-         | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~" when b <> op ->
-             (if sfx = "l" then "int64" elif sfx = "s" then "float32" elif sfx = "w" then "uint32" else "float")
+         | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u~~~" when stripped ->
+             (match sfx with
+              | "l" -> "int64"
+              | "s" -> "float32"
+              | "w" -> "uint32"
+              | "v" -> "uint64"
+              | "p" -> "nativeint"
+              | "h" -> "float16"
+              | "t" -> "string"
+              | _ -> "float")
          | "+" | "-" | "*" | "/" | "%" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" | "u-" | "u~~~" | "abs" -> "int"
          | _ -> "")
     | EIf (_, a, b) -> (let x = printConOf st a in if x <> "" then x else printConOf st b)
