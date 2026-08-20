@@ -1040,6 +1040,11 @@ type Workspace() =
                 match d with
                 | Fpp.Core.Ir.DLet (_, v, _, e) when v.Path <> "(builtin)" ->
                     eprintfn "COREDECL %s:%d %s = %s" v.Path v.Offset v.Name (Fpp.Core.Ir.printExpr e)
+                | Fpp.Core.Ir.DLet (_, v, _, _) -> eprintfn "COREFN %s:%d %s" v.Path v.Offset v.Name
+                | Fpp.Core.Ir.DClass (n, b, own, impls) ->
+                    eprintfn "CORECLASS %s base=%A own=[%s] impls=[%s]" n b
+                        (own |> List.map fst |> String.concat ",")
+                        (impls |> List.map (fun (i, ms) -> i + ":" + (ms |> List.map fst |> String.concat "/")) |> String.concat ";")
                 | _ -> ()
         if not (List.isEmpty errs) then [||], errs
         elif low then Fpp.Backend.WasmLin.emitLinearLow linked

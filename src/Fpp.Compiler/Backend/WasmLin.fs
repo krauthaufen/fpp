@@ -7221,10 +7221,20 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // heap scribble). A prelude method a gap still can't lower stubs loudly.
     for d in decls0 do
         match d with
-        | DClass (_, _, _, impls) ->
+        | DClass (_, _, own, impls) ->
             for _, ms in impls do
                 for _, v in ms do
                     visit (v.Path + ":" + string v.Offset)
+            // ... and the class' OWN members: an `override` of an abstract
+            // base member dispatches through the same vtable but lives in
+            // `own`, not `impls`. Leaving them out dropped every
+            // HashEmpty/HashLeaf/HashInner override, their rows stayed 0, and
+            // `HashMap.ofList` dispatched through index 0 — an indirect call
+            // whose signature did not match (the whole Map/Set/HashMap
+            // cluster). deadCodeEliminate already parked these on the
+            // constructor, so only CONSTRUCTED classes reach here.
+            for _, v in own do
+                visit (v.Path + ":" + string v.Offset)
         | _ -> ()
     // keep decls0 order (prelude before user — inits sequence correctly),
     // filtered to what is reachable

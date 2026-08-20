@@ -1412,6 +1412,10 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
         |> List.collect (fun (sub, cn, impls, own) ->
             [ DRecord (sub, [], [], false)
               DClass (sub, Some cn, own, impls) ])
+    if System.Environment.GetEnvironmentVariable "FPP_INSTCLS" = "1" then
+        for sub, cn, _, own in vecToList instClasses do
+            eprintfn "INSTCLS %s <- %s (%d own)" sub cn (List.length own)
+        for k, _ in dictPairs vtableLayoutDep do eprintfn "VTLAYDEP %s" k
     emitted @ (dictPairs stamped |> List.map snd) @ instDecls, vecToList errors
 
 // The link step, v0: demand-closure over symbols. Roots are the program's
