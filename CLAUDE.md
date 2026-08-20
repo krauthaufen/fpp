@@ -12,10 +12,17 @@ together, and they have each caught things review did not.
 
 ```bash
 dotnet build -c Release                      # ~30 s
-dotnet run  -c Release --project tests/Fpp.Tests      # ~2 min, 658 tests
+dotnet run  -c Release --project tests/Fpp.Tests      # ~4 min, 692 tests
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
+./tests/run-gates.sh --full                           # ~6 min, all 30, parallel
 ```
+
+There is ONE backend: wasm-linear over the fpprt/Whippet reactor (the C
+backend shares its middle end). The wasm-GC backend — `BinDriver.fs`, the
+`--wasmgc` flag, and the source maps that only it could emit — was deleted
+once every gate ran on the linear one. `fixpoint.fsx` still accepts the
+`linear` argument and ignores it.
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
