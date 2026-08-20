@@ -891,6 +891,7 @@ let private rtDeclsLin (m : Mod) : unit =
     rtDecls12 m
     rtDeclsHalf m
     declFn m "$atof" "$lt_i2d"
+    declFn m "$novt" "$lt_ii2i"
     declFn m "$clseq" "$lt_ii2i"
     declFn m "$clshash" "$lt_ii2i"
     declFn m "$showv" "$lt_i2i"
@@ -1273,6 +1274,16 @@ let private emitMemcopy (m : Mod) : unit =
 // row unless the class declares its own — without them $cmpv/$hashv walked a
 // class structurally and a genuinely RECURSIVE one (`{ value; nodes : cset<T> }`)
 // recursed until the stack ran out.
+// $novt: table index 0. A vtable row of 0 means NO IMPLEMENTATION; calling
+// through it used to run whatever function happened to be first in the table
+// (an eta-expanded dispatcher, which then called itself forever). Reserving
+// index 0 for a trap turns a missing row into an immediate, locatable failure.
+let private emitNoVt (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    localsDone f
+    ins f "unreachable"
+    endFn f
+
 let private emitClsEq (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     localsDone f
@@ -5658,6 +5669,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 branch (LCall ("$literNext", [ LGet (wReg t) ])) (isBuiltinIter ())
              elif bi = "IEnumerator" && method = "Current" then
                 branch (LCall ("$literCur", [ LGet (wReg t) ])) (isBuiltinIter ())
+             elif bi = "IEnumerator" && method = "Dispose" then
+                // the BUILT-IN iterator holds no resource: disposing it is a
+                // no-op. It has no vtable row, so without this `use e =
+                // xs.GetEnumerator ()` dispatched through a row of 0.
+                branch (lowInt 0) (isBuiltinIter ())
              elif gc && not (List.isEmpty args) then
                 // ROOT the receiver and every argument across each other's
                 // (possibly allocating) evaluations: register t and the wasm
@@ -6598,6 +6614,10 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
         | "array" -> [ CID_ARRAY ]
         | _ -> []
     let ids = if List.isEmpty scalarCids then typeTestIds ctx.LSt tn else scalarCids
+    // NIL is the null word, not a cons cell: the empty list is still a list,
+    // so `([] : int list) :? list<int>` answers true (the pointer test below
+    // rejects 0)
+    let nilIsMatch = (match bare with "list" | "seq" | "[]" -> true | _ -> false)
     let t = freshTmp ctx
     let r = freshTmp ctx
     let h = freshTmp ctx
@@ -6608,7 +6628,7 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
     LDo ([ LSet (wReg t, v)
            LIf (isPtr,
                 [ LSet (wReg h, lowHeaderCid (wReg t)); LSet (wReg r, matchAny) ],
-                [ LSet (wReg r, LConstW 0) ]) ],
+                [ LSet (wReg r, (if nilIsMatch then LPrim (EqW, [ LGet (wReg t); LConstW 0 ]) else LConstW 0)) ]) ],
          LGet (wReg r))
 
 let private lowOpIns (op : LOp) : string =
@@ -7448,6 +7468,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             | DLet (_, v, _, _) -> (dictTryFind reachable (v.Path + ":" + string v.Offset)).IsSome
             | _ -> false)
     let m = modNew ()
+    // table index 0 is the missing-row trap (see $novt): a vtable row of 0
+    // means NO implementation, and calling through it used to run whatever
+    // function registered first. Claimed HERE, before any lambda.
+    tblIdx m "$novt" |> ignore
     let st =
         { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
           Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
@@ -8084,6 +8108,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     rtCore12 m
     rtCoreHalf m
     emitAtof m
+    emitNoVt m
     emitClsEq m
     emitClsHash m
     emitShowv m
