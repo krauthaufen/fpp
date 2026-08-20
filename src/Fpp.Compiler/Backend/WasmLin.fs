@@ -5475,9 +5475,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                                 "float"; "int64"; "uint64"; "string" ]) ->
         // `:?>` downcast to a type we carry a class-id for: check the header
         // and trap on a mismatch, then yield the value unchanged
+        // a failed `:?>` THROWS (an InvalidCastException in F#), it does not
+        // trap: `try (o :?> B).N with _ -> ...` has to catch it. A trap is
+        // uncatchable and killed the whole module.
         let t = freshTmp ctx
         LDo ([ LSet (wReg t, coreToLowE ctx e2)
-               LIf (LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]), [ LTrap ], []) ],
+               LIf (LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]),
+                    [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"invalid cast\"")) ], []) ],
              LGet (wReg t))
     | ECast (_, e2, _) ->
         // `:>` widening, and `:?>` to a type without a class-id: the identity —
@@ -7405,10 +7409,22 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             let refs = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsNone)
             if not (List.isEmpty scalars) then
                 let m = dictNew<string, int * string> ()
+                // C's natural alignment: each scalar sits at a multiple of its
+                // own width and the struct's SIZE rounds up to the widest
+                // member's. `{ M : float; T : byte }` is 16 bytes in C, not 9 —
+                // an array of them strides 16, and a foreign reader walking at
+                // 9 read every element after the first at the wrong offset.
+                let widthOf (ty : string) = snd (optGet (storLTy ty))
+                let maxA = scalars |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
+                let align (o : int) (a : int) = ((o + a - 1) / a) * a
                 let mutable off = HDR
                 for (fn, ty) in scalars do
+                    let w = widthOf ty
+                    off <- HDR + align (off - HDR) w
                     dictSet m fn (off, ty)
-                    off <- off + snd (optGet (storLTy ty))
+                    off <- off + w
+                // pad to the widest member so the ARRAY stride is C's
+                off <- HDR + align (off - HDR) maxA
                 let firstRefWord = off / 4
                 for (fn, ty) in refs do
                     dictSet m fn (off, ty)
@@ -7867,6 +7883,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // intern all string constants FIRST, so the heap starts after them
     for d in decls do
         match d with DLet (_, _, _, e) -> scanConsts st e | _ -> ()
+    // the failed-downcast message, interned like any other literal
+    (if gc then internStrGc st "\"invalid cast\"" |> ignore else internStr st "\"invalid cast\"" |> ignore)
     // bool prints spell True/False at runtime — intern both up front
     (if gc then internStrGc st "\"True\"" |> ignore else internStr st "\"True\"" |> ignore)
     (if gc then internStrGc st "\"False\"" |> ignore else internStr st "\"False\"" |> ignore)
