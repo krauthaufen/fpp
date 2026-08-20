@@ -826,7 +826,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         d
     | ELit (LChar s) ->
         let d = slot f
-        stmt f (sref d + " = TAGI(" + string (Fpp.Backend.BinDriver.charCode s) + ");")
+        stmt f (sref d + " = TAGI(" + string (Fpp.Backend.StrLit.charCode s) + ");")
         d
     | ELit LUnit -> unitV ()
     | ELit LNull ->
@@ -842,7 +842,7 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | ELit (LString s) ->
         let d = slot f
         // unescape yields UTF-16LE bytes; the units go in RAW
-        let bs = Fpp.Backend.BinDriver.unescape s
+        let bs = Fpp.Backend.StrLit.unescape s
         let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
         stmt f (sref d + " = fpp_str_c16(" + cstr txt + ", " + string (bs.Length / 2) + ");")
         d
@@ -2486,14 +2486,14 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
         stmt f ("if (" + sref sv + " != TAGI(" + (if b then "1" else "0") + ")) "
                 + sref ok + " = TAGI(0);")
     | PLit (LChar s) ->
-        stmt f ("if (" + sref sv + " != TAGI(" + string (Fpp.Backend.BinDriver.charCode s) + ")) "
+        stmt f ("if (" + sref sv + " != TAGI(" + string (Fpp.Backend.StrLit.charCode s) + ")) "
                 + sref ok + " = TAGI(0);")
     | PLit LUnit -> ()
     | PLit LNull ->
         stmt f ("if (" + sref sv + " != 0) " + sref ok + " = TAGI(0);")
     | PLit (LString s) ->
         let lit = slot f
-        let bs = Fpp.Backend.BinDriver.unescape s
+        let bs = Fpp.Backend.StrLit.unescape s
         let txt = bs |> Array.map (fun b -> string (char (int b))) |> Array.toList |> String.concat ""
         stmt f (sref lit + " = fpp_str_c16(" + cstr txt + ", " + string (bs.Length / 2) + ");")
         stmt f ("if (!fpp_eqv(" + sref sv + ", " + sref lit + ")) " + sref ok + " = TAGI(0);")
@@ -2955,7 +2955,7 @@ and private emitRaw (st : CSt) (f : CFn) (e : Expr) : char * string =
             let txt = if t0.EndsWith "." then t0 + "0" else t0
             rk, (if rk = 's' then "(float)" + txt else txt)
         | ELit (LBool b) -> 'i', (if b then "1" else "0")
-        | ELit (LChar s) -> 'i', string (Fpp.Backend.BinDriver.charCode s)
+        | ELit (LChar s) -> 'i', string (Fpp.Backend.StrLit.charCode s)
         | EVar (v, _) | EVarI (v, _, _) ->
             let i = (dictTryFind f.Locals (v.Path, v.Offset)).Value
             let k, n = vecGet f.RawVars (-i - 1)

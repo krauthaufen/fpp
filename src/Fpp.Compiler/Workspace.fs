@@ -258,7 +258,6 @@ type Workspace() =
     /// generated path -> the generator that wrote it, for blaming diagnostics
     let generatedBy = dictNew<string, string> ()
     /// where each piece of the last emitted module came from
-    let mutable lastPositions : (int * string * int) list = []
     /// record instance selections for the pick checker (set BEFORE the
     /// first check — the project check is memoized)
     let mutable logPicks = false
@@ -266,7 +265,6 @@ type Workspace() =
     /// function that will TRAP if reached; `fpp build --strict` fails on
     /// them instead of warning, since a clean check that hands over a
     /// trapping binary was this project's most repeated bug shape
-    let mutable lastWarnings : string list = []
     /// hand-written text, captured before any generator rewrites a file: the
     /// INPUT to generation must stay what the human wrote, or a second compile
     /// would feed a generator its own output
@@ -519,11 +517,23 @@ type Workspace() =
               Members = members; Fields = fields; Classes = classes; Trees = trees
               Aliases = aliases; BuiltinInfer = binf })
 
+    /// The LINKED (monomorphized, DCE'd) top-level names for the wasm-linear
+    /// target. The stamping tests used to read clone names out of the emitted
+    /// module's name section; the linear emitter names functions by hash, so
+    /// they assert on the names the stamper actually produced instead.
+    member this.LinkedNames () : string list =
+        let linked, _ = this.LinkedCoreFor false true
+        linked
+        |> List.choose (fun d ->
+            match d with
+            | Fpp.Core.Ir.DLet (_, v, _, _) -> Some v.Name
+            | _ -> None)
+
     /// Turn on selection recording — call before the first check.
     member this.RecordPicks () : unit = logPicks <- true
     /// The backend warnings of the last emit (each stub names its function
     /// and why it could not be compiled).
-    member this.EmitWarnings : string list = lastWarnings
+    member this.EmitWarnings : string list = Fpp.Backend.WasmLin.lastWarnings ()
     /// The recorded selections, one line each (see Classes.select).
     member this.InstancePicks : string list =
         vecToList (this.ProjectCheck ()).Classes.PickLog
@@ -588,8 +598,6 @@ type Workspace() =
     /// output, and inlining legitimately removes the very functions those
     /// gates look for. Each pass is checked on its own output rather than
     /// through whatever survives the ones after it.
-    member this.EmitProgramWasmRaw () : byte[] * string list = this.EmitCore false
-
     /// Marks a file as generated: such files are compiled, but never shown to
     /// a generator (the staging rule) and never regenerated from.
     static member GeneratedPrefix = "(generated)/"
@@ -786,17 +794,27 @@ type Workspace() =
                 + "let viewTypes : (string * string * (string * string) list) list =\n"
                 + (if List.isEmpty typeRows then "    []\n"
                    else "    [\n" + String.concat "\n" typeRows + " ]\n")
+            let userHome = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
             let wasmtime =
                 match System.Environment.GetEnvironmentVariable "FPP_WASMTIME" with
-                | null | "" ->
-                    System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-                    + "/.wasmtime/bin/wasmtime"
+                | null | "" -> userHome + "/.wasmtime/bin/wasmtime"
                 | p -> p
+            // a generator is a REACTOR-LINEAR module now: it imports fpprt, so
+            // it runs under --preload. Same resolution order as the CLI's.
+            let reactor =
+                let candidates =
+                    [ System.Environment.GetEnvironmentVariable "FPP_REACTOR"
+                      System.IO.Path.Combine (System.AppContext.BaseDirectory, "fpprt_reactor_mmc.wasm")
+                      userHome + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
+                      userHome + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
+                match candidates |> List.tryFind (fun c -> not (isNull c) && c <> "" && System.IO.File.Exists c) with
+                | Some r -> r
+                | None -> userHome + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm"
             for gname, gsources in vecToList fppGenerators do
                 let pw = Workspace()
                 pw.SetFileText "(view)/view.fpp" viewSrc
                 for path, text in gsources do pw.SetFileText path text
-                let bytes, perrs = pw.EmitProgramWasm ()
+                let bytes, perrs = pw.EmitProgramWasmPreload ()
                 if not (List.isEmpty perrs) then
                     for e in perrs |> List.truncate 3 do
                         vecAdd pluginErrors ("F++ generator '" + gname + "' does not compile: " + e)
@@ -804,7 +822,9 @@ type Workspace() =
                     let tmp = System.IO.Path.GetTempFileName () + ".wasm"
                     System.IO.File.WriteAllBytes (tmp, bytes)
                     let psi =
-                        System.Diagnostics.ProcessStartInfo (wasmtime, "run -W gc=y,exceptions=y " + tmp)
+                        System.Diagnostics.ProcessStartInfo (
+                            wasmtime,
+                            "run -W gc=y,exceptions=y --env FPPRT_HEAP_MB=256 --preload fpprt=" + reactor + " " + tmp)
                     psi.RedirectStandardOutput <- true
                     psi.RedirectStandardError <- true
                     use proc = System.Diagnostics.Process.Start psi
@@ -826,9 +846,6 @@ type Workspace() =
                             let after = files |> List.skip (min (List.length files) (anchorIndex + 1))
                             db.SetInput "project" "" (box (before @ [ path ] @ after))
 
-
-    member private this.EmitCore (optimize : bool) : byte[] * string list =
-        this.EmitCoreMapped optimize ""
 
     /// Everything both backends share: generators, check, lower, link,
     /// monomorphize, optimize, DCE. Returns the linked program and any
@@ -982,17 +999,6 @@ type Workspace() =
             if not (List.isEmpty monoErrs) then [], monoErrs
             else linked, []
 
-    member private this.EmitCoreMapped (optimize : bool) (mapUrl : string) : byte[] * string list =
-        let linked, errs = this.LinkedCore optimize
-        if not (List.isEmpty errs) then [||], errs
-        else
-            let bytes, berrs, warns, positions =
-                Fpp.Backend.BinDriver.emitBinaryWithPositions mapUrl linked
-            for w in warns do ewarn ("warn: " + w)
-            lastWarnings <- warns
-            lastPositions <- positions
-            bytes, berrs
-
     /// The program as ONE C translation unit against the fpprt runtime
     /// (runtime/): gcc for native, emcc for wasm-linear. PLAN-CBACK.md.
     /// The program as a wasm-LINEAR module emitted DIRECTLY — no C
@@ -1065,26 +1071,6 @@ type Workspace() =
         let linked, errs = this.LinkedCore true
         if not (List.isEmpty errs) then "", errs
         else Fpp.Backend.CEmit.emitC linked
-
-    /// The program as a direct .wasm module: bytes out, no text anywhere.
-    member this.EmitProgramWasm () : byte[] * string list = this.EmitCore true
-
-    /// The program AND its source map. The module carries a `sourceMappingURL`
-    /// custom section naming `mapUrl`, so a browser loads the map and shows the
-    /// .fpp files — with their text embedded, so the sources need not be
-    /// fetchable separately.
-    member this.EmitProgramWasmWithSourceMap (mapUrl : string) : byte[] * string * string list =
-        // NOT optimized: inlining dissolves frames and moves code between
-        // lines, and a debugger that disagrees with the source is worse than
-        // no debugger. A debug build is for stepping; ship the plain one.
-        let bytes, errs = this.EmitCoreMapped false mapUrl
-        let sources =
-            // the prelude too, under the path its declarations carry: stepping
-            // into a library function should show that function, not nothing
-            ("(builtin)", Fpp.Prelude.preludeSource ())
-            :: (this.ProjectFiles |> List.map (fun p -> p, this.FileText p))
-        let map = Fpp.Backend.SourceMap.build mapUrl lastPositions sources
-        bytes, map, errs
 
     /// Produce a fat-IR library from the current project files.
     member this.BuildLibrary () : string * string list =

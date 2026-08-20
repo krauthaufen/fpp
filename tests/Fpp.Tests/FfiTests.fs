@@ -164,37 +164,6 @@ let hostImportTests =
     // test is the CONTRACT — strings only, null for "not there", newline
     // separated for a list — so any host can implement it.
     testList "host imports" [
-        test "the four host services are satisfied by a preloaded module" {
-            let ws = Workspace()
-            ws.SetFileText "seam.fpp" (System.IO.File.ReadAllText (
-                System.IO.Path.GetFullPath (__SOURCE_DIRECTORY__ + "/../../stdlib/bootstrap.fpp")))
-            ws.SetFileText "prog.fpp" (String.concat "\n" [
-                "module P"
-                "open Fpp.Prelude"
-                "let r1 ="
-                "    match hostReadText \"/there\" with"
-                "    | Some t -> print (\"read \" + t)"
-                "    | None -> print \"MISSING\""
-                "let r2 ="
-                "    match hostReadText \"/gone\" with"
-                "    | Some t -> print (\"BAD \" + t)"
-                "    | None -> print \"absent\""
-                "let r3 = print (string (hostExists \"/there\") + \" \" + string (hostExists \"/gone\"))"
-                "let r4 = print (String.concat \"|\" (Array.toList (hostListDir \"/d\")))"
-                "let r5 = print (string (Array.length (hostListDir \"/empty\")))"
-                "let r6 = print (hostCanonicalize \"/a/./b\")"
-                "" ])
-            // the env-import host contract is the wasm-GC HOSTING seam; the
-            // linear self-host reads files through WASI instead, so this
-            // stays pinned to the legacy emitter and retires with it
-            let bytes, errs = ws.EmitProgramWasm ()
-            Expect.isEmpty errs "the host surface emits"
-            // every import is declared against module "env"
-            Expect.isTrue ((System.Text.Encoding.Latin1.GetString bytes).Contains "readTextRaw") "readText is an import"
-            Expect.isTrue ((System.Text.Encoding.Latin1.GetString bytes).Contains "existsRaw") "exists is an import"
-            Expect.isTrue ((System.Text.Encoding.Latin1.GetString bytes).Contains "listDirRaw") "listDir is an import"
-            Expect.isTrue ((System.Text.Encoding.Latin1.GetString bytes).Contains "canonicalizeRaw") "canonicalize is an import"
-        }
         test "a missing file is None, not an exception" {
             // Runnable half of the contract: the .NET side of the seam, which
             // the dotnet-hosted compiler uses today and which the F++ side

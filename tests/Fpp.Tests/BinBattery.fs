@@ -3,7 +3,7 @@ module Fpp.Tests.BinBattery
 open Expecto
 
 // End-to-end battery for the direct binary backend: each case is a small F++
-// program compiled through Workspace.EmitProgramWasm (pure bytes, no wat),
+// program compiled through Workspace.EmitProgramWasmPreload (pure bytes,
 // executed under wasmtime, and pinned to its exact stdout. Every program
 // class the binary driver claims to support must have a case here — this is
 // the regression gate the porting loop runs against.

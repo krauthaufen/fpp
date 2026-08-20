@@ -88,7 +88,7 @@ let divergenceGate =
 let private disassemble (src : string) : string =
     let ws = Workspace()
     ws.SetFileText "prog.fpp" src
-    let bytes, errors = ws.EmitProgramWasm ()
+    let bytes, errors = ws.EmitProgramWasmPreload ()
     Expect.isEmpty errors "emission errors"
     let tmp = System.IO.Path.GetTempFileName() + ".wasm"
     System.IO.File.WriteAllBytes(tmp, bytes)
@@ -131,15 +131,11 @@ let noBoxGate =
                     "    print floats.Length"
                     "" ]
             let text = disassemble src
-            // The backing store is chosen from the struct's fields: a pair of
-            // doubles is backed by an f64 ARRAY, so reading a field is the
-            // array.get alone. Integer words would mean a load into a general
-            // register and a move across to the FPU for every field. The bytes
-            // are the same either way, so the C image still holds.
-            Expect.stringContains text "array.new_fixed $pf64" "V2d arrays are packed, and backed by floats"
-            Expect.stringContains text "array.new_fixed $parr_i" "int arrays are flat i32"
-            Expect.stringContains text "array.new_fixed $parr_f" "float arrays are flat f64"
-            Expect.isFalse (text.Contains "$sarr_") "no SoA wrapper for POD structs"
+            // A POD element is stored INLINE and headerless — the element's
+            // fields sit at ARRHDR + i*stride and a field read is a plain
+            // load. So there is no per-element box to build and no
+            // dispatching accessor: those are what this asserts, since the
+            // linear image has no per-representation array type to name.
             Expect.isFalse (text.Contains "$indexv") "no dispatching reader"
             Expect.isFalse (text.Contains "$setv") "no dispatching writer"
             Expect.isFalse (text.Contains "$creatv") "no dispatching allocator"
@@ -181,11 +177,12 @@ let noBoxGate =
                     // the read is inline AND its base is hoisted out of the
                     // loop, so neither a call nor the handle appears in here;
                     // what remains is the load itself
-                    if seg.Contains "array.get" && seg.Contains "f64.add" then loopSeg <- seg
+                    if seg.Contains "f64.load" && seg.Contains "f64.add" then loopSeg <- seg
                 i <- i + 1
             Expect.isTrue (loopSeg <> "") "the summation loop is found"
-            for alloc in [ "call $off"; "call $oss"; "call $ofl"; "call $ofi"
-                           "struct.new $box"; "struct.new $r_V2d"; "call $addv" ] do
+            // linear allocates through ONE funnel, so the invariant is a
+            // single assertion: the loop body must not call it.
+            for alloc in [ "call $fpalloc"; "call $fpallocn"; "call $lalloc" ] do
                 Expect.isFalse (loopSeg.Contains alloc) (sprintf "'%s' in the hot loop" alloc)
             Expect.equal (runProgram src) "4\n" "and the sum is right"
         }
@@ -697,17 +694,9 @@ let qualifiedCasePatternTests =
                 "let r = print (string (run (Chose { Head = \"h\"; Ctx = [ \"ab\"; \"cde\" ] })))"
                 "" ])
             Expect.isEmpty (ws.Diagnostics "m.fpp") "clean"
-            let bytes, errs = ws.EmitProgramWasm ()
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "emits"
-            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-            System.IO.File.WriteAllBytes(tmp, bytes)
-            let psi = System.Diagnostics.ProcessStartInfo(wasmtime, "run -W gc=y,exceptions=y " + tmp)
-            psi.RedirectStandardOutput <- true
-            psi.RedirectStandardError <- true
-            use p = System.Diagnostics.Process.Start psi
-            let out = p.StandardOutput.ReadToEnd()
-            p.WaitForExit()
-            System.IO.File.Delete tmp
+            let _code, out, _err = Fpp.Tests.WasmRun.run bytes
             Expect.equal out "5\n" "the payload's list field is walked"
         }
         test "a qualified nullary case still matches" {

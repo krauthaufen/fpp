@@ -152,12 +152,14 @@ let generateHost (files : (string * string) list) : string =
 // the BINARY backend is the only backend: every fixpoint is a byte fixpoint
 let binMode = true
 
-/// `linear` moves the whole fixpoint onto the wasm-LINEAR backend: stage-0
+/// The fixpoint runs on the wasm-LINEAR backend, the only backend: stage-0
 /// emits through LowIR/WasmLin, stage-1 is that module merged with the fpprt
 /// reactor running under wasmtime, its sources served as real FILES through
 /// the WASI preopen (readTextRaw is path_open/fd_read there), and it must
-/// re-emit the same LINEAR bytes. Composes with `self`.
-let linMode = System.Environment.GetCommandLineArgs () |> Array.contains "linear"
+/// re-emit the same LINEAR bytes. Composes with `self`. (`linear` was the
+/// flag that selected it while the wasm-GC backend still existed; it is
+/// accepted and ignored.)
+let linMode = true
 
 // stage-0 lowering recurses per expression node; the compiler's own biggest
 // functions overflow fsi's default thread stack, so emission runs on a
@@ -175,7 +177,7 @@ let emit (label : string) (files : (string * string) list) : string =
     for path, text in files do ws.SetFileText path text
     let wat, errs =
         let bytes, errs =
-            onBigStack (fun () -> if linMode then ws.EmitProgramWasmReactor () else ws.EmitProgramWasm ())
+            onBigStack (fun () -> ws.EmitProgramWasmReactor ())
         System.Text.Encoding.Latin1.GetString bytes, errs
     if not (List.isEmpty errs) then
         printfn "%s: %d emit errors" label errs.Length
@@ -256,9 +258,7 @@ let report (expected : string) (actual : string) =
 /// two stages on a program neither of them is.
 let selfHost = System.Environment.GetCommandLineArgs () |> Array.contains "self"
 
-let driverPath =
-    if linMode then root + "/tests/bootstrap/compiledrive-lin.fpp"
-    else root + "/tests/bootstrap/compiledrive-bin.fpp"
+let driverPath = root + "/tests/bootstrap/compiledrive-lin.fpp"
 
 /// The names the corpus is SERVED under. In self mode they are the
 /// compiler's own files, which is what the driver must name too.

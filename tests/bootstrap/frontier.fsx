@@ -48,7 +48,7 @@ for k in 1 .. min limit compilerFiles.Length do
         let files = compilerFiles |> List.truncate k
         let ws = Workspace()
         for f in files do ws.SetFileText f (System.IO.File.ReadAllText f)
-        let bytes, errors = ws.EmitProgramWasm ()
+        let bytes, errors = ws.EmitProgramWasmReactor ()
         if not (List.isEmpty errors) then
             stop <- true
             printfn "%2d %-42s %d ERRORS" k (short (List.last files)) errors.Length

@@ -124,17 +124,15 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
     // handing over the binary anyway is right for the porting workflow
     // (unreached surface stubs are routine there) and wrong for a program
     // someone intends to ship — this flag draws that line.
-    let failOnStubs (bytes : byte[]) : int =
+    let strictBlocked () : bool =
         let stubs = ws.EmitWarnings |> List.filter (fun w -> w.StartsWith "stubbed ")
         if strict && not (List.isEmpty stubs) then
             for s in stubs do eprintfn "error (strict): %s" s
             eprintfn "error (strict): %d function(s) would trap if reached" (List.length stubs)
-            1
-        else
-            System.IO.File.WriteAllBytes(out, bytes)
-            0
+            true
+        else false
     // an `-o something.c` selects the C backend (fpprt runtime); anything
-    // else is the wasm-GC module
+    // else is the wasm module
     if out.EndsWith ".c" then
         let text, errors = ws.EmitProgramC ()
         if not (List.isEmpty errors) then
@@ -143,25 +141,20 @@ let private build (strict : bool) (defines : string list) (out : string) (files 
         else
             System.IO.File.WriteAllText(out, text)
             0
-    elif linearBackend then
-        // --linear: the direct wasm-LINEAR module, no C compiler in the path.
-        // --lowir additionally routes supported functions through the shared
+    else
+        // the wasm-LINEAR module, no C compiler in the path. `--lowir`
+        // additionally routes supported functions through the shared
         // LowIR (Core/LowIR.fs) rather than the hand-lowering.
         let bytes, errors = ws.EmitProgramWasmLinearWith lowirBackend
         if not (List.isEmpty errors) then
             for e in errors |> List.distinct do eprintfn "error: %s" e
             1
+        elif strictBlocked () then 1
         elif Fpp.Backend.WasmLin.gc then
             mergeGcModule bytes out
         else
             System.IO.File.WriteAllBytes(out, bytes)
             0
-    else
-        let bytes, errors = ws.EmitProgramWasm ()
-        if not (List.isEmpty errors) then
-            for e in errors do eprintfn "error: %s" e
-            1
-        else failOnStubs bytes
 
 // `fpp exe` — a platform executable. The module is compiled to machine code at
 // BUILD time and linked into a launcher that embeds wasmtime, so the result
@@ -558,17 +551,16 @@ let main argv =
     // BACKEND SELECTION. The DEFAULT is wasm-linear with the fpprt/Whippet
     // reactor as its collector (wasm-merge at link time): the configuration
     // that self-hosts byte-exactly, runs every browser leg, and carries
-    // deterministic cleanup. `--wasmgc` keeps the legacy wasm-GC backend
-    // available as a cross-check for one release; `--linear` is the
-    // standalone bump-allocator module (no collector — emitter debugging
-    // and short-lived programs only); `--gc` is the default spelled out.
-    let useWasmGc = argl0 |> List.exists (fun a -> a = "--wasmgc")
+    // deterministic cleanup. `--linear` is the standalone bump-allocator
+    // module (no collector — emitter debugging and short-lived programs
+    // only); `--gc` is the default spelled out. (`--wasmgc` named the
+    // wasm-GC backend, which is gone.)
     let standalone = argl0 |> List.exists (fun a -> a = "--linear" || a = "--lowir")
-    let useGc = not useWasmGc && (not standalone || argl0 |> List.exists (fun a -> a = "--gc"))
+    let useGc = not standalone || argl0 |> List.exists (fun a -> a = "--gc")
     Fpp.Backend.WasmLin.gc <- useGc
     lowirBackend <- (argl0 |> List.exists (fun a -> a = "--lowir")) || useGc
     linearBackend <- standalone || useGc
-    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc" && a <> "--wasmgc") with
+    match argl0 |> List.filter (fun a -> a <> "--strict" && a <> "--linear" && a <> "--lowir" && a <> "--gc") with
     | [ "check"; proj ] when isProject proj ->
         (match openProject proj with
          | Some (files, _, defs) -> check strict defs files

@@ -39,7 +39,6 @@ let private wholeFrontier =
         root + "/src/Fpp.Compiler/Core/Plugins.fs"
         root + "/src/Fpp.Compiler/Backend/WasmBinary.fs"
         root + "/src/Fpp.Compiler/Backend/EmitBin.fs"
-        root + "/src/Fpp.Compiler/Backend/BinDriver.fs"
         root + "/src/Fpp.Compiler/Query.fs" ]
 
 let private runWasm (files : string list) : string =

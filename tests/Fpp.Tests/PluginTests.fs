@@ -919,19 +919,15 @@ let monoTests =
                     "let rc = print c"
                     "let rd = print d"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasmRaw ()
-            let wat = System.Text.Encoding.Latin1.GetString bytes
-            Expect.isEmpty errs "compiles"
-            // wasm identifiers sanitize '$' to '_'
-            Expect.isTrue (wat.Contains "id2_V2d") "V2d instantiation stamped"
-            Expect.isTrue (wat.Contains "id2_Pt") "Pt instantiation stamped"
-            // definitions are followed by their parameter list; calls are not
-            let defsOf (needle : string) =
-                wat.Split([| needle |], System.StringSplitOptions.None).Length - 1
+            // the stamper's own output: the linear emitter names functions by
+            // hash, so the clone names are read from the LINKED core
+            let names = ws.LinkedNames ()
+            let defsOf (n : string) = names |> List.filter (fun x -> x = n) |> List.length
             // exactly one clone per struct type, no clone per reference type
-            Expect.equal (defsOf "_id2_V2d") 1 "one V2d clone"
-            Expect.equal (defsOf "_id2_Pt") 1 "one Pt clone"
-            Expect.isFalse (wat.Contains "id2_string") "reference instantiations share the canonical body"
+            Expect.equal (defsOf "id2$V2d") 1 "one V2d clone"
+            Expect.equal (defsOf "id2$Pt") 1 "one Pt clone"
+            Expect.isFalse (names |> List.exists (fun x -> x.StartsWith "id2$string"))
+                "reference instantiations share the canonical body"
         }
         test "classifier: struct -> stamp, reference -> canon" {
             let isStruct (n : string) = n = "V2d"
@@ -961,17 +957,14 @@ let monoPropagationTests =
                     "let b = print (outer 5)"
                     "let ra = print a.X"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasmRaw ()
-            let wat = System.Text.Encoding.Latin1.GetString bytes
-            Expect.isEmpty errs "compiles"
-            let defsOf (needle : string) =
-                wat.Split([| needle |], System.StringSplitOptions.None).Length - 1
-            Expect.equal (defsOf "_outer_V2d") 1 "outer stamped at V2d"
+            let names = ws.LinkedNames ()
+            let defsOf (n : string) = names |> List.filter (fun x -> x = n) |> List.length
+            Expect.equal (defsOf "outer$V2d") 1 "outer stamped at V2d"
             // the nested generic call inherits the caller's instantiation
-            Expect.equal (defsOf "_wrap_V2d") 1 "inner call specialized too"
+            Expect.equal (defsOf "wrap$V2d") 1 "inner call specialized too"
             // int goes through the shared bodies, no clones
-            Expect.equal (defsOf "_outer_int") 0 "reference/immediate uses share"
-            Expect.equal (defsOf "_wrap_int") 0 "reference/immediate uses share"
+            Expect.equal (defsOf "outer$int") 0 "reference/immediate uses share"
+            Expect.equal (defsOf "wrap$int") 0 "reference/immediate uses share"
         }
     ]
 
@@ -997,24 +990,15 @@ let monoLayoutTests =
                     "let a = print (accum pts (fun p -> p.X + p.Y))"
                     "let b = print (accum ints (fun n -> 0.5))"
                     "" ])
-            let bytes, errs = ws.EmitProgramWasmRaw ()
-            let wat = System.Text.Encoding.Latin1.GetString bytes
+            let bytes, errs = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errs "generic array code compiles once specialized"
-            let defsOf (needle : string) =
-                wat.Split([| needle |], System.StringSplitOptions.None).Length - 1
+            let names = ws.LinkedNames ()
+            let defsOf (n : string) = names |> List.filter (fun x -> x = n) |> List.length
             // int[] and V2d[] have different representations, so BOTH get
             // their own stamp — sharing would be a silent deoptimization
-            Expect.equal (defsOf "_accum_V2d") 1 "struct element stamp"
-            Expect.equal (defsOf "_accum_int") 1 "primitive element stamp"
-            let tmp = System.IO.Path.GetTempFileName() + ".wasm"
-            System.IO.File.WriteAllBytes(tmp, bytes)
-            let home = System.Environment.GetFolderPath System.Environment.SpecialFolder.UserProfile
-            let psi = System.Diagnostics.ProcessStartInfo(home + "/.wasmtime/bin/wasmtime", "run -W gc=y,exceptions=y " + tmp)
-            psi.RedirectStandardOutput <- true
-            use p = System.Diagnostics.Process.Start psi
-            let out = p.StandardOutput.ReadToEnd()
-            p.WaitForExit()
-            System.IO.File.Delete tmp
+            Expect.equal (defsOf "accum$V2d") 1 "struct element stamp"
+            Expect.equal (defsOf "accum$int") 1 "primitive element stamp"
+            let _code, out, _err = Fpp.Tests.WasmRun.run bytes
             Expect.equal out "10\n1.5\n" "both specializations compute correctly"
         }
     ]

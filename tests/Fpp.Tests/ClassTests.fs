@@ -2119,7 +2119,7 @@ let declarationCheckTests =
                 "let useB (xs : list<int>) = Sized.size xs"
                 "print (string (useB [ 1 ]))"
                 "" ])
-            let _bytes, errors = ws.EmitProgramWasm ()
+            let _bytes, errors = ws.EmitProgramWasmPreload ()
             Expect.isEmpty errors "no hard errors — that is the point"
             Expect.exists ws.EmitWarnings (fun w -> w.StartsWith "stubbed ")
                 "the stub is on record for --strict"

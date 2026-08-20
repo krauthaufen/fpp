@@ -690,7 +690,7 @@ let private internStr (st : St) (s : string) : int =
         // the literal is the RAW source token (quotes, escapes and all) —
         // unescape it to little-endian UTF-16 unit bytes, the same routine
         // the wasm-GC backend uses
-        let ub = Fpp.Backend.BinDriver.unescape s
+        let ub = Fpp.Backend.StrLit.unescape s
         let n = ub.Length / 2
         // header = the string class-id (nunits @4 and units @8 unchanged, so
         // the string runtime functions need no adjustment)
@@ -716,7 +716,7 @@ let private internStrGc (st : St) (s : string) : int =
     | None ->
         let slot = st.RootNext
         st.RootNext <- slot + 1
-        vecAdd st.GcConstData (slot, Fpp.Backend.BinDriver.unescape s)
+        vecAdd st.GcConstData (slot, Fpp.Backend.StrLit.unescape s)
         dictSet st.Consts s slot
         slot
 
@@ -4367,7 +4367,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> LConstW (halfBits (parseFloatLit s))
     | ELit (LFloat s) -> lowBoxF ctx (LConstF (parseFloatLit s))
     | ELit (LBool b) -> lowInt (if b then 1 else 0)
-    | ELit (LChar raw) -> lowInt (Fpp.Backend.BinDriver.charCode raw)
+    | ELit (LChar raw) -> lowInt (Fpp.Backend.StrLit.charCode raw)
     | ELit LUnit | ELit LNull -> lowInt 0
     | ELit (LString s) -> lowStrConst st s
     | EVar (v, _) | EVarI (v, _, _) when (dictTryFind st.Externs v.Name).IsSome -> lowInt 0
@@ -6459,7 +6459,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PListLit (x :: rest) ->
         // an exact list literal [a; b; …] is a :: b :: … :: []
         lowPatTest ctx scrutReg fail (PCons (x, PListLit rest))
-    | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (Fpp.Backend.BinDriver.charCode raw) ])) ]
+    | PLit (LChar raw) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (Fpp.Backend.StrLit.charCode raw) ])) ]
     | PLit LNull -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
     | PLit (LFloat s) -> [ LBreakIf (fail, LPrim (NeF, [ lowUnboxF sc; LConstF (parseFloatLit s) ])) ]
     | PLit (LString raw) ->
@@ -7615,6 +7615,7 @@ let private scanNoCollapse (decls : Decl list) : Dict<string, bool> =
     for d in decls do match d with DLet (_, _, _, e) -> go e | _ -> ()
     m
 
+let mutable private linWarnings : string list = []
 let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // emit the REACHABLE program: the user's declarations plus every
     // prelude function or global a chain of references reaches from them.
@@ -8543,9 +8544,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         for (k, _) in dictPairs st.Funcs do
             for h in [ "2034791193"; "658953085"; "2143567545"; "1381067340"; "1380175341" ] do
                 if string (abs (strHash k)) = h then eprintfn "FNMAP f%s = %s name=%s" h k (match dictTryFind nameOf k with Some n -> n | None -> "?")
+    linWarnings <- vecToList st.Warnings
     bytes, vecToList st.Errors
 
 // the wasm-linear backend: Core straight to a linear-memory module through the
 // shared LowIR. `--lowir` is a retained alias for the same path.
+/// the warnings of the LAST emission — gaps ("stubbed …"/"quietstub …"),
+/// field-site traps, untagged union cases. Quiet by default (FPP_LINWARN=1
+/// prints them); `fpp check --strict` and the tests read them from here.
+let lastWarnings () : string list = linWarnings
 let emitLinear (decls0 : Decl list) : byte[] * string list = emitLinearImpl decls0
 let emitLinearLow (decls0 : Decl list) : byte[] * string list = emitLinearImpl decls0
