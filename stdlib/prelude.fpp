@@ -862,6 +862,12 @@ instance Ordered<StructTuple2<'a, 'b>> when Ordered<'a> when Ordered<'b>
 type StructTuple3<'a, 'b, 'c> = { Item1 : 'a; Item2 : 'b; Item3 : 'c }
 [<Struct>]
 type StructTuple4<'a, 'b, 'c, 'd> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd }
+[<Struct>]
+type StructTuple5<'a, 'b, 'c, 'd, 'e> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd; Item5 : 'e }
+[<Struct>]
+type StructTuple6<'a, 'b, 'c, 'd, 'e, 'f> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd; Item5 : 'e; Item6 : 'f }
+[<Struct>]
+type StructTuple7<'a, 'b, 'c, 'd, 'e, 'f, 'g> = { Item1 : 'a; Item2 : 'b; Item3 : 'c; Item4 : 'd; Item5 : 'e; Item6 : 'f; Item7 : 'g }
 /// .NET's ordering hook. `Compare(a, b)` is negative, zero or positive —
 /// the tupled member shape is what ported code calls.
 type IComparer<'a> =

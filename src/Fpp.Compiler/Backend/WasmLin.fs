@@ -3338,6 +3338,67 @@ let private podArrOf (st : St) (kind : string) : (Dict<string, int * string> * i
     match dictTryFind st.RecPod kind with
     | Some (layout, size, firstRefWord) when firstRefWord = size / 4 -> Some (layout, size - HDR)
     | _ -> None
+// A record name that NO decl declared: a Canon (unstamped) body builds
+// `StructTuple2$<Node$<Index.ElementOperation$<#42>>.bool>`, while every stamped
+// twin of it IS registered, with the scalars-first inline layout. The name
+// spells out each component's type, so the same rule reproduces the twin's
+// offsets exactly. Without this the generic constructor wrote Item1 at HDR+0
+// where the stamped reader reads Item2 — the adaptive enumerator's
+// `let struct(n, deep) = x.Head` then bound n to the BOOL, and CurrentNode
+// became 1.
+let private podSynth (st : St) (name : string) : (Dict<string, int * string> * int * int) option =
+    let i = name.IndexOf "$<"
+    if not (name.StartsWith "StructTuple") || i <= 0 || not (name.EndsWith ">") then None
+    else
+        let inner = name.Substring (i + 2, name.Length - i - 3)
+        let args = vecNew<string> ()
+        let mutable depth = 0
+        let mutable start = 0
+        for k in 0 .. inner.Length - 1 do
+            let c = inner.[k]
+            if c = '<' then depth <- depth + 1
+            elif c = '>' then depth <- depth - 1
+            elif c = '.' && depth = 0 then
+                vecAdd args (inner.Substring (start, k - start))
+                start <- k + 1
+        vecAdd args (inner.Substring (start, inner.Length - start))
+        let fs = vecToList args |> List.mapi (fun k ty -> ("Item" + string (k + 1)), ty)
+        // a BARE type variable's scalar-ness is not decidable from the name, so
+        // such a tuple stays on the uniform word path — the same call the
+        // registration loop makes for a `'a` field.
+        if List.length fs < 2 || fs |> List.exists (fun (_, ty) -> ty.StartsWith "#" || ty.StartsWith "'" || ty = "") then None
+        else
+            let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
+            let refs = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsNone)
+            if List.isEmpty scalars then None
+            else
+                let m = dictNew<string, int * string> ()
+                let widthOf (ty : string) = snd (optGet (storLTy ty))
+                let maxA = scalars |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
+                let align (o : int) (a : int) = ((o + a - 1) / a) * a
+                let mutable off = HDR
+                for (fn, ty) in scalars do
+                    let w = widthOf ty
+                    off <- HDR + align (off - HDR) w
+                    dictSet m fn (off, ty)
+                    off <- off + w
+                off <- HDR + align (off - HDR) maxA
+                let firstRefWord = off / 4
+                for (fn, ty) in refs do
+                    dictSet m fn (off, ty)
+                    off <- off + 4
+                dictSet st.RecFields name (fs |> List.map fst)
+                dictSet st.RecFieldTypes name fs
+                dictSet st.RecPod name (m, off, firstRefWord)
+                Some (m, off, firstRefWord)
+
+/// the inline layout of a record name, synthesizing an unregistered struct
+/// tuple's (podSynth) so a Canon body and its stamped twins agree on offsets.
+let private podOf (st : St) (name : string) : (Dict<string, int * string> * int * int) option =
+    match dictTryFind st.RecPod name with
+    | Some v -> Some v
+    | None -> podSynth st name
+
 let private regNm (r : LReg) : string = "$r" + string r.Id
 // the class-id descriptor for a record type / a union case's union; -1 for an
 // undeclared name (a value no type test looks for)
@@ -3609,6 +3670,10 @@ let rec private recGroupOf (e : Expr) : (VarId * Expr) list * Expr =
 // array through the runtime $str_cmp / $cmpv.
 type private CmpShape =
     | ShScalar | ShStr | ShFloat | ShInt64
+    // UNSIGNED scalars compare unsigned: `compare 1UL 0x8000000000000000UL`
+    // answered 1 under the signed form, which scrambled every MapExt keyed by
+    // an Index (its Key is a uint64 distance that routinely crosses 2^63).
+    | ShUScalar | ShUInt64
     // a float16 is its 16 raw BITS in a word — comparing those bits orders
     // wrongly (and calls -0.0h <> 0.0h), so it widens before comparing
     | ShHalf
@@ -3621,8 +3686,10 @@ let rec private shapeOfType (t : Type) : CmpShape =
     | TCon ("string", _) -> ShStr
     | TCon ("float16", _) -> ShHalf
     | TCon (("float" | "double" | "single" | "float32"), _) -> ShFloat
-    | TCon (("int64" | "uint64"), _) -> ShInt64
-    | TCon (("int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint"), _) -> ShScalar
+    | TCon ("uint64", _) -> ShUInt64
+    | TCon ("int64", _) -> ShInt64
+    | TCon (("uint32" | "unativeint"), _) -> ShUScalar
+    | TCon (("int" | "int32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint"), _) -> ShScalar
     | TCon (("list" | "[]" | "seq"), (e :: _)) -> ShList (shapeOfType e)
     | TCon (("list" | "[]" | "seq"), _) -> ShList ShOther
     | TCon ("array", (e :: _)) -> ShArr (shapeOfType e)
@@ -3897,7 +3964,12 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
 let private shapeOfExprF (st : St) (e : Expr) : CmpShape =
     let ofTyName (ty : string) : CmpShape =
         let inner = if ty.StartsWith "&" then ty.Substring 1 else ty
-        if rawScalarName inner then ShScalar elif inner = "string" then ShStr else ShOther
+        match inner with
+        | "uint64" -> ShUInt64
+        | "int64" -> ShInt64
+        | "uint32" | "unativeint" -> ShUScalar
+        | "string" -> ShStr
+        | _ -> if rawScalarName inner then ShScalar else ShOther
     match e with
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> ofTyName ty | None -> ShOther)
     | EIndex (ek, _, _) -> ofTyName ek
@@ -3917,7 +3989,7 @@ let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
 
 let private needsStructCmp (sh : CmpShape) : bool =
     match sh with
-    | ShStr | ShFloat | ShInt64 | ShHalf | ShList _ | ShArr _ | ShTup _ -> true
+    | ShStr | ShFloat | ShInt64 | ShUInt64 | ShHalf | ShList _ | ShArr _ | ShTup _ -> true
     // ShOther is an unknown/generic type variable ('k in a generic function, e.g.
     // dictSlotH's `d.Keys.[e-1] = k`). The tagged-int/pointer fast path below is
     // correct ONLY for a statically-known tagged scalar; a compound held in a
@@ -3926,7 +3998,7 @@ let private needsStructCmp (sh : CmpShape) : bool =
     // self-describing — it handles tagged ints, strings, floats and compounds
     // uniformly — so route the unknown case through it. Only a KNOWN scalar keeps
     // the fast path.
-    | ShScalar -> false
+    | ShScalar | ShUScalar -> false
     | ShOther -> true
 
 // the shape from a mangled type name — "$tupN$<t0.t1...>", "string", "int", … —
@@ -3953,8 +4025,10 @@ let rec private shapeOfName (nm : string) : CmpShape =
         | "string" -> ShStr
         | "float16" -> ShHalf
         | "float" | "double" | "single" | "float32" -> ShFloat
-        | "int64" | "uint64" -> ShInt64
-        | "int" | "int32" | "uint32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint" -> ShScalar
+        | "uint64" -> ShUInt64
+        | "int64" -> ShInt64
+        | "uint32" | "unativeint" -> ShUScalar
+        | "int" | "int32" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" | "nativeint" -> ShScalar
         | "list" | "seq" | "[]" -> ShList ShOther
         | "array" -> ShArr ShOther
         | _ -> ShOther
@@ -3987,6 +4061,10 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
         LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
     | ShInt64 ->
         LPrim (SubW, [ LPrim (GtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
+    | ShUInt64 ->
+        LPrim (SubW, [ LPrim (GtUL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtUL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
+    | ShUScalar ->
+        LPrim (SubW, [ LPrim (GtUW, [ wa; wb ]); LPrim (LtUW, [ wa; wb ]) ])
     | ShHalf ->
         let da = LPrim (PromF, [ LCall ("$h2f", [ wa ]) ])
         let db = LPrim (PromF, [ LCall ("$h2f", [ wb ]) ])
@@ -4637,8 +4715,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // inline value type: an all-scalar record stores its fields raw inline. Each
     // raw field value rides a typed local before the allocation (GC-invisible),
     // so no shadow rooting; a field read boxes (cancelled by unbox in arithmetic).
-    | ERecord (name, fields) when (dictTryFind st.RecPod name).IsSome ->
-        let (layout, _, _) = optGet (dictTryFind st.RecPod name)
+    | ERecord (name, fields) when (podOf st name).IsSome ->
+        let (layout, _, _) = optGet (podOf st name)
         let order = ctorOrder st name (List.map fst fields)
         let items =
             order |> List.map (fun fn ->
@@ -4650,8 +4728,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     (off, sty, storValTy sty, false, raw)
                 | None -> (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)))
         lowPodBuild ctx name items
-    | ERecordExt (name, baseE, updates) when (dictTryFind st.RecPod name).IsSome ->
-        let (layout, _, _) = optGet (dictTryFind st.RecPod name)
+    | ERecordExt (name, baseE, updates) when (podOf st name).IsSome ->
+        let (layout, _, _) = optGet (podOf st name)
         let order = ctorOrder st name (List.map fst updates)
         let bl = freshTmp ctx
         // pre-evaluate each update value into a local; then bind base. lowPodBuild
@@ -4756,8 +4834,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet (wReg ir, (coreToLowE ctx i))
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
-    | EField (r, fname, owner) when (dictTryFind st.RecPod owner).IsSome ->
-        let (layout, _, _) = optGet (dictTryFind st.RecPod owner)
+    | EField (r, fname, owner) when (podOf st owner).IsSome ->
+        let (layout, _, _) = optGet (podOf st owner)
         let (off, kind) = optGet (dictTryFind layout fname)
         (match storLTy kind with
          | Some (sty, _) ->
@@ -4765,8 +4843,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let fv = freshTmpT ctx vty
              LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
          | None -> LLoad (W, coreToLowE ctx r, off))
-    | EFieldSet (r, fname, owner, v) when (dictTryFind st.RecPod owner).IsSome ->
-        let (layout, _, _) = optGet (dictTryFind st.RecPod owner)
+    | EFieldSet (r, fname, owner, v) when (podOf st owner).IsSome ->
+        let (layout, _, _) = optGet (podOf st owner)
         let (off, kind) = optGet (dictTryFind layout fname)
         (match storLTy kind with
          | Some (sty, _) ->
@@ -6205,9 +6283,12 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
 // builds with the scalars unboxed inline and every live pointer correctly rooted.
 and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
     let cid = cidRec ctx.LSt name
-    let (_, size, firstRefWord) = optGet (dictTryFind ctx.LSt.RecPod name)
+    let (_, size, firstRefWord) = optGet (podOf ctx.LSt name)
     let bs = freshTmp ctx
-    let alloc = if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt ("inl:" + string cid) size FK_TAGGED firstRefWord) ]) else LAlloc (LConstW size)
+    // an UNDECLARED (synthesized) name has no class id, so key its type-id by
+    // the name — two different synthesized tuples must not share one tid
+    let tidKey = if cid >= 0 then "inl:" + string cid else "inl@" + name
+    let alloc = if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt tidKey size FK_TAGGED firstRefWord) ]) else LAlloc (LConstW size)
     let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
     let scalars = items |> List.filter (fun (_, _, _, r, _) -> not r)
     let refs = items |> List.filter (fun (_, _, _, r, _) -> r)
