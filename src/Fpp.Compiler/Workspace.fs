@@ -1040,7 +1040,14 @@ type Workspace() =
                 match d with
                 | Fpp.Core.Ir.DLet (_, v, _, e) when v.Path <> "(builtin)" ->
                     eprintfn "COREDECL %s:%d %s = %s" v.Path v.Offset v.Name (Fpp.Core.Ir.printExpr e)
-                | Fpp.Core.Ir.DLet (_, v, _, _) -> eprintfn "COREFN %s:%d %s" v.Path v.Offset v.Name
+                | Fpp.Core.Ir.DLet (_, v, _, e) ->
+                    // builtin bodies are dumped only when asked by NAME, so a
+                    // whole-prelude dump does not drown the interesting one
+                    (match System.Environment.GetEnvironmentVariable "FPP_CORE_FN" with
+                     | null | "" -> eprintfn "COREFN %s:%d %s" v.Path v.Offset v.Name
+                     | want when v.Name.StartsWith want ->
+                         eprintfn "COREFN %s = %s" v.Name (Fpp.Core.Ir.printExpr e)
+                     | _ -> ())
                 | Fpp.Core.Ir.DClass (n, b, own, impls) ->
                     // no %A: it lowers to showv, which the SELF-HOSTED linear
                     // backend stubs — and one gap stubs the WHOLE enclosing

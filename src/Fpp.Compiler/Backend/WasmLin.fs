@@ -2568,8 +2568,21 @@ let private emitCmpv (m : Mod) : unit =
     ifE f
     lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"
     endB f
-    lg f "$a"; ins f "i32.eqz"; ifE f; ic f -1; ins f "return"; endB f
-    lg f "$b"; ins f "i32.eqz"; ifE f; ic f 1; ins f "return"; endB f
+    // ZERO is null — but only against a POINTER. Against a raw scalar (an odd
+    // word) it is the integer 0, and `compare -7 0` must be -1: the old
+    // null-orders-first shortcut answered 1 (`sign -7` came out positive).
+    lg f "$a"; ins f "i32.eqz"
+    ifE f
+    lg f "$b"; ic f 1; ins f "i32.and"
+    ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+    ic f -1; ins f "return"
+    endB f
+    lg f "$b"; ins f "i32.eqz"
+    ifE f
+    lg f "$a"; ic f 1; ins f "i32.and"
+    ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
+    ic f 1; ins f "return"
+    endB f
     // one odd, one even: the even side is a POINTER only if it looks like a
     // managed object (in-memory, odd header, tid inside the shape table) —
     // then ints order before pointers, arbitrarily but consistently. An even
@@ -2580,6 +2593,11 @@ let private emitCmpv (m : Mod) : unit =
     // isPtr(reg): even && < msz && header odd && tid < table count
     let isPtr (r : string) =
         lg f r; lg f "$msz"; ins f "i32.lt_u"
+        // ... and ABOVE the constant base: below it is fixed scratch, never an
+        // object. Without this every small even int (a loop counter at 2) was
+        // "a pointer" and ordered after any tagged int — `k >= n` in an
+        // object-expression enumerator stopped at exactly 2, whatever n was.
+        lg f r; ic f CONST_BASE; ins f "i32.ge_u"; ins f "i32.and"
         (if gc then (
             lg f r; mem f "i32.load"; ls f "$x"
             lg f "$x"; ic f 1; ins f "i32.and"; ins f "i32.and"
@@ -2605,6 +2623,9 @@ let private emitCmpv (m : Mod) : unit =
     // raw int (< memory) still rides the tid-table guard below, unchanged.
     memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
     lg f "$a"; lg f "$msz"; ins f "i32.ge_u"; lg f "$b"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+    // ... or below the constant base: two small even ints are INTS
+    lg f "$a"; ic f CONST_BASE; ins f "i32.lt_u"; ins f "i32.or"
+    lg f "$b"; ic f CONST_BASE; ins f "i32.lt_u"; ins f "i32.or"
     ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
     lg f "$a"; mem f "i32.load"; ls f "$ca"
     lg f "$b"; mem f "i32.load"; ls f "$cb"
@@ -2753,6 +2774,16 @@ let private emitHashv (m : Mod) : unit =
     else
         lg f "$v"; ic f 1; ins f "i32.and"
         ifE f; lg f "$v"; ic f 1; ins f "i32.shr_s"; ins f "return"; endB f
+    // STANDALONE: an even word is a raw int unless it addresses a real
+    // object. Below the constant base is fixed scratch and beyond memory is
+    // nothing, so both are the value itself — reading a "header" there faulted
+    // (a large int hashed out of bounds).
+    if not gc then
+        memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+        lg f "$v"; ins f "i32.eqz"
+        lg f "$v"; ic f CONST_BASE; ins f "i32.lt_u"; ins f "i32.or"
+        lg f "$v"; lg f "$msz"; ins f "i32.ge_u"; ins f "i32.or"
+        ifE f; lg f "$v"; ins f "return"; endB f
     lg f "$v"; mem f "i32.load"; ls f "$cid"
     // IDENTITY DISPATCH: a class that declares GetHashCode hashes by THAT —
     // equal-by-Equals values must hash equal, and the structural fold over a
@@ -4388,7 +4419,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "<<<"; ">>>" ] ->
         let ia = lowUnboxI (coreToLowE ctx a)
         let ib = LPrim (WToL, [ (coreToLowE ctx b) ])
-        let iop = if op.Substring (0, op.Length - 1) = "<<<" then ShlL else ShrSL
+        // `>>>` on a UINT64 shifts in zeros: the signed form made
+        // `UInt64.MaxValue >>> 60` stay all-ones instead of 15
+        let iop =
+            if op.Substring (0, op.Length - 1) = "<<<" then ShlL
+            elif op.EndsWith "v" then ShrUL
+            else ShrSL
         lowBoxI ctx (LPrim (iop, [ ia; ib ]))
     | EPrim (op, [ a; b ]) when (op.EndsWith "l" || op.EndsWith "v") && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let unsigned = op.EndsWith "v"
