@@ -200,6 +200,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// argument (`IEqualityComparer<int>` is IEqualityComparer, not int).
     let rec ifaceNameOf (tn : GreenNode) : string option =
         let sub = tn.Children |> List.choose (fun c -> match c with GNode m -> Some m | _ -> None)
+        // `int[]` is a POSTFIX type whose only child is the ELEMENT: the last
+        // identifier names the element, not the type. `o :? int[]` lowered to
+        // `o :? int` and answered by the int tag instead of the array header.
+        let ownToks = tn.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+        if tn.NodeKind = PostfixType && List.length sub = 1
+           && not (ownToks |> List.exists (fun t -> t.Kind = Ident)) then Some "array"
+        else
         match sub |> List.tryFind (fun m -> m.NodeKind = NamedType || m.NodeKind = AppType) with
         | Some head when tn.NodeKind = AppType -> ifaceNameOf head
         | _ ->

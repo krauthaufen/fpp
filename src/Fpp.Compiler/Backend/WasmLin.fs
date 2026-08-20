@@ -439,6 +439,9 @@ let rec private printConOf (st : St) (e : Expr) : string =
     | ELit (LString _) -> "string"
     | EVar (_, sch) | EVarI (_, sch, _) ->
         (match prune sch.Body with TCon (n, []) -> n | _ -> "")
+    // the intrinsics whose result type is FIXED, whatever the operand:
+    // `print (hash x)` classified as "" and printed the int as a string
+    | EApp (EUnknown ("hash" | "$hash" | "compare" | "sign" | "$idhash"), _) -> "int"
     | EApp (EUnknown n, _) ->
         // a builtin conversion names its RESULT before the '#'
         let i = n.IndexOf "#"
@@ -6452,6 +6455,12 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
         | "float" -> [ CID_FLOAT ]
         | "int64" | "uint64" -> [ CID_INT64 ]
         | "string" -> [ CID_STRING ]
+        // the BUILT-IN collections answer by representation: a cons cell
+        // carries CID_LIST, an array CID_ARRAY (the tid->cid table maps every
+        // witness-selected cons/array variant back to them). Without these
+        // `o :? list<int>` had no ids at all and answered false for a list.
+        | "list" | "seq" | "[]" -> [ CID_LIST ]
+        | "array" -> [ CID_ARRAY ]
         | _ -> []
     let ids = if List.isEmpty scalarCids then typeTestIds ctx.LSt tn else scalarCids
     let t = freshTmp ctx
