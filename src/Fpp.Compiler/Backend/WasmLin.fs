@@ -4513,6 +4513,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let ra, rb, pre = evalRooted ctx a b
         LDo (pre, (structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)))
     // the `compare` intrinsic: -1/0/1 by the shape its dispatch name carries
+    // `min`/`max` whose operand type never grounded (a `#N` marker): decide at
+    // RUNTIME through the self-describing comparator. Both operands are
+    // evaluated once, into rooted registers.
+    | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:MinMax:min:" || n.StartsWith "$class:MinMax:max:" ->
+        let wantMin = n.StartsWith "$class:MinMax:min:"
+        let sh = shapeOfName (n.Substring (n.LastIndexOf ':' + 1))
+        let ra, rb, pre = evalRooted ctx a b
+        let c = freshTmp ctx
+        let r = freshTmp ctx
+        LDo (pre
+             @ [ LSet (wReg c, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b))
+                 LIf (LPrim ((if wantMin then LeSW else GeSW), [ LGet (wReg c); LConstW 0 ]),
+                      [ LSet (wReg r, LGet (wReg ra)) ],
+                      [ LSet (wReg r, LGet (wReg rb)) ]) ],
+             LGet (wReg r))
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
@@ -4699,7 +4714,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
         LConstW (optGet (dictTryFind st.EnumConst case))
     | ECtor (case, _, args) ->
-        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
+        // a MISSING case is not tag 0: that silently made two arms of one match
+        // test the same tag, so a value with any other tag matched NEITHER and
+        // fell into the match's `unreachable`
+        let tag =
+            match dictTryFind st.UnionTag case with
+            | Some t -> t
+            | None ->
+                vecAdd st.Warnings ("union case with no tag: " + case)
+                0
         // slot 0 is the raw tag word; the payload follows. A concrete payload
         // gets a ref-map so its unboxed scalars are skipped by the collector.
         let kinds = RKRaw :: List.map (refKindOfExprC st) args
@@ -5211,7 +5234,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         LDo ([ LCallVoidS ("$prints", [ LCall ("$str_of_char", [ coreToLowE ctx a ]) ])
                LCallVoidS ("$prints", [ LCall ("$str_of_char", [ LConstW 10 ]) ]) ], lowInt 0)
     | EApp (EUnknown ("printraw" | "printRaw"), [ a ]) -> LDo ([ LCallVoidS ("$printraw", [ coreToLowE ctx a ]) ], lowInt 0)
-    | EApp (EUnknown "isNull", [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
+    | EApp (EUnknown ("isNull" | "Unchecked.isNull"), [ x ]) -> (LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ]))
+    // `Unchecked.xxx` reaches here as a FIELD access on an unresolved module
+    // (the adaptive port declares a member of that name, so it never binds to
+    // the builtin): the runtime services under their real spellings.
+    | EApp (EField (EUnknown "Unchecked", m, _), args) ->
+        (match m, args with
+         | "isNull", [ x ] -> LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ])
+         | "hash", [ x ] -> LCall ("$hashv", [ coreToLowE ctx x ])
+         | "equals", [ a; b ] -> LPrim (EqW, [ LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ]); LConstW 0 ])
+         | "compare", [ a; b ] -> LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ])
+         | _ -> (for a in args do (coreToLowE ctx a) |> ignore); lowInt 0)
+    | EField (EUnknown "Unchecked", _, _) -> lowInt 0
+    // Unchecked.defaultof<T> at an unresolved type: the zero word, which is
+    // null for a reference and 0 for a raw scalar
+    | EUnknown "Unchecked.defaultof" -> lowInt 0
+    | EApp (EUnknown n, [ x ]) when n.StartsWith "Unchecked.hash" -> LCall ("$hashv", [ coreToLowE ctx x ])
+    | EPrim (op, [ a; b ]) when op.StartsWith "Unchecked.equals" ->
+        LPrim (EqW, [ LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ]); LConstW 0 ])
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
     // a CLASS instance hashes by IDENTITY (DIVERGENCES.md): stable across
     // mutation and moves (fpprt keeps the table), distinct per object
@@ -5790,6 +5830,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let what =
             match e with
             | EUnknown n -> "unknown " + n
+            | EField (EUnknown o, fnm, _) -> "field-unknown " + o + "." + fnm
             | EApp (EUnknown n, _) -> "apply-unknown " + n
             | EPrim (op, _) -> "prim " + op
             | EArrayPin _ -> "arraypin" | EArrayUnpin _ -> "arrayunpin" | EArrayBytes _ -> "arraybytes"
@@ -6057,7 +6098,12 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
             let sk = "s:" + string cid + ":" + string n + ":" + string raw + ":" + rpat
             let isNew = (dictTryFind st.Tids sk).IsNone
             let t = gcTidRef st sk (HDR + 4 * n) offs
-            if isNew && (cid >= CID_FIRST_USER || cid = CID_LIST) then vecAdd st.TidCid (t, cid)
+            // register the tid->cid mapping whenever the cid is KNOWN, not only
+            // the first time this shape key is interned: a tid first created by
+            // another path stayed unmapped, its cid read 0, and every `:?` /
+            // union-case test against it failed — a match on such a value hit
+            // its `unreachable` (the adaptive suite's voption arms).
+            if cid >= CID_FIRST_USER || cid = CID_LIST then vecAdd st.TidCid (t, cid)
             t
         let tidTmp = freshTmp ctx
         let rec selTid (j : int) (accMask : int) : LStmt list =
@@ -6128,7 +6174,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         // built-in cids skip the tid->cid table, EXCEPT CID_LIST: $isBuiltinSeq
         // recovers a cons cell's class-id from it, so every FK_STRUCT cons variant
         // must map back to CID_LIST.
-        if isNew && (cid >= CID_FIRST_USER || cid = CID_LIST) then vecAdd st.TidCid (tid, cid)
+        if cid >= CID_FIRST_USER || cid = CID_LIST then vecAdd st.TidCid (tid, cid)
         let isConst e = match e with LConstW _ -> true | _ -> false
         let idx = slots |> List.mapi (fun i v -> i, v)
         // REF slots are live pointers: evaluate and push to the shadow stack
@@ -6272,7 +6318,15 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PCtor (case, _, []) when (dictTryFind ctx.LSt.EnumConst case).IsSome ->
         [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (optGet (dictTryFind ctx.LSt.EnumConst case)) ])) ]
     | PCtor (case, _, subs) ->
-        let tag = match dictTryFind st.UnionTag case with Some t -> t | None -> 0
+        // a MISSING case is not tag 0: that silently made two arms of one match
+        // test the same tag, so a value with any other tag matched NEITHER and
+        // fell into the match's `unreachable`
+        let tag =
+            match dictTryFind st.UnionTag case with
+            | Some t -> t
+            | None ->
+                vecAdd st.Warnings ("union case with no tag: " + case)
+                0
         // a union case is [cid/tid][tag][payload…]. A union's cases do not all
         // share one class-id: they land in several groups, and the tag is
         // numbered PER GROUP, so two cases in different groups can carry the
@@ -7168,6 +7222,10 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
 // from the env at 8+4*slot (st.Captures is set by the driver). Register 0 is
 // the env, register 1 the argument.
 let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (psch : Scheme) (body : Expr) : unit =
+    // FPP_LAM_DUMP=<$blamN>: the CORE body of one lifted lambda, for finding
+    // which construct in it lowered to a trap
+    if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
+        eprintfn "LAM %s = %s" lamName (printExpr body)
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
@@ -7577,6 +7635,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // (no heap object), UNLESS it is mutated, type-tested/cast, or a CLASS (a
     // class has a vtable + its storage is a DRecord, so it also lands in
     // RecFields — but its instance-field reads and dispatch need the object).
+    if System.Environment.GetEnvironmentVariable "FPP_CID_DUMP" = "1" then
+        for k, v in dictPairs st.ClassId do eprintfn "CID %s = %d" k v
+        for k, v in dictPairs st.UnionTag do
+            let owner = match dictTryFind st.CaseClass k with Some c -> c | None -> -1
+            eprintfn "TAG %s = %d (cid %d)" k v owner
     let noCollapse = scanNoCollapse decls0
     let classNames = st.ClassNames
     for d in decls0 do match d with DClass (n, _, _, _) -> dictSet classNames n true | _ -> ()
