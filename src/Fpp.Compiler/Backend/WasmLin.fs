@@ -5620,9 +5620,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // a failed `:?>` THROWS (an InvalidCastException in F#), it does not
         // trap: `try (o :?> B).N with _ -> ...` has to catch it. A trap is
         // uncatchable and killed the whole module.
+        // NULL downcasts to anything (as in .NET): `downcast x.SetNext` at the
+        // end of a linked chain is a null, and rejecting it threw where the
+        // reference implementation walks off the end normally. A failed cast
+        // of a NON-null value THROWS (an InvalidCastException), it does not
+        // trap — `try (o :?> B).N with _ -> ...` has to catch it.
         let t = freshTmp ctx
         LDo ([ LSet (wReg t, coreToLowE ctx e2)
-               LIf (LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]),
+               LIf (LPrim (AndW, [ LPrim (NeW, [ LGet (wReg t); LConstW 0 ])
+                                   LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]) ]),
                     [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"invalid cast\"")) ], []) ],
              LGet (wReg t))
     | ECast (_, e2, _) ->
