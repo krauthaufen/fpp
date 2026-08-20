@@ -159,6 +159,8 @@ def port(path, first):
     src = drop_dotnet_interop_interfaces(src)
     src = dotnet_hashset(src)
     src = strip_namespace_headers(src, first)
+    if path.endswith("Index.fs"):
+        src = track_index_construction(src)
     if path.endswith("AdaptiveIndexList.fs"):
         # this file's Cache is keyed by a STRUCT tuple; the calls pass the
         # elements bare and F++ does not adapt plain to struct tuples
@@ -662,17 +664,42 @@ def inject_after_type(src, type_header, block):
 
 
 # CallbackDisposable pins itself with a GCHandle so a weakly-referenced
-# subscription outlives collection. This runtime's WeakReference IS strong
-# (prelude), so there is nothing to pin — the handle becomes a flag.
+# subscription outlives collection: `cbs` holds the callback WEAKLY, and the
+# disposable is the only strong reference, so a caller who drops it would
+# otherwise unsubscribe itself at the next collection. WeakReference is real
+# here now, so the pin is real too — GCRoot is the prelude's GCHandle, and it
+# roots the CALLBACK (what the weak entry points at) rather than the wrapper.
 SPOT.append((
     "    let mutable gc = if makeGCRoot then GCHandle.Alloc(this) else Unchecked.defaultof<GCHandle>",
-    "    let mutable gc = makeGCRoot"))
+    "    let mutable gc = if makeGCRoot then GCRoot.Alloc (box callback) else 0 - 1"))
 SPOT.append((
     """            if gc.IsAllocated then 
                 gc.Free()
                 gc <- Unchecked.defaultof<GCHandle>""",
-    """            if gc then
-                gc <- false"""))
+    """            if GCRoot.IsAllocated gc then
+                GCRoot.Free gc
+                gc <- 0 - 1"""))
+
+# Index's FINALIZER detaches the node from the doubly-linked list, which is
+# what keeps the list from growing without bound. There are no finalizers
+# here, but there is GC.OnCleanup: watch the wrapper, detach the node when a
+# collection proves the wrapper dead. Every construction goes through the
+# factory so every Index is watched, exactly as every Index had a finalizer.
+# The closure captures the NODE, never the wrapper — capturing the watched
+# object would keep it alive and the cleanup would never run.
+SPOT.append((
+    """    override x.Finalize() =
+        real.Delete()""",
+    """    static member internal Track (n : IndexNode) : Index =
+        let i = Index n
+        GC.OnCleanup (box i) (fun () -> n.Delete())
+        i"""))
+
+
+def track_index_construction(src):
+    """Route every `Index` construction through Index.Track (see above)."""
+    src = re.sub(r"\|> Index\b", "|> Index.Track", src)
+    return src.replace("        Index(r)", "        Index.Track r")
 
 REGEX_SPOTS = [
     # ValueOption's intrinsic .Value has no equivalent here (adding a Value

@@ -300,20 +300,36 @@ extension declares nothing — no record, no constructor, no vtable slot — so
 an interface extension is a function of the receiver, not a new slot every
 implementer must fill.
 
-## Weak references are STRONG, and byref members are absent bar one
+## Weak references are REAL; there are no finalizers, but there IS cleanup
 
-`WeakReference<'a>` and `ConditionalWeakTable<'k,'v>` exist and hold their
-targets. wasm-GC has no weak references and no finalizers: there is no way
-to observe that a value became unreachable and no way to be told, so
-`TryGetTarget` always succeeds and a table entry lives until it is removed.
+`WeakReference<'a>` clears, and `ConditionalWeakTable<'k,'v>` drops an entry
+once its key is collected. Both ride the collector's ephemerons (fpprt over
+Whippet): a weak reference is an ephemeron whose key and value are the target,
+and a table entry is an ephemeron over (key, value). The table's entry
+therefore dies WITH its key even when the value points back at the key — a
+weak-key/strong-value table would keep that pair alive forever, and the
+adaptive port's callback objects are exactly that shape.
 
-**The divergence has teeth.** Reading through one behaves identically — .NET
-cannot collect what is still reachable either. What changes is a graph that
-relied on weakness to drop its dead half: it keeps it. A cache keyed on
-objects grows until its entries are removed explicitly.
+They were strong until the wasm-GC backend was deleted. That backend rode the
+engine's collector, which offered neither weak references nor finalizers; the
+one that remains does.
 
 `ConditionalWeakTable` compares keys by IDENTITY, as .NET's does; two
-structurally equal keys are two entries.
+structurally equal keys are two entries. Its entries are pruned lazily, when
+the table grows or is counted — nothing tells it that a key died.
+
+**What is still missing is `Finalize`.** A type cannot declare a finalizer;
+the equivalent is explicit — `GC.OnCleanup obj (fun () -> ...)` runs a closure
+once, at the first drain after a collection proves `obj` dead, and
+`GC.Collect ()` forces that point. The cleanup closure must not capture the
+watched object: a closure is held until it runs, so capturing its own subject
+keeps it alive and the cleanup never fires. Up to 262144 cleanups may be
+pending at once (`CB_SLOTS`); past that the registry traps rather than
+silently overwriting, since a watch per VALUE is now an ordinary thing to do.
+
+`GCRoot.Alloc` / `GCRoot.Free` are `GCHandle`'s job: a strong root that keeps
+an object alive until freed, for the case where only weak references would
+otherwise point at it.
 
 `TryGetValue` IS there, on `Dictionary` and on `ConditionalWeakTable`. F#
 hands a byref out-parameter over as a TUPLE, and that shape is expressible:

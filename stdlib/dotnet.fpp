@@ -182,10 +182,9 @@ let s5 =
 
 // ---- WeakReference, ConditionalWeakTable, TryGetValue -------------------
 //
-// The weak types are STRONG here (DIVERGENCES.md): wasm-GC has no weak
-// references and no finalizers. Everything below holds a live reference
-// throughout, which is exactly where the two agree — .NET cannot collect
-// what is still reachable either.
+// The weak types are REAL on both sides now (DIVERGENCES.md). Everything
+// below holds a live reference throughout, which is where the two agree
+// whatever the collector does — neither can collect what is still reachable.
 
 type Cell(n : int) =
     member x.N = n

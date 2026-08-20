@@ -5537,6 +5537,10 @@ type ResizeArray<'a>() =
         while k < count - 1 do
             items.[k] <- items.[k + 1]
             k <- k + 1
+        // .NET clears the vacated slot, and now that a weak reference or a
+        // cleanup watch can OBSERVE liveness, so must this: a stale slot
+        // keeps a removed element alive for as long as the list lives
+        items.[count - 1] <- Unchecked.defaultof<'a>
         count <- count - 1
     member x.IndexOf (v : 'a) : int =
         let mutable found = -1
@@ -5553,7 +5557,13 @@ type ResizeArray<'a>() =
         else
             x.RemoveAt i
             true
-    member x.Clear () : unit = count <- 0
+    member x.Clear () : unit =
+        // clear the SLOTS, not just the count — see RemoveAt
+        let mutable i = 0
+        while i < count do
+            items.[i] <- Unchecked.defaultof<'a>
+            i <- i + 1
+        count <- 0
     member x.ToArray () : 'a[] = Array.init count (fun i -> items.[i])
     member x.Reverse () : unit =
         let mutable i = 0
@@ -5908,62 +5918,95 @@ type Lazy<'a>(f : unit -> 'a) =
     member x.IsValueCreated = computed
     member x.Force () : 'a = x.Value
 
-/// System.WeakReference — a STRONG reference.
+/// System.WeakReference — a REAL weak reference.
 ///
-/// wasm-GC has no weak references and no finalizers: there is no way to
-/// observe that a value became unreachable, and no way to be told. So this
-/// holds its target and `TryGetTarget` always succeeds. Every program that
-/// only READS through a weak reference behaves identically; what changes is
-/// that nothing collected through one is ever released, so a graph that
-/// relied on weakness to drop its dead half keeps it.
-///
-/// This is a divergence with teeth, and it is written down in
-/// DIVERGENCES.md rather than hidden here.
+/// The field holds an EPHEMERON over the target, never the target itself:
+/// the reference keeps nothing alive, and `TryGetTarget` starts failing once
+/// a collection proves the target unreachable. On the standalone module
+/// (no collector) `gcWeakNew` is the identity and the reference is strong —
+/// nothing is ever reclaimed there, so nothing can observe the difference.
 type WeakReference<'a>(value : 'a) =
+    let w : obj = gcWeakNew (box value)
     /// .NET's signature. The tuple view — `match w.TryGetTarget () with |
     /// (true, t) -> ...` — is the compiler's, as it is in F#.
     member x.TryGetTarget (target : byref<'a>) : bool =
-        target <- value
-        true
-    member x.Target = value
-    member x.IsAlive = true
+        let t = gcWeakGet w
+        if isNull t then false
+        else
+            target <- unbox<'a> t
+            true
+    member x.Target : 'a = unbox<'a> (gcWeakGet w)
+    member x.IsAlive = not (isNull (gcWeakGet w))
+
+/// an ephemeron's stand-in where the collector has none (the standalone
+/// module): an ordinary strong pair, which is the right answer when nothing
+/// is ever collected
+type internal EphPair(k : obj, v : obj) =
+    member x.K = k
+    member x.V = v
+
+let internal ephNew (k : obj) (v : obj) : obj =
+    if gcWeakSupported () then gcEphNew k v else box (EphPair (k, v))
+let internal ephKey (e : obj) : obj =
+    if gcWeakSupported () then gcEphKey e else (unbox<EphPair> e).K
+let internal ephValue (e : obj) : obj =
+    if gcWeakSupported () then gcEphValue e else (unbox<EphPair> e).V
 
 /// System.Runtime.CompilerServices.ConditionalWeakTable — an IDENTITY-keyed
-/// table, strong for the same reason WeakReference is.
+/// table whose entries are EPHEMERONS.
+///
+/// The value lives exactly as long as its key. That is stronger than a
+/// weak-key table with strong values, and the difference is the whole point:
+/// a value that points BACK at its key (a callback object holding the object
+/// it decorates — the adaptive port's shape) would keep its own key alive
+/// forever under weak-key/strong-value, and the entry would never be
+/// collectable. An ephemeron traces the value only once the key is proven
+/// live, so the cycle dies as a unit.
 ///
 /// Identity, not structure: the .NET table compares keys by reference, and
 /// the values it holds are keyed on objects whose structural equality would
-/// be both wrong and expensive. Linear probing over insertion-ordered
-/// entries, like Dictionary, but the probe tests `ReferenceEquals`.
+/// be both wrong and expensive. Entries are scanned linearly; cleared ones
+/// (key collected) are dropped whenever the table grows or is counted.
 type ConditionalWeakTable<'k, 'v>() =
-    let mutable ckeys : 'k[] = Array.zeroCreate 8
-    let mutable cvals : 'v[] = Array.zeroCreate 8
+    let mutable centries : obj[] = Array.zeroCreate 8
     let mutable ccount = 0
+    /// drop entries whose key has been collected — the table's own upkeep,
+    /// since nothing tells it that a key died
+    member private x.Prune () : unit =
+        let mutable w = 0
+        let mutable i = 0
+        while i < ccount do
+            let e = centries.[i]
+            if not (isNull (ephKey e)) then
+                centries.[w] <- e
+                w <- w + 1
+            i <- i + 1
+        let mutable j = w
+        while j < ccount do
+            centries.[j] <- box 0
+            j <- j + 1
+        ccount <- w
     member x.IndexOf (k : 'k) : int =
         let mutable found = 0 - 1
         let mutable i = 0
         while i < ccount do
-            if found < 0 && System.Object.ReferenceEquals (ckeys.[i], k) then found <- i
+            if found < 0 && System.Object.ReferenceEquals (unbox<'k> (ephKey centries.[i]), k) then found <- i
             i <- i + 1
         found
     member x.TryGetValue (k : 'k, value : byref<'v>) : bool =
         let i = x.IndexOf k
-        if i < 0 then
-            value <- cvals.[0]
-            false
+        if i < 0 then false
         else
-            value <- cvals.[i]
+            value <- unbox<'v> (ephValue centries.[i])
             true
     member x.Add (k : 'k, v : 'v) : unit =
-        if ccount >= ckeys.Length then
-            let nk : 'k[] = Array.zeroCreate (ckeys.Length * 2)
-            let nv : 'v[] = Array.zeroCreate (cvals.Length * 2)
-            Array.blit ckeys 0 nk 0 ccount
-            Array.blit cvals 0 nv 0 ccount
-            ckeys <- nk
-            cvals <- nv
-        ckeys.[ccount] <- k
-        cvals.[ccount] <- v
+        if ccount >= centries.Length then
+            x.Prune ()
+            if ccount >= centries.Length then
+                let ne : obj[] = Array.zeroCreate (centries.Length * 2)
+                Array.blit centries 0 ne 0 ccount
+                centries <- ne
+        centries.[ccount] <- ephNew (box k) (box v)
         ccount <- ccount + 1
     member x.Remove (k : 'k) : bool =
         let i = x.IndexOf k
@@ -5971,12 +6014,15 @@ type ConditionalWeakTable<'k, 'v>() =
         else
             let mutable j = i
             while j < ccount - 1 do
-                ckeys.[j] <- ckeys.[j + 1]
-                cvals.[j] <- cvals.[j + 1]
+                centries.[j] <- centries.[j + 1]
                 j <- j + 1
+            centries.[ccount - 1] <- box 0
             ccount <- ccount - 1
             true
-    member x.Count = ccount
+    /// LIVE entries: a key that was collected is no longer in the table
+    member x.Count =
+        x.Prune ()
+        ccount
 
 /// System.Text.StringBuilder. Appending is O(1) — the chunks are joined once,
 /// by the pairwise merge in String.concat, when the text is asked for. A left
@@ -6303,6 +6349,52 @@ extern let gcHeapRefs : obj -> int
 /// collection nor synchronous finalizers — there these are no-ops.
 extern let gcOnCleanup : obj -> (unit -> unit) -> unit
 extern let gcCollect : unit -> unit
+
+/// Weak references and ephemerons, over the collector's own. A WEAK ref is an
+/// ephemeron with key = value = the target: it keeps nothing alive and reads
+/// as 0 once the target is collected. The general EPHEMERON holds its value
+/// only while its KEY lives, which is what a weak-keyed table needs — a value
+/// that points back at its key (the adaptive port's callback objects do) has
+/// to die WITH the key, and a weak-key/strong-value table would keep both
+/// forever. `gcWeakSupported` is false only on the standalone module, which
+/// has no collector at all; there a weak reference IS its target.
+extern let gcWeakSupported : unit -> bool
+extern let gcWeakNew : obj -> obj
+extern let gcWeakGet : obj -> obj
+extern let gcEphNew : obj -> obj -> obj
+extern let gcEphKey : obj -> obj
+extern let gcEphValue : obj -> obj
+
+/// A strong ROOT the program holds on the runtime's behalf: `GCRoot.Alloc o`
+/// keeps `o` reachable until the handle is freed. Ported code reaches for
+/// System.Runtime.InteropServices.GCHandle to do exactly this — hold a
+/// subscription that only WEAK references would otherwise point at, so
+/// dropping the returned disposable does not silently unsubscribe. A handle
+/// is an index; `Free` releases the slot for reuse, and never freeing one is
+/// a leak, precisely as GCHandle.Alloc without Free is.
+// module-level, not `static member`: a static member is a PROPERTY, so its
+// initializer runs at every access and each Alloc would root into a fresh
+// table (the roots then held nothing and the target still collected)
+let mutable private gcRootHeld : ResizeArray<obj> = ResizeArray<obj>()
+let mutable private gcRootFreed : ResizeArray<int> = ResizeArray<int>()
+
+type GCRoot =
+    static member Alloc (o : obj) : int =
+        let held = gcRootHeld
+        let freed = gcRootFreed
+        if freed.Count > 0 then
+            let h = freed.[freed.Count - 1]
+            freed.RemoveAt (freed.Count - 1)
+            held.[h] <- o
+            h
+        else
+            held.Add o
+            held.Count - 1
+    static member Free (h : int) : unit =
+        if h >= 0 && h < gcRootHeld.Count then
+            gcRootHeld.[h] <- box 0
+            gcRootFreed.Add h
+    static member IsAllocated (h : int) : bool = h >= 0
 
 type GC =
 #if NATIVE

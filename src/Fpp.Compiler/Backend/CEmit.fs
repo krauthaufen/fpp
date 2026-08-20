@@ -912,6 +912,32 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
     | EApp (EUnknown "gcCollect", [ _ ]) ->
         stmt f "fpprt_collect();"
         unitV ()
+    // weak references and ephemerons: fpprt's, the same ones the wasm leg
+    // imports. Only a real POINTER can be watched — a tagged scalar or null
+    // is its own answer.
+    | EApp (EUnknown "gcWeakSupported", [ _ ]) ->
+        let d = slot f
+        stmt f (sref d + " = TAGI(1);")
+        d
+    | EApp (EUnknown gn, [ a ]) when
+            gn = "gcWeakNew" || gn = "gcWeakGet" || gn = "gcEphKey" || gn = "gcEphValue" ->
+        let x = emitE st f a
+        let d = slot f
+        let fn2 =
+            match gn with
+            | "gcWeakNew" -> "fpprt_weak_new"
+            | "gcWeakGet" -> "fpprt_weak_get"
+            | "gcEphKey" -> "fpprt_eph_key"
+            | _ -> "fpprt_eph_value"
+        stmt f (sref d + " = (" + sref x + " && !(" + sref x + " & 1)) ? "
+                + fn2 + "(" + sref x + ") : " + sref x + ";")
+        d
+    | EApp (EUnknown "gcEphNew", [ a; b ]) ->
+        let k = emitE st f a
+        let v = emitE st f b
+        let d = slot f
+        stmt f (sref d + " = fpprt_eph_new(" + sref k + ", " + sref v + ");")
+        d
     | EApp (EUnknown "printb", [ a ]) ->
         let x = emitE st f a
         stmt f ("fpp_print(fpp_bool_to_string(" + sref x + "));")
@@ -1250,6 +1276,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         emitE st f u1 |> ignore
         stmt f "fpprt_collect();"
         unitV ()
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when
+            v.Name = "gcWeakNew" || v.Name = "gcWeakGet" || v.Name = "gcEphKey"
+            || v.Name = "gcEphValue" || v.Name = "gcWeakSupported" ->
+        emitE st f (EApp (EUnknown v.Name, [ a ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Name = "gcEphNew" ->
+        emitE st f (EApp (EUnknown "gcEphNew", [ a; b ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when
           (dictTryFind st.Fns (v.Path, v.Offset)) = Some (List.length args) ->
         let fn = (dictTryFind st.FnName (v.Path, v.Offset)).Value
@@ -1986,18 +2018,8 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
              let order = (recFieldsOf st name).Value
              let d = slot f
              stmt f (sref d + " = fpprt_alloc(" + string tid + ");")
-             // WeakReference holds its target through a REAL weak ref on
-             // fpprt (the prelude body is strong — a wasm-GC limitation)
-             let weakWrap = recBase name = "WeakReference"
              for fn2, v in fs do
-                 if weakWrap && fn2 = "value" then
-                     let x = emitE st f v
-                     let w = slot f
-                     stmt f (sref w + " = fpprt_weak_new(" + sref x + ");")
-                     let idx = fieldIdx order fn2
-                     stmt f ("fpprt_write_ref(" + sref d + ", "
-                             + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref w + ");")
-                 elif fn2 = "base" then
+                 if fn2 = "base" then
                      // the base constructor built a BASE instance; its
                      // fields are this layout's shared prefix — copy them
                      let b = emitE st f v
@@ -2013,10 +2035,6 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                      else
                          stmt f ("fpprt_write_ref(" + sref d + ", "
                                  + ("FPPOFF(" + string (idx + 1) + ")") + ", " + sref x + ");")
-             // ConditionalWeakTable: field 0 becomes the ephemeron table —
-             // its members are runtime intrinsics, the other fields unused
-             if recBase name = "ConditionalWeakTable" then
-                 stmt f ("fpp_cwt_init(" + sref d + ");")
              d
          | None -> trap ("record " + name))
     | ERecordExt (name, b, fs) ->
@@ -3245,19 +3263,6 @@ let emitC (decls : Decl list) : string * string list =
             (match b with Some x -> dictSet st.ClassBase n x | None -> ())
             dictSet st.ClassImpls n impls
             dictSet st.ClassOwn n own
-            // WeakReference / ConditionalWeakTable: the prelude bodies are
-            // STRONG (wasm-GC has no weak refs); fpprt has real ephemerons,
-            // so their members route to runtime intrinsics here
-            let cbase = recBase n
-            if cbase = "WeakReference" then
-                for mn, mv in own do
-                    if mn = "TryGetTarget" || mn = "Target" || mn = "IsAlive" then
-                        dictSet st.Intrin (mv.Path, mv.Offset) ("weak." + mn)
-            if cbase = "ConditionalWeakTable" then
-                for mn, mv in own do
-                    if mn = "TryGetValue" || mn = "Add" || mn = "Remove"
-                       || mn = "Count" || mn = "IndexOf" then
-                        dictSet st.Intrin (mv.Path, mv.Offset) ("cwt." + mn)
             for iface, ms in impls do
                 let bare =
                     match iface.IndexOf "`" with

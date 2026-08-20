@@ -283,6 +283,14 @@ let mutable private envSigs : Dict<string, string * string * string list * strin
 // GC mode: base slot of the callback root area (fixed slots the collector
 // scans; $cbreg hands them out through the $cbnext global)
 let mutable private cbBase = 0
+/// how many callback/cleanup closures can be PENDING at once. Slots recycle
+/// when a cleanup runs, so this bounds LIVE watches, not registrations. The
+/// whole 2M-slot root array is registered and scanned either way, so a bigger
+/// area costs nothing per collection — and 1024 was far too small the moment
+/// something watched a per-VALUE object (an Index per list element) rather
+/// than a handful of interop handles. Overflow used to walk silently into the
+/// shadow stack: $cbreg now traps instead.
+let private CB_SLOTS = 262144
 
 // GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
 // raw SCALAR byte buffer, resolved by the driver before the runtime string and
@@ -355,6 +363,17 @@ let private importFpprt (m : Mod) : unit =
     // force a collection (GC.OnCleanup / GC.Collect / Js.watch)
     importFn m "fpprt" "fpprt_watch" "$fpwatch" [ "i32"; "i32"; "i32" ] []
     importFn m "fpprt" "fpprt_idhash" "$fpidh" [ "i32" ] [ "i32" ]
+    // weak references and ephemerons: a weak ref is an ephemeron whose key
+    // and value are both the target, so it keeps nothing alive and reads as
+    // 0 once the target is collected. The general form holds `value` only
+    // while `key` lives — a value that points BACK at its key (the adaptive
+    // port's callback objects do) still dies, which a weak-key/strong-value
+    // table could never manage.
+    importFn m "fpprt" "fpprt_weak_new" "$fpweaknew" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_weak_get" "$fpweakget" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_eph_new" "$fpephnew" [ "i32"; "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_eph_key" "$fpephkey" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_eph_value" "$fpephval" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_drain1" "$fpdrain1" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_collect" "$fpcollect" [] []
     // per-object pinning: real under the mmc reactor, aborts under semi —
@@ -1393,6 +1412,11 @@ let private emitCbreg (m : Mod) : unit =
         endB f
         lg f "$p"; ins f "i32.eqz"
         ifE f
+        // out of slots: the next bump would land in the SHADOW STACK, which
+        // reads back as a bogus closure (a call_indirect into nowhere, or a
+        // hang). Fail here, where the cause is visible.
+        gg f "$cbnext"; ic f CB_SLOTS; ins f "i32.ge_u"
+        ifE f; ins f "unreachable"; endB f
         gg f "$roots"; ic f (cbBase * 4); ins f "i32.add"
         gg f "$cbnext"; ic f 2; ins f "i32.shl"; ins f "i32.add"; ls f "$p"
         gg f "$cbnext"; ic f 1; ins f "i32.add"; gs f "$cbnext"
@@ -2923,6 +2947,14 @@ let private baseOp (op : string) : string =
 // which let-bound mutables need a heap cell: those that are ASSIGNED and also
 // referenced INSIDE a lambda (captured). A top-level function's outermost
 // lambda IS the function, not a capture boundary, so its params are skipped.
+/// `(builtin)`-path names that lower as INTRINSICS and therefore hold no
+/// value a closure could capture (see the capture scanner below).
+let private builtinIntrinsic (n : string) : bool =
+    n.StartsWith "compare"
+    || n = "gcOnCleanup" || n = "gcCollect" || n = "gcHeapRefs"
+    || n = "gcWeakSupported" || n = "gcWeakNew" || n = "gcWeakGet"
+    || n = "gcEphNew" || n = "gcEphKey" || n = "gcEphValue"
+
 let private cellScan (decls : Decl list) : Dict<string, bool> =
     let letBound = dictNew<string, bool> ()
     let assigned = dictNew<string, bool> ()
@@ -3033,12 +3065,15 @@ let private freeVars (st : St) (bound : Dict<string, bool>) (body : Expr) : (str
         | EVar (v, sch) | EVarI (v, sch, _) ->
             let k = key v
             dictSet nameOf k v.Name
-            // bare `compare` is the one `(builtin)` INTRINSIC with no value (a
-            // coreToLowE handler lowers it) — it must never be captured, or the
-            // closure reads an unresolved variable. But OTHER `(builtin)`-path
-            // names are genuine locals (a prelude fold's `acc`, a lambda's `x`):
-            // those MUST be captured, else the lambda that uses them is stubbed.
-            if not (v.Path = "(builtin)" && v.Name.StartsWith "compare")
+            // a `(builtin)` INTRINSIC has NO value: a coreToLowE handler
+            // lowers its application, so capturing the NAME into a closure
+            // env makes the lambda read a variable that does not exist (and
+            // the whole lambda is stubbed). `compare` was the first; every
+            // extern the backend intrinsifies belongs on the list — using
+            // `gcWeakNew` inside a lambda hit exactly this. But OTHER
+            // `(builtin)`-path names are genuine locals (a prelude fold's
+            // `acc`, a lambda's `x`): those MUST be captured.
+            if not (v.Path = "(builtin)" && builtinIntrinsic v.Name)
                && (dictTryFind bnd k).IsNone
                && (dictTryFind st.Globals k).IsNone
                && (dictTryFind st.Funcs k).IsNone
@@ -5589,6 +5624,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                   RKRaw, W, LCall ("$cbreg", [ coreToLowE ctx f ])
                   RKRaw, W, LConstW 1 ]
         else LDo ([ LEval (coreToLowE ctx o); LEval (coreToLowE ctx f) ], lowInt 0)
+    // ---- weak references and ephemerons -----------------------------------
+    // Only a real POINTER can be watched: a raw scalar (odd tag bit) and null
+    // pass through unchanged, so `WeakReference 5` reads back 5 rather than
+    // handing fpprt a non-object to trace.
+    | EApp (EUnknown "gcWeakSupported", [ _ ]) -> lowInt (if gc then 1 else 0)
+    | EApp (EUnknown "gcWeakNew", [ x ]) when gc -> lowWeakCall ctx "$fpweaknew" x
+    | EApp (EUnknown "gcWeakGet", [ x ]) when gc -> lowWeakCall ctx "$fpweakget" x
+    | EApp (EUnknown "gcEphKey", [ x ]) when gc -> lowWeakCall ctx "$fpephkey" x
+    | EApp (EUnknown "gcEphValue", [ x ]) when gc -> lowWeakCall ctx "$fpephval" x
+    | EApp (EUnknown "gcEphNew", [ k; v ]) when gc ->
+        lowJsi ctx "$fpephnew" "i" [ RKRef, W, coreToLowE ctx k; RKRef, W, coreToLowE ctx v ]
+    // no collector (the standalone bump-allocator module): nothing is ever
+    // reclaimed, so a weak reference IS its target and the prelude falls back
+    // to its strong table (gcWeakSupported answers false).
+    | EApp (EUnknown gn, [ x ]) when
+            gn = "gcWeakNew" || gn = "gcWeakGet" || gn = "gcEphKey" || gn = "gcEphValue" ->
+        coreToLowE ctx x
+    | EApp (EUnknown "gcEphNew", [ k; v ]) -> LDo ([ LEval (coreToLowE ctx k) ], coreToLowE ctx v)
     | EApp (EUnknown "gcCollect", [ _ ]) ->
         // zero the shadow-stack REGION above $sp first: every popped slot
         // keeps its last value and the whole registered range is scanned,
@@ -5640,6 +5693,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         coreToLowE ctx (EApp (EUnknown "gcOnCleanup", [ o; f ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), [ u1 ]) when v.Name = "gcCollect" ->
         coreToLowE ctx (EApp (EUnknown "gcCollect", [ u1 ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a ]) when
+            v.Name = "gcWeakNew" || v.Name = "gcWeakGet" || v.Name = "gcEphKey"
+            || v.Name = "gcEphValue" || v.Name = "gcWeakSupported" ->
+        coreToLowE ctx (EApp (EUnknown v.Name, [ a ]))
+    | EApp ((EVar (v, _) | EVarI (v, _, _)), [ a; b ]) when v.Name = "gcEphNew" ->
+        coreToLowE ctx (EApp (EUnknown "gcEphNew", [ a; b ]))
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind envSigs (key v)).IsSome ->
         let fnm, _, pks, rk = optGet (dictTryFind envSigs (key v))
         let unitEvals =
@@ -6729,6 +6788,19 @@ and private lowJsi (ctx : LowCtx) (fname : string) (ret : string) (args : (RefKi
             LDo ([ LSet ({ Id = r; RTy = F64 }, LCall (fname, vals)) ], flatBox ctx F64 (LGet { Id = r; RTy = F64 }))
         | _ -> LCall (fname, vals)
     if List.isEmpty setup then call else LDo (setup, call)
+
+/// a one-argument fpprt weak/ephemeron call, guarded so only a real pointer
+/// reaches the runtime: an odd (tagged scalar) or null word is its own answer.
+and private lowWeakCall (ctx : LowCtx) (fname : string) (x : Expr) : LExpr =
+    let setup, vals = lowRootedArgsK ctx [ RKRef, None, W, coreToLowE ctx x ]
+    let v = List.head vals
+    let r = freshTmp ctx
+    LDo (setup
+         @ [ LIf (LPrim (AndW, [ LPrim (EqW, [ LPrim (AndW, [ v; LConstW 1 ]); LConstW 0 ])
+                                 LPrim (NeW, [ v; LConstW 0 ]) ]),
+                  [ LSet (wReg r, LCall (fname, [ v ])) ],
+                  [ LSet (wReg r, v) ]) ],
+         LGet (wReg r))
 
 and private lowApply (ctx : LowCtx) (cloE : LExpr) (args : Expr list) : LExpr =
     match args with
@@ -8092,7 +8164,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // cleanup has run
     if gc then
         cbBase <- st.RootNext
-        st.RootNext <- st.RootNext + 1024
+        st.RootNext <- st.RootNext + CB_SLOTS
     // the host FILE-I/O externs have no WasmLin implementation (DExterns are
     // stripped before the backend, so they arrive as unresolved refs). Answer
     // their calls with a null default so the pipeline RUNS: readTextRaw null ->
