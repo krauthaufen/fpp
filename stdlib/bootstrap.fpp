@@ -609,6 +609,7 @@ let bytesString (bs : byte[]) : string =
 /// a warning to stderr — self-hosted this is a NO-OP: stdout carries the
 /// compiledrive protocol and must stay clean, and there is no stderr FFI
 let ewarn (s : string) : unit = ignore s
+let withLock (gate : obj) (f : unit -> 'a) : 'a = f ()
 
 /// The same text as BYTES.
 let stringBytes (s : string) : byte[] =

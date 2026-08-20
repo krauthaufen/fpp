@@ -87,6 +87,9 @@ let singleBits (v : float32) : int = System.BitConverter.SingleToInt32Bits v
 /// a warning to stderr — self-hosted this is a no-op (stdout carries the
 /// compiledrive protocol and must stay clean)
 let ewarn (s : string) : unit = System.Console.Error.WriteLine s
+/// serialize a critical section. The self-hosted compiler is single-threaded
+/// (wasm), so its bootstrap seam runs the body directly.
+let withLock (gate : obj) (f : unit -> 'a) : 'a = lock gate f
 /// How many BYTES this text occupies. Source is read as bytes (see
 /// `hostReadText`), so a string IS its bytes and no re-encoding is wanted —
 /// encoding it as UTF-8 here turned one em dash already in the source into

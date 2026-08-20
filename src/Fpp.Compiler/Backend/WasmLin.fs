@@ -3504,6 +3504,10 @@ let private shapeOfExprF (st : St) (e : Expr) : CmpShape =
     match e with
     | EField (_, f, owner) -> (match recFieldTy st owner f with Some ty -> ofTyName ty | None -> ShOther)
     | EIndex (ek, _, _) -> ofTyName ek
+    // a builtin conversion names its RESULT before the '#' — `compare
+    // (sbyte -5) (sbyte 7)` routed to $cmpv on two RAW ints without this
+    | EApp (EUnknown n, _) when n.Contains "#" && not (n.StartsWith "$") ->
+        ofTyName (n.Substring (0, n.IndexOf "#"))
     | _ -> shapeOfExpr e
 
 let rec private mergeShape (a : CmpShape) (b : CmpShape) : CmpShape =
@@ -4631,6 +4635,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#l" || n.StartsWith "byte#v" ->
         LPrim (AndW, [ LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ]); LConstW 0xFF ])
     | EApp (EUnknown n, [ a ]) when n.StartsWith "byte#" -> (LPrim (AndW, [ (coreToLowE ctx a); LConstW 0xFF ]))
+    // the remaining NARROW conversions, by operand kind: sbyte sign-extends
+    // the low byte, int16 the low half, uint16 masks it
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "sbyte#" || n.StartsWith "int16#" || n.StartsWith "uint16#" ->
+        let w =
+            if n.StartsWith "sbyte#f" || n.StartsWith "sbyte#s" || n.StartsWith "int16#f" || n.StartsWith "int16#s" || n.StartsWith "uint16#f" || n.StartsWith "uint16#s" then
+                LPrim (FToW, [ lowUnboxF (coreToLowE ctx a) ])
+            elif n.StartsWith "sbyte#l" || n.StartsWith "sbyte#v" || n.StartsWith "int16#l" || n.StartsWith "int16#v" || n.StartsWith "uint16#l" || n.StartsWith "uint16#v" then
+                LPrim (LToW, [ lowUnboxI (coreToLowE ctx a) ])
+            else coreToLowE ctx a
+        if n.StartsWith "uint16#" then LPrim (AndW, [ w; LConstW 0xFFFF ])
+        elif n.StartsWith "int16#" then LPrim (ShrSW, [ LPrim (ShlW, [ w; LConstW 16 ]); LConstW 16 ])
+        else LPrim (ShrSW, [ LPrim (ShlW, [ w; LConstW 24 ]); LConstW 24 ])
     // the raw bits of a double, as int64 — read the boxed payload as i64
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
     // singleBits: a float32's raw i32 bits. float32 rides an f64 box here, so
@@ -4664,7 +4680,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | "" -> (if refKindOfExpr a = RKRaw then "int" else "")
             | c -> c
         if System.Environment.GetEnvironmentVariable "FPP_PRINT_DUMP" = "1" then
-            eprintfn "PRINTARG con=%s a=%s raw=%A" con (Fpp.Core.Ir.printExpr a) a
+            // no %A here: it lowers to showv, which the SELF-HOSTED backend
+            // stubs — and a gap anywhere in this body stubs ALL of coreToLowE
+            ewarn ("PRINTARG con=" + con + " a=" + Fpp.Core.Ir.printExpr a)
         let v =
             match con with
             | "int" | "int32" | "nativeint" | "byte" | "sbyte" | "int16" | "uint16" -> LCall ("$str_of_int", [ coreToLowE ctx a ])
@@ -6470,25 +6488,30 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // to THIS function there lowers to LTailCall (wasm return_call). The
     // entry $sp is saved (gc) so the transfer can discharge every
     // outstanding shadow-stack push in one restore.
-    tailFnName <- (if isInit then "" else dbgName)
+    tailFnName <- (if isInit || not (isNull (System.Environment.GetEnvironmentVariable "FPP_NO_TAILCALL")) then "" else dbgName)
     tailSpReg <- -1
-    if not isInit then
+    if tailFnName <> "" then
         markTails st body
         if gc then tailSpReg <- freshTmp ctx
     let bodyLow1 = coreToLowE ctx body
+    // the entry-$sp save must come BEFORE the rootParams pushes (they wrap
+    // the whole body below) — saving after them made every return_call
+    // restore to the post-push level, leaking one frame of pushes per tail
+    // transfer until the shadow stack ran off the end of memory
     let preamble =
-        (if tailSpReg >= 0 then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else [])
+        (if tailSpReg >= 0 && List.isEmpty rootParams then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else [])
         @ selfPreamble @ constPreamble
     let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
     let bodyLow2 =
         if List.isEmpty rootParams then bodyLow0
         else
             let resReg = freshTmp ctx
-            let pushes = rootParams |> List.collect (fun (pv, slotReg) ->
+            let spSave = if tailSpReg >= 0 then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else []
+            let pushes = spSave @ (rootParams |> List.collect (fun (pv, slotReg) ->
                 let pvReg = match dictTryFind ctx.Regs (key pv) with Some i -> i | None -> 0 - 1
                 [ LSet (wReg slotReg, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
                   LStore (W, LGet (wReg slotReg), 0, LGet (wReg pvReg))
-                  LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ])
+                  LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]))
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
             LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
     // FPP_CONSCHECK: the shadow-stack pointer must be BALANCED across the

@@ -1005,7 +1005,7 @@ type Workspace() =
     /// Whippet heap). One method so the linear-fixpoint DRIVER and harness
     /// cannot disagree about the flag.
     member this.EmitProgramWasmReactor () : byte[] * string list =
-        lock WasmLinGate.gate (fun () ->
+        withLock WasmLinGate.gate (fun () ->
             Fpp.Backend.WasmLin.gc <- true
             Fpp.Backend.WasmLin.gcExportMem <- false
             this.EmitProgramWasmLinearWith true)
@@ -1014,7 +1014,7 @@ type Workspace() =
     /// same module, but the imported memory is re-exported as "memory" so
     /// WASI binds — no wasm-merge in the path. The test harness's emitter.
     member this.EmitProgramWasmPreload () : byte[] * string list =
-        lock WasmLinGate.gate (fun () ->
+        withLock WasmLinGate.gate (fun () ->
             Fpp.Backend.WasmLin.gc <- true
             Fpp.Backend.WasmLin.gcExportMem <- true
             this.EmitProgramWasmLinearWith true)
@@ -1026,7 +1026,7 @@ type Workspace() =
       // flags, the jslin/jsxl/env registries), so two concurrent emissions
       // interleave into garbage. Monitor is re-entrant, so the flag-setting
       // wrappers above can hold the same gate.
-      lock WasmLinGate.gate (fun () ->
+      withLock WasmLinGate.gate (fun () ->
         // the linear backend lowers UNOPTIMIZED core: the wasm-GC optimizer's
         // inlining shares and beta-reduces lambda nodes, which the reference-
         // keyed lambda lift is not built for. Slice work first, speed later.
