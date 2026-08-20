@@ -1441,3 +1441,48 @@ persists stage-1's stderr (it was silently dropped on byte mismatches,
 which cost half the hunt), and a debug reactor recipe with fpprt_dbg_live
 exists (conscheck needs it; note the checker still false-positives on raw
 even ints like dictSlotH's hash argument). Battery 31/31.
+
+## 21. The adaptive gate: four bugs, all in the value model
+
+The adaptive suite (100 tests, the FSharp.Data.Adaptive port) was the last
+red gate of the wasm-GC removal arc. It is green, and every failure was a
+disagreement about how a value is laid out or compared — nothing about the
+adaptive machinery itself.
+
+* **`compare` on unsigned ints compared SIGNED.** `compare 1UL
+  0x8000000000000000UL` answered 1. The operators (`<`, `>`) were already
+  right, so nothing looked wrong until a MapExt keyed by an `Index` — whose
+  Key is a uint64 distance that routinely crosses 2^63 — came out in
+  scrambled order. CmpShape gained ShUScalar/ShUInt64 (uint32/unativeint,
+  uint64) and structCmpW the unsigned ops. `$cmpv` still compares a BOXED
+  uint64 signed: int64 and uint64 share one class id, so the runtime
+  comparator cannot tell them apart. Known gap, no case reaches it yet.
+
+* **`x >>> 58 |> int` returned the BOX POINTER.** printConOf strips an
+  operator's kind-letter suffix to name its result type, and knew only
+  f/s/l/w — `v` (uint64) fell through to "", so the bare-`int` arm took its
+  identity branch. It surfaced as DeltaOperationList64's 6-bit count being
+  a heap address, which sent the Myers diff into an unbounded churn (the
+  "hang" was 46% of samples in the collector). All kind letters strip now,
+  guarded so `not` does not lose its 't'.
+
+* **A Canon body and its stamped twins disagreed on a struct tuple's
+  layout.** `StructTuple2$<Node$<Index.ElementOperation$<#42>>.bool>` is
+  declared for no one: the generic body built it in declared order while
+  every stamp read the registered scalars-first layout. So
+  `let struct(n, deep) = x.Head` bound `n` to the BOOL, and the enumerator's
+  CurrentNode became 1. podSynth reconstructs the layout from the name's
+  own type arguments (the same rule the registration loop runs) and
+  memoizes it, so both sides agree.
+
+* **StructTuple5/6/7 were never declared.** The prelude stopped at 4, so a
+  7-element `let struct(...)` read Item5+ through a field-site trap.
+
+The tell for the first three was the same: replicate the suspect expression
+in a five-line program. Each reproduced in seconds once isolated — the cost
+was all in getting from "the adaptive suite traps" down to that expression,
+and the WAT unreachable-numbering trick is what walks that distance.
+
+NOTE: `fixpoint.fsx` with no arguments (the wasm-GC mode) traps in init125.
+That is PRE-EXISTING — it fails identically at the commit before this work
+— and it is the backend being deleted. The linear modes are the gates.
