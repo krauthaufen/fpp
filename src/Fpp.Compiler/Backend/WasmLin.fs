@@ -307,6 +307,12 @@ let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
+// identity dispatch ($cmpv/$hashv -> a class' own Equals/GetHashCode/CompareTo):
+// where the vtable lives and how wide a row is. Slots 0/1/2 of every row are
+// reserved for those three; 0 means "not declared, use the structural fold".
+let mutable private vtBaseConst = 0
+let mutable private vtRootSlot = 0
+let mutable private vtNSlots = 0
 // GC: wasm global name ("$g<hash>" of a top-level binding) -> its root-table
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
@@ -2501,6 +2507,38 @@ let private emitCmpv (m : Mod) : unit =
     ifE f; lg f "$a"; lg f "$b"; ins f "i32.gt_s"; lg f "$a"; lg f "$b"; ins f "i32.lt_s"; ins f "i32.sub"; ins f "return"; endB f
     lg f "$a"; mem f "i32.load"; ls f "$ca"
     lg f "$b"; mem f "i32.load"; ls f "$cb"
+    // IDENTITY DISPATCH: a class that declares its own CompareTo/Equals
+    // orders/compares by THAT, not by the structural word fold — a Map or
+    // HashMap over a tree whose SHAPE differs for equal contents would
+    // otherwise call equal maps unequal. Slots 2 and 0 of the class' vtable
+    // row; 0 means "not declared".
+    let cidOfHdr (hdrLocal : string) =
+        if gc then (lg f hdrLocal; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+        else lg f hdrLocal
+    let vtRowAddr (slot : int) =
+        // vtable base + (cid * NSlots + slot) * 4
+        (if gc then (gg f "$roots"; ic f (4 * vtRootSlot); ins f "i32.add"; mem f "i32.load"; ic f 8; ins f "i32.add")
+         else ic f vtBaseConst)
+        cidOfHdr "$ca"
+        ic f vtNSlots; ins f "i32.mul"; ic f slot; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
+        mem f "i32.load"
+    if vtNSlots > 0 then
+        // both sides the same class, and that class declares one
+        lg f "$ca"; lg f "$cb"; ins f "i32.eq"
+        ifE f
+        vtRowAddr 2; ls f "$x"
+        lg f "$x"; ifE f
+        lg f "$a"; lg f "$b"; lg f "$x"; callIndirect f "$lfn2"; ins f "return"
+        endB f
+        vtRowAddr 0; ls f "$x"
+        lg f "$x"; ifE f
+        // Equals answers a bool: equal -> 0, else an arbitrary but stable
+        // order (by address), so sorting a set of them still terminates
+        lg f "$a"; lg f "$b"; lg f "$x"; callIndirect f "$lfn2"
+        ifE f; ic f 0; ins f "return"; endB f
+        lg f "$a"; lg f "$b"; ins f "i32.gt_u"; lg f "$a"; lg f "$b"; ins f "i32.lt_u"; ins f "i32.sub"; ins f "return"
+        endB f
+        endB f
     both strH
     ifE f; lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "return"; endB f
     both fltH
@@ -2615,6 +2653,21 @@ let private emitHashv (m : Mod) : unit =
         lg f "$v"; ic f 1; ins f "i32.and"
         ifE f; lg f "$v"; ic f 1; ins f "i32.shr_s"; ins f "return"; endB f
     lg f "$v"; mem f "i32.load"; ls f "$cid"
+    // IDENTITY DISPATCH: a class that declares GetHashCode hashes by THAT —
+    // equal-by-Equals values must hash equal, and the structural fold over a
+    // tree's words does not (its shape varies with insertion order)
+    if vtNSlots > 0 then
+        (if gc then (gg f "$roots"; ic f (4 * vtRootSlot); ins f "i32.add"; mem f "i32.load"; ic f 8; ins f "i32.add")
+         else ic f vtBaseConst)
+        (if gc then (lg f "$cid"; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+         else lg f "$cid")
+        ic f vtNSlots; ins f "i32.mul"; ic f 1; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
+        mem f "i32.load"; ls f "$r"
+        lg f "$r"; ifE f
+        // GetHashCode takes (self) but rides the 2-param indirect signature
+        // the identity trio shares — the extra word is ignored
+        lg f "$v"; ic f 0; lg f "$r"; callIndirect f "$lfn2"; ins f "return"
+        endB f
     lg f "$cid"; ic f (hv CID_STRING gcStrTid); ins f "i32.eq"
     ifE f
     lg f "$v"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
@@ -7235,6 +7288,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             // constructor, so only CONSTRUCTED classes reach here.
             for _, v in own do
                 visit (v.Path + ":" + string v.Offset)
+        // a RECORD's or UNION's identity members are reached the same way —
+        // $cmpv/$hashv dispatch through the vtable row, never by name (a
+        // union's `member x.Equals` is what makes Map content equality work)
+        | DMembers (_, own) ->
+            for mn, v in own do
+                if mn = "Equals" || mn = "GetHashCode" || mn = "CompareTo" then
+                    visit (v.Path + ":" + string v.Offset)
         | _ -> ()
     // keep decls0 order (prelude before user — inits sequence correctly),
     // filtered to what is reachable
@@ -7420,13 +7480,20 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             match d with
             | DMembers (n, own) -> own |> List.map (fun (mn, _) -> bareIfaceOf n, mn)
             | _ -> [])
+    // slots 0/1/2 of EVERY row are the identity trio: a class' own Equals,
+    // GetHashCode and CompareTo. $cmpv/$hashv dispatch through them, so a
+    // type that defines content equality (Map/HashMap over an AVL/patricia
+    // tree, whose SHAPE differs for equal contents) compares by its own rule
+    // instead of the structural word fold. 0 = not declared.
+    let identitySlots = [ "$id", "Equals"; "$id", "GetHashCode"; "$id", "CompareTo" ]
     let vtableSlots =
-        ((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
-         @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn))))
-         // abstract/override members dispatched through the CLASS: a slot
-         // per declared member name, keyed by the declaring class
-         @ declaredMemberSlots)
-        |> List.distinct |> List.sort
+        identitySlots
+        @ (((interfaceDecls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn)))
+            @ (classDecls |> List.collect (fun (_, _, _, impls) -> impls |> List.collect (fun (i, ms) -> ms |> List.map (fun (mn, _) -> bareIface i, mn))))
+            // abstract/override members dispatched through the CLASS: a slot
+            // per declared member name, keyed by the declaring class
+            @ declaredMemberSlots)
+           |> List.distinct |> List.sort)
     st.NSlots <- List.length vtableSlots
     vtableSlots |> List.iteri (fun i (ifn, mn) -> dictSet st.SlotOf (ifn + "|" + mn) i)
     // the class-id set a `:? T` accepts: a class matches itself and its
@@ -7465,6 +7532,18 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // uniform sig; a scalar rides the boxed-at-rest representation coreToLowE
     // already produces. (Matches the wasm-GC backend's all-anyref vtable rule.)
     let vtImpls = dictNew<string, bool> ()
+    // the identity trio is dispatched INDIRECTLY by $cmpv/$hashv, so it must
+    // keep the uniform (self, other) signature: no specialized scalar ABI and
+    // no hidden witness params, or the call_indirect type mismatches
+    for d in decls0 do
+        match d with
+        | DMembers (_, own) ->
+            for mn, v in own do
+                if mn = "Equals" || mn = "GetHashCode" || mn = "CompareTo" then dictSet vtImpls (key v) true
+        | DClass (_, _, own, _) ->
+            for mn, v in own do
+                if mn = "Equals" || mn = "GetHashCode" || mn = "CompareTo" then dictSet vtImpls (key v) true
+        | _ -> ()
     for d in decls0 do
         match d with
         | DClass (cn, _, _, impls) ->
@@ -7614,7 +7693,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     etaCtr <- 0
     let decls = decls |> List.map (fun d -> match d with DLet (r, v, s, e) -> DLet (r, v, s, etaExpand st.Funcs st.UnionArity e) | _ -> d)
     // function type per arity used, and the function declarations
-    let arities = st.Funcs |> dictPairs |> List.map snd |> List.distinct
+    // arity 2 is always present: $cmpv/$hashv dispatch the identity trio
+    // (Equals/GetHashCode/CompareTo) through a (self, other) indirect call
+    let arities = 2 :: (st.Funcs |> dictPairs |> List.map snd) |> List.distinct
     for a in arities do
         tyFunc m ("$lfn" + string a) (List.replicate a "i32") [ "i32" ]
     // GC: reserve the string and scratch-byte type-ids up front (eagerly
@@ -7720,9 +7801,49 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // call table here. Rows for types with no impls stay 0.
     let vtRows = Array.zeroCreate (nCid * st.NSlots)
     let vtdbg = System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1"
+    // the identity trio, by NAME, from anywhere in the class' own chain. An
+    // arity check keeps a same-named member of a different shape out: Equals
+    // and CompareTo take (self, other), GetHashCode takes (self) — a unit
+    // parameter makes that 2, which the runtime call passes 0 for.
+    let ownMemberNamed (cn : string) (mn : string) : VarId option =
+        chainOf cn
+        |> List.tryPick (fun c ->
+            classDecls
+            |> List.tryPick (fun (n2, _, own, _) ->
+                if n2 <> c then None
+                else own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None)))
+    // the identity trio for RECORDS and UNIONS too: `type Map<'k,'v> = ... member
+    // x.Equals o` is a DMembers on the union name, and all its cases share the
+    // union's class-id, so one row serves them all. Without this a Map compared
+    // by its TREE and two equal maps built in different orders came out unequal.
+    let fillIdentity (owner : string) (own : (string * VarId) list) =
+        match dictTryFind st.ClassId owner with
+        | Some cid when st.NSlots > 0 ->
+            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
+            |> List.iter (fun (slot, mn) ->
+                match own |> List.tryPick (fun (mm, v) -> if mm = mn then Some v else None) with
+                | Some v when (dictTryFind st.Funcs (key v)) = Some 2 ->
+                    vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
+                | Some v ->
+                    if System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1" then
+                        eprintfn "IDENT %s.%s SKIP arity=%A" owner mn (dictTryFind st.Funcs (key v))
+                | _ ->
+                    if System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1" then
+                        eprintfn "IDENT %s.%s absent" owner mn)
+        | _ -> ()
+    for d in decls0 do
+        match d with
+        | DMembers (n, own) -> fillIdentity n own
+        | _ -> ()
     for cn, _, _, _ in classDecls do
         match dictTryFind st.ClassId cn with
         | Some cid ->
+            [ 0, "Equals"; 1, "GetHashCode"; 2, "CompareTo" ]
+            |> List.iter (fun (slot, mn) ->
+                match ownMemberNamed cn mn with
+                | Some v when (dictTryFind st.Funcs (key v)) = Some 2 ->
+                    vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
+                | _ -> ())
             vtableSlots |> List.iteri (fun slot (ifn, mn) ->
                 match slotImpl cn ifn mn with
                 // only a declared top-level function can go in the table; an
@@ -7742,6 +7863,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     (if gc then internStrGc st "\"False\"" |> ignore else internStr st "\"False\"" |> ignore)
     // bake the vtable right after the string constants; $hp starts after it
     st.VtBase <- st.ConstNext
+    vtBaseConst <- st.VtBase
+    vtRootSlot <- st.VtSlot
+    vtNSlots <- st.NSlots
     for w in vtRows do
         emitByte st.ConstData (w &&& 0xFF); emitByte st.ConstData ((w >>> 8) &&& 0xFF)
         emitByte st.ConstData ((w >>> 16) &&& 0xFF); emitByte st.ConstData ((w >>> 24) &&& 0xFF)
