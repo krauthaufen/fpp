@@ -7851,7 +7851,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     vtRows.[cid * st.NSlots + slot] <- tblIdx m (fn v)
                 | Some v ->
                     if System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1" then
-                        eprintfn "IDENT %s.%s SKIP arity=%A" owner mn (dictTryFind st.Funcs (key v))
+                        eprintfn "IDENT %s.%s SKIP arity=%s" owner mn
+                            (match dictTryFind st.Funcs (key v) with Some a -> string a | None -> "none")
                 | _ ->
                     if System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1" then
                         eprintfn "IDENT %s.%s absent" owner mn)

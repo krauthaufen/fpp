@@ -1289,8 +1289,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             EPrim ("+t", [ EPrim ("+t", [ ELit (LString "\"'\""); EApp (EUnknown "string#c", [ e ]) ])
                                                            ELit (LString "\"'\"") ])
                                         | "f" | "s" | "l" | "w" | "h" -> EApp (EUnknown ("string#" + k), [ e ])
-                                        // int and statically-unknown share "":
-                                        // the runtime dispatch answers both
+                                        // a KNOWN int needs no runtime dispatch
+                                        // (kindOf now names it), which is what
+                                        // lets a backend with no $showv print it
+                                        | "i" -> EApp (EUnknown "string#i", [ e ])
+                                        // statically unknown: the runtime decides
                                         | _ -> EApp (EUnknown "showv", [ e ]))
                                    | _ ->   // d, i
                                        // int64/uint64 through the prelude's

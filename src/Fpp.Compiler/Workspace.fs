@@ -1042,7 +1042,11 @@ type Workspace() =
                     eprintfn "COREDECL %s:%d %s = %s" v.Path v.Offset v.Name (Fpp.Core.Ir.printExpr e)
                 | Fpp.Core.Ir.DLet (_, v, _, _) -> eprintfn "COREFN %s:%d %s" v.Path v.Offset v.Name
                 | Fpp.Core.Ir.DClass (n, b, own, impls) ->
-                    eprintfn "CORECLASS %s base=%A own=[%s] impls=[%s]" n b
+                    // no %A: it lowers to showv, which the SELF-HOSTED linear
+                    // backend stubs — and one gap stubs the WHOLE enclosing
+                    // lambda (here the emit thunk itself)
+                    eprintfn "CORECLASS %s base=%s own=[%s] impls=[%s]" n
+                        (match b with Some x -> x | None -> "-")
                         (own |> List.map fst |> String.concat ",")
                         (impls |> List.map (fun (i, ms) -> i + ":" + (ms |> List.map fst |> String.concat "/")) |> String.concat ";")
                 | _ -> ()
