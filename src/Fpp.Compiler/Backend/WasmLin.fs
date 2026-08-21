@@ -291,6 +291,9 @@ let mutable private cbBase = 0
 /// than a handful of interop handles. Overflow used to walk silently into the
 /// shadow stack: $cbreg now traps instead.
 let private CB_SLOTS = 262144
+/// entries in fpprt's static tid->class-id table. MUST equal
+/// FPPRT_WASM_NTIDS in runtime/fpprt-wasm-shim.c.
+let private FPPRT_WASM_NTIDS = 65536
 
 // GC: the fpprt type-ids for a heap STRING (SCALAR_ARRAY, 2 bytes/unit) and a
 // raw SCALAR byte buffer, resolved by the driver before the runtime string and
@@ -8801,7 +8804,16 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             gg rf "$witnesses"; ic rf off; ins rf "i32.add"; ic rf size; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 4); ins rf "i32.add"; ic rf align; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 8); ins rf "i32.add"; ic rf refMask; mem rf "i32.store"
+        // the tid->cid table is a FIXED static array in fpprt-wasm-shim.c
+        // (FPPRT_WASM_NTIDS). Writing past it corrupts the static memory that
+        // follows AND leaves those shapes reading class-id 0, so a dispatch on
+        // one goes through another type's vtable row — silently, until it hits
+        // an empty slot. Fail here instead, where the cause is legible.
         for tid, cid in vecToList st.TidCid do
+            if tid >= FPPRT_WASM_NTIDS then
+                err st ("too many shapes for the tid->cid table: tid " + string tid
+                        + " >= FPPRT_WASM_NTIDS (" + string FPPRT_WASM_NTIDS
+                        + ") — raise it in runtime/fpprt-wasm-shim.c and rebuild the reactors")
             gg rf "$t2c"; ic rf (4 * tid); ins rf "i32.add"; ic rf cid; mem rf "i32.store"
         // register every shape's fpprt type. A FK_STRUCT shape with a ref-map
         // writes its byte-offsets into the static g_refoffs pool (a compile-time

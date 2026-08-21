@@ -3238,13 +3238,23 @@ instance Pinnable<string>
         String.unpin s |> ignore
 
 module Seq =
+    // the mapping runs ON MoveNext and the result is CACHED: applying it in
+    // Current re-ran it on every read (F#'s enumerators promise Current is
+    // effect-free) and never ran it at all for an element the consumer moved
+    // past without reading — `Seq.map f xs |> Seq.skip 8` ran f twice, not ten
+    // times.
     let map (f : 'a -> 'b) (xs : seq<'a>) : seq<'b> =
         { new IEnumerable<'b> with
             member _.GetEnumerator() =
                 let en = xs.GetEnumerator()
+                let mutable cur = Unchecked.defaultof<'b>
                 { new IEnumerator<'b> with
-                    member _.MoveNext() = en.MoveNext()
-                    member _.Current = f en.Current
+                    member _.MoveNext() =
+                        if en.MoveNext() then
+                            cur <- f en.Current
+                            true
+                        else false
+                    member _.Current = cur
                     member _.Dispose() = en.Dispose() } }
     let filter (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
         { new IEnumerable<'a> with
@@ -3400,34 +3410,48 @@ module Seq =
                          | Some en -> en.Dispose()
                          | None -> ())
                         outer.Dispose() } }
+    // these STOP at the answer. Walking the whole sequence behind a flag gave
+    // the same result but ran the source's effects for every element, and
+    // could not finish an infinite one at all.
     let exists (p : 'a -> bool) (xs : seq<'a>) =
+        let en = xs.GetEnumerator()
         let mutable found = false
-        for x in xs do
-            if not found then found <- p x
+        while not found && en.MoveNext() do
+            found <- p en.Current
+        en.Dispose()
         found
     let forall (p : 'a -> bool) (xs : seq<'a>) =
+        let en = xs.GetEnumerator()
         let mutable ok = true
-        for x in xs do
-            if ok then ok <- p x
+        while ok && en.MoveNext() do
+            ok <- p en.Current
+        en.Dispose()
         ok
     let contains (value : 'a) (xs : seq<'a>) = exists (fun x -> x = value) xs
     let tryFind (p : 'a -> bool) (xs : seq<'a>) : option<'a> =
+        let en = xs.GetEnumerator()
         let mutable found = None
-        for x in xs do
-            match found with
-            | None -> if p x then found <- Some x
-            | Some _ -> ()
+        let mutable go = true
+        while go && en.MoveNext() do
+            if p en.Current then
+                found <- Some en.Current
+                go <- false
+        en.Dispose()
         found
     let find (p : 'a -> bool) (xs : seq<'a>) =
         match tryFind p xs with
         | Some x -> x
         | None -> raise (KeyNotFoundException "no element matches the predicate")
     let tryPick (f : 'a -> option<'b>) (xs : seq<'a>) : option<'b> =
+        let en = xs.GetEnumerator()
         let mutable picked = None
-        for x in xs do
+        let mutable go = true
+        while go && en.MoveNext() do
+            picked <- f en.Current
             match picked with
-            | None -> picked <- f x
-            | Some _ -> ()
+            | Some _ -> go <- false
+            | None -> ()
+        en.Dispose()
         picked
     let pick (f : 'a -> option<'b>) (xs : seq<'a>) =
         match tryPick f xs with
@@ -3532,13 +3556,71 @@ module Seq =
         acc
     let indexed (xs : seq<'a>) : seq<int * 'a> = mapi (fun i x -> (i, x)) xs
     let scan (f : 's -> 'a -> 's) (state : 's) (xs : seq<'a>) : seq<'s> =
-        List.toSeq (List.scan f state (toList xs))
-    let pairwise (xs : seq<'a>) : seq<'a * 'a> = List.toSeq (List.pairwise (toList xs))
+        { new IEnumerable<'s> with
+            member _.GetEnumerator() =
+                let en = xs.GetEnumerator()
+                let mutable acc = state
+                let mutable started = false
+                let mutable cur = state
+                { new IEnumerator<'s> with
+                    member _.MoveNext() =
+                        if not started then
+                            started <- true
+                            cur <- acc
+                            true
+                        elif en.MoveNext() then
+                            acc <- f acc en.Current
+                            cur <- acc
+                            true
+                        else false
+                    member _.Current = cur
+                    member _.Dispose() = en.Dispose() } }
+    let pairwise (xs : seq<'a>) : seq<'a * 'a> =
+        { new IEnumerable<'a * 'a> with
+            member _.GetEnumerator() =
+                let en = xs.GetEnumerator()
+                let mutable prev = Unchecked.defaultof<'a>
+                let mutable havePrev = false
+                let mutable cur = Unchecked.defaultof<'a * 'a>
+                { new IEnumerator<'a * 'a> with
+                    member _.MoveNext() =
+                        if not havePrev then
+                            if en.MoveNext() then
+                                prev <- en.Current
+                                havePrev <- true
+                            else havePrev <- false
+                        if not havePrev then false
+                        elif en.MoveNext() then
+                            cur <- (prev, en.Current)
+                            prev <- en.Current
+                            true
+                        else false
+                    member _.Current = cur
+                    member _.Dispose() = en.Dispose() } }
     let unfold (gen : 's -> ('a * 's) option) (state : 's) : seq<'a> =
         List.toSeq (List.unfold gen state)
-    let distinct (xs : seq<'a>) : seq<'a> = List.toSeq (List.distinct (toList xs))
     let distinctBy (key : 'a -> 'k) (xs : seq<'a>) : seq<'a> =
-        List.toSeq (List.distinctBy key (toList xs))
+        { new IEnumerable<'a> with
+            member _.GetEnumerator() =
+                let en = xs.GetEnumerator()
+                let mutable seen : 'k list = []
+                let mutable cur = Unchecked.defaultof<'a>
+                { new IEnumerator<'a> with
+                    member _.MoveNext() =
+                        let mutable found = false
+                        let mutable more = true
+                        while more && not found do
+                            if en.MoveNext() then
+                                let k = key en.Current
+                                if not (List.contains k seen) then
+                                    seen <- k :: seen
+                                    cur <- en.Current
+                                    found <- true
+                            else more <- false
+                        found
+                    member _.Current = cur
+                    member _.Dispose() = en.Dispose() } }
+    let distinct (xs : seq<'a>) : seq<'a> = distinctBy (fun x -> x) xs
     let except (excluded : seq<'a>) (xs : seq<'a>) : seq<'a> =
         let ex = List.ofSeq excluded
         filter (fun x -> not (List.contains x ex)) xs
@@ -3594,9 +3676,48 @@ module Seq =
     let maxBy (f : 'a -> 'k) (xs : seq<'a>) : 'a = List.maxBy f (toList xs)
     let minBy (f : 'a -> 'k) (xs : seq<'a>) : 'a = List.minBy f (toList xs)
     let takeWhile (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
-        List.toSeq (List.takeWhile p (toList xs))
+        { new IEnumerable<'a> with
+            member _.GetEnumerator() =
+                let en = xs.GetEnumerator()
+                let mutable live = true
+                let mutable cur = Unchecked.defaultof<'a>
+                { new IEnumerator<'a> with
+                    member _.MoveNext() =
+                        if not live then false
+                        elif en.MoveNext() then
+                            cur <- en.Current
+                            live <- p cur
+                            live
+                        else
+                            live <- false
+                            false
+                    member _.Current = cur
+                    member _.Dispose() = en.Dispose() } }
     let skipWhile (p : 'a -> bool) (xs : seq<'a>) : seq<'a> =
-        List.toSeq (List.skipWhile p (toList xs))
+        { new IEnumerable<'a> with
+            member _.GetEnumerator() =
+                let en = xs.GetEnumerator()
+                let mutable dropped = false
+                let mutable cur = Unchecked.defaultof<'a>
+                { new IEnumerator<'a> with
+                    member _.MoveNext() =
+                        if dropped then
+                            if en.MoveNext() then
+                                cur <- en.Current
+                                true
+                            else false
+                        else
+                            dropped <- true
+                            let mutable found = false
+                            let mutable more = true
+                            while more && not found do
+                                if en.MoveNext() then
+                                    cur <- en.Current
+                                    if not (p cur) then found <- true
+                                else more <- false
+                            found
+                    member _.Current = cur
+                    member _.Dispose() = en.Dispose() } }
     let countBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'k * int> =
         List.toSeq (List.countBy f (toList xs))
     let groupBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'k * seq<'a>> =
@@ -3615,8 +3736,23 @@ module Seq =
     let averageBy (f : 'a -> float) (xs : seq<'a>) : float = List.averageBy f (toList xs)
     let splitInto (n : int) (xs : seq<'a>) : seq<'a[]> =
         List.toSeq (List.map List.toArray (List.splitInto n (toList xs)))
+    // stops at the SHORTER side, as F# does — going through List.zip raised on
+    // a length mismatch, so `Seq.zip` over sources of different lengths (an
+    // infinite one among them) could not work at all
     let zip (a : seq<'a>) (b : seq<'b>) : seq<'a * 'b> =
-        List.toSeq (List.zip (toList a) (toList b))
+        { new IEnumerable<'a * 'b> with
+            member _.GetEnumerator() =
+                let ea = a.GetEnumerator()
+                let eb = b.GetEnumerator()
+                let mutable cur = Unchecked.defaultof<'a * 'b>
+                { new IEnumerator<'a * 'b> with
+                    member _.MoveNext() =
+                        if ea.MoveNext() && eb.MoveNext() then
+                            cur <- (ea.Current, eb.Current)
+                            true
+                        else false
+                    member _.Current = cur
+                    member _.Dispose() = (ea.Dispose (); eb.Dispose ()) } }
     let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)
     let readonly (xs : seq<'a>) : seq<'a> = xs
     /// Really delayed: the thunk runs once per enumeration, not once when
