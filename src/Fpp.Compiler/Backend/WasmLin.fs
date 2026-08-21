@@ -899,6 +899,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_remove2" "$lt_iii2i"
     declFn m "$str_cmp" "$lt_ii2i"
     declFn m "$cmpv" "$lt_ii2i"
+    declFn m "$eqv" "$lt_ii2i"
     declFn m "$hashv" "$lt_i2i"
     declFn m "$lappend" "$lt_ii2i"
     declFn m "$isBuiltinSeq" "$lt_i2i"
@@ -2871,6 +2872,142 @@ let private emitCmpv (m : Mod) : unit =
     ic f 0
     endFn f
 
+// $eqv(a, b): STRUCTURAL EQUALITY, which is not `$cmpv … = 0`. F# keeps the
+// two relations apart and floats are where they part: comparison is a total
+// order (NaN equal to itself, below everything) so that values sort, while
+// equality is IEEE, so `nan = nan` is false and `[nan] = [nan]` with it. The C
+// backend has had `fpp_eqv` beside `fpp_cmpv` all along; this is its wasm
+// counterpart, and the shapes it answers for match it: strings by content,
+// floats by IEEE, arrays and classes by identity (DIVERGENCES.md), records,
+// unions, tuples and lists field by field.
+let private emitEqv (m : Mod) : unit =
+    let f = beginFn m [ "$a"; "$b" ]
+    local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"
+    local f "$w" "i32"; local f "$tot" "i32"; local f "$st" "i32"; local f "$r" "i32"
+    local f "$tbl" "i32"; local f "$tid" "i32"; local f "$msz" "i32"
+    local f "$fa" "f64"; local f "$fb" "f64"
+    localsDone f
+    let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
+    let strH = hv CID_STRING gcStrTid
+    let fltH = hv CID_FLOAT gcFloatTid
+    let i64H = hv CID_INT64 gcInt64Tid
+    let both h = (lg f "$ca"; ic f h; ins f "i32.eq"; lg f "$cb"; ic f h; ins f "i32.eq"; ins f "i32.and")
+    memSizeIns f; ic f 16; ins f "i32.shl"; ls f "$msz"
+    (if gc then (gg f "$roots"; ic f (4 * gcCmpTblSlot); ins f "i32.add"; mem f "i32.load"; ls f "$tbl"))
+    let isPtr (r : string) =
+        lg f r; lg f "$msz"; ins f "i32.lt_u"
+        lg f r; ic f CONST_BASE; ins f "i32.ge_u"; ins f "i32.and"
+        (if gc then (
+            lg f r; mem f "i32.load"; ls f "$x"
+            lg f "$x"; ic f 1; ins f "i32.and"; ins f "i32.and"
+            lg f "$x"; ic f 1; ins f "i32.shr_u"; lg f "$tbl"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.lt_u"; ins f "i32.and"))
+    // ADDRESSABLE means: even, non-zero, inside linear memory and above the
+    // constant base. Only then may a header be loaded — a raw scalar like -1
+    // would otherwise be dereferenced at 0xffffffff.
+    let addressable (r : string) =
+        lg f r; ic f 1; ins f "i32.and"; ins f "i32.eqz"
+        lg f r; ic f CONST_BASE; ins f "i32.ge_u"; ins f "i32.and"
+        lg f r; lg f "$msz"; ins f "i32.lt_u"; ins f "i32.and"
+    // the SAME WORD is equal to itself — except a float box, whose NaN is not
+    // equal to itself
+    lg f "$a"; lg f "$b"; ins f "i32.eq"
+    ifE f
+    addressable "$a"
+    ifE f
+    lg f "$a"; mem f "i32.load"; ic f fltH; ins f "i32.ne"
+    ifE f; ic f 1; ins f "return"; endB f
+    elseB f
+    ic f 1; ins f "return"
+    endB f
+    endB f
+    // distinct words: a tagged scalar, a null, or anything not addressable is
+    // equal only to itself, and it was not itself
+    addressable "$a"; ins f "i32.eqz"
+    ifE f; ic f 0; ins f "return"; endB f
+    addressable "$b"; ins f "i32.eqz"
+    ifE f; ic f 0; ins f "return"; endB f
+    // ... and its header must name a shape the table knows
+    isPtr "$a"; ins f "i32.eqz"
+    ifE f; ic f 0; ins f "return"; endB f
+    isPtr "$b"; ins f "i32.eqz"
+    ifE f; ic f 0; ins f "return"; endB f
+    lg f "$a"; mem f "i32.load"; ls f "$ca"
+    lg f "$b"; mem f "i32.load"; ls f "$cb"
+    let cidOfHdr (hdrLocal : string) =
+        if gc then (lg f hdrLocal; ic f 1; ins f "i32.shr_u"; ic f 2; ins f "i32.shl"; gg f "$t2c"; ins f "i32.add"; mem f "i32.load")
+        else lg f hdrLocal
+    let vtRowAddr (slot : int) =
+        (if gc then (gg f "$roots"; ic f (4 * vtRootSlot); ins f "i32.add"; mem f "i32.load"; ic f 8; ins f "i32.add")
+         else ic f vtBaseConst)
+        cidOfHdr "$ca"
+        ic f vtNSlots; ins f "i32.mul"; ic f slot; ins f "i32.add"; ic f 4; ins f "i32.mul"; ins f "i32.add"
+        mem f "i32.load"
+    // a class (or any type declaring Equals) answers for itself — slot 0 of
+    // its vtable row, which every class row carries ($clseq by default, i.e.
+    // reference equality)
+    if vtNSlots > 0 then
+        lg f "$ca"; lg f "$cb"; ins f "i32.eq"
+        cidOfHdr "$ca"; ic f CID_FIRST_USER; ins f "i32.ge_s"; ins f "i32.and"
+        ifE f
+        vtRowAddr 0; ls f "$x"
+        lg f "$x"; ifE f
+        lg f "$a"; lg f "$b"; lg f "$x"; callIndirect f "$lfn2"
+        ins f "return"
+        endB f
+        endB f
+    both strH
+    ifE f; lg f "$a"; lg f "$b"; callf f "$str_cmp"; ins f "i32.eqz"; ins f "return"; endB f
+    both fltH
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fa"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fb"
+    // IEEE: this is the one place equality and comparison disagree
+    lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ins f "return"
+    endB f
+    both i64H
+    ifE f
+    lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i64.load"
+    lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i64.load"
+    ins f "i64.eq"; ins f "return"
+    endB f
+    if gc then
+        // different CLASS-IDs are different values (one shape can intern under
+        // several tids, so compare ids and not headers — see $cmpv)
+        lg f "$ca"; lg f "$cb"; ins f "i32.ne"
+        ifE f
+        cidOfHdr "$ca"; ls f "$x"
+        cidOfHdr "$cb"; ls f "$r"
+        lg f "$x"; lg f "$r"; ins f "i32.ne"
+        ifE f; ic f 0; ins f "return"; endB f
+        endB f
+        lg f "$ca"; ic f 1; ins f "i32.and"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
+        lg f "$ca"; ic f 1; ins f "i32.shr_u"; ls f "$tid"
+        lg f "$tbl"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$r"
+        // packed scalar array: arrays are equal only when IDENTICAL
+        // (DIVERGENCES.md), and identity was answered at the top
+        lg f "$r"; ic f 0x3FF; ins f "i32.and"; ic f 0x3FF; ins f "i32.eq"
+        ifE f; ic f 0; ins f "return"; endB f
+        lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
+        lg f "$r"; ic f 10; ins f "i32.shr_u"; ls f "$st"
+        ic f 1; ls f "$w"
+        blockE f "$ed"; loopE f "$ego"
+        lg f "$w"; lg f "$tot"; ins f "i32.ge_s"; brIf f "$ed"
+        lg f "$st"; lg f "$w"; ins f "i32.shr_u"; ic f 1; ins f "i32.and"
+        ifE f
+        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        callf f "$eqv"; ls f "$r"
+        elseB f
+        lg f "$a"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        lg f "$b"; lg f "$w"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"
+        ins f "i32.eq"; ls f "$r"
+        endB f
+        lg f "$r"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f
+        lg f "$w"; ic f 1; ins f "i32.add"; ls f "$w"
+        br f "$ego"; endB f; endB f
+    ic f 1
+    endFn f
+
 // $hashv(v): a structural hash. The dicts are insertion-ordered, so hash
 // values never reach any output — only CONSISTENCY matters: equal values must
 // hash equal, and $hashv must agree with the witnessed raw fast path (a raw
@@ -4248,7 +4385,64 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
         // array's f64 halves read as 4-byte elements faulted).
         LPrim (SubW, [ LPrim (GtUW, [ wa; wb ]); LPrim (LtUW, [ wa; wb ]) ])
 
-// Should this `let`-bound var be rooted on the shadow stack for its scope? Only
+/// STRUCTURAL EQUALITY at a known shape -> a raw 0/1 word. Not `structCmpW …
+/// = 0`: the two relations disagree on floats, where comparison is a total
+/// order (so values sort) and equality is IEEE (so `nan = nan` is false, and
+/// `[nan] = [nan]` with it). Everything else answers the same either way, and
+/// the shapes that are IDENTITY here — arrays, classes — are the divergences
+/// DIVERGENCES.md records.
+let rec private structEqW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LExpr) (wit : int option) : LExpr =
+    match sh with
+    | ShScalar | ShUScalar -> LPrim (EqW, [ wa; wb ])
+    | ShStr -> LPrim (EqW, [ LCall ("$str_cmp", [ wa; wb ]); LConstW 0 ])
+    | ShFloat -> LPrim (EqF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ])
+    | ShInt64 | ShUInt64 -> LPrim (EqL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ])
+    | ShHalf ->
+        // widened, so -0.0h equals 0.0h and a NaN half equals nothing
+        LPrim (EqF, [ LPrim (PromF, [ LCall ("$h2f", [ wa ]) ]); LPrim (PromF, [ LCall ("$h2f", [ wb ]) ]) ])
+    | ShArr _ -> LPrim (EqW, [ wa; wb ])
+    | ShTup shapes ->
+        let ra = freshTmp ctx
+        let rb = freshTmp ctx
+        let r = freshTmp ctx
+        let elemEq i shi = structEqW ctx shi (LLoad (W, LGet (wReg ra), HDR + 4 * i)) (LLoad (W, LGet (wReg rb), HDR + 4 * i)) None
+        (match shapes with
+         | [] -> LConstW 1
+         | sh0 :: more ->
+             let init = [ LSet (wReg ra, wa); LSet (wReg rb, wb); LSet (wReg r, elemEq 0 sh0) ]
+             let guards = more |> List.mapi (fun k shi -> LIf (LGet (wReg r), [ LSet (wReg r, elemEq (k + 1) shi) ], []))
+             LDo (init @ guards, LGet (wReg r)))
+    | ShList esh ->
+        // two cons chains, element by element; equal only if they run out
+        // together (nil = 0)
+        let pa = freshTmp ctx
+        let pb = freshTmp ctx
+        let r = freshTmp ctx
+        let notNil p = LPrim (NeW, [ LGet (wReg p); LConstW 0 ])
+        let cond = LPrim (AndW, [ notNil pa; LPrim (AndW, [ notNil pb; LGet (wReg r) ]) ])
+        let body =
+            [ LSet (wReg r, structEqW ctx esh (LLoad (W, LGet (wReg pa), HDR)) (LLoad (W, LGet (wReg pb), HDR)) None)
+              LIf (LGet (wReg r),
+                   [ LSet (wReg pa, LLoad (W, LGet (wReg pa), HDR + 4)); LSet (wReg pb, LLoad (W, LGet (wReg pb), HDR + 4)) ], []) ]
+        LDo ([ LSet (wReg pa, wa); LSet (wReg pb, wb); LSet (wReg r, LConstW 1)
+               LWhile (cond, body)
+               LIf (LGet (wReg r),
+                    [ LSet (wReg r, LPrim (EqW, [ notNil pa; notNil pb ])) ], []) ],
+             LGet (wReg r))
+    | ShOther ->
+        // unknown/generic: the witness says whether the element is a RAW
+        // scalar (compare the words) or a ref ($eqv walks it), exactly as
+        // structCmpW does
+        (match wit with
+         | Some w ->
+             let t = freshTmp ctx
+             LDo ([ LIf (LPrim (EqW, [ LLoad (W, LGet (wReg w), 8); LConstW 0 ]),
+                         [ LSet (wReg t, LPrim (EqW, [ wa; wb ])) ],
+                         [ LSet (wReg t, LCall ("$eqv", [ wa; wb ])) ]) ],
+                   LGet (wReg t))
+         | None -> LCall ("$eqv", [ wa; wb ]))
+
+// Should this `let`-bound var be rooted on the shadow stack for its scope? Only// Should this `let`-bound var be rooted on the shadow stack for its scope? Only
 // a genuine pointer (RKRef) that is NOT a cell (cells are heap boxes with their
 // own rooting) and NOT an unboxed scalar (those ride typed locals the GC never
 // scans). Its value is even/pointer, so the odd-tag-skipping root scanner traces
@@ -4807,7 +5001,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let sh = if isStr then ShStr elif hasAt then ShOther else mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
         let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
-        let boolOp = match cb with "=" -> EqW | "<>" -> NeW | "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
+        // `=`/`<>` take the EQUALITY relation, the ordering operators take
+        // comparison. They answer alike everywhere except a float, and
+        // routing equality through `compare … = 0` made `[nan] = [nan]` true.
+        if cb = "=" || cb = "<>" then
+            LDo (pre @ [ LSet (wReg cr, structEqW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)) ],
+                 (if cb = "=" then LGet (wReg cr) else LPrim (EqW, [ LGet (wReg cr); LConstW 0 ])))
+        else
+        let boolOp = match cb with "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
         LDo (pre @ [ LSet (wReg cr, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)) ],
              (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
     | EPrim (op, [ a; b ]) ->
@@ -5464,7 +5665,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (match m, args with
          | "isNull", [ x ] -> LPrim (EqW, [ coreToLowE ctx x; LConstW 0 ])
          | "hash", [ x ] -> LCall ("$hashv", [ coreToLowE ctx x ])
-         | "equals", [ a; b ] -> LPrim (EqW, [ LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ]); LConstW 0 ])
+         | "equals", [ a; b ] -> LCall ("$eqv", [ coreToLowE ctx a; coreToLowE ctx b ])
          | "compare", [ a; b ] -> LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ])
          | _ -> (for a in args do (coreToLowE ctx a) |> ignore); lowInt 0)
     | EField (EUnknown "Unchecked", _, _) -> lowInt 0
@@ -5473,7 +5674,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EUnknown "Unchecked.defaultof" -> lowInt 0
     | EApp (EUnknown n, [ x ]) when n.StartsWith "Unchecked.hash" -> LCall ("$hashv", [ coreToLowE ctx x ])
     | EPrim (op, [ a; b ]) when op.StartsWith "Unchecked.equals" ->
-        LPrim (EqW, [ LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ]); LConstW 0 ])
+        LCall ("$eqv", [ coreToLowE ctx a; coreToLowE ctx b ])
     | EApp (EUnknown ("refEq" | "$refeq"), [ a; b ]) -> (LPrim (EqW, [ coreToLowE ctx a; coreToLowE ctx b ]))
     // a CLASS instance hashes by IDENTITY (DIVERGENCES.md): stable across
     // mutation and moves (fpprt keeps the table), distinct per object
@@ -8497,7 +8698,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitPrintRaw m; emitFtoa6 m; emitStreq m
     emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
-    emitStrCmp m; emitCmpv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
+    emitStrCmp m; emitCmpv m; emitEqv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
     emitMemsize m; emitMemcopy m; emitFtoaS m; emitLtoa m true; emitLtoa m false
     if jsUsed || gc then emitCbreg m
     if gc then (emitGcdrain m; emitRootswipe m)

@@ -300,22 +300,19 @@ extension declares nothing — no record, no constructor, no vtable slot — so
 an interface extension is a function of the receiver, not a new slot every
 implementer must fill.
 
-## Equality on a COMPOUND is comparison, and NaN shows the seam
+## Equality and comparison are SEPARATE relations
 
-F# has two generic relations. Equality is IEEE on floats, so `nan = nan` is
-false and `[nan] = [nan]` is false with it. Comparison is a TOTAL order, where
-NaN is equal to itself and less than every other value — that is what lets
-`List.sort` order floats and a float serve as a Map key.
+F# has two generic relations and they disagree on exactly one value. Equality
+is IEEE on floats, so `nan = nan` is false and `[nan] = [nan]` is false with
+it. Comparison is a TOTAL order, where NaN is equal to itself and below
+everything else — that is what lets `List.sort` order floats and a float serve
+as a Map key. Both hold here: `=`/`<>` lower to structural EQUALITY (per shape,
+or `$eqv` at runtime), the ordering operators to comparison (`structCmpW` /
+`$cmpv`), and `compare [nan] [nan]` is 0 while `[nan] = [nan]` is false.
 
-Here the two agree on a float compared directly (`nan = nan` is false, the
-IEEE instruction) and on `compare` at every shape (NaN is lowest, as F# has
-it). They part on a compound: `=` on a list, tuple, record or union is defined
-as `compare … = 0`, so `[nan] = [nan]` and `(1.0, nan) = (1.0, nan)` are TRUE
-here and false in F#. Nothing else is affected — NaN is the only value whose
-equality and comparison disagree.
-
-Closing it means an equality walker beside `$cmpv` rather than routing both
-through one.
+What still diverges from F# is narrower, and deliberate: an ARRAY is equal only
+to itself (F# compares arrays structurally), and so is a CLASS instance unless
+it declares its own `Equals`. Both are recorded above.
 
 ## Source files are read as BYTES, not UTF-8
 

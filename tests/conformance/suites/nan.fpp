@@ -9,13 +9,9 @@
 //
 // DROPPED: the DoubleNaNNonStructuralComparison modules (they re-run the same
 // checks under `open NonStructuralComparison`, which is not in the subset);
-// and `[nan] = [nan]` / `(1.0, nan) = (1.0, nan)`, which F# calls FALSE. F#
-// has two generic relations — equality (IEEE on floats, so NaN equals
-// nothing) and comparison (a total order, NaN lowest) — while equality on a
-// COMPOUND here is defined as `compare … = 0`, so the total order decides it
-// and the pair compares equal. Splitting them needs an equality walker beside
-// $cmpv. A float compared DIRECTLY is unaffected: `nan = nan` is false above,
-// because that takes the IEEE instruction.
+// (the two generic relations — equality, IEEE on floats, and comparison, a
+// total order with NaN lowest — are separate here as they are in F#, so both
+// sets of checks below hold at once).
 module Core_nan
 
 let mutable ntests = 0
@@ -120,6 +116,11 @@ test "nan-min-rev" (System.Double.IsNaN (min 1.0 nan))
 test "nan-max" (System.Double.IsNaN (max nan 1.0))
 test "nan-max-rev" (System.Double.IsNaN (max 1.0 nan))
 test "nan-contains" (List.exists (fun x -> System.Double.IsNaN x) [ 1.0; nan ])
+// equality and comparison DISAGREE here, and that is the point: `=` is IEEE
+// all the way down, `compare` is the total order all the way down
+test "nan-structural-eq" (([ nan ] = [ nan ]) = false)
+test "nan-in-tuple" (((1.0, nan) = (1.0, nan)) = false)
+test "nan-in-option" ((Some nan = Some nan) = false)
 test "nan-compare-list" (compare [ nan ] [ nan ] = 0)
 test "nan-compare-tuple" (compare (1.0, nan) (1.0, nan) = 0)
 
