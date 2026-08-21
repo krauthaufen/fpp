@@ -1272,6 +1272,9 @@ let globalI32Mut (m : Mod) (name : string) (init : int) : unit =
     emitByte m.GlobalBody opEnd
 
 let F10 = 0x4024000000000000L
+/// +infinity's bits — `nan` is built as inf - inf, so no NaN constant is
+/// needed (and the payload matches the runtime's own quiet NaN)
+let FINF = 0x7FF0000000000000L
 let FTENTH = 0x3FB999999999999AL
 let rtTypesHalf (m : Mod) : unit =
     tyFunc m "$rt_f2i" [ "f64" ] [ "i32" ]

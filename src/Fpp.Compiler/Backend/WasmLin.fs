@@ -964,6 +964,55 @@ let private emitAtof (m : Mod) : unit =
     lg f "$s"
     ic f 4; ins f "i32.add"; mem f "i32.load"
     ls f "$n"
+    // the NAMED values: F#'s `float "NaN"` is nan and `float "Infinity"` is
+    // infinity, while the digit scanner below reads them as no digits at all
+    // and answers 0. Recognised by their first letter (and 'I' after a '-'),
+    // which no numeric spelling can start with.
+    lg f "$n"
+    ic f 0
+    ins f "i32.gt_s"
+    ifE f
+    lg f "$s"; ic f 8; ins f "i32.add"; mem f "i32.load16_u"; ls f "$c"
+    lg f "$c"; ic f 78; ins f "i32.eq"      // 'N'
+    lg f "$c"; ic f 110; ins f "i32.eq"     // 'n'
+    ins f "i32.or"
+    ifE f
+    fc f FINF
+    fc f FINF
+    ins f "f64.sub"
+    ins f "return"
+    endB f
+    lg f "$c"; ic f 73; ins f "i32.eq"      // 'I'
+    lg f "$c"; ic f 105; ins f "i32.eq"     // 'i'
+    ins f "i32.or"
+    ifE f
+    fc f FINF
+    ins f "return"
+    endB f
+    lg f "$c"; ic f 45; ins f "i32.eq"      // '-' then a name
+    lg f "$n"; ic f 1; ins f "i32.gt_s"
+    ins f "i32.and"
+    ifE f
+    lg f "$s"; ic f 10; ins f "i32.add"; mem f "i32.load16_u"; ls f "$c"
+    lg f "$c"; ic f 73; ins f "i32.eq"
+    lg f "$c"; ic f 105; ins f "i32.eq"
+    ins f "i32.or"
+    ifE f
+    fc f FINF
+    ins f "f64.neg"
+    ins f "return"
+    endB f
+    lg f "$c"; ic f 78; ins f "i32.eq"
+    lg f "$c"; ic f 110; ins f "i32.eq"
+    ins f "i32.or"
+    ifE f
+    fc f FINF
+    fc f FINF
+    ins f "f64.sub"
+    ins f "return"
+    endB f
+    endB f
+    endB f
     fc f FTENTH
     ls f "$scale"
     ic f 1

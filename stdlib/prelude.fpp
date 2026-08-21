@@ -943,6 +943,12 @@ let pown (x : float) (n : int) : float =
         k <- k / 2
     acc
 
+/// System.BitConverter's bit-level views, as F# spells them. The reverse
+/// directions need a bits->float extern the backends do not carry yet.
+module BitConverter =
+    let DoubleToInt64Bits (x : float) : int64 = doubleBits x
+    let SingleToInt32Bits (x : float32) : int = singleBits x
+
 /// System.Double's statics, as F# spells them
 module Double =
     let IsNaN (x : float) : bool = x <> x

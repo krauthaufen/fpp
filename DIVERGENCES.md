@@ -300,6 +300,20 @@ extension declares nothing — no record, no constructor, no vtable slot — so
 an interface extension is a function of the receiver, not a new slot every
 implementer must fill.
 
+## Source files are read as BYTES, not UTF-8
+
+`fpp` reads a source file as Latin-1 — one byte, one char. That is the byte
+domain the self-host fixpoint compares in, and it keeps a source file, its
+literals and the emitted constants in one representation end to end.
+
+The consequence is at the SOURCE level only: a non-ASCII character written
+literally in a file is its UTF-8 BYTES, so `String.length "e-acute-as-utf8"` is
+2 where fsc (which reads UTF-8) says 1. Escapes are unaffected and mean exactly
+what they mean in F#: `"\u00e9"` is one char, `"\U0001F600"` is a surrogate
+PAIR (length 2), and the whole UTF-16 view — indexing, comparison, `Substring`
+— agrees with .NET. Write non-ASCII text as escapes and the two languages
+agree; `tests/conformance/suites/strings.fpp` pins that.
+
 ## Weak references are REAL; there are no finalizers, but there IS cleanup
 
 `WeakReference<'a>` clears, and `ConditionalWeakTable<'k,'v>` drops an entry
