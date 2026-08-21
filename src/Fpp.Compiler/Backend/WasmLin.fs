@@ -2766,7 +2766,24 @@ let private emitCmpv (m : Mod) : unit =
     ifE f
     lg f "$a"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fa"
     lg f "$b"; ic f HDR; ins f "i32.add"; mem f "f64.load"; ls f "$fb"
-    lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ins f "return"
+    // the same TOTAL order structCmpW uses: `gt - lt` answers 0 for an
+    // unordered pair, so NaN would compare equal to every number — and
+    // `List.sort` passes `compare` as a VALUE, which lands here rather than
+    // in the float-shaped compare.
+    lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ls f "$x"
+    lg f "$x"; ins f "i32.eqz"
+    lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ins f "i32.eqz"
+    ins f "i32.and"
+    ifE f
+    lg f "$fa"; lg f "$fa"; ins f "f64.ne"
+    ifE f
+    lg f "$fb"; lg f "$fb"; ins f "f64.ne"
+    ifE f; ic f 0; ls f "$x"; elseB f; ic f -1; ls f "$x"; endB f
+    elseB f
+    ic f 1; ls f "$x"
+    endB f
+    endB f
+    lg f "$x"; ins f "return"
     endB f
     both i64H
     ifE f
@@ -4164,7 +4181,28 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
          | None -> LCall ("$cmpv", [ wa; wb ]))
     | ShStr -> LCall ("$str_cmp", [ wa; wb ])
     | ShFloat ->
-        LPrim (SubW, [ LPrim (GtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]); LPrim (LtF, [ LLoad (F64, wa, HDR); LLoad (F64, wb, HDR) ]) ])
+        // `gt - lt` answers 0 for an UNORDERED pair, which would call NaN
+        // equal to every number. F#'s structural order is TOTAL: NaN is equal
+        // to itself and less than everything else (that is what lets a list of
+        // floats sort and a float key live in a Map).
+        let fa = freshTmpT ctx F64
+        let fb = freshTmpT ctx F64
+        let ga = LGet { Id = fa; RTy = F64 }
+        let gb = LGet { Id = fb; RTy = F64 }
+        let r = freshTmp ctx
+        LDo ([ LSet ({ Id = fa; RTy = F64 }, LLoad (F64, wa, HDR))
+               LSet ({ Id = fb; RTy = F64 }, LLoad (F64, wb, HDR))
+               LSet (wReg r, LPrim (SubW, [ LPrim (GtF, [ ga; gb ]); LPrim (LtF, [ ga; gb ]) ]))
+               // 0 and NOT equal => unordered => at least one is NaN
+               LIf (LPrim (AndW, [ LPrim (EqW, [ LGet (wReg r); LConstW 0 ])
+                                   LPrim (EqW, [ LPrim (EqF, [ ga; gb ]); LConstW 0 ]) ]),
+                    [ LIf (LPrim (NeF, [ ga; ga ]),
+                           [ LIf (LPrim (NeF, [ gb; gb ]),
+                                  [ LSet (wReg r, LConstW 0) ],
+                                  [ LSet (wReg r, LConstW (0 - 1)) ]) ],
+                           [ LSet (wReg r, LConstW 1) ]) ],
+                    []) ],
+             LGet (wReg r))
     | ShInt64 ->
         LPrim (SubW, [ LPrim (GtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]); LPrim (LtSL, [ LLoad (I64, wa, HDR); LLoad (I64, wb, HDR) ]) ])
     | ShUInt64 ->

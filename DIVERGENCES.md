@@ -300,6 +300,23 @@ extension declares nothing — no record, no constructor, no vtable slot — so
 an interface extension is a function of the receiver, not a new slot every
 implementer must fill.
 
+## Equality on a COMPOUND is comparison, and NaN shows the seam
+
+F# has two generic relations. Equality is IEEE on floats, so `nan = nan` is
+false and `[nan] = [nan]` is false with it. Comparison is a TOTAL order, where
+NaN is equal to itself and less than every other value — that is what lets
+`List.sort` order floats and a float serve as a Map key.
+
+Here the two agree on a float compared directly (`nan = nan` is false, the
+IEEE instruction) and on `compare` at every shape (NaN is lowest, as F# has
+it). They part on a compound: `=` on a list, tuple, record or union is defined
+as `compare … = 0`, so `[nan] = [nan]` and `(1.0, nan) = (1.0, nan)` are TRUE
+here and false in F#. Nothing else is affected — NaN is the only value whose
+equality and comparison disagree.
+
+Closing it means an equality walker beside `$cmpv` rather than routing both
+through one.
+
 ## Source files are read as BYTES, not UTF-8
 
 `fpp` reads a source file as Latin-1 — one byte, one char. That is the byte

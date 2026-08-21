@@ -153,8 +153,11 @@ instance Ordered<float>
 instance Neg<float>
 instance Abs<float>
 instance MinMax<float>
-    static min a b = if a < b then a else b
-    static max a b = if a > b then a else b
+    // NaN PROPAGATES, in EITHER argument order — F# lowers float min/max to
+    // System.Math.Min/Max, which do that. An IEEE `<` on its own answers the
+    // non-NaN operand whenever NaN sits on the left.
+    static min a b = if a <> a then a elif b <> b then b elif a < b then a else b
+    static max a b = if a <> a then a elif b <> b then b elif a > b then a else b
 instance Add<float32, float32>
     type Result = float32
 instance Sub<float32, float32>
@@ -171,8 +174,9 @@ instance Ordered<float32>
 instance Neg<float32>
 instance Abs<float32>
 instance MinMax<float32>
-    static min a b = if a < b then a else b
-    static max a b = if a > b then a else b
+    // see MinMax<float>: NaN propagates either way round
+    static min a b = if a <> a then a elif b <> b then b elif a < b then a else b
+    static max a b = if a <> a then a elif b <> b then b elif a > b then a else b
 // ---- uint64: the same tower as uint32, on the 64-bit rail --------------
 instance Add<uint64, uint64>
     type Result = uint64
@@ -932,6 +936,9 @@ let round (x : float) : float =
 let log10 (x : float) : float = log x / log 10.0
 let infinity : float = 1.0 / 0.0
 let nan : float = 0.0 / 0.0
+/// F#'s float32 spellings of the same two
+let infinityf : float32 = 1.0f / 0.0f
+let nanf : float32 = 0.0f / 0.0f
 /// integer power, by squaring — F#'s pown
 let pown (x : float) (n : int) : float =
     let mutable acc = 1.0
