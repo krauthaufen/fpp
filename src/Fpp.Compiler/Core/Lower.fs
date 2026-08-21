@@ -545,13 +545,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let loV = { Path = path; Offset = off + 16000000; Name = "_rlo" }
         let iV = { Path = path; Offset = off + 17000000; Name = "_ri" }
         let outV = { Path = path; Offset = off + 18000000; Name = "_rout" }
+        // STOP AT lo rather than stepping past it: at Int32.MinValue the
+        // decrement WRAPS to MaxValue and `i >= lo` stays true forever
+        // ([Int32.MinValue .. Int32.MinValue + 2] hung).
+        let goV = { Path = path; Offset = off + 18500000; Name = "_rgo" }
+        let bsch = mono (TCon ("bool", []))
         ELet (false, loV, ish, lo,
           ELet (false, iV, ish, hi,
             ELet (false, outV, anonScheme, EListLit [],
-              ESeq [ EWhile (EPrim (">=", [ EVar (iV, ish); EVar (loV, ish) ]),
-                       ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anonScheme) ]))
-                              EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ])) ])
-                     EVar (outV, anonScheme) ])))
+              ELet (false, goV, bsch, EPrim (">=", [ EVar (iV, ish); EVar (loV, ish) ]),
+                ESeq [ EWhile (EVar (goV, bsch),
+                         ESeq [ EAssign (outV, EPrim ("::", [ EVar (iV, ish); EVar (outV, anonScheme) ]))
+                                EIf (EPrim ("<=", [ EVar (iV, ish); EVar (loV, ish) ]),
+                                     EAssign (goV, ELit (LBool false)),
+                                     EAssign (iV, EPrim ("-", [ EVar (iV, ish); ELit (LInt "1") ]))) ])
+                       EVar (outV, anonScheme) ]))))
 
     /// A range at its ELEMENT: int stays on the inline builder, anything
     /// else calls the prelude's RangeOps.Seq, stamped per element
@@ -3362,11 +3370,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   { Path = path; Offset = offsetOf n + 19000000; Name = "_i" },
                                   mono (TCon ("int", []))
                           let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
+                          // see the counted-loop case below: stepping past the
+                          // bound wraps at Int32.MaxValue and never terminates
+                          let goV = { Path = iv.Path; Offset = iv.Offset + 1200000; Name = "_go" }
+                          let bsch = mono (TCon ("bool", []))
                           ELet (false, iv, isch, lo,
                             ELet (false, hiV, isch, hi,
-                              EWhile (EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
-                                ESeq [ loopBody body
-                                       EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                              ELet (false, goV, bsch, EPrim ("<=", [ EVar (iv, isch); EVar (hiV, isch) ]),
+                                EWhile (EVar (goV, bsch),
+                                  ESeq [ loopBody body
+                                         EIf (EPrim (">=", [ EVar (iv, isch); EVar (hiV, isch) ]),
+                                              EAssign (goV, ELit (LBool false)),
+                                              EAssign (iv, EPrim ("+", [ EVar (iv, isch); ELit (LInt "1") ]))) ]))))
                       | pat, EPrim (rop1, [ EPrim (rop2, [ lo; st ]); hi ]) when
                             (rangeElem rop1).IsSome && (rangeElem rop2).IsSome ->
                           // a NON-ordinal STEPPED source (`for x in 3.0 .. -1.0 .. 0.0`):
@@ -3499,11 +3514,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              { Path = path; Offset = offsetOf n + 19000000; Name = "_i" },
                              mono (TCon ("int", []))
                      let hiV = { Path = iv.Path; Offset = iv.Offset + 1000000; Name = "_hi" }
+                     // STOP AT the bound rather than stepping past it: with
+                     // hi = Int32.MaxValue the increment wraps to MinValue and
+                     // `i <= hi` is true forever (an `i - 1` at MinValue is the
+                     // same loop going down). F# guarantees these terminate,
+                     // and the fsc integer-loop suite is where it showed.
+                     let goV = { Path = iv.Path; Offset = iv.Offset + 1200000; Name = "_go" }
+                     let bsch = mono (TCon ("bool", []))
+                     let cmp = if down then ">=" else "<="
+                     let cmp2 = if down then "<=" else ">="
+                     let stepOp = if down then "-" else "+"
                      ELet (false, iv, isch, lowerExpr (GNode lo),
                        ELet (false, hiV, isch, lowerExpr (GNode hi),
-                         EWhile (EPrim ((if down then ">=" else "<="), [ EVar (iv, isch); EVar (hiV, isch) ]),
-                           ESeq [ loopBody body
-                                  EAssign (iv, EPrim ((if down then "-" else "+"), [ EVar (iv, isch); ELit (LInt "1") ])) ])))
+                         ELet (false, goV, bsch, EPrim (cmp, [ EVar (iv, isch); EVar (hiV, isch) ]),
+                           EWhile (EVar (goV, bsch),
+                             ESeq [ loopBody body
+                                    // the LAST-iteration test is an ORDERING
+                                    // one, not `=`: a synthetic `=` here goes
+                                    // through structural equality and
+                                    // dispatches on a raw int
+                                    EIf (EPrim (cmp2, [ EVar (iv, isch); EVar (hiV, isch) ]),
+                                         EAssign (goV, ELit (LBool false)),
+                                         EAssign (iv, EPrim (stepOp, [ EVar (iv, isch); ELit (LInt "1") ]))) ]))))
                  | _ -> note (offsetOf n) "for loop shape")
             | WhileExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

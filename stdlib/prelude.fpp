@@ -1063,11 +1063,24 @@ type RangeOps =
         // [1.0; 2.0], not [1.5; 2.5]) and `i - One` underflows an unsigned
         // lo of zero into an infinite loop. Built by prepending, so the
         // ascending order needs one reversal.
+        // STOP AT hi rather than stepping past it: at the type's maximum the
+        // increment WRAPS and `i <= hi` stays true forever ([Int32.MaxValue-3
+        // .. Int32.MaxValue] hung). The extra flag is what makes the last
+        // iteration the last one.
         let mutable i = lo
         let mutable out : list<'a> = []
-        while i <= hi do
+        let mutable go = lo <= hi
+        while go do
             out <- i :: out
-            i <- i + One
+            // two conditions, and both are needed: stop AT hi so the step
+            // never runs at the type's maximum (where it would wrap), and
+            // re-test after stepping because the step can overshoot a bound
+            // that is not a whole number of steps away ([1.0 .. 2.5])
+            if i >= hi then
+                go <- false
+            else
+                i <- i + One
+                go <- i <= hi
         let mutable r : list<'a> = []
         let mutable rest = out
         let mutable go = true
@@ -2551,6 +2564,9 @@ module List =
             i <- i + 1
         acc
     let item (n : int) (xs : 'a list) =
+        // a NEGATIVE index used to skip the loop and answer the head; F#
+        // raises, and the fsc Seq conformance port compared the two
+        if n < 0 then failwith "The index was outside the range of elements in the list."
         let mutable rest = xs
         let mutable i = 0
         while i < n do
@@ -3513,10 +3529,14 @@ module Seq =
     let except (excluded : seq<'a>) (xs : seq<'a>) : seq<'a> =
         let ex = List.ofSeq excluded
         filter (fun x -> not (List.contains x ex)) xs
-    let windowed (size : int) (xs : seq<'a>) : seq<'a list> =
-        List.toSeq (List.windowed size (toList xs))
-    let chunkBySize (size : int) (xs : seq<'a>) : seq<'a list> =
-        List.toSeq (List.chunkBySize size (toList xs))
+    // F# yields ARRAYS from Seq.windowed/chunkBySize/splitInto, while the
+    // List versions yield lists and the Array versions arrays. These three
+    // yielded lists until the fsc Seq conformance port compared them against
+    // real F#.
+    let windowed (size : int) (xs : seq<'a>) : seq<'a[]> =
+        List.toSeq (List.map List.toArray (List.windowed size (toList xs)))
+    let chunkBySize (size : int) (xs : seq<'a>) : seq<'a[]> =
+        List.toSeq (List.map List.toArray (List.chunkBySize size (toList xs)))
     let sortDescending (xs : seq<'a>) : seq<'a> when Ordered<'a> =
         sortWith (fun a b -> compare b a) xs
     let sortByDescending (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
@@ -3580,8 +3600,8 @@ module Seq =
         List.toSeq ys, s2
     let average (xs : seq<float>) : float = List.average (toList xs)
     let averageBy (f : 'a -> float) (xs : seq<'a>) : float = List.averageBy f (toList xs)
-    let splitInto (n : int) (xs : seq<'a>) : seq<'a list> =
-        List.toSeq (List.splitInto n (toList xs))
+    let splitInto (n : int) (xs : seq<'a>) : seq<'a[]> =
+        List.toSeq (List.map List.toArray (List.splitInto n (toList xs)))
     let zip (a : seq<'a>) (b : seq<'b>) : seq<'a * 'b> =
         List.toSeq (List.zip (toList a) (toList b))
     let cache (xs : seq<'a>) : seq<'a> = List.toSeq (toList xs)

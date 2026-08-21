@@ -94,9 +94,13 @@ let tokenize (src : string) : Token list =
             while isHexDigit (peek i) || peek i = '_' do i <- i + 1
         else
             while isDigit (peek i) || peek i = '_' do i <- i + 1
-            // consume '.' only when followed by a digit, so `1..10` and
-            // `1.ToString()` lex as int-then-operator
-            if peek i = '.' && isDigit (peek (i + 1)) then
+            // consume '.' unless what follows makes it an OPERATOR: another
+            // '.' is a range (`1..10`), a letter or '_' is a member access
+            // (`1.ToString()`). A bare trailing dot IS a float in F# —
+            // `100. * 101. / 2.` is ordinary arithmetic there, and rejecting
+            // it was a lexer divergence the Seq conformance port tripped on.
+            if peek i = '.' && peek (i + 1) <> '.'
+               && not (isAsciiLetter (peek (i + 1))) && peek (i + 1) <> '_' then
                 isFloat <- true
                 i <- i + 1
                 while isDigit (peek i) || peek i = '_' do i <- i + 1
