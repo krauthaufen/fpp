@@ -1882,11 +1882,19 @@ let parse (src : string) : ParseResult =
         elif s.IsKw "class" then parseClassLike ClassDecl
         elif atInstanceDecl () then parseClassLike InstanceDecl
         elif s.IsKw "exception" then
-            let acc = vecNew<Green> ()
-            vecAdd acc (s.Bump ())
-            if s.Is Ident then vecAdd acc (s.Bump ())
+            // `exception E of T` DECLARES A CASE OF `exn`. Spelled as one —
+            // a TypeDecl naming `exn` whose child is E's UnionCase — it rides
+            // the rule that a user type of a prelude type's name MERGES with
+            // it (CLAUDE.md), so E becomes a constructor and a pattern with
+            // no special handling anywhere downstream. The `exn` identifier
+            // is synthesized at the keyword's own offset, so a diagnostic
+            // still points at the declaration.
+            let kw = s.Bump ()
+            let kwOffset = (match kw with GToken t -> t.Offset | _ -> 0)
+            let c = vecNew<Green> ()
+            if s.Is Ident then vecAdd c (s.Bump ())
             if s.IsKw "of" then
-                vecAdd acc (s.Bump ())
+                vecAdd c (s.Bump ())
                 // the payload may be LABELLED — `exception E of level : int`
                 // — and the label is documentation, not part of the type
                 let mutable go = true
@@ -1894,10 +1902,12 @@ let parse (src : string) : ParseResult =
                     if s.Is Ident && (s.Peek 1).Kind = Operator && (s.Peek 1).Text = ":" then
                         s.Bump () |> ignore
                         s.Bump () |> ignore
-                    vecAdd acc (parseType ctx)
+                    vecAdd c (parseType ctx)
                     if s.Is Comma || (s.IsOp "*" && s.SameLine) then s.Bump () |> ignore
                     else go <- false
-            Green.node TypeDecl (vecToList acc)
+            let exnTok =
+                GToken { Kind = Ident; Text = "exn"; Leading = []; Trailing = []; Offset = kwOffset }
+            Green.node TypeDecl [ kw; exnTok; Green.node UnionCase (vecToList c) ]
         elif isDirectiveHere () then
             // a COMPILER DIRECTIVE: `#nowarn "7331"`, `#light`. It addresses
             // the compiler, not the program, and every one of them is either

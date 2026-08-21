@@ -7877,6 +7877,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
     // its id and are told apart by their tag.
     let mutable nextCid = CID_FIRST_USER
+    /// per-union next tag, so a re-declaration appends (see DUnion below)
+    let unionNextTag = dictNew<string, int> ()
     for d in decls0 do
         match d with
         | DRecord (n, _, fs, _) ->
@@ -7888,10 +7890,17 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             if (dictTryFind st.ClassId n).IsNone then (dictSet st.ClassId n nextCid; nextCid <- nextCid + 1)
         | DUnion (uname, _, cs) ->
             let cid = match dictTryFind st.ClassId uname with Some c -> c | None -> (let c = nextCid in dictSet st.ClassId uname c; nextCid <- nextCid + 1; c)
+            // a SECOND declaration of a union name CONTINUES the tags rather
+            // than restarting them: a user type merges with a prelude type of
+            // the same name (CLAUDE.md), and restarting gave the merged-in
+            // cases the tags the original cases already held — every pattern
+            // for one then matched the other.
+            let start = match dictTryFind unionNextTag uname with Some n -> n | None -> 0
             cs |> List.iteri (fun i (cn, ar) ->
-                dictSet st.UnionTag cn i
+                dictSet st.UnionTag cn (start + i)
                 dictSet st.UnionArity cn ar
                 dictSet st.CaseClass cn cid)
+            dictSet unionNextTag uname (start + List.length cs)
         | DEnum (_, cs) -> for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
     // single-field-collapse (repr(T)): a one-field record travels as its field
