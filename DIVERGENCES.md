@@ -300,6 +300,32 @@ extension declares nothing — no record, no constructor, no vtable slot — so
 an interface extension is a function of the receiver, not a new slot every
 implementer must fill.
 
+## Structural COMPARISON of a record is not derived, and walks LAYOUT order
+
+F# derives structural comparison for every record and union. Here a user type
+needs an explicit `instance Ordered<T>`, and there is a reason beyond the
+missing derivation: the runtime comparator walks an object's payload words in
+LAYOUT order, and a record that mixes scalar and reference fields is laid out
+SCALARS FIRST (the inline-value layout, which packs a byte field into a byte).
+So for `type R = { f1 : string; f2 : int }` the comparator reaches `f2` first,
+where F# compares `f1` first.
+
+The consequence is visible today: a hand-written `instance Ordered<R>` and the
+generic path disagree. With `x = { f1 = "b"; f2 = 1 }` and `y = { f1 = "a";
+f2 = 2 }`, `compare x y` answers 1 through the instance and -1 through
+`compare [x] [y]` or `Unchecked.compare x y`.
+
+EQUALITY and HASHING are unaffected — neither depends on field order — and
+`tests/conformance/suites/equality.fpp` pins them, along with records and
+unions as Dictionary keys.
+
+Fixing the comparison means making the walk follow declaration order. The
+straightforward route is to stop reordering the fields of a MIXED record (the
+inline layout would stay for the all-scalar records that need it for the C
+ABI) and register those shapes as FK_STRUCT with an explicit ref-offset map,
+which fpprt already supports; the alternative is a per-shape order table
+beside the ref bitmask.
+
 ## Equality and comparison are SEPARATE relations
 
 F# has two generic relations and they disagree on exactly one value. Equality
