@@ -3262,6 +3262,7 @@ let rec private patBinders (p : Pat) : VarId list =
     | PVar (v, _) -> [ v ]
     | PAs (inner, v, _) -> v :: patBinders inner
     | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.collect patBinders ps
+    | PAnd (a, b) -> patBinders a @ patBinders b
     | PCons (a, b) -> patBinders a @ patBinders b
     | _ -> []
 
@@ -3388,6 +3389,7 @@ let rec private scanPatConsts (st : St) (p : Pat) : unit =
     | PLit (LString s) -> (if gc then internStrGc st s else internStr st s) |> ignore
     | PAs (q, _, _) -> scanPatConsts st q
     | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) | POr subs -> for q in subs do scanPatConsts st q
+    | PAnd (a, b) -> scanPatConsts st a; scanPatConsts st b
     | PCons (a, b) -> scanPatConsts st a; scanPatConsts st b
     | _ -> ()
 
@@ -4621,6 +4623,7 @@ let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list
     | PVar (v, sch) -> if keep v sch then [ v, sch ] else []
     | PAs (p, v, sch) -> (if keep v sch then [ v, sch ] else []) @ patRefBinders ctx p
     | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) -> List.collect (patRefBinders ctx) subs
+    | PAnd (a, b) -> patRefBinders ctx a @ patRefBinders ctx b
     | PCons (h, tl) -> patRefBinders ctx h @ patRefBinders ctx tl
     // an or-pattern binds the SAME names in every alternative, and the binder
     // rides a register whichever alternative matched — collect from the first.
@@ -4657,6 +4660,7 @@ let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
     | PVar (v, sch) -> pick v sch
     | PAs (p, v, sch) -> pick v sch @ patGenBinders ctx p
     | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) -> List.collect (patGenBinders ctx) subs
+    | PAnd (a, b) -> patGenBinders ctx a @ patGenBinders ctx b
     | PCons (h, tl) -> patGenBinders ctx h @ patGenBinders ctx tl
     | POr (p :: _) -> patGenBinders ctx p   // same-binders-per-alternative, see patRefBinders
     | _ -> []
@@ -6152,7 +6156,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // an enum case compares the RAW scrutinee value — never slotted
             // (a raw even int in a scanned root slot reads as a pointer)
             | PCtor (c, _, []) when (dictTryFind st.EnumConst c).IsSome -> false
-            | PCtor _ | PTuple _ | PCons _ | PListLit _ | PArrLit _ | PTypeTest _ -> true
+            | PCtor _ | PTuple _ | PCons _ | PListLit _ | PArrLit _ | PAnd _ | PTypeTest _ -> true
             | PLit (LString _) | PLit LNull -> true
             | PAs (p, _, _) -> derefPat p
             | POr ps -> List.exists derefPat ps
@@ -6915,6 +6919,8 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
                     | None -> LLoad (W, baseP, ARRHDR + 4 * i)
             LSet (wReg er, load) :: lowPatTest ctx er fail (List.item i ps)
         (LSet (wReg ar, sc) :: lenOk) @ (List.collect elemAt [ 0 .. n - 1 ])
+    // `p1 & p2`: both tests run against the SAME scrutinee, in order
+    | PAnd (a, b) -> lowPatTest ctx scrutReg fail a @ lowPatTest ctx scrutReg fail b
     | PListLit [] -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
     | PListLit (x :: rest) ->
         // an exact list literal [a; b; …] is a :: b :: … :: []

@@ -365,7 +365,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat || k = RecordPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AndPat || k = AsPat || k = TypeTestPat || k = RecordPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType

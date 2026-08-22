@@ -1346,7 +1346,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.filter (fun p ->
                 match p.NodeKind with
                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
-                | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AsPat | TypeTestPat -> true
+                | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AndPat | AsPat | TypeTestPat -> true
                 | _ -> false)
             |> List.map (fun p ->
                 // the match comes LAST: a `match` with an `else` after it
@@ -1377,7 +1377,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat || k = RecordPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AndPat || k = AsPat || k = TypeTestPat || k = RecordPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -2777,6 +2777,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             for m in nodesOf n do
                 if isPatKind m.NodeKind then unify (patType pvars m) elem |> ignore
             tList elem
+        | AndPat ->
+            // both sides describe the SAME value
+            (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
+             | [ a; b ] ->
+                 let ta = patType pvars a
+                 unify (patType pvars b) ta |> ignore
+                 ta
+             | [ one ] -> patType pvars one
+             | _ -> st.Fresh ())
         | ArrayPat ->
             let elem = st.Fresh ()
             for m in nodesOf n do

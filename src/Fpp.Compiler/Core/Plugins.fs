@@ -85,7 +85,7 @@ type GenValueDecl =
 
 let private isPatNodeK (k : NodeKind) =
     k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-    || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat
+    || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AndPat || k = AsPat || k = TypeTestPat
     || k = SplicePat
 
 let private isTypeNode (k : NodeKind) =

@@ -119,6 +119,7 @@ let rec private encPat (p : Pat) : Sx =
     | PCons (a, b) -> L [ A "pn"; encPat a; encPat b ]
     | PListLit ps -> L (A "pk" :: List.map encPat ps)
     | PArrLit (k, ps) -> L (A "pak" :: S k :: List.map encPat ps)
+    | PAnd (a, b) -> L [ A "pand"; encPat a; encPat b ]
     | PAs (p, v, s) -> L [ A "pa"; encPat p; encVarId v; encScheme s ]
     | POr ps -> L (A "po" :: List.map encPat ps)
 
@@ -271,6 +272,7 @@ let rec private decPat (x : Sx) : Pat =
     | L [ A "pn"; a; b ] -> PCons (decPat a, decPat b)
     | L (A "pk" :: ps) -> PListLit (List.map decPat ps)
     | L (A "pak" :: S k :: ps) -> PArrLit (k, List.map decPat ps)
+    | L [ A "pand"; a; b ] -> PAnd (decPat a, decPat b)
     | L [ A "pa"; p; v; s ] -> PAs (decPat p, decVarId v, decScheme s)
     | L (A "po" :: ps) -> POr (List.map decPat ps)
     | _ -> PWild

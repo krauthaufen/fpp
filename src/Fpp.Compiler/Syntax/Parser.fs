@@ -259,7 +259,9 @@ let parse (src : string) : ParseResult =
                         fin <- true
                     else ok <- false
                 else ok <- false
-            if ok && fin && List.length names >= 2 && List.length names <= 4 then names else []
+            // `(|Pos|_|)` — a PARTIAL active pattern: the trailing `_` case is
+            // the "no match" one, and the function answers an option
+            if ok && fin && List.length names >= 1 && List.length names <= 5 then names else []
 
     let atActivePatternName () = not (List.isEmpty (activePatternCases ()))
 
@@ -269,6 +271,10 @@ let parse (src : string) : ParseResult =
     /// as it does in F#.
     let apFunctionOf = dictNew<string, string> ()      // case -> function
     let apIndexOf = dictNew<string, string> ()         // case -> choice case
+    let apCaseIndex = dictNew<string, int> ()          // case -> 0-based index
+    let apCaseCount = dictNew<string, int> ()          // case -> how many cases
+    let apIsPartial = dictNew<string, bool> ()         // case -> answers an option?
+    let apParamCount = dictNew<string, int> ()         // case -> extra args the USE gives
 
     /// Rename identifiers through a parsed subtree. Used only for the
     /// active-pattern desugar, where a case name has to become the choice
@@ -286,18 +292,343 @@ let parse (src : string) : ParseResult =
     /// case it becomes.
     let apRenames () : Dict<string, string> = apIndexOf
 
+    /// A match CLAUSE of an active pattern. The case name becomes its choice
+    /// case, and a case matched with NO sub-pattern gains a wildcard: the
+    /// choice case carries a payload (unit, for a nullary case), and without
+    /// the wildcard the pattern was read as the constructor FUNCTION.
+    let rec renameApClause (m : Dict<string, string>) (g : Green) : Green =
+        let caseOf (h : GreenNode) : string option =
+            if h.NodeKind <> IdentPat then None
+            else
+                match Green.tokens (GNode h) with
+                | [ t ] when t.Kind = Ident -> dictTryFind m t.Text
+                | _ -> None
+        let renamedHead (h : GreenNode) (r : string) : Green =
+            match Green.tokens (GNode h) with
+            | [ t ] -> Green.node IdentPat [ GToken { t with Text = r } ]
+            | _ -> GNode h
+        match g with
+        | GToken t when t.Kind = Ident ->
+            (match dictTryFind m t.Text with
+             | Some r -> GToken { t with Text = r }
+             | None -> g)
+        | GToken _ -> g
+        | GNode n when n.NodeKind = AppPat ->
+            (match n.Children with
+             | GNode h :: rest when (caseOf h).IsSome ->
+                 Green.node AppPat (renamedHead h (caseOf h).Value :: List.map (renameApClause m) rest)
+             | kids -> Green.node AppPat (List.map (renameApClause m) kids))
+        | GNode n when n.NodeKind = IdentPat && (caseOf n).IsSome ->
+            let off =
+                match Green.tokens (GNode n) |> List.tryHead with
+                | Some t -> t.Offset + 91000000
+                | None -> 0
+            let wild = Green.node WildcardPat [ GToken { Kind = Ident; Text = "_"; Leading = []; Trailing = []; Offset = off } ]
+            Green.node AppPat [ renamedHead n (caseOf n).Value; wild ]
+        | GNode n -> Green.node n.NodeKind (n.Children |> List.map (renameApClause m))
+
+    /// The BODY of an active pattern, with each case name replaced by the
+    /// choice case it compiles to. A case used with no argument (`Even`, the
+    /// nullary shape) becomes `Choice2Of1 ()` — the choice case carries a
+    /// payload, so left bare it was the CONSTRUCTOR FUNCTION and the match
+    /// tested tags against a closure.
+    let rec renameApBody (m : Dict<string, string>) (g : Green) : Green =
+        let caseOf (h : GreenNode) : string option =
+            if h.NodeKind <> IdentExpr then None
+            else
+                match Green.tokens (GNode h) with
+                | [ t ] when t.Kind = Ident -> dictTryFind m t.Text
+                | _ -> None
+        let renamedHead (h : GreenNode) (r : string) : Green =
+            match Green.tokens (GNode h) with
+            | [ t ] -> Green.node IdentExpr [ GToken { t with Text = r } ]
+            | _ -> GNode h
+        match g with
+        | GToken _ -> g
+        | GNode n when n.NodeKind = AppExpr ->
+            (match n.Children with
+             | GNode h :: rest when (caseOf h).IsSome ->
+                 Green.node AppExpr (renamedHead h (caseOf h).Value :: List.map (renameApBody m) rest)
+             | kids -> Green.node AppExpr (List.map (renameApBody m) kids))
+        | GNode n when (match n.NodeKind with IdentExpr -> true | _ -> false) && (caseOf n).IsSome ->
+            let off =
+                match Green.tokens (GNode n) |> List.tryHead with
+                | Some t -> t.Offset + 90000000
+                | None -> 0
+            let unit_ =
+                Green.node ParenExpr
+                    [ GToken { Kind = LParen; Text = "("; Leading = []; Trailing = []; Offset = off }
+                      GToken { Kind = RParen; Text = ")"; Leading = []; Trailing = []; Offset = off + 1 } ]
+            Green.node AppExpr [ renamedHead n (caseOf n).Value; unit_ ]
+        | GNode n -> Green.node n.NodeKind (n.Children |> List.map (renameApBody m))
+
+    /// The clauses of a match (or a `function`) that mention an ACTIVE
+    /// PATTERN, as a chain: each clause becomes its own match over the
+    /// already-bound scrutinee, with the rest of the chain as its
+    /// fallthrough. That is what lets a PARTIAL pattern fail into the next
+    /// clause, several different patterns share one match, and an active
+    /// pattern sit beside ordinary ones.
+    /// Synthetic offsets for the active-pattern desugar. One counter, so two
+    /// synthesised nodes never share an offset — every table downstream is
+    /// keyed by it.
+    let mutable apSynthNext = 86000000
+    let apTok (k : TokenKind) (txt : string) : Green =
+        apSynthNext <- apSynthNext + 1
+        GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = apSynthNext }
+
+    /// `let (Split (n, s)) = e` — an active pattern in a BINDING. The pattern
+    /// becomes the payload it matches and the right-hand side goes through the
+    /// pattern's function, which is the same rewrite a match clause gets.
+    let apLetRewrite (pat : Green) (rhs : Green) : (Green * Green) option =
+        let isPatNode (k : Green) =
+            match k with
+            | GNode m ->
+                (match m.NodeKind with
+                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
+                 | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AndPat | AsPat
+                 | TypeTestPat | RecordPat -> true
+                 | _ -> false)
+            | GToken _ -> false
+        // the pattern may be parenthesised: `let (Split (n, s)) = …`
+        let rec inner (p : Green) : Green =
+            match p with
+            | GNode m when m.NodeKind = ParenPat ->
+                (match m.Children |> List.filter isPatNode with
+                 | [ one ] -> inner one
+                 | _ -> p)
+            | _ -> p
+        let p0 = inner pat
+        let head =
+            match p0 with
+            | GNode m when m.NodeKind = IdentPat ->
+                (match Green.tokens p0 with [ t ] when t.Kind = Ident -> Some (t.Text, []) | _ -> None)
+            | GNode m when m.NodeKind = AppPat ->
+                (match m.Children with
+                 | GNode h :: rest when h.NodeKind = IdentPat ->
+                     (match Green.tokens (GNode h) with
+                      | [ t ] when t.Kind = Ident -> Some (t.Text, rest |> List.filter isPatNode)
+                      | _ -> None)
+                 | _ -> None)
+            | _ -> None
+        match head with
+        | Some (h, args) when (dictTryFind apFunctionOf h).IsSome ->
+            let fn = (dictTryFind apFunctionOf h).Value
+            let n = match dictTryFind apCaseCount h with Some c -> c | None -> 1
+            let i = match dictTryFind apCaseIndex h with Some c -> c | None -> 0
+            let partial = (dictTryFind apIsPartial h) = Some true
+            let payload = if List.isEmpty args then [ Green.node WildcardPat [ apTok Ident "_" ] ] else args
+            let choice =
+                if n > 1 then
+                    Green.node ParenPat
+                        [ Green.node AppPat (Green.node IdentPat [ apTok Ident ("Choice" + string n + "Of" + string (i + 1)) ] :: payload) ]
+                else (match payload with [ one ] -> one | many -> Green.node AppPat many)
+            let pat2 =
+                if partial then Green.node AppPat [ Green.node IdentPat [ apTok Ident "Some" ]; choice ] else choice
+            // NOT re-parenthesised: an extra ParenPat hides the tuple's comma
+            // from the destructure test, and the binding then took just its
+            // first name
+            Some (pat2, Green.node AppExpr [ Green.node IdentExpr [ apTok Ident fn ]; rhs ])
+        | _ -> None
+
+    /// Does a clause's PATTERN mention an active-pattern case — at the head
+    /// or nested inside another pattern (`Some (Pos v)`)? The body is not
+    /// scanned: a value there may share a case's name.
+    let clauseUsesAp (c : Green) : bool =
+        let isPatNode (k : Green) =
+            match k with
+            | GNode m ->
+                (match m.NodeKind with
+                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
+                 | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AndPat | AsPat
+                 | TypeTestPat | RecordPat -> true
+                 | _ -> false)
+            | GToken _ -> false
+        match c with
+        | GNode cn when cn.NodeKind = MatchClause ->
+            (match cn.Children |> List.tryFind isPatNode with
+             | Some p ->
+                 Green.tokens p
+                 |> List.exists (fun t -> t.Kind = Ident && (dictTryFind apFunctionOf t.Text).IsSome)
+             | None -> false)
+        | _ -> false
+
+    let apChain (baseOff0 : int) (scrutName : string) (clauses : Green list) : Green =
+        let mutable synth = baseOff0
+        let fresh () = synth <- synth + 1; synth
+        let tok (k : TokenKind) (txt : string) : Green =
+            GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = fresh () }
+        let identE (nm : string) = Green.node IdentExpr [ tok Ident nm ]
+        let identP (nm : string) = Green.node IdentPat [ tok Ident nm ]
+        let wildP () = Green.node WildcardPat [ tok Ident "_" ]
+        let unitE () = Green.node ParenExpr [ tok LParen "("; tok RParen ")" ]
+        let unitP () = Green.node ParenPat [ tok LParen "("; tok RParen ")" ]
+        let failE () =
+            Green.node AppExpr
+                [ identE "failwith"; Green.node LiteralExpr [ tok StringLit "match failure" ] ]
+        let isPat (k : Green) =
+            match k with
+            | GNode m ->
+                (match m.NodeKind with
+                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
+                 | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AndPat | AsPat
+                 | TypeTestPat | RecordPat -> true
+                 | _ -> false)
+            | GToken _ -> false
+        let isExprNode (k : Green) =
+            match k with
+            | GNode m ->
+                (match m.NodeKind with
+                 | IdentExpr | LiteralExpr | AppExpr | ParenExpr | BinaryExpr | MatchExpr
+                 | IfExpr | LambdaExpr | BlockExpr | ListExpr | ArrayExpr | RecordExpr
+                 | DotExpr | TupleExpr | PrefixExpr | LetDecl | CastExpr -> true
+                 | _ -> false)
+            | GToken _ -> false
+        /// a pattern used as an ARGUMENT of a parameterized pattern is an
+        /// EXPRESSION in F#: only the literal and identifier shapes cross over
+        let patAsExpr (p : Green) : Green option =
+            match p with
+            | GNode m when m.NodeKind = LiteralPat -> Some (Green.node LiteralExpr (Green.tokens p |> List.map GToken))
+            | GNode m when m.NodeKind = IdentPat -> Some (Green.node IdentExpr (Green.tokens p |> List.map GToken))
+            | GNode m when m.NodeKind = ParenPat ->
+                (match Green.tokens p |> List.filter (fun t -> t.Kind = Ident || t.Kind = IntLit
+                                                               || t.Kind = StringLit || t.Kind = FloatLit) with
+                 | [ t ] when t.Kind = Ident -> Some (Green.node IdentExpr [ GToken t ])
+                 | [ t ] -> Some (Green.node LiteralExpr [ GToken t ])
+                 | _ -> None)
+            | _ -> None
+        /// the head name and arguments of a pattern, when it has one
+        let headOfPat (p : Green) : (string * Green list) option =
+            match p with
+            | GNode m when m.NodeKind = IdentPat ->
+                (match Green.tokens p with
+                 | [ t ] when t.Kind = Ident -> Some (t.Text, [])
+                 | _ -> None)
+            | GNode m when m.NodeKind = AppPat ->
+                (match m.Children with
+                 | GNode h :: rest when h.NodeKind = IdentPat ->
+                     (match Green.tokens (GNode h) with
+                      | [ t ] when t.Kind = Ident -> Some (t.Text, rest |> List.filter isPat)
+                      | _ -> None)
+                 | _ -> None)
+            | _ -> None
+        /// the pattern the payload of case `h` matches against
+        let payloadPattern (h : string) (payload : Green list) : Green =
+            let n = match dictTryFind apCaseCount h with Some c -> c | None -> 1
+            let i = match dictTryFind apCaseIndex h with Some c -> c | None -> 0
+            let partial = (dictTryFind apIsPartial h) = Some true
+            let args = if List.isEmpty payload then [ wildP () ] else payload
+            let choice =
+                if n > 1 then
+                    Green.node ParenPat [ Green.node AppPat (identP ("Choice" + string n + "Of" + string (i + 1)) :: args) ]
+                else (match args with [ one ] -> one | many -> Green.node AppPat many)
+            if partial then Green.node AppPat [ identP "Some"; choice ] else choice
+        /// PEEL every active-pattern use out of a pattern, at any depth: each
+        /// becomes a fresh binder, and the test it stands for is recorded so
+        /// the clause can run it after the ordinary pattern has matched.
+        let rec peel (peeled : Vec<string * string * Green list * Green>) (p : Green) : Green =
+            match headOfPat p with
+            | Some (h, args0) when (dictTryFind apFunctionOf h).IsSome ->
+                let fn = (dictTryFind apFunctionOf h).Value
+                let np = match dictTryFind apParamCount h with Some k -> k | None -> 0
+                let take = min np (List.length args0)
+                let extra = args0 |> List.truncate take |> List.choose patAsExpr
+                let payload = args0 |> List.skip take |> List.map (peel peeled)
+                let binder = "__apV" + string (fresh ())
+                vecAdd peeled (binder, fn, extra, payloadPattern h payload)
+                identP binder
+            | _ ->
+                (match p with
+                 | GNode m when m.NodeKind = AppPat || m.NodeKind = ParenPat || m.NodeKind = TuplePat
+                                || m.NodeKind = ConsPat || m.NodeKind = ListPat || m.NodeKind = ArrayPat
+                                || m.NodeKind = AndPat || m.NodeKind = AsPat || m.NodeKind = RecordPat ->
+                     Green.node m.NodeKind (m.Children |> List.map (fun c -> if isPat c then peel peeled c else c))
+                 | _ -> p)
+        let rec chain (cs : Green list) : Green =
+            match cs with
+            | [] -> failE ()
+            | c :: rest ->
+                match c with
+                | GNode cn when cn.NodeKind = MatchClause ->
+                    let kids = cn.Children
+                    let patIdx = kids |> List.mapi (fun i k -> i, k) |> List.tryPick (fun (i, k) -> if isPat k then Some i else None)
+                    (match patIdx with
+                     | None -> chain rest
+                     | Some pi ->
+                         let pat = List.item pi kids
+                         let guard =
+                             kids |> List.mapi (fun i k -> i, k)
+                                  |> List.tryPick (fun (i, k) ->
+                                        match k with
+                                        | GToken t when t.Kind = Keyword && t.Text = "when" ->
+                                            kids |> List.skip (i + 1) |> List.tryFind isExprNode
+                                        | _ -> None)
+                         let body =
+                             match kids |> List.filter isExprNode |> List.rev with
+                             | b :: _ when guard.IsNone || (match guard with Some g -> not (System.Object.ReferenceEquals (g, b)) | None -> true) -> b
+                             | _ -> unitE ()
+                         let peeled = vecNew<string * string * Green list * Green> ()
+                         let pat2 = peel peeled pat
+                         let hasTests = vecLen peeled > 0 || guard.IsSome
+                         // the rest of the chain, behind a join point when a
+                         // failed TEST (not just a failed pattern) has to
+                         // reach it — otherwise it would be duplicated once
+                         // per test
+                         let joinName = "__apJ" + string (fresh ())
+                         let needJoin = hasTests && not (List.isEmpty rest)
+                         let fallthrough () =
+                             if List.isEmpty rest then failE ()
+                             elif needJoin then Green.node AppExpr [ identE joinName; unitE () ]
+                             else chain rest
+                         let inner0 = if guard.IsSome then
+                                        Green.node IfExpr
+                                            [ tok Keyword "if"; guard.Value; tok Keyword "then"; body
+                                              tok Keyword "else"; fallthrough () ]
+                                      else body
+                         let mutable inner = inner0
+                         for k in (vecLen peeled - 1) .. -1 .. 0 do
+                             let (binder, fn, extra, casePat) = vecGet peeled k
+                             let call = Green.node AppExpr ([ identE fn ] @ extra @ [ identE binder ])
+                             inner <-
+                                 Green.node MatchExpr
+                                     [ tok Keyword "match"; call; tok Keyword "with"
+                                       Green.node MatchClause [ tok Operator "|"; casePat; tok Operator "->"; inner ]
+                                       Green.node MatchClause [ tok Operator "|"; wildP (); tok Operator "->"; fallthrough () ] ]
+                         let outer =
+                             let tail =
+                                 if List.isEmpty rest && not hasTests then []
+                                 else [ Green.node MatchClause [ tok Operator "|"; wildP (); tok Operator "->"; fallthrough () ] ]
+                             Green.node MatchExpr
+                                 ([ tok Keyword "match"; identE scrutName; tok Keyword "with"
+                                    Green.node MatchClause [ tok Operator "|"; pat2; tok Operator "->"; inner ] ] @ tail)
+                         if needJoin then
+                             Green.node LetDecl
+                                 [ tok Keyword "let"; identP joinName; unitP (); tok Operator "="
+                                   chain rest; tok Keyword "in"; outer ]
+                         else outer)
+                | _ -> chain rest
+        chain clauses
+
     let bumpActivePatternName () : Green =
-        let names = activePatternCases ()
+        let names0 = activePatternCases ()
         let l = s.Cur
-        let fname = "$ap$" + String.concat "$" names
+        // a trailing `_` case marks a PARTIAL pattern: the function answers
+        // an OPTION, and a `None` falls through to the next clause
+        let partial = (match List.tryLast names0 with Some "_" -> true | _ -> false)
+        let names = if partial then names0 |> List.filter (fun c -> c <> "_") else names0
+        let fname = "$ap$" + String.concat "$" names0
         let n = List.length names
         names |> List.iteri (fun i c ->
             dictSet apFunctionOf c fname
-            dictSet apIndexOf c ("Choice" + string n + "Of" + string (i + 1)))
+            dictSet apCaseIndex c i
+            dictSet apCaseCount c n
+            dictSet apIsPartial c partial
+            // ONE case carries its payload bare; several ride a choice union
+            if n > 1 then dictSet apIndexOf c ("Choice" + string n + "Of" + string (i + 1)))
         // ( |A |B ... |) — a bar and a name per case, one closing bar, two
-        // parens: 2n + 3 tokens
+        // parens: 2n + 3 tokens, counting the partial pattern's `_` case
+        let n0 = List.length names0
         let mutable k = 0
-        while k < 2 * n + 3 do
+        while k < 2 * n0 + 3 do
             s.Bump () |> ignore
             k <- k + 1
         GToken { Kind = Ident; Text = fname
@@ -534,7 +865,18 @@ let parse (src : string) : ParseResult =
                     vecAdd acc (parseConsPat ctx)
                 Green.node TuplePat (vecToList acc)
             else first
-        parseAsSuffix p
+        parseAsSuffix (parseAndSuffix p)
+
+    /// `p1 & p2` — BOTH sides must match, and both sets of binders come into
+    /// scope. Binds tighter than `as` and looser than everything else, as in
+    /// F#; it is what a parameterized partial pattern is usually combined
+    /// with (`DivisibleByTwo & DivisibleByX 3`).
+    and parseAndSuffix (p : Green) : Green =
+        if s.IsText "&" && s.Is Operator then
+            let op = s.Bump ()
+            let rhs = parseAndSuffix (parseConsPat 0)
+            Green.node AndPat [ p; op; rhs ]
+        else p
 
     /// `pat as name` — binds loosest of all pattern forms.
     and parseAsSuffix (p : Green) : Green =
@@ -1019,9 +1361,28 @@ let parse (src : string) : ParseResult =
         elif s.IsKw "function" then
             let acc = vecNew<Green> ()
             let col = s.CurCol
+            let fnTok = s.Cur
             vecAdd acc (s.Bump ())
             parseClauses acc col
-            Green.node MatchExpr (vecToList acc)
+            let clauses = vecToList acc |> List.filter (fun c -> match c with GNode m -> m.NodeKind = MatchClause | _ -> false)
+            let heads =
+                clauses |> List.collect (fun c ->
+                    match Green.tokens c |> List.tryFind (fun t -> t.Kind = Ident) with
+                    | Some t -> [ t.Text ]
+                    | None -> [])
+            if clauses |> List.exists clauseUsesAp then
+                // `function | Even -> …` is a lambda over the same chain a
+                // `match` gets — without this the case names reached the
+                // union resolver and were "unknown case"
+                let scrutName = "__apF" + string fnTok.Offset
+                let tk (k : TokenKind) (txt : string) (off : int) : Green =
+                    GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = off }
+                Green.node LambdaExpr
+                    [ tk Keyword "fun" (84000000 + fnTok.Offset)
+                      Green.node IdentPat [ tk Ident scrutName (84100000 + fnTok.Offset) ]
+                      tk Operator "->" (84200000 + fnTok.Offset)
+                      apChain (84300000 + fnTok.Offset) scrutName clauses ]
+            else Green.node MatchExpr (vecToList acc)
         elif s.IsKw "for" then
             let acc = vecNew<Green> ()
             let fcol = s.CurCol
@@ -1230,7 +1591,13 @@ let parse (src : string) : ParseResult =
         let apFns =
             clauseHeads |> List.choose (fun h -> dictTryFind apFunctionOf h) |> List.distinct
         match apFns with
-        | [ fn ] when clauseHeads |> List.forall (fun h -> (dictTryFind apFunctionOf h).IsSome || h = "_") ->
+        // the FAST path: one TOTAL, multi-case pattern owns every clause, so
+        // one call to it dispatches them all. Anything else (a partial
+        // pattern, a one-case pattern, a mix) takes the chain below.
+        | [ fn ] when (clauseHeads |> List.forall (fun h -> (dictTryFind apFunctionOf h).IsSome || h = "_"))
+                      && (clauseHeads |> List.forall (fun h ->
+                              h = "_" || ((dictTryFind apIsPartial h) <> Some true
+                                          && (match dictTryFind apCaseCount h with Some c -> c > 1 | None -> false)))) ->
             let acc2 = vecNew<Green> ()
             vecAdd acc2 kw
             let call =
@@ -1244,8 +1611,22 @@ let parse (src : string) : ParseResult =
                       scrutinee ]
             vecAdd acc2 call
             for i in 2 .. vecLen acc - 1 do vecAdd acc2 (vecGet acc i)
-            for c in vecToList clauses do vecAdd acc2 (renameIdents (apRenames ()) c)
+            for c in vecToList clauses do vecAdd acc2 (renameApClause (apRenames ()) c)
             Green.node MatchExpr (vecToList acc2)
+        | _ when vecToList clauses |> List.exists clauseUsesAp ->
+            // an ACTIVE PATTERN among the clauses: the scrutinee is evaluated
+            // ONCE, by an outer clause that binds it, and the clauses become a
+            // chain (see apChain)
+            let scrutName = "__apS" + string kwTok.Offset
+            let tk (k : TokenKind) (txt : string) (off : int) : Green =
+                GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = off }
+            Green.node MatchExpr
+                [ tk Keyword "match" (83000000 + kwTok.Offset); scrutinee; tk Keyword "with" (83100000 + kwTok.Offset)
+                  Green.node MatchClause
+                    [ tk Operator "|" (83200000 + kwTok.Offset)
+                      Green.node IdentPat [ tk Ident scrutName (83300000 + kwTok.Offset) ]
+                      tk Operator "->" (83400000 + kwTok.Offset)
+                      apChain (82000000 + kwTok.Offset) scrutName (vecToList clauses) ] ]
         | _ ->
             for c in vecToList clauses do vecAdd acc c
             Green.node MatchExpr (vecToList acc)
@@ -1353,8 +1734,10 @@ let parse (src : string) : ParseResult =
         // pattern parser cannot read; it becomes the function the active
         // pattern compiles to, and the cases are recorded for its uses.
         let mutable isActivePattern = false
+        let mutable apDefCases : string list = []
         if atActivePatternName () then
             isActivePattern <- true
+            apDefCases <- activePatternCases () |> List.filter (fun c -> c <> "_")
             vecAdd acc (Green.node IdentPat [ bumpActivePatternName () ])
         // `let (+++) a b = ...` — an OPERATOR defined as an ordinary
         // binding. The name fuses into one identifier, as it does everywhere
@@ -1377,8 +1760,15 @@ let parse (src : string) : ParseResult =
             if s.IsOp "<" && s.SameLine && (s.Peek 1).Text = "'" then
                 vecAdd acc (Green.node TyParams (parseAngleArgs letCol))
             // curried parameters
+            let beforeParams = vecLen acc
             while canStartAtomPat () && (s.SameLine || s.CurCol > letCol) do
                 vecAdd acc (parseAtomPat letCol)
+            // a PARAMETERIZED active pattern (`let (|Mul|) k x = ...`): every
+            // parameter but the last is given at the USE site, before the
+            // value being matched
+            if not (List.isEmpty apDefCases) then
+                let extra = vecLen acc - beforeParams - 1
+                for c in apDefCases do dictSet apParamCount c (max 0 extra)
         if s.IsOp ":" then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseType letCol)
@@ -1393,13 +1783,44 @@ let parse (src : string) : ParseResult =
                 // in an active pattern's own body, `Add (x, y)` CONSTRUCTS
                 // the case: rename it to the choice case the pattern
                 // compiles to
-                vecAdd acc (if isActivePattern then renameIdents (apRenames ()) body else body)
+                vecAdd acc (if isActivePattern then renameApBody (apRenames ()) body else body)
         elif not pendingExtern then s.Diag "expected '=' in binding"
         pendingExtern <- false
         if s.IsKw "in" && s.SameLine then
             vecAdd acc (s.Bump ())
             vecAdd acc (parseBlock letCol)
-        Green.node LetDecl (vecToList acc)
+        // `let (Split (n, s)) = e`: the binding pattern goes through the
+        // active pattern's function. Only a VALUE binding — a function's
+        // parameters are patterns of their own.
+        let kids = vecToList acc
+        let isPatNode (k : Green) =
+            match k with
+            | GNode m ->
+                (match m.NodeKind with
+                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
+                 | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AndPat | AsPat
+                 | TypeTestPat | RecordPat -> true
+                 | _ -> false)
+            | GToken _ -> false
+        let pats = kids |> List.filter isPatNode
+        let eqIdx = kids |> List.mapi (fun i k -> i, k)
+                         |> List.tryPick (fun (i, k) -> match k with
+                                                        | GToken t when t.Kind = Operator && t.Text = "=" -> Some i
+                                                        | _ -> None)
+        match pats, eqIdx with
+        | [ p ], Some ei when not isActivePattern ->
+            let rhsIdx = kids |> List.mapi (fun i k -> i, k)
+                              |> List.tryPick (fun (i, k) -> if i > ei && (match k with GNode _ -> true | _ -> false) then Some i else None)
+            (match rhsIdx with
+             | Some ri ->
+                 (match apLetRewrite p (List.item ri kids) with
+                  | Some (p2, rhs2) ->
+                      let pi = kids |> List.mapi (fun i k -> i, k) |> List.pick (fun (i, k) -> if isPatNode k then Some i else None)
+                      Green.node LetDecl
+                          (kids |> List.mapi (fun i k -> if i = pi then p2 elif i = ri then rhs2 else k))
+                  | None -> Green.node LetDecl kids)
+             | None -> Green.node LetDecl kids)
+        | _ -> Green.node LetDecl kids
 
     and parseTypeDecl (ctx : int) : Green =
         lastMajor <- "type"

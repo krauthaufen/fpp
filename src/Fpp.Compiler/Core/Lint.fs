@@ -105,6 +105,10 @@ let lint (decls : Decl list) : string list =
             let elem = st.Fresh ()
             for p in ps do unifyC "array pattern" (patType p) elem
             TCon ("array", [ elem ])
+        | PAnd (a, b) ->
+            let t = patType a
+            unifyC "and pattern" (patType b) t
+            t
         | PAs (p, v, _) ->
             let t = patType p
             dictSet env (keyOf v) t

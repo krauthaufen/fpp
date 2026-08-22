@@ -537,6 +537,7 @@ let rec private walkE (g : Expr -> unit) (e : Expr) : unit =
 let rec private patBinders (p : Pat) (acc : Vec<string * int>) : unit =
     match p with
     | PVar (v, _) -> vecAdd acc (v.Path, v.Offset)
+    | PAnd (a, b) -> patBinders a acc; patBinders b acc
     | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps ->
         for q in ps do patBinders q acc
     | PCons (a, b) -> patBinders a acc; patBinders b acc
@@ -2552,6 +2553,9 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
                     + sref cur + ", FPPOFF(2));")
         stmt f ("if (UNTAGI(" + sref ok + ") && " + sref cur + " != 0) "
                 + sref ok + " = TAGI(0);")
+    | PAnd (a, b) ->
+        emitPat st f a sv ok
+        emitPat st f b sv ok
     | PArrLit (_, ps) ->
         // an array of exactly this LENGTH whose elements match. fpp_arr_get
         // answers a tagged/boxed element whatever the array's storage is, so

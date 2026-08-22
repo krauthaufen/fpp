@@ -32,6 +32,8 @@ type Pat =
     | PListLit of Pat list
     /// `[| p; q |]` — the element KIND rides along, the way EIndex carries it
     | PArrLit of string * Pat list
+    /// `p1 & p2` — both must match, and both sets of binders are in scope
+    | PAnd of Pat * Pat
     /// `:? T` — matches when the value is a T (or a subclass)
     | PTypeTest of string
     | PAs of Pat * VarId * Scheme
@@ -179,6 +181,7 @@ and printPat (p : Pat) : string =
     | PCons (h, t) -> "(" + printPat h + " :: " + printPat t + ")"
     | PListLit ps -> "[" + String.concat "; " (List.map printPat ps) + "]"
     | PArrLit (_, ps) -> "[|" + String.concat "; " (List.map printPat ps) + "|]"
+    | PAnd (a, b) -> printPat a + " & " + printPat b
     | PTypeTest t -> ":? " + t
     | PAs (p, v, _) -> "(" + printPat p + " as " + v.Name + ")"
     | POr ps -> "(" + String.concat " | " (List.map printPat ps) + ")"
@@ -195,6 +198,7 @@ let rec expandOr (p : Pat) : Pat list =
     | PTuple ps -> orProduct ps |> List.map PTuple
     | PListLit ps -> orProduct ps |> List.map PListLit
     | PArrLit (k, ps) -> orProduct ps |> List.map (fun qs -> PArrLit (k, qs))
+    | PAnd (a, b) -> orProduct [ a; b ] |> List.map (fun qs -> match qs with [ x; y ] -> PAnd (x, y) | _ -> PAnd (a, b))
     | PCons (h, t) -> orProduct [ h; t ] |> List.map (fun qs -> PCons (List.head qs, List.item 1 qs))
     | PAs (inner, v, sch) -> expandOr inner |> List.map (fun q -> PAs (q, v, sch))
     | PWild | PLit _ | PVar _ | PTypeTest _ -> [ p ]

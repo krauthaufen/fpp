@@ -308,7 +308,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat || k = RecordPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AndPat || k = AsPat || k = TypeTestPat || k = RecordPat
         || k = SplicePat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -689,6 +689,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match p with
             | PVar (v, sch) -> [ v.Name, (v, sch) ]
             | PArrLit (_, ps) -> List.collect binders ps
+            | PAnd (a, b) -> binders a @ binders b
             | PAs (inner, v, sch) -> (v.Name, (v, sch)) :: binders inner
             | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.collect binders ps
             | PCons (h, t) -> binders h @ binders t
@@ -887,6 +888,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [ one ] -> lowerPat one
              | many when hasBar -> POr (alignOrBinders (List.map lowerPat many))
              | many -> PTuple (List.map lowerPat many))
+        | AndPat ->
+            (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
+             | [ a; b ] -> PAnd (lowerPat a, lowerPat b)
+             | [ one ] -> lowerPat one
+             | _ -> PWild)
         | AsPat ->
             (match nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) with
              | [ inner; namePat ] ->
@@ -4723,6 +4729,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match p with
                          | PVar (v2, sch2) -> [ v2, sch2 ]
                          | PArrLit (_, ps2) -> List.collect patBinders ps2
+                         | PAnd (a2, b2) -> patBinders a2 @ patBinders b2
                          | PAs (inner, v2, sch2) -> (v2, sch2) :: patBinders inner
                          | PCtor (_, _, ps) | PTuple ps | PListLit ps -> List.collect patBinders ps
                          | POr ps -> (match ps with p0 :: _ -> patBinders p0 | [] -> [])
