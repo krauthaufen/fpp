@@ -4857,18 +4857,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> ()
                 // `a.[lo..hi]` is a SLICE: the bracket holds a range and the
                 // result is an array, not an element
+                // a slice is any index that spells a RANGE: `lo..hi`, and the
+                // open forms `lo..`, `..hi` and `*`, whose missing bound is
+                // the array's own edge
                 let isSlice =
                     nodesOf n
                     |> List.filter (fun m -> m.NodeKind = ListExpr)
                     |> List.exists (fun ix ->
-                        match nodesOf ix |> List.filter (fun m -> isExprish m.NodeKind) with
-                        | [ one ] ->
-                            one.NodeKind = BinaryExpr
-                            && (one.Children |> List.exists (fun c ->
-                                    match c with
-                                    | GToken t -> t.Kind = Operator && t.Text = ".."
-                                    | _ -> false))
-                        | _ -> false)
+                        let toks = Green.tokens (GNode ix)
+                        (toks |> List.exists (fun t -> t.Kind = Operator && t.Text = ".."))
+                        || (toks |> List.filter (fun t -> t.Kind = Operator) |> List.map (fun t -> t.Text)) = [ "*" ])
                 (match lhsTy |> Option.map prune with
                  | Some (TCon ("array", [ e ])) when isSlice ->
                      (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
@@ -4914,6 +4912,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt t.Offset idxTy tInt
                       | None -> ())
                      e
+                 | Some (TCon ("string", [])) when isSlice ->
+                     // `s.[lo..hi]` is a SUBSTRING, not a character: the same
+                     // range sugar an array takes
+                     (match nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
+                            |> Option.bind (fun ix -> Green.tokens (GNode ix) |> List.tryHead) with
+                      | Some br ->
+                          vecAdd arrKindsRaw (br.Offset, TCon ("$str", []))
+                          vecAdd fieldOwnersRaw (br.Offset, "$slice")
+                      | None -> ())
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("$str", []))
+                      | None -> ())
+                     tString
                  | Some (TCon ("string", [])) ->
                      // the marker means "the RECEIVER is a string", which is
                      // not the same thing as an array whose ELEMENTS are

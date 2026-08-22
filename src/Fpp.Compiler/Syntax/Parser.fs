@@ -720,6 +720,13 @@ let parse (src : string) : ParseResult =
                     let opText = s.Cur.Text
                     let op = s.Bump ()
                     let nextMin = if rightAssoc opText then prec else prec + 1
+                    // `a.[lo..]` — an OPEN range: the `..` is there and the
+                    // upper bound is not. Left as an error the whole slice
+                    // form was unusable; the one-sided node is the marker
+                    // lowering fills in the array's length for.
+                    if opText = ".." && s.Is RBracket then
+                        lhs <- Green.node BinaryExpr [ lhs; op ]
+                    else
                     let rhs =
                         // `x <- \n  let k = ... \n  k + 1` — an assignment
                         // may take a whole BLOCK, and only an assignment

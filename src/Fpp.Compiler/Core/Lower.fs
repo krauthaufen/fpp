@@ -466,7 +466,27 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// `a.[lo..hi]` — build an array of the range and copy into it. There is
     /// no slice primitive; a counted loop is what one would be.
-    let sliceRead (off : int) (kind : string) (src : Expr) (lo : Expr) (hi : Expr) : Expr =
+    /// `s.[lo..hi]` on a STRING is a substring — the same range sugar, but
+    /// the value is a string and not a fresh array.
+    let strSliceRead (off : int) (src : Expr) (lo : Expr option) (hi : Expr option) : Expr =
+        let ish = mono (TCon ("int", []))
+        let anon = mono (TCon ("?", []))
+        let srcV = { Path = path; Offset = off + 19500000; Name = "_ssrcs" }
+        let loV = { Path = path; Offset = off + 19600000; Name = "_slos" }
+        let lo0 = match lo with Some e -> e | None -> ELit (LInt "0")
+        let len =
+            match hi with
+            | Some h -> EPrim ("+", [ EPrim ("-", [ h; EVar (loV, ish) ]); ELit (LInt "1") ])
+            // a string's length is the same node an array's is, under the
+            // "$str" sentinel kind
+            | None -> EPrim ("-", [ EArrayLen ("$str", EVar (srcV, anon)); EVar (loV, ish) ])
+        ELet (false, srcV, anon, src,
+          ELet (false, loV, ish, lo0,
+            EApp (EUnknown "$str.Substring#2", [ EVar (srcV, anon); EVar (loV, ish); len ])))
+
+    /// `a.[lo..hi]`, and the OPEN forms `a.[lo..]`, `a.[..hi]` and `a.[*]`,
+    /// whose missing bound is the array's own edge (0 or Length - 1).
+    let sliceRead (off : int) (kind : string) (src : Expr) (lo : Expr option) (hi : Expr option) : Expr =
         let ish = mono (TCon ("int", []))
         let anon = mono (TCon ("?", []))
         let loV = { Path = path; Offset = off + 19000000; Name = "_slo" }
@@ -474,6 +494,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let nV = { Path = path; Offset = off + 19200000; Name = "_sn" }
         let dstV = { Path = path; Offset = off + 19300000; Name = "_sdst" }
         let iV = { Path = path; Offset = off + 19400000; Name = "_si" }
+        let lo = match lo with Some e -> e | None -> ELit (LInt "0")
+        // the upper bound reads the LENGTH of the bound source, so it is
+        // evaluated inside the `srcV` binding rather than off the expression
+        // a second time
+        let hi =
+            match hi with
+            | Some e -> e
+            | None -> EPrim ("-", [ EArrayLen (kind, EVar (srcV, anon)); ELit (LInt "1") ])
         ELet (false, srcV, anon, src,
           ELet (false, loV, ish, lo,
             ELet (false, nV, ish, EPrim ("+", [ EPrim ("-", [ hi; EVar (loV, ish) ]); ELit (LInt "1") ]),
@@ -1769,6 +1797,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | _ -> note (offsetOf n) "operator shape")
             | BinaryExpr ->
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind), tokensOf n with
+                 // `a.[lo..]` — an OPEN range keeps its lower bound and no
+                 // upper one; the index site reads it back and fills the
+                 // array's own edge in
+                 | [ l ], [ op ] when op.Text = ".." -> EPrim ("..", [ lowerExpr (GNode l) ])
                  | [ l; r ], [ op ] ->
                      (match op.Text with
                       // `:=` is `<-` through a ref CELL: inference already
@@ -2888,10 +2920,30 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match Green.tokens (GNode ix) |> List.tryHead with
                          | Some br -> (dictTryFind fieldOwners br.Offset) = Some "$slice"
                          | None -> false
+                     // an OPEN slice: `a.[lo..]` leaves the range node with one
+                     // operand, `a.[..hi]` puts the `..` token before a bare
+                     // expression, and `a.[*]` has no expression at all
+                     let ixToks = Green.tokens (GNode ix)
+                     // `..hi` has the range operator FIRST, right after the
+                     // bracket — filtering the tokens down to the operators
+                     // made `lo..` look the same and sliced 0..lo
+                     let leadingDots =
+                         match ixToks with
+                         | _ :: d :: _ -> d.Kind = Operator && d.Text = ".."
+                         | _ -> false
+                     let starOnly =
+                         (ixToks |> List.filter (fun t -> t.Kind = Operator) |> List.map (fun t -> t.Text)) = [ "*" ]
+                     let slice (lo : Expr option) (hi : Expr option) =
+                         if nm = "$str" then strSliceRead (offsetOf n) (lowerExpr (GNode lhs)) lo hi
+                         else sliceRead (offsetOf n) nm (lowerExpr (GNode lhs)) lo hi
                      (match indexer, idx with
                       | _, [ EPrim (rop, [ lo; hi ]) ] when isSlice && (rangeElem rop).IsSome ->
                           // `a.[lo..hi]` — a fresh array of the range, copied
-                          sliceRead (offsetOf n) nm (lowerExpr (GNode lhs)) lo hi
+                          slice (Some lo) (Some hi)
+                      | _, [] when isSlice && starOnly -> slice None None
+                      | _, [ hi ] when isSlice && leadingDots -> slice None (Some hi)
+                      | _, [ EPrim (rop, [ lo ]) ] when isSlice && (rangeElem rop).IsSome ->
+                          slice (Some lo) None
                       | Some fn, [ i ] -> EApp (fn, [ lowerExpr (GNode lhs); i ])
                       | _, [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")
