@@ -3369,7 +3369,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         | Ok segs ->
                                             let holeTys =
                                                 Format.holes segs
-                                                |> List.mapi (fun i (c, _, _, _) ->
+                                                |> List.mapi (fun i (c, _, _, _, _, _) ->
                                                     let ty =
                                                         match c with
                                                         // any integer width, decided by
@@ -3378,8 +3378,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                         | 's' -> tString
                                                         | 'c' -> tChar
                                                         | 'b' -> tBool
-                                                        | 'f' -> tFloat
-                                                        | _ -> st.Fresh ()   // %A takes anything
+                                                        | 'f' | 'e' | 'E' | 'g' | 'G' -> tFloat
+                                                        | _ -> st.Fresh ()   // %A and %O take anything
                                                     vecAdd opKindsRaw (ft.Offset + 1 + i, ty)
                                                     // `%A` renders through the Show class, so the
                                                     // hole DEMANDS it — which is what makes a record

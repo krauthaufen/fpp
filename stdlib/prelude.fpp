@@ -864,6 +864,13 @@ type exn =
     | Failure of string
     | InvalidCast of string
     | KeyNotFoundException of string
+    /// .NET's own member, and the usual way a `with ex ->` clause reads the
+    /// text: without it the dot resolved to nothing and the catch TRAPPED
+    member e.Message =
+        match e with
+        | Failure m -> m
+        | InvalidCast m -> m
+        | KeyNotFoundException m -> m
 type ValueOption<'a> =
     | ValueNone
     | ValueSome of 'a
@@ -2409,7 +2416,16 @@ type FormatOps =
             while n > 0 do
                 p <- p + (if zero then "0" else " ")
                 n <- n - 1
-            if left then s + p else p + s
+            if left then s + p
+            // zero padding goes AFTER the sign: printf spells -42 in five
+            // columns as -0042, never 00-42
+            elif zero && s.Length > 0 && (s.[0] = '-' || s.[0] = '+') then
+                s.Substring (0, 1) + p + s.Substring (1, s.Length - 1)
+            else p + s
+
+    /// printf's `+` flag: a non-negative number carries its sign too
+    static member Plus (s : string) : string =
+        if s.Length > 0 && (s.[0] = '-' || s.[0] = '+') then s else "+" + s
 
 /// Scoped pinning: `use p = fixed arr` pins for the binding's scope and
 /// unpins on every exit path. Instances decide what pinning MEANS; the
@@ -6983,6 +6999,84 @@ type FloatFmt =
             // the exponent is lowercase here, unlike `string`
             let txt = String.concat "e" (List.ofArray (txt.Split 'E'))
             if txt.Contains "." || txt.Contains "e" then txt else txt + ".0"
+
+    /// printf's `%f`: exactly `p` digits after the point. The digits come
+    /// from the EXACT expansion and round half to even, which is what makes
+    /// `%.0f 2.5` answer 2 and `%.2f 1.005` answer 1.00 (the double just
+    /// below 1.005) the way .NET does.
+    static member FixedStr (v : float, p : int) : string =
+        if v <> v then "NaN"
+        elif v = infinity then "Infinity"
+        elif v = 0.0 - infinity then "-Infinity"
+        else
+            let a = FloatFmt.OfFloat v
+            let keep = a.dp + p
+            if keep < 0 then
+                a.nd <- 0
+                a.dp <- 0
+            else FloatFmt.RoundTo a keep
+            let sign = if a.neg then "-" else ""
+            let mutable whole = ""
+            if a.dp <= 0 then whole <- "0"
+            else
+                let mutable i = 0
+                while i < a.dp do
+                    whole <- whole + (if i < a.nd then string (char (int '0' + a.dig.[i])) else "0")
+                    i <- i + 1
+            let mutable frac = ""
+            if p > 0 then
+                frac <- "."
+                let mutable k = 0
+                while k < p do
+                    let idx = a.dp + k
+                    frac <- frac + (if idx >= 0 && idx < a.nd then string (char (int '0' + a.dig.[idx])) else "0")
+                    k <- k + 1
+            sign + whole + frac
+
+    /// printf's `%e`: one digit, the point, `p` more, and an exponent of at
+    /// least `ew` digits (three for %e, two inside %g).
+    static member SciStr (v : float, p : int, upper : bool, ew : int) : string =
+        if v <> v then "NaN"
+        elif v = infinity then "Infinity"
+        elif v = 0.0 - infinity then "-Infinity"
+        else
+            let a = FloatFmt.OfFloat v
+            let zero = a.nd = 0
+            if not zero then FloatFmt.RoundTo a (p + 1)
+            let e = if zero then 0 else a.dp - 1
+            let sign = if a.neg then "-" else ""
+            let lead = if zero then "0" else string (char (int '0' + a.dig.[0]))
+            let mutable frac = ""
+            if p > 0 then
+                frac <- "."
+                let mutable k = 1
+                while k <= p do
+                    frac <- frac + (if (not zero) && k < a.nd then string (char (int '0' + a.dig.[k])) else "0")
+                    k <- k + 1
+            let esign = if e < 0 then "-" else "+"
+            let ea = if e < 0 then 0 - e else e
+            let mutable edig = string ea
+            while edig.Length < ew do edig <- "0" + edig
+            sign + lead + frac + (if upper then "E" else "e") + esign + edig
+
+    /// printf's `%g`: `p` SIGNIFICANT digits, the fixed form while the
+    /// exponent is in [-4, p) and the exponent form otherwise, with the
+    /// trailing zeros dropped (RoundTo trims them already).
+    static member GenStr (v : float, p : int, upper : bool) : string =
+        if v <> v then "NaN"
+        elif v = infinity then "Infinity"
+        elif v = 0.0 - infinity then "-Infinity"
+        else
+            let sig0 = if p <= 0 then 1 else p
+            let a = FloatFmt.OfFloat v
+            if a.nd = 0 then (if a.neg then "-0" else "0")
+            else
+                FloatFmt.RoundTo a sig0
+                let e = a.dp - 1
+                if e >= 0 - 4 && e < sig0 then FloatFmt.Render a false
+                else
+                    let txt = FloatFmt.SciStr (v, a.nd - 1, upper, 2)
+                    txt
 
     /// the double a string spells, correctly rounded
     static member OfStr (s : string) : float =

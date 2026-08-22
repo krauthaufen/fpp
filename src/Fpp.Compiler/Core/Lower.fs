@@ -1368,7 +1368,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    EPrim ("+t", [ EPrim ("+t", [ dquote; e ]); dquote ])
                                let boolWords lower =
                                    if lower then "\"true\"", "\"false\"" else "\"True\"", "\"False\""
-                               let render (i : int) (c : char) (e : Expr) : Expr =
+                               let viaOps (nm : string) (args : Expr list) (fallback : Expr) : Expr =
+                                   match dictTryFind memberIndex nm with
+                                   | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ ETuple args ])
+                                   | None -> fallback
+                               let render (i : int) (c : char) (prec : int) (e : Expr) : Expr =
                                    let k = kindAt i
                                    match c with
                                    | 's' -> e
@@ -1396,7 +1400,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                 (if c = 'x' then "hexlower" elif c = 'X' then "hexupper" else "octal")
                                                 + (if k = "l" then "64" else "")
                                             EApp (EUnknown fn, [ e ]))
-                                   | 'f' -> EApp (EUnknown "fixed6", [ e ])
+                                   | 'f' ->
+                                       // the prelude's EXACT expansion, so a
+                                       // precision rounds .NET's way (half to
+                                       // even, on the true binary value)
+                                       let p = if prec < 0 then 6 else prec
+                                       viaOps "FloatFmt.FixedStr" [ e; ELit (LInt (string p)) ]
+                                              (EApp (EUnknown "fixed6", [ e ]))
+                                   | 'e' | 'E' ->
+                                       let p = if prec < 0 then 6 else prec
+                                       // .NET's printf spells the exponent in
+                                       // THREE digits here and two inside %g
+                                       viaOps "FloatFmt.SciStr"
+                                              [ e; ELit (LInt (string p)); ELit (LBool (c = 'E')); ELit (LInt "3") ]
+                                              (EApp (EUnknown "fixed6", [ e ]))
+                                   | 'g' | 'G' ->
+                                       let p = if prec < 0 then 6 else prec
+                                       viaOps "FloatFmt.GenStr"
+                                              [ e; ELit (LInt (string p)); ELit (LBool (c = 'G')) ]
+                                              (EApp (EUnknown "fixed6", [ e ]))
+                                   | 'O' ->
+                                       // ToString, which for every primitive
+                                       // is what `string` already answers
+                                       (match k with
+                                        | "t" -> e
+                                        | "" -> EApp (EUnknown "showv", [ e ])
+                                        | _ -> EApp (EUnknown ("string#" + k), [ e ]))
                                    | 'u' ->
                                        (match k with
                                         | "l" | "v" ->
@@ -1444,15 +1473,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    segs |> List.map (fun seg ->
                                        match seg with
                                        | Fpp.Analysis.Format.Text t2 -> ELit (LString ("\"" + t2 + "\""))
-                                       | Fpp.Analysis.Format.Hole (c, width, zero, left) ->
+                                       | Fpp.Analysis.Format.Hole (c, width, zero, left, prec, plus) ->
                                            let e =
                                                if hi < List.length holeArgs then
                                                    lowerExpr (GNode (List.item hi holeArgs))
                                                else
                                                    let v, sch = List.item (hi - List.length holeArgs) lamBinds
                                                    EVar (v, sch)
-                                           let r = render hi c e
+                                           let r0 = render hi c prec e
                                            hi <- hi + 1
+                                           let r =
+                                               if not plus then r0
+                                               else
+                                                   match dictTryFind memberIndex "FormatOps.Plus" with
+                                                   | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ r0 ])
+                                                   | None -> r0
                                            if width = 0 then r
                                            else
                                                // pad to the minimum width,
