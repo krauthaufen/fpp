@@ -314,6 +314,18 @@ So `compare` on a record agrees with F#, and with a hand-written
 also DERIVED on demand for records and unions that do not write their own
 instance, as F# derives it.
 
+## The ordering OPERATORS are a partial order, `compare` is total
+
+F# splits the two: `<`, `>`, `<=` and `>=` over a structure containing a NaN
+all answer false (a PER), while `compare` on the same pair answers a TOTAL
+order in which NaN equals itself and sits below every number. Both hold here —
+the comparison walk answers the total order and raises an "unordered" flag that
+only the four operators read.
+
+The C backend is the exception: its comparator is the total order throughout,
+so `(1, nan) <= (1, 0.0)` answers true there. wasm-linear is the exactness
+target; the C leg is a known gap.
+
 ## Equality and comparison are SEPARATE relations
 
 F# has two generic relations and they disagree on exactly one value. Equality
