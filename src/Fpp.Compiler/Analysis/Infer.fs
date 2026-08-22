@@ -1390,6 +1390,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
 
+    /// `enum` / `enum<T>` as an application head — F#'s enum conversion.
+    /// Returns the WRITTEN type arguments (empty when none were spelled).
+    let enumHeadTyParams (h : GreenNode) : GreenNode list option =
+        let named (g : GreenNode) =
+            g.NodeKind = IdentExpr
+            && (match tokensOf g |> List.tryHead with
+                | Some t -> t.Text = "enum" && (dictTryFind useDefs t.Offset).IsNone
+                | None -> false)
+        if named h then Some []
+        elif h.NodeKind = AppExpr then
+            match nodesOf h with
+            | [ i; tp ] when named i && tp.NodeKind = TyParams ->
+                Some (nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind))
+            | _ -> None
+        else None
+
     // ---- syntax types -> Type ---------------------------------------------
 
     /// Convert a type node. `vars` maps type-variable names to Types and is
@@ -3262,6 +3278,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           vecAdd freshIdentsRaw t.Offset
                           st.Fresh ())
                  | _ -> st.Fresh ())   // quote-ident type variable
+            | AppExpr when
+                  (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                   | [ h; _ ] -> (enumHeadTyParams h).IsSome
+                   | _ -> false) ->
+                // `enum<Colour> 2`: an enum IS its integer, so the value
+                // passes through and the WRITTEN type argument names the
+                // result. The head is `AppExpr [ enum; TyParams ]`, which no
+                // conversion path recognised — the statement lowered to
+                // nothing at all.
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ h; x ] ->
+                     Types.unify (exprType (GNode x)) (TCon ("int", [])) |> ignore
+                     (match enumHeadTyParams h with
+                      | Some (tp :: _) -> typeFromNode tyScope tp
+                      | _ -> st.Fresh ())
+                 | _ -> st.Fresh ())
             | AppExpr when
                   (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                    | [ h; _ ] when h.NodeKind = IdentExpr ->

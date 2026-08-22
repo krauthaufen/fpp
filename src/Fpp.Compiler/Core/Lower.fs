@@ -183,6 +183,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | None -> ()
     // "TypeName.MemberName" -> the member's definition; a use site picks the
     // entry named by the receiver's inferred type (Infer.MemberSites)
+    /// type names declared as ENUMS: their values are integers, and their
+    /// cases are keyed by the QUALIFIED name ("Colour.Red")
+    let enumTypes = dictNew<string, bool> ()
     let showTypeAt = dictNew<int, string> ()
     for off, tn in showTypes do dictSet showTypeAt off tn
     let memberIndex = dictNew<string, Resolve.Definition> ()
@@ -321,6 +324,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // `%t` in type position is a type node like any other
         || k = SpliceType
     let isExprish (k : NodeKind) = not (isPatKind k) && not (isTypeKind k) && k <> TyParams
+
+    /// `enum` / `enum<T>` as an application head — F#'s enum conversion.
+    /// Returns the WRITTEN type arguments (empty when none were spelled).
+    let enumHeadTyParams (h : GreenNode) : GreenNode list option =
+        let named (g : GreenNode) =
+            g.NodeKind = IdentExpr
+            && (match tokensOf g |> List.tryHead with
+                | Some t -> t.Text = "enum" && (dictTryFind useDefs t.Offset).IsNone
+                | None -> false)
+        if named h then Some []
+        elif h.NodeKind = AppExpr then
+            match nodesOf h with
+            | [ i; tp ] when named i && tp.NodeKind = TyParams ->
+                Some (nodesOf tp |> List.filter (fun x -> isTypeKind x.NodeKind))
+            | _ -> None
+        else None
 
     /// The SLOT-TABLE spelling of an interface in impl position: the
     /// resolved name plus its `N arity. `IAdaptiveValue<'T>` (and `aval<'T>`
@@ -1222,6 +1241,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 ELet (false, tmp, sch, built,
                       ESeq ((pairs |> List.map (fun (f, v) -> EFieldSet (EVar (tmp, sch), f, tn, v)))
                             @ [ EVar (tmp, sch) ]))
+            | AppExpr when
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ h; _ ] -> (enumHeadTyParams h).IsSome
+                 | _ -> false) ->
+                // an enum IS its integer: `enum<Colour> 2` passes the value
+                // through unchanged
+                (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
+                 | [ _; a ] -> lowerExpr (GNode a)
+                 | _ -> note (offsetOf n) "enum conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
                  | head :: [ _ ] when head.NodeKind = IdentExpr ->
@@ -4202,6 +4230,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     Some (nt.Text, (if digits = "" then 0 else int digits))
                 | _ -> None)
         let isEnum = not (List.isEmpty caseNodes) && enumCases.Length = caseNodes.Length
+        if isEnum then dictSet enumTypes name true
         // A field records its TYPE, not a representation. Resolving a kind
         // here would freeze a `'a` field as boxed before anyone knows what
         // it is instantiated at; the backend derives the kind once the type
@@ -4791,6 +4820,43 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               vecAdd decls
                                   (DLet (false, bv, bsch,
                                          EMatch (EVar (tmp, anonScheme), [ pat, None, wrapRecPatBody obs (EVar (bv, bsch)) ]))))
+                 | Some (StructLet (elems, tn, rhs, _)) ->
+                     // `let struct (a, b) = e` at TOP LEVEL: bind the struct
+                     // once and give each element its own global reading its
+                     // field. The nested form wraps a body instead, which a
+                     // top-level binding has none of.
+                     let off = offsetOf n
+                     let tmp = { Path = path; Offset = 152000000 + off; Name = "_stt" }
+                     let tsch = mono (TCon (tn, []))
+                     vecAdd decls (DLet (false, tmp, tsch, rhs))
+                     elems
+                     |> List.iteri (fun i m ->
+                         let field = EField (EVar (tmp, tsch), "Item" + string (i + 1), tn)
+                         match Green.tokens (GNode m)
+                               |> List.filter (fun t -> t.Kind = Ident)
+                               |> List.tryHead
+                               |> Option.bind (fun t -> dictTryFind defsAt t.Offset) with
+                         | Some d -> vecAdd decls (DLet (false, varIdOf d, schemeOf d, field))
+                         | None ->
+                             // a STRUCTURED element (a nested pattern): bind it
+                             // whole and re-match for each of its own binders
+                             let et = { Path = path; Offset = 153000000 + offsetOf m; Name = "_ste" }
+                             let esch = mono (TCon ("?", []))
+                             vecAdd decls (DLet (false, et, esch, field))
+                             let pat = lowerPat m
+                             let rec pb (q : Pat) : (VarId * Scheme) list =
+                                 match q with
+                                 | PVar (v2, s2) -> [ v2, s2 ]
+                                 | PAs (inner, v2, s2) -> (v2, s2) :: pb inner
+                                 | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) -> List.collect pb ps
+                                 | PAnd (a2, b2) -> pb a2 @ pb b2
+                                 | PCons (h, t) -> pb h @ pb t
+                                 | POr ps -> (match ps with p0 :: _ -> pb p0 | [] -> [])
+                                 | PWild | PLit _ | PTypeTest _ -> []
+                             for bv, bsch in pb pat do
+                                 vecAdd decls
+                                     (DLet (false, bv, bsch,
+                                            EMatch (EVar (et, esch), [ pat, None, EVar (bv, bsch) ]))))
                  | _ -> vecAdd notes (offsetOf n, "top-level let shape"))
                 pendingExport <- false
             | TypeDecl ->
@@ -4847,7 +4913,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ ETuple [ acc; piece ] ])
             | None -> cat acc piece
         let body =
-            if not isUnion then
+            if (dictTryFind enumTypes typeName) = Some true then
+                // F# prints an enum by its case NAME, and the case is matched
+                // by its QUALIFIED name — the key the enum table carries
+                EMatch (EVar (av, anon),
+                        (entries |> List.map (fun (cn, _) -> PCtor (typeName + "." + cn, anon, []), None, str cn))
+                        @ [ PWild, None, str "?" ])
+            elif not isUnion then
                 let single = List.length entries <= 1
                 let step (acc : Expr) (i : int) (fn : string, comps : string list) : Expr =
                     let sep = if i = 0 then "{ " elif single then "; " else "\n  "
@@ -4938,7 +5010,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      EIf (EPrim (">" + sfx, [ x; y ]), ELit (LInt "1"), ELit (LInt "0")))
             | _ -> EApp (EUnknown ("$class:Ordered:compare:" + tyName), [ x; y ])
         let body =
-            if not isUnion then
+            if (dictTryFind enumTypes typeName) = Some true then
+                // an ENUM is its INTEGER. Matching its cases by bare name
+                // missed the enum table (whose keys are qualified) and fell
+                // into the union-tag path, where every value read as one.
+                EIf (EPrim ("<", [ EVar (av, anon); EVar (bv, anon) ]), ELit (LInt "-1"),
+                     EIf (EPrim (">", [ EVar (av, anon); EVar (bv, anon) ]), ELit (LInt "1"),
+                          ELit (LInt "0")))
+            elif not isUnion then
                 // f1 decides unless it ties, then f2, and so on
                 let rec fold (fs : (string * string list) list) : Expr =
                     match fs with
