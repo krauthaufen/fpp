@@ -363,9 +363,48 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             else nm)
 
 
+    /// A BINARY (`0b1011`) or OCTAL (`0o17`) literal, rewritten to decimal
+    /// with its type suffix kept. Neither backend understood those bases —
+    /// wasm-linear's own parser knew only `0x` and folded them to 0, and the
+    /// C emitter passes the source text into C, which has no `0o` at all.
+    /// Hex stays as written (both ends read it).
+    let normIntLit (raw : string) : string =
+        let n = strLen raw
+        let radix =
+            if n > 1 && charAt raw 0 = '0' then
+                let c = charAt raw 1
+                if c = 'b' || c = 'B' then 2 elif c = 'o' || c = 'O' then 8 else 0
+            else 0
+        if radix = 0 then raw
+        else
+            let mutable acc = 0L
+            let mutable i = 2
+            let mutable go = true
+            while go && i < n do
+                let c = charAt raw i
+                if c = '_' then i <- i + 1
+                else
+                    let d = if c >= '0' && c <= '9' then int c - int '0' else -1
+                    if d < 0 || d >= radix then go <- false
+                    else
+                        acc <- acc * int64 radix + int64 d
+                        i <- i + 1
+            string acc + raw.Substring (i, n - i)
+
+    /// F# arithmetic on a NARROW width WRAPS at that width. Those types ride
+    /// an i32 here, so the operation is followed by the same truncation the
+    /// conversion does — without it `200uy + 100uy` answered 300.
+    let narrowWrap (opText : string) (off : int) (e : Expr) : Expr =
+        if not (List.contains opText [ "+"; "-"; "*"; "<<<"; "~~~" ]) then e
+        else
+            match dictTryFind opTypes off with
+            | Some tn when tn = "byte" || tn = "sbyte" || tn = "int16" || tn = "uint16" ->
+                EApp (EUnknown (tn + "#"), [ e ])
+            | _ -> e
+
     let litOf (t : Token) : Lit option =
         match t.Kind with
-        | IntLit -> Some (LInt t.Text)
+        | IntLit -> Some (LInt (normIntLit t.Text))
         | FloatLit -> Some (LFloat t.Text)
         | StringLit -> Some (LString t.Text)
         | CharLit -> Some (LChar t.Text)
@@ -2139,7 +2178,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
                               else call
                           | None ->
-                              EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
+                              narrowWrap op.Text op.Offset
+                                  (EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ])))
                  | _ -> note (offsetOf n) "operator shape")
             | PrefixExpr when (match tokensOf n |> List.tryHead with
                                | Some t -> t.Kind = Keyword && t.Text = "yield"
@@ -2511,7 +2551,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + op.Text), [ call ])
                                  | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
                              else call
-                         | None -> EPrim (op.Text + suffix, [ la; lb ])
+                         | None -> narrowWrap op.Text op.Offset (EPrim (op.Text + suffix, [ la; lb ]))
                      ELam ([ va, sch; vb, sch ], body)
                  | [] -> ELit LUnit
                  | [ one ] -> lowerExpr (GNode one)

@@ -1049,3 +1049,76 @@ let rec desugarMemberVal (n : GreenNode) : GreenNode =
     match Green.node n.NodeKind (n.Children |> List.collect expand) with
     | GNode r -> r
     | _ -> n
+
+/// Does the tree carry a `[<Literal>]` attribute at all? Cheap gate,
+/// mirroring hasLazy.
+let rec hasLiteralDecl (n : GreenNode) : bool =
+    (n.NodeKind = AttributeList
+     && (tokensOf n |> List.exists (fun t -> t.Kind = Ident && t.Text = "Literal")))
+    || (nodesOf n |> List.exists hasLiteralDecl)
+
+/// `[<Literal>] let Threshold = 10` makes the NAME usable as a pattern:
+/// `| Threshold ->` matches the value 10, it does not bind. Without this the
+/// name reads as a union case (F#'s uppercase rule) and the compile fails
+/// with "unknown case". The rewrite substitutes the literal token, so the
+/// pattern is the one the source could have written by hand.
+///
+/// Only MATCH CLAUSE patterns are rewritten: a `let` binder is an IdentPat
+/// too, and the declaration itself must keep its name.
+let desugarLiteralPats (root : GreenNode) : GreenNode =
+    // the declared constants: name -> its literal token
+    let consts = dictNew<string, Token> ()
+    let mutable found = 0
+    // the attribute is a SIBLING of the declaration it decorates, not a
+    // child of it — the collector carries it forward one node
+    let rec collect (n : GreenNode) : unit =
+        let mutable pending = false
+        for c in nodesOf n do
+            if c.NodeKind = AttributeList then
+                pending <- tokensOf c |> List.exists (fun t -> t.Kind = Ident && t.Text = "Literal")
+            else
+                if pending && c.NodeKind = LetDecl then
+                    let name =
+                        nodesOf c
+                        |> List.tryFind (fun x -> x.NodeKind = IdentPat)
+                        |> Option.bind (fun x -> tokensOf x |> List.tryHead)
+                    let value =
+                        nodesOf c
+                        |> List.tryFind (fun x -> x.NodeKind = LiteralExpr)
+                        |> Option.bind (fun x -> tokensOf x |> List.tryHead)
+                    match name, value with
+                    | Some nt, Some vt ->
+                        dictSet consts nt.Text vt
+                        found <- found + 1
+                    | _ -> ()
+                pending <- false
+                collect c
+    collect root
+    if found = 0 then root
+    else
+        let rec inPat (g : Green) : Green =
+            match g with
+            | GNode m when m.NodeKind = IdentPat ->
+                (match tokensOf m |> List.tryHead with
+                 | Some t ->
+                     (match dictTryFind consts t.Text with
+                      | Some v ->
+                          Green.node LiteralPat
+                              [ GToken { v with Leading = t.Leading; Trailing = t.Trailing; Offset = freshOffset () } ]
+                      | None -> g)
+                 | None -> g)
+            | GNode m -> Green.node m.NodeKind (m.Children |> List.map inPat)
+            | t -> t
+        let rec walkTree (g : Green) : Green =
+            match g with
+            | GNode m when m.NodeKind = MatchClause ->
+                Green.node MatchClause
+                    (m.Children |> List.map (fun c ->
+                        match c with
+                        | GNode p when isPatKind p.NodeKind -> inPat c
+                        | other -> walkTree other))
+            | GNode m -> Green.node m.NodeKind (m.Children |> List.map walkTree)
+            | t -> t
+        match walkTree (GNode root) with
+        | GNode r -> r
+        | _ -> root

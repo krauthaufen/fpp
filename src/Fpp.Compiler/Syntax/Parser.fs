@@ -274,6 +274,17 @@ let parse (src : string) : ParseResult =
     /// its cases becomes. Recorded as the definition is parsed, and read at
     /// every later use — which is why a definition has to precede its uses,
     /// as it does in F#.
+    /// A union case's NAMED fields, in declaration order — `| Rectangle of
+    /// Width : float * Height : float`. F# lets those names be used at the
+    /// construction (`Rectangle (Width = 4.0, Height = 5.0)`) and in a
+    /// pattern (`Rectangle (Width = w)`); both are rewritten POSITIONALLY
+    /// here, so nothing downstream needs to know the names. Recorded as the
+    /// declaration is parsed, like the active-pattern tables below, so a
+    /// declaration has to precede its uses — as it does in F#.
+    let ucFieldNames = dictNew<string, string list> ()
+    /// the case whose ARGUMENT patterns are being parsed, "" outside one
+    let mutable curCasePat = ""
+
     let apFunctionOf = dictNew<string, string> ()      // case -> function
     let apIndexOf = dictNew<string, string> ()         // case -> choice case
     let apCaseIndex = dictNew<string, int> ()          // case -> 0-based index
@@ -380,6 +391,100 @@ let parse (src : string) : ParseResult =
     let apTok (k : TokenKind) (txt : string) : Green =
         apSynthNext <- apSynthNext + 1
         GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = apSynthNext }
+
+    /// The NAMES a case payload declares, one per slot ("" where the slot is
+    /// unnamed). `Radius : float` and `W : float * H : float` both read off
+    /// the payload node's direct children: a name, its colon, its type.
+    let payloadFieldNames (g : Green) : string list =
+        let isTypeNode (k : NodeKind) =
+            k = NamedType || k = VarType || k = AnonType || k = TupleType
+            || k = StructTupleType || k = FunType || k = AppType || k = PostfixType
+            || k = ParenType
+        match g with
+        | GNode n ->
+            let names = vecNew<string> ()
+            let mutable pending = ""
+            for ch in n.Children do
+                match ch with
+                | GToken t when t.Kind = Ident -> pending <- t.Text
+                | GToken _ -> ()
+                | GNode m when isTypeNode m.NodeKind ->
+                    vecAdd names pending
+                    pending <- ""
+                | GNode _ -> ()
+            vecToList names
+        | GToken _ -> []
+
+    /// The `name = value` pairs a parenthesised argument list spells, or None
+    /// when any element is something else. Works for both trees: the elements
+    /// of an expression list are `BinaryExpr =` nodes, and a pattern list
+    /// carries the name and `=` as loose tokens beside the element.
+    let namedExprPairs (inner : Green list) : (string * Green) list option =
+        let out = vecNew<string * Green> ()
+        let mutable ok = true
+        for g in inner do
+            match g with
+            | GNode n when n.NodeKind = BinaryExpr ->
+                (match n.Children with
+                 | [ GNode l; GToken op; (GNode _ as v) ] when
+                       op.Kind = Operator && op.Text = "=" && l.NodeKind = IdentExpr ->
+                     (match l.Children with
+                      | [ GToken nt ] when nt.Kind = Ident -> vecAdd out (nt.Text, v)
+                      | _ -> ok <- false)
+                 | _ -> ok <- false)
+            | GNode n when n.NodeKind = TupleExpr ->
+                ok <- false   // handled by the caller, which flattens first
+            | GToken t when t.Kind = Comma || t.Kind = LParen || t.Kind = RParen -> ()
+            | _ -> ok <- false
+        if ok && vecLen out > 0 then Some (vecToList out) else None
+
+    /// `Rectangle (Width = 4.0, Height = 5.0)` — a union case applied to
+    /// NAMED arguments, rebuilt in the declaration's order. Anything that is
+    /// not exactly one parenthesised list of `Field = value` over a KNOWN
+    /// case is left alone, so an ordinary `f (x = 1)` comparison is
+    /// untouched.
+    let rec fixNamedCaseApp (g : Green) : Green =
+        match g with
+        | GNode n when n.NodeKind = AppExpr ->
+            (match n.Children with
+             | [ GNode h; GNode par ] when h.NodeKind = IdentExpr && par.NodeKind = ParenExpr ->
+                 let caseName =
+                     match h.Children with
+                     | [ GToken t ] when t.Kind = Ident -> t.Text
+                     | _ -> ""
+                 (match dictTryFind ucFieldNames caseName with
+                  | Some declared ->
+                      // the elements: one BinaryExpr, or a TupleExpr of them
+                      let elems =
+                          par.Children
+                          |> List.collect (fun c ->
+                              match c with
+                              | GNode m when m.NodeKind = TupleExpr -> m.Children
+                              | GNode m when m.NodeKind = BinaryExpr -> [ c ]
+                              | _ -> [])
+                      (match namedExprPairs elems with
+                       | Some pairs when
+                             List.length pairs = List.length declared
+                             && pairs |> List.forall (fun (nm, _) -> List.contains nm declared) ->
+                           let ordered =
+                               declared
+                               |> List.map (fun d -> pairs |> List.find (fun (nm, _) -> nm = d) |> snd)
+                           let inner =
+                               match ordered with
+                               | [ one ] -> [ one ]
+                               | many ->
+                                   let acc = vecNew<Green> ()
+                                   many |> List.iteri (fun i v ->
+                                       if i > 0 then vecAdd acc (apTok Comma ",")
+                                       vecAdd acc v)
+                                   [ Green.node TupleExpr (vecToList acc) ]
+                           Green.node AppExpr
+                               [ GNode h
+                                 Green.node ParenExpr ((apTok LParen "(") :: inner @ [ apTok RParen ")" ]) ]
+                       | _ -> g)
+                  | None -> g)
+             | _ -> g)
+        | _ -> g
 
     /// `let (Split (n, s)) = e` — an active pattern in a BINDING. The pattern
     /// becomes the payload it matches and the right-hand side goes through the
@@ -913,10 +1018,68 @@ let parse (src : string) : ParseResult =
         if canStartAtomPat () && s.SameLine then
             let acc = vecNew<Green> ()
             vecAdd acc head
+            let outer = curCasePat
+            curCasePat <-
+                (match head with
+                 | GNode h when h.NodeKind = IdentPat ->
+                     (match h.Children with
+                      | [ GToken t ] when t.Kind = Ident && (dictTryFind ucFieldNames t.Text).IsSome -> t.Text
+                      | _ -> "")
+                 | _ -> "")
+            let caseHere = curCasePat
             while canStartAtomPat () && s.SameLine do
                 vecAdd acc (parseAtomPat ctx)
-            Green.node AppPat (vecToList acc)
+            curCasePat <- outer
+            fixNamedCasePat caseHere (Green.node AppPat (vecToList acc))
         else head
+
+    /// The named-field pattern list, rebuilt POSITIONALLY: each declared
+    /// slot takes the pattern its name was given, and a slot no name
+    /// mentioned takes a wildcard (F# allows a partial list).
+    and fixNamedCasePat (caseName : string) (g : Green) : Green =
+        if caseName = "" then g
+        else
+        match dictTryFind ucFieldNames caseName, g with
+        | Some declared, GNode n when n.NodeKind = AppPat ->
+            (match n.Children with
+             | [ hd; GNode par ] when par.NodeKind = ParenPat ->
+                 // collect `Ident = pat` triples; anything else means the
+                 // list is ordinary and stays as written
+                 let pairs = vecNew<string * Green> ()
+                 let mutable ok = true
+                 let mutable i = 0
+                 let kids = par.Children
+                 let count = List.length kids
+                 while ok && i < count do
+                     match List.item i kids with
+                     | GToken t when t.Kind = LParen || t.Kind = RParen || t.Kind = Comma -> i <- i + 1
+                     | GToken t when t.Kind = Ident && i + 2 < count ->
+                         (match List.item (i + 1) kids with
+                          | GToken eq when eq.Kind = Operator && eq.Text = "=" ->
+                              vecAdd pairs (t.Text, List.item (i + 2) kids)
+                              i <- i + 3
+                          | _ -> ok <- false)
+                     | _ -> ok <- false
+                 if not ok || vecLen pairs = 0 then g
+                 else
+                     let given = vecToList pairs
+                     if given |> List.exists (fun (nm, _) -> not (List.contains nm declared)) then g
+                     else
+                         let ordered =
+                             declared
+                             |> List.map (fun d ->
+                                 match given |> List.tryFind (fun (nm, _) -> nm = d) with
+                                 | Some (_, v) -> v
+                                 | None -> Green.node WildcardPat [ apTok Ident "_" ])
+                         let acc = vecNew<Green> ()
+                         vecAdd acc (apTok LParen "(")
+                         ordered |> List.iteri (fun k v ->
+                             if k > 0 then vecAdd acc (apTok Comma ",")
+                             vecAdd acc v)
+                         vecAdd acc (apTok RParen ")")
+                         Green.node AppPat [ hd; Green.node ParenPat (vecToList acc) ]
+             | _ -> g)
+        | _ -> g
 
     and canStartAtomPat () =
         s.Is Ident || isLiteral () || isLiteralKw () || s.Is LParen || s.Is LBracket || s.Is LBrace
@@ -966,9 +1129,24 @@ let parse (src : string) : ParseResult =
                 // parameter it belongs to and give that one an option type.
                 let optHere () =
                     s.IsOp "?" && (s.Peek 1).Kind = Ident && s.SameLine
+                // `Circle (Radius = r)` — a NAMED field pattern. Only inside
+                // the argument list of a case that declares that name, so an
+                // ordinary parenthesised pattern is never misread; the name
+                // and its `=` ride as loose tokens and parseAppPat reorders
+                // the whole list positionally.
+                let namedHere () =
+                    curCasePat <> "" && s.Is Ident && (s.Peek 1).Kind = Operator
+                    && (s.Peek 1).Text = "="
+                    && (match dictTryFind ucFieldNames curCasePat with
+                        | Some ns -> List.contains s.Cur.Text ns
+                        | None -> false)
                 let mutable go = canStartAtomPat () || optHere ()
                 while go do
                     if optHere () then vecAdd acc (s.Bump ())
+                    if namedHere () then
+                        vecAdd acc (s.Bump ())   // field name
+                        vecAdd acc (s.Bump ())   // =
+
                     vecAdd acc (parseAsSuffix (parseConsPat ctx))
                     // parenthesized or-pattern: ("&&" | "||")
                     while s.IsOp "|" && not s.AtEof do
@@ -1131,7 +1309,7 @@ let parse (src : string) : ParseResult =
             vecAdd acc head
             while (canStartAtom () || isNegArg () || isAddrArg () || isDerefArg ()) && (s.SameLine || s.CurCol > ctx) do
                 vecAdd acc (parseArg ())
-            Green.node AppExpr (vecToList acc)
+            fixNamedCaseApp (Green.node AppExpr (vecToList acc))
         else head
 
     and parsePostfix (ctx : int) : Green =
@@ -1156,7 +1334,7 @@ let parse (src : string) : ParseResult =
                 // followed by `(` binds tighter than juxtaposition, so
                 // `C(1).Get()` chains the dot onto the call — without this
                 // the postfix loop never saw past the constructor
-                e <- Green.node AppExpr [ e; parseAtom ctx ]
+                e <- fixNamedCaseApp (Green.node AppExpr [ e; parseAtom ctx ])
             elif s.Is LBrace && s.SameLine && isNameExpr e
                  && not ((s.Peek 1).Kind = Keyword && (s.Peek 1).Text = "new")
                  && not (looksLikeRecordExpr ()) then
@@ -2188,10 +2366,14 @@ let parse (src : string) : ParseResult =
         // optional first case without a leading bar: `type T = A | B`
         if s.Is Ident then
             let c = vecNew<Green> ()
+            let nameTok = s.Cur.Text
             vecAdd c (s.Bump ())
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
-                vecAdd c (parseCasePayload typeCol)
+                let payload = parseCasePayload typeCol
+                let fns = payloadFieldNames payload
+                if fns |> List.exists (fun x -> x <> "") then dictSet ucFieldNames nameTok fns
+                vecAdd c payload
             vecAdd acc (Green.node UnionCase (vecToList c))
         let mutable go = true
         while go && s.IsOp "|" && (s.SameLine || s.CurCol > typeCol) do
@@ -2199,6 +2381,7 @@ let parse (src : string) : ParseResult =
             let c = vecNew<Green> ()
             let barCol = s.CurCol
             vecAdd c (s.Bump ())
+            let caseName = if s.Is Ident then s.Cur.Text else ""
             if s.Is Ident then vecAdd c (s.Bump ()) else s.Diag "expected a union case name"
             // the GADT form: `| Lit of value : int -> E<int>` — the
             // constructor IS a function, and the top-level arrow names its
@@ -2218,7 +2401,11 @@ let parse (src : string) : ParseResult =
                     else for w__ in parseWhen false barCol do vecAdd c w__
             if s.IsKw "of" then
                 vecAdd c (s.Bump ())
-                vecAdd c (parseCasePayload barCol)
+                let payload = parseCasePayload barCol
+                let fns = payloadFieldNames payload
+                if caseName <> "" && (fns |> List.exists (fun x -> x <> "")) then
+                    dictSet ucFieldNames caseName fns
+                vecAdd c payload
                 if s.IsOp "->" then
                     vecAdd c (s.Bump ())
                     vecAdd c (parsePostfixType barCol)

@@ -377,7 +377,9 @@ type Workspace() =
             // parse sees the rewritten form (the raw parse stays lossless
             // for the round-trip tests, which call the parser directly)
             let p = if Desugar.hasLazy (GNode p.Root) then { p with Root = Desugar.desugarLazy p.Root } else p
-            if Desugar.hasMemberVal p.Root then { p with Root = Desugar.desugarMemberVal p.Root } else p)
+            let p = if Desugar.hasMemberVal p.Root then { p with Root = Desugar.desugarMemberVal p.Root } else p
+            // `[<Literal>] let N = 10` makes N a PATTERN constant
+            if Desugar.hasLiteralDecl p.Root then { p with Root = Desugar.desugarLiteralPats p.Root } else p)
 
     /// The tree everything semantic runs on: computation expressions are
     /// rewritten into ordinary syntax first, so resolution, inference and

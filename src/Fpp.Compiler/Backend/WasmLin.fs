@@ -5687,6 +5687,13 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
         lowBoxI ctx (LPrim (WToL, [ (coreToLowE ctx a) ]))
+    // a float32 rides the SAME boxed f64, so widening it is the identity —
+    // the word conversion below read the box POINTER as an integer
+    | EApp (EUnknown n, [ a ]) when
+          n.StartsWith "float#f" || n.StartsWith "float#s"
+          || n.StartsWith "double#f" || n.StartsWith "double#s" -> coreToLowE ctx a
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float#h" || n.StartsWith "double#h" ->
+        lowBoxF ctx (LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
         lowBoxF ctx (LPrim (WToF, [ (coreToLowE ctx a) ]))
     // char and int share the tagged-int representation, so `int c` / `char i`
