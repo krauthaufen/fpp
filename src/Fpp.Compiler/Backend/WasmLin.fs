@@ -5685,6 +5685,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
          | _ -> coreToLowE ctx a)
     | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#t" ->
         lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "int64#w" || n.StartsWith "int64#p" ->
+        lowBoxI ctx (LPrim (WUToL, [ (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when n = "int64#" || n.StartsWith "int64#" ->
         lowBoxI ctx (LPrim (WToL, [ (coreToLowE ctx a) ]))
     // a float32 rides the SAME boxed f64, so widening it is the identity —
@@ -5694,6 +5696,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
           || n.StartsWith "double#f" || n.StartsWith "double#s" -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n.StartsWith "float#h" || n.StartsWith "double#h" ->
         lowBoxF ctx (LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ]))
+    // the WIDE and UNSIGNED sources: an int64/uint64 arrives BOXED, so the
+    // word conversion read its pointer; a uint32 is a raw word whose top bit
+    // is a magnitude, so the signed convert answered a negative
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float#l" || n.StartsWith "double#l" ->
+        lowBoxF ctx (LPrim (LToF, [ lowUnboxI (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float#v" || n.StartsWith "double#v" ->
+        lowBoxF ctx (LPrim (LUToF, [ lowUnboxI (coreToLowE ctx a) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float#w" || n.StartsWith "double#w" ->
+        lowBoxF ctx (LPrim (WUToF, [ (coreToLowE ctx a) ]))
     | EApp (EUnknown n, [ a ]) when (n = "float#" || n.StartsWith "float#") && not (n.StartsWith "float32") ->
         lowBoxF ctx (LPrim (WToF, [ (coreToLowE ctx a) ]))
     // char and int share the tagged-int representation, so `int c` / `char i`
@@ -5721,6 +5732,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#l" || n.StartsWith "uint64#v" -> coreToLowE ctx a
     | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#t" ->
         lowBoxI ctx (LCall ("$atol", [ coreToLowE ctx a ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "uint64#w" || n.StartsWith "uint64#p" ->
+        lowBoxI ctx (LPrim (WUToL, [ coreToLowE ctx a ]))
     | EApp (EUnknown n, [ a ]) when n = "uint64#" || n.StartsWith "uint64#" ->
         lowBoxI ctx (LPrim (WToL, [ coreToLowE ctx a ]))
     // int from float: unbox, truncate, tag
@@ -5754,7 +5767,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         elif n.StartsWith "int16#" then LPrim (ShrSW, [ LPrim (ShlW, [ w; LConstW 16 ]); LConstW 16 ])
         else LPrim (ShrSW, [ LPrim (ShlW, [ w; LConstW 24 ]); LConstW 24 ])
     // the raw bits of a double, as int64 — read the boxed payload as i64
-    | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
+    | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LPrim (D2Bits, [ lowUnboxF (coreToLowE ctx a) ]))
     // the other direction: the BITS of a double, as a double. Building a
     // float from its exponent and mantissa is how a correctly-rounded parse
     // ends, and there was no way to spell it.
@@ -5765,8 +5778,23 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `float32 x`/`float16 x` FROM a float: round to f32 precision and keep the
     // value in its f64 box (demote then promote). Half rides the same box; f32
     // rounding is the closest we do without a dedicated f16 path.
-    | EApp (EUnknown ("float32#f" | "single#f"), [ a ]) ->
+    | EApp (EUnknown ("float32#f" | "single#f" | "float32#s" | "single#s"), [ a ]) ->
         lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
+    // from an INTEGER source: convert, then round to f32. These arms were
+    // missing outright, and an unmatched conversion lowers to nothing — the
+    // whole statement disappeared with no diagnostic.
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float32#l" || n.StartsWith "single#l" ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ LPrim (LToF, [ lowUnboxI (coreToLowE ctx a) ]) ]) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float32#v" || n.StartsWith "single#v" ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ LPrim (LUToF, [ lowUnboxI (coreToLowE ctx a) ]) ]) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float32#w" || n.StartsWith "single#w" ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ LPrim (WUToF, [ coreToLowE ctx a ]) ]) ]))
+    | EApp (EUnknown n, [ a ]) when n.StartsWith "float32#h" || n.StartsWith "single#h" ->
+        lowBoxF ctx (LPrim (PromF, [ LCall ("$h2f", [ coreToLowE ctx a ]) ]))
+    | EApp (EUnknown n, [ a ]) when
+          (n = "float32#" || n.StartsWith "float32#" || n = "single#" || n.StartsWith "single#")
+          && not (n.StartsWith "float32#t") && not (n.StartsWith "single#t") ->
+        lowBoxF ctx (LPrim (PromF, [ LPrim (DemF, [ LPrim (WToF, [ coreToLowE ctx a ]) ]) ]))
     // ---- float16: a half IS its 16 raw bits in a word ---------------------
     // INTO a half: round the value to half precision, keep the bits
     | EApp (EUnknown "float16#f", [ a ]) -> LCall ("$f2h64", [ lowUnboxF (coreToLowE ctx a) ])
@@ -6887,6 +6915,72 @@ and private lowBox64 (ctx : LowCtx) (shape : string) (cid : int) (ty : LTy) (v :
 
 and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID_FLOAT F64 fv
 
+/// Does a register appear anywhere in these statements / this expression?
+/// The unbox peephole below elides a box whose ONLY consumer is the unbox, so
+/// it has to prove the pointer is read nowhere else.
+and private regInE (id : int) (e : LExpr) : bool =
+    match e with
+    | LGet r -> r.Id = id
+    | LConstW _ | LConstL _ | LConstF _ | LGetGlobal _ -> false
+    | LLoad (_, a, _) -> regInE id a
+    | LPrim (_, xs) -> xs |> List.exists (regInE id)
+    | LAlloc a -> regInE id a
+    | LCall (_, xs) -> xs |> List.exists (regInE id)
+    | LCallIndirect (_, f, xs) -> regInE id f || (xs |> List.exists (regInE id))
+    | LCallIdx (_, ix, xs) -> regInE id ix || (xs |> List.exists (regInE id))
+    | LTailCall (_, xs) -> xs |> List.exists (regInE id)
+    | LDo (ss, v) -> (ss |> List.exists (regInS id)) || regInE id v
+
+and private regInS (id : int) (st : LStmt) : bool =
+    match st with
+    | LStore (_, a, _, v) -> regInE id a || regInE id v
+    | LSet (r, v) -> r.Id = id || regInE id v
+    | LSetGlobal (_, v) -> regInE id v
+    | LEval v -> regInE id v
+    | LCallVoidS (_, xs) -> xs |> List.exists (regInE id)
+    | LIf (c, a, b) -> regInE id c || (a |> List.exists (regInS id)) || (b |> List.exists (regInS id))
+    | LWhile (c, b) -> regInE id c || (b |> List.exists (regInS id))
+    | LBlock (_, b) -> b |> List.exists (regInS id)
+    | LBreakIf (_, c) -> regInE id c
+    | LBreak _ | LTrap -> false
+    | LReturn v -> regInE id v
+    | LThrow v -> regInE id v
+    | LTryStmt (b, r, x, hs) -> regInE id b || r.Id = id || x.Id = id || (hs |> List.exists (regInS id))
+
+/// The general box-then-unbox cancellation: a box built inside this LDo whose
+/// pointer is read by NOTHING but the unbox itself. The narrow form below
+/// only sees a payload store in LAST position, which the RETURN path breaks —
+/// a function answering a raw f64 ends with the shadow-stack pop after the
+/// store, so every such return allocated a box and immediately read it back.
+and private cancelBox (ty : LTy) (p : LExpr) : LExpr option =
+    match p with
+    | LDo (stmts, LGet rb) ->
+        // the payload the box was given, and the two statements that built it
+        let mutable payload = None
+        let mutable allocAt = -1
+        let mutable storeAt = -1
+        stmts |> List.iteri (fun i st ->
+            match st with
+            | LSet (r, _) when r.Id = rb.Id && allocAt < 0 -> allocAt <- i
+            | LStore (t, LGet r, off, v) when
+                  r.Id = rb.Id && off = HDR && t = ty && storeAt < 0 && allocAt >= 0 ->
+                storeAt <- i
+                payload <- Some v
+            | _ -> ())
+        match payload with
+        | Some v when allocAt >= 0 && storeAt > allocAt
+                      // only a cheap, position-independent payload moves past
+                      // the statements that followed the store
+                      && (match v with LGet _ | LConstF _ | LConstL _ | LConstW _ -> true | _ -> false) ->
+            let rest = stmts |> List.mapi (fun i st -> i, st)
+                             |> List.filter (fun (i, _) -> i <> allocAt && i <> storeAt)
+                             |> List.map snd
+            if rest |> List.exists (regInS rb.Id) then None
+            elif regInE rb.Id v then None
+            else Some (LDo (rest, v))
+        | _ -> None
+    | _ -> None
+
 // box elimination: unbox(box(v)) is just v — a box built here (an LDo whose
 // value is its own register and whose last store is the payload) is cancelled
 // on the spot, so a float/int64 chain (a+b, arr.[i]+c) never materialises the
@@ -6899,6 +6993,7 @@ and private lowUnboxF (p : LExpr) : LExpr =
     // so a `float[]` read in arithmetic reduces to the bare f64 load.
     | LDo (stmts, LGet rb) when (match List.tryLast stmts with Some (LStore (F64, LGet rb2, off, _)) -> rb2 = rb && off = HDR | _ -> false) ->
         (match List.tryLast stmts with Some (LStore (_, _, _, v)) -> v | _ -> LLoad (F64, p, HDR))
+    | LDo (_, LGet _) when (cancelBox F64 p).IsSome -> (cancelBox F64 p).Value
     | LDo (stmts, tail) -> LDo (stmts, lowUnboxF tail)
     | _ -> LLoad (F64, p, HDR)
 
@@ -6908,6 +7003,7 @@ and private lowUnboxI (p : LExpr) : LExpr =
     match p with
     | LDo (stmts, LGet rb) when (match List.tryLast stmts with Some (LStore (I64, LGet rb2, off, _)) -> rb2 = rb && off = HDR | _ -> false) ->
         (match List.tryLast stmts with Some (LStore (_, _, _, v)) -> v | _ -> LLoad (I64, p, HDR))
+    | LDo (_, LGet _) when (cancelBox I64 p).IsSome -> (cancelBox I64 p).Value
     | LDo (stmts, tail) -> LDo (stmts, lowUnboxI tail)
     | _ -> LLoad (I64, p, HDR)
 
@@ -7515,10 +7611,14 @@ let private lowOpIns (op : LOp) : string =
     | FToW -> "i32.trunc_f64_s"
     | LToF -> "f64.convert_i64_s"
     | FToL -> "i64.trunc_f64_s"
+    | WUToL -> "i64.extend_i32_u"
+    | WUToF -> "f64.convert_i32_u"
+    | LUToF -> "f64.convert_i64_u"
     | PromF -> "f64.promote_f32"
     | DemF -> "f32.demote_f64"
     | Bits2F -> "f32.reinterpret_i32"
     | Bits2D -> "f64.reinterpret_i64"
+    | D2Bits -> "i64.reinterpret_f64"
     | F2Bits -> "i32.reinterpret_f32"
 
 // the wasm value type a local of this LTy is declared as: I64 is a real i64

@@ -49,6 +49,10 @@ type LOp =
     | EqF  | NeF  | LtF  | GtF   | LeF | GeF
     // conversions between machine types
     | WToL | LToW | WToF | FToW | LToF | FToL
+    // the UNSIGNED widenings. Without them `float 4000000000u` came out
+    // negative and `int64 4000000000u` sign-extended — the signed op is not
+    // a conversion for a value whose type says the top bit is a magnitude.
+    | WUToL | WUToF | LUToF
     // float32 packing: an f32 never lives in a local (no F32 LTy) — it appears
     // only transiently on the operand stack. PromF widens a loaded f32 to the
     // f64 a float value rides in; DemF narrows for a 4-byte store. Bits2F/F2Bits
@@ -58,6 +62,10 @@ type LOp =
     // the 64-bit pair: an i64 bit pattern as an f64, which is how a parsed
     // float is finally assembled
     | Bits2D
+    /// the other direction: an f64's bit pattern as an i64. Without it
+    /// `DoubleToInt64Bits` had to ALLOCATE a box, store the double and read
+    /// the payload back as an integer — a heap allocation per float printed.
+    | D2Bits
 
 type LExpr =
     | LConstW of int

@@ -254,8 +254,10 @@ let opByte (name : string) : int =
     | "i64.trunc_f32_s" -> 0xAE | "i64.trunc_f32_u" -> 0xAF
     | "i64.trunc_f64_s" -> 0xB0 | "i64.trunc_f64_u" -> 0xB1
     | "f32.convert_i32_s" -> 0xB2 | "f32.convert_i32_u" -> 0xB3 | "f32.convert_i64_s" -> 0xB4
+    | "f32.convert_i64_u" -> 0xB5
     | "f32.demote_f64" -> 0xB6
     | "f64.convert_i32_s" -> 0xB7 | "f64.convert_i32_u" -> 0xB8 | "f64.convert_i64_s" -> 0xB9
+    | "f64.convert_i64_u" -> 0xBA
     | "f64.promote_f32" -> 0xBB
     | "i32.reinterpret_f32" -> 0xBC | "i64.reinterpret_f64" -> 0xBD
     | "f32.reinterpret_i32" -> 0xBE | "f64.reinterpret_i64" -> 0xBF
