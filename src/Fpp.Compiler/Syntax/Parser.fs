@@ -631,6 +631,23 @@ let parse (src : string) : ParseResult =
                     else go <- false
             if s.Is RParen then vecAdd acc (s.Bump ()) else s.Diag "expected ')' in pattern"
             Green.node ParenPat (vecToList acc)
+        // `[| p; q |]` — an ARRAY pattern, spelled the way the literal is.
+        // Read as a LIST pattern (the bar just another token to skip) it
+        // typed the scrutinee as a list and every array match was an error.
+        elif s.Is LBracket && (s.Peek 1).Kind = Operator && ((s.Peek 1).Text = "|" || (s.Peek 1).Text = "||") then
+            let acc = vecNew<Green> ()
+            vecAdd acc (s.Bump ())   // [
+            vecAdd acc (s.Bump ())   // | (or || when empty)
+            let mutable go = true
+            while go && not s.AtEof && not (s.Is RBracket) && not (s.IsOp "|") do
+                let mark = s.Mark
+                if s.Is Semicolon then vecAdd acc (s.Bump ())
+                elif canStartAtomPat () then vecAdd acc (parsePat ctx)
+                else vecAdd acc (s.Bump ())
+                if s.Mark = mark then go <- false
+            if s.IsOp "|" then vecAdd acc (s.Bump ())
+            if s.Is RBracket then vecAdd acc (s.Bump ()) else s.Diag "expected '|]' in pattern"
+            Green.node ArrayPat (vecToList acc)
         elif s.Is LBracket then
             let acc = vecNew<Green> ()
             vecAdd acc (s.Bump ())
@@ -1339,7 +1356,10 @@ let parse (src : string) : ParseResult =
         elif atOperatorName () then
             vecAdd acc (Green.node IdentPat [ bumpOperatorName () ])
         else
-            vecAdd acc (parseAtomPat letCol)
+            // `let (x, y) as whole = e`: an as-pattern binds the WHOLE value
+            // beside its parts. It binds loosest, so it WRAPS the pattern —
+            // left as a sibling it read as a curried parameter named `as`.
+            vecAdd acc (parseAsSuffix (parseAtomPat letCol))
         if s.Is Comma then
             // tuple destructuring: `let leading, p = scanLeading pos`
             while s.Is Comma && s.SameLine do

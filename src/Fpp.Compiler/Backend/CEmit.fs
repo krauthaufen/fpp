@@ -537,7 +537,7 @@ let rec private walkE (g : Expr -> unit) (e : Expr) : unit =
 let rec private patBinders (p : Pat) (acc : Vec<string * int>) : unit =
     match p with
     | PVar (v, _) -> vecAdd acc (v.Path, v.Offset)
-    | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps ->
+    | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps ->
         for q in ps do patBinders q acc
     | PCons (a, b) -> patBinders a acc; patBinders b acc
     | PAs (q, v, _) -> patBinders q acc; vecAdd acc (v.Path, v.Offset)
@@ -2552,6 +2552,17 @@ and private emitPat (st : CSt) (f : CFn) (p : Pat) (sv : int) (ok : int) : unit 
                     + sref cur + ", FPPOFF(2));")
         stmt f ("if (UNTAGI(" + sref ok + ") && " + sref cur + " != 0) "
                 + sref ok + " = TAGI(0);")
+    | PArrLit (_, ps) ->
+        // an array of exactly this LENGTH whose elements match. fpp_arr_get
+        // answers a tagged/boxed element whatever the array's storage is, so
+        // one accessor serves every element kind.
+        stmt f ("if (!" + sref sv + " || (size_t)fpprt_array_len(" + sref sv + ") != "
+                + string (List.length ps) + "u) " + sref ok + " = TAGI(0);")
+        ps |> List.iteri (fun i q ->
+            let el = slot f
+            stmt f ("if (UNTAGI(" + sref ok + ")) " + sref el + " = fpp_arr_get("
+                    + sref sv + ", (size_t)" + string i + ");")
+            emitPat st f q el ok)
     | PCtor (cn, _, ps) ->
         (match dictTryFind st.CaseTid cn with
          | Some tid ->

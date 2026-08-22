@@ -159,7 +159,7 @@ let private isExprish (k : NodeKind) : bool =
 let private isPatKind (k : NodeKind) : bool =
     match k with
     | WildcardPat | IdentPat | LiteralPat | TuplePat | StructTuplePat | ConsPat
-    | AppPat | ParenPat | ListPat | AsPat | TypeTestPat | SplicePat -> true
+    | AppPat | ParenPat | ListPat | ArrayPat | AsPat | TypeTestPat | SplicePat -> true
     | _ -> false
 
 let private hasKw (n : GreenNode) (text : string) : bool =

@@ -112,7 +112,7 @@ let private freshenBinders (counter : Vec<int>) (e : Expr) : Expr =
         match p with
         | PVar (v, _) -> fresh v
         | PAs (inner, v, _) -> fresh v; bindPat inner
-        | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter bindPat ps
+        | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.iter bindPat ps
         | PCons (h, t) -> bindPat h; bindPat t
         | PWild | PLit _ | PTypeTest _ -> ()
     mapExpr
@@ -138,6 +138,7 @@ let private freshenBinders (counter : Vec<int>) (e : Expr) : Expr =
         | PCtor (n, sc, ps) -> PCtor (n, sc, List.map subPat ps)
         | PTuple ps -> PTuple (List.map subPat ps)
         | PListLit ps -> PListLit (List.map subPat ps)
+        | PArrLit (k, ps) -> PArrLit (k, List.map subPat ps)
         | POr ps -> POr (List.map subPat ps)
         | PCons (h, t) -> PCons (subPat h, subPat t)
         | other -> other

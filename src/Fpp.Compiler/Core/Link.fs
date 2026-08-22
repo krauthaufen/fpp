@@ -345,7 +345,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             let rec patLayout (p : Pat) =
                 match p with
                 | PTypeTest tn -> tn.Contains "#"
-                | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.exists patLayout ps
+                | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.exists patLayout ps
                 | PCons (a, b) -> patLayout a || patLayout b
                 | PAs (inner, _, _) -> patLayout inner
                 | _ -> false
@@ -934,6 +934,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                     | PCtor (n2, s2, ps) -> PCtor (n2, s2, List.map subPat ps)
                     | PTuple ps -> PTuple (List.map subPat ps)
                     | PListLit ps -> PListLit (List.map subPat ps)
+                    | PArrLit (k, ps) -> PArrLit (k, List.map subPat ps)
                     | POr ps -> POr (List.map subPat ps)
                     | PCons (a, b) -> PCons (subPat a, subPat b)
                     | PAs (inner, v2, s2) -> PAs (subPat inner, v2, s2)
@@ -961,7 +962,7 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
             match p with
             | PVar (v, _) -> dictSet bound (v.Path, v.Offset) true
             | PAs (inner, v, _) -> dictSet bound (v.Path, v.Offset) true; collectPat inner
-            | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.iter collectPat ps
+            | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.iter collectPat ps
             | PCons (h, t) -> collectPat h; collectPat t
             | PWild | PLit _ | PTypeTest _ -> ()
         // mapExpr visits every node; we only use it to gather binders

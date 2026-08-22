@@ -308,7 +308,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat || k = RecordPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat || k = RecordPat
         || k = SplicePat
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -660,6 +660,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let rec binders (p : Pat) : (string * (VarId * Scheme)) list =
             match p with
             | PVar (v, sch) -> [ v.Name, (v, sch) ]
+            | PArrLit (_, ps) -> List.collect binders ps
             | PAs (inner, v, sch) -> (v.Name, (v, sch)) :: binders inner
             | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.collect binders ps
             | PCons (h, t) -> binders h @ binders t
@@ -710,7 +711,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | PAs (inner, _, _) -> irrefutablePat inner
         | PTuple ps -> ps |> List.forall irrefutablePat
         | _ -> false
-    let wrapRecPatBody (obs : (VarId * string * (string * Pat) list) list) (body : Expr) : Expr =
+    /// OUTERMOST FIRST. lowerPat stashes an inner record pattern BEFORE the
+    /// outer one that contains it (it lowers the field sub-patterns on the way
+    /// down), and folding in that order put the inner field read OUTSIDE the
+    /// binder it reads from — `{ Inner = { Age = a } }` bound `a` to 0.
+    let outerFirst (obs : (VarId * string * (string * Pat) list) list) = List.rev obs
+    let wrapRecPatBody (obs0 : (VarId * string * (string * Pat) list) list) (body : Expr) : Expr =
+        let obs = outerFirst obs0
         List.foldBack
             (fun (tmp, owner, fps) acc ->
                 List.foldBack
@@ -719,7 +726,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         else EMatch (EField (EVar (tmp, anonPatScheme), fn, owner), [ sub, None, acc2 ]))
                     fps acc)
             obs body
-    let wrapRecPatGuard (obs : (VarId * string * (string * Pat) list) list) (guard : Expr option) : Expr option =
+    let wrapRecPatGuard (obs0 : (VarId * string * (string * Pat) list) list) (guard : Expr option) : Expr option =
+        let obs = outerFirst obs0
         let refutable =
             obs |> List.exists (fun (_, _, fps) -> fps |> List.exists (fun (_, sub) -> not (irrefutablePat sub)))
         if not refutable && guard.IsNone then None
@@ -747,7 +755,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         match n.NodeKind with
         | WildcardPat -> PWild
         | LiteralPat ->
-            (match tokensOf n |> List.tryLast |> Option.bind litOf with
+            // `| -1 ->` is TWO tokens, the minus and the digits. Reading only
+            // the last one dropped the sign, so the arm matched +1 — silently,
+            // and the negative case fell through to the wildcard.
+            let negated =
+                match tokensOf n with
+                | [ m; d ] when m.Kind = Operator && m.Text = "-" ->
+                    (match litOf d with
+                     | Some (LInt v) -> Some (LInt ("-" + v))
+                     | Some (LFloat v) -> Some (LFloat ("-" + v))
+                     | _ -> None)
+                | _ -> None
+            (match (match negated with Some l -> Some l | None -> tokensOf n |> List.tryLast |> Option.bind litOf) with
              | Some l -> PLit l
              | None ->
                  // `null` is a keyword, not a literal token, so litOf misses
@@ -805,6 +824,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              | [ h; t ] -> PCons (lowerPat h, lowerPat t)
              | _ -> PWild)
         | ListPat -> PListLit (nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
+        | ArrayPat ->
+            // the element kind inference recorded at the opening bracket: the
+            // backend reads a slot by its WIDTH, so a packed float array and a
+            // reference array are not the same walk
+            let k =
+                match tokensOf n |> List.tryHead |> Option.bind (fun t -> dictTryFind arrKinds t.Offset) with
+                | Some v -> v
+                | None -> ""
+            PArrLit (k, nodesOf n |> List.filter (fun m -> isPatKind m.NodeKind) |> List.map lowerPat)
         | RecordPat ->
             let owner =
                 match Green.tokens (GNode n) |> List.tryHead |> Option.bind (fun t -> dictTryFind fieldOwners t.Offset) with
@@ -850,9 +878,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // keep the pattern and let emission handle simple cases)
         let isStructParam (p : GreenNode) =
             p.NodeKind = StructTuplePat
+            // a RECORD parameter (`let ageOf { Age = a } = a`) lowers to a
+            // plain binder plus stashed field reads, so read as a SIMPLE
+            // parameter it bound the record and dropped every field read —
+            // the body then used an unbound name and trapped
+            || p.NodeKind = RecordPat
             || (p.NodeKind = ParenPat
                 && (match nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) with
-                    | [ one ] -> one.NodeKind = StructTuplePat
+                    | [ one ] -> one.NodeKind = StructTuplePat || one.NodeKind = RecordPat
                     | _ -> false))
         let binds =
             pats
@@ -892,7 +925,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let sch = mono (TCon ("?", []))
                     bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
                     arg, sch)
-        binds, bodyW
+        // a record pattern among the parameters stashed its field reads
+        binds, wrapRecPatBody (drainRecPats ()) bodyW
 
     /// One slot per element of a `struct(...)` pattern, in source order:
     /// `Some binder` for a named element, `None` for a wildcard or literal.
@@ -3854,7 +3888,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     let sch = mono (TCon ("?", []))
                     bodyW <- EMatch (EVar (arg, sch), [ other, None, bodyW ])
                     arg, sch)
-        binds, bodyW
+        binds, wrapRecPatBody (drainRecPats ()) bodyW
 
     /// Bind the elements of a struct-tuple pattern from its fields. A simple
     /// binder reads its ItemN directly; a STRUCTURED element (a nested tuple,
@@ -3912,6 +3946,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.choose (fun c -> match c with GNode p when isPatKind p.NodeKind -> Some p | _ -> None)
         let isDestructure =
             (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
+            // `let (x, y) as whole = e` — an as-pattern binds BOTH the parts
+            // and the whole, so it is a destructure however simple its inner
+            // pattern is. Read as a simple binding it took the first name it
+            // saw (`x`) and bound the entire value to it.
+            || (match pats with [ p ] -> p.NodeKind = AsPat | _ -> false)
             // `let (k, v) = e` — the parens hide the comma from the token
             // scan, and treating it as a SIMPLE binding bound only k
             || (match pats with
@@ -4631,6 +4670,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      let rec patBinders (p : Pat) : (VarId * Scheme) list =
                          match p with
                          | PVar (v2, sch2) -> [ v2, sch2 ]
+                         | PArrLit (_, ps2) -> List.collect patBinders ps2
                          | PAs (inner, v2, sch2) -> (v2, sch2) :: patBinders inner
                          | PCtor (_, _, ps) | PTuple ps | PListLit ps -> List.collect patBinders ps
                          | POr ps -> (match ps with p0 :: _ -> patBinders p0 | [] -> [])

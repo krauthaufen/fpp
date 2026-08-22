@@ -3261,7 +3261,7 @@ let rec private patBinders (p : Pat) : VarId list =
     match p with
     | PVar (v, _) -> [ v ]
     | PAs (inner, v, _) -> v :: patBinders inner
-    | PCtor (_, _, ps) | PTuple ps | PListLit ps | POr ps -> List.collect patBinders ps
+    | PCtor (_, _, ps) | PTuple ps | PListLit ps | PArrLit (_, ps) | POr ps -> List.collect patBinders ps
     | PCons (a, b) -> patBinders a @ patBinders b
     | _ -> []
 
@@ -3387,7 +3387,7 @@ let rec private scanPatConsts (st : St) (p : Pat) : unit =
     match p with
     | PLit (LString s) -> (if gc then internStrGc st s else internStr st s) |> ignore
     | PAs (q, _, _) -> scanPatConsts st q
-    | PCtor (_, _, subs) | PTuple subs | PListLit subs | POr subs -> for q in subs do scanPatConsts st q
+    | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) | POr subs -> for q in subs do scanPatConsts st q
     | PCons (a, b) -> scanPatConsts st a; scanPatConsts st b
     | _ -> ()
 
@@ -4620,7 +4620,7 @@ let rec private patRefBinders (ctx : LowCtx) (pat : Pat) : (VarId * Scheme) list
     match pat with
     | PVar (v, sch) -> if keep v sch then [ v, sch ] else []
     | PAs (p, v, sch) -> (if keep v sch then [ v, sch ] else []) @ patRefBinders ctx p
-    | PCtor (_, _, subs) | PTuple subs | PListLit subs -> List.collect (patRefBinders ctx) subs
+    | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) -> List.collect (patRefBinders ctx) subs
     | PCons (h, tl) -> patRefBinders ctx h @ patRefBinders ctx tl
     // an or-pattern binds the SAME names in every alternative, and the binder
     // rides a register whichever alternative matched — collect from the first.
@@ -4656,7 +4656,7 @@ let rec private patGenBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
     match pat with
     | PVar (v, sch) -> pick v sch
     | PAs (p, v, sch) -> pick v sch @ patGenBinders ctx p
-    | PCtor (_, _, subs) | PTuple subs | PListLit subs -> List.collect (patGenBinders ctx) subs
+    | PCtor (_, _, subs) | PTuple subs | PListLit subs | PArrLit (_, subs) -> List.collect (patGenBinders ctx) subs
     | PCons (h, tl) -> patGenBinders ctx h @ patGenBinders ctx tl
     | POr (p :: _) -> patGenBinders ctx p   // same-binders-per-alternative, see patRefBinders
     | _ -> []
@@ -6152,7 +6152,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             // an enum case compares the RAW scrutinee value — never slotted
             // (a raw even int in a scanned root slot reads as a pointer)
             | PCtor (c, _, []) when (dictTryFind st.EnumConst c).IsSome -> false
-            | PCtor _ | PTuple _ | PCons _ | PListLit _ | PTypeTest _ -> true
+            | PCtor _ | PTuple _ | PCons _ | PListLit _ | PArrLit _ | PTypeTest _ -> true
             | PLit (LString _) | PLit LNull -> true
             | PAs (p, _, _) -> derefPat p
             | POr ps -> List.exists derefPat ps
@@ -6830,6 +6830,17 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     | PWild -> []
     | PVar (v, _) -> [ LSet (wReg (freshReg ctx (key v)), sc) ]
     | PAs (p, v, _) -> LSet (wReg (freshReg ctx (key v)), sc) :: lowPatTest ctx scrutReg fail p
+    // an INT64 literal pattern (`0L`, `9223372036854775807L`) tests a BOXED
+    // payload: compared as a word it tested the pointer against the truncated
+    // constant and matched nothing at all
+    | PLit (LInt s) when
+            strLen s > 1 && (let c = charAt s (strLen s - 1) in c = 'L' || c = 'l') ->
+        let digits =
+            let mutable cut = strLen s
+            while cut > 1 && (let c = charAt s (cut - 1) in c = 'L' || c = 'l' || c = 'u' || c = 'U') do
+                cut <- cut - 1
+            substr s 0 cut
+        [ LBreakIf (fail, LPrim (NeL, [ lowUnboxI sc; LConstL (parseI64Lit digits) ])) ]
     | PLit (LInt s) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (parseI32Lit s) ])) ]
     | PLit (LBool b) -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW (if b then 1 else 0) ])) ]
     | PLit LUnit -> []
@@ -6871,6 +6882,39 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
         LBreakIf (fail, LPrim (EqW, [ sc; LConstW 0 ]))
         :: (LSet (wReg th, LLoad (W, sc, HDR)) :: lowPatTest ctx th fail h)
         @ (LSet (wReg tt, LLoad (W, sc, HDR + 4)) :: lowPatTest ctx tt fail tl)
+    // `[| p; q |]`: an array of exactly that LENGTH whose elements match. The
+    // element kind (recorded by inference, carried like EIndex's) says how
+    // wide a slot is and how to read it — a packed float array holds raw f64s,
+    // a reference array holds words, a POD-record array holds inline structs.
+    | PArrLit (kind, ps) ->
+        let n = List.length ps
+        let lenOk = [ LBreakIf (fail, LPrim (EqW, [ sc; LConstW 0 ]))
+                      LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, HDR); LConstW n ])) ]
+        let ar = freshTmp ctx
+        let elemAt (i : int) : LStmt list =
+            let er = freshTmp ctx
+            let baseP = LGet (wReg ar)
+            let load =
+                match podArrOf st kind with
+                | Some (layout, stride) ->
+                    // an inline STRUCT element: rebuild it, the way an index
+                    // expression does, and match against the value
+                    let order = match dictTryFind st.RecFields kind with Some o -> o | None -> []
+                    let elemBase = LPrim (AddW, [ baseP; LConstW (stride * i) ])
+                    let items =
+                        order |> List.map (fun fnm ->
+                            let (off, fk) = optGet (dictTryFind layout fnm)
+                            let (sty, _) = optGet (storLTy fk)
+                            (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
+                    lowPodBuild ctx kind items
+                | None ->
+                    match storLTy kind with
+                    | Some (F64, w) -> lowBoxF ctx (LLoad (F64, baseP, ARRHDR + w * i))
+                    | Some (I64, w) -> lowBoxI ctx (LLoad (I64, baseP, ARRHDR + w * i))
+                    | Some (sty, w) -> LLoad (sty, baseP, ARRHDR + w * i)
+                    | None -> LLoad (W, baseP, ARRHDR + 4 * i)
+            LSet (wReg er, load) :: lowPatTest ctx er fail (List.item i ps)
+        (LSet (wReg ar, sc) :: lenOk) @ (List.collect elemAt [ 0 .. n - 1 ])
     | PListLit [] -> [ LBreakIf (fail, LPrim (NeW, [ sc; LConstW 0 ])) ]
     | PListLit (x :: rest) ->
         // an exact list literal [a; b; …] is a :: b :: … :: []

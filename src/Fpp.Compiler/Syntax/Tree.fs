@@ -72,6 +72,7 @@ type NodeKind =
     | AppPat
     | ParenPat
     | ListPat
+    | ArrayPat
     | AsPat
     | TypeTestPat
     /// `{ F1 = p1; F2 = p2 }` in pattern position

@@ -1346,7 +1346,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.filter (fun p ->
                 match p.NodeKind with
                 | IdentPat | WildcardPat | LiteralPat | TuplePat | StructTuplePat
-                | ConsPat | AppPat | ParenPat | ListPat | AsPat | TypeTestPat -> true
+                | ConsPat | AppPat | ParenPat | ListPat | ArrayPat | AsPat | TypeTestPat -> true
                 | _ -> false)
             |> List.map (fun p ->
                 // the match comes LAST: a `match` with an `else` after it
@@ -1377,7 +1377,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let isPatKind (k : NodeKind) =
         k = IdentPat || k = WildcardPat || k = LiteralPat || k = TuplePat || k = StructTuplePat
-        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = AsPat || k = TypeTestPat || k = RecordPat
+        || k = ConsPat || k = AppPat || k = ParenPat || k = ListPat || k = ArrayPat || k = AsPat || k = TypeTestPat || k = RecordPat
 
     let isTypeKind (k : NodeKind) =
         k = NamedType || k = VarType || k = AnonType || k = TupleType || k = StructTupleType
@@ -2777,6 +2777,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             for m in nodesOf n do
                 if isPatKind m.NodeKind then unify (patType pvars m) elem |> ignore
             tList elem
+        | ArrayPat ->
+            let elem = st.Fresh ()
+            for m in nodesOf n do
+                if isPatKind m.NodeKind then unify (patType pvars m) elem |> ignore
+            // the element KIND, keyed by the pattern's own offset: lowering
+            // reads it back to spell the element loads, the way an index
+            // expression does
+            (match tokensOf n |> List.tryHead with
+             | Some t -> vecAdd arrKindsRaw (t.Offset, TCon ("array", [ elem ]))
+             | None -> ())
+            TCon ("array", [ elem ])
         | RecordPat ->
             // `{ F1 = p1; F2 = p2 }`: resolve the record from the written
             // labels (a PATTERN may name a SUBSET of the fields), type each
@@ -5684,6 +5695,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> List.tryPick (fun c -> match c with GNode t when isTypeKind t.NodeKind -> Some (typeFromNode vars t) | _ -> None)
         let isDestructure =
             (vecToList before |> List.exists (fun c -> match c with GToken t -> t.Kind = Comma | _ -> false))
+            // `let (x, y) as whole = e` binds the parts AND the whole — a
+            // destructure however simple its inner pattern is (in step with
+            // Lower)
+            || (match pats with [ p ] -> p.NodeKind = AsPat | _ -> false)
             // `let (k, v) = e` — the parens hide the comma from the token
             // scan, and treating it as a SIMPLE binding bound only k
             || (match pats with
