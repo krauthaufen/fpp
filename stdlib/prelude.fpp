@@ -7109,12 +7109,27 @@ instance Show<Result<'a, 'e>> when Show<'a> when Show<'e>
         match r with
         | Ok v -> showAppend "Ok " (showPar (show v))
         | Error e -> showAppend "Error " (showPar (show e))
-/// the elements of a collection, each lined up under the column it starts at
+/// The elements of a collection, each lined up under the column it starts at
+/// — and WRAPPED at F#'s width: a rendering that would pass 80 columns
+/// continues on the next line, indented one column in from the opening
+/// bracket, with the `;` left at the end of the line before.
 let private showElems (opening : string) (closing : string) (parts : string list) : string =
     let mutable acc = opening
     let mutable first = true
     for p in parts do
-        if not first then acc <- acc + "; "
+        if not first then
+            // does the next element still fit? its FIRST line is what has to
+            let need = showLastLen acc + 2 + showLastLen (String.concat "" (List.truncate 1 (List.ofArray (p.Split '\n'))))
+            // the continuation lines up under the FIRST element, so the
+            // indent is the opening bracket's own width (`[` one, `[|` two)
+            if need > 80 then
+                let mutable pad = ""
+                let mutable q = 0
+                while q < opening.Length do
+                    pad <- pad + " "
+                    q <- q + 1
+                acc <- acc + ";\n" + pad
+            else acc <- acc + "; "
         first <- false
         acc <- showAppend acc p
     acc + closing

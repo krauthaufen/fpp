@@ -1761,9 +1761,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let unionsReg = dictNew<string, bool> ()
     let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
     /// the same shape for DERIVED Ordered instances: Lower builds the bodies
-    let ordDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
+    let ordDeriveRaw = vecNew<string * string * int * bool * Var list * (string * Type list) list> ()
     /// and for DERIVED Show instances
-    let showDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
+    let showDeriveRaw = vecNew<string * string * int * bool * Var list * (string * Type list) list> ()
     /// `%A` holes whose type has NO renderer: lowering keeps the walker there
     let showUnsolved = vecNew<int> ()
     /// every `%A` hole and the type it renders
@@ -1873,8 +1873,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     arbSynthNext <- arbSynthNext + 100000
                     let headArgs = ps2 |> List.map TVar
                     vecAdd ordDeriveRaw
-                        (tn, instName (TCon (tn, headArgs)), off, isUnion,
-                         ps2 |> List.map prunedId, entries)
+                        (tn, instName (TCon (tn, headArgs)), off, isUnion, ps2, entries)
                     let ctx =
                         entries
                         |> List.collect (fun (_, comps) -> comps)
@@ -1940,8 +1939,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     arbSynthNext <- arbSynthNext + 100000
                     let headArgs = ps2 |> List.map TVar
                     vecAdd showDeriveRaw
-                        (tn, instName (TCon (tn, headArgs)), off, isUnion,
-                         ps2 |> List.map prunedId, entries)
+                        (tn, instName (TCon (tn, headArgs)), off, isUnion, ps2, entries)
                     let ctx =
                         entries
                         |> List.collect (fun (_, comps) -> comps)
@@ -8188,13 +8186,19 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         |> List.filter (fun (_, k) -> k <> "")
       ShowDerive =
         vecToList showDeriveRaw
-        |> List.map (fun (key, rn, off, isU, pids, entries) ->
-            key, rn, off, isU, pids,
+        |> List.map (fun (key, rn, off, isU, pvars, entries) ->
+            // the ids are read HERE, with the same pruning the component
+            // names get — recorded earlier they named a var that had since
+            // linked, and the body's `#id` no longer matched the stamp
+            key, rn, off, isU, pvars |> List.map (fun (v : Var) -> prunedId v),
             entries |> List.map (fun (n2, comps) -> n2, comps |> List.map instConName))
       OrdDerive =
         vecToList ordDeriveRaw
-        |> List.map (fun (key, rn, off, isU, pids, entries) ->
-            key, rn, off, isU, pids,
+        |> List.map (fun (key, rn, off, isU, pvars, entries) ->
+            // the ids are read HERE, with the same pruning the component
+            // names get — recorded earlier they named a var that had since
+            // linked, and the body's `#id` no longer matched the stamp
+            key, rn, off, isU, pvars |> List.map (fun (v : Var) -> prunedId v),
             entries |> List.map (fun (n2, comps) -> n2, comps |> List.map instConName))
       ArbDerive =
         vecToList arbDeriveRaw

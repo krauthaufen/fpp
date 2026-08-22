@@ -6,9 +6,9 @@
 // The output is compared to the oracle byte for byte, so every line below is
 // also a check on the LAYOUT, not just the content.
 //
-// DROPPED: a collection long enough to wrap. F# breaks a rendering that
-// passes ~80 columns onto the next line; this renderer does not
-// (DIVERGENCES.md).
+// A collection long enough to WRAP is here too: F# breaks a rendering that
+// would pass 80 columns and lines the continuation up under the first
+// element, which is the last thing this renderer learned.
 module Core_showa
 
 let mutable ntests = 0
@@ -70,6 +70,15 @@ printfn "union-two %A" (Rect (2, 3))
 printfn "union-record %A" (Nested { X = 1; Y = 2 })
 printfn "union-list %A" [ Dot; Circle 2.0 ]
 printfn "union-option %A" (Some Dot)
+
+// the wrap: 22 one- and two-digit elements fill a line exactly, the 23rd
+// starts the next one, and an array's continuation aligns under its `[|`
+printfn "wrap-none %A" [ 1 .. 22 ]
+printfn "wrap-two %A" [ 1 .. 24 ]
+printfn "wrap-more %A" [ 1 .. 60 ]
+printfn "wrap-array %A" [| 1 .. 30 |]
+printfn "wrap-strings %A" [ "aaaaaaaaaa"; "bbbbbbbbbb"; "cccccccccc"; "dddddddddd"; "eeeeeeeeee"; "ffffffffff" ]
+printfn "wrap-nested %A" [ [ 1 .. 12 ]; [ 13 .. 24 ] ]
 
 test "placeholder" true
 printfn "DONE tests=%d failures=%d" ntests failures

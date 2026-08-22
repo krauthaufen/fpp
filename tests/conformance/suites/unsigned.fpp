@@ -42,10 +42,13 @@ test "u64-compare-rev" (compare small64 big64 < 0)
 
 test "u32-in-tuple" (compare (1, big32) (1, small32) > 0)
 test "u32-in-list" (compare [ big32 ] [ small32 ] > 0)
-// NOT here: `compare (Some big32) (Some small32)`. An unsigned payload of the
-// PRELUDE's own option compares SIGNED — the derived comparer's payload step
-// loses the element type when it stamps, and falls back to the runtime walker
-// (DIVERGENCES.md). A user union with the same shape is right.
+// an unsigned payload of a GENERIC union — the prelude's own option, and a
+// user union of the same shape — compares unsigned too: the derived
+// comparer types its payload binders, so the stamped copy knows the element
+test "u32-in-option" (compare (Some big32) (Some small32) > 0)
+test "u32-in-option-rev" (compare (Some small32) (Some big32) < 0)
+test "u32-in-result" (compare (Ok big32 : Result<uint32, string>) (Ok small32) > 0)
+test "u64-in-option" (compare (Some big64) (Some small64) > 0)
 test "u64-in-tuple" (compare (1, big64) (1, small64) > 0)
 
 // ---- through a generic function's constraint -----------------------------

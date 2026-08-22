@@ -326,20 +326,6 @@ Both backends implement it: the C runtime carries the same flag (`fpp_unord`),
 and the float instance's own `compare` is a primitive rather than a fold over
 `<`/`>`, so a NaN reached through a list's element instance raises it too.
 
-## An unsigned payload of `option`/`Result` compares SIGNED
-
-Every other route to an unsigned comparison is right — the operators, a
-`compare` call, an unsigned value inside a tuple, a list, a record, a USER
-union, a sorted collection, a Map or Set key, and a generic function's
-constraint (the value witness carries the comparison kind). The one that is
-not is a `uint32`/`uint64` payload of the PRELUDE's `option`, `voption` or
-`Result`: their derived comparer loses the element type when it stamps and
-falls back to the runtime walker, which reads a raw word as signed.
-
-`compare (Some 4000000000u) (Some 2u)` therefore answers -1 where F# says 1.
-Wrapping the value in a user-declared union of the same shape, or comparing
-the payloads directly, both answer correctly.
-
 ## `%A` does not WRAP a long rendering
 
 `%A` renders like F#: a string quoted, a char in ticks, an int64 with its `L`,
@@ -348,9 +334,9 @@ list with semicolons, a union case with its payload, and a record one field
 per LINE with each continuation lined up under the column it starts at —
 including nested records inside tuples, lists, arrays and options.
 
-What it does not do is F#'s 80-column WRAP: `printfn "%A" [ 1 .. 30 ]` prints
-one long line where F# breaks it across two. Content is identical; only the
-line breaking of an over-long collection differs.
+It also WRAPS the way F# does: a rendering that would pass 80 columns
+continues on the next line, lined up under the first element (one column in
+for a list, two for an array).
 
 A type with no renderer of its own — a class, `obj` — prints `?` rather than
 failing to compile: `%A` demands `Show`, but an unsatisfied demand falls back

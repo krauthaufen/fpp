@@ -4902,6 +4902,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let av = { Path = path; Offset = off + 3; Name = "_oa" }
         let bv = { Path = path; Offset = off + 4; Name = "_ob" }
         let anon = mono (TCon ("?", []))
+        // a payload binder is TYPED by its component: in the stamped copy the
+        // type is concrete, so the comparison lowers by SHAPE (a uint32
+        // payload unsigned) instead of falling to the word walker
+        let compScheme (nm : string) : Scheme =
+            if nm = "" then anon
+            elif nm.StartsWith "#" then
+                let idTxt = nm.Substring 1
+                let mutable id = 0
+                let mutable ok = idTxt.Length > 0
+                for ch in idTxt do
+                    if ch >= '0' && ch <= '9' then id <- id * 10 + (int ch - int '0') else ok <- false
+                if ok then mono (TVar ({ Id = id; Level = 1; Link = None; Rigid = false } : Fpp.Analysis.Types.Var))
+                else anon
+            elif nm.Contains "$<" then mono (TCon (nm.Substring (0, nm.IndexOf "$<"), []))
+            else mono (TCon (nm, []))
         let ish = mono (TCon ("int", []))
         // a component of KNOWN scalar type compares with the typed operators
         // (which carry signedness) rather than through the class reference —
@@ -4952,8 +4967,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 let payloadPat (side : string) (i : int) (j : int) (cn : string) (comps : string list) : Pat =
                     match List.length comps with
                     | 0 -> PCtor (cn, anon, [])
-                    | 1 -> PCtor (cn, anon, [ PVar (binder side i j 0, anon) ])
-                    | n -> PCtor (cn, anon, [ PTuple (List.init n (fun k -> PVar (binder side i j k, anon))) ])
+                    | 1 -> PCtor (cn, anon, [ PVar (binder side i j 0, compScheme (List.head comps)) ])
+                    | n ->
+                        PCtor (cn, anon,
+                               [ PTuple (List.init n (fun k ->
+                                    PVar (binder side i j k, compScheme (List.item k comps)))) ])
                 let caseClause (i : int) (cn : string, comps : string list) : Pat * Expr option * Expr =
                     let pa = payloadPat "a" i 0 cn comps
                     let inner =
@@ -4972,7 +4990,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                             match cs with
                                             | [] -> ELit (LInt "0")
                                             | c :: rest ->
-                                                let one = cmpOf c (EVar (binder "a" i 0 k, anon)) (EVar (binder "b" i j k, anon))
+                                                let one = cmpOf c (EVar (binder "a" i 0 k, compScheme c)) (EVar (binder "b" i j k, compScheme c))
                                                 match rest with
                                                 | [] -> one
                                                 | _ ->
