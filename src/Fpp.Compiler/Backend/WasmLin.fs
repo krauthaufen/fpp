@@ -2779,6 +2779,10 @@ let private emitCmpv (m : Mod) : unit =
     lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ins f "i32.eqz"
     ins f "i32.and"
     ifE f
+    // unordered: answer the total order, but raise $unord so an ORDERING
+    // operator over the structure that contains this float answers false
+    // (F#'s operators are a PER, `compare` is total)
+    ic f 1; gs f "$unord"
     lg f "$fa"; lg f "$fa"; ins f "f64.ne"
     ifE f
     lg f "$fb"; lg f "$fb"; ins f "f64.ne"
@@ -4363,7 +4367,14 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
                // 0 and NOT equal => unordered => at least one is NaN
                LIf (LPrim (AndW, [ LPrim (EqW, [ LGet (wReg r); LConstW 0 ])
                                    LPrim (EqW, [ LPrim (EqF, [ ga; gb ]); LConstW 0 ]) ]),
-                    [ LIf (LPrim (NeF, [ ga; ga ]),
+                    [ // F#'s ORDERING OPERATORS are a partial order (PER): a
+                      // NaN anywhere inside makes <, >, <= and >= all false,
+                      // while `compare` stays TOTAL. The walk cannot answer
+                      // both at once, so it answers the total order and
+                      // records that it met an unordered pair; only the four
+                      // operators read the flag.
+                      LSetGlobal ("$unord", LConstW 1)
+                      LIf (LPrim (NeF, [ ga; ga ]),
                            [ LIf (LPrim (NeF, [ gb; gb ]),
                                   [ LSet (wReg r, LConstW 0) ],
                                   [ LSet (wReg r, LConstW (0 - 1)) ]) ],
@@ -4974,6 +4985,27 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                       [ LSet (wReg r, LGet (wReg ra)) ],
                       [ LSet (wReg r, LGet (wReg rb)) ]) ],
              LGet (wReg r))
+    // the STRUCTURAL comparator by name: Link synthesises a compound type's
+    // builtin `compare` as this rather than out of `<` and `>`, which are a
+    // partial order (see $unord) and would answer 0 for a NaN inside
+    | EApp (EUnknown "compare", [ a; b ]) ->
+        LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ])
+    // `x < y` on an Ordered-constrained value: Link marks the four ordering
+    // operators, which are a PARTIAL order — the comparison walk answers the
+    // total order and raises $unord when it met a NaN, and then all four
+    // answer false. `compare` itself is unmarked and stays total.
+    | EApp (EUnknown n, [ inner ]) when n.StartsWith "$per:" ->
+        let boolOp =
+            match n.Substring (strLen "$per:") with
+            | "<" -> LtSW
+            | ">" -> GtSW
+            | "<=" -> LeSW
+            | _ -> GeSW
+        let c = freshTmp ctx
+        LDo ([ LSetGlobal ("$unord", LConstW 0)
+               LSet (wReg c, coreToLowE ctx inner) ],
+             LPrim (AndW, [ LPrim (EqW, [ LGetGlobal "$unord"; LConstW 0 ])
+                            LPrim (boolOp, [ LGet (wReg c); LConstW 0 ]) ]))
     | EApp (EUnknown n, [ a; b ]) when n.StartsWith "$class:Ordered:compare:" ->
         let sh = shapeOfName (n.Substring (strLen "$class:Ordered:compare:"))
         let ra, rb, pre = evalRooted ctx a b
@@ -5039,8 +5071,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                  (if cb = "=" then LGet (wReg cr) else LPrim (EqW, [ LGet (wReg cr); LConstW 0 ])))
         else
         let boolOp = match cb with "<" -> LtSW | ">" -> GtSW | "<=" -> LeSW | _ -> GeSW
-        LDo (pre @ [ LSet (wReg cr, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)) ],
-             (LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ])))
+        // PER: the comparison walk answers the TOTAL order and raises $unord
+        // when it met a NaN, and an ordering operator over a structured value
+        // answers false in that case — `(1, nan) <= (1, 0.0)` is false in F#
+        // while `compare (1, nan) (1, 0.0)` is -1.
+        LDo (pre
+             @ [ LSetGlobal ("$unord", LConstW 0)
+                 LSet (wReg cr, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b)) ],
+             LPrim (AndW, [ LPrim (EqW, [ LGetGlobal "$unord"; LConstW 0 ])
+                            LPrim (boolOp, [ LGet (wReg cr); LConstW 0 ]) ]))
     | EPrim (op, [ a; b ]) ->
         // int is RAW i32: plain wasm arithmetic, no tag juggling. A comparison
         // yields a raw 0/1 bool, which is also the raw representation.
@@ -8533,6 +8572,36 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         st.RootNext <- st.RootNext + 1
         gcCmpTblSlot <- st.CmpTblSlot
     rtDeclsLin m
+    // An inline (POD) record whose layout holds a field the WORD walk cannot
+    // describe gets its own Equals/GetHashCode/CompareTo. $cmpv/$eqv/$hashv
+    // read an object as a vector of words plus a ref bitmask, which says
+    // nothing about an inline f64, i64 or packed byte: a record's float field
+    // was ordered by its raw BIT PATTERN, so `{ a = -1.0 }` compared BELOW
+    // `{ a = -2.0 }`, NaN inside a record compared equal to a number, and two
+    // sub-word fields sharing a word were weighed in the wrong order. The
+    // walkers already dispatch to the identity trio, so the fix is to give
+    // these records one.
+    let trioNeeded (fs : (string * string) list) : bool =
+        fs |> List.exists (fun (_, ty) ->
+            match storLTy ty with
+            | Some (F64, _) | Some (I64, _) | Some (I16, _) | Some (I8, _) -> true
+            | Some _ -> ty = "float32" || ty = "single" || ty = "uint32" || ty = "unativeint"
+            | None -> false)
+    let podTrio =
+        decls0
+        |> List.choose (fun d ->
+            match d with
+            | DRecord (n, _, fs, _) when trioNeeded fs ->
+                (match dictTryFind st.RecPod n, dictTryFind st.ClassId n with
+                 | Some (layout, _, _), Some cid -> Some (cid, fs, layout)
+                 | _ -> None)
+            | _ -> None)
+    if gc then
+        tyFunc m "$lfn2" [ "i32"; "i32" ] [ "i32" ]
+        for cid, _, _ in podTrio do
+            declFn m ("$rcmp" + string cid) "$lfn2"
+            declFn m ("$reqv" + string cid) "$lfn2"
+            declFn m ("$rhash" + string cid) "$lfn2"
     for d in decls do
         match d with
         | DLet (_, v, _, ELam (ps, _)) when (dictTryFind st.Funcs (key v)).IsSome ->
@@ -8622,6 +8691,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     if System.Environment.GetEnvironmentVariable "FPP_VTDBG" = "1" then
                         eprintfn "IDENT %s.%s absent" owner mn)
         | _ -> ()
+    // the synthetic trio first, so a record that DECLARES its own Equals or
+    // CompareTo still wins the slot below
+    if gc && st.NSlots > 0 then
+        for cid, _, _ in podTrio do
+            vtRows.[cid * st.NSlots + 0] <- tblIdx m ("$reqv" + string cid)
+            vtRows.[cid * st.NSlots + 1] <- tblIdx m ("$rhash" + string cid)
+            vtRows.[cid * st.NSlots + 2] <- tblIdx m ("$rcmp" + string cid)
     for d in decls0 do
         match d with
         | DMembers (n, own) -> fillIdentity n own
@@ -8669,6 +8745,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         emitByte st.ConstData ((w >>> 16) &&& 0xFF); emitByte st.ConstData ((w >>> 24) &&& 0xFF)
     st.ConstNext <- st.ConstNext + 4 * (nCid * st.NSlots)
     globalI32Mut m "$hp" st.ConstNext
+    // raised by a comparison walk that met an unordered (NaN) float pair; read
+    // by the ordering operators, which are a PARTIAL order over structures
+    globalI32Mut m "$unord" 0
     // GC: base of the shim's root table, and of the fpprt-allocated scratch
     // buffer (I/O iovec + UTF-8 staging + float formatting); filled at startup
     if gc then globalI32Mut m "$roots" 0
@@ -8723,6 +8802,131 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitClsHash m
     emitShowv m
     emitStrv m
+    // the per-record identity trio declared beside rtDeclsLin, in the SAME
+    // order: the function and code sections are positional
+    if gc then
+        for cid, fs, layout in podTrio do
+            let fields =
+                fs |> List.map (fun (fnm, ty) ->
+                    (match dictTryFind layout fnm with Some (off, _) -> off | None -> HDR), ty)
+            // the load instruction and signedness a field's storage wants
+            let loadOf (ty : string) : string =
+                match storLTy ty with
+                | Some (F64, _) -> "f64.load"
+                | Some (I64, _) -> "i64.load"
+                | Some (I16, _) -> if ty = "uint16" then "i32.load16_u" else "i32.load16_s"
+                | Some (I8, _) -> if ty = "byte" then "i32.load8_u" else "i32.load8_s"
+                | _ -> if ty = "float32" || ty = "single" then "f32.load" else "i32.load"
+            let unsignedTy (ty : string) = ty = "uint32" || ty = "unativeint" || ty = "uint64" || ty = "uint16" || ty = "byte"
+            let isFloatTy (ty : string) = ty = "float" || ty = "double" || ty = "float32" || ty = "single"
+            let isWideTy (ty : string) = match storLTy ty with Some (I64, _) -> true | _ -> false
+            let isRefTy (ty : string) = (storLTy ty).IsNone
+            // both operands of one field into the typed locals it needs
+            let loadPair (f : Fn) (off : int) (ty : string) =
+                let ld = loadOf ty
+                let put (side : string) (dst : string) =
+                    lg f side; ic f off; ins f "i32.add"; mem f ld
+                    if ty = "float32" || ty = "single" then ins f "f64.promote_f32"
+                    ls f dst
+                if isFloatTy ty then (put "$a" "$fa"; put "$b" "$fb")
+                elif isWideTy ty then (put "$a" "$la"; put "$b" "$lb")
+                else (put "$a" "$x"; put "$b" "$y")
+            // -1/0/1 into $r, the TOTAL order (NaN equal to itself and below
+            // every number) with $unord raised for an unordered pair
+            let cmpField (f : Fn) (off : int) (ty : string) =
+                if isRefTy ty then
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f "i32.load"
+                     lg f "$b"; ic f off; ins f "i32.add"; mem f "i32.load"
+                     callf f "$cmpv"; ls f "$r")
+                else
+                    loadPair f off ty
+                    if isFloatTy ty then
+                        lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ls f "$r"
+                        lg f "$r"; ins f "i32.eqz"
+                        lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ins f "i32.eqz"
+                        ins f "i32.and"
+                        ifE f
+                        ic f 1; gs f "$unord"
+                        lg f "$fa"; lg f "$fa"; ins f "f64.ne"
+                        ifE f
+                        lg f "$fb"; lg f "$fb"; ins f "f64.ne"
+                        ifE f; ic f 0; ls f "$r"; elseB f; ic f (0 - 1); ls f "$r"; endB f
+                        elseB f
+                        ic f 1; ls f "$r"
+                        endB f
+                        endB f
+                    elif isWideTy ty then
+                        let gt = if unsignedTy ty then "i64.gt_u" else "i64.gt_s"
+                        let lt = if unsignedTy ty then "i64.lt_u" else "i64.lt_s"
+                        lg f "$la"; lg f "$lb"; ins f gt; lg f "$la"; lg f "$lb"; ins f lt; ins f "i32.sub"; ls f "$r"
+                    else
+                        let gt = if unsignedTy ty then "i32.gt_u" else "i32.gt_s"
+                        let lt = if unsignedTy ty then "i32.lt_u" else "i32.lt_s"
+                        lg f "$x"; lg f "$y"; ins f gt; lg f "$x"; lg f "$y"; ins f lt; ins f "i32.sub"; ls f "$r"
+            // 1/0 into $r — IEEE on floats, which is where equality and the
+            // ordering above part ways
+            let eqField (f : Fn) (off : int) (ty : string) =
+                if isRefTy ty then
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f "i32.load"
+                     lg f "$b"; ic f off; ins f "i32.add"; mem f "i32.load"
+                     callf f "$eqv"; ls f "$r")
+                else
+                    loadPair f off ty
+                    if isFloatTy ty then (lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ls f "$r")
+                    elif isWideTy ty then (lg f "$la"; lg f "$lb"; ins f "i64.eq"; ls f "$r")
+                    else (lg f "$x"; lg f "$y"; ins f "i32.eq"; ls f "$r")
+            // one field's hash into $r. +0.0 and -0.0 are EQUAL, so a zero
+            // hashes as 0 rather than by its sign bit.
+            let hashField (f : Fn) (off : int) (ty : string) =
+                if isRefTy ty then
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f "i32.load"; callf f "$hashv"; ls f "$r")
+                elif isFloatTy ty then
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f (loadOf ty)
+                     (if ty = "float32" || ty = "single" then ins f "f64.promote_f32")
+                     ls f "$fa"
+                     lg f "$fa"; ic f 0; ins f "f64.convert_i32_s"; ins f "f64.eq"
+                     ifE f
+                     ic f 0; ls f "$r"
+                     elseB f
+                     lg f "$fa"; ins f "i64.reinterpret_f64"; ls f "$la"
+                     lg f "$la"; ins f "i32.wrap_i64"; lg f "$la"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ls f "$r"
+                     endB f)
+                elif isWideTy ty then
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f "i64.load"; ls f "$la"
+                     lg f "$la"; ins f "i32.wrap_i64"; lg f "$la"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ls f "$r")
+                else
+                    (lg f "$a"; ic f off; ins f "i32.add"; mem f (loadOf ty); ls f "$r")
+            let locals (f : Fn) =
+                local f "$r" "i32"; local f "$x" "i32"; local f "$y" "i32"; local f "$h" "i32"
+                local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
+                localsDone f
+            // CompareTo: the first field that differs decides, in DECLARATION
+            // order (which is the layout order)
+            let fc = beginFn m [ "$a"; "$b" ]
+            locals fc
+            for off, ty in fields do
+                cmpField fc off ty
+                lg fc "$r"; ifE fc; lg fc "$r"; ins fc "return"; endB fc
+            ic fc 0
+            endFn fc
+            // Equals
+            let fe = beginFn m [ "$a"; "$b" ]
+            locals fe
+            for off, ty in fields do
+                eqField fe off ty
+                lg fe "$r"; ins fe "i32.eqz"; ifE fe; ic fe 0; ins fe "return"; endB fe
+            ic fe 1
+            endFn fe
+            // GetHashCode — rides the two-parameter indirect signature the
+            // trio shares, and ignores the second word
+            let fh = beginFn m [ "$a"; "$b" ]
+            locals fh
+            ic fh 0; ls fh "$h"
+            for off, ty in fields do
+                hashField fh off ty
+                lg fh "$h"; ic fh 31; ins fh "i32.mul"; lg fh "$r"; ins fh "i32.add"; ls fh "$h"
+            lg fh "$h"
+            endFn fh
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

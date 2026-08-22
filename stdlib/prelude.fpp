@@ -336,10 +336,22 @@ instance MinMax<sbyte>
     static max a b = if a > b then a else b
 instance Ordered<string>
 instance Ordered<char>
+// F# orders bools, false below true — `compare false true` is -1, and a bool
+// field inside a record is compared like any other
+instance Ordered<bool>
+instance MinMax<bool>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
 instance MinMax<string>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
 instance MinMax<char>
+    static min a b = if a < b then a else b
+    static max a b = if a > b then a else b
+// `max`/`min` are defined for EVERY ordered type in F#, records and unions
+// included — the primitive instances above stay because they are more
+// specific (float's propagates NaN, which this one cannot).
+instance MinMax<'a> when Ordered<'a>
     static min a b = if a < b then a else b
     static max a b = if a > b then a else b
 // exact: doubling and halving a float are exact until it goes subnormal,

@@ -2390,6 +2390,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                              + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
                      d
                  | None -> trap ("typetest " + tn))
+    // the PER marker Link puts on the four ordering operators: the C leg
+    // compares the walk's answer to 0 the way it always has (its comparator is
+    // the total order throughout — wasm-linear is the exactness target)
+    | EApp (EUnknown n, [ inner ]) when n.StartsWith "$per:" ->
+        emitE st f (EPrim (n.Substring (strLen "$per:"), [ inner; ELit (LInt "0") ]))
     | EUnknown n when n.StartsWith "$class:Ordered:compare:" ->
         // a still-symbolic Ordered dictionary member: uniform values answer
         // it STRUCTURALLY, which is what the wasm backend's $cmpv does

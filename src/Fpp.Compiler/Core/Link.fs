@@ -775,8 +775,16 @@ let monomorphizeWith (stampScalars : bool) (isStructName : string -> bool) (inst
                                   else ref0
                               let call = EApp (ref1, callArgs)
                               // ordering has one operation; the predicates
-                              // test its result
-                              if cls = "Ordered" then EPrim (baseOp, [ call; ELit (LInt "0") ]) else call
+                              // test its result. The FOUR ordering operators
+                              // are a PARTIAL order in F# — a NaN met anywhere
+                              // in the walk makes all four false while
+                              // `compare` stays total — so they are marked for
+                              // the backend rather than compared to 0 here.
+                              if cls = "Ordered" then
+                                  match baseOp with
+                                  | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + baseOp), [ call ])
+                                  | _ -> EPrim (baseOp, [ call; ELit (LInt "0") ])
+                              else call
                           // resolving to the function BEING rewritten turns
                           // its own body into a call to itself. That is
                           // exactly the shape of the generated `compare`,
@@ -1733,6 +1741,12 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
                         let args = ps |> List.map (fun (pv, psch) -> EVar (pv, psch))
                         let opnd = typeConName (List.head operands)
                         let prim (name : string) = EPrim (withOpType (name + "@") opnd, args)
+                        // the types whose ordering PREDICATES are total, so a
+                        // three-way compare folds out of them
+                        let isPrimOpnd (o : string) =
+                            List.contains o [ "int"; "int32"; "uint32"; "nativeint"; "unativeint"
+                                              "int64"; "uint64"; "int16"; "uint16"; "byte"; "sbyte"
+                                              "bool"; "char"; "string" ]
                         let body =
                             match Classes.memberOperator m with
                             | Some op -> Some (prim (Classes.primOperator op))
@@ -1740,11 +1754,37 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
                             // predicates — the one place the ordering
                             // predicates are more primitive than `compare`
                             | None when m = "compare" ->
-                                Some (EIf (EPrim (withOpType "<@" opnd, args),
-                                           ELit (LInt "-1"),
-                                           EIf (EPrim (withOpType ">@" opnd, args),
-                                                ELit (LInt "1"),
-                                                ELit (LInt "0"))))
+                                let lt = EPrim (withOpType "<@" opnd, args)
+                                let gt = EPrim (withOpType ">@" opnd, args)
+                                if opnd = "float" || opnd = "float32" || opnd = "float16" then
+                                    // a FLOAT's comparison is a TOTAL order —
+                                    // NaN equal to itself and below every
+                                    // number — while its <, > and = are IEEE
+                                    // and all answer false for a NaN. Falling
+                                    // through to 0 called NaN EQUAL to every
+                                    // number wherever this generated body is
+                                    // the witness (`compare (Some nan) (Some
+                                    // 0.0)`), even though the shaped compare
+                                    // and the runtime walker both order it.
+                                    let self (k : int) =
+                                        let x = List.item k args
+                                        EPrim (withOpType "<>@" opnd, [ x; x ])
+                                    Some (EIf (lt, ELit (LInt "-1"),
+                                           EIf (gt, ELit (LInt "1"),
+                                            EIf (EPrim (withOpType "=@" opnd, args), ELit (LInt "0"),
+                                             EIf (self 0,
+                                                  EIf (self 1, ELit (LInt "0"), ELit (LInt "-1")),
+                                                  ELit (LInt "1"))))))
+                                elif isPrimOpnd opnd then
+                                    Some (EIf (lt, ELit (LInt "-1"), EIf (gt, ELit (LInt "1"), ELit (LInt "0"))))
+                                else
+                                    // a COMPOUND (an option, a record, a
+                                    // union): its `<` and `>` are the partial
+                                    // order, so a compare folded out of them
+                                    // answers 0 for values that merely contain
+                                    // a NaN. The structural comparator IS the
+                                    // total order — take it directly.
+                                    Some (EApp (EUnknown "compare", args))
                             // unary machine instructions
                             | None when m = "sqrt" || m = "abs" || m = "truncate" -> Some (prim m)
                             | None -> None
