@@ -1197,6 +1197,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f ("{ double D_; int64_t B_; D_ = fpp_unbox_f64(" + sref x
                 + "); memcpy(&B_, &D_, 8); " + sref d + " = fpp_box_i64(B_); }")
         d
+    | EApp (EUnknown "bitsDouble", [ a ]) ->
+        let x = emitE st f a
+        let d = slot f
+        stmt f ("{ double D_; int64_t B_; B_ = fpp_unbox_i64(" + sref x
+                + "); memcpy(&D_, &B_, 8); " + sref d + " = fpp_box_f64(D_); }")
+        d
     | EApp (EUnknown "singleBits", [ a ]) ->
         let x = emitE st f a
         let d = slot f
@@ -3248,7 +3254,7 @@ let emitC (decls : Decl list) : string * string list =
             // the result travel on the raw ABI. Names Lower claims as
             // builtins never call through here.
             let builtinNames =
-                [ "box"; "unbox"; "float16Bits"; "doubleBits"; "singleBits"
+                [ "box"; "unbox"; "float16Bits"; "doubleBits"; "bitsDouble"; "singleBits"
                   "stackDepth"; "stackFrame"
                   // cleanup intrinsics: lowered in emitE, never raw C externs
                   "gcOnCleanup"; "gcCollect" ]

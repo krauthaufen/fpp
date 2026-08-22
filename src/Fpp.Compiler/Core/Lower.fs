@@ -1233,7 +1233,23 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      // no entry means the source is int, which is the kind
                      // OpKinds leaves out
                      let k = match dictTryFind opKinds t.Offset with Some x -> x | None -> ""
-                     EApp (EUnknown (t.Text + "#" + k), [ lowerExpr (GNode a) ])
+                     let arg = lowerExpr (GNode a)
+                     // float <-> string go through the PRELUDE's exact
+                     // conversion: the backends' own were a digit-at-a-time
+                     // scale (several ulps out at the extremes) and a
+                     // 15-digit printer that spelled 1e300 and 1e-7
+                     // differently from .NET
+                     let viaPrelude (nm : string) =
+                         match dictTryFind memberIndex nm with
+                         | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), [ arg ]))
+                         | None -> None
+                     let routed =
+                         if t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
+                         elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
+                         else None
+                     (match routed with
+                      | Some e -> e
+                      | None -> EApp (EUnknown (t.Text + "#" + k), [ arg ]))
                  | _ -> note (offsetOf n) "conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with

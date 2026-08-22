@@ -83,6 +83,7 @@ let halfBits (v : float) : int =
 /// IEEE bits of a double/single — what the BINARY writer emits for a float
 /// constant (self-hosted this is i64.reinterpret_f64 / i32.reinterpret_f32)
 let doubleBits (v : float) : int64 = System.BitConverter.DoubleToInt64Bits v
+let bitsDouble (b : int64) : float = System.BitConverter.Int64BitsToDouble b
 let singleBits (v : float32) : int = System.BitConverter.SingleToInt32Bits v
 /// a warning to stderr — self-hosted this is a no-op (stdout carries the
 /// compiledrive protocol and must stay clean)

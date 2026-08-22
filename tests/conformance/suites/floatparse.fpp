@@ -9,14 +9,10 @@
 // These pin the DENORMAL boundary: 1E-323 is two ticks above zero, 1E-324
 // rounds to zero, and the sign has to survive that rounding.
 //
-// DROPPED: FloatParse.2 ("-1E-127") and a "1E308" round-trip. $atof applies
-// the exponent by stepping the value ten at a time, so a LARGE |exponent|
-// rounds once per step and lands 3-4 ulps off what .NET's correctly-rounded
-// parser gives. Everything with a modest exponent — including the denormal
-// boundary above, which ends in few significant bits — agrees exactly.
-// Closing this needs a correctly-rounded algorithm (Eisel-Lemire and a
-// big-integer fallback), not a tweak: squaring the power was tried and moved
-// the error around without removing it.
+// The extreme exponents are here too: parsing is a DECIMAL SHIFT (the
+// prelude's FloatFmt, one bit at a time), which is exact, so the answer is
+// the correctly-rounded double whatever the exponent — the old digit-at-a-
+// time scaling landed 3-4 ulps out.
 module Core_floatparse
 
 let mutable ntests = 0
@@ -31,6 +27,14 @@ let ofString (s : string) : float = float s
 let toBits (x : float) : int64 = System.BitConverter.DoubleToInt64Bits x
 
 test "FloatParse.1" (toBits (ofString "0.0") = 0L)
+// the cases the digit-at-a-time scaling could not round: a large NEGATIVE
+// exponent, the largest finite double, and a 17-significant-digit mantissa
+test "FloatParse.2" (toBits (ofString "-1E-127") = toBits (0.0 - 1E-127))
+test "FloatParse.C" (toBits (ofString "1E308") = toBits 1E308)
+test "FloatParse.D" (toBits (ofString "1.2345678901234567E17") = toBits 1.2345678901234567E17)
+test "FloatParse.E" (toBits (ofString "2.2250738585072011E-308") = toBits 2.2250738585072011E-308)
+test "FloatParse.F" (toBits (ofString "1E22") = toBits 1E22)
+test "FloatParse.G" (toBits (ofString "1E23") = toBits 1E23)
 test "FloatParse.0" (toBits (ofString "-0.0") = -9223372036854775808L)
 test "FloatParse.3" (toBits (ofString "-1E-323") = -9223372036854775806L)
 test "FloatParse.4" (toBits (ofString "-1E-324") = -9223372036854775808L)

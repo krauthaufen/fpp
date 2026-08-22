@@ -962,11 +962,11 @@ let pown (x : float) (n : int) : float =
         k <- k / 2
     acc
 
-/// System.BitConverter's bit-level views, as F# spells them. The reverse
-/// directions need a bits->float extern the backends do not carry yet.
+/// System.BitConverter's bit-level views, as F# spells them.
 module BitConverter =
     let DoubleToInt64Bits (x : float) : int64 = doubleBits x
     let SingleToInt32Bits (x : float32) : int = singleBits x
+    let Int64BitsToDouble (x : int64) : float = bitsDouble x
 
 /// System.Double's statics, as F# spells them
 module Double =
@@ -6608,3 +6608,369 @@ type GC =
         ignore blocking
         ignore compacting
         gcCollect ()
+
+/// Exact decimal <-> binary conversion, the machinery BOTH directions need.
+/// A decimal buffer shifted one bit at a time is enough: no bignum, and every
+/// step is exact, so parsing rounds correctly and printing can find the
+/// SHORTEST digit string that reads back as the same double.
+///
+/// The digits are `d[0..nd-1]`, most significant first, and the value is
+/// `0.d[0]d[1]... * 10^dp` — Go's strconv carries the same shape.
+type Dec =
+    { mutable dig : int[]
+      mutable nd : int
+      mutable dp : int
+      mutable neg : bool }
+
+type FloatFmt =
+    static member New () : Dec = { dig = Array.zeroCreate 1100; nd = 0; dp = 0; neg = false }
+
+    /// drop trailing zeros — they carry no information and make the shortest
+    /// search stop earlier
+    static member Trim (a : Dec) : unit =
+        while a.nd > 0 && a.dig.[a.nd - 1] = 0 do a.nd <- a.nd - 1
+        if a.nd = 0 then a.dp <- 0
+
+    /// v <- v * 2, exactly
+    static member MulTwo (a : Dec) : unit =
+        let mutable carry = 0
+        let mutable i = a.nd - 1
+        while i >= 0 do
+            let x = a.dig.[i] * 2 + carry
+            a.dig.[i] <- x % 10
+            carry <- x / 10
+            i <- i - 1
+        if carry > 0 then
+            // one more digit in FRONT: shift right and raise the point
+            let mutable j = a.nd
+            while j > 0 do
+                if j < a.dig.Length then a.dig.[j] <- a.dig.[j - 1]
+                j <- j - 1
+            a.dig.[0] <- carry
+            if a.nd < a.dig.Length then a.nd <- a.nd + 1
+            a.dp <- a.dp + 1
+        FloatFmt.Trim a
+
+    /// v <- v / 2, exactly (the buffer grows by at most one digit per step)
+    static member DivTwo (a : Dec) : unit =
+        let mutable rem = 0
+        let mutable i = 0
+        let mutable out = 0
+        let res = Array.zeroCreate a.dig.Length
+        // a leading digit smaller than 2 borrows, which moves the point
+        let mutable dp = a.dp
+        while i < a.nd do
+            let x = rem * 10 + a.dig.[i]
+            let q = x / 2
+            rem <- x % 2
+            if out = 0 && q = 0 then dp <- dp - 1      // skip a leading zero
+            else
+                if out < res.Length then res.[out] <- q
+                out <- out + 1
+            i <- i + 1
+        while rem > 0 && out < res.Length do
+            let x = rem * 10
+            let q = x / 2
+            rem <- x % 2
+            if out = 0 && q = 0 then dp <- dp - 1
+            else
+                res.[out] <- q
+                out <- out + 1
+        a.dig <- res
+        a.nd <- out
+        a.dp <- dp
+        FloatFmt.Trim a
+
+    /// is the value >= 2?
+    static member Ge2 (a : Dec) : bool =
+        if a.nd = 0 then false
+        elif a.dp > 1 then true
+        elif a.dp < 1 then false
+        else a.dig.[0] >= 2
+
+    /// is the value < 1?
+    static member Lt1 (a : Dec) : bool =
+        if a.nd = 0 then true else a.dp <= 0
+
+    /// the integer part, rounded to nearest with ties to EVEN
+    static member RoundToInt (a : Dec) : int64 =
+        let mutable v = 0L
+        let mutable i = 0
+        while i < a.dp do
+            let dig = if i < a.nd then a.dig.[i] else 0
+            v <- v * 10L + int64 dig
+            i <- i + 1
+        // the fraction: > 1/2 rounds up, = 1/2 goes to even
+        let mutable up = false
+        if a.nd > a.dp && a.dp >= 0 then
+            let first = a.dig.[a.dp]
+            if first > 5 then up <- true
+            elif first = 5 then
+                let mutable rest = false
+                let mutable j = a.dp + 1
+                while j < a.nd do
+                    if a.dig.[j] <> 0 then rest <- true
+                    j <- j + 1
+                if rest then up <- true
+                elif v % 2L = 1L then up <- true
+        if up then v + 1L else v
+
+    /// round to `n` significant digits, in place
+    static member RoundTo (a : Dec) (n : int) : unit =
+        if n < a.nd then
+            let first = a.dig.[n]
+            let mutable up = first > 5
+            if first = 5 then
+                let mutable rest = false
+                let mutable j = n + 1
+                while j < a.nd do
+                    if a.dig.[j] <> 0 then rest <- true
+                    j <- j + 1
+                if rest then up <- true
+                elif n > 0 && a.dig.[n - 1] % 2 = 1 then up <- true
+            a.nd <- n
+            if up then
+                let mutable i = n - 1
+                let mutable carry = true
+                while carry && i >= 0 do
+                    if a.dig.[i] = 9 then
+                        a.dig.[i] <- 0
+                        i <- i - 1
+                    else
+                        a.dig.[i] <- a.dig.[i] + 1
+                        carry <- false
+                if carry then
+                    // 999... became 1000...: one digit in front
+                    let mutable j = a.nd
+                    while j > 0 do
+                        if j < a.dig.Length then a.dig.[j] <- a.dig.[j - 1]
+                        j <- j - 1
+                    a.dig.[0] <- 1
+                    if a.nd < a.dig.Length then a.nd <- a.nd + 1
+                    a.dp <- a.dp + 1
+            FloatFmt.Trim a
+
+    /// the DECIMAL a string spells, or None when it spells no number
+    static member Parse (s : string) : Dec =
+        let a = FloatFmt.New ()
+        let n = s.Length
+        let mutable i = 0
+        if i < n && (s.[i] = '-' || s.[i] = '+') then
+            a.neg <- s.[i] = '-'
+            i <- i + 1
+        let mutable sawDigit = false
+        let mutable sawDot = false
+        let mutable nd = 0
+        let mutable dp = 0
+        let mutable leading = true
+        while i < n && (s.[i] = '.' || (s.[i] >= '0' && s.[i] <= '9')) do
+            if s.[i] = '.' then
+                sawDot <- true
+                dp <- nd
+            else
+                sawDigit <- true
+                let dig = int s.[i] - int '0'
+                if dig = 0 && leading && not sawDot then ()          // 000123
+                elif dig = 0 && leading && sawDot && nd = 0 then dp <- dp - 1
+                else
+                    leading <- false
+                    if nd < a.dig.Length then
+                        a.dig.[nd] <- dig
+                        nd <- nd + 1
+            i <- i + 1
+        if not sawDot then dp <- nd
+        a.nd <- nd
+        a.dp <- dp
+        // the exponent
+        if i < n && (s.[i] = 'e' || s.[i] = 'E') then
+            i <- i + 1
+            let mutable esign = 1
+            if i < n && (s.[i] = '-' || s.[i] = '+') then
+                if s.[i] = '-' then esign <- 0 - 1
+                i <- i + 1
+            let mutable e = 0
+            while i < n && s.[i] >= '0' && s.[i] <= '9' do
+                if e < 10000 then e <- e * 10 + (int s.[i] - int '0')
+                i <- i + 1
+            a.dp <- a.dp + esign * e
+        if not sawDigit then (a.nd <- 0; a.dp <- 0)
+        FloatFmt.Trim a
+        a
+
+    /// the DOUBLE a decimal denotes, correctly rounded
+    /// NEGATIVE zero, which `0.0 - 0.0` is not: the sign bit alone
+    static member NegZero () : float =
+        BitConverter.Int64BitsToDouble (0L - 9223372036854775807L - 1L)
+
+    static member ToFloat (a : Dec) : float =
+        if a.nd = 0 then (if a.neg then FloatFmt.NegZero () else 0.0)
+        elif a.dp > 310 then (if a.neg then 0.0 - infinity else infinity)
+        elif a.dp < 0 - 330 then (if a.neg then FloatFmt.NegZero () else 0.0)
+        else
+            let mutable exp = 0
+            while FloatFmt.Ge2 a do
+                FloatFmt.DivTwo a
+                exp <- exp + 1
+            while FloatFmt.Lt1 a do
+                FloatFmt.MulTwo a
+                exp <- exp - 1
+            // 1 <= v < 2 now: the mantissa is v * 2^52, or fewer bits when
+            // the exponent has bottomed out into the denormals
+            let mutable bits = 52
+            if exp < 0 - 1022 then bits <- 52 - ((0 - 1022) - exp)
+            let mutable k = 0
+            if bits >= 0 then
+                while k < bits do
+                    FloatFmt.MulTwo a
+                    k <- k + 1
+            else
+                // BELOW the smallest denormal: the value still has to be
+                // divided down before rounding, or everything tiny came out
+                // as the smallest denormal instead of zero
+                while k < 0 - bits do
+                    FloatFmt.DivTwo a
+                    k <- k + 1
+                bits <- 0
+            let mutable m = FloatFmt.RoundToInt a
+            let mutable e2 = exp
+            if bits = 52 && m >= 9007199254740992L then
+                // rounding carried into the next binary exponent
+                m <- m / 2L
+                e2 <- e2 + 1
+            let raw =
+                if m = 0L then 0L                                        // rounded away to zero
+                elif e2 < 0 - 1022 then m                                // denormal: exponent field 0
+                elif e2 + 1023 >= 2047 then 9218868437227405312L         // +infinity
+                else ((int64 (e2 + 1023)) * 4503599627370496L) + (m - 4503599627370496L)
+            let v = BitConverter.Int64BitsToDouble raw
+            if a.neg then (if v = 0.0 then FloatFmt.NegZero () else 0.0 - v) else v
+
+    /// the exact decimal expansion of a double
+    static member OfFloat (v : float) : Dec =
+        let a = FloatFmt.New ()
+        let bits0 = BitConverter.DoubleToInt64Bits v
+        let negative = bits0 < 0L
+        // the MAGNITUDE: a negative double's bit pattern is negative as an
+        // int64, and dividing that by 2^52 rounds the wrong way
+        let bits = bits0 &&& 9223372036854775807L
+        let expField = int ((bits / 4503599627370496L) % 2048L)
+        let frac = bits % 4503599627370496L
+        let mantissa = if expField = 0 then frac else frac + 4503599627370496L
+        let e2 = if expField = 0 then 0 - 1074 else expField - 1075
+        // the mantissa's own digits
+        if mantissa = 0L then (a.nd <- 0; a.dp <- 0)
+        else
+            // the mantissa's own digits, written back to front (FormatOps
+            // is declared further down, and a prelude use must follow its
+            // declaration)
+            let tmp = Array.zeroCreate 24
+            let mutable cnt = 0
+            let mutable x = mantissa
+            while x > 0L do
+                tmp.[cnt] <- int (x % 10L)
+                x <- x / 10L
+                cnt <- cnt + 1
+            let mutable i = 0
+            while i < cnt do
+                a.dig.[i] <- tmp.[cnt - 1 - i]
+                i <- i + 1
+            a.nd <- cnt
+            a.dp <- cnt
+            let mutable k = 0
+            if e2 > 0 then
+                while k < e2 do
+                    FloatFmt.MulTwo a
+                    k <- k + 1
+            elif e2 < 0 then
+                while k < 0 - e2 do
+                    FloatFmt.DivTwo a
+                    k <- k + 1
+        a.neg <- negative
+        a
+
+    /// the digits and the decimal exponent of the SHORTEST spelling that reads
+    /// back as the same double
+    static member Shortest (v : float) : Dec =
+        // only the LENGTH survives the loop. Holding the winning buffer in a
+        // mutable across it kept a heap value live over hundreds of
+        // allocations, and it came back empty.
+        let mutable len = 17
+        let mutable found = false
+        let mutable n = 1
+        while not found && n <= 17 do
+            let cand = FloatFmt.OfFloat v
+            FloatFmt.RoundTo cand n
+            let back = FloatFmt.ToFloat (FloatFmt.Parse (FloatFmt.Render cand false))
+            if back = v then
+                len <- n
+                found <- true
+            n <- n + 1
+        let ans = FloatFmt.OfFloat v
+        FloatFmt.RoundTo ans len
+        ans
+
+    /// digits and point to text. `sci` picks the exponent form.
+    static member Render (a : Dec) (sci : bool) : string =
+        if a.nd = 0 then (if a.neg then "-0" else "0")
+        else
+            let sign = if a.neg then "-" else ""
+            if sci then
+                let mutable s = string (char (int '0' + a.dig.[0]))
+                if a.nd > 1 then
+                    let mutable i = 1
+                    let mutable rest = ""
+                    while i < a.nd do
+                        rest <- rest + string (char (int '0' + a.dig.[i]))
+                        i <- i + 1
+                    s <- s + "." + rest
+                let e = a.dp - 1
+                let esign = if e < 0 then "-" else "+"
+                let ea = if e < 0 then 0 - e else e
+                let edigits = if ea < 10 then "0" + string ea else string ea
+                sign + s + "E" + esign + edigits
+            elif a.dp <= 0 then
+                let mutable s = "0."
+                let mutable i = 0
+                while i < 0 - a.dp do
+                    s <- s + "0"
+                    i <- i + 1
+                let mutable j = 0
+                while j < a.nd do
+                    s <- s + string (char (int '0' + a.dig.[j]))
+                    j <- j + 1
+                sign + s
+            else
+                let mutable s = ""
+                let mutable i = 0
+                while i < a.dp do
+                    s <- s + (if i < a.nd then string (char (int '0' + a.dig.[i])) else "0")
+                    i <- i + 1
+                if a.nd > a.dp then
+                    s <- s + "."
+                    let mutable j = a.dp
+                    while j < a.nd do
+                        s <- s + string (char (int '0' + a.dig.[j]))
+                        j <- j + 1
+                sign + s
+
+    /// .NET's own spelling of a double: the shortest round-trip digits, in
+    /// fixed-point when the exponent is in [-4, 17) and in the `E+xx` form
+    /// otherwise.
+    static member ToStr (v : float) : string =
+        if v <> v then "NaN"
+        elif v = infinity then "Infinity"
+        elif v = 0.0 - infinity then "-Infinity"
+        elif v = 0.0 then (if BitConverter.DoubleToInt64Bits v < 0L then "-0" else "0")
+        else
+            let a = FloatFmt.Shortest v
+            let e = a.dp - 1
+            FloatFmt.Render a (e < 0 - 4 || e >= 17)
+
+    /// the double a string spells, correctly rounded
+    static member OfStr (s : string) : float =
+        let n = s.Length
+        let neg = n > 0 && s.[0] = '-'
+        let i = if n > 0 && (s.[0] = '-' || s.[0] = '+') then 1 else 0
+        if i < n && (s.[i] = 'I' || s.[i] = 'i') then (if neg then 0.0 - infinity else infinity)
+        elif i < n && (s.[i] = 'N' || s.[i] = 'n') then nan
+        else FloatFmt.ToFloat (FloatFmt.Parse s)

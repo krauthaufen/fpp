@@ -55,6 +55,9 @@ type LOp =
     // reinterpret an i32 slot as the f32 and back, so `float32` storage is a
     // plain 4-byte word with no new machine type.
     | PromF | DemF | Bits2F | F2Bits
+    // the 64-bit pair: an i64 bit pattern as an f64, which is how a parsed
+    // float is finally assembled
+    | Bits2D
 
 type LExpr =
     | LConstW of int

@@ -5748,6 +5748,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         else LPrim (ShrSW, [ LPrim (ShlW, [ w; LConstW 24 ]); LConstW 24 ])
     // the raw bits of a double, as int64 — read the boxed payload as i64
     | EApp (EUnknown "doubleBits", [ a ]) -> lowBoxI ctx (LLoad (I64, coreToLowE ctx a, HDR))
+    // the other direction: the BITS of a double, as a double. Building a
+    // float from its exponent and mantissa is how a correctly-rounded parse
+    // ends, and there was no way to spell it.
+    | EApp (EUnknown "bitsDouble", [ a ]) -> lowBoxF ctx (LPrim (Bits2D, [ lowUnboxI (coreToLowE ctx a) ]))
     // singleBits: a float32's raw i32 bits. float32 rides an f64 box here, so
     // re-demote to f32 and reinterpret (mirrors storUnbox for float32).
     | EApp (EUnknown "singleBits", [ a ]) -> (LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF (coreToLowE ctx a) ]) ]))
@@ -7507,6 +7511,7 @@ let private lowOpIns (op : LOp) : string =
     | PromF -> "f64.promote_f32"
     | DemF -> "f32.demote_f64"
     | Bits2F -> "f32.reinterpret_i32"
+    | Bits2D -> "f64.reinterpret_i64"
     | F2Bits -> "i32.reinterpret_f32"
 
 // the wasm value type a local of this LTy is declared as: I64 is a real i64
