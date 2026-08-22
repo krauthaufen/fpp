@@ -34,6 +34,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (tyAliases : Dict<string, Var list * Type>)
           (arbDerive : (string * string * int * bool * int list * (string * string list) list) list)
           (ordDerive : (string * string * int * bool * int list * (string * string list) list) list)
+          (showDerive : (string * string * int * bool * int list * (string * string list) list) list)
+          (showTypes : (int * string) list)
           (existPack : Dict<int, (string * int * string * string list) list>)
           (existCases : Dict<string, int>)
           (existMatch : Dict<int, string>)
@@ -181,6 +183,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         | None -> ()
     // "TypeName.MemberName" -> the member's definition; a use site picks the
     // entry named by the receiver's inferred type (Infer.MemberSites)
+    let showTypeAt = dictNew<int, string> ()
+    for off, tn in showTypes do dictSet showTypeAt off tn
     let memberIndex = dictNew<string, Resolve.Definition> ()
     for k, d in dictPairs projectMembers do dictSet memberIndex k d
     for k, d in binder.Members do dictSet memberIndex k d
@@ -1372,6 +1376,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                              | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ e ])
                                              | None -> EApp (EUnknown "string#l", [ e ]))
                                         | _ -> EApp (EUnknown "string#w", [ e ]))
+                                   | 'A' when (dictTryFind showTypeAt (ft.Offset + 1 + i)).IsSome ->
+                                       // through the Show CLASS: every type
+                                       // renders itself, which is the only way
+                                       // a record's field names or a union's
+                                       // case names can reach the output (the
+                                       // runtime walker printed "?")
+                                       let tn = (dictTryFind showTypeAt (ft.Offset + 1 + i)).Value
+                                       EApp (EUnknown ("$class:Show:show:" + tn), [ e ])
                                    | 'A' ->
                                        (match k with
                                         | "t" -> quoted e
@@ -4810,6 +4822,75 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // `&location` becomes copy-in/copy-out, in EVERY binding — members and
     // lifted lambdas reach `decls` by their own routes, so the pass runs
     // here rather than at any one of them
+    // ---- derived Show bodies -----------------------------------------------
+    // `%A` on a record prints `{ A = 1; B = "x" }` and on a union `Case (1,
+    // 2)`. The names live in the type, so the renderer is generated per type
+    // and each component renders through the COMPONENT's own instance.
+    for (key, typeName, off, isUnion, paramIds, entries) in showDerive do
+        let av = { Path = path; Offset = off + 3; Name = "_sa" }
+        let anon = mono (TCon ("?", []))
+        // a Core string literal carries its SOURCE spelling, quotes included
+        let str (t : string) : Expr = ELit (LString ("\"" + t + "\""))
+        let cat (a : Expr) (b : Expr) : Expr = EPrim ("+t", [ a; b ])
+        let showOf (tyName : string) (x : Expr) : Expr =
+            EApp (EUnknown ("$class:Show:show:" + tyName), [ x ])
+        // a payload that is not atomic takes parentheses, as F# does
+        let parens (e : Expr) : Expr =
+            match dictTryFind memberIndex "ShowOps.Par" with
+            | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ e ])
+            | None -> e
+        // F# lays a record out one field per LINE, each continuation lined up
+        // two columns in from the brace, and a nested value under the column
+        // it starts at — `showAppend` is that rule
+        let appendOf (acc : Expr) (piece : Expr) : Expr =
+            match dictTryFind memberIndex "ShowOps.Append" with
+            | Some d -> EApp (EVar (varIdOf d, schemeOf d), [ ETuple [ acc; piece ] ])
+            | None -> cat acc piece
+        let body =
+            if not isUnion then
+                let single = List.length entries <= 1
+                let step (acc : Expr) (i : int) (fn : string, comps : string list) : Expr =
+                    let sep = if i = 0 then "{ " elif single then "; " else "\n  "
+                    let head = cat acc (str (sep + fn + " = "))
+                    appendOf head (showOf (List.head comps) (EField (EVar (av, anon), fn, typeName)))
+                let mutable acc = str ""
+                let mutable i = 0
+                for e in entries do
+                    acc <- step acc i e
+                    i <- i + 1
+                cat acc (str " }")
+            else
+                let binder (i : int) (k : int) =
+                    { Path = path; Offset = off + 1000 + i * 20 + k; Name = "_sv" + string i + "_" + string k }
+                let clause (i : int) (cn : string, comps : string list) : Pat * Expr option * Expr =
+                    let n = List.length comps
+                    let pat =
+                        if n = 0 then PCtor (cn, anon, [])
+                        elif n = 1 then PCtor (cn, anon, [ PVar (binder i 0, anon) ])
+                        else PCtor (cn, anon, [ PTuple (List.init n (fun k -> PVar (binder i k, anon))) ])
+                    let rendered =
+                        if n = 0 then str cn
+                        elif n = 1 then appendOf (str (cn + " ")) (parens (showOf (List.head comps) (EVar (binder i 0, anon))))
+                        else
+                            let inner =
+                                comps
+                                |> List.mapi (fun k c ->
+                                    let piece = showOf c (EVar (binder i k, anon))
+                                    if k = 0 then piece else cat (str ", ") piece)
+                                |> List.fold cat (str "")
+                            cat (cat (str (cn + " (")) inner) (str ")")
+                    pat, None, rendered
+                EMatch (EVar (av, anon), entries |> List.mapi clause)
+        let quantified =
+            paramIds
+            |> List.map (fun id ->
+                { Id = id; Level = 1; Link = None; Rigid = false } : Fpp.Analysis.Types.Var)
+        vecAdd decls
+            (DLet (false, { Path = path; Offset = off; Name = "$showD@" + key },
+                   { Quantified = quantified; Constraints = []
+                     Body = TFun (TCon ("?", []), TCon ("string", [])) },
+                   ELam ([ av, anon ], body)))
+
     // ---- derived Ordered bodies -------------------------------------------
     // One function per derived instance. A record compares its fields in
     // DECLARATION order; a union compares TAGS first and then the payload of

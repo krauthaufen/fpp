@@ -34,6 +34,10 @@ type InferResult =
       /// derived Arb shapes: (instance key, record/ctor name, synth offset,
       /// isUnion, entries as (field-or-case, component type names))
       OrdDerive : (string * string * int * bool * int list * (string * string list) list) list
+      /// derived Show instances, in the same shape
+      ShowDerive : (string * string * int * bool * int list * (string * string list) list) list
+      /// `%A` hole offset -> the type name whose Show instance renders it
+      ShowTypes : (int * string) list
       ArbDerive : (string * string * int * bool * int list * (string * string list) list) list
       /// member/field name-token offset -> the receiver's type name. Member
       /// names are not unique, so this — not the name — binds a dot-access
@@ -1758,6 +1762,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
     /// the same shape for DERIVED Ordered instances: Lower builds the bodies
     let ordDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
+    /// and for DERIVED Show instances
+    let showDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
+    /// `%A` holes whose type has NO renderer: lowering keeps the walker there
+    let showUnsolved = vecNew<int> ()
+    /// every `%A` hole and the type it renders
+    let showHolesRaw = vecNew<int * Type> ()
     /// type name -> the synthesized instance's offset, so a WRITTEN instance
     /// arriving later (a generated file lands after the type it derives for)
     /// can evict the derived one instead of overlapping with it
@@ -1887,6 +1897,62 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           Context = ps |> List.map (fun p -> { Class = "Ordered"; Args = [ TVar p ]; Assoc = [] })
                           Members = []
                           Builtin = true; Path = path; Offset = 0 }
+                    true
+
+    /// F# renders EVERY record and union with `%A`; a user type gets a Show
+    /// instance derived the way its comparison is, with a body Lower builds
+    /// out of the type's own structure.
+    let showDerived = dictNew<string, bool> ()
+    let deriveShow (tn : string) : bool =
+        if (dictTryFind showDerived tn).IsSome then true
+        else
+            let shape =
+                match dictTryFind unionCasesReg tn with
+                | Some (ps2, cases) -> Some (ps2, cases, true)
+                | None ->
+                    if (dictTryFind recordsReg tn).IsSome then
+                        let fs =
+                            dictPairs fields
+                            |> List.choose (fun (k, fi) ->
+                                if fi.TypeName = tn && fi.DefKey.IsNone && not fi.IsStatic
+                                   && k.StartsWith (tn + ".")
+                                   && not ((k.Substring (tn.Length + 1)).Contains ".") then
+                                    Some (fi.Params, (k.Substring (tn.Length + 1), [ fi.FieldType ]))
+                                else None)
+                        (match fs with
+                         | [] -> None
+                         | (ps2, _) :: _ -> Some (ps2, fs |> List.map snd, false))
+                    else None
+            match shape with
+            | None -> false
+            | Some (ps2, entries, isUnion) ->
+                let renderable =
+                    not (List.isEmpty entries)
+                    && entries |> List.forall (fun (_, comps) ->
+                           comps |> List.forall (fun t ->
+                               match prune t with
+                               | TFun (_, _) -> false
+                               | _ -> true))
+                if not renderable then false
+                else
+                    dictSet showDerived tn true
+                    let off = arbSynthNext
+                    arbSynthNext <- arbSynthNext + 100000
+                    let headArgs = ps2 |> List.map TVar
+                    vecAdd showDeriveRaw
+                        (tn, instName (TCon (tn, headArgs)), off, isUnion,
+                         ps2 |> List.map prunedId, entries)
+                    let ctx =
+                        entries
+                        |> List.collect (fun (_, comps) -> comps)
+                        |> List.map (fun t -> { Class = "Show"; Args = [ t ]; Assoc = [] })
+                    Classes.addInstance classes
+                        { Class = "Show"; Params = ps2
+                          Head = [ TCon (tn, headArgs) ]
+                          Assoc = []
+                          Context = ctx
+                          Members = [ "show", { MPath = path; MOffset = off; MName = "$showD@" + tn; MTakesUnit = false; MTupled = false; MInst = [] } ]
+                          Builtin = false; Path = path; Offset = off }
                     true
 
     let deriveArbGeneric (tn : string) : bool =
@@ -2071,7 +2137,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              + " — neither is more specific, and a `when` context does not select")
                     else vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
-                    if c.Class = "Ordered"
+                    if c.Class = "Show"
+                       && (match c.Args |> List.map prune with
+                           | [ TCon (tn, _) ] -> deriveShow tn
+                           | _ -> false) then
+                        // derived renderer: requeue, it exists now
+                        progress <- true
+                        vecAdd queue (offset, c)
+                    elif c.Class = "Ordered"
                        && (match c.Args |> List.map prune with
                            | [ TCon (tn, _) ] -> deriveOrdered tn
                            | _ -> false) then
@@ -2085,6 +2158,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         // derived on demand: requeue, the instance now exists
                         progress <- true
                         vecAdd queue (offset, c)
+                    elif isGround c && c.Class = "Show" then
+                        // `%A` is OPTIONAL: a type with no renderer of its own
+                        // (a class, `obj`) falls back to the runtime walker
+                        // rather than failing the compile. The site is
+                        // recorded so lowering knows not to route it.
+                        progress <- true
+                        vecAdd showUnsolved offset
                     elif isGround c then
                         progress <- true
                         vecAdd diags
@@ -3271,6 +3351,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                         | 'f' -> tFloat
                                                         | _ -> st.Fresh ()   // %A takes anything
                                                     vecAdd opKindsRaw (ft.Offset + 1 + i, ty)
+                                                    // `%A` renders through the Show class, so the
+                                                    // hole DEMANDS it — which is what makes a record
+                                                    // or union derive one (see deriveShow)
+                                                    if c = 'A' then
+                                                        addWanted (ft.Offset + 1 + i) { Class = "Show"; Args = [ ty ]; Assoc = [] }
+                                                        vecAdd showHolesRaw (ft.Offset + 1 + i, ty)
                                                     ty)
                                             let ret =
                                                 match t.Text with
@@ -8100,6 +8186,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         vecToList opKindsRaw
         |> List.map (fun (off, ty) -> off, kindOf ty)
         |> List.filter (fun (_, k) -> k <> "")
+      ShowDerive =
+        vecToList showDeriveRaw
+        |> List.map (fun (key, rn, off, isU, pids, entries) ->
+            key, rn, off, isU, pids,
+            entries |> List.map (fun (n2, comps) -> n2, comps |> List.map instConName))
       OrdDerive =
         vecToList ordDeriveRaw
         |> List.map (fun (key, rn, off, isU, pids, entries) ->
@@ -8199,6 +8290,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       ExprTypes =
         vecToList exprTypesRaw
         |> List.map (fun (st, en, ty) -> st, en, Types.typeString (prune ty))
+      // the `%A` holes that DO have a renderer, by offset. Their own table:
+      // these offsets also name operators in OpTypes, and filtering that one
+      // took an operator's type with it. (No `let` here — a binding inside a
+      // record field is not in the subset the compiler itself compiles.)
+      ShowTypes =
+        vecToList showHolesRaw
+        |> List.filter (fun (off, _) -> not (List.contains off (vecToList showUnsolved)))
+        |> List.map (fun (off, ty) ->
+            off,
+            match prune ty with
+            | TCon (n, targs) when not (List.isEmpty targs) ->
+                (match Types.instConName (prune ty) with
+                 | "" -> n
+                 | inm -> inm)
+            | TCon (n, _) -> n
+            | TTuple _ as tt -> Types.instConName tt
+            | _ -> "")
+        |> List.filter (fun (_, n) -> n <> "" && not (n.StartsWith "#"))
       OpTypes =
         vecToList opTypesRaw
         |> List.map (fun (off, ty) ->
@@ -8217,6 +8326,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // substitutes the caller's argument and the operator resolves
             // in the specialized copy
             | TVar v -> "#" + string v.Id
+            // a TUPLE names its own instance head ($tup2$<int.string>), which
+            // is how `%A` on a tuple finds the Show instance
+            | TTuple _ as tt -> Types.instConName tt
             | _ -> "")
       ArrKinds =
         // a loop source that only became known after the walk joins the

@@ -1,0 +1,45 @@
+int 42
+neg -7
+float 1.5
+float-exp 1e+300
+int64 3L
+uint 3u
+bool true
+char 'q'
+string "hi"
+unit ()
+tuple (1, "a")
+tuple3 (1, 'c', 2.5)
+list [1; 2; 3]
+list-empty []
+list-str ["a"; "b"]
+array [|1; 2|]
+array-empty [||]
+option Some 3
+option-none None
+option-tuple Some (1, 2)
+nested-list [[1]; [2; 3]]
+list-option [Some 1; None]
+record1 { Only = 1 }
+record2 { X = 1
+  Y = 2 }
+record-nested { Name = "n"
+  At = { X = 1
+         Y = 2 } }
+record-in-tuple ({ X = 1
+   Y = 2 }, 5)
+record-in-list [{ X = 1
+   Y = 2 }; { X = 3
+              Y = 4 }]
+record-in-option Some { X = 1
+       Y = 2 }
+record-in-array [|{ X = 1
+    Y = 2 }|]
+union-nullary Dot
+union-one Circle 1.5
+union-two Rect (2, 3)
+union-record Nested { X = 1
+         Y = 2 }
+union-list [Dot; Circle 2.0]
+union-option Some Dot
+DONE tests=1 failures=0

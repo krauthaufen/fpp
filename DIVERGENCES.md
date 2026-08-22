@@ -340,6 +340,22 @@ falls back to the runtime walker, which reads a raw word as signed.
 Wrapping the value in a user-declared union of the same shape, or comparing
 the payloads directly, both answer correctly.
 
+## `%A` does not WRAP a long rendering
+
+`%A` renders like F#: a string quoted, a char in ticks, an int64 with its `L`,
+a float in F#'s own ten-digit `%g` form (`1.0`, `1e+14`, `0.3333333333`), a
+list with semicolons, a union case with its payload, and a record one field
+per LINE with each continuation lined up under the column it starts at —
+including nested records inside tuples, lists, arrays and options.
+
+What it does not do is F#'s 80-column WRAP: `printfn "%A" [ 1 .. 30 ]` prints
+one long line where F# breaks it across two. Content is identical; only the
+line breaking of an over-long collection differs.
+
+A type with no renderer of its own — a class, `obj` — prints `?` rather than
+failing to compile: `%A` demands `Show`, but an unsatisfied demand falls back
+to the runtime walker instead of erroring.
+
 ## Equality and comparison are SEPARATE relations
 
 F# has two generic relations and they disagree on exactly one value. Equality

@@ -6966,6 +6966,24 @@ type FloatFmt =
             let e = a.dp - 1
             FloatFmt.Render a (e < 0 - 4 || e >= 17)
 
+    /// `%A`'s own float format: TEN significant digits, C's `%g` choice
+    /// between fixed and exponent (lowercase `e`), and a trailing `.0` when
+    /// the result would otherwise read as an integer — `1.0`, `1e+14`,
+    /// `0.3333333333`.
+    static member ToStrA (v : float) : string =
+        if v <> v then "nan"
+        elif v = infinity then "infinity"
+        elif v = 0.0 - infinity then "-infinity"
+        elif v = 0.0 then (if BitConverter.DoubleToInt64Bits v < 0L then "-0.0" else "0.0")
+        else
+            let a = FloatFmt.OfFloat v
+            FloatFmt.RoundTo a 10
+            let e = a.dp - 1
+            let txt = FloatFmt.Render a (e < 0 - 4 || e >= 10)
+            // the exponent is lowercase here, unlike `string`
+            let txt = String.concat "e" (List.ofArray (txt.Split 'E'))
+            if txt.Contains "." || txt.Contains "e" then txt else txt + ".0"
+
     /// the double a string spells, correctly rounded
     static member OfStr (s : string) : float =
         let n = s.Length
@@ -6974,3 +6992,134 @@ type FloatFmt =
         if i < n && (s.[i] = 'I' || s.[i] = 'i') then (if neg then 0.0 - infinity else infinity)
         elif i < n && (s.[i] = 'N' || s.[i] = 'n') then nan
         else FloatFmt.ToFloat (FloatFmt.Parse s)
+
+/// `%A`'s renderer, as a class so every type can answer for itself: the
+/// primitives here, the containers below, and a record or union through the
+/// instance the compiler DERIVES for it (Infer/Lower, beside the derived
+/// comparison). F# spells a string quoted, a char in ticks, a list with
+/// semicolons, and a union case with its payload — that is what these are.
+[<AutoOpen>]
+class Show<'a>
+    static show : 'a -> string
+
+instance Show<int>
+    static show x = string x
+instance Show<int64>
+    static show x = string x + "L"
+instance Show<uint32>
+    static show x = string x + "u"
+instance Show<uint64>
+    static show x = string x + "UL"
+instance Show<int16>
+    static show x = string x + "s"
+instance Show<uint16>
+    static show x = string x + "us"
+instance Show<byte>
+    static show x = string x + "uy"
+instance Show<sbyte>
+    static show x = string x + "y"
+instance Show<float>
+    static show x = FloatFmt.ToStrA x
+instance Show<float32>
+    static show x = FloatFmt.ToStrA (float x) + "f"
+instance Show<bool>
+    static show x = if x then "true" else "false"
+instance Show<char>
+    static show x = "'" + string x + "'"
+instance Show<string>
+    static show x = "\"" + x + "\""
+instance Show<unit>
+    static show _ = "()"
+
+/// How long the LAST line of a rendering is — the column the next piece
+/// starts at, which is what a nested multi-line value has to line up under.
+let showLastLen (s : string) : int =
+    let mutable last = 0 - 1
+    let mutable i = 0
+    while i < s.Length do
+        if s.[i] = '\n' then last <- i
+        i <- i + 1
+    s.Length - last - 1
+
+/// re-indent every line after the first by `n` spaces
+let showIndentBy (n : int) (s : string) : string =
+    if n <= 0 || not (s.Contains "\n") then s
+    else
+        let mutable pad = ""
+        let mutable k = 0
+        while k < n do
+            pad <- pad + " "
+            k <- k + 1
+        String.concat ("\n" + pad) (List.ofArray (s.Split '\n'))
+
+/// append a rendering, lining its continuation lines up under the column it
+/// starts at — F#'s own layout: `Some { X = 1` puts `Y = 2` under the `X`
+let showAppend (acc : string) (piece : string) : string =
+    acc + showIndentBy (showLastLen acc) piece
+
+let showAtomic (s : string) : bool =
+    if s.Length = 0 then true
+    else
+        let c = s.[0]
+        // a compound rendering already carries its own brackets
+        c = '(' || c = '[' || c = '{' || c = '"' || c = '\''
+        || not (s.Contains " ")
+
+/// The layout helpers a DERIVED renderer needs. Static members, because that
+/// is what the member index Lower reads carries — a top-level `let` is not in
+/// it.
+let showPar (s : string) : string =
+    if showAtomic s then s else "(" + s + ")"
+
+type ShowOps =
+    static member Append (acc : string, piece : string) : string = showAppend acc piece
+    static member Par (s : string) : string = showPar s
+
+/// a payload that is not ATOMIC takes parentheses inside a case or an option,
+/// the way F# prints `Some (1, 2)` but `Some 3`
+instance Show<'a * 'b> when Show<'a> when Show<'b>
+    static show p =
+        let a = showAppend "(" (show (fst p))
+        showAppend (showAppend a ", ") (show (snd p)) + ")"
+instance Show<'a * 'b * 'c> when Show<'a> when Show<'b> when Show<'c>
+    static show t =
+        let (a, b, c) = t
+        let s1 = showAppend "(" (show a)
+        let s2 = showAppend (showAppend s1 ", ") (show b)
+        showAppend (showAppend s2 ", ") (show c) + ")"
+instance Show<'a * 'b * 'c * 'd> when Show<'a> when Show<'b> when Show<'c> when Show<'d>
+    static show t =
+        let (a, b, c, d) = t
+        let s1 = showAppend "(" (show a)
+        let s2 = showAppend (showAppend s1 ", ") (show b)
+        let s3 = showAppend (showAppend s2 ", ") (show c)
+        showAppend (showAppend s3 ", ") (show d) + ")"
+instance Show<Option<'a>> when Show<'a>
+    static show o =
+        match o with
+        | None -> "None"
+        | Some v -> showAppend "Some " (showPar (show v))
+instance Show<ValueOption<'a>> when Show<'a>
+    static show o =
+        match o with
+        | ValueNone -> "ValueNone"
+        | ValueSome v -> showAppend "ValueSome " (showPar (show v))
+instance Show<Result<'a, 'e>> when Show<'a> when Show<'e>
+    static show r =
+        match r with
+        | Ok v -> showAppend "Ok " (showPar (show v))
+        | Error e -> showAppend "Error " (showPar (show e))
+/// the elements of a collection, each lined up under the column it starts at
+let private showElems (opening : string) (closing : string) (parts : string list) : string =
+    let mutable acc = opening
+    let mutable first = true
+    for p in parts do
+        if not first then acc <- acc + "; "
+        first <- false
+        acc <- showAppend acc p
+    acc + closing
+
+instance Show<list<'a>> when Show<'a>
+    static show xs = showElems "[" "]" (List.map (fun x -> show x) xs)
+instance Show<'a[]> when Show<'a>
+    static show xs = showElems "[|" "|]" (List.map (fun x -> show x) (Array.toList xs))
