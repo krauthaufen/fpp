@@ -336,6 +336,10 @@ void fpp_match_fail(void);
 
 int fpp_eqv(V a, V b);
 int fpp_cmpv(V a, V b);
+/* set by a comparison that met a NaN; the ordering OPERATORS answer false */
+extern int fpp_unord;
+/* the TOTAL order over floats: NaN equals itself, below every number */
+int fpp_cmp_f64(double x, double y);
 intptr_t fpp_hashv(V v);
 
 /* ---- conversions and printing ------------------------------------------ */

@@ -631,6 +631,22 @@ int fpp_eqv(V a, V b) {
   }
 }
 
+/* Raised by a comparison that met an UNORDERED (NaN) pair. `compare` answers
+ * the total order regardless; the four ordering OPERATORS are a partial order
+ * in F#, and read this to answer false. */
+int fpp_unord = 0;
+
+/* F#'s structural order over floats is TOTAL: NaN equals itself and sits
+ * below every number, while `<` and friends stay IEEE. */
+int fpp_cmp_f64(double x, double y) {
+  if (x < y) return -1;
+  if (x > y) return 1;
+  if (x == y) return 0;
+  fpp_unord = 1;
+  if (x != x) return (y != y) ? 0 : -1;
+  return 1;
+}
+
 int fpp_cmpv(V a, V b) {
   if (a == b) return 0;
   if ((a & 1) && (b & 1))
@@ -652,7 +668,7 @@ int fpp_cmpv(V a, V b) {
     if (tr == FPP_TID_F64) {
       double x = (a & 1) ? (double)tv : fpp_unbox_f64(a);
       double y = (b & 1) ? (double)tv : fpp_unbox_f64(b);
-      return x < y ? -1 : x > y ? 1 : 0;
+      return fpp_cmp_f64(x, y);
     }
     return (a & 1) ? -1 : 1;
   }
@@ -662,7 +678,7 @@ int fpp_cmpv(V a, V b) {
   case FPP_TID_STR: return fpp_str_cmp(a, b);
   case FPP_TID_F64: {
     double x = fpp_unbox_f64(a), y = fpp_unbox_f64(b);
-    return x < y ? -1 : x > y ? 1 : 0;
+    return fpp_cmp_f64(x, y);
   }
   case FPP_TID_I64: {
     int64_t x = fpp_unbox_i64(a), y = fpp_unbox_i64(b);

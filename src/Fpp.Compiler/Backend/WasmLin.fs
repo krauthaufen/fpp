@@ -4989,6 +4989,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                       [ LSet (wReg r, LGet (wReg ra)) ],
                       [ LSet (wReg r, LGet (wReg rb)) ]) ],
              LGet (wReg r))
+    // the float instance's `compare`: the TOTAL order, raising $unord on an
+    // unordered pair (see structCmpW's ShFloat arm)
+    | EPrim ("$cmpf", [ a; b ]) ->
+        structCmpW ctx ShFloat (coreToLowE ctx a) (coreToLowE ctx b) None
     // the STRUCTURAL comparator by name: Link synthesises a compound type's
     // builtin `compare` as this rather than out of `<` and `>`, which are a
     // partial order (see $unord) and would answer 0 for a NaN inside

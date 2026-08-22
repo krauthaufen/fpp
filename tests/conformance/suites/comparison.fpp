@@ -85,6 +85,20 @@ test "nan-compare-below" (compare nan 0.0 < 0 && compare 0.0 nan > 0)
 test "nan-compare-in-tuple" (compare (1, nan) (1, nan) = 0)
 test "nan-equality-false" (not ([ nan ] = [ nan ]) && not ({ a = nan; b = 1.0 } = { a = nan; b = 1.0 }))
 
+// the SAME NaN rule reaches through every container, however the comparison
+// gets there: a list's ordering goes through its element instance, a record's
+// through the runtime walker, and both must answer false
+test "nan-list-single" (not (anyOp [ nan ] [ 0.0 ]))
+test "nan-list-compare" (compare [ nan ] [ 0.0 ] < 0)
+test "nan-record-single" (not (anyOp { a = nan; b = 1.0 } { a = 0.0; b = 1.0 }))
+test "nan-record-compare" (compare { a = nan; b = 1.0 } { a = 0.0; b = 1.0 } < 0)
+test "nan-option-single" (not (anyOp (Some nan) (Some 0.0)))
+test "nan-option-compare" (compare (Some nan) (Some 0.0) < 0)
+test "nan-nested-list" (not (anyOp [ [ nan ] ] [ [ 0.0 ] ]))
+// a NEGATIVE float inside a record still orders by VALUE, not by bit pattern
+test "neg-float-record" (lt { a = 0.0 - 2.0; b = 0.0 } { a = 0.0 - 1.0; b = 0.0 })
+test "neg-float-list" (lt [ 0.0 - 2.0 ] [ 0.0 - 1.0 ])
+
 // ---- unions order by CASE ORDER, then by payload --------------------------
 
 type DU =

@@ -322,9 +322,9 @@ order in which NaN equals itself and sits below every number. Both hold here —
 the comparison walk answers the total order and raises an "unordered" flag that
 only the four operators read.
 
-The C backend is the exception: its comparator is the total order throughout,
-so `(1, nan) <= (1, 0.0)` answers true there. wasm-linear is the exactness
-target; the C leg is a known gap.
+Both backends implement it: the C runtime carries the same flag (`fpp_unord`),
+and the float instance's own `compare` is a primitive rather than a fold over
+`<`/`>`, so a NaN reached through a list's element instance raises it too.
 
 ## Equality and comparison are SEPARATE relations
 

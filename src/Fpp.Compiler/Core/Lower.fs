@@ -2037,7 +2037,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       EApp (classRef im, [ lowerExpr (GNode l); lowerExpr (GNode r) ])
                               // ordering has ONE operation: the predicates are
                               // notation for a test on its result
-                              if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
+                              // the four ordering operators are a PARTIAL
+                              // order (see Link's copy of this rewrite): mark
+                              // them so the backend answers false when the
+                              // comparison walk met a NaN
+                              if im.MName = "compare" then
+                                  match op.Text with
+                                  | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + op.Text), [ call ])
+                                  | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
                               else call
                           | None ->
                               EPrim (op.Text + suffix, [ lowerExpr (GNode l); lowerExpr (GNode r) ]))
@@ -2407,7 +2414,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match dictTryFind classUses op.Offset with
                          | Some im ->
                              let call = EApp (classRef im, [ la; lb ])
-                             if im.MName = "compare" then EPrim (op.Text, [ call; ELit (LInt "0") ])
+                             if im.MName = "compare" then
+                                 match op.Text with
+                                 | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + op.Text), [ call ])
+                                 | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
                              else call
                          | None -> EPrim (op.Text + suffix, [ la; lb ])
                      ELam ([ va, sch; vb, sch ], body)

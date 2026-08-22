@@ -1760,7 +1760,15 @@ let builtinInstanceWrappers (classes : Classes.Tables) : Decl list =
                             | None when m = "compare" ->
                                 let lt = EPrim (withOpType "<@" opnd, args)
                                 let gt = EPrim (withOpType ">@" opnd, args)
-                                if opnd = "float" || opnd = "float32" || opnd = "float16" then
+                                if opnd = "float" || opnd = "float32" then
+                                    // ONE primitive: it answers the total
+                                    // order AND records that it met a NaN, so
+                                    // an ordering operator over a structure
+                                    // that contains this float can answer
+                                    // false. Spelled out of `<`/`>`/`=` the
+                                    // walk could not tell the two apart.
+                                    Some (EPrim ("$cmpf", args))
+                                elif opnd = "float16" then
                                     // a FLOAT's comparison is a TOTAL order —
                                     // NaN equal to itself and below every
                                     // number — while its <, > and = are IEEE

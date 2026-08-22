@@ -1261,6 +1261,22 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f (sref d + " = TAGI((UNTAGI(" + sref x + ") & UNTAGI(" + sref y
                 + ")) == UNTAGI(" + sref y + "));")
         d
+    | EPrim ("$cmpf", [ a; b ]) ->
+        let x = emitE st f a
+        let y = emitE st f b
+        let d = slot f
+        stmt f (sref d + " = TAGI(fpp_cmp_f64(fpp_unbox_f64(" + sref x + "), fpp_unbox_f64(" + sref y + ")));")
+        d
+    // the PER marker Link puts on the four ordering operators. ABOVE the
+    // generic application arm: that one emits the head as a value, and the
+    // marker is not a function.
+    | EApp (EUnknown n, [ inner ]) when n.StartsWith "$per:" ->
+        let op = n.Substring (strLen "$per:")
+        stmt f "fpp_unord = 0;"
+        let x = emitE st f inner
+        let d = slot f
+        stmt f (sref d + " = TAGI(!fpp_unord && (UNTAGI(" + sref x + ") " + op + " 0));")
+        d
     | EApp (EUnknown "isNull", [ a ]) ->
         let x = emitE st f a
         let d = slot f
@@ -1404,10 +1420,12 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         (match baseOp with
          | "=" -> stmt f (sref d + " = TAGI(fpp_eqv(" + sref x + ", " + sref y + "));")
          | "<>" -> stmt f (sref d + " = TAGI(!fpp_eqv(" + sref x + ", " + sref y + "));")
-         | "<" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") < 0);")
-         | ">" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") > 0);")
-         | "<=" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") <= 0);")
-         | ">=" -> stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") >= 0);")
+         // the four ordering operators are a PARTIAL order: a NaN anywhere
+         // inside makes them all false, while `compare` stays total
+         | "<" | ">" | "<=" | ">=" ->
+             stmt f ("fpp_unord = 0;")
+             stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") " + baseOp + " 0);")
+             stmt f ("if (fpp_unord) " + sref d + " = TAGI(0);")
          | _ -> stmt f (sref d + " = fpp_not_emitted(" + cstr ("op " + op0) + ");"))
         d
     | EPrim (op0, [ a; b ]) ->
@@ -1450,8 +1468,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                         + " (int32_t)UNTAGI(" + sref y + ")));")
         let rel (cop : string) =
             if k = '?' || k = 't' || k = 'o' then
+                // PER, as above — only `compare` itself stays total
+                stmt f ("fpp_unord = 0;")
                 stmt f (sref d + " = TAGI(fpp_cmpv(" + sref x + ", " + sref y + ") "
                         + cop + " 0);")
+                stmt f ("if (fpp_unord) " + sref d + " = TAGI(0);")
             elif k = 'f' || k = 's' || k = 'h' then
                 stmt f (sref d + " = TAGI(fpp_unbox_f64(" + sref x + ") " + cop
                         + " fpp_unbox_f64(" + sref y + "));")
@@ -2391,11 +2412,9 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
                              + " & 1) && fpprt_typeid(" + sref xv + ") == " + string tid + ");")
                      d
                  | None -> trap ("typetest " + tn))
-    // the PER marker Link puts on the four ordering operators: the C leg
-    // compares the walk's answer to 0 the way it always has (its comparator is
-    // the total order throughout — wasm-linear is the exactness target)
-    | EApp (EUnknown n, [ inner ]) when n.StartsWith "$per:" ->
-        emitE st f (EPrim (n.Substring (strLen "$per:"), [ inner; ELit (LInt "0") ]))
+    // the PER marker Link puts on the four ordering operators: the walk
+    // answers the TOTAL order and raises fpp_unord when it met a NaN, and
+    // then all four answer false
     | EUnknown n when n.StartsWith "$class:Ordered:compare:" ->
         // a still-symbolic Ordered dictionary member: uniform values answer
         // it STRUCTURALLY, which is what the wasm backend's $cmpv does
