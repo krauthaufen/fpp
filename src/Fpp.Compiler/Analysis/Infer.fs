@@ -33,6 +33,7 @@ type InferResult =
       InstSites : (int * string list) list
       /// derived Arb shapes: (instance key, record/ctor name, synth offset,
       /// isUnion, entries as (field-or-case, component type names))
+      OrdDerive : (string * string * int * bool * int list * (string * string list) list) list
       ArbDerive : (string * string * int * bool * int list * (string * string list) list) list
       /// member/field name-token offset -> the receiver's type name. Member
       /// names are not unique, so this — not the name — binds a dot-access
@@ -1755,6 +1756,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// resolution only, like recordsReg)
     let unionsReg = dictNew<string, bool> ()
     let arbDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
+    /// the same shape for DERIVED Ordered instances: Lower builds the bodies
+    let ordDeriveRaw = vecNew<string * string * int * bool * int list * (string * Type list) list> ()
     /// type name -> the synthesized instance's offset, so a WRITTEN instance
     /// arriving later (a generated file lands after the type it derives for)
     /// can evict the derived one instead of overlapping with it
@@ -1802,20 +1805,89 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         else
                             let vs = varsOf want
                             if List.length vs = want then Some vs else None
+            // the type's STRUCTURE, when this compilation can see it: a real
+            // body compares each component through the COMPONENT's instance,
+            // where the walker only sees words (and read a uint32 payload as
+            // a signed one). Without a visible structure the instance stays
+            // primitive and the walker serves, as before.
+            let shape =
+                match dictTryFind unionCasesReg tn with
+                | Some (ps2, cases) -> Some (ps2, cases, true)
+                | None when (match ps with Some _ -> true | None -> false)
+                            && (tn = "Option" || tn = "ValueOption" || tn = "Result") ->
+                    // the PRELUDE's own structural unions: a user compilation
+                    // cannot see their cases, so the structure is spelled here
+                    let ps2 = match ps with Some v -> v | None -> []
+                    let a0 = TVar (List.item 0 ps2)
+                    (match tn with
+                     | "Option" -> Some (ps2, [ "None", []; "Some", [ a0 ] ], true)
+                     | "ValueOption" -> Some (ps2, [ "ValueNone", []; "ValueSome", [ a0 ] ], true)
+                     | _ ->
+                         let e0 = TVar (List.item 1 ps2)
+                         Some (ps2, [ "Ok", [ a0 ]; "Error", [ e0 ] ], true))
+                | None ->
+                    if (dictTryFind recordsReg tn).IsSome then
+                        let fs =
+                            dictPairs fields
+                            |> List.choose (fun (k, fi) ->
+                                if fi.TypeName = tn && fi.DefKey.IsNone && not fi.IsStatic
+                                   && k.StartsWith (tn + ".")
+                                   && not ((k.Substring (tn.Length + 1)).Contains ".") then
+                                    Some (fi.Params, (k.Substring (tn.Length + 1), [ fi.FieldType ]))
+                                else None)
+                        (match fs with
+                         | [] -> None
+                         | (ps2, _) :: _ -> Some (ps2, fs |> List.map snd, false))
+                    else None
             match ps with
             | None -> false
             | Some ps ->
                 dictSet orderedDerived tn true
-                Classes.addInstance classes
-                    { Class = "Ordered"; Params = ps
-                      Head = [ TCon (tn, ps |> List.map TVar) ]
-                      Assoc = []
-                      // every component must be comparable too, as F#'s
-                      // derived comparison demands
-                      Context = ps |> List.map (fun p -> { Class = "Ordered"; Args = [ TVar p ]; Assoc = [] })
-                      Members = []
-                      Builtin = true; Path = path; Offset = 0 }
-                true
+                let comparable =
+                    match shape with
+                    | Some (_, entries, _) ->
+                        not (List.isEmpty entries)
+                        && entries |> List.forall (fun (_, comps) ->
+                               comps |> List.forall (fun t ->
+                                   match prune t with
+                                   | TFun (_, _) -> false
+                                   | _ -> true))
+                    | None -> false
+                match shape with
+                | Some (ps2, entries, isUnion) when comparable ->
+                    let off = arbSynthNext
+                    // ROOM for the body's own binders: the generated comparer
+                    // names one per component and per case pair, all keyed by
+                    // offsets above this one, and a 10-wide stride had them
+                    // land on the NEXT derivation's function
+                    arbSynthNext <- arbSynthNext + 100000
+                    let headArgs = ps2 |> List.map TVar
+                    vecAdd ordDeriveRaw
+                        (tn, instName (TCon (tn, headArgs)), off, isUnion,
+                         ps2 |> List.map prunedId, entries)
+                    let ctx =
+                        entries
+                        |> List.collect (fun (_, comps) -> comps)
+                        |> List.map (fun t -> { Class = "Ordered"; Args = [ t ]; Assoc = [] })
+                    Classes.addInstance classes
+                        { Class = "Ordered"; Params = ps2
+                          Head = [ TCon (tn, headArgs) ]
+                          Assoc = []
+                          Context = ctx
+                          Members = [ "compare", { MPath = path; MOffset = off; MName = "$ordD@" + tn; MTakesUnit = false; MTupled = false; MInst = [] } ]
+                          Builtin = false; Path = path; Offset = off }
+                    true
+                | _ ->
+                    Classes.addInstance classes
+                        { Class = "Ordered"; Params = ps
+                          Head = [ TCon (tn, ps |> List.map TVar) ]
+                          Assoc = []
+                          // every component must be comparable too, as F#'s
+                          // derived comparison demands
+                          Context = ps |> List.map (fun p -> { Class = "Ordered"; Args = [ TVar p ]; Assoc = [] })
+                          Members = []
+                          Builtin = true; Path = path; Offset = 0 }
+                    true
 
     let deriveArbGeneric (tn : string) : bool =
         if (dictTryFind arbDerived tn).IsSome then true
@@ -8028,6 +8100,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         vecToList opKindsRaw
         |> List.map (fun (off, ty) -> off, kindOf ty)
         |> List.filter (fun (_, k) -> k <> "")
+      OrdDerive =
+        vecToList ordDeriveRaw
+        |> List.map (fun (key, rn, off, isU, pids, entries) ->
+            key, rn, off, isU, pids,
+            entries |> List.map (fun (n2, comps) -> n2, comps |> List.map instConName))
       ArbDerive =
         vecToList arbDeriveRaw
         |> List.map (fun (key, rn, off, isU, pids, entries) ->

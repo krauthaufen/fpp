@@ -80,7 +80,7 @@ type private St =
       /// interned value-witness tables: a "size:align:refMask" key -> its BYTE
       /// offset in the static g_witnesses pool. Deduped, emitted at startup.
       Witnesses : Dict<string, int>
-      WitnessData : Vec<int * int * int * int>   // (offset, size, align, refMask)
+      WitnessData : Vec<int * int * int * int * int>   // (offset, size, align, refMask, cmpKind)
       mutable WitnessCur : int
       /// top-level non-lambda bindings: a mutable global each
       Globals : Dict<string, bool>       // "path:offset" -> unit
@@ -4096,23 +4096,42 @@ let private layoutOf (st : St) (t : Type) : Layout =
 
 // intern a {size,align,refMask} witness (deduped into the static g_witnesses
 // pool) and return a runtime pointer to it: $witnesses + offset.
-let private witnessPtrRM (st : St) (size : int) (align : int) (refMask : int) : LExpr =
-    let k = string size + ":" + string align + ":" + string refMask
+/// how a value of the witnessed type COMPARES, for the generic path: the
+/// refMask alone says raw-or-pointer, which reads a uint32 as a signed word
+/// and a boxed uint64 with i64.gt_s.
+/// 0 = signed word, 1 = unsigned word, 2 = boxed float, 3 = boxed int64,
+/// 4 = boxed uint64, 5 = anything else (the structural walker).
+let private cmpKindOfName (nm : string) : int =
+    match nm with
+    | "int" | "int32" | "nativeint" | "bool" | "char" | "sbyte" | "int16" -> 0
+    | "uint32" | "unativeint" | "byte" | "uint16" -> 1
+    | "float" | "double" -> 2
+    | "int64" -> 3
+    | "uint64" -> 4
+    | _ -> 5
+
+let private witnessPtrRMK (st : St) (size : int) (align : int) (refMask : int) (cmpKind : int) : LExpr =
+    let k = string size + ":" + string align + ":" + string refMask + ":" + string cmpKind
     let off =
         match dictTryFind st.Witnesses k with
         | Some o -> o
         | None ->
             let o = st.WitnessCur
-            st.WitnessCur <- o + 12
+            st.WitnessCur <- o + 16
             dictSet st.Witnesses k o
-            vecAdd st.WitnessData (o, size, align, refMask)
+            vecAdd st.WitnessData (o, size, align, refMask, cmpKind)
             o
     LPrim (AddW, [ LGetGlobal "$witnesses"; LConstW off ])
+
+let private witnessPtrRM (st : St) (size : int) (align : int) (refMask : int) : LExpr =
+    // an unnamed witness: raw words order SIGNED, pointers structurally
+    witnessPtrRMK st size align refMask (if refMask = 0 then 0 else 5)
 
 // a concrete type's witness from its layout.
 let private witnessPtr (st : St) (t : Type) : LExpr =
     let l = layoutOf st t
-    witnessPtrRM st l.Size l.Align (int l.RefMask)
+    let kind = match prune t with TCon (n, _) -> cmpKindOfName n | _ -> (if int l.RefMask = 0 then 0 else 5)
+    witnessPtrRMK st l.Size l.Align (int l.RefMask) kind
 
 // the witness a call must pass for one type-arg NAME (from EVarI.inst):
 // - "#N": forward the enclosing function's witness param for type-var N
@@ -4125,7 +4144,8 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
         | Some reg -> LGet (wReg reg)
         | None -> witnessPtrRM ctx.LSt 4 4 1
     else
-        witnessPtrRM ctx.LSt 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
+        let bare = layStripGen nm
+        witnessPtrRMK ctx.LSt 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
 
 // A witness LExpr for a GENERIC aggregate slot, so lowObjR takes the precise
 // refoffs path (a raw element excluded, a ref included) rather than the tagged
@@ -4136,7 +4156,9 @@ let private witnessArgOfName (ctx : LowCtx) (nm : string) : LExpr =
 // value-witness ABI gap that lowObjR then logs.
 let rec private slotWitness (ctx : LowCtx) (e : Expr) : LExpr option =
     let st = ctx.LSt
-    let ofName (nm : string) = witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1)
+    let ofName (nm : string) =
+        let bare = layStripGen nm
+        witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare)
     let ofTy (t : Type) : LExpr option =
         match prune t with
         | TVar tv -> (match dictTryFind ctx.Witness tv.Id with Some r -> Some (LGet (wReg r)) | None -> None)
@@ -4214,7 +4236,12 @@ let rec private shapeOfExpr (e : Expr) : CmpShape =
     | ELit (LString _) -> ShStr
     | ELit (LFloat s) when s.EndsWith "h" || s.EndsWith "H" -> ShHalf
     | ELit (LFloat _) -> ShFloat
+    // the literal's SUFFIX names its type: an unsigned one compares
+    // unsigned, and read as a signed word `compare 4000000000u 2u` was
+    // negative
+    | ELit (LInt s) when s.EndsWith "UL" || s.EndsWith "ul" || s.EndsWith "uL" || s.EndsWith "Ul" -> ShUInt64
     | ELit (LInt s) when s.EndsWith "L" || s.EndsWith "l" -> ShInt64
+    | ELit (LInt s) when s.EndsWith "u" || s.EndsWith "U" -> ShUScalar
     | ELit (LInt _ | LChar _ | LBool _) -> ShScalar
     | EListLit (x :: _) -> ShList (shapeOfExpr x)
     | EListLit [] -> ShList ShOther
@@ -4346,10 +4373,29 @@ let rec private structCmpW (ctx : LowCtx) (sh : CmpShape) (wa : LExpr) (wb : LEx
     | ShOther ->
         (match wit with
          | Some w ->
+             // the witness' COMPARISON KIND (word 3), not just its refMask:
+             // a uint32 element ordered as a SIGNED word, and a boxed uint64
+             // went through i64.gt_s — both wrong for half the range
              let t = freshTmp ctx
-             LDo ([ LIf (LPrim (EqW, [ LLoad (W, LGet (wReg w), 8); LConstW 0 ]),
-                         [ LSet (wReg t, LPrim (SubW, [ LPrim (GtSW, [ wa; wb ]); LPrim (LtSW, [ wa; wb ]) ])) ],
-                         [ LSet (wReg t, LCall ("$cmpv", [ wa; wb ])) ]) ],
+             let ra = freshTmp ctx
+             let rb = freshTmp ctx
+             let ga = LGet (wReg ra)
+             let gb = LGet (wReg rb)
+             let kind = LLoad (W, LGet (wReg w), 12)
+             let kr = freshTmp ctx
+             let unsignedWord = LPrim (SubW, [ LPrim (GtUW, [ ga; gb ]); LPrim (LtUW, [ ga; gb ]) ])
+             let signedWord = LPrim (SubW, [ LPrim (GtSW, [ ga; gb ]); LPrim (LtSW, [ ga; gb ]) ])
+             let boxedU64 =
+                 LPrim (SubW, [ LPrim (GtUL, [ LLoad (I64, ga, HDR); LLoad (I64, gb, HDR) ])
+                                LPrim (LtUL, [ LLoad (I64, ga, HDR); LLoad (I64, gb, HDR) ]) ])
+             LDo ([ LSet (wReg ra, wa); LSet (wReg rb, wb); LSet (wReg kr, kind)
+                    LIf (LPrim (EqW, [ LGet (wReg kr); LConstW 1 ]),
+                         [ LSet (wReg t, unsignedWord) ],
+                         [ LIf (LPrim (EqW, [ LGet (wReg kr); LConstW 4 ]),
+                                [ LSet (wReg t, boxedU64) ],
+                                [ LIf (LPrim (EqW, [ LLoad (W, LGet (wReg w), 8); LConstW 0 ]),
+                                       [ LSet (wReg t, signedWord) ],
+                                       [ LSet (wReg t, LCall ("$cmpv", [ ga; gb ])) ]) ]) ]) ],
                    LGet (wReg t))
          | None -> LCall ("$cmpv", [ wa; wb ]))
     | ShStr -> LCall ("$str_cmp", [ wa; wb ])
@@ -4992,12 +5038,40 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // the float instance's `compare`: the TOTAL order, raising $unord on an
     // unordered pair (see structCmpW's ShFloat arm)
     | EPrim ("$cmpf", [ a; b ]) ->
-        structCmpW ctx ShFloat (coreToLowE ctx a) (coreToLowE ctx b) None
+        // the operands ride whichever rail their source uses — a boxed float
+        // from a list element, a RAW f64 from an inline record field — so
+        // unbox them the way float arithmetic does rather than assuming a box
+        let fa = freshTmpT ctx F64
+        let fb = freshTmpT ctx F64
+        let ga = LGet { Id = fa; RTy = F64 }
+        let gb = LGet { Id = fb; RTy = F64 }
+        let r = freshTmp ctx
+        LDo ([ LSet ({ Id = fa; RTy = F64 }, lowUnboxF (coreToLowE ctx a))
+               LSet ({ Id = fb; RTy = F64 }, lowUnboxF (coreToLowE ctx b))
+               LSet (wReg r, LPrim (SubW, [ LPrim (GtF, [ ga; gb ]); LPrim (LtF, [ ga; gb ]) ]))
+               LIf (LPrim (AndW, [ LPrim (EqW, [ LGet (wReg r); LConstW 0 ])
+                                   LPrim (EqW, [ LPrim (EqF, [ ga; gb ]); LConstW 0 ]) ]),
+                    [ LSetGlobal ("$unord", LConstW 1)
+                      LIf (LPrim (NeF, [ ga; ga ]),
+                           [ LIf (LPrim (NeF, [ gb; gb ]),
+                                  [ LSet (wReg r, LConstW 0) ],
+                                  [ LSet (wReg r, LConstW (0 - 1)) ]) ],
+                           [ LSet (wReg r, LConstW 1) ]) ],
+                    []) ],
+             LGet (wReg r))
     // the STRUCTURAL comparator by name: Link synthesises a compound type's
     // builtin `compare` as this rather than out of `<` and `>`, which are a
     // partial order (see $unord) and would answer 0 for a NaN inside
     | EApp (EUnknown "compare", [ a; b ]) ->
-        LCall ("$cmpv", [ coreToLowE ctx a; coreToLowE ctx b ])
+        // by SHAPE when the operands have one: the runtime walker reads every
+        // raw word as a SIGNED int, so `compare 4000000000u 2u` came out
+        // negative and a uint64 box compared with i64.gt_s
+        // by SHAPE where the operands have one, and otherwise through the
+        // WITNESS: structCmpW's ShOther arm reads the witness' comparison kind
+        // and only falls back to the walker when there is none
+        let sh = mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
+        let ra, rb, pre = evalRooted ctx a b
+        LDo (pre, structCmpW ctx sh (LGet (wReg ra)) (LGet (wReg rb)) (cmpWit ctx a b))
     // `x < y` on an Ordered-constrained value: Link marks the four ordering
     // operators, which are a PARTIAL order — the comparison walk answers the
     // total order and raises $unord when it met a NaN, and then all four
@@ -5068,7 +5142,32 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let b0 = if hasAt then op.Substring (0, op.IndexOf "@") else baseOp op
         let isStr = (not hasAt) && b0.EndsWith "t"
         let cb = if isStr then b0.Substring (0, b0.Length - 1) else b0
-        let sh = if isStr then ShStr elif hasAt then ShOther else mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
+        // the op's KIND SUFFIX names the operand type where it has one, and it
+        // beats the inferred shape: inside a stamped generic the operands are
+        // type VARIABLES (ShOther), so `>w` on two uint32 parameters went to
+        // the witness path and compared them SIGNED
+        let shSuffix =
+            if hasAt then ShOther
+            else
+                // `op`, not the stripped base: baseOp has already taken the
+                // kind letter off b0
+                match (if baseOp op <> op && strLen op > 1 then substr op (strLen op - 1) 1 else "") with
+                | "w" -> ShUScalar
+                | "v" -> ShUInt64
+                | "l" -> ShInt64
+                | "f" -> ShFloat
+                | "s" -> ShFloat
+                | "h" -> ShHalf
+                | _ -> ShOther
+        let sh =
+            if isStr then ShStr
+            // `<@uint32` — an instance-TYPED operator: the name after the `@`
+            // says the shape. Read as ShOther it took the witness path, so a
+            // `compare` passed as a VALUE (List.sort's comparer) compared two
+            // uint32s SIGNED.
+            elif hasAt then shapeOfName (op.Substring (op.IndexOf "@" + 1))
+            elif shSuffix <> ShOther then shSuffix
+            else mergeShape (shapeOfExprF st a) (shapeOfExprF st b)
         let ra, rb, pre = evalRooted ctx a b
         let cr = freshTmp ctx
         // `=`/`<>` take the EQUALITY relation, the ordering operators take
@@ -9005,7 +9104,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             let constWits =
                 match (if gc then dictTryFind stampedClassWits (v.Path, v.Offset) else None) with
                 | Some pairs ->
-                    pairs |> List.map (fun (vid, nm) -> vid, witnessPtrRM st 4 4 (if rawScalarName (layStripGen nm) then 0 else 1))
+                    pairs |> List.map (fun (vid, nm) ->
+                        let bare = layStripGen nm
+                        vid, witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare))
                 | None -> []
             emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) (ps |> List.map (fun (_, s) -> s.Body)) body (fun _ -> ())
         | _ -> ()
@@ -9063,10 +9164,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         // value-witness pool: point $witnesses at it and write each interned
         // {size,align,refMask} triple (static metadata the generic ABI passes).
         callf rf "$witnessbase"; gs rf "$witnesses"
-        for off, size, align, refMask in vecToList st.WitnessData do
+        for off, size, align, refMask, cmpKind in vecToList st.WitnessData do
             gg rf "$witnesses"; ic rf off; ins rf "i32.add"; ic rf size; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 4); ins rf "i32.add"; ic rf align; mem rf "i32.store"
             gg rf "$witnesses"; ic rf (off + 8); ins rf "i32.add"; ic rf refMask; mem rf "i32.store"
+            gg rf "$witnesses"; ic rf (off + 12); ins rf "i32.add"; ic rf cmpKind; mem rf "i32.store"
         // the tid->cid table is a FIXED static array in fpprt-wasm-shim.c
         // (FPPRT_WASM_NTIDS). Writing past it corrupts the static memory that
         // follows AND leaves those shapes reading class-id 0, so a dispatch on

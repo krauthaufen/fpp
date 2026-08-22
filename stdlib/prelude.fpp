@@ -1855,7 +1855,9 @@ module Array =
             b <- t
             width <- width + width
         a
-    let sort (xs : 'a[]) : 'a[] when Ordered<'a> = sortWith compare xs
+    // `compare` as a VALUE is the generic walker, which orders a uint32 as
+    // a signed word; APPLIED it resolves to the element type's instance
+    let sort (xs : 'a[]) : 'a[] when Ordered<'a> = sortWith (fun a b -> compare a b) xs
     let sortBy (f : 'a -> 'k) (xs : 'a[]) : 'a[] when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
     let toList (xs : 'a[]) : 'a list =
@@ -2108,7 +2110,7 @@ module Array =
         while i < length xs do
             xs.[i] <- sorted.[i]
             i <- i + 1
-    let sortInPlace (xs : 'a[]) : unit when Ordered<'a> = sortInPlaceWith compare xs
+    let sortInPlace (xs : 'a[]) : unit when Ordered<'a> = sortInPlaceWith (fun a b -> compare a b) xs
     let sortInPlaceBy (f : 'a -> 'k) (xs : 'a[]) : unit when Ordered<'k> =
         sortInPlaceWith (fun a b -> compare (f a) (f b)) xs
 // ---- List: the F# List module ----
@@ -2667,7 +2669,7 @@ module List =
                     r <- t
                 | [], [] -> go <- false
             rev acc
-    let sort (xs : 'a list) : 'a list when Ordered<'a> = sortWith compare xs
+    let sort (xs : 'a list) : 'a list when Ordered<'a> = sortWith (fun a b -> compare a b) xs
     let sortBy (f : 'a -> 'k) (xs : 'a list) : 'a list when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
     /// First occurrence wins, order preserved — F#'s own rule.
@@ -3537,7 +3539,7 @@ module Seq =
     let rev (xs : seq<'a>) : seq<'a> = Array.toSeq (Array.rev (Array.ofSeq xs))
     let sortWith (cmp : 'a -> 'a -> int) (xs : seq<'a>) : seq<'a> =
         Array.toSeq (Array.sortWith cmp (Array.ofSeq xs))
-    let sort (xs : seq<'a>) : seq<'a> when Ordered<'a> = sortWith compare xs
+    let sort (xs : seq<'a>) : seq<'a> when Ordered<'a> = sortWith (fun a b -> compare a b) xs
     let sortBy (f : 'a -> 'k) (xs : seq<'a>) : seq<'a> when Ordered<'k> =
         sortWith (fun a b -> compare (f a) (f b)) xs
 

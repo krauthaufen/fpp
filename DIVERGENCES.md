@@ -326,6 +326,20 @@ Both backends implement it: the C runtime carries the same flag (`fpp_unord`),
 and the float instance's own `compare` is a primitive rather than a fold over
 `<`/`>`, so a NaN reached through a list's element instance raises it too.
 
+## An unsigned payload of `option`/`Result` compares SIGNED
+
+Every other route to an unsigned comparison is right — the operators, a
+`compare` call, an unsigned value inside a tuple, a list, a record, a USER
+union, a sorted collection, a Map or Set key, and a generic function's
+constraint (the value witness carries the comparison kind). The one that is
+not is a `uint32`/`uint64` payload of the PRELUDE's `option`, `voption` or
+`Result`: their derived comparer loses the element type when it stamps and
+falls back to the runtime walker, which reads a raw word as signed.
+
+`compare (Some 4000000000u) (Some 2u)` therefore answers -1 where F# says 1.
+Wrapping the value in a user-declared union of the same shape, or comparing
+the payloads directly, both answer correctly.
+
 ## Equality and comparison are SEPARATE relations
 
 F# has two generic relations and they disagree on exactly one value. Equality

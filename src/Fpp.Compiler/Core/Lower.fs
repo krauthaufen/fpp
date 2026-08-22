@@ -33,6 +33,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (opTypes : Dict<int, string>)
           (tyAliases : Dict<string, Var list * Type>)
           (arbDerive : (string * string * int * bool * int list * (string * string list) list) list)
+          (ordDerive : (string * string * int * bool * int list * (string * string list) list) list)
           (existPack : Dict<int, (string * int * string * string list) list>)
           (existCases : Dict<string, int>)
           (existMatch : Dict<int, string>)
@@ -2041,7 +2042,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               // order (see Link's copy of this rewrite): mark
                               // them so the backend answers false when the
                               // comparison walk met a NaN
-                              if im.MName = "compare" then
+                              if im.MName = "compare" || im.MName.StartsWith "$ordD@" then
                                   match op.Text with
                                   | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + op.Text), [ call ])
                                   | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
@@ -2414,7 +2415,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match dictTryFind classUses op.Offset with
                          | Some im ->
                              let call = EApp (classRef im, [ la; lb ])
-                             if im.MName = "compare" then
+                             if im.MName = "compare" || im.MName.StartsWith "$ordD@" then
                                  match op.Text with
                                  | "<" | ">" | "<=" | ">=" -> EApp (EUnknown ("$per:" + op.Text), [ call ])
                                  | _ -> EPrim (op.Text, [ call; ELit (LInt "0") ])
@@ -4793,6 +4794,110 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // `&location` becomes copy-in/copy-out, in EVERY binding — members and
     // lifted lambdas reach `decls` by their own routes, so the pass runs
     // here rather than at any one of them
+    // ---- derived Ordered bodies -------------------------------------------
+    // One function per derived instance. A record compares its fields in
+    // DECLARATION order; a union compares TAGS first and then the payload of
+    // the shared case. Each component goes through the COMPONENT's own
+    // instance, which is what the runtime walker cannot do: it sees words, so
+    // a uint32 payload compared as a signed one and a float payload could not
+    // raise the unordered flag.
+    for (key, typeName, off, isUnion, paramIds, entries) in ordDerive do
+        let av = { Path = path; Offset = off + 3; Name = "_oa" }
+        let bv = { Path = path; Offset = off + 4; Name = "_ob" }
+        let anon = mono (TCon ("?", []))
+        let ish = mono (TCon ("int", []))
+        // a component of KNOWN scalar type compares with the typed operators
+        // (which carry signedness) rather than through the class reference —
+        // that one resolves to the untyped walker for a builtin instance, and
+        // the walker reads every raw word as signed
+        let cmpOf (tyName : string) (x : Expr) (y : Expr) : Expr =
+            let suffix =
+                match tyName with
+                | "uint32" | "unativeint" -> Some "w"
+                | "uint64" -> Some "v"
+                | "int64" -> Some "l"
+                | "string" -> Some "t"
+                | "int" | "int32" | "nativeint" | "char" | "bool" | "byte" | "sbyte" | "int16" | "uint16" -> Some ""
+                | _ -> None
+            match tyName, suffix with
+            | ("float" | "double"), _ -> EPrim ("$cmpf", [ x; y ])
+            | _, Some sfx ->
+                EIf (EPrim ("<" + sfx, [ x; y ]), ELit (LInt "-1"),
+                     EIf (EPrim (">" + sfx, [ x; y ]), ELit (LInt "1"), ELit (LInt "0")))
+            | _ -> EApp (EUnknown ("$class:Ordered:compare:" + tyName), [ x; y ])
+        let body =
+            if not isUnion then
+                // f1 decides unless it ties, then f2, and so on
+                let rec fold (fs : (string * string list) list) : Expr =
+                    match fs with
+                    | [] -> ELit (LInt "0")
+                    | (fn, comps) :: rest ->
+                        let c = cmpOf (List.head comps)
+                                      (EField (EVar (av, anon), fn, typeName))
+                                      (EField (EVar (bv, anon), fn, typeName))
+                        match rest with
+                        | [] -> c
+                        | _ ->
+                            let cv = { Path = path; Offset = off + 5 + List.length rest; Name = "_oc" }
+                            ELet (false, cv, ish, c,
+                                  EIf (EPrim ("<>", [ EVar (cv, ish); ELit (LInt "0") ]),
+                                       EVar (cv, ish), fold rest))
+                fold entries
+            else
+                // one clause per (case of a, case of b) pair the tags share,
+                // plus the tag ordering for the rest
+                let binder (side : string) (i : int) (j : int) (k : int) =
+                    { Path = path; Offset = off + 1000 + i * 400 + j * 20 + k * 2 + (if side = "a" then 0 else 1)
+                      Name = "_o" + side + string i + "_" + string j + "_" + string k }
+                // a case's payload: one binder per component (a multi-payload
+                // case carries them as ONE tuple, taken apart here so each
+                // component compares through its OWN instance)
+                let payloadPat (side : string) (i : int) (j : int) (cn : string) (comps : string list) : Pat =
+                    match List.length comps with
+                    | 0 -> PCtor (cn, anon, [])
+                    | 1 -> PCtor (cn, anon, [ PVar (binder side i j 0, anon) ])
+                    | n -> PCtor (cn, anon, [ PTuple (List.init n (fun k -> PVar (binder side i j k, anon))) ])
+                let caseClause (i : int) (cn : string, comps : string list) : Pat * Expr option * Expr =
+                    let pa = payloadPat "a" i 0 cn comps
+                    let inner =
+                        let clauses =
+                            entries
+                            |> List.mapi (fun j (cn2, comps2) ->
+                                let pb = payloadPat "b" i j cn2 comps2
+                                let res =
+                                    if j < i then ELit (LInt "1")
+                                    elif j > i then ELit (LInt "-1")
+                                    else
+                                        // the same case on both sides: compare
+                                        // component by component, the first
+                                        // difference deciding
+                                        let rec fold (k : int) (cs : string list) : Expr =
+                                            match cs with
+                                            | [] -> ELit (LInt "0")
+                                            | c :: rest ->
+                                                let one = cmpOf c (EVar (binder "a" i 0 k, anon)) (EVar (binder "b" i j k, anon))
+                                                match rest with
+                                                | [] -> one
+                                                | _ ->
+                                                    let cv = { Path = path; Offset = off + 50000 + i * 400 + j * 20 + k; Name = "_ou" }
+                                                    ELet (false, cv, ish, one,
+                                                          EIf (EPrim ("<>", [ EVar (cv, ish); ELit (LInt "0") ]),
+                                                               EVar (cv, ish), fold (k + 1) rest))
+                                        fold 0 comps
+                                pb, None, res)
+                        EMatch (EVar (bv, anon), clauses)
+                    pa, None, inner
+                EMatch (EVar (av, anon), entries |> List.mapi caseClause)
+        let quantified =
+            paramIds
+            |> List.map (fun id ->
+                { Id = id; Level = 1; Link = None; Rigid = false } : Fpp.Analysis.Types.Var)
+        vecAdd decls
+            (DLet (false, { Path = path; Offset = off; Name = "$ordD@" + key },
+                   { Quantified = quantified; Constraints = []
+                     Body = TFun (TCon ("?", []), TFun (TCon ("?", []), TCon ("int", []))) },
+                   ELam ([ av, anon; bv, anon ], body)))
+
     // ---- derived Arb bodies ----------------------------------------------
     // One function per derived instance: a record generates every field, a
     // union picks a case and generates its payload. The $class references
