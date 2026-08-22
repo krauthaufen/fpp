@@ -232,11 +232,16 @@ let parse (src : string) : ParseResult =
     /// sees an operator member as an ordinary name. Concatenation still
     /// reproduces the source exactly, which is what losslessness requires —
     /// hence the no-inner-trivia rule (`( + )` is not a name).
+    /// SPACES are allowed around the operator: `( * )` and `( *** )` have to
+    /// be written that way, since `(*` opens a comment. A NEWLINE inside is
+    /// still not an operator name.
+    let spacesOnly (ts : Trivia list) =
+        ts |> List.forall (fun t -> t.TriviaKind = Whitespace)
     let atOperatorName () =
-        s.Is LParen && List.isEmpty s.Cur.Trailing
+        s.Is LParen && spacesOnly s.Cur.Trailing
         && (s.Peek 1).Kind = Operator
-        && List.isEmpty (s.Peek 1).Leading && List.isEmpty (s.Peek 1).Trailing
-        && (s.Peek 2).Kind = RParen && List.isEmpty (s.Peek 2).Leading
+        && spacesOnly (s.Peek 1).Leading && spacesOnly (s.Peek 1).Trailing
+        && (s.Peek 2).Kind = RParen && spacesOnly (s.Peek 2).Leading
 
     /// `(|Add|Rem|)` — a multi-case ACTIVE PATTERN name. Seven adjacent
     /// tokens, all of them fused into one identifier, the way `(+)` is.
@@ -666,6 +671,11 @@ let parse (src : string) : ParseResult =
     /// column the first argument happens to sit at, and that column is an
     /// artifact of the layout rather than a bound anyone wrote.
     let mutable guardCols : int list = []
+    /// The column of the BINDING a block belongs to. An infix operator may
+    /// start a continuation line left of the expression it continues, as long
+    /// as it stays right of this — F#'s offside exception for infix tokens.
+    let mutable outerCols : int list = []
+    let outerCol () = match outerCols with c :: _ -> c | [] -> 0 - 1
     let mutable pendingBracketBlock = false
     let undentGuard () =
         let rec first (cs : int list) =
@@ -1040,8 +1050,13 @@ let parse (src : string) : ParseResult =
         let mutable lhs = parseApp ctx
         let mutable go = true
         while go do
-            // operators may sit at exactly the block column on a fresh line
-            let allowed = s.SameLine || s.CurCol >= ctx || bracketDepth > 0
+            // operators may sit at exactly the block column on a fresh line —
+            // or LEFT of it, down to the binding's own column: `let z =    x`
+            // then `        -- 1` continues the expression, which is F#'s
+            // offside exception for an infix token
+            let allowed =
+                s.SameLine || s.CurCol >= ctx || bracketDepth > 0
+                || (s.Is Operator && s.CurCol > outerCol () && infixPrec s.Cur.Text > 0)
             // A CAST binds looser than `|>`: F# reads `x |> f :> obj` as
             // `(x |> f) :> obj`, and taking the cast unconditionally made it
             // `x |> (f :> obj)` — a function upcast to obj. Level 4 is the
@@ -1676,7 +1691,9 @@ let parse (src : string) : ParseResult =
         let isBracketContent = pendingBracketBlock
         pendingBracketBlock <- false
         guardCols <- (if isBracketContent then -1 else blockCol) :: guardCols
+        outerCols <- outerCtx :: outerCols
         let r = parseBlockInner outerCtx blockCol
+        outerCols <- List.tail outerCols
         guardCols <- List.tail guardCols
         pendingBracketBlock <- isBracketContent
         r
@@ -1864,9 +1881,12 @@ let parse (src : string) : ParseResult =
         // `type C(args) as this =` — a name for the object under
         // construction. The tokens are kept so the parse stays lossless;
         // what the name MEANS is the same question `base` asks.
+        let mutable classSelf = ""
         if s.IsKw "as" && s.SameLine then
             vecAdd acc (s.Bump ())
-            if s.Is Ident then vecAdd acc (s.Bump ())
+            if s.Is Ident then
+                classSelf <- s.Cur.Text
+                vecAdd acc (s.Bump ())
         // declared class constraints: `type Box<'a> when Ordered<'a> = ...`,
         // the same `when C<'a>` a let signature carries
         while s.IsKw "when" && (s.SameLine || s.CurCol > typeCol) do
@@ -1910,6 +1930,48 @@ let parse (src : string) : ParseResult =
         // nested `let`s in the body reset this, but a following `and`
         // continues the TYPE, not those lets
         lastMajor <- "type"
+        // `type C(x) as self = ...` — the name of the object under
+        // construction. Each member already binds a self of its own (`this`,
+        // or `_` for none), so the class-level name is bound THROUGH it: a
+        // member without one takes this name, and a member with one has this
+        // name renamed to it inside its body.
+        if classSelf <> "" then
+            let rec bindSelf (g : Green) : Green =
+                match g with
+                | GNode n when n.NodeKind = MemberDecl ->
+                    // the self token is the Ident right before the `.` that
+                    // introduces the member's name
+                    let kids = n.Children
+                    let mutable selfIdx = 0 - 1
+                    let mutable k = 0
+                    while k + 1 < List.length kids do
+                        (match List.item k kids, List.item (k + 1) kids with
+                         | GToken a, GToken b when (a.Kind = Ident || (a.Kind = Operator && a.Text = "_"))
+                                                   && b.Kind = Operator && b.Text = "." && selfIdx < 0 ->
+                             selfIdx <- k
+                         | _ -> ())
+                        k <- k + 1
+                    if selfIdx < 0 then g
+                    else
+                        match List.item selfIdx kids with
+                        | GToken t when t.Text = "_" ->
+                            Green.node MemberDecl
+                                (kids |> List.mapi (fun i c ->
+                                    if i = selfIdx then GToken { t with Kind = Ident; Text = classSelf } else c))
+                        | GToken t ->
+                            let mine = t.Text
+                            let rec ren (x : Green) : Green =
+                                match x with
+                                | GToken tk when tk.Kind = Ident && tk.Text = classSelf -> GToken { tk with Text = mine }
+                                | GToken _ -> x
+                                | GNode m -> Green.node m.NodeKind (m.Children |> List.map ren)
+                            Green.node MemberDecl
+                                (kids |> List.mapi (fun i c -> if i <= selfIdx then c else ren c))
+                        | _ -> g
+                | GNode n -> Green.node n.NodeKind (n.Children |> List.map bindSelf)
+                | GToken _ -> g
+            Green.node TypeDecl (vecToList acc |> List.map bindSelf)
+        else
         Green.node TypeDecl (vecToList acc)
 
     and isMemberStart () =
