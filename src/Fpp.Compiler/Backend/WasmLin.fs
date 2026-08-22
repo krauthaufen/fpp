@@ -3597,6 +3597,49 @@ let private storShape (k : string) : string = "sa:" + k
 // header, GC-invisible (a scalar array). Returns (field layout, stride). Mixed
 // (ref-holding) element records need a per-element ref-map — not yet.
 let private ARRHDR = HDR + 4
+
+/// the inline layout of a field list, in DECLARATION order: a scalar sits at a
+/// multiple of its own width, a reference field takes one word, and the size
+/// rounds up to the widest member so an ARRAY of the record strides the way C
+/// says. The order is not cosmetic — the structural comparator walks an
+/// object's WORDS, so a layout that hoisted the scalars in front of the
+/// references made `compare` disagree with the field order the source
+/// declares, and with a hand-written instance.
+/// `firstRefWord` is the word index of the first reference field (the whole
+/// size in words when there is none, which is what marks an all-scalar record
+/// packable as an array element).
+let private layoutDecl (fs : (string * string) list) : Dict<string, int * string> * int * int =
+    let m = dictNew<string, int * string> ()
+    let widthOf (ty : string) = match storLTy ty with Some (_, w) -> w | None -> 4
+    let maxA = fs |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
+    let align (o : int) (a : int) = ((o + a - 1) / a) * a
+    let mutable off = HDR
+    let mutable firstRef = 0 - 1
+    for (fnm, ty) in fs do
+        let w = widthOf ty
+        off <- HDR + align (off - HDR) w
+        if (storLTy ty).IsNone && firstRef < 0 then firstRef <- off
+        dictSet m fnm (off, ty)
+        off <- off + w
+    let size = HDR + align (off - HDR) maxA
+    (m, size, (if firstRef < 0 then size / 4 else firstRef / 4))
+
+/// the byte offsets of an inline layout's reference fields, ascending
+let private podRefOffs (layout : Dict<string, int * string>) : int list =
+    dictPairs layout
+    |> List.choose (fun (_, v) -> let (off, ty) = v in (if (storLTy ty).IsNone then Some off else None))
+    |> List.sortWith (fun (a : int) (b : int) -> if a < b then 0 - 1 elif a > b then 1 else 0)
+
+/// the type-id of an inline record. FK_TAGGED can only say "every word from N
+/// on is a reference", so a record whose references are not a contiguous
+/// SUFFIX — declaration order puts them wherever the author wrote them —
+/// carries the explicit ref-offset map instead.
+let private podTid (st : St) (key : string) (layout : Dict<string, int * string>) (size : int) (firstRefWord : int) : int =
+    let refs = podRefOffs layout
+    let suffix = List.init (size / 4 - firstRefWord) (fun k -> 4 * (firstRefWord + k))
+    if List.isEmpty refs || refs = suffix then gcTid st key size FK_TAGGED firstRefWord
+    else gcTidRef st key size refs
+
 let private podArrOf (st : St) (kind : string) : (Dict<string, int * string> * int) option =
     match dictTryFind st.RecPod kind with
     | Some (layout, size, firstRefWord) when firstRefWord = size / 4 -> Some (layout, size - HDR)
@@ -3631,29 +3674,13 @@ let private podSynth (st : St) (name : string) : (Dict<string, int * string> * i
         // registration loop makes for a `'a` field.
         if List.length fs < 2 || fs |> List.exists (fun (_, ty) -> ty.StartsWith "#" || ty.StartsWith "'" || ty = "") then None
         else
-            let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
-            let refs = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsNone)
-            if List.isEmpty scalars then None
+            if fs |> List.forall (fun (_, ty) -> (storLTy ty).IsNone) then None
             else
-                let m = dictNew<string, int * string> ()
-                let widthOf (ty : string) = snd (optGet (storLTy ty))
-                let maxA = scalars |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
-                let align (o : int) (a : int) = ((o + a - 1) / a) * a
-                let mutable off = HDR
-                for (fn, ty) in scalars do
-                    let w = widthOf ty
-                    off <- HDR + align (off - HDR) w
-                    dictSet m fn (off, ty)
-                    off <- off + w
-                off <- HDR + align (off - HDR) maxA
-                let firstRefWord = off / 4
-                for (fn, ty) in refs do
-                    dictSet m fn (off, ty)
-                    off <- off + 4
+                let (m, size, firstRefWord) = layoutDecl fs
                 dictSet st.RecFields name (fs |> List.map fst)
                 dictSet st.RecFieldTypes name fs
-                dictSet st.RecPod name (m, off, firstRefWord)
-                Some (m, off, firstRefWord)
+                dictSet st.RecPod name (m, size, firstRefWord)
+                Some (m, size, firstRefWord)
 
 /// the inline layout of a record name, synthesizing an unregistered struct
 /// tuple's (podSynth) so a Canon body and its stamped twins agree on offsets.
@@ -6655,12 +6682,12 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
 // builds with the scalars unboxed inline and every live pointer correctly rooted.
 and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
     let cid = cidRec ctx.LSt name
-    let (_, size, firstRefWord) = optGet (podOf ctx.LSt name)
+    let (podLayout, size, firstRefWord) = optGet (podOf ctx.LSt name)
     let bs = freshTmp ctx
     // an UNDECLARED (synthesized) name has no class id, so key its type-id by
     // the name — two different synthesized tuples must not share one tid
     let tidKey = if cid >= 0 then "inl:" + string cid else "inl@" + name
-    let alloc = if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt tidKey size FK_TAGGED firstRefWord) ]) else LAlloc (LConstW size)
+    let alloc = if gc then LCall ("$fpalloc", [ LConstW (podTid ctx.LSt tidKey podLayout size firstRefWord) ]) else LAlloc (LConstW size)
     let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
     let scalars = items |> List.filter (fun (_, _, _, r, _) -> not r)
     let refs = items |> List.filter (fun (_, _, _, r, _) -> r)
@@ -8166,30 +8193,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 List.length fs >= 2 && (dictTryFind classNames n).IsNone
                 && not (fs |> List.exists (fun (_, ty) -> ty.StartsWith "'" && not (ty.Contains "[") && not (ty.Contains "<"))) ->
             let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
-            let refs = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsNone)
             if not (List.isEmpty scalars) then
-                let m = dictNew<string, int * string> ()
-                // C's natural alignment: each scalar sits at a multiple of its
-                // own width and the struct's SIZE rounds up to the widest
-                // member's. `{ M : float; T : byte }` is 16 bytes in C, not 9 —
-                // an array of them strides 16, and a foreign reader walking at
-                // 9 read every element after the first at the wrong offset.
-                let widthOf (ty : string) = snd (optGet (storLTy ty))
-                let maxA = scalars |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
-                let align (o : int) (a : int) = ((o + a - 1) / a) * a
-                let mutable off = HDR
-                for (fn, ty) in scalars do
-                    let w = widthOf ty
-                    off <- HDR + align (off - HDR) w
-                    dictSet m fn (off, ty)
-                    off <- off + w
-                // pad to the widest member so the ARRAY stride is C's
-                off <- HDR + align (off - HDR) maxA
-                let firstRefWord = off / 4
-                for (fn, ty) in refs do
-                    dictSet m fn (off, ty)
-                    off <- off + 4
-                dictSet st.RecPod n (m, off, firstRefWord)
+                dictSet st.RecPod n (layoutDecl fs)
         | _ -> ()
     // record every STRUCT record's ordered declared fields for the inline-value
     // layout engine (`layoutOf`). Value types only — reference records stay a
@@ -8211,7 +8216,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     match dictTryFind st.RecPod n with
                     // inline value type: FK_TAGGED scanning only the ref suffix
                     // (start = first ref word); all-scalar => start = size/4 => scans nothing
-                    | Some (_, size, firstRefWord) -> vecAdd st.TidCid (gcTid st ("inl:" + string cid) size FK_TAGGED firstRefWord, cid)
+                    | Some (layout, size, firstRefWord) -> vecAdd st.TidCid (podTid st ("inl:" + string cid) layout size firstRefWord, cid)
                     | None ->
                         let nf = List.length fs
                         vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string nf + ":0") (HDR + 4 * nf) FK_TAGGED 1, cid)

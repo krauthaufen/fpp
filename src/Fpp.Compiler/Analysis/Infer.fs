@@ -1761,6 +1761,62 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let arbDerived = dictNew<string, int> ()
     let mutable arbSynthNext = 300000000
 
+    /// F# DERIVES structural comparison for every record and union. Asking an
+    /// author to write `instance Ordered<T>` by hand for each one is a
+    /// divergence with no upside now that the comparator agrees with a
+    /// hand-written instance: the backend lowers `$class:Ordered:compare:T`
+    /// straight to the structural comparator, which walks a record's fields in
+    /// DECLARATION order (mixed records stopped being reordered for exactly
+    /// this reason). So a demand that finds no instance registers a PRIMITIVE
+    /// one — no bodies, the backend supplies the operation — and re-queues. A
+    /// type that writes its own instance never reaches here; this fires only
+    /// after selection has already failed.
+    let orderedDerived = dictNew<string, bool> ()
+    /// n fresh type variables. Total on purpose: a `failwith` here would run
+    /// inside the compiler's own solve loop, and the self-host compile threw
+    /// exactly that.
+    let varsOf (n : int) : Var list =
+        List.init n (fun _ -> st.Fresh ())
+        |> List.choose (fun t -> match t with TVar v -> Some v | _ -> None)
+    let deriveOrdered (tn : string) : bool =
+        if (dictTryFind orderedDerived tn).IsSome then true
+        else
+            let ps =
+                match dictTryFind unionCasesReg tn with
+                | Some (ps, _) -> Some ps
+                | None ->
+                    if (dictTryFind recordsReg tn).IsSome then Some []
+                    else
+                        // the PRELUDE's own structural unions are not in the
+                        // registry a user compilation sees, and F# derives
+                        // comparison for them too. Declaring the instances in
+                        // the prelude instead was TRIED and broke the byte
+                        // fixpoint — a statically present instance perturbs
+                        // selection while a derived one only appears where it
+                        // is demanded.
+                        let want = match tn with
+                                   | "Option" | "ValueOption" -> 1
+                                   | "Result" -> 2
+                                   | _ -> 0 - 1
+                        if want < 0 then None
+                        else
+                            let vs = varsOf want
+                            if List.length vs = want then Some vs else None
+            match ps with
+            | None -> false
+            | Some ps ->
+                dictSet orderedDerived tn true
+                Classes.addInstance classes
+                    { Class = "Ordered"; Params = ps
+                      Head = [ TCon (tn, ps |> List.map TVar) ]
+                      Assoc = []
+                      // every component must be comparable too, as F#'s
+                      // derived comparison demands
+                      Context = ps |> List.map (fun p -> { Class = "Ordered"; Args = [ TVar p ]; Assoc = [] })
+                      Members = []
+                      Builtin = true; Path = path; Offset = 0 }
+                true
+
     let deriveArbGeneric (tn : string) : bool =
         if (dictTryFind arbDerived tn).IsSome then true
         elif (dictTryFind unionGadt tn).IsSome then false
@@ -1943,7 +1999,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              + " — neither is more specific, and a `when` context does not select")
                     else vecAdd survivors (offset, c)
                 | Classes.NoInstance ->
-                    if c.Class = "Arb"
+                    if c.Class = "Ordered"
+                       && (match c.Args |> List.map prune with
+                           | [ TCon (tn, _) ] -> deriveOrdered tn
+                           | _ -> false) then
+                        // derived structural comparison: requeue, it exists now
+                        progress <- true
+                        vecAdd queue (offset, c)
+                    elif c.Class = "Arb"
                        && (match c.Args |> List.map prune with
                            | [ TCon (tn, _) ] -> deriveArbGeneric tn
                            | _ -> false) then

@@ -8,18 +8,6 @@
 // must hash EQUAL and compare 0, and a structurally equal key must find its
 // entry however it was built.
 //
-// DROPPED: `compare` over the user RECORD and UNION types, and the Map/Set
-// keyed by them. F# derives structural comparison for such a type; here it
-// needs an explicit `instance Ordered<T>`, which is not F# syntax and so
-// cannot appear in a suite that both compilers read. Deriving it is not just
-// a frontend change either: the runtime comparator walks payload words in
-// LAYOUT order, and a record mixing scalar and reference fields is laid out
-// scalars-first, so a derived comparison would order by the wrong field.
-// Recorded in DIVERGENCES.md. Everything below — equality, hashing, and
-// comparison over the BUILT-IN shapes — is unaffected, since equality and
-// hashing do not depend on field order. `option` is a union too, so its
-// comparison goes with them.
-//
 // ADAPTED: `Dictionary` is reached through `open System.Collections.Generic`
 // rather than its fully-qualified name — F++ knows the type but not the
 // namespace path, and an unresolved path becomes a field access that traps.
@@ -52,6 +40,12 @@ let ra3 = { f1 = "bri"; f2 = 68 }
 
 test "rec-eq" (ra1 = ra2)
 test "rec-neq" (not (ra1 = ra3))
+test "rec-compare-0" (compare ra1 ra2 = 0)
+test "rec-compare-order" (compare ra3 ra1 < 0)
+// DECLARATION order decides: f1 first, f2 only as a tie-break
+test "rec-compare-fields" (compare { f1 = "b"; f2 = 1 } { f1 = "a"; f2 = 2 } > 0)
+let sortedRecs = List.sort [ { f1 = "b"; f2 = 9 }; { f1 = "b"; f2 = 2 }; { f1 = "a"; f2 = 5 } ]
+test "rec-sort" (sortedRecs = [ { f1 = "a"; f2 = 5 }; { f1 = "b"; f2 = 2 }; { f1 = "b"; f2 = 9 } ])
 test "rec-hash" (hash ra1 = hash ra2)
 test "rec-in-list" (List.contains ra2 [ ra3; ra1 ])
 
@@ -60,6 +54,10 @@ test "rec-in-list" (List.contains ra2 [ ra3; ra1 ])
 test "union-eq" (Int 1 = Int 1)
 test "union-neq-payload" (not (Int 1 = Int 2))
 test "union-neq-case" (not (Int 1 = Foo 1.0))
+test "union-compare-0" (compare (Int 1) (Int 1) = 0)
+// cases order by DECLARATION order, then by payload
+test "union-compare-case" (compare (Foo 9.0) (Int 0) < 0)
+test "union-compare-payload" (compare (Int 1) (Int 2) < 0)
 test "union-hash" (hash (Int 1) = hash (Int 1))
 test "union-recursive-eq" (Recursive (Foo 3.0) = Recursive (Foo 3.0))
 test "union-recursive-neq" (not (Recursive (Foo 3.0) = Recursive (Foo 4.0)))
@@ -72,6 +70,9 @@ let t3 = Node (Node (Leaf, 1, Leaf), 2, Node (Leaf, 4, Leaf))
 
 test "tree-eq" (t1 = t2)
 test "tree-neq" (not (t1 = t3))
+test "tree-compare-0" (compare t1 t2 = 0)
+test "tree-compare-lt" (compare t1 t3 < 0)
+test "union-nullary-compare" (compare Leaf (Node (Leaf, 1, Leaf)) < 0)
 test "tree-hash" (hash t1 = hash t2)
 
 // ---- tuples, options, lists --------------------------------------------
@@ -84,6 +85,7 @@ test "tuple-hash" (hash (1, "a") = hash (1, "a"))
 test "opt-eq" (Some 3 = Some 3)
 test "opt-none" ((None : int option) = None)
 test "opt-neq" (not (Some 3 = Some 4))
+test "opt-compare-none-first" (compare (None : int option) (Some 0) < 0)
 test "opt-hash" (hash (Some 3) = hash (Some 3))
 test "list-eq" ([1;2;3] = [1;2;3])
 test "list-neq-len" (not ([1;2] = [1;2;3]))
@@ -105,6 +107,22 @@ test "equal-implies-compare-0"
      (List.forall2 (fun (a : obj) (b : obj) -> not (Unchecked.equals a b) || Unchecked.compare a b = 0) sameShape sameShape2)
 
 // ---- as KEYS ------------------------------------------------------------
+
+let mapByRec = Map.ofList [ (ra1, "one"); (ra3, "two") ]
+test "map-record-key" (Map.tryFind ra2 mapByRec = Some "one")
+test "map-record-missing" (Map.tryFind { f1 = "zz"; f2 = 0 } mapByRec = None)
+
+let mapByUnion = Map.ofList [ (Int 1, "i"); (Foo 2.0, "f") ]
+test "map-union-key" (Map.tryFind (Int 1) mapByUnion = Some "i")
+test "map-union-key2" (Map.tryFind (Foo 2.0) mapByUnion = Some "f")
+
+let mapByTuple = Map.ofList [ ((1, "a"), 10); ((2, "b"), 20) ]
+test "map-tuple-key" (Map.tryFind (1, "a") mapByTuple = Some 10)
+
+let setOfRecs = Set.ofList [ ra1; ra3 ]
+test "set-record-contains" (Set.contains ra2 setOfRecs)
+test "set-record-dedup" (Set.count (Set.ofList [ ra1; ra2; ra3 ]) = 2)
+test "set-tree-contains" (Set.contains t2 (Set.ofList [ t1; t3 ]))
 
 let d = Dictionary<RecA, int>()
 d.[ra1] <- 1
