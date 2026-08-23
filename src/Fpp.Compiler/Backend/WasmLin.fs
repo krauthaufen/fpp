@@ -140,6 +140,13 @@ type private St =
       /// type string)), the total size, and that first-ref word index (= size/4
       /// when all-scalar). A one-field record still collapses (newtype) first.
       RecPod : Dict<string, Dict<string, int * string> * int * int>
+      /// unions every case of which is laid out inline: name -> [case, tag].
+      /// The synthetic identity trio these share switches on the tag.
+      UnionFlat : Dict<string, (string * int) list>
+      /// a union CASE whose declared payload is laid out INLINE: case name ->
+      /// (layout incl. the tag word, size, first ref word). Only concrete
+      /// payloads qualify — a `'a` slot stays a uniform word.
+      CasePod : Dict<string, Dict<string, int * string> * int * int>
       /// a STRUCT record's declared fields IN ORDER, as (field, type-name).
       /// Only [<Struct>] records are listed — presence marks a value type the
       /// inline-value layout engine (`layoutOf`) lays out .NET-sequentially;
@@ -3694,6 +3701,12 @@ let private podSynth (st : St) (name : string) : (Dict<string, int * string> * i
 
 /// the inline layout of a record name, synthesizing an unregistered struct
 /// tuple's (podSynth) so a Canon body and its stamped twins agree on offsets.
+/// the inline layout of a union case, when it has one. `$tag` is field 0, the
+/// payload slots are `Item1…` — the same shape a record layout has, so the
+/// same builder, the same tid interning and the same field emitters serve it.
+let private casePodOf (st : St) (case : string) : (Dict<string, int * string> * int * int) option =
+    dictTryFind st.CasePod case
+
 let private podOf (st : St) (name : string) : (Dict<string, int * string> * int * int) option =
     match dictTryFind st.RecPod name with
     | Some v -> Some v
@@ -4738,7 +4751,19 @@ let private patCondBinders (ctx : LowCtx) (pat : Pat) : (VarId * int) list =
     match pat with
     | PCons (h, t) -> List.choose id [ pick HDR h; pick (HDR + 4) t ]
     | PTuple subs -> subs |> List.mapi (fun i p -> pick (HDR + 4 * i) p) |> List.choose id
-    | PCtor (_, _, subs) -> subs |> List.mapi (fun i p -> pick (HDR + 4 * (i + 1)) p) |> List.choose id
+    | PCtor (case, _, subs) ->
+        // an INLINE case's slots are not four bytes apart: read each binder's
+        // offset from the case layout, and skip the ones the layout stores
+        // RAW (a scalar slot holds no pointer to root)
+        (match casePodOf st case with
+         | Some (layout, _, _) when List.length subs = (List.length (dictPairs layout)) - 1 ->
+             subs
+             |> List.mapi (fun i p ->
+                 match dictTryFind layout ("Item" + string (i + 1)) with
+                 | Some (off, kind) when (storLTy kind).IsNone -> pick off p
+                 | _ -> None)
+             |> List.choose id
+         | _ -> subs |> List.mapi (fun i p -> pick (HDR + 4 * (i + 1)) p) |> List.choose id)
     | _ -> []
 
 let private isSafepointNode (e : Expr) : bool =
@@ -5360,6 +5385,56 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | None ->
                 vecAdd st.Warnings ("union case with no tag: " + case)
                 0
+        match casePodOf st case with
+        | Some (layout, size, firstRefWord) ->
+            // INLINE payload: each slot at its own width, the tag in field 0.
+            // A MULTI-field case arrives as one TUPLE argument — spelled out
+            // when the site writes a literal tuple, read element by element
+            // otherwise.
+            let nslots = (List.length (dictPairs layout)) - 1
+            let slotVal (i : int) (kind : string) (e : Expr) : LExpr =
+                match storLTy kind with
+                | Some _ -> storUnbox kind (coreToLowE ctx e)
+                | None -> coreToLowE ctx e
+            let items =
+                match args with
+                | _ when List.length args = nslots ->
+                    args |> List.mapi (fun i a ->
+                        let (off, kind) = optGet (dictTryFind layout ("Item" + string (i + 1)))
+                        match storLTy kind with
+                        | Some (sty, _) -> (off, sty, storValTy sty, false, slotVal i kind a)
+                        | None -> (off, W, W, true, coreToLowE ctx a))
+                | [ ETuple xs ] when List.length xs = nslots ->
+                    xs |> List.mapi (fun i a ->
+                        let (off, kind) = optGet (dictTryFind layout ("Item" + string (i + 1)))
+                        match storLTy kind with
+                        | Some (sty, _) -> (off, sty, storValTy sty, false, slotVal i kind a)
+                        | None -> (off, W, W, true, coreToLowE ctx a))
+                | [ one ] when nslots > 1 ->
+                    // a tuple VALUE: bind it, then copy its words into the
+                    // inline slots (unboxing whatever the slot stores raw)
+                    let tp = freshTmp ctx
+                    let read i = LLoad (W, LGet (wReg tp), HDR + 4 * i)
+                    (0, W, W, false, LDo ([ LSet (wReg tp, coreToLowE ctx one) ], LConstW tag))
+                    :: (List.init nslots (fun i ->
+                            let (off, kind) = optGet (dictTryFind layout ("Item" + string (i + 1)))
+                            match storLTy kind with
+                            | Some (sty, _) -> (off, sty, storValTy sty, false, storUnbox kind (read i))
+                            | None -> (off, W, W, true, read i)))
+                | _ -> []
+            if List.isEmpty items && nslots > 0 then
+                let kinds = RKRaw :: List.map (refKindOfExprC st) args
+                lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args)
+            else
+                let tagOff = (optGet (dictTryFind layout "$tag") |> fun (off, _) -> off)
+                // the tuple-read form already carries the tag store as its
+                // first item (it has to bind the tuple first)
+                let items =
+                    match items with
+                    | (0, _, _, _, pre) :: rest -> (tagOff, W, W, false, pre) :: rest
+                    | _ -> (tagOff, W, W, false, LConstW tag) :: items
+                lowPodBuildAt ctx ("case:" + case) (cidCase st case) layout size firstRefWord items
+        | _ ->
         // slot 0 is the raw tag word; the payload follows. A concrete payload
         // gets a ref-map so its unboxed scalars are skipped by the collector.
         let kinds = RKRaw :: List.map (refKindOfExprC st) args
@@ -6909,10 +6984,15 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
 and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
     let cid = cidRec ctx.LSt name
     let (podLayout, size, firstRefWord) = optGet (podOf ctx.LSt name)
-    let bs = freshTmp ctx
     // an UNDECLARED (synthesized) name has no class id, so key its type-id by
     // the name — two different synthesized tuples must not share one tid
     let tidKey = if cid >= 0 then "inl:" + string cid else "inl@" + name
+    lowPodBuildAt ctx tidKey cid podLayout size firstRefWord items
+
+/// the same builder over an EXPLICIT layout — a union case brings its own
+/// (its tid is keyed by the CASE, not by the class id its whole union shares).
+and private lowPodBuildAt (ctx : LowCtx) (tidKey : string) (cid : int) (podLayout : Dict<string, int * string>) (size : int) (firstRefWord : int) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
+    let bs = freshTmp ctx
     let alloc = if gc then LCall ("$fpalloc", [ LConstW (podTid ctx.LSt tidKey podLayout size firstRefWord) ]) else LAlloc (LConstW size)
     let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
     let scalars = items |> List.filter (fun (_, _, _, r, _) -> not r)
@@ -7179,6 +7259,60 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
                 [ LBreakIf (fail, LPrim (NeW, [ lowHeaderCid (wReg scrutReg); LConstW cid ])) ]
             else []
         let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, HDR); LConstW tag ]))
+        // an INLINE payload reads each slot at its own width. A binder over a
+        // wide slot becomes a TYPED local (VarScalar), so the value never
+        // takes a box on the way out of the match either.
+        match casePodOf st case with
+        | Some (layout, _, _) ->
+            // INLINE payload. A multi-field case's payload is ONE sub-pattern
+            // — the tuple it is declared as — so its elements are the slot
+            // patterns; a binder over the payload as a WHOLE is the only shape
+            // that still needs the tuple built.
+            let nslots = (List.length (dictPairs layout)) - 1
+            let slotPats =
+                if List.length subs = nslots then Some subs
+                else
+                    match subs with
+                    | [ PTuple ps ] when List.length ps = nslots -> Some ps
+                    | _ -> None
+            let slotOf (i : int) = optGet (dictTryFind layout ("Item" + string (i + 1)))
+            let readSlot (i : int) : LExpr =
+                let (off, kind) = slotOf i
+                match storLTy kind with
+                | Some (sty, _) ->
+                    let vty = storValTy sty
+                    let fv = freshTmpT ctx vty
+                    LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, sc, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
+                | None -> LLoad (W, sc, off)
+            match slotPats with
+            | Some ps ->
+                cidTest @ tagTest :: List.concat (ps |> List.mapi (fun i sub ->
+                    let (off, kind) = slotOf i
+                    match storLTy kind, sub with
+                    // the binder takes the slot's own machine type only when
+                    // its OWN scheme agrees: an or-pattern binder is typed `?`
+                    // and rides the conditional-rooting path as a word
+                    | Some (sty, _), PVar (v, sch) when
+                            (match storValTy sty with F64 | I64 -> true | _ -> false)
+                            && scalarLTy sch.Body = Some (storValTy sty) ->
+                        let vty = storValTy sty
+                        let id = freshReg ctx (key v)
+                        vecSet ctx.RegTys id vty
+                        dictSet ctx.VarScalar (key v) vty
+                        [ LSet ({ Id = id; RTy = vty }, LLoad (sty, sc, off)) ]
+                    | _ ->
+                        let t = freshTmp ctx
+                        LSet (wReg t, readSlot i) :: lowPatTest ctx t fail sub))
+            | None when List.length subs = 1 && nslots > 1 ->
+                // the payload is bound WHOLE (`| Rect pair ->`): materialise
+                // the tuple the flat slots stand for, then match against it
+                let elems = List.init nslots readSlot
+                let t = freshTmp ctx
+                cidTest @ tagTest
+                :: [ LSet (wReg t, lowObjR ctx CID_TUPLE 0 elems None []) ]
+                @ List.concat (subs |> List.map (fun sub -> lowPatTest ctx t fail sub))
+            | None -> cidTest @ [ tagTest ]
+        | _ ->
         cidTest @ tagTest :: List.concat (subs |> List.mapi (fun i sub ->
             let t = freshTmp ctx
             LSet (wReg t, LLoad (W, sc, HDR + 4 * (i + 1))) :: lowPatTest ctx t fail sub))
@@ -8519,7 +8653,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
           Captures = dictNew (); LamWits = dictNew ()
           RecFields = dictNew (); ClassNames = dictNew (); RecBase = dictNew (); RecFieldTypes = dictNew (); RecPod = dictNew (); RecFieldTys = dictNew (); Collapse = dictNew (); UnionTag = dictNew (); UnionArity = dictNew (); EnumConst = dictNew ()
-          ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew ()
+          ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
@@ -8532,6 +8666,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let mutable nextCid = CID_FIRST_USER
     /// per-union next tag, so a re-declaration appends (see DUnion below)
     let unionNextTag = dictNew<string, int> ()
+    // enum TYPE names: a slot declared at one holds a RAW int, never a pointer
+    let enumTypeNames = dictNew<string, bool> ()
     for d in decls0 do
         match d with
         | DRecord (n, _, fs, _) ->
@@ -8554,7 +8690,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.UnionArity cn ar
                 dictSet st.CaseClass cn cid)
             dictSet unionNextTag uname (start + List.length cs)
-        | DEnum (_, cs) -> for c, v in cs do dictSet st.EnumConst c v
+        | DEnum (en, cs) ->
+            // the enum's own NAME as well: a slot declared at an enum type
+            // holds a RAW int, so it must never be laid out as a reference
+            dictSet enumTypeNames en true
+            for c, v in cs do dictSet st.EnumConst c v
         | _ -> ()
     // single-field-collapse (repr(T)): a one-field record travels as its field
     // (no heap object), UNLESS it is mutated, type-tested/cast, or a CLASS (a
@@ -8617,6 +8757,39 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
             if not (List.isEmpty scalars) then
                 dictSet st.RecPod n (layoutDecl fs)
+        // a union whose EVERY case has a concrete payload gets the inline
+        // treatment: the tag rides field 0 and each payload slot its own
+        // width, so a float or int64 payload stops being a pointer to a box.
+        // All-or-nothing per union, because the synthetic comparison the
+        // cases share switches on the tag and must know every layout.
+        | DUnionFields (uname, cs) ->
+            // a slot may be laid out when its type is a KNOWN scalar, or when
+            // it is definitely a POINTER. `?` (a tuple, array or function
+            // type) is always a pointer; a named type is one unless it is an
+            // enum (a raw int) or collapses to a scalar. A type VARIABLE never
+            // is — its value may be a raw scalar or a pointer at runtime, and
+            // only a uniform word can carry both.
+            let slotOk (t : string) =
+                if t.StartsWith "'" then false
+                elif t = "?" then true
+                else
+                    let r = storKindRes st t
+                    (storLTy r).IsSome
+                    || ((dictTryFind enumTypeNames r).IsNone && not (rawScalarName r))
+            let concrete (tys : string list) = tys |> List.forall slotOk
+            let wide (tys : string list) =
+                tys |> List.exists (fun t ->
+                    match storLTy t with
+                    | Some (sty, _) -> (match sty with F64 | I64 -> true | _ -> false)
+                    | None -> false)
+            if (cs |> List.forall (fun (_, tys) -> concrete tys))
+               && (cs |> List.exists (fun (_, tys) -> wide tys)) then
+                let flat = vecNew<string * int> ()
+                for cn, tys in cs do
+                    let fs2 = ("$tag", "int") :: (tys |> List.mapi (fun i t -> "Item" + string (i + 1), t))
+                    dictSet st.CasePod cn (layoutDecl fs2)
+                    vecAdd flat (cn, (match dictTryFind st.UnionTag cn with Some t -> t | None -> 0))
+                dictSet st.UnionFlat uname (vecToList flat)
         | _ -> ()
     // record every STRUCT record's ordered declared fields for the inline-value
     // layout engine (`layoutOf`). Value types only — reference records stay a
@@ -8647,6 +8820,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 for cn, ar in cs do
                     match dictTryFind st.CaseClass cn with
                     | Some cid ->
+                        // an INLINE case interns the same tid its allocation
+                        // does, or a `:?` on it would look up a shape nobody
+                        // builds
+                        (match casePodOf st cn with
+                         | Some (layout, size, firstRefWord) ->
+                             vecAdd st.TidCid (podTid st ("case:" + cn) layout size firstRefWord, cid)
+                         | None -> ())
                         vecAdd st.TidCid (gcTid st ("s:" + string cid + ":" + string (1 + ar) + ":1") (HDR + 4 * (1 + ar)) FK_TAGGED 2, cid)
                     | None -> ()
             | _ -> ()
@@ -8993,9 +9173,22 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                  | Some (layout, _, _), Some cid -> Some (cid, fs, layout)
                  | _ -> None)
             | _ -> None)
+    // every INLINE-payload union, by the class id its cases share: the trio
+    // below switches on the tag to reach each case's own layout
+    let unionTrio =
+        dictPairs st.UnionFlat
+        |> List.choose (fun (uname, variants) ->
+            match dictTryFind st.ClassId uname with
+            | Some cid -> Some (cid, variants)
+            | None -> None)
+        |> List.sortWith (fun (a, _) (b, _) -> if a < b then 0 - 1 elif a > b then 1 else 0)
     if gc then
         tyFunc m "$lfn2" [ "i32"; "i32" ] [ "i32" ]
         for cid, _, _ in podTrio do
+            declFn m ("$rcmp" + string cid) "$lfn2"
+            declFn m ("$reqv" + string cid) "$lfn2"
+            declFn m ("$rhash" + string cid) "$lfn2"
+        for cid, _ in unionTrio do
             declFn m ("$rcmp" + string cid) "$lfn2"
             declFn m ("$reqv" + string cid) "$lfn2"
             declFn m ("$rhash" + string cid) "$lfn2"
@@ -9094,6 +9287,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // CompareTo still wins the slot below
     if gc && st.NSlots > 0 then
         for cid, _, _ in podTrio do
+            vtRows.[cid * st.NSlots + 0] <- tblIdx m ("$reqv" + string cid)
+            vtRows.[cid * st.NSlots + 1] <- tblIdx m ("$rhash" + string cid)
+            vtRows.[cid * st.NSlots + 2] <- tblIdx m ("$rcmp" + string cid)
+        for cid, _ in unionTrio do
             vtRows.[cid * st.NSlots + 0] <- tblIdx m ("$reqv" + string cid)
             vtRows.[cid * st.NSlots + 1] <- tblIdx m ("$rhash" + string cid)
             vtRows.[cid * st.NSlots + 2] <- tblIdx m ("$rcmp" + string cid)
@@ -9204,10 +9401,10 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // the per-record identity trio declared beside rtDeclsLin, in the SAME
     // order: the function and code sections are positional
     if gc then
-        for cid, fs, layout in podTrio do
-            let fields =
-                fs |> List.map (fun (fnm, ty) ->
-                    (match dictTryFind layout fnm with Some (off, _) -> off | None -> HDR), ty)
+        // the field emitters are shared by the RECORD trio below and the UNION
+        // trio after it (which switches on the tag, then compares that case's
+        // own inline slots)
+        if true then
             // the load instruction and signedness a field's storage wants
             let loadOf (ty : string) : string =
                 match storLTy ty with
@@ -9297,35 +9494,111 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     (lg f "$a"; ic f off; ins f "i32.add"; mem f (loadOf ty); ls f "$r")
             let locals (f : Fn) =
                 local f "$r" "i32"; local f "$x" "i32"; local f "$y" "i32"; local f "$h" "i32"
+                local f "$ta" "i32"; local f "$tb" "i32"
                 local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
                 localsDone f
-            // CompareTo: the first field that differs decides, in DECLARATION
-            // order (which is the layout order)
-            let fc = beginFn m [ "$a"; "$b" ]
-            locals fc
-            for off, ty in fields do
+            // ---- the RECORD trio -------------------------------------------
+            for cid, fs, layout in podTrio do
+             let fields =
+                fs |> List.map (fun (fnm, ty) ->
+                    (match dictTryFind layout fnm with Some (off, _) -> off | None -> HDR), ty)
+             // CompareTo: the first field that differs decides, in DECLARATION
+             // order (which is the layout order)
+             let fc = beginFn m [ "$a"; "$b" ]
+             locals fc
+             for off, ty in fields do
                 cmpField fc off ty
                 lg fc "$r"; ifE fc; lg fc "$r"; ins fc "return"; endB fc
-            ic fc 0
-            endFn fc
-            // Equals
-            let fe = beginFn m [ "$a"; "$b" ]
-            locals fe
-            for off, ty in fields do
+             ic fc 0
+             endFn fc
+             // Equals
+             let fe = beginFn m [ "$a"; "$b" ]
+             locals fe
+             for off, ty in fields do
                 eqField fe off ty
                 lg fe "$r"; ins fe "i32.eqz"; ifE fe; ic fe 0; ins fe "return"; endB fe
-            ic fe 1
-            endFn fe
-            // GetHashCode — rides the two-parameter indirect signature the
-            // trio shares, and ignores the second word
-            let fh = beginFn m [ "$a"; "$b" ]
-            locals fh
-            ic fh 0; ls fh "$h"
-            for off, ty in fields do
+             ic fe 1
+             endFn fe
+             // GetHashCode — rides the two-parameter indirect signature the
+             // trio shares, and ignores the second word
+             let fh = beginFn m [ "$a"; "$b" ]
+             locals fh
+             ic fh 0; ls fh "$h"
+             for off, ty in fields do
                 hashField fh off ty
                 lg fh "$h"; ic fh 31; ins fh "i32.mul"; lg fh "$r"; ins fh "i32.add"; ls fh "$h"
-            lg fh "$h"
-            endFn fh
+             lg fh "$h"
+             endFn fh
+            // ---- the UNION trio: tag first, then that case's inline slots ---
+            // A union's cases share one class id, so one function serves them
+            // all and switches on the tag. Ordering is by tag (declaration
+            // order), then field by field — F#'s rule, and the one the generic
+            // word walk used to give when every payload was a boxed pointer.
+            for cid, variants in unionTrio do
+             let tagOff (cn : string) =
+                match casePodOf st cn with
+                | Some (layout, _, _) -> (match dictTryFind layout "$tag" with Some (o, _) -> o | None -> HDR)
+                | None -> HDR
+             let slotsOf (cn : string) =
+                match casePodOf st cn with
+                | Some (layout, _, _) ->
+                    dictPairs layout
+                    |> List.filter (fun (k, _) -> k <> "$tag")
+                    |> List.sortWith (fun (_, (o1, _)) (_, (o2, _)) -> if o1 < o2 then 0 - 1 elif o1 > o2 then 1 else 0)
+                    |> List.map (fun (_, v) -> v)
+                | None -> []
+             let readTags (f : Fn) =
+                lg f "$a"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$ta"
+                lg f "$b"; ic f HDR; ins f "i32.add"; mem f "i32.load"; ls f "$tb"
+             // CompareTo
+             let fc = beginFn m [ "$a"; "$b" ]
+             locals fc
+             readTags fc
+             lg fc "$ta"; lg fc "$tb"; ins fc "i32.ne"
+             ifE fc
+             lg fc "$ta"; lg fc "$tb"; ins fc "i32.gt_s"; lg fc "$ta"; lg fc "$tb"; ins fc "i32.lt_s"; ins fc "i32.sub"; ins fc "return"
+             endB fc
+             for cn, tg in variants do
+                if not (List.isEmpty (slotsOf cn)) then
+                    lg fc "$ta"; ic fc tg; ins fc "i32.eq"
+                    ifE fc
+                    for off, ty in slotsOf cn do
+                        cmpField fc off ty
+                        lg fc "$r"; ifE fc; lg fc "$r"; ins fc "return"; endB fc
+                    endB fc
+             ic fc 0
+             endFn fc
+             // Equals
+             let fe = beginFn m [ "$a"; "$b" ]
+             locals fe
+             readTags fe
+             lg fe "$ta"; lg fe "$tb"; ins fe "i32.ne"
+             ifE fe; ic fe 0; ins fe "return"; endB fe
+             for cn, tg in variants do
+                if not (List.isEmpty (slotsOf cn)) then
+                    lg fe "$ta"; ic fe tg; ins fe "i32.eq"
+                    ifE fe
+                    for off, ty in slotsOf cn do
+                        eqField fe off ty
+                        lg fe "$r"; ins fe "i32.eqz"; ifE fe; ic fe 0; ins fe "return"; endB fe
+                    endB fe
+             ic fe 1
+             endFn fe
+             // GetHashCode
+             let fh = beginFn m [ "$a"; "$b" ]
+             locals fh
+             lg fh "$a"; ic fh HDR; ins fh "i32.add"; mem fh "i32.load"; ls fh "$ta"
+             lg fh "$ta"; ls fh "$h"
+             for cn, tg in variants do
+                if not (List.isEmpty (slotsOf cn)) then
+                    lg fh "$ta"; ic fh tg; ins fh "i32.eq"
+                    ifE fh
+                    for off, ty in slotsOf cn do
+                        hashField fh off ty
+                        lg fh "$h"; ic fh 31; ins fh "i32.mul"; lg fh "$r"; ins fh "i32.add"; ls fh "$h"
+                    endB fh
+             lg fh "$h"
+             endFn fh
     // top-level function bodies — all through LowIR (Core/LowIR.fs); an
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do

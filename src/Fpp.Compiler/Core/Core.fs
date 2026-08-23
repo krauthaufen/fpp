@@ -95,6 +95,11 @@ type Decl =
     /// name is what the wasm export is called.
     | DExport of VarId * string
     | DUnion of string * string list * (string * int) list
+    /// the DECLARED payload types of each case, flattened through a tuple
+    /// payload: `(unionName, [ caseName, [ typeName … ] ])`. Carried beside
+    /// DUnion rather than inside it so an older IR still reads (a union with
+    /// no entry simply keeps uniform-word payload slots).
+    | DUnionFields of string * (string * string list) list
     /// name, type params, fields as (name, kind "f|s|l|i|r"), isStruct
     | DRecord of string * string list * (string * string) list * bool
     /// enum name and its cases as (case, integer value). An enum value IS
@@ -218,6 +223,9 @@ let printDecl (d : Decl) : string =
     | DUnion (n, ps, cases) ->
         "union " + n + (if List.isEmpty ps then "" else "<" + String.concat "," ps + ">")
         + " = " + String.concat " | " (cases |> List.map (fun (c, a) -> c + "/" + string a))
+    | DUnionFields (n, cs) ->
+        "unionfields " + n + " = "
+        + String.concat " | " (cs |> List.map (fun (c, tys) -> c + ":" + String.concat "*" tys))
     | DEnum (n, cs) ->
         "enum " + n + " = " + String.concat " | " (cs |> List.map (fun (c, v) -> c + "=" + string v))
     | DInterface (n, ms) ->

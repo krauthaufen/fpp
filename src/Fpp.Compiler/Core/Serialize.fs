@@ -175,6 +175,8 @@ let private encDecl (d : Decl) : Sx =
     | DLet (r, v, s, e) -> L [ A "dl"; A (if r then "1" else "0"); encVarId v; encScheme s; encExpr e ]
     | DUnion (n, ps, cs) ->
         L [ A "du"; S n; L (List.map S ps); L (cs |> List.map (fun (c, a) -> L [ S c; A (string a) ])) ]
+    | DUnionFields (n, cs) ->
+        L [ A "duf"; S n; L (cs |> List.map (fun (c, tys) -> L [ S c; L (List.map S tys) ])) ]
     | DRecord (n, ps, fs, st) ->
         L [ A "dr"; S n; L (List.map S ps)
             L (fs |> List.map (fun (f, k) -> L [ S f; A k ])); A (if st then "1" else "0") ]
@@ -339,6 +341,13 @@ let private decDecl (x : Sx) : Decl option =
     | L [ A "du"; S n; L ps; L cs ] ->
         Some (DUnion (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
                       cs |> List.choose (fun c -> match c with L [ S cn; A a ] -> Some (cn, int a) | _ -> None)))
+    | L [ A "duf"; S n; L cs ] ->
+        Some (DUnionFields (n,
+                            cs |> List.choose (fun c ->
+                                match c with
+                                | L [ S cn; L tys ] ->
+                                    Some (cn, tys |> List.choose (fun t -> match t with S x -> Some x | _ -> None))
+                                | _ -> None)))
     | L [ A "dr"; S n; L ps; L fs; A st ] ->
         Some (DRecord (n, ps |> List.choose (fun p -> match p with S s -> Some s | _ -> None),
                        fs |> List.choose (fun f -> match f with L [ S fn; A k ] -> Some (fn, k) | _ -> None),

@@ -4291,6 +4291,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> Option.map (fun t ->
                     let hasPayload = nodesOf c |> List.exists (fun x -> isTypeKind x.NodeKind)
                     t.Text, (if hasPayload then 1 else 0)))
+        // the DECLARED payload types of each case, flattened through a tuple
+        // payload (`C of string * int64` carries two slots). The backend lays
+        // a case out INLINE from these — which is why they have to be the
+        // declared types and not the ones a construction site happens to
+        // supply: a generic case's `'a` slot stays a uniform word everywhere.
+        let casePayloadNodes (c : GreenNode) : GreenNode list =
+            match nodesOf c |> List.filter (fun x -> isTypeKind x.NodeKind) with
+            | [ one ] when one.NodeKind = TupleType ->
+                nodesOf one |> List.filter (fun x -> isTypeKind x.NodeKind)
+            | many -> many
         // `| Leaf = 0uy` on every case makes this an enum: the cases are
         // integer constants, not constructors
         let enumCases =
@@ -4312,11 +4322,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // here would freeze a `'a` field as boxed before anyone knows what
         // it is instantiated at; the backend derives the kind once the type
         // is concrete.
-        let fieldKind (f : GreenNode) : string =
-            // a field at an instantiated generic renders its FULL name:
-            // `Inner : KV<int,'a>` is "KV$<int.'a>". The last-ident
-            // shorthand named the field after its final type ARGUMENT,
-            // which classified a `KV<int,int>` field as an int
+        // a type NODE's recorded name — shared by record fields and union case
+        // payloads. A field at an instantiated generic renders its FULL name:
+        // `Inner : KV<int,'a>` is "KV$<int.'a>". The last-ident shorthand
+        // named the field after its final type ARGUMENT, which classified a
+        // `KV<int,int>` field as an int
+        let fieldTyName (tn0 : GreenNode) : string =
             let rec renderTy (tn : GreenNode) : string =
                 let argNodes = nodesOf tn |> List.filter (fun x -> isTypeKind x.NodeKind)
                 if tn.NodeKind = VarType then
@@ -4337,8 +4348,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      | Some t -> t.Text
                      | None -> "?")
                 else "?"     // functions, tuples, arrays: uniform REFS
+            renderTy tn0
+
+        let fieldKind (f : GreenNode) : string =
             match nodesOf f |> List.tryFind (fun x -> isTypeKind x.NodeKind) with
-            | Some tn -> renderTy tn
+            | Some tn -> fieldTyName tn
             | None -> "?"
         let recordFields =
             nodesOf n
@@ -4710,6 +4724,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some nm -> cn, ar + nm
                     | None -> cn, ar)
             vecAdd decls (DUnion (name, tyParams, cases2))
+            let payloadTys =
+                caseNodes
+                |> List.choose (fun c ->
+                    tokensOf c
+                    |> List.tryFind (fun t -> t.Kind = Ident)
+                    |> Option.map (fun t -> t.Text, casePayloadNodes c |> List.map fieldTyName))
+            if payloadTys |> List.exists (fun (_, tys) -> not (List.isEmpty tys)) then
+                vecAdd decls (DUnionFields (name, payloadTys))
         elif not (List.isEmpty recordFields) then
             if pendingStruct then vecAdd structNames name
             vecAdd decls (DRecord (name, tyParams, recordFields, pendingStruct))
