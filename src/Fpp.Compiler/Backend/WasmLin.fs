@@ -4916,14 +4916,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EPrim ("||", [ a; b ]) ->
         let r = freshTmp ctx
         LDo ([ LIf (coreToLowE ctx a, [ LSet (wReg r, lowInt 1) ], [ LSet (wReg r, coreToLowE ctx b) ]) ], LGet (wReg r))
-    // float AND float32 arithmetic: float32 rides an f64 box in this backend, so
-    // an `s`-suffixed op lowers exactly like its `f` sibling (the f32 rounding
-    // happens only when a value is demoted into a float32 slot).
+    // float and float32 arithmetic. A float32 is its OWN value set: every
+    // operation answers the single-precision result, which is what the
+    // rounding below makes true — computing in double and rounding once to
+    // single is exactly the single-rounded answer for + - * / (53 bits is
+    // more than the 2*24+2 a double rounding needs to be safe). Without it
+    // `0.1f + 0.2f = 0.3f` was FALSE here and true in .NET, and every
+    // float32 result carried digits a single cannot hold.
     | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
+        let single = op.EndsWith "s"
         let fop = match op.Substring (0, op.Length - 1) with | "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
-        lowBoxF ctx (LPrim (fop, [ fa; fb ]))
+        let raw = LPrim (fop, [ fa; fb ])
+        lowBoxF ctx (if single then LPrim (PromF, [ LPrim (DemF, [ raw ]) ]) else raw)
     | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)

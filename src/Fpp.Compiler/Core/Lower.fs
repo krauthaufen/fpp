@@ -1315,7 +1315,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), [ arg ]))
                          | None -> None
                      let routed =
-                         if t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
+                         if t.Text = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
+                         elif (t.Text = "float32" || t.Text = "single") && k = "t" then viaPrelude "FloatFmt.OfStrS"
+                         elif t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
                          elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
                          else None
                      (match routed with

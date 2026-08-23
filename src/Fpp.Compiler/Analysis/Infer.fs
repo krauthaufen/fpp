@@ -3378,7 +3378,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                                         | 's' -> tString
                                                         | 'c' -> tChar
                                                         | 'b' -> tBool
-                                                        | 'f' | 'e' | 'E' | 'g' | 'G' -> tFloat
+                                                        // a float hole takes EITHER width:
+                                                        // F# renders a float32 with `%f`
+                                                        // too, and float32 is its own type
+                                                        // here, so pinning the hole to
+                                                        // `float` rejected it
+                                                        | 'f' | 'e' | 'E' | 'g' | 'G' -> st.Fresh ()
                                                         | _ -> st.Fresh ()   // %A and %O take anything
                                                     vecAdd opKindsRaw (ft.Offset + 1 + i, ty)
                                                     // `%A` renders through the Show class, so the

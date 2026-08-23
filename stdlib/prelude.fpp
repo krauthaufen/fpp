@@ -6982,6 +6982,43 @@ type FloatFmt =
             let e = a.dp - 1
             FloatFmt.Render a (e < 0 - 4 || e >= 17)
 
+    /// a float32 IS its own value set: the shortest digits that read back as
+    /// the same SINGLE, which is nine at most (a double needs seventeen).
+    static member ShortestS (v : float) : Dec =
+        let mutable len = 9
+        let mutable found = false
+        let mutable n = 1
+        while not found && n <= 9 do
+            let cand = FloatFmt.OfFloat v
+            FloatFmt.RoundTo cand n
+            let back = float (float32 (FloatFmt.ToFloat (FloatFmt.Parse (FloatFmt.Render cand false))))
+            if back = v then
+                len <- n
+                found <- true
+            n <- n + 1
+        let ans = FloatFmt.OfFloat v
+        FloatFmt.RoundTo ans len
+        ans
+
+    /// .NET's `Single.ToString ()`: the shortest single round-trip digits, in
+    /// the exponent form when the exponent leaves [-4, 9) — the same rule as
+    /// the double printer with single's precision in place of seventeen.
+    static member ToStrS (v : float) : string =
+        if v <> v then "NaN"
+        elif v = infinity then "Infinity"
+        elif v = 0.0 - infinity then "-Infinity"
+        elif v = 0.0 then (if BitConverter.DoubleToInt64Bits v < 0L then "-0" else "0")
+        else
+            let a = FloatFmt.ShortestS v
+            let e = a.dp - 1
+            FloatFmt.Render a (e < 0 - 4 || e >= 9)
+
+    /// the single a string spells, correctly rounded (parse exactly, then one
+    /// rounding to single — two roundings through a sloppy parser are not the
+    /// same value)
+    static member OfStrS (s : string) : float =
+        float (float32 (FloatFmt.OfStr s))
+
     /// `%A`'s own float format: TEN significant digits, C's `%g` choice
     /// between fixed and exponent (lowercase `e`), and a trailing `.0` when
     /// the result would otherwise read as an integer — `1.0`, `1e+14`,
