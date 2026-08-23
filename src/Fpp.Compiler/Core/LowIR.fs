@@ -20,6 +20,9 @@ type LTy =
     | W
     | I64
     | F64
+    /// a SINGLE. float32 is its own primitive type, so it is its own machine
+    /// type too: f32 locals, f32 arithmetic, and a 4-byte slot in memory.
+    | F32
     | I8
     | I16
 
@@ -47,6 +50,9 @@ type LOp =
     // double ops
     | AddF | SubF | MulF | DivF | NegF | AbsF | SqrtF | TruncF
     | EqF  | NeF  | LtF  | GtF   | LeF | GeF
+    // single ops — the same ALU one width down
+    | AddS | SubS | MulS | DivS | NegS | AbsS | SqrtS
+    | EqS  | NeS  | LtS  | GtS   | LeS | GeS
     // conversions between machine types
     | WToL | LToW | WToF | FToW | LToF | FToL
     // the UNSIGNED widenings. Without them `float 4000000000u` came out

@@ -3994,12 +3994,13 @@ let rec private shapeOfType (t : Type) : CmpShape =
     | _ -> ShOther
 
 // the unboxed local type for a monomorphic scalar binding, or None to keep it
-// a tagged word. Mirrors flatScalarTy: only the 64-bit boxed scalars gain (int/
-// bool/char are already unboxed words; float32/16 still ride an f64 box).
+// a tagged word (int/bool/char are already unboxed words).
 let private scalarLTy (t : Type) : LTy option =
     match prune t with
-    // float32 rides an f64 box, so an unboxed float32 local/param is just an f64
-    | TCon (("float" | "double" | "float32" | "single"), _) -> Some F64
+    | TCon (("float" | "double"), _) -> Some F64
+    // a float32 is its OWN machine type: an f32 local, not a double that
+    // happens to hold a single-representable value
+    | TCon (("float32" | "single"), _) -> Some F32
     | TCon (("int64" | "uint64"), _) -> Some I64
     | _ -> None
 
@@ -4924,12 +4925,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // `0.1f + 0.2f = 0.3f` was FALSE here and true in .NET, and every
     // float32 result carried digits a single cannot hold.
     | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "+"; "-"; "*"; "/" ] ->
+        let single = op.EndsWith "s"
+        let bop = op.Substring (0, op.Length - 1)
+        if single then
+            // SINGLE arithmetic, in single: the operands are f32 and so is the
+            // result. (Boundary promote/demote pairs cancel, so a chain of
+            // float32 work stays in f32 registers throughout.)
+            let sa = flatUnbox F32 (coreToLowE ctx a)
+            let sb = flatUnbox F32 (coreToLowE ctx b)
+            let sop = match bop with | "+" -> AddS | "-" -> SubS | "*" -> MulS | _ -> DivS
+            flatBox ctx F32 (LPrim (sop, [ sa; sb ]))
+        else
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
-        let single = op.EndsWith "s"
-        let fop = match op.Substring (0, op.Length - 1) with | "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
-        let raw = LPrim (fop, [ fa; fb ])
-        lowBoxF ctx (if single then LPrim (PromF, [ LPrim (DemF, [ raw ]) ]) else raw)
+        let fop = match bop with | "+" -> AddF | "-" -> SubF | "*" -> MulF | _ -> DivF
+        lowBoxF ctx (LPrim (fop, [ fa; fb ]))
     | EPrim (op, [ a; b ]) when (op.EndsWith "f" || op.EndsWith "s") && List.contains (op.Substring (0, op.Length - 1)) [ "<"; ">"; "<="; ">="; "="; "<>" ] ->
         let fa = lowUnboxF (coreToLowE ctx a)
         let fb = lowUnboxF (coreToLowE ctx b)
@@ -7071,9 +7081,27 @@ and private lowUnboxI (p : LExpr) : LExpr =
 // box/unbox picked by the flat-scalar type (F64 vs I64) — for locals/ABI, where
 // only the 64-bit scalars are unboxed.
 and private flatBox (ctx : LowCtx) (ty : LTy) (v : LExpr) : LExpr =
-    match ty with F64 -> lowBoxF ctx v | _ -> lowBoxI ctx v
+    match ty with
+    | F64 -> lowBoxF ctx v
+    // a float32 in a UNIFORM slot rides the ordinary float box, widened: the
+    // widening is exact, so one box shape serves both and the runtime
+    // comparator needs no new class id
+    | F32 -> lowBoxF ctx (LPrim (PromF, [ v ]))
+    | _ -> lowBoxI ctx v
 and private flatUnbox (ty : LTy) (p : LExpr) : LExpr =
-    match ty with F64 -> lowUnboxF p | _ -> lowUnboxI p
+    match ty with
+    | F64 -> lowUnboxF p
+    | F32 -> demoteS (lowUnboxF p)
+    | _ -> lowUnboxI p
+
+/// f32 <- f64, with the promote/demote pair cancelled: `DemF (PromF x)` is
+/// x exactly (widening a single loses nothing), so a value that never left
+/// single precision costs no instructions at the boundary.
+and private demoteS (e : LExpr) : LExpr =
+    match e with
+    | LPrim (PromF, [ inner ]) -> inner
+    | LDo (stmts, tail) -> LDo (stmts, demoteS tail)
+    | _ -> LPrim (DemF, [ e ])
 
 // a raw packed slot value -> the uniform tagged word, per element KIND: a wide
 // scalar boxes; a narrow int sign/zero-extends then tags; float32 widens its
@@ -7678,6 +7706,10 @@ let private lowOpIns (op : LOp) : string =
     | PromF -> "f64.promote_f32"
     | DemF -> "f32.demote_f64"
     | Bits2F -> "f32.reinterpret_i32"
+    | AddS -> "f32.add" | SubS -> "f32.sub" | MulS -> "f32.mul" | DivS -> "f32.div"
+    | NegS -> "f32.neg" | AbsS -> "f32.abs" | SqrtS -> "f32.sqrt"
+    | EqS -> "f32.eq" | NeS -> "f32.ne" | LtS -> "f32.lt" | GtS -> "f32.gt"
+    | LeS -> "f32.le" | GeS -> "f32.ge"
     | Bits2D -> "f64.reinterpret_i64"
     | D2Bits -> "i64.reinterpret_f64"
     | F2Bits -> "i32.reinterpret_f32"
@@ -7688,10 +7720,12 @@ let private wtyName (ty : LTy) : string =
     match ty with
     | I64 -> "i64"
     | F64 -> "f64"
+    | F32 -> "f32"
     | _ -> "i32"
 
 let private loadIns (ty : LTy) : string =
     match ty with
+    | F32 -> "f32.load"
     | F64 -> "f64.load"
     | I64 -> "i64.load"
     | I8 -> "i32.load8_u"
@@ -7700,6 +7734,7 @@ let private loadIns (ty : LTy) : string =
 
 let private storeIns (ty : LTy) : string =
     match ty with
+    | F32 -> "f32.store"
     | F64 -> "f64.store"
     | I64 -> "i64.store"
     | I8 -> "i32.store8"
