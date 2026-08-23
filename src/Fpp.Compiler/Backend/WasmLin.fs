@@ -6398,7 +6398,16 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | EApp (g, args) -> lowApply ctx (coreToLowE ctx g) args
     | EMatch (scrut, clauses) ->
         let sc = freshTmp ctx
-        let mr = freshTmp ctx
+        // a match whose arms all answer a 64-bit scalar keeps the value RAW
+        // across the join, exactly as an `if` does: the word result register
+        // made every arm box and the consumer unbox again
+        let joinTy =
+            match printConOf ctx.LSt e with
+            | "float" | "double" -> Some F64
+            | "int64" | "uint64" -> Some I64
+            | _ -> None
+        let mr = match joinTy with Some t -> freshTmpT ctx t | None -> freshTmp ctx
+        let mrReg = { Id = mr; RTy = (match joinTy with Some t -> t | None -> W) }
         // A clause GUARD can allocate (a safepoint): the collector moves the
         // scrutinee, and a FAILED guard falls to the next clause's tests, which
         // re-read the stale register (mapExpr's `| P when g e -> …` chain died
@@ -6481,9 +6490,14 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 ctx.SlottedGen <- savedSG
                 ctx.ActiveGen <- savedGen
                 for v, _ in slotRegs do dictRemove ctx.Slotted (key v)
-                LBlock ("$mnext", reload @ tests @ pushes @ condSetup @ guardStmt @ [ LSet (wReg mr, bodyLow) ] @ condPop @ pop @ [ LBreak "$mdone" ]))
+                let armVal = match joinTy with Some t -> flatUnbox t bodyLow | None -> bodyLow
+                LBlock ("$mnext", reload @ tests @ pushes @ condSetup @ guardStmt @ [ LSet (mrReg, armVal) ] @ condPop @ pop @ [ LBreak "$mdone" ]))
+        let result =
+            match joinTy with
+            | Some t -> flatBox ctx t (LGet mrReg)
+            | None -> LGet mrReg
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut) ] @ scPush
-             @ [ LBlock ("$mdone", clauseStmts @ [ LTrap ]) ] @ scPop, LGet (wReg mr))
+             @ [ LBlock ("$mdone", clauseStmts @ [ LTrap ]) ] @ scPop, result)
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
     | ECast (tn, e2, true) when
           not (List.isEmpty (typeTestIds st tn))
