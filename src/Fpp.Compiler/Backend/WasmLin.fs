@@ -206,6 +206,11 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
+      /// a function whose ONE parameter is a tuple the body immediately
+      /// destructures: its binders, which become the wasm parameters. A
+      /// tupled member is an N-ARY method (what .NET compiles it to), so the
+      /// tuple object never exists and its scalars never box.
+      TupleParam : Dict<string, (VarId * Scheme) list>
       /// per-TID field descriptors: (tid, [(byte offset, kind)]). The runtime
       /// walkers ($cmpv/$eqv/$hashv) read an object as words plus a ref
       /// bitmask, which cannot say "this slot is an f64" — this is what lets
@@ -6537,14 +6542,37 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let isSelfTail =
             fn v = tailFnName && tailFnName <> ""
             && (match refMapTryFind st.TailApp e with Some true -> true | _ -> false)
+        // a TUPLED member takes its ELEMENTS: a literal tuple argument is
+        // spelled out (so the tuple is never built), a tuple VALUE is read
+        // field by field. Either way no tuple object crosses the call.
+        let args =
+            match dictTryFind st.TupleParam (key v), args with
+            | Some binds, [ ETuple xs ] when List.length xs = List.length binds -> xs
+            | _ -> args
+        let tupleRead =
+            match dictTryFind st.TupleParam (key v), args with
+            | Some binds, [ one ] when List.length binds >= 2 -> Some (List.length binds, one)
+            | _ -> None
         (match dictTryFind st.FuncSig (key v) with
          | Some (paramTys, retTy) ->
-             let argVals = List.map2 (fun ty a ->
+             let tupPre, argVals =
+                 match tupleRead with
+                 | Some (n, one) ->
+                     let tr = freshTmp ctx
+                     let vals =
+                         paramTys |> List.mapi (fun i ty ->
+                             let w = LLoad (W, LGet (wReg tr), HDR + 4 * i)
+                             let lowered = match ty with W -> w | _ -> flatUnbox ty w
+                             (if ty = W then RKRef else RKRaw), None, ty, lowered)
+                     [ LSet (wReg tr, coreToLowE ctx one) ], vals
+                 | None ->
+                     [], List.map2 (fun ty a ->
                              let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
                              let kind = refKindOfExprC st a
                              let wit = if kind = RKGen then slotWitness ctx a else None
                              kind, wit, ty, lowered) paramTys args
-             let setup, argGets = lowRootedArgsK ctx argVals
+             let setup0, argGets = lowRootedArgsK ctx argVals
+             let setup = tupPre @ setup0
              let loweredArgs = witnessArgs @ argGets
              let callE =
                  if isSelfTail then LTailCall (fn v, loweredArgs)
@@ -8846,7 +8874,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
-          Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
@@ -9152,11 +9180,35 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | _ -> ()
     for d in decls do
         match d with
-        | DLet (_, v, s, ELam (ps, _)) when (dictTryFind assigned (key v)).IsNone ->
+        | DLet (_, v, s, ELam (ps, body)) when (dictTryFind assigned (key v)).IsNone ->
             dictSet st.Funcs (key v) (List.length ps)
+            // a TUPLED member: one parameter, destructured straight away into
+            // simple binders. Those binders ARE the parameters — the tuple
+            // was only ever a calling convention.
+            (if (dictTryFind vtImpls (key v)).IsNone then
+                match ps, body with
+                | [ (pv, _) ], EMatch (EVar (mv, _), [ (PTuple subs, None, _) ]) when
+                        key mv = key pv
+                        && List.length subs >= 2
+                        && subs |> List.forall (fun sp -> match sp with PVar _ -> true | _ -> false) ->
+                    let binds =
+                        subs |> List.map (fun sp -> match sp with PVar (bv, bs) -> bv, bs | _ -> pv, mono (TCon ("?", [])))
+                    // only when every element has a machine type worth naming
+                    // (an unresolved `?` element would give the ABI no shape)
+                    if binds |> List.forall (fun (_, bs) -> match prune bs.Body with TCon ("?", []) -> false | TVar _ -> false | _ -> true) then
+                        dictSet st.TupleParam (key v) binds
+                | _ -> ())
             match funSigOf s (List.length ps) with
             | Some sig_ when (dictTryFind vtImpls (key v)).IsNone -> dictSet st.FuncSig (key v) sig_
             | _ -> ()
+            // the tupled member's signature is its ELEMENTS, whatever
+            // funSigOf made of the tuple parameter
+            (match dictTryFind st.TupleParam (key v) with
+             | Some binds ->
+                 let rec resultOf t n = if n <= 0 then t else (match prune t with TFun (_, r) -> resultOf r (n - 1) | _ -> t)
+                 let ret = abiTy (resultOf s.Body (List.length ps))
+                 dictSet st.FuncSig (key v) (binds |> List.map (fun (_, bs) -> abiTy bs.Body), ret)
+             | None -> ())
             // a generic top-level fn takes a hidden witness pointer per quantified
             // type var (in Quantified order); a direct caller prepends them. The
             // witness ABI is a GC-scan concern only — under --linear (no collector)
@@ -9829,7 +9881,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                         let bare = layStripGen nm
                         vid, witnessPtrRMK st 4 4 (if rawScalarName bare then 0 else 1) (cmpKindOfName bare))
                 | None -> []
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps |> List.map fst) (ps |> List.map (fun (_, s) -> s.Body)) body (fun _ -> ())
+            // a tupled member's PARAMETERS are the destructured binders, and
+            // its body is the match's arm — the tuple never exists
+            let ps2, body2 =
+                match dictTryFind st.TupleParam (key v), body with
+                | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
+                | _ -> ps, body
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
