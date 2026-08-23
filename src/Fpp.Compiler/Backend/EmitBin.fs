@@ -1262,6 +1262,20 @@ let frame (m : Mod) (vArities : int list) (tupArities : int list) : unit =
 
 // ---- runtime: closures and boxing ------------------------------------------
 
+/// a mutable global of a NON-word type, zero-initialised. A module-level
+/// float/int64/float32 binding lives in one of these: it holds the raw value,
+/// so it needs no box and the collector never has to scan it.
+let globalTypedMut (m : Mod) (name : string) (ty : string) : unit =
+    dictSet m.GlobalIdx name m.GlobalCount
+    m.GlobalCount <- m.GlobalCount + 1
+    emitByte m.GlobalBody (valByte ty)
+    emitByte m.GlobalBody 1
+    if ty = "f64" then (emitByte m.GlobalBody opF64Const; emitF64Bits m.GlobalBody 0L)
+    elif ty = "f32" then (emitByte m.GlobalBody opF32Const; emitF32Bits m.GlobalBody 0)
+    elif ty = "i64" then (emitByte m.GlobalBody opI64Const; emitS64 m.GlobalBody 0L)
+    else (emitByte m.GlobalBody opI32Const; emitS32 m.GlobalBody 0)
+    emitByte m.GlobalBody opEnd
+
 let globalI32Mut (m : Mod) (name : string) (init : int) : unit =
     dictSet m.GlobalIdx name m.GlobalCount
     m.GlobalCount <- m.GlobalCount + 1

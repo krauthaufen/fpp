@@ -331,6 +331,10 @@ let mutable private vtNSlots = 0
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
 let mutable private gcGlobalSlots : Dict<string, int> = dictNew ()
+/// module-level bindings whose type is a 64-bit scalar or a single: those live
+/// in a TYPED wasm global holding the raw value. They used to take a root slot
+/// and a heap box each — the last ordinary shape in which a float allocated.
+let mutable private globalScalarTy : Dict<string, LTy> = dictNew ()
 
 // fpprt's reserved type-ids; the compiler numbers its own from here (mirrors
 // FPPRT_TID_FIRST in fpprt.h)
@@ -6652,7 +6656,10 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
                         LSet (wReg id, LGet (wReg t))
                         LIf (slotGenRaw wit, [], [ LStore (W, LGet (wReg slotReg), 0, LGet (wReg t)) ]) ]
                   | None -> [ LSet (wReg id, coreToLowE ctx rhs) ])
-         | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ]
+         | None when (dictTryFind ctx.LSt.Globals (key v)).IsSome ->
+             (match dictTryFind globalScalarTy (gl v) with
+              | Some ty -> [ LSetGlobal (gl v, flatUnbox ty (coreToLowE ctx rhs)) ]
+              | None -> [ LSetGlobal (gl v, coreToLowE ctx rhs) ])
          | None -> err ctx.LSt ("wasm-linear LowIR: assignment to unbound " + v.Name); [ LEval (coreToLowE ctx rhs) ])
     | EIf (c, a, b) -> [ LIf (coreToLowE ctx c, coreToLowS ctx a, coreToLowS ctx b) ]
     | EWhile (c, b) -> [ LWhile (coreToLowE ctx c, coreToLowS ctx b) ]
@@ -7298,7 +7305,11 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
             chkReadE ctx ("env:" + k) (LLoad (W, envPtr, HDR + 8 + 4 * slot))
         | _ ->
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
-            | Some _ -> LGetGlobal ("$g" + string (abs (strHash k)))
+            | Some _ ->
+                let g = "$g" + string (abs (strHash k))
+                (match dictTryFind globalScalarTy g with
+                 | Some ty -> flatBox ctx ty (LGetGlobal g)
+                 | None -> LGetGlobal g)
             | None -> err st ("wasm-linear LowIR: unresolved variable " + k + " name=" + (match dictTryFind nameOf k with Some n -> n | None -> "?")); lowInt 0
 
 // the initial value a shouldSlot binder's shadow-stack slot holds: for a cell
@@ -7988,10 +7999,17 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         (if tailSpReg >= 0 && List.isEmpty rootParams then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else [])
         @ selfPreamble @ constPreamble
     let bodyLow0 = if List.isEmpty preamble then bodyLow1 else LDo (preamble, bodyLow1)
+    // a SCALAR result leaves the body unboxed and is parked in a typed
+    // register across the scope exit. Parking it as a word meant boxing the
+    // value, popping, and loading the payload straight back — the return path
+    // of every float/int64 function that roots a parameter.
+    let scalarRet = retTy <> W
+    let mutable retUnboxed = false
     let bodyLow2 =
         if List.isEmpty rootParams then bodyLow0
         else
-            let resReg = freshTmp ctx
+            let resReg = if scalarRet then freshTmpT ctx retTy else freshTmp ctx
+            let reg = { Id = resReg; RTy = (if scalarRet then retTy else W) }
             let spSave = if tailSpReg >= 0 then [ LSet (wReg tailSpReg, LGetGlobal "$sp") ] else []
             let pushes = spSave @ (rootParams |> List.collect (fun (pv, slotReg) ->
                 let pvReg = match dictTryFind ctx.Regs (key pv) with Some i -> i | None -> 0 - 1
@@ -7999,24 +8017,28 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
                   LStore (W, LGet (wReg slotReg), 0, LGet (wReg pvReg))
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]))
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
-            LDo (pushes @ [ LSet (wReg resReg, bodyLow0); pop ], LGet (wReg resReg))
+            let inner = if scalarRet then flatUnbox retTy bodyLow0 else bodyLow0
+            retUnboxed <- scalarRet
+            LDo (pushes @ [ LSet (reg, inner); pop ], LGet reg)
     // FPP_CONSCHECK: the shadow-stack pointer must be BALANCED across the
     // body (pushes = pops on every path) — an imbalance desyncs every later
     // frame's slots and the collector scans junk
     let bodyLow2 =
         if consCheckOn () then
             let spSave = freshTmp ctx
-            let r2 = freshTmp ctx
+            let r2 = if retUnboxed then freshTmpT ctx retTy else freshTmp ctx
             chkSite <- chkSite + 1
             let site = chkSite
             eprintfn "SPSITE %d = %s" site dbgName
+            let r2Reg = { Id = r2; RTy = (if retUnboxed then retTy else W) }
             LDo ([ LSet (wReg spSave, LGetGlobal "$sp")
-                   LSet (wReg r2, bodyLow2)
+                   LSet (r2Reg, bodyLow2)
                    LIf (LPrim (NeW, [ LGetGlobal "$sp"; LGet (wReg spSave) ]),
                         [ LCallVoidS ("$eprints", [ LCall ("$str_of_int", [ LConstW site ]) ]); LTrap ], []) ],
-                 LGet (wReg r2))
+                 LGet r2Reg)
         else bodyLow2
-    let bodyLow = match retTy with W -> bodyLow2 | _ -> flatUnbox retTy bodyLow2
+    let bodyLow =
+        if retTy = W || retUnboxed then bodyLow2 else flatUnbox retTy bodyLow2
     // TEMP DEBUG: validate the freshly-lowered tree — every register it
     // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
     let mutable maxReg = -1
@@ -8715,6 +8737,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // non-function global takes a root slot (before constants).
     let assigned = collectAssigned decls
     if gc then gcGlobalSlots <- dictNew ()
+    globalScalarTy <- dictNew ()
     // interface-method impls are reached ONLY through the vtable, which dispatches
     // at the uniform `$lfn<n>` type. So a vtable member must NEVER take a
     // funSigOf-specialized signature (a raw f64/i64 param/return) — its declared
@@ -8741,11 +8764,21 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             // any function a class-keyed SLOT can resolve to is vtable-
             // reachable too (abstract-through-class dispatch, the object-
             // expression overrides) — it must keep the uniform signature
-            // or the call_indirect type mismatches
-            for ifn, mn in vtableSlots do
-                (match slotImpl cn ifn mn with
-                 | Some v -> dictSet vtImpls (key v) true
-                 | None -> ())
+            // or the call_indirect type mismatches.
+            //
+            // Only for a class that PARTICIPATES in dispatch, though: the
+            // slot list carries a name per declared member in the program, so
+            // marking every match made every member of every type uniform —
+            // including the prelude's static ones, whose float results then
+            // boxed on the way out for a dispatch that cannot happen.
+            let dispatchable =
+                List.length (chainOf cn) > 1 || List.length (subclassesOf cn) > 1
+                || not (List.isEmpty impls)
+            if dispatchable then
+                for ifn, mn in vtableSlots do
+                    (match slotImpl cn ifn mn with
+                     | Some v -> dictSet vtImpls (key v) true
+                     | None -> ())
         | _ -> ()
     for d in decls do
         match d with
@@ -8763,11 +8796,14 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 dictSet st.FuncWitness (key v) (s.Quantified |> List.map (fun qv -> qv.Id))
         | DLet (_, v, s, _) ->
             dictSet st.Globals (key v) true
+            (match scalarLTy s.Body with
+             | Some ty -> dictSet globalScalarTy (gl v) ty
+             | None -> ())
             // a RAW-scalar top-level binding (int/bool/char) stays in its
             // unscanned wasm global — an even int in the SCANNED root table
             // reads as a bogus pointer. Only ref/generic globals take a root
             // slot (they hold heap pointers a moving collection must update).
-            if gc && refKindOfTy s.Body <> RKRaw then
+            if gc && refKindOfTy s.Body <> RKRaw && (scalarLTy s.Body).IsNone then
                 let slot = st.RootNext
                 st.RootNext <- slot + 1
                 dictSet st.GlobalSlot (key v) slot
@@ -8984,7 +9020,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, _) ->
-            globalI32Mut m (gl v) 0
+            (match dictTryFind globalScalarTy (gl v) with
+             | Some ty -> globalTypedMut m (gl v) (wtyName ty)
+             | None -> globalI32Mut m (gl v) 0)
             let nm = "$linit" + string initN
             initN <- initN + 1
             vecAdd inits nm
@@ -9324,7 +9362,11 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
-            emitFuncLow st m (gl v) true None [] [] [] [] [] rhs (fun f ->
+            let initSig =
+                match dictTryFind globalScalarTy (gl v) with
+                | Some ty -> Some ([], ty)
+                | None -> None
+            emitFuncLow st m (gl v) true initSig [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
