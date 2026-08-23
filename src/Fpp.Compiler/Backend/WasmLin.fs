@@ -206,6 +206,12 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
+      /// per-TID field descriptors: (tid, [(byte offset, kind)]). The runtime
+      /// walkers ($cmpv/$eqv/$hashv) read an object as words plus a ref
+      /// bitmask, which cannot say "this slot is an f64" — this is what lets
+      /// them handle an INLINE layout of any shape without a per-class vtable
+      /// entry, and it is what a flat tuple or generic instantiation needs.
+      TidDesc : Vec<int * (int * int) list>
       /// FK_STRUCT tid -> the byte offsets of its POINTER words (a `layoutOf`-
       /// derived ref-map). Concrete tuples and union payloads register this so
       /// the collector traces only real pointers and skips raw inline scalars.
@@ -232,7 +238,11 @@ type private St =
       /// GC mode: root slot holding the tid->shape-info array the generic $cmpv
       /// uses to structurally compare ANY shape at runtime (kind/start/nwords
       /// packed per tid). Standalone reads the same info from static memory.
-      mutable CmpTblSlot : int }
+      mutable CmpTblSlot : int
+      /// root slots for the two descriptor arrays: tid -> index, and the flat
+      /// `[n, off, kind, off, kind, …]` data
+      mutable DescIdxSlot : int
+      mutable DescDataSlot : int }
 
 // reserved class-ids for the built-in shapes that have no declared type name;
 // declared records and unions are numbered above these
@@ -328,6 +338,8 @@ let mutable private chkSite = 0
 let mutable private gcConsRawTid = 0
 let mutable private gcConsRefTid = 0
 let mutable private gcCmpTblSlot = 0
+let mutable private gcDescIdxSlot = 0
+let mutable private gcDescDataSlot = 0
 // identity dispatch ($cmpv/$hashv -> a class' own Equals/GetHashCode/CompareTo):
 // where the vtable lives and how wide a row is. Slots 0/1/2 of every row are
 // reserved for those three; 0 means "not declared, use the structural fold".
@@ -2653,12 +2665,141 @@ let private emitStrCmp (m : Mod) : unit =
 // $cmpv falls to the best-effort equal tail. Never allocates. Under GC an
 // object's word-0 is (tid<<1)|1, so we match the reserved tid headers (else the
 // raw class-id in the standalone path).
+/// The per-TID field DESCRIPTOR walk, shared by the three runtime walkers.
+/// For every slot a shape declares it loads both operands at that slot's own
+/// width and signedness — which is what an INLINE layout needs and what the
+/// word+ref-bitmask encoding can never express. `mode`: 0 compare, 1 equals,
+/// 2 hash. Emits its own `return` on every path that decides.
+let private emitDescWalk (f : Fn) (mode : int) (av : string) (bv : string) : unit =
+    // the descriptor index for $tid, if the program has any descriptors
+    gg f "$roots"; ic f (4 * gcDescIdxSlot); ins f "i32.add"; mem f "i32.load"; ls f "$dt"
+    lg f "$dt"
+    ifE f
+    lg f "$dt"; ic f 8; ins f "i32.add"; lg f "$tid"; ic f 2; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$dix"
+    lg f "$dix"
+    ifE f
+    gg f "$roots"; ic f (4 * gcDescDataSlot); ins f "i32.add"; mem f "i32.load"; ls f "$dd"
+    // $dp -> [n, off0, kind0, …]
+    lg f "$dd"; ic f 8; ins f "i32.add"
+    lg f "$dix"; ic f 1; ins f "i32.sub"; ic f 2; ins f "i32.shl"; ins f "i32.add"; ls f "$dp"
+    lg f "$dp"; mem f "i32.load"; ls f "$dn"
+    ic f 0; ls f "$di"
+    (if mode = 2 then (ic f 0; ls f "$h"))
+    blockE f "$dend"; loopE f "$dgo"
+    lg f "$di"; lg f "$dn"; ins f "i32.ge_s"; brIf f "$dend"
+    lg f "$dp"; ic f 4; ins f "i32.add"; lg f "$di"; ic f 3; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$doff"
+    lg f "$dp"; ic f 8; ins f "i32.add"; lg f "$di"; ic f 3; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load"; ls f "$dk"
+    // load one side's slot at the descriptor's width into the right local
+    let loadSide (side : string) (dst : string) (k : int) =
+        lg f side; lg f "$doff"; ins f "i32.add"
+        (if k = 3 then mem f "f64.load"
+         elif k = 6 then (mem f "f32.load"; ins f "f64.promote_f32")
+         elif k = 4 || k = 5 then mem f "i64.load"
+         elif k = 7 then mem f "i32.load16_s"
+         elif k = 8 then mem f "i32.load16_u"
+         elif k = 9 then mem f "i32.load8_s"
+         elif k = 10 then mem f "i32.load8_u"
+         else mem f "i32.load")
+        ls f dst
+    // one KIND's body, guarded by a test on $dk
+    let arm (k : int) (body : unit -> unit) =
+        lg f "$dk"; ic f k; ins f "i32.eq"
+        ifE f
+        body ()
+        endB f
+    // 0: a REFERENCE slot — recurse through the walker itself
+    arm 0 (fun () ->
+        if mode = 2 then
+            (lg f av; lg f "$doff"; ins f "i32.add"; mem f "i32.load"; callf f "$hashv"; ls f "$r")
+        else
+            (lg f av; lg f "$doff"; ins f "i32.add"; mem f "i32.load"
+             lg f bv; lg f "$doff"; ins f "i32.add"; mem f "i32.load"
+             callf f (if mode = 1 then "$eqv" else "$cmpv"); ls f "$r"))
+    // 3/6: a FLOAT slot (f32 promoted). Ordering is the TOTAL order — NaN
+    // equal to itself, below every number — and raises $unord; equality is
+    // IEEE; a zero hashes as 0 whatever its sign.
+    let floatArm (k : int) =
+        arm k (fun () ->
+            loadSide av "$fa" k
+            (if mode <> 2 then loadSide bv "$fb" k)
+            if mode = 0 then
+                (lg f "$fa"; lg f "$fb"; ins f "f64.gt"; lg f "$fa"; lg f "$fb"; ins f "f64.lt"; ins f "i32.sub"; ls f "$r"
+                 lg f "$r"; ins f "i32.eqz"
+                 lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ins f "i32.eqz"
+                 ins f "i32.and"
+                 ifE f
+                 ic f 1; gs f "$unord"
+                 lg f "$fa"; lg f "$fa"; ins f "f64.ne"
+                 ifE f
+                 lg f "$fb"; lg f "$fb"; ins f "f64.ne"
+                 ifE f; ic f 0; ls f "$r"; elseB f; ic f (0 - 1); ls f "$r"; endB f
+                 elseB f
+                 ic f 1; ls f "$r"
+                 endB f
+                 endB f)
+            elif mode = 1 then (lg f "$fa"; lg f "$fb"; ins f "f64.eq"; ls f "$r")
+            else
+                (lg f "$fa"; ic f 0; ins f "f64.convert_i32_s"; ins f "f64.eq"
+                 ifE f
+                 ic f 0; ls f "$r"
+                 elseB f
+                 lg f "$fa"; ins f "i64.reinterpret_f64"; ls f "$la"
+                 lg f "$la"; ins f "i32.wrap_i64"; lg f "$la"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ls f "$r"
+                 endB f))
+    floatArm 3
+    floatArm 6
+    // 4/5: a 64-bit INTEGER slot, signed or not
+    let wideArm (k : int) =
+        arm k (fun () ->
+            loadSide av "$la" k
+            (if mode <> 2 then loadSide bv "$lb" k)
+            if mode = 0 then
+                (lg f "$la"; lg f "$lb"; ins f (if k = 5 then "i64.gt_u" else "i64.gt_s")
+                 lg f "$la"; lg f "$lb"; ins f (if k = 5 then "i64.lt_u" else "i64.lt_s")
+                 ins f "i32.sub"; ls f "$r")
+            elif mode = 1 then (lg f "$la"; lg f "$lb"; ins f "i64.eq"; ls f "$r")
+            else
+                (lg f "$la"; ins f "i32.wrap_i64"; lg f "$la"; lc f 32L; ins f "i64.shr_u"; ins f "i32.wrap_i64"; ins f "i32.xor"; ls f "$r"))
+    wideArm 4
+    wideArm 5
+    // 1/2/7/8/9/10: a WORD-sized slot, at its own width and signedness
+    let wordArm (k : int) =
+        arm k (fun () ->
+            loadSide av "$x" k
+            (if mode <> 2 then loadSide bv "$y" k)
+            if mode = 0 then
+                (lg f "$x"; lg f "$y"; ins f (if k = 2 || k = 8 || k = 10 then "i32.gt_u" else "i32.gt_s")
+                 lg f "$x"; lg f "$y"; ins f (if k = 2 || k = 8 || k = 10 then "i32.lt_u" else "i32.lt_s")
+                 ins f "i32.sub"; ls f "$r")
+            elif mode = 1 then (lg f "$x"; lg f "$y"; ins f "i32.eq"; ls f "$r")
+            else (lg f "$x"; ls f "$r"))
+    wordArm 1
+    wordArm 2
+    wordArm 7
+    wordArm 8
+    wordArm 9
+    wordArm 10
+    // combine: compare and equality decide early, a hash folds every slot
+    (if mode = 0 then (lg f "$r"; ifE f; lg f "$r"; ins f "return"; endB f)
+     elif mode = 1 then (lg f "$r"; ins f "i32.eqz"; ifE f; ic f 0; ins f "return"; endB f)
+     else (lg f "$h"; ic f 31; ins f "i32.mul"; lg f "$r"; ins f "i32.add"; ls f "$h"))
+    lg f "$di"; ic f 1; ins f "i32.add"; ls f "$di"
+    br f "$dgo"
+    endB f; endB f
+    (if mode = 0 then (ic f 0; ins f "return")
+     elif mode = 1 then (ic f 1; ins f "return")
+     else (lg f "$h"; ins f "return"))
+    endB f
+    endB f
+
 let private emitCmpv (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"; local f "$y" "i32"
     local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$r" "i32"
     local f "$w" "i32"; local f "$st" "i32"; local f "$tot" "i32"; local f "$tbl" "i32"; local f "$tid" "i32"; local f "$msz" "i32"
     local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
+    local f "$dt" "i32"; local f "$dix" "i32"; local f "$dd" "i32"; local f "$dp" "i32"
+    local f "$dn" "i32"; local f "$di" "i32"; local f "$doff" "i32"; local f "$dk" "i32"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     let strH = hv CID_STRING gcStrTid
@@ -2862,6 +3003,8 @@ let private emitCmpv (m : Mod) : unit =
         ifE f
         lg f "$a"; lg f "$b"; ins f "i32.gt_u"; lg f "$a"; lg f "$b"; ins f "i32.lt_u"; ins f "i32.sub"; ins f "return"
         endB f
+        // an INLINE layout describes itself field by field
+        emitDescWalk f 0 "$a" "$b"
         // tid -> info: low 10 bits = nword count, the high bits a REF BITMASK (bit
         // w set = word w is a pointer). ONE walk over words [1, nwords): a ref word
         // recurses through $cmpv; a raw word (a union tag, or a tuple/record's
@@ -2903,7 +3046,9 @@ let private emitEqv (m : Mod) : unit =
     local f "$ca" "i32"; local f "$cb" "i32"; local f "$x" "i32"
     local f "$w" "i32"; local f "$tot" "i32"; local f "$st" "i32"; local f "$r" "i32"
     local f "$tbl" "i32"; local f "$tid" "i32"; local f "$msz" "i32"
-    local f "$fa" "f64"; local f "$fb" "f64"
+    local f "$fa" "f64"; local f "$fb" "f64"; local f "$y" "i32"; local f "$la" "i64"; local f "$lb" "i64"
+    local f "$dt" "i32"; local f "$dix" "i32"; local f "$dd" "i32"; local f "$dp" "i32"
+    local f "$dn" "i32"; local f "$di" "i32"; local f "$doff" "i32"; local f "$dk" "i32"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     let strH = hv CID_STRING gcStrTid
@@ -3005,6 +3150,7 @@ let private emitEqv (m : Mod) : unit =
         // (DIVERGENCES.md), and identity was answered at the top
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ic f 0x3FF; ins f "i32.eq"
         ifE f; ic f 0; ins f "return"; endB f
+        emitDescWalk f 1 "$a" "$b"
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
         lg f "$r"; ic f 10; ins f "i32.shr_u"; ls f "$st"
         ic f 1; ls f "$w"
@@ -3047,6 +3193,9 @@ let private emitHashv (m : Mod) : unit =
     let f = beginFn m [ "$v" ]
     local f "$h" "i32"; local f "$n" "i32"; local f "$i" "i32"; local f "$cid" "i32"; local f "$b" "i64"
     local f "$tbl" "i32"; local f "$tid" "i32"; local f "$r" "i32"; local f "$tot" "i32"; local f "$st" "i32"; local f "$w" "i32"; local f "$msz" "i32"
+    local f "$x" "i32"; local f "$y" "i32"; local f "$fa" "f64"; local f "$fb" "f64"; local f "$la" "i64"; local f "$lb" "i64"
+    local f "$dt" "i32"; local f "$dix" "i32"; local f "$dd" "i32"; local f "$dp" "i32"
+    local f "$dn" "i32"; local f "$di" "i32"; local f "$doff" "i32"; local f "$dk" "i32"
     localsDone f
     let hv cid tid = if gc then (tid <<< 1) ||| 1 else cid
     if gc then
@@ -3134,6 +3283,7 @@ let private emitHashv (m : Mod) : unit =
         // mutated array then changed its hash) or read f64 payload halves
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ic f 0x3FF; ins f "i32.eq"
         ifE f; lg f "$v"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "return"; endB f
+        emitDescWalk f 2 "$v" "$v"
         lg f "$r"; ic f 0x3FF; ins f "i32.and"; ls f "$tot"
         lg f "$r"; ic f 10; ins f "i32.shr_u"; ls f "$st"
         ic f 0; ls f "$h"
@@ -3591,6 +3741,22 @@ let private storLTy (k : string) : (LTy * int) option =
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
 let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | _ -> W
+
+/// the descriptor code for a field of this declared type. 0 is a REFERENCE
+/// (the walkers recurse); everything else names a width and a signedness, so
+/// an inline slot is compared, tested and hashed as the value it holds rather
+/// than as raw words.
+let private descKindOf (ty : string) : int =
+    match storLTy ty with
+    | None -> 0
+    | Some (F64, _) -> 3
+    | Some (I64, _) -> if ty = "uint64" then 5 else 4
+    | Some (I16, _) -> if ty = "uint16" then 8 else 7
+    | Some (I8, _) -> if ty = "byte" then 10 else 9
+    | Some _ ->
+        if ty = "float32" || ty = "single" then 6
+        elif ty = "uint32" || ty = "unativeint" then 2
+        else 1
 // resolve an array-element KIND through the newtype collapse: a collapsed
 // single-field record IS its field, so `F1[]` (F1 = { V : float32 }) stores
 // PACKED float32 — which is what lets Array.pin + zero-copy views alias real
@@ -3654,8 +3820,18 @@ let private podRefOffs (layout : Dict<string, int * string>) : int list =
 let private podTid (st : St) (key : string) (layout : Dict<string, int * string>) (size : int) (firstRefWord : int) : int =
     let refs = podRefOffs layout
     let suffix = List.init (size / 4 - firstRefWord) (fun k -> 4 * (firstRefWord + k))
-    if List.isEmpty refs || refs = suffix then gcTid st key size FK_TAGGED firstRefWord
-    else gcTidRef st key size refs
+    let known = (dictTryFind st.Tids key).IsSome
+    let t =
+        if List.isEmpty refs || refs = suffix then gcTid st key size FK_TAGGED firstRefWord
+        else gcTidRef st key size refs
+    // the field descriptor, recorded once per shape: offsets in layout order
+    if not known then
+        let entries =
+            dictPairs layout
+            |> List.map (fun (_, v) -> let (off, ty) = v in off, descKindOf ty)
+            |> List.sortWith (fun (a, _) (b, _) -> if a < b then 0 - 1 elif a > b then 1 else 0)
+        vecAdd st.TidDesc (t, entries)
+    t
 
 let private podArrOf (st : St) (kind : string) : (Dict<string, int * string> * int) option =
     match dictTryFind st.RecPod kind with
@@ -8670,9 +8846,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
-          Tids = dictNew (); TidRegs = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
-          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0 }
+          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -9162,6 +9338,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         st.CmpTblSlot <- st.RootNext
         st.RootNext <- st.RootNext + 1
         gcCmpTblSlot <- st.CmpTblSlot
+        st.DescIdxSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        st.DescDataSlot <- st.RootNext
+        st.RootNext <- st.RootNext + 1
+        gcDescIdxSlot <- st.DescIdxSlot
+        gcDescDataSlot <- st.DescDataSlot
     rtDeclsLin m
     // An inline (POD) record whose layout holds a field the WORD walk cannot
     // describe gets its own Equals/GetHashCode/CompareTo. $cmpv/$eqv/$hashv
@@ -9299,6 +9481,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | _ -> ()
     // the synthetic trio first, so a record that DECLARES its own Equals or
     // CompareTo still wins the slot below
+    // The synthetic trio stays installed as the FAST path — a direct call
+    // beats interpreting a descriptor on every comparison. The descriptor is
+    // the GENERAL one: it serves any inline shape that has no class row of its
+    // own (a tuple shares CID_TUPLE with every other tuple), and the whole
+    // battery passes with the trio switched off, which is what says the two
+    // agree.
     if gc && st.NSlots > 0 then
         for cid, _, _ in podTrio do
             vtRows.[cid * st.NSlots + 0] <- tblIdx m ("$reqv" + string cid)
@@ -9746,6 +9934,31 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             gg rf "$roots"; ic rf (4 * st.VtSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
             vtRows |> Array.iteri (fun i w ->
                 if w <> 0 then (lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf w; mem rf "i32.store"))
+        // tid -> field DESCRIPTOR: an index into the flat data array (0 = the
+        // shape has none, walk it as words). Both are fpprt int arrays whose
+        // data starts past the [tag][len] header.
+        if st.TidNext > 0 && vecLen st.TidDesc > 0 then
+            let descs = vecToList st.TidDesc
+            // the flat data: per shape, [n, off0, kind0, off1, kind1, …]
+            let data = vecNew<int> ()
+            let idxOf = dictNew<int, int> ()
+            for tid, entries in descs do
+                if (dictTryFind idxOf tid).IsNone then
+                    dictSet idxOf tid (vecLen data + 1)
+                    vecAdd data (List.length entries)
+                    for off, k in entries do
+                        vecAdd data off
+                        vecAdd data k
+            ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
+            gg rf "$roots"; ic rf (4 * st.DescIdxSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+            for tid, _ in descs do
+                match dictTryFind idxOf tid with
+                | Some ix -> lg rf "$t"; ic rf (8 + 4 * tid); ins rf "i32.add"; ic rf ix; mem rf "i32.store"
+                | None -> ()
+            ic rf gcIntTid; ic rf (vecLen data); callf rf "$fpallocn"; ls rf "$t"
+            gg rf "$roots"; ic rf (4 * st.DescDataSlot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+            vecToList data |> List.iteri (fun i w ->
+                lg rf "$t"; ic rf (8 + 4 * i); ins rf "i32.add"; ic rf w; mem rf "i32.store")
         // tid -> shape info (kind<<20 | start<<10 | nwords) for the generic $cmpv
         if st.TidNext > 0 then
             ic rf gcIntTid; ic rf st.TidNext; callf rf "$fpallocn"; ls rf "$t"
