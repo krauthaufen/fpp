@@ -206,6 +206,11 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
+      /// per Core parameter of a function with a specialised signature: the
+      /// BY-VALUE struct type it expands to, or None. The caller expands by
+      /// the CALLEE's plan — deciding from the argument instead let the two
+      /// ends disagree about how many values cross the call.
+      FuncParamPlan : Dict<string, string option list>
       /// a function whose ONE parameter is a tuple the body immediately
       /// destructures: its binders, which become the wasm parameters. A
       /// tupled member is an N-ARY method (what .NET compiles it to), so the
@@ -3635,6 +3640,11 @@ type private LowCtx =
       // contract (box-elim cancels it back in arithmetic); a capture re-boxes
       // into the closure env. Captured mutables are cells, so never listed here.
       VarScalar : Dict<string, LTy>
+      /// a variable holding a BY-VALUE struct: field name -> its register.
+      /// The value lives in registers, so reading a field is a register read
+      /// and nothing is allocated; only a use of the WHOLE value materialises
+      /// an object (which is where .NET boxes a struct too).
+      StructVars : Dict<string, string * Dict<string, int>>
       // in a generic function: its quantified type-var id -> the register of the
       // hidden witness-pointer param for that type. A generic aggregate reads the
       // element type's witness through here to pick its GC scan map.
@@ -4420,14 +4430,51 @@ let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * 
 // (param abi types, return abi type) of a top-level function: peel `arity`
 // arrows off its scheme. None when every slot is a plain word (nothing to
 // specialize — the uniform $lfn signature already fits).
-let private funSigOf (sch : Scheme) (arity : int) : (LTy list * LTy) option =
+/// A [<Struct>] record whose fields are ALL scalars travels BY VALUE: its
+/// fields in registers, never a pointer to a heap object. A user writes a
+/// struct to avoid GC pressure, and a heap object per value breaks exactly
+/// that promise. Returns the fields in layout order.
+let private structAbiOf (st : St) (tyName : string) : (string * int * LTy * string) list option =
+    match dictTryFind st.RecFieldTys tyName, dictTryFind st.RecPod tyName with
+    | Some fs, Some (layout, _, _) when
+            not (List.isEmpty fs) && List.length fs <= 4
+            && fs |> List.forall (fun (_, ty) -> (storLTy ty).IsSome) ->
+        Some (fs
+              |> List.map (fun (fn, ty) ->
+                  let (off, _) = optGet (dictTryFind layout fn)
+                  let (sty, _) = optGet (storLTy ty)
+                  fn, off, storValTy sty, ty)
+              |> List.sortWith (fun (_, a, _, _) (_, b, _, _) -> if a < b then 0 - 1 elif a > b then 1 else 0))
+    | _ -> None
+
+/// the by-value struct type a type denotes, if any
+let private structTyName (st : St) (t : Type) : string option =
+    match prune t with
+    | TCon (n, _) when (structAbiOf st n).IsSome -> Some n
+    | _ -> None
+
+let private funSigOfWith (st : St) (sch : Scheme) (arity : int) (binderStructs : string option list) : (LTy list * LTy) option =
     let rec go t n = if n <= 0 then [], t else (match prune t with TFun (a, r) -> let (ps, ret) = go r (n - 1) in a :: ps, ret | _ -> [], t)
     let argTs, retT = go sch.Body arity
     if List.length argTs <> arity then None
     else
-        let ps = argTs |> List.map abiTy
+        // a BY-VALUE struct parameter contributes its FIELDS — only when the
+        // binder agrees it is one (see the plan above)
+        let agree =
+            if List.length binderStructs = List.length argTs then
+                List.map2 (fun t b -> match structTyName st t, b with
+                                      | Some x, Some y when x = y -> Some x
+                                      | _ -> None) argTs binderStructs
+            else argTs |> List.map (fun _ -> None)
+        let ps =
+            List.map2 (fun t sTy ->
+                match sTy with
+                | Some tn -> (optGet (structAbiOf st tn)) |> List.map (fun (_, _, vty, _) -> vty)
+                | None -> [ abiTy t ]) argTs agree
+            |> List.concat
         let ret = abiTy retT
-        if List.forall (fun t -> t = W) ps && ret = W then None else Some (ps, ret)
+        if List.forall (fun t -> t = W) ps && ret = W && List.length ps = List.length argTs then None
+        else Some (ps, ret)
 
 let rec private shapeOfExpr (e : Expr) : CmpShape =
     match e with
@@ -5649,6 +5696,20 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet (wReg ir, (coreToLowE ctx i))
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
+    // a field of a BY-VALUE struct variable is a REGISTER read
+    | EField (EVar (v, _), fname, _) when (dictTryFind ctx.StructVars (key v)).IsSome ->
+        let (_, fmap) = optGet (dictTryFind ctx.StructVars (key v))
+        (match dictTryFind fmap fname with
+         | Some r ->
+             let vty = vecGet ctx.RegTys r
+             let kind =
+                 match structTyName st (TCon ("?", [])) with
+                 | _ -> ""
+             (match vty with
+              | F64 -> lowBoxF ctx (LGet { Id = r; RTy = F64 })
+              | I64 -> lowBoxI ctx (LGet { Id = r; RTy = I64 })
+              | _ -> LGet (wReg r))
+         | None -> err st ("wasm-linear: no field " + fname + " on by-value struct"); lowInt 0)
     | EField (r, fname, owner) when (podOf st owner).IsSome ->
         let (layout, _, _) = optGet (podOf st owner)
         let (off, kind) = optGet (dictTryFind layout fname)
@@ -6565,12 +6626,60 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                              let lowered = match ty with W -> w | _ -> flatUnbox ty w
                              (if ty = W then RKRef else RKRaw), None, ty, lowered)
                      [ LSet (wReg tr, coreToLowE ctx one) ], vals
-                 | None ->
+                 | None when List.length paramTys = List.length args ->
                      [], List.map2 (fun ty a ->
                              let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
                              let kind = refKindOfExprC st a
                              let wit = if kind = RKGen then slotWitness ctx a else None
                              kind, wit, ty, lowered) paramTys args
+                 | None ->
+                     // a BY-VALUE struct argument contributes its FIELDS: a
+                     // literal is spelled out (so no object is built), a
+                     // by-value variable passes its registers, anything else
+                     // reads the object's inline slots. WHICH arguments expand
+                     // is the callee's plan, never a guess from the argument.
+                     let plan =
+                         match dictTryFind st.FuncParamPlan (key v) with
+                         | Some pl when List.length pl = List.length args -> pl
+                         | _ -> args |> List.map (fun _ -> None)
+                     let pre = vecNew<LStmt> ()
+                     let vals = vecNew<RefKind * LExpr option * LTy * LExpr> ()
+                     let mutable rest = paramTys
+                     for a, sTy in List.zip args plan do
+                         match sTy with
+                         | Some tn ->
+                             let fields = optGet (structAbiOf st tn)
+                             (match a with
+                              | ERecord (_, fs) ->
+                                  for fn, _, vty, kind in fields do
+                                      let fe = fs |> List.tryPick (fun (n2, e2) -> if n2 = fn then Some e2 else None)
+                                      let raw =
+                                          match fe with
+                                          | Some e2 -> storUnbox kind (coreToLowE ctx e2)
+                                          | None -> (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+                                      vecAdd vals (RKRaw, None, vty, raw)
+                              | EVar (v, _) | EVarI (v, _, _) when (dictTryFind ctx.StructVars (key v)).IsSome ->
+                                  let (_, fmap) = optGet (dictTryFind ctx.StructVars (key v))
+                                  for fn, _, vty, _ in fields do
+                                      let r = match dictTryFind fmap fn with Some r -> r | None -> 0
+                                      vecAdd vals (RKRaw, None, vty, LGet { Id = r; RTy = vty })
+                              | _ ->
+                                  let objR = freshTmp ctx
+                                  vecAdd pre (LSet (wReg objR, coreToLowE ctx a))
+                                  for _, off, vty, kind in fields do
+                                      let (sty, _) = optGet (storLTy kind)
+                                      vecAdd vals (RKRaw, None, vty, LLoad (sty, LGet (wReg objR), off)))
+                             rest <- (if List.length rest >= List.length fields then List.skip (List.length fields) rest else [])
+                         | None ->
+                             (match rest with
+                              | ty :: more ->
+                                  let lowered = match ty with W -> coreToLowE ctx a | _ -> flatUnbox ty (coreToLowE ctx a)
+                                  let kind = refKindOfExprC st a
+                                  let wit = if kind = RKGen then slotWitness ctx a else None
+                                  vecAdd vals (kind, wit, ty, lowered)
+                                  rest <- more
+                              | [] -> ())
+                     vecToList pre, vecToList vals
              let setup0, argGets = lowRootedArgsK ctx argVals
              let setup = tupPre @ setup0
              let loweredArgs = witnessArgs @ argGets
@@ -7643,6 +7752,21 @@ and private chkReadE (ctx : LowCtx) (tag : string) (e : LExpr) : LExpr =
 
 and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
     let st = ctx.LSt
+    match dictTryFind ctx.StructVars k with
+    // the WHOLE value of a by-value struct: build the object here. This is
+    // the only place a struct costs an allocation, and it is the same place
+    // .NET boxes one — crossing into code that wants a uniform value.
+    | Some (tn, fmap) when tn <> "" && (podOf st tn).IsSome ->
+        let (layout, size, firstRefWord) = optGet (podOf st tn)
+        let items =
+            dictPairs layout
+            |> List.map (fun (fn, v) ->
+                let (off, kind) = v
+                let (sty, _) = optGet (storLTy kind)
+                let r = match dictTryFind fmap fn with Some r -> r | None -> 0
+                (off, sty, storValTy sty, false, LGet { Id = r; RTy = storValTy sty }))
+        lowPodBuildAt ctx ("inl@" + tn) (cidRec st tn) layout size firstRefWord items
+    | _ ->
     match dictTryFind ctx.Slotted k with
     | Some addr -> chkReadE ctx ("slot:" + k) (LLoad (W, addr, 0))   // a shadow-stack-rooted ref local: read the current (post-GC) value
     | None ->
@@ -8248,14 +8372,46 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
     let wnames = witnessVars |> List.map (fun vid -> let r = freshReg ctx ("$w" + string vid) in dictSet ctx.Witness vid r; regNm (wReg r))
-    let pnames = ps |> List.map (fun pv -> regNm (wReg (freshReg ctx (key pv))))
+    // a BY-VALUE struct parameter arrives as its FIELDS, each in its own
+    // typed register: no object, nothing for the collector to manage. Only a
+    // use of the whole value materialises one.
+    // the plan comes from the REGISTERED signature, never from the binder
+    // schemes: a stamped generic's binders can still read `'a` where the
+    // function's own scheme says the struct, and the two ends must agree on
+    // how many values cross the call
+    let paramPlan0 =
+        if List.length structPlan = List.length ps then
+            List.map2 (fun pv tn ->
+                pv, (match tn with Some n -> structAbiOf st n | None -> None)) ps structPlan
+        else ps |> List.map (fun pv -> pv, None)
+    // expand ONLY when the declared signature says so: a vtable-reachable
+    // member keeps the uniform one-pointer-per-parameter shape, and emitting
+    // fields into it would read parameters the type does not have
+    let planWidth = paramPlan0 |> List.sumBy (fun (_, sfs) -> match sfs with Some fs -> List.length fs | None -> 1)
+    let paramPlan =
+        match sig_ with
+        | Some (paramTys, _) when List.length paramTys = planWidth -> paramPlan0
+        | _ -> ps |> List.map (fun pv -> pv, None)
+    let pnames =
+        paramPlan |> List.collect (fun (pv, sfs) ->
+            match sfs with
+            | Some fields ->
+                let fmap = dictNew<string, int> ()
+                let names =
+                    fields |> List.map (fun (fn, _, vty, _) ->
+                        let r = freshTmpT ctx vty
+                        dictSet fmap fn r
+                        regNm { Id = r; RTy = vty })
+                dictSet ctx.StructVars (key pv) ((match structTyName st (List.item (List.findIndex (fun (p2, _) -> key p2 = key pv) paramPlan) paramTypes) with Some tn -> tn | None -> ""), fmap)
+                names
+            | None -> [ regNm (wReg (freshReg ctx (key pv))) ])
     let pnames = wnames @ pnames
     // this ctor's class-param witnesses (for the class ERecord it builds).
     ctx.ClassCtorWits <- witnessVars
@@ -8288,7 +8444,21 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let retTy =
         match sig_ with
         | Some (paramTys, ret) ->
-            List.iter2 (fun pv ty -> match ty with W -> () | _ -> let id = regOf ctx (key pv) in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty) ps paramTys
+            // walk the plan and the ABI together: a struct parameter already
+            // owns its typed field registers, an ordinary scalar one gets its
+            // register retyped here
+            let mutable rest = paramTys
+            for pv, sfs in paramPlan do
+                match sfs with
+                | Some fields -> rest <- List.skip (min (List.length fields) (List.length rest)) rest
+                | None ->
+                    (match rest with
+                     | ty :: more ->
+                         (match ty with
+                          | W -> ()
+                          | _ -> let id = regOf ctx (key pv) in vecSet ctx.RegTys id ty; dictSet ctx.VarScalar (key pv) ty)
+                         rest <- more
+                     | [] -> ())
             ret
         | None -> W
     // GC: root each ref-typed (non-scalar) parameter on the shadow stack for the
@@ -8307,7 +8477,10 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             // rooting (at a raw stamp its W lane holds a raw even int the
             // scanner must never chase); RAW/scalar params never root.
             |> List.filter (fun (pv, ty) ->
-                (scalarLTy ty).IsNone && (dictTryFind ctx.VarScalar (key pv)).IsNone
+                // a BY-VALUE struct param is fields in registers: no pointer,
+                // nothing to root (and no register of its own to read)
+                (dictTryFind ctx.StructVars (key pv)).IsNone
+                && (scalarLTy ty).IsNone && (dictTryFind ctx.VarScalar (key pv)).IsNone
                 && (match refKindOfTy ty with
                     | RKRef -> true
                     | RKGen -> (match prune ty with
@@ -8326,7 +8499,10 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             List.zip ps paramTypes
             |> List.choose (fun (pv, ty) ->
                 match prune ty with
-                | TVar tv when (dictTryFind ctx.VarScalar (key pv)).IsNone && (dictTryFind ctx.LSt.CellVars (key pv)).IsNone ->
+                // a BY-VALUE struct param has no register of its own — its
+                // fields do — and holds no pointer to root
+                | TVar tv when (dictTryFind ctx.StructVars (key pv)).IsNone
+                               && (dictTryFind ctx.VarScalar (key pv)).IsNone && (dictTryFind ctx.LSt.CellVars (key pv)).IsNone ->
                     (match dictTryFind ctx.Witness tv.Id with Some w -> Some (regOf ctx (key pv), w) | None -> None)
                 | _ -> None)
          else [])
@@ -8493,7 +8669,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // which construct in it lowered to a trap
     if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
         eprintfn "LAM %s = %s" lamName (printExpr body)
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     // GC: root the env AND a ref-typed argument on the shadow stack for the body's
@@ -8874,7 +9050,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
-          TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          FuncParamPlan = dictNew (); TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
@@ -9143,6 +9319,17 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // uniform sig; a scalar rides the boxed-at-rest representation coreToLowE
     // already produces. (Matches the wasm-GC backend's all-anyref vtable rule.)
     let vtImpls = dictNew<string, bool> ()
+    // every function that is a MEMBER of something (a class, an interface
+    // impl, a user instance): reachable by dispatch, so its parameter shape
+    // is not ours to change
+    let memberFns = dictNew<string, bool> ()
+    for d in decls0 do
+        match d with
+        | DMembers (_, own) -> for _, mv in own do dictSet memberFns (key mv) true
+        | DClass (_, _, own, impls) ->
+            for _, mv in own do dictSet memberFns (key mv) true
+            for _, ms in impls do (for _, mv in ms do dictSet memberFns (key mv) true)
+        | _ -> ()
     // the identity trio is dispatched INDIRECTLY by $cmpv/$hashv, so it must
     // keep the uniform (self, other) signature: no specialized scalar ABI and
     // no hidden witness params, or the call_indirect type mismatches
@@ -9198,8 +9385,40 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     if binds |> List.forall (fun (_, bs) -> match prune bs.Body with TCon ("?", []) -> false | TVar _ -> false | _ -> true) then
                         dictSet st.TupleParam (key v) binds
                 | _ -> ())
-            match funSigOf s (List.length ps) with
-            | Some sig_ when (dictTryFind vtImpls (key v)).IsNone -> dictSet st.FuncSig (key v) sig_
+            match funSigOfWith st s (List.length ps) (ps |> List.map (fun (_, bs) -> structTyName st bs.Body)) with
+            | Some sig_ when (dictTryFind vtImpls (key v)).IsNone ->
+                let rec argTys t n = if n <= 0 then [] else (match prune t with TFun (a, r) -> a :: argTys r (n - 1) | _ -> [])
+                // BOTH sources must agree that a parameter is a by-value
+                // struct: the function's own scheme AND the binder's. A
+                // stamped clone can carry an unsubstituted `'a` on the binder
+                // while its scheme reads the struct, and expanding one end
+                // only is a shape the other end never sees.
+                let fromScheme = argTys s.Body (List.length ps) |> List.map (structTyName st)
+                let fromBinders = ps |> List.map (fun (_, bs) -> structTyName st bs.Body)
+                let plan =
+                    List.map2 (fun a b -> match a, b with
+                                          | Some x, Some y when x = y -> Some x
+                                          | _ -> None) fromScheme fromBinders
+                // Only a PLAIN function expands its struct parameters. A
+                // member — of a class, an interface or a user INSTANCE — is
+                // reachable through dispatch as well as directly, and a value
+                // that crosses one of those edges must find the uniform shape
+                // on the other side. (A generic function keeps it too: its
+                // stamped and canonical copies are reached different ways.)
+                let plainFn =
+                    (dictTryFind memberFns (key v)).IsNone && List.isEmpty s.Quantified
+                if plainFn || plan |> List.forall (fun x -> x.IsNone) then
+                    dictSet st.FuncSig (key v) sig_
+                    dictSet st.FuncParamPlan (key v) plan
+                else
+                    // recompute the signature WITHOUT struct expansion
+                    let noStruct =
+                        argTys s.Body (List.length ps) |> List.map abiTy
+                    let rec resultOf t n = if n <= 0 then t else (match prune t with TFun (_, r) -> resultOf r (n - 1) | _ -> t)
+                    let ret = abiTy (resultOf s.Body (List.length ps))
+                    if not (List.forall (fun t -> t = W) noStruct && ret = W) then
+                        dictSet st.FuncSig (key v) (noStruct, ret)
+                        dictSet st.FuncParamPlan (key v) (plan |> List.map (fun _ -> None))
             | _ -> ()
             // the tupled member's signature is its ELEMENTS, whatever
             // funSigOf made of the tuple parameter
@@ -9887,7 +10106,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
                 | _ -> ps, body
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -9899,7 +10118,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 match dictTryFind globalScalarTy (gl v) with
                 | Some ty -> Some ([], ty)
                 | None -> None
-            emitFuncLow st m (gl v) true initSig [] [] [] [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) true initSig [] [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
