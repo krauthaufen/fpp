@@ -108,6 +108,10 @@ type LExpr =
 and LStmt =
     | LStore of LTy * LExpr * int * LExpr
     | LSet of LReg * LExpr
+    /// evaluate a MULTI-VALUE call and store its results into these
+    /// registers, in order. A struct returns its fields this way: the value
+    /// never takes a heap slot on the way back.
+    | LSetMany of LReg list * LExpr
     | LSetGlobal of string * LExpr
     /// evaluate an expression for its effect, discard the result
     | LEval of LExpr

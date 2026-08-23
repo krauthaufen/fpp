@@ -206,6 +206,9 @@ type private St =
       /// first-payload-word-index). tids are numbered from TID_FIRST.
       Tids : Dict<string, int>
       TidRegs : Vec<int * int * int * int>
+      /// a function whose RESULT is a by-value struct: it returns the fields
+      /// as multiple values, so the caller never receives a pointer to one
+      FuncRetStruct : Dict<string, string>
       /// per Core parameter of a function with a specialised signature: the
       /// BY-VALUE struct type it expands to, or None. The caller expands by
       /// the CALLEE's plan — deciding from the argument instead let the two
@@ -6686,6 +6689,33 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let callE =
                  if isSelfTail then LTailCall (fn v, loweredArgs)
                  else
+                 match dictTryFind st.FuncRetStruct (key v) with
+                 // a BY-VALUE struct result arrives as its fields: park them
+                 // in registers, then materialise an object only because this
+                 // context wants one value — lowStructBind recognises the
+                 // shape and takes the registers instead
+                 | Some rn ->
+                     // hand the callee a destination on the raw struct stack,
+                     // then read the fields back out of it. Nothing the
+                     // collector manages is involved.
+                     let (layout, size, firstRefWord) = optGet (podOf st rn)
+                     let fields = optGet (structAbiOf st rn)
+                     let dst = freshTmp ctx
+                     let stmts =
+                         [ LSetGlobal ("$ssp", LPrim (SubW, [ LGetGlobal "$ssp"; LConstW size ]))
+                           LSet (wReg dst, LGetGlobal "$ssp")
+                           LEval (LCall (fn v, loweredArgs @ [ LGet (wReg dst) ]))
+                           LSetGlobal ("$ssp", LPrim (AddW, [ LGetGlobal "$ssp"; LConstW size ])) ]
+                     // this context wants ONE value, so copy the fields into a
+                     // real object — the scratch slot is reused by the next
+                     // call and must never escape. A struct BINDING recognises
+                     // the shape and takes the fields straight into registers.
+                     let items =
+                         fields |> List.map (fun (_, off, vty, kind) ->
+                             let (sty, _) = optGet (storLTy kind)
+                             (off, sty, vty, false, LLoad (sty, LGet (wReg dst), off)))
+                     LDo (stmts, lowPodBuildAt ctx ("inl@" + rn) (cidRec st rn) layout size firstRefWord items)
+                 | None ->
                  match retTy with
                  | W -> LCall (fn v, loweredArgs)
                  // hold the scalar result in a typed local before boxing: the call
@@ -7025,6 +7055,11 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         bind :: bodyStmts
     | ELet (_, v, sch, rhs, body) ->
         lowLetBind ctx v sch rhs :: coreToLowS ctx body
+    // assigning a BY-VALUE struct writes its FIELD registers — no object, no
+    // copy through the heap
+    | EAssign (v, rhs) when (dictTryFind ctx.StructVars (key v)).IsSome ->
+        let (tn, _) = optGet (dictTryFind ctx.StructVars (key v))
+        lowStructBind ctx (key v) tn rhs
     | EAssign (v, rhs) when (dictTryFind ctx.LSt.CellVars (key v)).IsSome ->
         // a captured mutable: store into its cell (shared with the closure).
         // The VALUE is evaluated first — it can allocate and move the cell —
@@ -7383,6 +7418,7 @@ and private regInS (id : int) (st : LStmt) : bool =
     match st with
     | LStore (_, a, _, v) -> regInE id a || regInE id v
     | LSet (r, v) -> r.Id = id || regInE id v
+    | LSetMany (rs, v) -> (rs |> List.exists (fun r -> r.Id = id)) || regInE id v
     | LSetGlobal (_, v) -> regInE id v
     | LEval v -> regInE id v
     | LCallVoidS (_, xs) -> xs |> List.exists (regInE id)
@@ -7803,11 +7839,93 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
 // bind a local `let`: a monomorphic scalar rides unboxed in a typed local
 // (recorded in VarScalar, read/captured through a re-box), everything else a
 // tagged word — wrapped in a cell when captured-and-mutable.
+/// bind a BY-VALUE struct into field registers, and fill them from the rhs
+/// without ever building an object when the rhs is a literal or another
+/// by-value struct
+and private lowStructBind (ctx : LowCtx) (k : string) (tn : string) (rhs : Expr) : LStmt list =
+
+    let st = ctx.LSt
+    let fields = optGet (structAbiOf st tn)
+    let fmap =
+        match dictTryFind ctx.StructVars k with
+        | Some (_, m) -> m
+        | None ->
+            let m = dictNew<string, int> ()
+            for fn, _, vty, _ in fields do dictSet m fn (freshTmpT ctx vty)
+            dictSet ctx.StructVars k (tn, m)
+            m
+    let regOfField (fn : string) (vty : LTy) = { Id = (match dictTryFind fmap fn with Some r -> r | None -> 0); RTy = vty }
+    match rhs with
+    // the literal is usually reached through the lets that pre-evaluate its
+    // fields: bind those, then keep looking for the record
+    | ELet (false, lv, lsch, lrhs, lbody) ->
+        lowLetBind ctx lv lsch lrhs :: lowStructBind ctx k tn lbody
+    | ESeq xs when not (List.isEmpty xs) ->
+        let rec split (ys : Expr list) : LStmt list =
+            match ys with
+            | [ last ] -> lowStructBind ctx k tn last
+            | y :: more -> coreToLowS ctx y @ split more
+            | [] -> []
+        split xs
+    | ERecord (rn, fs) when rn = tn || (structAbiOf st rn).IsSome ->
+        fields |> List.map (fun (fn, _, vty, kind) ->
+            let ve = fs |> List.tryPick (fun (n2, e2) -> if n2 = fn then Some e2 else None)
+            let raw =
+                match ve with
+                | Some e2 -> storUnbox kind (coreToLowE ctx e2)
+                | None -> (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+            LSet (regOfField fn vty, raw))
+    | (EVar (sv, _) | EVarI (sv, _, _)) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
+        let (_, srcMap) = optGet (dictTryFind ctx.StructVars (key sv))
+        fields |> List.map (fun (fn, _, vty, _) ->
+            let sr = match dictTryFind srcMap fn with Some r -> r | None -> 0
+            LSet (regOfField fn vty, LGet { Id = sr; RTy = vty }))
+    | _ ->
+        // a struct-returning CALL wrote its fields into a scratch slot: read
+        // them straight into these registers and drop the object it built for
+        // a one-value context. The call may sit under argument-rooting
+        // statements, so peel the LDo layers looking for the destination.
+        let rec scratchCall (e : LExpr) (acc : LStmt list) : (LStmt list * LReg) option =
+            match e with
+            | LDo (stmts, tail) ->
+                (match stmts |> List.tryPick (fun st2 -> match st2 with LSet (r, LGetGlobal "$ssp") -> Some r | _ -> None) with
+                 | Some r -> Some (acc @ stmts, r)
+                 | None -> scratchCall tail (acc @ stmts))
+            | _ -> None
+        match coreToLowE ctx rhs with
+        | lowered when (scratchCall lowered []).IsSome ->
+            let (stmts, dstR) = optGet (scratchCall lowered [])
+            stmts
+            @ (fields |> List.map (fun (fn, off, vty, kind) ->
+                    let (sty, _) = optGet (storLTy kind)
+                    LSet (regOfField fn vty, LLoad (sty, LGet dstR, off))))
+        | lowered ->
+            // an object: read its inline fields once into the registers
+            let objR = freshTmp ctx
+            LSet (wReg objR, lowered)
+            :: (fields |> List.map (fun (fn, off, vty, kind) ->
+                    let (sty, _) = optGet (storLTy kind)
+                    LSet (regOfField fn vty, LLoad (sty, LGet (wReg objR), off))))
+
 and private lowLetBind (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) : LStmt =
     let st = ctx.LSt
     let k = key v
     let isCell = (dictTryFind st.CellVars k).IsSome
-    match (if isCell then None else scalarLTy sch.Body) with
+    // the binder's scheme can be the anonymous `?` (a `let mutable` desugar
+    // writes no type), so a struct literal on the right names the type
+    let structTn =
+        match structTyName st sch.Body with
+        | Some tn -> Some tn
+        | None ->
+            (match rhs with
+             | ERecord (rn, _) when (structAbiOf st rn).IsSome -> Some rn
+             | _ -> None)
+    match (if isCell then None else (match structTn with Some _ -> None | None -> scalarLTy sch.Body)) with
+    | _ when not isCell && structTn.IsSome ->
+        // a BY-VALUE struct local lives in field registers
+        (match lowStructBind ctx k (optGet structTn) rhs with
+         | [ one ] -> one
+         | many -> LIf (LConstW 1, many, []))
     | Some ty ->
         let id = freshReg ctx k
         vecSet ctx.RegTys id ty
@@ -8289,6 +8407,11 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
         emitLowE f v
         mem f (storeIns ty)
     | LSet (r, e) -> emitLowE f e; ls f (regNm r)
+    // the results land on the stack left to right, so the LAST register is
+    // filled first
+    | LSetMany (rs, e) ->
+        emitLowE f e
+        for r in List.rev rs do ls f (regNm r)
     | LSetGlobal (g, e) ->
         match (if gc then dictTryFind gcGlobalSlots g else None) with
         | Some slot -> gg f "$roots"; ic f (4 * slot); ins f "i32.add"; emitLowE f e; mem f "i32.store"
@@ -8372,7 +8495,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
     | EIfaceCall (_, _, r, xs) -> preRecGroups ctx r; List.iter (preRecGroups ctx) xs
     | _ -> ()
 
-let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
+let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
     let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
@@ -8412,7 +8535,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
                 dictSet ctx.StructVars (key pv) ((match structTyName st (List.item (List.findIndex (fun (p2, _) -> key p2 = key pv) paramPlan) paramTypes) with Some tn -> tn | None -> ""), fmap)
                 names
             | None -> [ regNm (wReg (freshReg ctx (key pv))) ])
-    let pnames = wnames @ pnames
+    let pnames = wnames @ pnames @ (match retStruct with Some _ -> [ "$sret" ] | None -> [])
     // this ctor's class-param witnesses (for the class ERecord it builds).
     ctx.ClassCtorWits <- witnessVars
     // a method of a Canon generic class reads its class-param witnesses off
@@ -8584,6 +8707,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         match st2 with
         | LStore (_, a, _, b) -> seeE a; seeE b
         | LSet (r, e2) -> seeR r; seeE e2
+        | LSetMany (rs, e2) -> (for r in rs do seeR r); seeE e2
         | LSetGlobal (_, e2) | LEval e2 | LBreakIf (_, e2) | LThrow e2 | LReturn e2 -> seeE e2
         | LCallVoidS (_, xs) -> for x in xs do seeE x
         | LIf (c, a, b) -> seeE c; (for x in a do seeS x); (for x in b do seeS x)
@@ -8611,6 +8735,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         match st2 with
         | LStore (_, a, o, b) -> "st[" + dumpE a + "+" + string o + "]=" + dumpE b
         | LSet (r, e2) -> "s" + string r.Id + "=" + dumpE e2
+        | LSetMany (rs, e2) -> "sm[" + String.concat "," (rs |> List.map (fun r -> string r.Id)) + "]=" + dumpE e2
         | LSetGlobal (n, e2) -> "SG(" + n + ")=" + dumpE e2
         | LEval e2 -> "ev " + dumpE e2
         | LCallVoidS (n, xs) -> "cv:" + n + "(" + String.concat " " (List.map dumpE xs) + ")"
@@ -8654,10 +8779,36 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         // methods. A stubbed FUNCTION still traps loudly if it is ever called.
         if isInit then (ic f 0; finish f) else ins f "unreachable"
     else
-        let np = List.length witnessVars + List.length ps
+        // the PARAMETER registers are pnames — with a by-value struct that is
+        // more than one per Core parameter, and declaring one of them as a
+        // local again would shadow the incoming value
+        // a BY-VALUE struct result: bind the body into field registers and
+        // leave those on the stack — the object is never built
+        let retBind =
+            match retStruct with
+            | Some rn ->
+                let stmts = lowStructBind ctx "$sret" rn body
+                let (_, fmap) = optGet (dictTryFind ctx.StructVars "$sret")
+                let fields = optGet (structAbiOf st rn)
+                Some (stmts, fields |> List.map (fun (fn2, off, vty, kind) ->
+                                        let (sty, _) = optGet (storLTy kind)
+                                        off, sty, { Id = (match dictTryFind fmap fn2 with Some r -> r | None -> 0); RTy = vty }))
+            | None -> None
+        let np = List.length pnames
         for id in np .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
         localsDone f
-        emitLowE f bodyLow
+        (match retBind with
+         | Some (stmts, slots) ->
+             for st2 in stmts do emitLowS f st2
+             // write the fields through the caller's destination pointer, and
+             // answer that pointer
+             for off, sty, r in slots do
+                 lg f "$sret"
+                 (if off <> 0 then (ic f off; ins f "i32.add"))
+                 lg f (regNm r)
+                 mem f (storeIns sty)
+             lg f "$sret"
+         | None -> emitLowE f bodyLow)
         finish f
     endFn f
 
@@ -9050,7 +9201,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
           ClassId = dictNew (); CaseClass = dictNew (); WitnessedClasses = dictNew (); CasePod = dictNew (); UnionFlat = dictNew ()
           SlotOf = dictNew (); NSlots = 0; VtBase = 0; TestIds = dictNew (); UsesExn = false
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
-          FuncParamPlan = dictNew (); TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
+          FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
           GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
@@ -9410,6 +9561,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 if plainFn || plan |> List.forall (fun x -> x.IsNone) then
                     dictSet st.FuncSig (key v) sig_
                     dictSet st.FuncParamPlan (key v) plan
+                    // a struct RESULT comes back in registers too
+                    (if plainFn then
+                        let rec resultOf t n = if n <= 0 then t else (match prune t with TFun (_, r) -> resultOf r (n - 1) | _ -> t)
+                        match structTyName st (resultOf s.Body (List.length ps)) with
+                        | Some rn -> dictSet st.FuncRetStruct (key v) rn
+                        | None -> ())
                 else
                     // recompute the signature WITHOUT struct expansion
                     let noStruct =
@@ -9666,7 +9823,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             (match dictTryFind st.FuncSig (key v) with
              | Some (paramTys, retTy) ->
                  let tn = "$ft" + fn v
-                 tyFunc m tn ((List.replicate nw "i32") @ (paramTys |> List.map wtyName)) [ wtyName retTy ]
+                 // a BY-VALUE struct result is written through a DESTINATION
+                 // pointer the caller supplies (C's sret): every function stays
+                 // single-valued, which the merge step requires, and the
+                 // destination is a raw scratch stack the collector never sees
+                 let extra = match dictTryFind st.FuncRetStruct (key v) with Some _ -> [ "i32" ] | None -> []
+                 tyFunc m tn ((List.replicate nw "i32") @ (paramTys |> List.map wtyName) @ extra) [ wtyName retTy ]
                  declFn m (fn v) tn
              | None ->
                  let a = nw + List.length ps
@@ -9813,7 +9975,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         emitByte st.ConstData (w &&& 0xFF); emitByte st.ConstData ((w >>> 8) &&& 0xFF)
         emitByte st.ConstData ((w >>> 16) &&& 0xFF); emitByte st.ConstData ((w >>> 24) &&& 0xFF)
     st.ConstNext <- st.ConstNext + 4 * (nCid * st.NSlots)
-    globalI32Mut m "$hp" st.ConstNext
+    globalI32Mut m "$hp" (st.ConstNext + 65536)
+    // the STRUCT-RETURN stack: a raw region the collector never scans, bumped
+    // down for the destination a by-value struct result is written into. 64 KB
+    // reserved above the constant pool; strictly LIFO, so nesting and
+    // recursion share it safely.
+    globalI32Mut m "$ssp" (st.ConstNext + 65536)
     // raised by a comparison walk that met an unordered (NaN) float pair; read
     // by the ordering operators, which are a PARTIAL order over structures
     globalI32Mut m "$unord" 0
@@ -10106,7 +10273,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 match dictTryFind st.TupleParam (key v), body with
                 | Some binds, EMatch (_, [ (_, None, inner) ]) -> binds, inner
                 | _ -> ps, body
-            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
+            emitFuncLow st m (fn v) false (dictTryFind st.FuncSig (key v)) (match dictTryFind st.FuncParamPlan (key v) with Some pl -> pl | None -> []) (dictTryFind st.FuncRetStruct (key v)) (match dictTryFind st.FuncWitness (key v) with Some ws -> ws | None -> []) selfWits constWits (ps2 |> List.map fst) (ps2 |> List.map (fun (_, s) -> s.Body)) body2 (fun _ -> ())
         | _ -> ()
     // init bodies — DECLARED before _start and the lambdas, so emitted here
     // too (the function and code sections are positional and must agree)
@@ -10118,7 +10285,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 match dictTryFind globalScalarTy (gl v) with
                 | Some ty -> Some ([], ty)
                 | None -> None
-            emitFuncLow st m (gl v) true initSig [] [] [] [] [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) true initSig [] None [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot
                 match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
