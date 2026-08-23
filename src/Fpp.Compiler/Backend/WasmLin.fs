@@ -4868,11 +4868,29 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | x :: rest -> LDo (coreToLowS ctx x, go rest)
         go xs
     | EIf (c, a, b) ->
-        let r = freshTmp ctx
-        LDo ([ LIf (coreToLowE ctx c,
-                    [ LSet (wReg r, coreToLowE ctx a) ],
-                    [ LSet (wReg r, coreToLowE ctx b) ]) ],
-             LGet (wReg r))
+        // a JOIN of two 64-bit scalars keeps the value RAW across the merge.
+        // The word temp below is a uniform slot, so both arms boxed their
+        // result and the consumer unboxed it again — the last shape in which
+        // a float still allocated on an ordinary path.
+        let joinTy =
+            match printConOf ctx.LSt e with
+            | "float" | "double" -> Some F64
+            | "int64" | "uint64" -> Some I64
+            | _ -> None
+        (match joinTy with
+         | Some t ->
+             let r = freshTmpT ctx t
+             let reg = { Id = r; RTy = t }
+             LDo ([ LIf (coreToLowE ctx c,
+                         [ LSet (reg, flatUnbox t (coreToLowE ctx a)) ],
+                         [ LSet (reg, flatUnbox t (coreToLowE ctx b)) ]) ],
+                  flatBox ctx t (LGet reg))
+         | None ->
+             let r = freshTmp ctx
+             LDo ([ LIf (coreToLowE ctx c,
+                         [ LSet (wReg r, coreToLowE ctx a) ],
+                         [ LSet (wReg r, coreToLowE ctx b) ]) ],
+                  LGet (wReg r)))
     | EWhile (_, _) | EAssign (_, _) -> LDo (coreToLowS ctx e, lowInt 0)
     | EPrim ("+t", [ a; b ]) ->
         // GC: root `a` across `b`'s evaluation — `"x" + string n` allocates
@@ -6954,6 +6972,43 @@ and private regInS (id : int) (st : LStmt) : bool =
 /// store, so every such return allocated a box and immediately read it back.
 and private cancelBox (ty : LTy) (p : LExpr) : LExpr option =
     match p with
+    | LDo (stmts0, LGet rb0) ->
+        // the value may reach the tail through COPIES (`r11 = r10`) — the
+        // scope-exit shape puts one between the box and the result. Follow
+        // the chain, and drop the copies with the box.
+        let copies = vecNew<int> ()
+        let mutable rb = rb0
+        let mutable go = true
+        while go do
+            go <- false
+            let mutable at = -1
+            let mutable src = None
+            stmts0 |> List.iteri (fun i st ->
+                match st with
+                | LSet (r, LGet s2) when r.Id = rb.Id && at < 0 -> at <- i; src <- Some s2
+                | _ -> ())
+            match src with
+            | Some s2 ->
+                // the copy target must be written ONCE and read only here
+                let others =
+                    stmts0 |> List.mapi (fun i st -> i, st)
+                           |> List.filter (fun (i, _) -> i <> at && not (List.contains i (vecToList copies)))
+                           |> List.map snd
+                if not (others |> List.exists (regInS rb.Id)) then
+                    vecAdd copies at
+                    rb <- s2
+                    go <- true
+            | None -> ()
+        let stmts = stmts0 |> List.mapi (fun i st -> i, st)
+                           |> List.filter (fun (i, _) -> not (List.contains i (vecToList copies)))
+                           |> List.map snd
+        cancelBoxIn ty stmts rb (fun rest v ->
+            // the dropped copies never held anything but the box pointer
+            LDo (rest, v))
+    | _ -> None
+
+and private cancelBoxIn (ty : LTy) (stmts : LStmt list) (rb : LReg) (mk : LStmt list -> LExpr -> LExpr) : LExpr option =
+    match LDo (stmts, LGet rb) with
     | LDo (stmts, LGet rb) ->
         // the payload the box was given, and the two statements that built it
         let mutable payload = None
@@ -6977,7 +7032,7 @@ and private cancelBox (ty : LTy) (p : LExpr) : LExpr option =
                              |> List.map snd
             if rest |> List.exists (regInS rb.Id) then None
             elif regInE rb.Id v then None
-            else Some (LDo (rest, v))
+            else Some (mk rest v)
         | _ -> None
     | _ -> None
 
