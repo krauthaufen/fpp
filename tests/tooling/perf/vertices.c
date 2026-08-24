@@ -9,6 +9,6 @@ int main(int argc, char **argv) {
     double acc = 0;
     for (int r = 0; r < R; r++)
         for (int i = 0; i < N; i++) acc += (double)v[i].x + (double)v[i].y + (double)v[i].z;
-    printf("%f\n", acc);
+    printf("%.0f\n", acc);
     return 0;
 }
