@@ -3755,14 +3755,26 @@ let private storLTy (k : string) : (LTy * int) option =
     match k with
     | "float" | "double" -> Some (F64, 8)
     | "int64" | "uint64" -> Some (I64, 8)
-    | "float32" | "single" -> Some (W, 4)
+    // a real f32, not the four bits of one: loading through i32 forces every
+    // element through a general register and back into an FP one, where
+    // `f32.load` lands it there directly (13% on the vertex benchmark)
+    | "float32" | "single" -> Some (F32, 4)
     | "int" | "int32" | "uint32" | "nativeint" | "unativeint" | "bool" -> Some (W, 4)
     | "int16" | "uint16" -> Some (I16, 2)
     | "byte" | "sbyte" -> Some (I8, 1)
     | _ -> None
 // the machine type a pre-store element value rides in before it hits its slot:
 // f64/i64 stay wide; a packed narrow int or f32-bits is just an i32 word.
-let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | _ -> W
+let private storValTy (sty : LTy) : LTy = match sty with F64 -> F64 | I64 -> I64 | F32 -> F32 | _ -> W
+
+/// the zero of a machine type. An f32 has no constant of its own in the IR —
+/// it is the f64 zero demoted, which folds to `f32.const 0` on the way out.
+let private zeroOfTy (ty : LTy) : LExpr =
+    match ty with
+    | F64 -> LConstF 0.0
+    | I64 -> LConstL 0L
+    | F32 -> LPrim (DemF, [ LConstF 0.0 ])
+    | _ -> LConstW 0
 
 /// the descriptor code for a field of this declared type. 0 is a REFERENCE
 /// (the walkers recurse); everything else names a width and a signedness, so
@@ -5766,7 +5778,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 let ve = fields |> List.tryPick (fun (f, e) -> if f = fn then Some e else None)
                 match storLTy kind with
                 | Some (sty, _) ->
-                    let raw = match ve with Some e -> storUnbox kind (coreToLowE ctx e) | None -> (match storValTy sty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+                    let raw = match ve with Some e -> storUnbox kind (coreToLowE ctx e) | None -> zeroOfTy (storValTy sty)
                     [ (off, sty, storValTy sty, false, raw) ]
                 | None when (podOf st kind).IsSome
                             && (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 kind).IsSome ->
@@ -5791,7 +5803,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                          podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
                              let (isty, _) = optGet (storLTy ity)
                              (off + ioff - HDR, isty, storValTy isty, false,
-                              (match storValTy isty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0))))
+                              zeroOfTy (storValTy isty))))
                 | None -> [ (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)) ])
         lowPodBuild ctx name (itemsOf layout order fields 0)
     | ERecordExt (name, baseE, updates) when (podOf st name).IsSome ->
@@ -5941,6 +5953,17 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             storBox ctx kind
                 (LLoad (sty, LPrim (AddW, [ arrE; LPrim (MulW, [ iE; LConstW stride ]) ]), ARRHDR + off - HDR))
         if lowSafeE arrE && lowSafeE iE && lowSafeE direct then direct
+        // the BOX around the result may allocate (a later peephole usually
+        // cancels it), and no allocation may sit between the address and the
+        // load. Only the LOAD needs that ordering, so it takes a typed temp
+        // while the address still goes in inline — the `ar`/`ir` copies below
+        // exist for a safepoint that a plain global read and an index cannot
+        // reach.
+        elif lowSafeE arrE && lowSafeE iE then
+            let fv = freshTmpT ctx vty
+            LDo ([ LSet ({ Id = fv; RTy = vty },
+                         LLoad (sty, LPrim (AddW, [ arrE; LPrim (MulW, [ iE; LConstW stride ]) ]), ARRHDR + off - HDR)) ],
+                 storBox ctx kind (LGet { Id = fv; RTy = vty }))
         else
         let ar = freshTmp ctx
         let ir = freshTmp ctx
@@ -6045,6 +6068,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let addr = LPrim (AddW, [ arrE; LPrim (MulW, [ iE; LConstW stride ]) ])
         let direct = storBox ctx kind (LLoad (sty, addr, ARRHDR + off - HDR))
         if lowSafeE arrE && lowSafeE iE && lowSafeE direct then direct
+        elif lowSafeE arrE && lowSafeE iE then
+            let fv = freshTmpT ctx vty
+            LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, addr, ARRHDR + off - HDR)) ],
+                 storBox ctx kind (LGet { Id = fv; RTy = vty }))
         else
         let ar = freshTmp ctx
         let ir = freshTmp ctx
@@ -6394,7 +6421,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // fill the raw scalar zero, NOT a mis-unboxed tagged 0 (which would read
         // a bogus address as if the slot were boxed).
         let isZero = match init with EUnknown n | EApp (EUnknown n, _) -> n.StartsWith "$zero" | _ -> false
-        let fill = if isZero then (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0) else storUnbox k (coreToLowE ctx init)
+        let fill = if isZero then zeroOfTy vty else storUnbox k (coreToLowE ctx init)
         let header =
             [ LSet (wReg cnt, (coreToLowE ctx n))
               LSet ({ Id = fv; RTy = vty }, fill)
@@ -7101,7 +7128,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                                       let raw =
                                           match fe with
                                           | Some e2 -> storUnbox kind (coreToLowE ctx e2)
-                                          | None -> (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+                                          | None -> zeroOfTy vty
                                       vecAdd vals (RKRaw, None, vty, raw)
                               | EVar (v, _) | EVarI (v, _, _) when (dictTryFind ctx.StructVars (key v)).IsSome ->
                                   let (_, fmap) = optGet (dictTryFind ctx.StructVars (key v))
@@ -8003,7 +8030,7 @@ and private storBox (ctx : LowCtx) (k : string) (raw : LExpr) : LExpr =
     match k with
     | "float" | "double" -> lowBoxF ctx raw
     | "int64" | "uint64" -> lowBoxI ctx raw
-    | "float32" | "single" -> lowBoxF ctx (LPrim (PromF, [ LPrim (Bits2F, [ raw ]) ]))
+    | "float32" | "single" -> lowBoxF ctx (LPrim (PromF, [ raw ]))
     | "sbyte" -> (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 24 ]); LConstW 24 ]))
     | "int16" -> (LPrim (ShrSW, [ LPrim (ShlW, [ raw; LConstW 16 ]); LConstW 16 ]))
     | _ -> raw   // byte / uint16: the unsigned load already zero-extended; raw at rest
@@ -8013,7 +8040,7 @@ and private storUnbox (k : string) (word : LExpr) : LExpr =
     match k with
     | "float" | "double" -> lowUnboxF word
     | "int64" | "uint64" -> lowUnboxI word
-    | "float32" | "single" -> LPrim (F2Bits, [ LPrim (DemF, [ lowUnboxF word ]) ])
+    | "float32" | "single" -> LPrim (DemF, [ lowUnboxF word ])
     | _ -> word
 
 // test `pat` against the value in register `scrutReg`; produce statements that
@@ -8355,7 +8382,7 @@ and private lowStructBind (ctx : LowCtx) (k : string) (tn : string) (rhs : Expr)
             let raw =
                 match litLeaf fs (splitDots fn) with
                 | Some e2 -> storUnbox kind (coreToLowE ctx e2)
-                | None -> (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
+                | None -> zeroOfTy vty
             LSet (regOfField fn vty, raw))
     | (EVar (sv, _) | EVarI (sv, _, _)) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
         let (_, srcMap) = optGet (dictTryFind ctx.StructVars (key sv))
@@ -8881,6 +8908,168 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
         for s in ss do emitLowS f s
         emitLowE f v
 
+/// Does anything here reach a GC safepoint (a call, or an allocation)? An
+/// object may MOVE at one, so a pointer read before it is stale after it.
+and private hasSafepointE (e : LExpr) : bool =
+    match e with
+    | LAlloc _ | LCall _ | LTailCall _ | LCallIndirect _ | LCallIdx _ -> true
+    | LPrim (_, xs) -> xs |> List.exists hasSafepointE
+    | LLoad (_, a, _) -> hasSafepointE a
+    | LDo (ss, t) -> hasSafepointE t || ss |> List.exists hasSafepointS
+    | _ -> false
+
+and private hasSafepointS (st : LStmt) : bool =
+    match st with
+    | LCallVoidS _ -> true
+    | LSet (_, v) | LSetGlobal (_, v) | LEval v | LBreakIf (_, v) | LReturn v | LThrow v | LSetMany (_, v) -> hasSafepointE v
+    | LStore (_, a, _, v) -> hasSafepointE a || hasSafepointE v
+    | LMemFill (d, v, n) -> hasSafepointE d || hasSafepointE v || hasSafepointE n
+    | LIf (c, a, b) -> hasSafepointE c || List.exists hasSafepointS a || List.exists hasSafepointS b
+    | LWhile (c, b) -> hasSafepointE c || List.exists hasSafepointS b
+    | LBlock (_, b) -> List.exists hasSafepointS b
+    | LTryStmt _ -> true
+    | LBreak _ | LTrap -> false
+
+/// a store whose address is built from the shadow stack could write the very
+/// root slot a hoisted pointer was read from
+and private touchesRoots (e : LExpr) : bool =
+    match e with
+    | LGetGlobal g -> g = "$roots" || g = "$sp"
+    | LPrim (_, xs) -> xs |> List.exists touchesRoots
+    | LLoad (_, a, _) -> touchesRoots a
+    | LDo (ss, t) -> touchesRoots t || ss |> List.exists (fun st -> match st with LSet (_, v) -> touchesRoots v | _ -> true)
+    | _ -> false
+
+and private storesRoots (st : LStmt) : bool =
+    match st with
+    | LStore (_, a, _, _) -> touchesRoots a
+    | LMemFill (d, _, _) -> touchesRoots d
+    | LIf (_, a, b) -> List.exists storesRoots a || List.exists storesRoots b
+    | LWhile (_, b) -> List.exists storesRoots b
+    | LBlock (_, b) -> List.exists storesRoots b
+    | _ -> false
+
+and private setsGlobalIn (g : string) (st : LStmt) : bool =
+    match st with
+    | LSetGlobal (g2, _) -> g2 = g
+    | LIf (_, a, b) -> List.exists (setsGlobalIn g) a || List.exists (setsGlobalIn g) b
+    | LWhile (_, b) -> List.exists (setsGlobalIn g) b
+    | LBlock (_, b) -> List.exists (setsGlobalIn g) b
+    | _ -> false
+
+/// every `LLoad (W, LGetGlobal g, off)` in here — the shape an array held in a
+/// module-level binding takes, read once per element inside a loop
+and private globalLoadsE (e : LExpr) (acc : Vec<string * int>) : unit =
+    match e with
+    // a slot-backed global is not a `global.get`: it emits a LOAD from the root
+    // table, which is what makes it worth hoisting at all
+    | LGetGlobal g when gc && (dictTryFind gcGlobalSlots g).IsSome -> vecAdd acc (g, 0 - 1)
+    | LLoad (W, LGetGlobal g, off) -> vecAdd acc (g, off)
+    | LLoad (_, a, _) -> globalLoadsE a acc
+    | LPrim (_, xs) | LCall (_, xs) | LTailCall (_, xs) -> for x in xs do globalLoadsE x acc
+    | LAlloc a -> globalLoadsE a acc
+    | LCallIndirect (_, a, xs) | LCallIdx (_, a, xs) -> globalLoadsE a acc; (for x in xs do globalLoadsE x acc)
+    | LDo (ss, t) -> (for st in ss do globalLoadsS st acc); globalLoadsE t acc
+    | _ -> ()
+
+and private globalLoadsS (st : LStmt) (acc : Vec<string * int>) : unit =
+    match st with
+    | LSet (_, v) | LSetGlobal (_, v) | LEval v | LBreakIf (_, v) | LReturn v | LThrow v | LSetMany (_, v) -> globalLoadsE v acc
+    | LStore (_, a, _, v) -> globalLoadsE a acc; globalLoadsE v acc
+    | LMemFill (d, v, n) -> globalLoadsE d acc; globalLoadsE v acc; globalLoadsE n acc
+    | LCallVoidS (_, xs) -> for x in xs do globalLoadsE x acc
+    | LIf (c, a, b) -> globalLoadsE c acc; (for x in a do globalLoadsS x acc); (for x in b do globalLoadsS x acc)
+    | LWhile (c, b) -> globalLoadsE c acc; (for x in b do globalLoadsS x acc)
+    | LBlock (_, b) -> for x in b do globalLoadsS x acc
+    | _ -> ()
+
+and private substLoadE (g : string) (off : int) (r : LReg) (e : LExpr) : LExpr =
+    match e with
+    | LGetGlobal g2 when off = 0 - 1 && g2 = g -> LGet r
+    | LLoad (W, LGetGlobal g2, off2) when g2 = g && off2 = off -> LGet r
+    | LLoad (ty, a, o) -> LLoad (ty, substLoadE g off r a, o)
+    | LPrim (op, xs) -> LPrim (op, xs |> List.map (substLoadE g off r))
+    | LCall (f2, xs) -> LCall (f2, xs |> List.map (substLoadE g off r))
+    | LTailCall (f2, xs) -> LTailCall (f2, xs |> List.map (substLoadE g off r))
+    | LAlloc a -> LAlloc (substLoadE g off r a)
+    | LCallIndirect (t, a, xs) -> LCallIndirect (t, substLoadE g off r a, xs |> List.map (substLoadE g off r))
+    | LCallIdx (t, a, xs) -> LCallIdx (t, substLoadE g off r a, xs |> List.map (substLoadE g off r))
+    | LDo (ss, t) -> LDo (ss |> List.map (substLoadS g off r), substLoadE g off r t)
+    | _ -> e
+
+and private substLoadS (g : string) (off : int) (r : LReg) (st : LStmt) : LStmt =
+    let se = substLoadE g off r
+    match st with
+    | LSet (a, v) -> LSet (a, se v)
+    | LSetGlobal (a, v) -> LSetGlobal (a, se v)
+    | LSetMany (a, v) -> LSetMany (a, se v)
+    | LEval v -> LEval (se v)
+    | LBreakIf (l, v) -> LBreakIf (l, se v)
+    | LReturn v -> LReturn (se v)
+    | LThrow v -> LThrow (se v)
+    | LStore (ty, a, o, v) -> LStore (ty, se a, o, se v)
+    | LMemFill (d, v, n) -> LMemFill (se d, se v, se n)
+    | LCallVoidS (f2, xs) -> LCallVoidS (f2, xs |> List.map se)
+    | LIf (c, a, b) -> LIf (se c, a |> List.map (substLoadS g off r), b |> List.map (substLoadS g off r))
+    | LWhile (c, b) -> LWhile (se c, b |> List.map (substLoadS g off r))
+    | LBlock (l, b) -> LBlock (l, b |> List.map (substLoadS g off r))
+    | other -> other
+
+/// Hoist a loop-invariant array-pointer read out of a loop that cannot reach a
+/// safepoint. A module-level array lives in a root-table slot, so every element
+/// access re-loaded the pointer from memory — once per element, on the
+/// dependency chain ahead of the element load itself. Nothing inside such a
+/// loop can move the object or rewrite the slot, so one read before the loop
+/// answers for all of them.
+and private hoistE (ctx : LowCtx) (e : LExpr) : LExpr =
+    match e with
+    | LDo (ss, t) -> LDo (hoistStmts ctx ss, hoistE ctx t)
+    | LPrim (op, xs) -> LPrim (op, xs |> List.map (hoistE ctx))
+    | LCall (f2, xs) -> LCall (f2, xs |> List.map (hoistE ctx))
+    | LTailCall (f2, xs) -> LTailCall (f2, xs |> List.map (hoistE ctx))
+    | LLoad (ty, a, o) -> LLoad (ty, hoistE ctx a, o)
+    | LAlloc a -> LAlloc (hoistE ctx a)
+    | LCallIndirect (t, a, xs) -> LCallIndirect (t, hoistE ctx a, xs |> List.map (hoistE ctx))
+    | LCallIdx (t, a, xs) -> LCallIdx (t, hoistE ctx a, xs |> List.map (hoistE ctx))
+    | _ -> e
+
+and private hoistStmts (ctx : LowCtx) (ss : LStmt list) : LStmt list =
+    ss |> List.collect (fun st ->
+        match st with
+        | LWhile (c, body) ->
+            let body = hoistStmts ctx body
+            let safe =
+                not (hasSafepointE c) && not (List.exists hasSafepointS body)
+                && not (List.exists storesRoots body)
+            if not safe then [ LWhile (hoistE ctx c, body) ]
+            else
+                let cands = vecNew<string * int> ()
+                for st2 in body do globalLoadsS st2 cands
+                globalLoadsE c cands
+                let uniq =
+                    vecToList cands
+                    |> List.filter (fun (g, _) -> not (List.exists (setsGlobalIn g) body))
+                    |> List.distinct
+                if List.isEmpty uniq then [ LWhile (hoistE ctx c, body) ]
+                else
+                    let mutable pre = []
+                    let mutable c2 = c
+                    let mutable b2 = body
+                    for (g, off) in uniq do
+                        let r = wReg (freshTmp ctx)
+                        let src = if off = 0 - 1 then LGetGlobal g else LLoad (W, LGetGlobal g, off)
+                        pre <- pre @ [ LSet (r, src) ]
+                        c2 <- substLoadE g off r c2
+                        b2 <- b2 |> List.map (substLoadS g off r)
+                    pre @ [ LWhile (c2, b2) ]
+        | LIf (c, a, b) -> [ LIf (hoistE ctx c, hoistStmts ctx a, hoistStmts ctx b) ]
+        | LBlock (l, b) -> [ LBlock (l, hoistStmts ctx b) ]
+        | LSet (r, v) -> [ LSet (r, hoistE ctx v) ]
+        | LSetGlobal (g, v) -> [ LSetGlobal (g, hoistE ctx v) ]
+        | LEval v -> [ LEval (hoistE ctx v) ]
+        | LStore (ty, a, o, v) -> [ LStore (ty, hoistE ctx a, o, hoistE ctx v) ]
+        | other -> [ other ])
+
 and private emitLowS (f : Fn) (s : LStmt) : unit =
     match s with
     | LMemFill (d, v, n) -> emitLowE f d; emitLowE f v; emitLowE f n; memFill f
@@ -9184,6 +9373,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         else bodyLow2
     let bodyLow =
         if retTy = W || retUnboxed then bodyLow2 else flatUnbox retTy bodyLow2
+    let bodyLow = hoistE ctx bodyLow
     // TEMP DEBUG: validate the freshly-lowered tree — every register it
     // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
     let mutable maxReg = -1
