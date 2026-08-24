@@ -5018,6 +5018,66 @@ let private isSafepointNode (e : Expr) : bool =
 // GC there can move a REF `'a` whose register would go stale. Generic functions
 // only (ActiveGen empty elsewhere). Control-flow nodes recurse to their
 // allocating sub-expressions, each wrapped in turn.
+/// No call and no allocation anywhere in this expression, so nothing in it can
+/// reach a GC safepoint. An element read only needs its `ar`/`ir`/`fv` temps to
+/// pin values ACROSS such a point; without one the address can be spelled
+/// inline, which is six instructions less per access and — more to the point —
+/// leaves the load depending on the induction variable alone, so the hardware
+/// can keep several misses in flight instead of chaining them.
+let rec private lowSafeE (e : LExpr) : bool =
+    match e with
+    | LAlloc _ | LCall _ | LTailCall _ | LCallIndirect _ | LCallIdx _ -> false
+    | LPrim (_, xs) -> xs |> List.forall lowSafeE
+    | LLoad (_, a, _) -> lowSafeE a
+    // a widening conversion arrives as a small LDo of plain binds; look inside
+    // rather than refusing it, or every f32 and byte element keeps its temps
+    | LDo (ss, t) -> lowSafeE t && ss |> List.forall lowSafeS
+    | _ -> true
+
+and private lowSafeS (st : LStmt) : bool =
+    match st with
+    | LSet (_, v) | LEval v -> lowSafeE v
+    | _ -> false
+
+/// The scalar fields this literal supplies, each with its offset RELATIVE TO
+/// THE OBJECT, or None when some field is not a scalar the literal spells out.
+/// A field that is itself an inline struct recurses, so `{ Lo = { PX = ... } }`
+/// flattens to its leaves rather than falling back.
+///
+/// Without this, `arr.[i] <- { ... }` materialises the record on the HEAP and
+/// copies it back out — an allocation per element. With a large array live, the
+/// collector work behind those allocations dwarfs the loop doing the storing:
+/// on the shapes benchmark the nested-Box store alone was 3.9 of 4.7 billion
+/// instructions, and the whole fill loop 8.4 billion against the read loop's 0.
+let rec private podFlatFields (st : St) (layout : Dict<string, int * string>)
+                              (order : string list) (baseOff : int)
+                              (flds : (string * Expr) list) : (int * string * Expr) list option =
+    if List.isEmpty order then None
+    else
+        let step (acc : (int * string * Expr) list option) (fn : string) =
+            match acc, dictTryFind layout fn, flds |> List.tryPick (fun (f, x) -> if f = fn then Some x else None) with
+            | Some got, Some (off, kind), Some fe ->
+                if (storLTy kind).IsSome then Some (got @ [ (baseOff + off, kind, fe) ])
+                else
+                    // an inline struct field: its own literal's leaves, shifted
+                    // by where the nested layout starts inside this one
+                    match podOf st kind, fe with
+                    | Some (inner, _, _), ERecord (_, innerFlds) ->
+                        let innerOrder = match dictTryFind st.RecFields kind with Some o -> o | None -> []
+                        match podFlatFields st inner innerOrder (baseOff + off - HDR) innerFlds with
+                        | Some more -> Some (got @ more)
+                        | None -> None
+                    | _ -> None
+            | _ -> None
+        List.fold step (Some []) order
+
+let private podElemFlat (st : St) (ek : string) (flds : (string * Expr) list) : (int * string * Expr) list option =
+    match podArrOf st ek with
+    | None -> None
+    | Some (layout, _) ->
+        let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
+        podFlatFields st layout order 0 flds
+
 let rec private coreToLowE (ctx : LowCtx) (e : Expr) : LExpr =
     let r = coreToLowEBody ctx e
     if isSafepointNode e then
@@ -5687,11 +5747,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let (off, kind) = optGet (dictTryFind layout fname)
         let (sty, _) = optGet (storLTy kind)
         let vty = storValTy sty
+        let arrE = coreToLowE ctx arr
+        let iE = coreToLowE ctx i
+        let direct =
+            storBox ctx kind
+                (LLoad (sty, LPrim (AddW, [ arrE; LPrim (MulW, [ iE; LConstW stride ]) ]), ARRHDR + off - HDR))
+        if lowSafeE arrE && lowSafeE iE && lowSafeE direct then direct
+        else
         let ar = freshTmp ctx
         let ir = freshTmp ctx
         let fv = freshTmpT ctx vty
-        LDo ([ LSet (wReg ar, coreToLowE ctx arr)
-               LSet (wReg ir, (coreToLowE ctx i))
+        LDo ([ LSet (wReg ar, arrE)
+               LSet (wReg ir, iE)
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
              storBox ctx kind (LGet { Id = fv; RTy = vty }))
     | EFieldSet (EIndex (ek, arr, i), fname, _, v) when (podArrOf st ek).IsSome ->
@@ -5821,6 +5888,25 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let (sty, _) = optGet (storLTy kind)
             (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
         LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
+    // the literal's fields go straight into the slot — no object to copy out of
+    | EIndexSet (ek, arr, i, ERecord (_, flds)) when (podElemFlat st ek flds).IsSome ->
+        let (_, stride) = optGet (podArrOf st ek)
+        // each value lands in a typed local FIRST, so a field expression that
+        // allocates cannot move the array between the base bind and the store
+        let vals =
+            optGet (podElemFlat st ek flds) |> List.map (fun (off, kind, fe) ->
+                let (sty, _) = optGet (storLTy kind)
+                let vty = storValTy sty
+                let id = freshTmpT ctx vty
+                (off, sty, LSet ({ Id = id; RTy = vty }, storUnbox kind (coreToLowE ctx fe)),
+                 LGet { Id = id; RTy = vty }))
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
+        LDo ((vals |> List.map (fun (_, _, ev, _) -> ev))
+             @ [ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ]
+             @ (vals |> List.map (fun (off, sty, _, v) -> LStore (sty, elemBase, ARRHDR + off - HDR, v))),
+             lowInt 0)
     | EIndexSet (ek, arr, i, v) when (podArrOf st ek).IsSome ->
         let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
@@ -8410,8 +8496,8 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
         | None -> gg f g
     | LLoad (ty, a, off) ->
         emitLowE f a
-        (if off <> 0 then (ic f off; ins f "i32.add"))
-        mem f (loadIns ty)
+        if off >= 0 then memOff f (loadIns ty) off
+        else (ic f off; ins f "i32.add"; mem f (loadIns ty))
     | LPrim (op, args) ->
         for a in args do emitLowE f a
         ins f (lowOpIns op)
@@ -8451,9 +8537,9 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
     match s with
     | LStore (ty, a, off, v) ->
         emitLowE f a
-        (if off <> 0 then (ic f off; ins f "i32.add"))
+        (if off < 0 then (ic f off; ins f "i32.add"))
         emitLowE f v
-        mem f (storeIns ty)
+        if off >= 0 then memOff f (storeIns ty) off else mem f (storeIns ty)
     | LSet (r, e) -> emitLowE f e; ls f (regNm r)
     // the results land on the stack left to right, so the LAST register is
     // filled first

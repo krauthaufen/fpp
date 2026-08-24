@@ -503,6 +503,21 @@ let mem (f : Fn) (name : string) : unit =
     emitU32 f.B al
     emitU32 f.B 0
 
+/// memory op carrying a CONSTANT displacement in its memarg instead of an
+/// `i32.const off; i32.add` ahead of it. Every field read of an inline layout
+/// has one, so this is two instructions saved per access. The offset is
+/// unsigned in the encoding — a negative one must stay explicit.
+let memOff (f : Fn) (name : string) (off : int) : unit =
+    emitByte f.B (memByte name)
+    let al =
+        match name with
+        | "i32.store8" | "i32.load8_u" | "i32.load8_s" -> 0
+        | "i32.store16" | "i32.load16_u" | "i32.load16_s" -> 1
+        | "i32.load" | "i32.store" | "f32.store" | "f32.load" -> 2
+        | _ -> 3
+    emitU32 f.B al
+    emitU32 f.B off
+
 /// memory.size, in pages
 let memSizeIns (f : Fn) : unit =
     emitByte f.B 0x3F
