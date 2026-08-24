@@ -390,6 +390,8 @@ let private importFpprt (m : Mod) : unit =
     importFn m "fpprt" "_initialize" "$fpinit" [] []
     importFn m "fpprt" "fpprt_init" "$fpheap" [ "i32" ] []
     importFn m "fpprt" "fpprt_alloc" "$fpalloc" [ "i32" ] [ "i32" ]
+    importFn m "fpprt" "fpprt_inline_hp_addr" "$fphp" [] [ "i32" ]
+    importFn m "fpprt" "fpprt_inline_limit_addr" "$fplim" [] [ "i32" ]
     if System.Environment.GetEnvironmentVariable "FPP_CONSCHECK" = "1" then
         importFn m "fpprt" "fpprt_dbg_live" "$fpdbglive" [ "i32" ] [ "i32" ]
     importFn m "fpprt" "fpprt_alloc_array" "$fpallocn" [ "i32"; "i32" ] [ "i32" ]
@@ -7712,13 +7714,13 @@ and private lowGenericCons (ctx : LowCtx) (refMask : LExpr) (hExpr : LExpr) (tEx
     let r = freshTmp ctx
     let rawBuild =
         gcPushStmts (LGet (wReg tt))
-        @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW gcConsRawTid ])) ]
+        @ [ LSet (wReg b, lowAllocSized ctx gcConsRawTid (HDR + 8)) ]
         @ gcPopInto (LGet (wReg b)) (HDR + 4)
         @ [ LStore (W, LGet (wReg b), HDR, LGet (wReg ht)); LSet (wReg r, LGet (wReg b)) ]
     let refBuild =
         gcPushStmts (LGet (wReg ht))
         @ gcPushStmts (LGet (wReg tt))
-        @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW gcConsRefTid ])) ]
+        @ [ LSet (wReg b, lowAllocSized ctx gcConsRefTid (HDR + 8)) ]
         @ gcPopInto (LGet (wReg b)) (HDR + 4)
         @ gcPopInto (LGet (wReg b)) HDR
         @ [ LSet (wReg r, LGet (wReg b)) ]
@@ -7913,7 +7915,7 @@ and private lowObjR (ctx : LowCtx) (cid : int) (raw : int) (slots : LExpr list) 
         let rawEvals = rawTemps |> List.map (fun (_, t, v) -> LSet (wReg t, v))
         let rawStores = rawTemps |> List.map (fun (i, t, _) -> LStore (W, LGet (wReg b), HDR + 4 * i, LGet (wReg t)))
         let consts = idx |> List.filter (fun (_, v) -> isConst v) |> List.map (fun (i, v) -> LStore (W, LGet (wReg b), HDR + 4 * i, v))
-        LDo (rawEvals @ pushes @ [ LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])) ] @ pops @ rawStores @ consts, LGet (wReg b))
+        LDo (rawEvals @ pushes @ [ LSet (wReg b, lowAllocSized ctx tid (HDR + 4 * n)) ] @ pops @ rawStores @ consts, LGet (wReg b))
     else
         let stores =
             LStore (W, LGet (wReg b), 0, LConstW cid)
@@ -7936,9 +7938,49 @@ and private lowPodBuild (ctx : LowCtx) (name : string) (items : (int * LTy * LTy
 
 /// the same builder over an EXPLICIT layout — a union case brings its own
 /// (its tid is keyed by the CASE, not by the class id its whole union shares).
+/// The allocator's bump-pointer fast path, emitted INLINE: load hp, add the
+/// size, compare against the limit, write the alloc-table byte(s) and the
+/// header. `fpprt_alloc` is 85 instructions behind a cross-module call, and a
+/// tree program spends a quarter of its time there; this is about fifteen.
+///
+/// Everything the write depends on is a compile-time constant because the SIZE
+/// is: the granule count, and so whether the object's metadata takes one byte
+/// (begin|end) or two (begin, and end at the last granule). If the collector is
+/// not the one these constants describe, `$ahp`/`$alim` point at a pair of
+/// words that fail the limit test for every size, and each allocation takes the
+/// ordinary call — see fpprt_inline_hp_addr.
+and private lowAllocSized (ctx : LowCtx) (tid : int) (size : int) : LExpr =
+    let slow = LCall ("$fpalloc", [ LConstW tid ])
+    if not gc || size <= 0 || size > 8192 then slow
+    else
+        let granules = (size + 15) / 16
+        let rounded = granules * 16
+        let hpR = freshTmp ctx
+        let newR = freshTmp ctx
+        let mR = freshTmp ctx
+        let res = freshTmp ctx
+        let meta =
+            LSet (wReg mR,
+                  LPrim (AddW, [ LPrim (AndW, [ LGet (wReg hpR); LConstW (0 - (4 * 1024 * 1024)) ])
+                                 LPrim (ShrUW, [ LPrim (AndW, [ LGet (wReg hpR); LConstW (4 * 1024 * 1024 - 1) ]); LConstW 4 ]) ]))
+            :: (if granules = 1 then [ LStore (I8, LGet (wReg mR), 0, LConstW 33) ]
+                else [ LStore (I8, LGet (wReg mR), 0, LConstW 1)
+                       LStore (I8, LGet (wReg mR), granules - 1, LConstW 32) ])
+        LDo ([ LSet (wReg hpR, LLoad (W, LGetGlobal "$ahp", 0))
+               LSet (wReg newR, LPrim (AddW, [ LGet (wReg hpR); LConstW rounded ]))
+               LIf (LPrim (GtUW, [ LGet (wReg newR); LLoad (W, LGetGlobal "$alim", 0) ]),
+                    [ LSet (wReg res, slow) ],
+                    [ LStore (W, LGetGlobal "$ahp", 0, LGet (wReg newR)) ]
+                    @ meta
+                    @ [ LStore (W, LGet (wReg hpR), 0, LConstW ((tid * 2) + 1))
+                        LSet (wReg res, LGet (wReg hpR)) ]) ],
+             LGet (wReg res))
+
 and private lowPodBuildAt (ctx : LowCtx) (tidKey : string) (cid : int) (podLayout : Dict<string, int * string>) (size : int) (firstRefWord : int) (items : (int * LTy * LTy * bool * LExpr) list) : LExpr =
     let bs = freshTmp ctx
-    let alloc = if gc then LCall ("$fpalloc", [ LConstW (podTid ctx.LSt tidKey podLayout size firstRefWord) ]) else LAlloc (LConstW size)
+    let alloc =
+        if gc then lowAllocSized ctx (podTid ctx.LSt tidKey podLayout size firstRefWord) size
+        else LAlloc (LConstW size)
     let hdr = if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW cid) ]
     let scalars = items |> List.filter (fun (_, _, _, r, _) -> not r)
     let refs = items |> List.filter (fun (_, _, _, r, _) -> r)
@@ -7974,7 +8016,7 @@ and private lowList (ctx : LowCtx) (xs : Expr list) : LExpr =
 and private lowBox64 (ctx : LowCtx) (shape : string) (cid : int) (ty : LTy) (v : LExpr) : LExpr =
     let b = freshTmp ctx
     let alloc =
-        if gc then LCall ("$fpalloc", [ LConstW (gcTid ctx.LSt shape (HDR + 8) FK_STRUCT 0) ])
+        if gc then lowAllocSized ctx (gcTid ctx.LSt shape (HDR + 8) FK_STRUCT 0) (HDR + 8)
         else LAlloc (LConstW (HDR + 8))
     let hdr = if gc then [] else [ LStore (W, LGet (wReg b), 0, LConstW cid) ]
     LDo (LSet (wReg b, alloc) :: hdr @ [ LStore (ty, LGet (wReg b), HDR, v) ], LGet (wReg b))
@@ -8591,10 +8633,10 @@ and private lowMkCell (ctx : LowCtx) (kind : RefKind) (v : LExpr) : LExpr =
         if kind = RKRaw then
             let tid = gcTidRef ctx.LSt "cell$s" (HDR + 4) []
             let t = freshTmp ctx
-            LDo ([ LSet (wReg t, v); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ], LGet (wReg b))
+            LDo ([ LSet (wReg t, v); LSet (wReg b, lowAllocSized ctx tid (HDR + 4)); LStore (W, LGet (wReg b), HDR, LGet (wReg t)) ], LGet (wReg b))
         else
             let tid = gcTid ctx.LSt "cell" (HDR + 4) FK_TAGGED 1
-            LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, LCall ("$fpalloc", [ LConstW tid ])); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
+            LDo ([ LCallVoidS ("$spush", [ v ]); LSet (wReg b, lowAllocSized ctx tid (HDR + 4)); LStore (W, LGet (wReg b), HDR, LCall ("$spop", [])) ], LGet (wReg b))
     else
         LDo ([ LSet (wReg b, LAlloc (LConstW 4)); LStore (W, LGet (wReg b), 0, v) ], LGet (wReg b))
 
@@ -10998,6 +11040,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then globalI32Mut m "$sp" 0
     // GC: base of the tid->class-id table (fixed static memory in the shim)
     if gc then globalI32Mut m "$t2c" 0
+    // where the collector's bump pointer and its limit live
+    if gc then globalI32Mut m "$ahp" 0
+    if gc then globalI32Mut m "$alim" 0
     if gc then globalI32Mut m "$witnesses" 0
     // callbacks/cleanups (GC): the next free slot in the cbBase root area,
     // and the freelist of recycled one-shot cleanup slots (odd-tagged links
@@ -11310,6 +11355,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     if gc then
         callf f "$fpinit"                 // fpprt reactor _initialize
         ic f 0; callf f "$fpheap"         // fpprt_init(NULL) -> default heap
+        callf f "$fphp"; gs f "$ahp"      // where the bump pointer lives
+        callf f "$fplim"; gs f "$alim"
         callf f "$fpreg_all"              // register every shape's fpprt type
     for nm in vecToList inits do callf f nm
     endFn f
