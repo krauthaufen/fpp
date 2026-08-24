@@ -363,6 +363,8 @@ let mutable private vtNSlots = 0
 // slot, so emitLowE can turn a global read/write into a root-table load/store.
 // Set by the driver per compile.
 let mutable private gcGlobalSlots : Dict<string, int> = dictNew ()
+/// case name -> root-table slot holding its shared instance
+let mutable private caseSingleton : Dict<string, int> = dictNew ()
 /// module-level bindings whose type is a 64-bit scalar or a single: those live
 /// in a TYPED wasm global holding the raw value. They used to take a root slot
 /// and a heap box each — the last ordinary shape in which a float allocated.
@@ -5905,6 +5907,31 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | ECtor (case, _, _) when (dictTryFind st.EnumConst case).IsSome ->
         LConstW (optGet (dictTryFind st.EnumConst case))
     | ECtor (case, _, args) ->
+        // A case with NO payload carries only its tag: every instance is
+        // identical and immutable, so ONE is enough. `Leaf`, `Nil`, `None`,
+        // `[]` each allocated a fresh object per construction — and in a binary
+        // tree the leaves ARE half the nodes, so half of all allocation was for
+        // objects differing in nothing. .NET F# shares nullary cases the same
+        // way and structural equality cannot tell the difference.
+        //
+        // The instance lives in a ROOT-TABLE slot: traced, so it survives, and
+        // updated in place when a collection moves it. Built on first use —
+        // zero is "no object yet", and nothing else is live across that build.
+        let shareNullary (built : LExpr) : LExpr =
+            if not (gc && List.isEmpty args && (dictTryFind st.EnumConst case).IsNone) then built
+            else
+                let slot =
+                    match dictTryFind caseSingleton case with
+                    | Some sl -> sl
+                    | None ->
+                        let sl = st.RootNext
+                        st.RootNext <- sl + 1
+                        dictSet caseSingleton case sl
+                        sl
+                let cell = LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * slot) ])
+                LDo ([ LIf (LPrim (EqW, [ LLoad (W, cell, 0); LConstW 0 ]),
+                            [ LStore (W, cell, 0, built) ], []) ],
+                     LLoad (W, cell, 0))
         // a MISSING case is not tag 0: that silently made two arms of one match
         // test the same tag, so a value with any other tag matched NEITHER and
         // fell into the match's `unreachable`
@@ -5953,7 +5980,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                 | _ -> []
             if List.isEmpty items && nslots > 0 then
                 let kinds = RKRaw :: List.map (refKindOfExprC st) args
-                lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args)
+                shareNullary (lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args))
             else
                 let tagOff = (optGet (dictTryFind layout "$tag") |> fun (off, _) -> off)
                 // the tuple-read form already carries the tag store as its
@@ -5962,12 +5989,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                     match items with
                     | (0, _, _, _, pre) :: rest -> (tagOff, W, W, false, pre) :: rest
                     | _ -> (tagOff, W, W, false, LConstW tag) :: items
-                lowPodBuildAt ctx ("case:" + case) (cidCase st case) layout size firstRefWord items
+                shareNullary (lowPodBuildAt ctx ("case:" + case) (cidCase st case) layout size firstRefWord items)
         | _ ->
         // slot 0 is the raw tag word; the payload follows. A concrete payload
         // gets a ref-map so its unboxed scalars are skipped by the collector.
         let kinds = RKRaw :: List.map (refKindOfExprC st) args
-        lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args)
+        shareNullary (lowObjR ctx (cidCase st case) 1 (LConstW tag :: List.map (coreToLowE ctx) args) (Some kinds) (genWitsOf ctx 1 args))
     | EField (r, _, owner) when (dictTryFind st.Collapse owner).IsSome -> coreToLowE ctx r
     // fused element-field access on an array of inline records — MUST precede the
     // plain POD field cases, or a field write would copy the element out and
@@ -10410,6 +10437,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // non-function global takes a root slot (before constants).
     let assigned = collectAssigned decls
     if gc then gcGlobalSlots <- dictNew ()
+    if gc then caseSingleton <- dictNew ()
     globalScalarTy <- dictNew ()
     globalStructTy <- dictNew ()
     // interface-method impls are reached ONLY through the vtable, which dispatches
