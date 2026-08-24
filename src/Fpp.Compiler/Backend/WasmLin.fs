@@ -8660,6 +8660,11 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // of every float/int64 function that roots a parameter.
     let scalarRet = retTy <> W
     let mutable retUnboxed = false
+    // the statements that WRAP every body: the preamble (self/const witnesses)
+    // and the parameter rooting. The struct-return path emits its own tail, so
+    // it needs these by name rather than folded into one expression.
+    let mutable wrapPre : LStmt list = preamble
+    let mutable wrapPost : LStmt list = []
     let bodyLow2 =
         if List.isEmpty rootParams then bodyLow0
         else
@@ -8674,6 +8679,8 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
             let pop = LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length rootParams) ]))
             let inner = if scalarRet then flatUnbox retTy bodyLow0 else bodyLow0
             retUnboxed <- scalarRet
+            wrapPre <- preamble @ pushes
+            wrapPost <- [ pop ]
             LDo (pushes @ [ LSet (reg, inner); pop ], LGet reg)
     // FPP_CONSCHECK: the shadow-stack pointer must be BALANCED across the
     // body (pushes = pops on every path) — an imbalance desyncs every later
@@ -8803,7 +8810,11 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         localsDone f
         (match retBind with
          | Some (stmts, slots) ->
+             // the same wrappers the ordinary body gets: without them `self`
+             // is read from a slot nothing ever filled
+             for st2 in wrapPre do emitLowS f st2
              for st2 in stmts do emitLowS f st2
+             for st2 in wrapPost do emitLowS f st2
              // write the fields through the caller's destination pointer, and
              // answer that pointer
              let dstName = regNm (wReg (optGet sretReg))
@@ -9571,7 +9582,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 // sides. A MEMBER may not yet — a class ctor stores its
                 // parameter into the instance's field, and that path still
                 // wants the whole value.
-                let plainFn = (dictTryFind memberFns (key v)).IsNone
+                let plainFn = true
                 if plainFn || plan |> List.forall (fun x -> x.IsNone) then
                     dictSet st.FuncSig (key v) sig_
                     dictSet st.FuncParamPlan (key v) plan
