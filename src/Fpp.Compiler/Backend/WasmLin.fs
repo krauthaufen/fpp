@@ -3803,44 +3803,137 @@ let private storShape (k : string) : string = "sa:" + k
 // (ref-holding) element records need a per-element ref-map — not yet.
 let private ARRHDR = HDR + 4
 
+/// A POINTER is one `nativeint` — the single place the target's pointer width
+/// is spelled, so a 64-bit target changes here rather than in every layout.
+let private PTRW = 4
+
+/// A resolver from a type name to a [<Struct>] record's declared fields, or
+/// None for anything that is NOT a struct: the presence of an entry IS the
+/// value-vs-reference distinction (`St.RecFieldTys` is [<Struct>]-only).
+type private LayRes = string -> (string * string) list option
+
+/// The fields of `ty` when a value of it is laid out INLINE, else None.
+/// A [<Struct>] record always inlines — this is interop surface, not an
+/// optimisation: `{ Lo : V2d; Hi : V2d }` has to be the 32 contiguous bytes C
+/// gives the same declaration, or a struct handed to C is a different type than
+/// the one C reads. The single exception is a BARE type-variable field, whose
+/// runtime value may be a raw scalar or a pointer; no static layout describes
+/// both, so such a record stays a reference.
+let rec private layInlineFields (resolve : LayRes) (depth : int) (ty : string) : (string * string) list option =
+    if depth > 16 then None                 // a value type cannot contain itself
+    else
+        match resolve ty with
+        | Some fs when not (List.isEmpty fs)
+                       && fs |> List.forall (fun (_, t) ->
+                            not (t.StartsWith "'") && not (t.StartsWith "#") && t <> ""
+                            && ((storLTy t).IsSome || (resolve t).IsNone
+                                || (layInlineFields resolve (depth + 1) t).IsSome)) -> Some fs
+        | _ -> None
+
+/// (size, alignment) of a value of this declared type: a scalar is its own
+/// width, an inline struct is its fields laid out sequentially, anything else
+/// is one pointer.
+let rec private laySizeAlign (resolve : LayRes) (depth : int) (ty : string) : int * int =
+    match storLTy ty with
+    | Some (_, w) -> (w, w)
+    | None ->
+        match layInlineFields resolve depth ty with
+        | Some fs ->
+            let mutable off = 0
+            let mutable al = 1
+            for (_, ft) in fs do
+                let (fsz, fal) = laySizeAlign resolve (depth + 1) ft
+                off <- ((off + fal - 1) / fal) * fal + fsz
+                if fal > al then al <- fal
+            (((off + al - 1) / al) * al, al)
+        | None -> (PTRW, PTRW)
+
+/// every scalar-or-pointer LEAF of a field list, at absolute offsets starting
+/// from `baseOff`, with inline struct fields expanded in place. The GC tracer
+/// and the structural walkers both need the leaves, not the declared fields:
+/// a nested struct holding a string contributes a reference at ITS offset.
+/// Alignment is RELATIVE to the record's own start, never to the absolute
+/// address: the header is 4 bytes, so a record begins at a 4-aligned offset and
+/// its first double sits at HDR+0 — aligning the absolute offset instead pushes
+/// that double to 8 and every later leaf drifts. On a struct ending in one
+/// reference that drift put the first ref exactly on `size/4`, which is the
+/// value that means "no references at all", and a struct holding a string was
+/// packed into an array as if it held none.
+let rec private layLeavesAt (resolve : LayRes) (depth : int) (baseOff : int) (fs : (string * string) list) : (int * string) list =
+    let acc = vecNew<int * string> ()
+    let mutable rel = 0
+    for (_, ft) in fs do
+        let (fsz, fal) = laySizeAlign resolve depth ft
+        rel <- ((rel + fal - 1) / fal) * fal
+        (match layInlineFields resolve depth ft with
+         | Some inner -> for it in layLeavesAt resolve (depth + 1) (baseOff + rel) inner do vecAdd acc it
+         | None -> vecAdd acc (baseOff + rel, ft))
+        rel <- rel + fsz
+    vecToList acc
+
 /// the inline layout of a field list, in DECLARATION order: a scalar sits at a
-/// multiple of its own width, a reference field takes one word, and the size
-/// rounds up to the widest member so an ARRAY of the record strides the way C
-/// says. The order is not cosmetic — the structural comparator walks an
-/// object's WORDS, so a layout that hoisted the scalars in front of the
-/// references made `compare` disagree with the field order the source
-/// declares, and with a hand-written instance.
-/// `firstRefWord` is the word index of the first reference field (the whole
-/// size in words when there is none, which is what marks an all-scalar record
+/// multiple of its own width, an inline struct at a multiple of ITS alignment,
+/// a reference field takes one pointer, and the size rounds up to the widest
+/// member so an ARRAY of the record strides the way C says. The order is not
+/// cosmetic — the structural comparator walks an object's WORDS, so a layout
+/// that hoisted the scalars in front of the references made `compare` disagree
+/// with the field order the source declares, and with a hand-written instance.
+/// `firstRefWord` is the word index of the first reference LEAF (the whole size
+/// in words when there is none, which is what marks an all-value record
 /// packable as an array element).
-let private layoutDecl (fs : (string * string) list) : Dict<string, int * string> * int * int =
+let private layoutDeclWith (resolve : LayRes) (fs : (string * string) list) : Dict<string, int * string> * int * int =
     let m = dictNew<string, int * string> ()
-    let widthOf (ty : string) = match storLTy ty with Some (_, w) -> w | None -> 4
-    let maxA = fs |> List.fold (fun acc (_, ty) -> max acc (widthOf ty)) 1
     let align (o : int) (a : int) = ((o + a - 1) / a) * a
+    let maxA = fs |> List.fold (fun acc (_, ty) -> max acc (snd (laySizeAlign resolve 0 ty))) 1
     let mutable off = HDR
-    let mutable firstRef = 0 - 1
     for (fnm, ty) in fs do
-        let w = widthOf ty
-        off <- HDR + align (off - HDR) w
-        if (storLTy ty).IsNone && firstRef < 0 then firstRef <- off
+        let (w, a) = laySizeAlign resolve 0 ty
+        off <- HDR + align (off - HDR) a
         dictSet m fnm (off, ty)
         off <- off + w
     let size = HDR + align (off - HDR) maxA
+    // a nested struct's OWN reference fields count, so the scan start comes
+    // from the leaves rather than from the declared fields
+    let refLeaves =
+        layLeavesAt resolve 0 HDR fs
+        |> List.filter (fun (_, ty) -> (storLTy ty).IsNone && (layInlineFields resolve 0 ty).IsNone)
+    let firstRef = refLeaves |> List.fold (fun acc (o, _) -> if acc < 0 || o < acc then o else acc) (0 - 1)
     (m, size, (if firstRef < 0 then size / 4 else firstRef / 4))
 
-/// the byte offsets of an inline layout's reference fields, ascending
-let private podRefOffs (layout : Dict<string, int * string>) : int list =
+/// the byte offsets of an inline layout's reference LEAVES, ascending
+let private podRefOffsWith (resolve : LayRes) (layout : Dict<string, int * string>) : int list =
     dictPairs layout
-    |> List.choose (fun (_, v) -> let (off, ty) = v in (if (storLTy ty).IsNone then Some off else None))
+    |> List.collect (fun (_, v) ->
+        let (off, ty) = v
+        match layInlineFields resolve 0 ty with
+        | Some inner ->
+            layLeavesAt resolve 1 off inner
+            |> List.choose (fun (o, t) -> if (storLTy t).IsNone then Some o else None)
+        | None -> if (storLTy ty).IsNone then [ off ] else [])
     |> List.sortWith (fun (a : int) (b : int) -> if a < b then 0 - 1 elif a > b then 1 else 0)
+
+/// the (offset, leaf type) pairs an inline layout is MADE of, ascending: what
+/// a bulk copy of the value moves. A nested struct field expands to its own
+/// leaves, so copying `{ Lo : V2d; Hi : V2d }` moves four doubles rather than
+/// asking for the storage type of `V2d` and finding none.
+let private podLayoutLeaves (st : St) (layout : Dict<string, int * string>) : (int * string) list =
+    dictPairs layout
+    |> List.collect (fun (_, v) ->
+        let (off, ty) = v
+        match layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 ty with
+        | Some inner -> layLeavesAt (fun n -> dictTryFind st.RecFieldTys n) 1 off inner
+        | None -> [ (off, ty) ])
+    |> List.sortWith (fun (a, _) (b, _) -> if a < b then 0 - 1 elif a > b then 1 else 0)
+
+/// the layout resolver for a program: struct records resolve to their fields
+let private layResOf (st : St) : LayRes = fun n -> dictTryFind st.RecFieldTys n
 
 /// the type-id of an inline record. FK_TAGGED can only say "every word from N
 /// on is a reference", so a record whose references are not a contiguous
 /// SUFFIX — declaration order puts them wherever the author wrote them —
 /// carries the explicit ref-offset map instead.
 let private podTid (st : St) (key : string) (layout : Dict<string, int * string>) (size : int) (firstRefWord : int) : int =
-    let refs = podRefOffs layout
+    let refs = podRefOffsWith (layResOf st) layout
     let suffix = List.init (size / 4 - firstRefWord) (fun k -> 4 * (firstRefWord + k))
     let known = (dictTryFind st.Tids key).IsSome
     let t =
@@ -3848,9 +3941,15 @@ let private podTid (st : St) (key : string) (layout : Dict<string, int * string>
         else gcTidRef st key size refs
     // the field descriptor, recorded once per shape: offsets in layout order
     if not known then
+        // a nested inline struct contributes ITS leaves, so the walkers compare
+        // and hash the values a nested field holds rather than raw words
         let entries =
             dictPairs layout
-            |> List.map (fun (_, v) -> let (off, ty) = v in off, descKindOf ty)
+            |> List.collect (fun (_, v) ->
+                let (off, ty) = v
+                match layInlineFields (layResOf st) 0 ty with
+                | Some inner -> layLeavesAt (layResOf st) 1 off inner |> List.map (fun (o, t) -> o, descKindOf t)
+                | None -> [ off, descKindOf ty ])
             |> List.sortWith (fun (a, _) (b, _) -> if a < b then 0 - 1 elif a > b then 1 else 0)
         vecAdd st.TidDesc (t, entries)
     t
@@ -3891,7 +3990,7 @@ let private podSynth (st : St) (name : string) : (Dict<string, int * string> * i
         else
             if fs |> List.forall (fun (_, ty) -> (storLTy ty).IsNone) then None
             else
-                let (m, size, firstRefWord) = layoutDecl fs
+                let (m, size, firstRefWord) = layoutDeclWith (layResOf st) fs
                 dictSet st.RecFields name (fs |> List.map fst)
                 dictSet st.RecFieldTypes name fs
                 dictSet st.RecPod name (m, size, firstRefWord)
@@ -5039,6 +5138,33 @@ and private lowSafeS (st : LStmt) : bool =
     | LSet (_, v) | LEval v -> lowSafeE v
     | _ -> false
 
+/// Resolve a chain of inline-struct field accesses to (base expression,
+/// absolute offset, field type). `box.Lo.PX` is one double at
+/// offsetof(Box,Lo) + offsetof(V2d,PX) — the address C computes for the same
+/// expression — rather than a pointer hop through a heap V2d. Folding stops at
+/// a field that is a REFERENCE: there the pointer really must be followed.
+let rec private podChain (st : St) (e : Expr) : (Expr * int * string) option =
+    match e with
+    | EField (inner, fname, owner) when (podOf st owner).IsSome ->
+        let (layout, _, _) = optGet (podOf st owner)
+        (match dictTryFind layout fname with
+         | Some (off, ty) ->
+             (match podChain st inner with
+              | Some (b, off0, tyi) when (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 tyi).IsSome ->
+                  Some (b, off0 + off - HDR, ty)
+              | Some _ -> None                      // parent field is a pointer
+              | None -> Some (inner, off, ty))
+         | None -> None)
+    | _ -> None
+
+/// the same chain when it bottoms out in a POD ARRAY element: the offset is
+/// then relative to the element, and the whole access is one load off the
+/// element address with no object in between
+let private podChainElem (st : St) (e : Expr) : (string * Expr * Expr * int * string) option =
+    match podChain st e with
+    | Some (EIndex (ek, arr, i), off, ty) when (podArrOf st ek).IsSome -> Some (ek, arr, i, off, ty)
+    | _ -> None
+
 /// The scalar fields this literal supplies, each with its offset RELATIVE TO
 /// THE OBJECT, or None when some field is not a scalar the literal spells out.
 /// A field that is itself an inline struct recurses, so `{ Lo = { PX = ... } }`
@@ -5601,16 +5727,45 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     | ERecord (name, fields) when (podOf st name).IsSome ->
         let (layout, _, _) = optGet (podOf st name)
         let order = ctorOrder st name (List.map fst fields)
-        let items =
-            order |> List.map (fun fn ->
-                let (off, kind) = optGet (dictTryFind layout fn)
+        // a NESTED struct field occupies its own bytes inside this record, so it
+        // contributes its leaves at their offsets — a pointer there would
+        // disagree with the layout every reader now uses
+        let rec itemsOf (layout : Dict<string, int * string>) (order : string list)
+                        (fields : (string * Expr) list) (shift : int) : (int * LTy * LTy * bool * LExpr) list =
+            order |> List.collect (fun fn ->
+                let (off0, kind) = optGet (dictTryFind layout fn)
+                let off = off0 + shift
                 let ve = fields |> List.tryPick (fun (f, e) -> if f = fn then Some e else None)
                 match storLTy kind with
                 | Some (sty, _) ->
                     let raw = match ve with Some e -> storUnbox kind (coreToLowE ctx e) | None -> (match storValTy sty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
-                    (off, sty, storValTy sty, false, raw)
-                | None -> (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)))
-        lowPodBuild ctx name items
+                    [ (off, sty, storValTy sty, false, raw) ]
+                | None when (podOf st kind).IsSome
+                            && (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 kind).IsSome ->
+                    let (inner, _, _) = optGet (podOf st kind)
+                    let innerOrder = match dictTryFind st.RecFields kind with Some o -> o | None -> []
+                    (match ve with
+                     // a literal spells its own leaves
+                     | Some (ERecord (_, innerFlds)) -> itemsOf inner innerOrder innerFlds (off - HDR)
+                     // any other value is an instance: copy its leaves across
+                     | Some other ->
+                         let br = freshTmp ctx
+                         let loads =
+                             podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                                 let (isty, _) = optGet (storLTy ity)
+                                 (off + ioff - HDR, isty, storValTy isty, false,
+                                  LLoad (isty, LGet (wReg br), ioff)))
+                         (match loads with
+                          | [] -> []
+                          | (o0, s0, v0, r0, e0) :: rest ->
+                              (o0, s0, v0, r0, LDo ([ LSet (wReg br, coreToLowE ctx other) ], e0)) :: rest)
+                     | None ->
+                         podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                             let (isty, _) = optGet (storLTy ity)
+                             (off + ioff - HDR, isty, storValTy isty, false,
+                              (match storValTy isty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0))))
+                | None -> [ (off, W, W, true, (match ve with Some e -> coreToLowE ctx e | None -> lowInt 0)) ])
+        lowPodBuild ctx name (itemsOf layout order fields 0)
     | ERecordExt (name, baseE, updates) when (podOf st name).IsSome ->
         let (layout, _, _) = optGet (podOf st name)
         let order = ctorOrder st name (List.map fst updates)
@@ -5742,7 +5897,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // fused element-field access on an array of inline records — MUST precede the
     // plain POD field cases, or a field write would copy the element out and
     // mutate the throwaway. Read fuses to the slot; write hits the slot directly.
-    | EField (EIndex (ek, arr, i), fname, _) when (podArrOf st ek).IsSome ->
+    | EField (EIndex (ek, arr, i), fname, _) when
+            (podArrOf st ek).IsSome
+            && (match podArrOf st ek with
+                | Some (layout, _) ->
+                    (match dictTryFind layout fname with Some (_, k) -> (storLTy k).IsSome | None -> false)
+                | None -> false) ->
         let (layout, stride) = optGet (podArrOf st ek)
         let (off, kind) = optGet (dictTryFind layout fname)
         let (sty, _) = optGet (storLTy kind)
@@ -5761,7 +5921,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet (wReg ir, iE)
                LSet ({ Id = fv; RTy = vty }, LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
              storBox ctx kind (LGet { Id = fv; RTy = vty }))
-    | EFieldSet (EIndex (ek, arr, i), fname, _, v) when (podArrOf st ek).IsSome ->
+    | EFieldSet (EIndex (ek, arr, i), fname, _, v) when
+            (podArrOf st ek).IsSome
+            && (match podArrOf st ek with
+                | Some (layout, _) ->
+                    (match dictTryFind layout fname with Some (_, k) -> (storLTy k).IsSome | None -> false)
+                | None -> false) ->
         let (layout, stride) = optGet (podArrOf st ek)
         let (off, kind) = optGet (dictTryFind layout fname)
         let (sty, _) = optGet (storLTy kind)
@@ -5797,6 +5962,35 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
               | I64 -> lowBoxI ctx (LGet { Id = r; RTy = I64 })
               | _ -> LGet (wReg r))
          | None -> err st ("wasm-linear: no field " + fname + " on by-value struct"); lowInt 0)
+    // a nested chain reaching a POD ARRAY element: one load off the element
+    | EField (EField (_, _, _), _, _) when
+            (match podChainElem st e with Some (_, _, _, _, ty) -> (storLTy ty).IsSome | None -> false) ->
+        let (ek, arr, i, off, kind) = optGet (podChainElem st e)
+        let (_, stride) = optGet (podArrOf st ek)
+        let (sty, _) = optGet (storLTy kind)
+        let vty = storValTy sty
+        let arrE = coreToLowE ctx arr
+        let iE = coreToLowE ctx i
+        let addr = LPrim (AddW, [ arrE; LPrim (MulW, [ iE; LConstW stride ]) ])
+        let direct = storBox ctx kind (LLoad (sty, addr, ARRHDR + off - HDR))
+        if lowSafeE arrE && lowSafeE iE && lowSafeE direct then direct
+        else
+        let ar = freshTmp ctx
+        let ir = freshTmp ctx
+        let fv = freshTmpT ctx vty
+        LDo ([ LSet (wReg ar, arrE)
+               LSet (wReg ir, iE)
+               LSet ({ Id = fv; RTy = vty },
+                     LLoad (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR)) ],
+             storBox ctx kind (LGet { Id = fv; RTy = vty }))
+    // a nested chain over an ordinary object: one load at the summed offset
+    | EField (EField (_, _, _), _, _) when
+            (match podChain st e with Some (_, _, ty) -> (storLTy ty).IsSome | None -> false) ->
+        let (b, off, kind) = optGet (podChain st e)
+        let (sty, _) = optGet (storLTy kind)
+        let vty = storValTy sty
+        let fv = freshTmpT ctx vty
+        LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx b, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
     | EField (r, fname, owner) when (podOf st owner).IsSome ->
         let (layout, _, _) = optGet (podOf st owner)
         let (off, kind) = optGet (dictTryFind layout fname)
@@ -5805,6 +5999,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let vty = storValTy sty
              let fv = freshTmpT ctx vty
              LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
+         // reading a nested STRUCT field yields a VALUE: copy its leaves out
+         // into a fresh instance, which is what a struct assignment means
+         | None when (podOf st kind).IsSome
+                     && (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 kind).IsSome ->
+             let (inner, _, _) = optGet (podOf st kind)
+             let br = freshTmp ctx
+             let items =
+                 podLayoutLeaves st inner |> List.map (fun (ioff, ity) ->
+                     let (isty, _) = optGet (storLTy ity)
+                     (ioff, isty, storValTy isty, false,
+                      LLoad (isty, LGet (wReg br), off + ioff - HDR)))
+             LDo ([ LSet (wReg br, coreToLowE ctx r) ], lowPodBuild ctx kind items)
          | None -> LLoad (W, coreToLowE ctx r, off))
     // writing a FIELD of a by-value struct GLOBAL writes that field's global
     | EFieldSet (EVar (sv, _), fname, _, value) when
@@ -5883,8 +6089,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let ar = freshTmp ctx
         let ir = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
-        let items = order |> List.map (fun fn ->
-            let (off, kind) = optGet (dictTryFind layout fn)
+        // LEAVES, not declared fields: a nested struct field has no storage type
+        // of its own, its scalars do
+        let items = podLayoutLeaves st layout |> List.map (fun (off, kind) ->
             let (sty, _) = optGet (storLTy kind)
             (off, sty, storValTy sty, false, LLoad (sty, elemBase, ARRHDR + off - HDR)))
         LDo ([ LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ], lowPodBuild ctx ek items)
@@ -5914,8 +6121,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let ar = freshTmp ctx
         let ir = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ])
-        let copies = order |> List.map (fun fn ->
-            let (off, kind) = optGet (dictTryFind layout fn)
+        let copies = podLayoutLeaves st layout |> List.map (fun (off, kind) ->
             let (sty, _) = optGet (storLTy kind)
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ] @ copies, lowInt 0)
@@ -5927,8 +6133,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let bs = freshTmp ctx
         let it = freshTmp ctx
         let elemBase = LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW stride ]) ])
-        let copies = order |> List.map (fun fn ->
-            let (off, kind) = optGet (dictTryFind layout fn)
+        let copies = podLayoutLeaves st layout |> List.map (fun (off, kind) ->
             let (sty, _) = optGet (storLTy kind)
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LGet (wReg cnt) ]) else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
@@ -5947,8 +6152,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let n = List.length xs
         let bs = freshTmp ctx
         let alloc = if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LConstW n ]) else LAlloc (LConstW (ARRHDR + n * stride))
-        let copyFields eb vr = order |> List.map (fun fn ->
-            let (off, kind) = optGet (dictTryFind layout fn)
+        let copyFields eb vr = podLayoutLeaves st layout |> List.map (fun (off, kind) ->
             let (sty, _) = optGet (storLTy kind)
             LStore (sty, eb, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         if gc then
@@ -9438,6 +9642,15 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | [ f ] when (dictTryFind noCollapse (fst kv)).IsNone && (dictTryFind classNames (fst kv)).IsNone ->
             dictSet st.Collapse (fst kv) f
         | _ -> ()
+    // record every STRUCT record's ordered declared fields FIRST: the layout
+    // below resolves a nested struct field through this table, so it has to be
+    // complete before the first layout is computed (a record may mention a
+    // struct declared after it). Value types only — a reference record stays a
+    // pointer word, which is what tells the two apart.
+    for d in decls0 do
+        match d with
+        | DRecord (n, _, fs, true) -> dictSet st.RecFieldTys n fs
+        | _ -> ()
     // inline value-type layout: a record with >=2 fields and >=1 scalar field,
     // not a class. Scalars pack raw from HDR (each its storage width); ref/word
     // fields follow (4 bytes each). The word index where refs begin is the
@@ -9454,9 +9667,13 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         | DRecord (n, _, fs, _) when
                 List.length fs >= 2 && (dictTryFind classNames n).IsNone
                 && not (fs |> List.exists (fun (_, ty) -> ty.StartsWith "'" && not (ty.Contains "[") && not (ty.Contains "<"))) ->
-            let scalars = fs |> List.filter (fun (_, ty) -> (storLTy ty).IsSome)
+            // a nested struct counts as a VALUE field: `{ Lo : V2d; Hi : V2d }`
+            // has no scalar of its own and must still lay out inline
+            let scalars =
+                fs |> List.filter (fun (_, ty) ->
+                    (storLTy ty).IsSome || (layInlineFields (layResOf st) 0 ty).IsSome)
             if not (List.isEmpty scalars) then
-                dictSet st.RecPod n (layoutDecl fs)
+                dictSet st.RecPod n (layoutDeclWith (layResOf st) fs)
         // a union whose EVERY case has a concrete payload gets the inline
         // treatment: the tag rides field 0 and each payload slot its own
         // width, so a float or int64 payload stops being a pointer to a box.
@@ -9487,16 +9704,9 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 let flat = vecNew<string * int> ()
                 for cn, tys in cs do
                     let fs2 = ("$tag", "int") :: (tys |> List.mapi (fun i t -> "Item" + string (i + 1), t))
-                    dictSet st.CasePod cn (layoutDecl fs2)
+                    dictSet st.CasePod cn (layoutDeclWith (layResOf st) fs2)
                     vecAdd flat (cn, (match dictTryFind st.UnionTag cn with Some t -> t | None -> 0))
                 dictSet st.UnionFlat uname (vecToList flat)
-        | _ -> ()
-    // record every STRUCT record's ordered declared fields for the inline-value
-    // layout engine (`layoutOf`). Value types only — reference records stay a
-    // pointer word. Written for groundwork; no codegen path reads it yet.
-    for d in decls0 do
-        match d with
-        | DRecord (n, _, fs, true) -> dictSet st.RecFieldTys n fs
         | _ -> ()
     let nCid = nextCid
     // GC: eagerly intern the fpprt type-id for every type-testable shape and

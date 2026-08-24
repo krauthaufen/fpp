@@ -20,6 +20,16 @@ type C3b = { R : byte; G : byte; B : byte }
 type C4b = { CR : byte; CG : byte; CB : byte; CA : byte }
 [<Struct>]
 type Mixed = { M : float; T : byte }
+// NESTED structs must inline, exactly as C lays them out
+[<Struct>]
+type Box = { Lo : V2d; Hi : V2d }
+[<Struct>]
+type Tagged = { P : V3f; T : byte }
+[<Struct>]
+type Small = { C : C4b; F : float32 }
+let bx : Box[] = Array.zeroCreate 2
+let tg : Tagged[] = Array.zeroCreate 2
+let sm : Small[] = Array.zeroCreate 2
 let c3 : C3b[] = Array.zeroCreate 2
 let c4 : C4b[] = Array.zeroCreate 2
 let mx : Mixed[] = Array.zeroCreate 2
@@ -32,3 +42,6 @@ let go =
     print (Array.byteSize c3 / 2)
     print (Array.byteSize c4 / 2)
     print (Array.byteSize mx / 2)
+    print (Array.byteSize bx / 2)
+    print (Array.byteSize tg / 2)
+    print (Array.byteSize sm / 2)
