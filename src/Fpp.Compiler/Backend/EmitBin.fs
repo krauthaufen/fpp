@@ -528,6 +528,12 @@ let memGrowIns (f : Fn) : unit =
     emitByte f.B 0x40
     emitByte f.B 0
 
+/// memory.fill dst byte len — one instruction for a bulk zero
+let memFill (f : Fn) : unit =
+    emitByte f.B 0xFC
+    emitU32 f.B 0x0B
+    emitByte f.B 0
+
 /// memory.copy dst src len — one instruction, the blit the serializer rides on
 let memCopy (f : Fn) : unit =
     emitByte f.B 0xFC

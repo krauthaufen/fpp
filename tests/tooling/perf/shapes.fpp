@@ -25,17 +25,21 @@ let fill =
         d.[i] <- { M = 1.0; T = 1uy }
         e.[i] <- { Lo = { PX = 1.0; PY = 1.0 }; Hi = { PX = 2.0; PY = 2.0 } }
         i <- i + 1
+// the addends are GROUPED, exactly as the C twin's `s += x + y + z` groups
+// them: left-associating instead puts every add on the accumulator's
+// dependency chain, which is a different computation (different rounding) and
+// measures latency rather than the code being compared.
 let go =
     let mutable s = 0.0
     let mutable r = 0
     while r < reps do
         let mutable i = 0
         while i < n do
-            s <- s + float a.[i].X + float a.[i].Y + float a.[i].Z
-            s <- s + b.[i].PX + b.[i].PY
-            s <- s + float (int c.[i].R) + float (int c.[i].G) + float (int c.[i].B) + float (int c.[i].A)
-            s <- s + d.[i].M + float (int d.[i].T)
-            s <- s + e.[i].Lo.PX + e.[i].Hi.PY
+            s <- s + (float a.[i].X + float a.[i].Y + float a.[i].Z)
+            s <- s + (b.[i].PX + b.[i].PY)
+            s <- s + (float (int c.[i].R) + float (int c.[i].G) + float (int c.[i].B) + float (int c.[i].A))
+            s <- s + (d.[i].M + float (int d.[i].T))
+            s <- s + (e.[i].Lo.PX + e.[i].Hi.PY)
             i <- i + 1
         r <- r + 1
     print s

@@ -118,6 +118,10 @@ and LStmt =
     /// call a function that returns nothing (a void runtime routine); unlike
     /// LEval of LCall there is no result to discard
     | LCallVoidS of string * LExpr list
+    /// fill `len` bytes at `dst` with a byte value — one bulk instruction in
+    /// place of a per-element store loop. `Array.zeroCreate` of a million
+    /// structs wrote every field of every element by hand before this.
+    | LMemFill of LExpr * LExpr * LExpr
     | LIf of LExpr * LStmt list * LStmt list
     | LWhile of LExpr * LStmt list
     /// a labelled block; `LBreak` on the same label exits it. Match compiles

@@ -6213,6 +6213,25 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             let (sty, _) = optGet (storLTy kind)
             LStore (sty, elemBase, ARRHDR + off - HDR, LLoad (sty, LGet (wReg vr), off)))
         LDo ([ LSet (wReg vr, coreToLowE ctx v); LSet (wReg ar, coreToLowE ctx arr); LSet (wReg ir, (coreToLowE ctx i)) ] @ copies, lowInt 0)
+    // `Array.zeroCreate` of a POD element: the elements are contiguous raw
+    // bytes, so ONE memory.fill replaces a loop that wrote every field of every
+    // element. On the shapes benchmark that loop was 761M instructions — more
+    // than the read loop it was setting up for.
+    | EArrayCreate (ek, n, init) when
+            (podArrOf st ek).IsSome
+            && (match init with EUnknown nm | EApp (EUnknown nm, _) -> nm.StartsWith "$zero" | _ -> false) ->
+        let (_, stride) = optGet (podArrOf st ek)
+        let cnt = freshTmp ctx
+        let bs = freshTmp ctx
+        let alloc =
+            if gc then LCall ("$fpallocn", [ LConstW (gcArrTidReg ctx.LSt ("pa:" + ek) stride FK_SCALAR_ARRAY); LGet (wReg cnt) ])
+            else LAlloc (LPrim (AddW, [ LConstW ARRHDR; LPrim (MulW, [ LGet (wReg cnt); LConstW stride ]) ]))
+        LDo ([ LSet (wReg cnt, (coreToLowE ctx n))
+               LSet (wReg bs, alloc) ]
+             @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
+             @ [ LMemFill (LPrim (AddW, [ LGet (wReg bs); LConstW ARRHDR ]), LConstW 0,
+                           LPrim (MulW, [ LGet (wReg cnt); LConstW stride ])) ],
+             LGet (wReg bs))
     | EArrayCreate (ek, n, init) when (podArrOf st ek).IsSome ->
         let (layout, stride) = optGet (podArrOf st ek)
         let order = match dictTryFind st.RecFields ek with Some o -> o | None -> []
@@ -6376,15 +6395,22 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // a bogus address as if the slot were boxed).
         let isZero = match init with EUnknown n | EApp (EUnknown n, _) -> n.StartsWith "$zero" | _ -> false
         let fill = if isZero then (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0) else storUnbox k (coreToLowE ctx init)
-        let stmts =
+        let header =
             [ LSet (wReg cnt, (coreToLowE ctx n))
               LSet ({ Id = fv; RTy = vty }, fill)
               LSet (wReg bs, alloc) ]
             @ (if gc then [] else [ LStore (W, LGet (wReg bs), 0, LConstW CID_ARRAY); LStore (W, LGet (wReg bs), HDR, LGet (wReg cnt)) ])
-            @ [ LSet (wReg it, LConstW 0)
-                LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
-                        [ LStore (sty, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty })
-                          LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
+        // an all-zero fill is a byte pattern, whatever the element width
+        let stmts =
+            if isZero then
+                header @ [ LMemFill (LPrim (AddW, [ LGet (wReg bs); LConstW (HDR + 4) ]), LConstW 0,
+                                     LPrim (MulW, [ LGet (wReg cnt); LConstW w ])) ]
+            else
+                header
+                @ [ LSet (wReg it, LConstW 0)
+                    LWhile (LPrim (LtUW, [ LGet (wReg it); LGet (wReg cnt) ]),
+                            [ LStore (sty, LPrim (AddW, [ LGet (wReg bs); LPrim (MulW, [ LGet (wReg it); LConstW w ]) ]), HDR + 4, LGet { Id = fv; RTy = vty })
+                              LSet (wReg it, LPrim (AddW, [ LGet (wReg it); LConstW 1 ])) ]) ]
         LDo (stmts, LGet (wReg bs))
     | EArrayCreate (_, n, init) ->
         let cnt = freshTmp ctx
@@ -7833,6 +7859,7 @@ and private regInE (id : int) (e : LExpr) : bool =
 and private regInS (id : int) (st : LStmt) : bool =
     match st with
     | LStore (_, a, _, v) -> regInE id a || regInE id v
+    | LMemFill (d, v, n) -> regInE id d || regInE id v || regInE id n
     | LSet (r, v) -> r.Id = id || regInE id v
     | LSetMany (rs, v) -> (rs |> List.exists (fun r -> r.Id = id)) || regInE id v
     | LSetGlobal (_, v) -> regInE id v
@@ -8856,6 +8883,7 @@ let rec private emitLowE (f : Fn) (e : LExpr) : unit =
 
 and private emitLowS (f : Fn) (s : LStmt) : unit =
     match s with
+    | LMemFill (d, v, n) -> emitLowE f d; emitLowE f v; emitLowE f n; memFill f
     | LStore (ty, a, off, v) ->
         emitLowE f a
         (if off < 0 then (ic f off; ins f "i32.add"))
@@ -9172,6 +9200,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     and seeS (st2 : LStmt) : unit =
         match st2 with
         | LStore (_, a, _, b) -> seeE a; seeE b
+        | LMemFill (d, v, n) -> seeE d; seeE v; seeE n
         | LSet (r, e2) -> seeR r; seeE e2
         | LSetMany (rs, e2) -> (for r in rs do seeR r); seeE e2
         | LSetGlobal (_, e2) | LEval e2 | LBreakIf (_, e2) | LThrow e2 | LReturn e2 -> seeE e2
@@ -9200,6 +9229,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     and dumpS (st2 : LStmt) : string =
         match st2 with
         | LStore (_, a, o, b) -> "st[" + dumpE a + "+" + string o + "]=" + dumpE b
+        | LMemFill (d, v, n) -> "fill[" + dumpE d + "]=" + dumpE v + "*" + dumpE n
         | LSet (r, e2) -> "s" + string r.Id + "=" + dumpE e2
         | LSetMany (rs, e2) -> "sm[" + String.concat "," (rs |> List.map (fun r -> string r.Id)) + "]=" + dumpE e2
         | LSetGlobal (n, e2) -> "SG(" + n + ")=" + dumpE e2

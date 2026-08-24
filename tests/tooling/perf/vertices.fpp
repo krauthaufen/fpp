@@ -15,7 +15,7 @@ let go =
     while r < reps do
         let mutable i = 0
         while i < n do
-            acc <- acc + float v.[i].X + float v.[i].Y + float v.[i].Z
+            acc <- acc + (float v.[i].X + float v.[i].Y + float v.[i].Z)
             i <- i + 1
         r <- r + 1
     print acc
