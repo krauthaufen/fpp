@@ -367,6 +367,10 @@ let mutable private gcGlobalSlots : Dict<string, int> = dictNew ()
 /// in a TYPED wasm global holding the raw value. They used to take a root slot
 /// and a heap box each — the last ordinary shape in which a float allocated.
 let mutable private globalScalarTy : Dict<string, LTy> = dictNew ()
+/// module-level bindings whose type is a BY-VALUE struct: the value lives in
+/// one typed global per field, so `let mutable b = a` COPIES the way F# says
+/// it does instead of aliasing one shared object.
+let mutable private globalStructTy : Dict<string, string> = dictNew ()
 
 // fpprt's reserved type-ids; the compiler numbers its own from here (mirrors
 // FPPRT_TID_FIRST in fpprt.h)
@@ -5703,6 +5707,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LSet (wReg ir, (coreToLowE ctx i))
                LStore (sty, LPrim (AddW, [ LGet (wReg ar); LPrim (MulW, [ LGet (wReg ir); LConstW stride ]) ]), ARRHDR + off - HDR, LGet { Id = fv; RTy = vty }) ],
              lowInt 0)
+    // a field of a by-value struct GLOBAL is a global read
+    | EField (EVar (v, _), fname, _) when
+            (dictTryFind ctx.LSt.Globals (key v)).IsSome
+            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key v))))).IsSome ->
+        let g = "$g" + string (abs (strHash (key v)))
+        let tn = optGet (dictTryFind globalStructTy g)
+        (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, vty, kind) -> if fn2 = fname then Some (vty, kind) else None) with
+         | Some (vty, kind) -> storBox ctx kind (LGetGlobal (g + "$" + fname))
+         | None -> err st ("wasm-linear: no field " + fname + " on struct global"); lowInt 0)
     // a field of a BY-VALUE struct variable is a REGISTER read
     | EField (EVar (v, _), fname, _) when (dictTryFind ctx.StructVars (key v)).IsSome ->
         let (_, fmap) = optGet (dictTryFind ctx.StructVars (key v))
@@ -5726,6 +5739,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let fv = freshTmpT ctx vty
              LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
          | None -> LLoad (W, coreToLowE ctx r, off))
+    // writing a FIELD of a by-value struct GLOBAL writes that field's global
+    | EFieldSet (EVar (sv, _), fname, _, value) when
+            (dictTryFind ctx.LSt.Globals (key sv)).IsSome
+            && (dictTryFind globalStructTy ("$g" + string (abs (strHash (key sv))))).IsSome ->
+        let g = "$g" + string (abs (strHash (key sv)))
+        let tn = optGet (dictTryFind globalStructTy g)
+        (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, _, kind) -> if fn2 = fname then Some kind else None) with
+         | Some kind -> LDo ([ LSetGlobal (g + "$" + fname, storUnbox kind (coreToLowE ctx value)) ], lowInt 0)
+         | None -> err st ("wasm-linear: no field " + fname + " to set on struct global"); lowInt 0)
     // writing a FIELD of a by-value struct local writes its register
     | EFieldSet (EVar (sv, _), fname, _, value) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
         let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key sv))
@@ -6730,7 +6752,7 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                          fields |> List.map (fun (_, off, vty, kind) ->
                              let (sty, _) = optGet (storLTy kind)
                              (off, sty, vty, false, LLoad (sty, LGet (wReg dst), off)))
-                     LDo (stmts, lowPodBuildAt ctx ("inl@" + rn) (cidRec st rn) layout size firstRefWord items)
+                     LDo (stmts, (let c = cidRec st rn in lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + rn) c layout size firstRefWord items))
                  | None ->
                  match retTy with
                  | W -> LCall (fn v, loweredArgs)
@@ -7817,7 +7839,7 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
                 let (sty, _) = optGet (storLTy kind)
                 let r = match dictTryFind fmap fn with Some r -> r | None -> 0
                 (off, sty, storValTy sty, false, LGet { Id = r; RTy = storValTy sty }))
-        lowPodBuildAt ctx ("inl@" + tn) (cidRec st tn) layout size firstRefWord items
+        (let c = cidRec st tn in lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + tn) c layout size firstRefWord items)
     | _ ->
     match dictTryFind ctx.Slotted k with
     | Some addr -> chkReadE ctx ("slot:" + k) (LLoad (W, addr, 0))   // a shadow-stack-rooted ref local: read the current (post-GC) value
@@ -7835,9 +7857,19 @@ and private lowVarStore (ctx : LowCtx) (k : string) : LExpr =
             match st.Globals |> dictPairs |> List.tryFind (fun (gk, _) -> gk = k) with
             | Some _ ->
                 let g = "$g" + string (abs (strHash k))
-                (match dictTryFind globalScalarTy g with
-                 | Some ty -> flatBox ctx ty (LGetGlobal g)
-                 | None -> LGetGlobal g)
+                (match dictTryFind globalStructTy g, dictTryFind globalScalarTy g with
+                 // the WHOLE value of a by-value struct global: build an object
+                 // from the field globals (the one place it costs anything)
+                 | Some tn, _ when (podOf st tn).IsSome ->
+                     let (layout, size, firstRefWord) = optGet (podOf st tn)
+                     let items =
+                         optGet (structAbiOf st tn)
+                         |> List.map (fun (fn2, off, vty, kind) ->
+                             let (sty, _) = optGet (storLTy kind)
+                             (off, sty, vty, false, LGetGlobal (g + "$" + fn2)))
+                     (let c = cidRec st tn in lowPodBuildAt ctx (if c >= 0 then "inl:" + string c else "inl@" + tn) c layout size firstRefWord items)
+                 | _, Some ty -> flatBox ctx ty (LGetGlobal g)
+                 | _, None -> LGetGlobal g)
             | None -> err st ("wasm-linear LowIR: unresolved variable " + k + " name=" + (match dictTryFind nameOf k with Some n -> n | None -> "?")); lowInt 0
 
 // the initial value a shouldSlot binder's shadow-stack slot holds: for a cell
@@ -8554,7 +8586,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // the sret DESTINATION is a real parameter, so it must own a register:
     // without one the register numbering and the wasm local indices drift
     // apart and the first temp lands on a slot nobody declared
-    let sretReg = match retStruct with Some _ -> Some (freshReg ctx "$sret") | None -> None
+    let sretReg = match retStruct with Some _ when not isInit -> Some (freshReg ctx "$sret") | _ -> None
     let pnames = wnames @ pnames @ (match sretReg with Some r -> [ regNm (wReg r) ] | None -> [])
     // this ctor's class-param witnesses (for the class ERecord it builds).
     ctx.ClassCtorWits <- witnessVars
@@ -8833,13 +8865,18 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
              for st2 in wrapPost do emitLowS f st2
              // write the fields through the caller's destination pointer, and
              // answer that pointer
-             let dstName = regNm (wReg (optGet sretReg))
-             for off, sty, r in slots do
-                 lg f dstName
-                 (if off <> 0 then (ic f off; ins f "i32.add"))
-                 lg f (regNm r)
-                 mem f (storeIns sty)
-             lg f dstName
+             (match sretReg with
+              | Some sr ->
+                  let dstName = regNm (wReg sr)
+                  for off, sty, r in slots do
+                      lg f dstName
+                      (if off <> 0 then (ic f off; ins f "i32.add"))
+                      lg f (regNm r)
+                      mem f (storeIns sty)
+                  lg f dstName
+              // an INIT: leave the field values for the finish callback to
+              // store into this global's per-field globals
+              | None -> for _, _, r in slots do lg f (regNm r))
          | None -> emitLowE f bodyLow)
         finish f
     endFn f
@@ -9495,6 +9532,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     let assigned = collectAssigned decls
     if gc then gcGlobalSlots <- dictNew ()
     globalScalarTy <- dictNew ()
+    globalStructTy <- dictNew ()
     // interface-method impls are reached ONLY through the vtable, which dispatches
     // at the uniform `$lfn<n>` type. So a vtable member must NEVER take a
     // funSigOf-specialized signature (a raw f64/i64 param/return) — its declared
@@ -9638,11 +9676,16 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
             (match scalarLTy s.Body with
              | Some ty -> dictSet globalScalarTy (gl v) ty
              | None -> ())
+            // a BY-VALUE struct global: one typed global per field
+            (match structTyName st s.Body with
+             | Some tn -> dictSet globalStructTy (gl v) tn
+             | None -> ())
             // a RAW-scalar top-level binding (int/bool/char) stays in its
             // unscanned wasm global — an even int in the SCANNED root table
             // reads as a bogus pointer. Only ref/generic globals take a root
             // slot (they hold heap pointers a moving collection must update).
-            if gc && refKindOfTy s.Body <> RKRaw && (scalarLTy s.Body).IsNone then
+            if gc && refKindOfTy s.Body <> RKRaw && (scalarLTy s.Body).IsNone
+               && (structTyName st s.Body).IsNone then
                 let slot = st.RootNext
                 st.RootNext <- slot + 1
                 dictSet st.GlobalSlot (key v) slot
@@ -9883,9 +9926,12 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, _) ->
-            (match dictTryFind globalScalarTy (gl v) with
-             | Some ty -> globalTypedMut m (gl v) (wtyName ty)
-             | None -> globalI32Mut m (gl v) 0)
+            (match dictTryFind globalStructTy (gl v), dictTryFind globalScalarTy (gl v) with
+             | Some tn, _ ->
+                 for fn2, _, vty, _ in optGet (structAbiOf st tn) do
+                     globalTypedMut m (gl v + "$" + fn2) (wtyName vty)
+             | None, Some ty -> globalTypedMut m (gl v) (wtyName ty)
+             | None, None -> globalI32Mut m (gl v) 0)
             let nm = "$linit" + string initN
             initN <- initN + 1
             vecAdd inits nm
@@ -10322,16 +10368,21 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
         | DLet (_, v, _, rhs) ->
+            let structG = dictTryFind globalStructTy (gl v)
             let initSig =
                 match dictTryFind globalScalarTy (gl v) with
                 | Some ty -> Some ([], ty)
                 | None -> None
-            emitFuncLow st m (gl v) true initSig [] None [] [] [] [] [] rhs (fun f ->
+            emitFuncLow st m (gl v) true initSig [] structG [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot
-                match (if gc then dictTryFind st.GlobalSlot (key v) else None) with
-                | Some slot -> gs f "$gstash"; gg f "$roots"; ic f (4 * slot); ins f "i32.add"; gg f "$gstash"; mem f "i32.store"
-                | None -> gs f (gl v))
+                match structG, (if gc then dictTryFind st.GlobalSlot (key v) else None) with
+                // the field VALUES are on the stack, last one on top
+                | Some tn, _ ->
+                    for fn2, _, _, _ in List.rev (optGet (structAbiOf st tn)) do
+                        gs f (gl v + "$" + fn2)
+                | None, Some slot -> gs f "$gstash"; gg f "$roots"; ic f (4 * slot); ins f "i32.add"; gg f "$gstash"; mem f "i32.store"
+                | None, None -> gs f (gl v))
         | _ -> ()
     // _start: in GC mode bring fpprt up first (reactor ctors, then the heap),
     // then run every init in order
