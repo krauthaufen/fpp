@@ -4087,6 +4087,19 @@ let private cidCase (st : St) (case : string) : int = match dictTryFind st.CaseC
 // the class-id a `:? T` / `:?>` looks for. An instantiated name tests its
 // erased head (the header carries no type arguments); an unknown name yields
 // -1, which no object header holds, so the test is a safe false.
+/// Is a case's TAG enough to identify it, without the class-id test in front?
+/// Tags are numbered PER class-id group, so two cases of one union in different
+/// groups can carry the same tag — that is what the cid test is for. When every
+/// case of the union sits in ONE group the tag is already unique, and the
+/// scrutinee of the match is statically that union, so the test is dead weight:
+/// nine instructions (header load, shift, table index, load, compare, branch)
+/// per case test, in the hottest code a functional program has.
+let private caseTagUnique (st : St) (case : string) : bool =
+    match dictPairs st.UnionFlat
+          |> List.tryPick (fun (_, cs) -> if cs |> List.exists (fun (c, _) -> c = case) then Some cs else None) with
+    | Some cs -> (cs |> List.map (fun (c, _) -> cidCase st c) |> List.distinct |> List.length) = 1
+    | None -> false
+
 let private typeTestCid (st : St) (tn0 : string) : int =
     let tn = if tn0.Contains "$<" then tn0.Substring (0, tn0.IndexOf "$<") else tn0
     match dictTryFind st.ClassId tn with Some c -> c | None -> 0 - 1
@@ -5316,6 +5329,28 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         let addrReg = freshTmp ctx
         let addr = LGet (wReg addrReg)
         let initVal = lowSlotInit ctx v sch rhs
+        // The value is ALREADY in a live slot — the binder is a copy of one
+        // (`match t with …` re-binds the parameter it scrutinises). A second
+        // slot roots the same pointer twice: the collector updates the first,
+        // so this binder can simply name it. Every recursive function that
+        // matches on its own argument paid the extra push, pop and indirection.
+        // Excluded when the binder is ASSIGNED — aliasing would write through
+        // to the binding it was copied from.
+        let aliasOf =
+            match rhs with
+            | EVar (sv, _) | EVarI (sv, _, _) ->
+                (match dictTryFind ctx.Slotted (key sv) with
+                 | Some a when not (assignsTo (key v) body) && not (assignsTo (key sv) body)
+                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone -> Some a
+                 | _ -> None)
+            | _ -> None
+        match aliasOf with
+        | Some a ->
+            dictSet ctx.Slotted (key v) a
+            let bodyLow = coreToLowE ctx body
+            dictRemove ctx.Slotted (key v)
+            bodyLow
+        | None ->
         dictSet ctx.Slotted (key v) addr
         let bodyLow = coreToLowE ctx body
         dictRemove ctx.Slotted (key v)
@@ -7237,6 +7272,24 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | PAs (p, _, _) -> derefPat p
             | POr ps -> List.exists derefPat ps
             | _ -> false
+        // …but only when something BETWEEN loading the scrutinee and finishing
+        // the tests can actually reach a safepoint. That is a clause guard, or
+        // a pattern whose own test calls (a string compare, a type test).
+        // With neither — `match t with Nil -> … | Node (l, r) -> …`, the shape
+        // every recursive function over a union has — the tests are loads and
+        // compares, nothing moves, and the register is as good as the slot.
+        let rec patCalls (p : Pat) =
+            match p with
+            | PLit (LString _) | PTypeTest _ -> true
+            | PAs (p2, _, _) -> patCalls p2
+            | POr ps -> List.exists patCalls ps
+            | PAnd (a, b) -> patCalls a || patCalls b
+            | PTuple ps -> List.exists patCalls ps
+            | PListLit ps -> List.exists patCalls ps
+            | PArrLit (_, ps) -> List.exists patCalls ps
+            | PCtor (_, _, ps) -> List.exists patCalls ps
+            | PCons (a, b) -> patCalls a || patCalls b
+            | _ -> false
         let slotScrut = gc && List.exists (fun (p, _, _) -> derefPat p) clauses
         let scAddr = if slotScrut then freshTmp ctx else 0
         let scPush =
@@ -7495,6 +7548,28 @@ and private coreToLowS (ctx : LowCtx) (e : Expr) : LStmt list =
         let addrReg = freshTmp ctx
         let addr = LGet (wReg addrReg)
         let initVal = lowSlotInit ctx v sch rhs
+        // The value is ALREADY in a live slot — the binder is a copy of one
+        // (`match t with …` re-binds the parameter it scrutinises). A second
+        // slot roots the same pointer twice: the collector updates the first,
+        // so this binder can simply name it. Every recursive function that
+        // matches on its own argument paid the extra push, pop and indirection.
+        // Excluded when the binder is ASSIGNED — aliasing would write through
+        // to the binding it was copied from.
+        let aliasOf =
+            match rhs with
+            | EVar (sv, _) | EVarI (sv, _, _) ->
+                (match dictTryFind ctx.Slotted (key sv) with
+                 | Some a when not (assignsTo (key v) body) && not (assignsTo (key sv) body)
+                               && (dictTryFind ctx.LSt.CellVars (key v)).IsNone -> Some a
+                 | _ -> None)
+            | _ -> None
+        match aliasOf with
+        | Some a ->
+            dictSet ctx.Slotted (key v) a
+            let bodyStmts = coreToLowS ctx body
+            dictRemove ctx.Slotted (key v)
+            bodyStmts
+        | None ->
         dictSet ctx.Slotted (key v) addr
         let bodyStmts = coreToLowS ctx body
         dictRemove ctx.Slotted (key v)
@@ -8088,7 +8163,7 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
         // `TApp`. Test the class-id too whenever the case is a real user union.
         let cid = cidCase st case
         let cidTest =
-            if cid >= CID_FIRST_USER then
+            if cid >= CID_FIRST_USER && not (caseTagUnique st case) then
                 [ LBreakIf (fail, LPrim (NeW, [ lowHeaderCid (wReg scrutReg); LConstW cid ])) ]
             else []
         let tagTest = LBreakIf (fail, LPrim (NeW, [ LLoad (W, sc, HDR); LConstW tag ]))
@@ -9070,6 +9145,156 @@ and private hoistStmts (ctx : LowCtx) (ss : LStmt list) : LStmt list =
         | LStore (ty, a, o, v) -> [ LStore (ty, hoistE ctx a, o, hoistE ctx v) ]
         | other -> [ other ])
 
+/// `LLoad (W, LGet slot, 0)` -> `LGet src`: undo a slot read, for a slot that
+/// turned out not to be needed.
+and private substSlotRead (slot : LReg) (src : LReg) (e : LExpr) : LExpr =
+    match e with
+    | LLoad (W, LGet r, 0) when r.Id = slot.Id -> LGet src
+    | LLoad (ty, a, o) -> LLoad (ty, substSlotRead slot src a, o)
+    | LPrim (op, xs) -> LPrim (op, xs |> List.map (substSlotRead slot src))
+    | LCall (f2, xs) -> LCall (f2, xs |> List.map (substSlotRead slot src))
+    | LTailCall (f2, xs) -> LTailCall (f2, xs |> List.map (substSlotRead slot src))
+    | LAlloc a -> LAlloc (substSlotRead slot src a)
+    | LCallIndirect (t, a, xs) -> LCallIndirect (t, substSlotRead slot src a, xs |> List.map (substSlotRead slot src))
+    | LCallIdx (t, a, xs) -> LCallIdx (t, substSlotRead slot src a, xs |> List.map (substSlotRead slot src))
+    | LDo (ss, t) -> LDo (ss |> List.map (substSlotReadS slot src), substSlotRead slot src t)
+    | _ -> e
+
+and private substSlotReadS (slot : LReg) (src : LReg) (st : LStmt) : LStmt =
+    let se = substSlotRead slot src
+    match st with
+    | LSet (a, v) -> LSet (a, se v)
+    | LSetGlobal (a, v) -> LSetGlobal (a, se v)
+    | LSetMany (a, v) -> LSetMany (a, se v)
+    | LEval v -> LEval (se v)
+    | LBreakIf (l, v) -> LBreakIf (l, se v)
+    | LReturn v -> LReturn (se v)
+    | LThrow v -> LThrow (se v)
+    | LStore (ty, a, o, v) -> LStore (ty, se a, o, se v)
+    | LMemFill (d, v, n) -> LMemFill (se d, se v, se n)
+    | LCallVoidS (f2, xs) -> LCallVoidS (f2, xs |> List.map se)
+    | LIf (c, a, b) -> LIf (se c, a |> List.map (substSlotReadS slot src), b |> List.map (substSlotReadS slot src))
+    | LWhile (c, b) -> LWhile (se c, b |> List.map (substSlotReadS slot src))
+    | LBlock (l, b) -> LBlock (l, b |> List.map (substSlotReadS slot src))
+    | other -> other
+
+/// Is this slot READ after a safepoint? A value only needs rooting if it is
+/// live ACROSS one — `check t = match t with Leaf -> 1 | Node (l, r) -> 1 +
+/// check l + check r` reads `t` only to pull `l` and `r` out, well before the
+/// recursive calls, so rooting it buys nothing.
+///
+/// Walked in evaluation order with a "a safepoint has happened" flag. A LOOP is
+/// conservative: a read at the top of the body follows the previous iteration's
+/// safepoint, so any read inside a loop that can collect counts.
+and private readAfterSafepoint (slot : int) (body : LExpr) : bool =
+    let mutable hit = false
+    let rec goE (e : LExpr) (seen : bool) : bool =
+        if hit then true
+        else
+        match e with
+        | LLoad (W, LGet r, 0) when r.Id = slot -> (if seen then hit <- true); seen
+        | LLoad (_, a, _) -> goE a seen
+        | LPrim (_, xs) -> List.fold (fun sn x -> goE x sn) seen xs
+        | LCall (_, xs) | LTailCall (_, xs) -> (List.fold (fun sn x -> goE x sn) seen xs) |> ignore; true
+        | LAlloc a -> goE a seen |> ignore; true
+        | LCallIndirect (_, a, xs) | LCallIdx (_, a, xs) ->
+            (List.fold (fun sn x -> goE x sn) (goE a seen) xs) |> ignore; true
+        | LDo (ss, t) -> goE t (List.fold (fun sn st -> goS st sn) seen ss)
+        | _ -> seen
+    and goS (st : LStmt) (seen : bool) : bool =
+        if hit then true
+        else
+        match st with
+        | LSet (_, v) | LSetGlobal (_, v) | LEval v | LBreakIf (_, v) | LReturn v | LThrow v | LSetMany (_, v) -> goE v seen
+        | LStore (_, a, _, v) -> goE v (goE a seen)
+        | LMemFill (d, v, n) -> goE n (goE v (goE d seen))
+        | LCallVoidS (_, xs) -> (List.fold (fun sn x -> goE x sn) seen xs) |> ignore; true
+        | LIf (c, a, b) ->
+            let sc = goE c seen
+            let sa = List.fold (fun sn x -> goS x sn) sc a
+            let sb = List.fold (fun sn x -> goS x sn) sc b
+            sa || sb
+        | LWhile (c, b) ->
+            // the body may run again after its own safepoint
+            let loops = List.exists hasSafepointS b || hasSafepointE c
+            let s0 = goE c (seen || loops)
+            List.fold (fun sn x -> goS x sn) s0 b
+        | LBlock (_, b) -> List.fold (fun sn x -> goS x sn) seen b
+        | LTryStmt (v, _, _, hs) -> (goE v true) |> ignore; List.fold (fun sn x -> goS x sn) true hs
+        | _ -> seen
+    goE body false |> ignore
+    hit
+
+/// Collect the registers a shadow-stack slot ADDRESS is bound to: the idiom is
+/// `r = $roots + $sp`, then `[r] = value`, then `$sp += 4`.
+and private slotAddrRegs (e : LExpr) (acc : Dict<int, bool>) : unit =
+    match e with
+    | LDo (ss, t) -> (for st in ss do slotAddrRegsS st acc); slotAddrRegs t acc
+    | LPrim (_, xs) -> for x in xs do slotAddrRegs x acc
+    | LLoad (_, a, _) -> slotAddrRegs a acc
+    | _ -> ()
+
+and private slotAddrRegsS (st : LStmt) (acc : Dict<int, bool>) : unit =
+    match st with
+    | LSet (r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ])) -> dictSet acc r.Id true
+    | LSet (_, v) | LSetGlobal (_, v) | LEval v | LBreakIf (_, v) | LReturn v | LThrow v | LSetMany (_, v) -> slotAddrRegs v acc
+    | LStore (_, a, _, v) -> slotAddrRegs a acc; slotAddrRegs v acc
+    | LIf (c, a, b) -> slotAddrRegs c acc; (for x in a do slotAddrRegsS x acc); (for x in b do slotAddrRegsS x acc)
+    | LWhile (c, b) -> slotAddrRegs c acc; (for x in b do slotAddrRegsS x acc)
+    | LBlock (_, b) -> for x in b do slotAddrRegsS x acc
+    | _ -> ()
+
+/// A function body that cannot reach a safepoint cannot have anything moved
+/// under it, so its shadow-stack slots buy nothing: the push, the `$sp` bump
+/// and — the part that actually costs — every read going through memory rather
+/// than a register. `height t = match t with Nil -> 0 | Node (_,_,_,_,h) -> h`
+/// rooted its argument TWICE for a body that cannot collect, and stood at 24%
+/// of the avl benchmark.
+///
+/// The slot register is repurposed to hold the VALUE: `[r] = v` becomes
+/// `r = v` and every `[r]` read becomes `r`. `$sp` updates are dropped in
+/// matched pairs — nothing in a safepoint-free body can observe them.
+and private stripLeafRoots (body : LExpr) : LExpr =
+    if hasSafepointE body then body
+    else
+        let marks = dictNew<int, bool> ()
+        slotAddrRegs body marks
+        if List.isEmpty (dictPairs marks) then body
+        else
+            let isSlot (id : int) = (dictTryFind marks id).IsSome
+            let rec goE (e : LExpr) : LExpr =
+                match e with
+                | LLoad (W, LGet r, 0) when isSlot r.Id -> LGet r
+                | LLoad (ty, a, o) -> LLoad (ty, goE a, o)
+                | LPrim (op, xs) -> LPrim (op, xs |> List.map goE)
+                | LCall (f2, xs) -> LCall (f2, xs |> List.map goE)
+                | LTailCall (f2, xs) -> LTailCall (f2, xs |> List.map goE)
+                | LAlloc a -> LAlloc (goE a)
+                | LCallIndirect (t, a, xs) -> LCallIndirect (t, goE a, xs |> List.map goE)
+                | LCallIdx (t, a, xs) -> LCallIdx (t, goE a, xs |> List.map goE)
+                | LDo (ss, t) -> LDo (goS ss, goE t)
+                | _ -> e
+            and goS (ss : LStmt list) : LStmt list =
+                ss |> List.collect (fun st ->
+                    match st with
+                    | LSet (r, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ])) when isSlot r.Id -> []
+                    | LSetGlobal ("$sp", _) -> []
+                    | LStore (W, LGet r, 0, v) when isSlot r.Id -> [ LSet (r, goE v) ]
+                    | LSet (r, v) -> [ LSet (r, goE v) ]
+                    | LSetGlobal (g, v) -> [ LSetGlobal (g, goE v) ]
+                    | LSetMany (rs, v) -> [ LSetMany (rs, goE v) ]
+                    | LEval v -> [ LEval (goE v) ]
+                    | LBreakIf (l, v) -> [ LBreakIf (l, goE v) ]
+                    | LReturn v -> [ LReturn (goE v) ]
+                    | LThrow v -> [ LThrow (goE v) ]
+                    | LStore (ty, a, o, v) -> [ LStore (ty, goE a, o, goE v) ]
+                    | LMemFill (d, v, n) -> [ LMemFill (goE d, goE v, goE n) ]
+                    | LIf (c, a, b) -> [ LIf (goE c, goS a, goS b) ]
+                    | LWhile (c, b) -> [ LWhile (goE c, goS b) ]
+                    | LBlock (l, b) -> [ LBlock (l, goS b) ]
+                    | other -> [ other ])
+            goE body
+
 and private emitLowS (f : Fn) (s : LStmt) : unit =
     match s with
     | LMemFill (d, v, n) -> emitLowE f d; emitLowE f v; emitLowE f n; memFill f
@@ -9374,6 +9599,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let bodyLow =
         if retTy = W || retUnboxed then bodyLow2 else flatUnbox retTy bodyLow2
     let bodyLow = hoistE ctx bodyLow
+    let bodyLow = if gc then stripLeafRoots bodyLow else bodyLow
     // TEMP DEBUG: validate the freshly-lowered tree — every register it
     // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
     let mutable maxReg = -1
@@ -9592,6 +9818,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
             let pop = if List.isEmpty entryRoots then [] else [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW (4 * List.length entryRoots) ])) ]
             LDo (pushes @ condPush @ [ LSet (wReg resReg, bodyLow0) ] @ condPop @ pop, LGet (wReg resReg))
     let bodyLow = if List.isEmpty witLoads then bodyLow else LDo (witLoads, bodyLow)
+    let bodyLow = if gc then stripLeafRoots bodyLow else bodyLow
     let f = beginFn m [ regNm (wReg envId); regNm (wReg argId) ]
     if vecLen sink > 0 then
         if not (isNull (System.Environment.GetEnvironmentVariable "FPP_GAP_DUMP")) then
@@ -10036,8 +10263,27 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     match storLTy t with
                     | Some (sty, _) -> (match sty with F64 | I64 -> true | _ -> false)
                     | None -> false)
+            // Worth laying out flat when a case has a WIDE slot (which would
+            // otherwise be a pointer to a box) or MORE THAN ONE slot — a
+            // multi-field case is declared as a tuple, so without this it
+            // allocates a second object for the payload and every field read
+            // pays a pointer hop. `Node of Tree * int * int * Tree * int` cost
+            // two allocations per node before this.
+            // …but NOT for a union DECLARED with type parameters. A GADT like
+            // `E<'a> = I of int -> E<int> | …` is read GENERICALLY (`eval :
+            // E<'a> -> 'a`), and a raw inline int handed back as `'a` is read
+            // as a tagged word — 42 came out as a pointer. The payload type
+            // STRINGS are erased by then, so the decl's own parameters are
+            // what has to be consulted. The wide case keeps its long-standing
+            // rule.
+            let noGenerics =
+                decls0 |> List.forall (fun d2 ->
+                    match d2 with
+                    | DUnion (u2, tps, _) when u2 = uname -> List.isEmpty tps
+                    | _ -> true)
+            let worth (tys : string list) = wide tys || (noGenerics && List.length tys >= 2)
             if (cs |> List.forall (fun (_, tys) -> concrete tys))
-               && (cs |> List.exists (fun (_, tys) -> wide tys)) then
+               && (cs |> List.exists (fun (_, tys) -> worth tys)) then
                 let flat = vecNew<string * int> ()
                 for cn, tys in cs do
                     let fs2 = ("$tag", "int") :: (tys |> List.mapi (fun i t -> "Item" + string (i + 1), t))
