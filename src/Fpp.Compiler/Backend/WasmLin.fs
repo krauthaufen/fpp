@@ -7318,17 +7318,29 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | PCons (a, b) -> patCalls a || patCalls b
             | _ -> false
         let slotScrut = gc && List.exists (fun (p, _, _) -> derefPat p) clauses
-        let scAddr = if slotScrut then freshTmp ctx else 0
+        // Matching a variable that ALREADY has a slot — `match t with …` on a
+        // rooted parameter, the shape every recursive function over a union has
+        // — can read that slot rather than root the same pointer twice.
+        let existingSlot =
+            if not slotScrut then None
+            else
+                match scrut with
+                // NOT a cell var: its slot holds the CELL, not the value
+                | EVar (sv, _) | EVarI (sv, _, _) when (dictTryFind ctx.LSt.CellVars (key sv)).IsNone ->
+                    dictTryFind ctx.Slotted (key sv)
+                | _ -> None
+        let scAddr = if slotScrut && existingSlot.IsNone then freshTmp ctx else 0
+        let scAddrE = match existingSlot with Some a -> a | None -> LGet (wReg scAddr)
         let scPush =
-            if slotScrut then
+            if slotScrut && existingSlot.IsNone then
                 [ LSet (wReg scAddr, LPrim (AddW, [ LGetGlobal "$roots"; LGetGlobal "$sp" ]))
                   LStore (W, LGet (wReg scAddr), 0, LGet (wReg sc))
                   LSetGlobal ("$sp", LPrim (AddW, [ LGetGlobal "$sp"; LConstW 4 ])) ]
             else []
-        let scPop = if slotScrut then [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ] else []
+        let scPop = if slotScrut && existingSlot.IsNone then [ LSetGlobal ("$sp", LPrim (SubW, [ LGetGlobal "$sp"; LConstW 4 ])) ] else []
         let clauseStmts =
             clauses |> List.map (fun (pat, guard, body) ->
-                let reload = if slotScrut then [ LSet (wReg sc, LLoad (W, LGet (wReg scAddr), 0)) ] else []
+                let reload = if slotScrut then [ LSet (wReg sc, LLoad (W, scAddrE, 0)) ] else []
                 let tests = lowPatTest ctx sc "$mnext" pat
                 // root the arm's ref binders across the GUARD and the body: the
                 // guard itself can allocate, and both the matched path (binders
