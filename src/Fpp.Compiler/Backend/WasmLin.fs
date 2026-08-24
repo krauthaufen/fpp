@@ -4540,17 +4540,36 @@ let private genWitsOf (ctx : LowCtx) (base_ : int) (exprs : Expr list) : (int * 
 /// fields in registers, never a pointer to a heap object. A user writes a
 /// struct to avoid GC pressure, and a heap object per value breaks exactly
 /// that promise. Returns the fields in layout order.
+/// The registers a by-value struct expands into: one per scalar LEAF, named by
+/// its dotted path (`Lo.PX`). A nested struct is part of the value — it rides
+/// registers with everything else rather than forcing the whole struct onto the
+/// heap — so the promise a struct makes about not allocating holds however
+/// deeply it nests. Capped at four leaves, which is the register budget, not a
+/// statement about which shapes are values.
 let private structAbiOf (st : St) (tyName : string) : (string * int * LTy * string) list option =
     match dictTryFind st.RecFieldTys tyName, dictTryFind st.RecPod tyName with
-    | Some fs, Some (layout, _, _) when
-            not (List.isEmpty fs) && List.length fs <= 4
-            && fs |> List.forall (fun (_, ty) -> (storLTy ty).IsSome) ->
-        Some (fs
-              |> List.map (fun (fn, ty) ->
-                  let (off, _) = optGet (dictTryFind layout fn)
-                  let (sty, _) = optGet (storLTy ty)
-                  fn, off, storValTy sty, ty)
-              |> List.sortWith (fun (_, a, _, _) (_, b, _, _) -> if a < b then 0 - 1 elif a > b then 1 else 0))
+    | Some fs, Some (layout, _, _) when not (List.isEmpty fs) ->
+        let acc = vecNew<string * int * LTy * string> ()
+        let mutable ok = true
+        let rec walk (prefix : string) (lay : Dict<string, int * string>) (flds : (string * string) list) (shift : int) : unit =
+            for (fn, _) in flds do
+                match dictTryFind lay fn with
+                | Some (off0, k) ->
+                    let off = off0 + shift
+                    (match storLTy k with
+                     | Some (sty, _) -> vecAdd acc (prefix + fn, off, storValTy sty, k)
+                     | None ->
+                         match podOf st k, dictTryFind st.RecFieldTys k with
+                         | Some (inner, _, _), Some innerFs when
+                                 (layInlineFields (fun n -> dictTryFind st.RecFieldTys n) 0 k).IsSome ->
+                             walk (prefix + fn + ".") inner innerFs (off - HDR)
+                         | _ -> ok <- false)
+                | None -> ok <- false
+        walk "" layout fs 0
+        if not ok || vecLen acc = 0 || vecLen acc > 4 then None
+        else
+            Some (vecToList acc
+                  |> List.sortWith (fun (_, a, _, _) (_, b, _, _) -> if a < b then 0 - 1 elif a > b then 1 else 0))
     | _ -> None
 
 /// the by-value struct type a type denotes, if any
@@ -5137,6 +5156,15 @@ and private lowSafeS (st : LStmt) : bool =
     match st with
     | LSet (_, v) | LEval v -> lowSafeE v
     | _ -> false
+
+/// an EField chain rooted at a variable, as its dotted leaf path: `b.Lo.PX`
+/// over a by-value struct local is the register named "Lo.PX"
+let rec private structVarPath (e : Expr) : (VarId * string) option =
+    match e with
+    | EField (EVar (v, _), fn, _) | EField (EVarI (v, _, _), fn, _) -> Some (v, fn)
+    | EField (inner, fn, _) ->
+        (match structVarPath inner with Some (v, p) -> Some (v, p + "." + fn) | None -> None)
+    | _ -> None
 
 /// Resolve a chain of inline-struct field accesses to (base expression,
 /// absolute offset, field type). `box.Lo.PX` is one double at
@@ -5948,6 +5976,49 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, vty, kind) -> if fn2 = fname then Some (vty, kind) else None) with
          | Some (vty, kind) -> storBox ctx kind (LGetGlobal (g + "$" + fname))
          | None -> err st ("wasm-linear: no field " + fname + " on struct global"); lowInt 0)
+    // a NESTED field of a by-value struct is just a deeper register name
+    | EField (EField (_, _, _), _, _) when
+            (match structVarPath e with
+             | Some (v, path) ->
+                 (match dictTryFind ctx.StructVars (key v) with
+                  | Some (_, fmap) -> (dictTryFind fmap path).IsSome
+                  | None -> false)
+             | None -> false) ->
+        let (v, path) = optGet (structVarPath e)
+        let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key v))
+        let r = optGet (dictTryFind fmap path)
+        let kind =
+            match structAbiOf st tn with
+            | Some fs -> (match fs |> List.tryPick (fun (fn2, _, _, k) -> if fn2 = path then Some k else None) with Some k -> k | None -> "int")
+            | None -> "int"
+        (match vecGet ctx.RegTys r with
+         | F64 -> lowBoxF ctx (LGet { Id = r; RTy = F64 })
+         | I64 -> lowBoxI ctx (LGet { Id = r; RTy = I64 })
+         | _ -> storBox ctx kind (LGet (wReg r)))
+    // reading a WHOLE nested struct field out of registers materialises a copy
+    | EField (EVar (v, _), fname, _) when
+            (match dictTryFind ctx.StructVars (key v) with
+             | Some (_, fmap) ->
+                 (dictTryFind fmap fname).IsNone
+                 && (dictPairs fmap |> List.exists (fun (n, _) -> n.StartsWith (fname + ".")))
+             | None -> false) ->
+        let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key v))
+        let fty =
+            match dictTryFind st.RecFieldTys tn with
+            | Some fs -> (match fs |> List.tryPick (fun (n2, t2) -> if n2 = fname then Some t2 else None) with Some t -> t | None -> "")
+            | None -> ""
+        let (parentLay, _, _) = optGet (podOf st tn)
+        let (offF, _) = optGet (dictTryFind parentLay fname)
+        // each leaf register of this field sits at (its parent offset) - (the
+        // field's offset) inside the copy being built
+        let items =
+            optGet (structAbiOf st tn)
+            |> List.filter (fun (n, _, _, _) -> n.StartsWith (fname + "."))
+            |> List.map (fun (n, off2, vty, kind) ->
+                let (isty, _) = optGet (storLTy kind)
+                (off2 - offF + HDR, isty, storValTy isty, false,
+                 LGet { Id = optGet (dictTryFind fmap n); RTy = vty }))
+        lowPodBuild ctx fty items
     // a field of a BY-VALUE struct variable is a REGISTER read
     | EField (EVar (v, _), fname, _) when (dictTryFind ctx.StructVars (key v)).IsSome ->
         let (_, fmap) = optGet (dictTryFind ctx.StructVars (key v))
@@ -6021,6 +6092,23 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (match optGet (structAbiOf st tn) |> List.tryPick (fun (fn2, _, _, kind) -> if fn2 = fname then Some kind else None) with
          | Some kind -> LDo ([ LSetGlobal (g + "$" + fname, storUnbox kind (coreToLowE ctx value)) ], lowInt 0)
          | None -> err st ("wasm-linear: no field " + fname + " to set on struct global"); lowInt 0)
+    // writing a NESTED field of a by-value struct writes its leaf register
+    | EFieldSet (EField (_, _, _) as tgt, fname, _, value) when
+            (match structVarPath (EField (tgt, fname, "")) with
+             | Some (v, path) ->
+                 (match dictTryFind ctx.StructVars (key v) with
+                  | Some (_, fmap) -> (dictTryFind fmap path).IsSome
+                  | None -> false)
+             | None -> false) ->
+        let (v, path) = optGet (structVarPath (EField (tgt, fname, "")))
+        let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key v))
+        let r = optGet (dictTryFind fmap path)
+        let kind =
+            match structAbiOf st tn with
+            | Some fs -> (match fs |> List.tryPick (fun (fn2, _, _, k) -> if fn2 = path then Some k else None) with Some k -> k | None -> "int")
+            | None -> "int"
+        let vty = vecGet ctx.RegTys r
+        LDo ([ LSet ({ Id = r; RTy = vty }, storUnbox kind (coreToLowE ctx value)) ], lowInt 0)
     // writing a FIELD of a by-value struct local writes its register
     | EFieldSet (EVar (sv, _), fname, _, value) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
         let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key sv))
@@ -8177,6 +8265,34 @@ and private lowSlotInit (ctx : LowCtx) (v : VarId) (sch : Scheme) (rhs : Expr) :
 // bind a local `let`: a monomorphic scalar rides unboxed in a typed local
 // (recorded in VarScalar, read/captured through a re-box), everything else a
 // tagged word — wrapped in a cell when captured-and-mutable.
+/// a dotted leaf path, split into its segments
+and private splitDots (s : string) : string list =
+    let acc = vecNew<string> ()
+    let mutable start = 0
+    for i in 0 .. strLen s - 1 do
+        if s.[i] = '.' then
+            vecAdd acc (s.Substring (start, i - start))
+            start <- i + 1
+    vecAdd acc (s.Substring (start, strLen s - start))
+    vecToList acc
+
+/// the expression a literal supplies for a leaf path, walking nested literals
+and private litLeaf (flds : (string * Expr) list) (path : string list) : Expr option =
+    match path with
+    | [] -> None
+    | [ p ] -> flds |> List.tryPick (fun (n, e) -> if n = p then Some e else None)
+    | p :: rest ->
+        (match flds |> List.tryPick (fun (n, e) -> if n = p then Some e else None) with
+         | Some (ERecord (_, inner)) -> litLeaf inner rest
+         | _ -> None)
+
+/// every leaf this literal must fill is reachable as a literal. A nested field
+/// given as a VALUE rather than spelled out is not, and takes the object path.
+and private litLeavesOk (flds : (string * Expr) list) (fields : (string * int * LTy * string) list) : bool =
+    fields |> List.forall (fun (fn, _, _, _) ->
+        let path = splitDots fn
+        List.length path = 1 || (litLeaf flds path).IsSome)
+
 /// bind a BY-VALUE struct into field registers, and fill them from the rhs
 /// without ever building an object when the rhs is a literal or another
 /// by-value struct
@@ -8205,11 +8321,12 @@ and private lowStructBind (ctx : LowCtx) (k : string) (tn : string) (rhs : Expr)
             | y :: more -> coreToLowS ctx y @ split more
             | [] -> []
         split xs
-    | ERecord (rn, fs) when rn = tn || (structAbiOf st rn).IsSome ->
+    // a leaf's value is reached by walking the literal's NESTED literals:
+    // `{ Lo = { PX = 1.0 } }` fills the register named "Lo.PX"
+    | ERecord (rn, fs) when (rn = tn || (structAbiOf st rn).IsSome) && litLeavesOk fs fields ->
         fields |> List.map (fun (fn, _, vty, kind) ->
-            let ve = fs |> List.tryPick (fun (n2, e2) -> if n2 = fn then Some e2 else None)
             let raw =
-                match ve with
+                match litLeaf fs (splitDots fn) with
                 | Some e2 -> storUnbox kind (coreToLowE ctx e2)
                 | None -> (match vty with F64 -> LConstF 0.0 | I64 -> LConstL 0L | _ -> LConstW 0)
             LSet (regOfField fn vty, raw))
