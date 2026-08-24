@@ -8535,7 +8535,11 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
                 dictSet ctx.StructVars (key pv) ((match structTyName st (List.item (List.findIndex (fun (p2, _) -> key p2 = key pv) paramPlan) paramTypes) with Some tn -> tn | None -> ""), fmap)
                 names
             | None -> [ regNm (wReg (freshReg ctx (key pv))) ])
-    let pnames = wnames @ pnames @ (match retStruct with Some _ -> [ "$sret" ] | None -> [])
+    // the sret DESTINATION is a real parameter, so it must own a register:
+    // without one the register numbering and the wasm local indices drift
+    // apart and the first temp lands on a slot nobody declared
+    let sretReg = match retStruct with Some _ -> Some (freshReg ctx "$sret") | None -> None
+    let pnames = wnames @ pnames @ (match sretReg with Some r -> [ regNm (wReg r) ] | None -> [])
     // this ctor's class-param witnesses (for the class ERecord it builds).
     ctx.ClassCtorWits <- witnessVars
     // a method of a Canon generic class reads its class-param witnesses off
@@ -8802,12 +8806,13 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
              for st2 in stmts do emitLowS f st2
              // write the fields through the caller's destination pointer, and
              // answer that pointer
+             let dstName = regNm (wReg (optGet sretReg))
              for off, sty, r in slots do
-                 lg f "$sret"
+                 lg f dstName
                  (if off <> 0 then (ic f off; ins f "i32.add"))
                  lg f (regNm r)
                  mem f (storeIns sty)
-             lg f "$sret"
+             lg f dstName
          | None -> emitLowE f bodyLow)
         finish f
     endFn f
@@ -9556,8 +9561,17 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 // that crosses one of those edges must find the uniform shape
                 // on the other side. (A generic function keeps it too: its
                 // stamped and canonical copies are reached different ways.)
-                let plainFn =
-                    (dictTryFind memberFns (key v)).IsNone && List.isEmpty s.Quantified
+                // .NET's rule: a struct parameter is by value everywhere; only
+                // an INDIRECT entry point needs the uniform shape, and that is
+                // exactly vtImpls (this backend's vtable carries one all-word
+                // signature per arity). Boxing then happens where .NET boxes:
+                // at an upcast to obj/an interface, or a Canon generic slot.
+                // A GENERIC function may use the struct ABI: its value-type
+                // instantiations are stamped, so the shape is concrete on both
+                // sides. A MEMBER may not yet — a class ctor stores its
+                // parameter into the instance's field, and that path still
+                // wants the whole value.
+                let plainFn = (dictTryFind memberFns (key v)).IsNone
                 if plainFn || plan |> List.forall (fun x -> x.IsNone) then
                     dictSet st.FuncSig (key v) sig_
                     dictSet st.FuncParamPlan (key v) plan
