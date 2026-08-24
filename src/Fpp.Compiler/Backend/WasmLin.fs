@@ -4813,7 +4813,11 @@ let private shouldSlot (ctx : LowCtx) (v : VarId) (sch : Scheme) : bool =
         // type says — a local `let mutable` cell held across a safepoint went
         // stale and was captured into a closure env (coredump'd cell$s edge), so
         // the pointer is slotted like any other ref binder
-        || ((scalarLTy sch.Body).IsNone
+        // a BY-VALUE struct local holds no pointer — its fields live in
+        // registers — so there is nothing for the collector to trace and
+        // nothing to slot. Slotting one forced it back into a heap object.
+        || ((structTyName ctx.LSt sch.Body).IsNone
+            && (scalarLTy sch.Body).IsNone
             && (refKindOfTy sch.Body = RKRef
                 || (Set.contains v.Name desugarRefTemps && refKindOfTy sch.Body <> RKRaw))))
 
@@ -5722,6 +5726,18 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
              let fv = freshTmpT ctx vty
              LDo ([ LSet ({ Id = fv; RTy = vty }, LLoad (sty, coreToLowE ctx r, off)) ], storBox ctx kind (LGet { Id = fv; RTy = vty }))
          | None -> LLoad (W, coreToLowE ctx r, off))
+    // writing a FIELD of a by-value struct local writes its register
+    | EFieldSet (EVar (sv, _), fname, _, value) when (dictTryFind ctx.StructVars (key sv)).IsSome ->
+        let (tn, fmap) = optGet (dictTryFind ctx.StructVars (key sv))
+        (match dictTryFind fmap fname with
+         | Some r ->
+             let kind =
+                 match structAbiOf st tn with
+                 | Some fs -> (match fs |> List.tryPick (fun (fn2, _, _, k) -> if fn2 = fname then Some k else None) with Some k -> k | None -> "int")
+                 | None -> "int"
+             let vty = vecGet ctx.RegTys r
+             LDo ([ LSet ({ Id = r; RTy = vty }, storUnbox kind (coreToLowE ctx value)) ], lowInt 0)
+         | None -> err st ("wasm-linear: no field " + fname + " to set on a by-value struct"); lowInt 0)
     | EFieldSet (r, fname, owner, v) when (podOf st owner).IsSome ->
         let (layout, _, _) = optGet (podOf st owner)
         let (off, kind) = optGet (dictTryFind layout fname)
