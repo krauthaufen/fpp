@@ -691,3 +691,24 @@ fsi oracle run, per rule 1 above).
   and user classes test exactly; int64 tests exactly on wasm-linear, while
   the wasm-GC leg keeps SMALL int64s in the i31 the ints use, so there
   `box 9L :? int` is also true.
+
+* **`string x` on a structured value renders it; .NET sometimes names its
+  CLASS instead.** `string` on a record, union, tuple, list or option
+  matches F# exactly here, quoting and all — that is the whole point of
+  the `str` member on Show. Where .NET's `ToString` falls back to a CLR
+  type name we render the value instead:
+
+      string [| 1; 2 |]      F#: "System.Int32[]"    F++: "[|1; 2|]"
+      string (Ok "a")        F#: "Microsoft.FSharp.Core.FSharpResult`2[…]"
+                             F++: "Ok(a)"
+      string (ValueSome "a") F#: "a"                 F++: "ValueSome(a)"
+
+  A `None` INSIDE a collection is the same story from the other side:
+  F# writes the null it is (`[Some(1); null]`), and there is no null here,
+  so it writes what `string None` writes at the top level — the empty
+  string (`[Some(1); ]`).
+
+  **Reason.** Those F# answers are artefacts of which type happens to
+  override `ToString`, not a rendering anyone wants; reproducing them
+  needs .NET type names, which do not exist here. `%A` is unaffected and
+  matches F# in every case above.

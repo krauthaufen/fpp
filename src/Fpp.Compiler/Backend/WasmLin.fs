@@ -65,6 +65,11 @@ type private St =
       /// text, one per stub (dead prelude/backend members that survive DCE but
       /// are never called during self-host)
       Warnings : Vec<string>
+      /// init globals that are a bare top-level STATEMENT (`_it`) rather than
+      /// a binding. A stubbed one must TRAP: nothing reads its value, so the
+      /// only reason it exists is its effect, and answering 0 drops that
+      /// effect silently (see tests/known-issues)
+      StmtInits : Dict<string, bool>
       /// top-level function names (their DLet is an ELam): reached by call
       Funcs : Dict<string, int>          // "path:offset" -> arity
       /// unboxed ABI of a top-level function whose signature has any scalar
@@ -2060,6 +2065,12 @@ let private emitListIter (m : Mod) : unit =
     lg f "$c"; ic f CID_LIST; ins f "i32.eq"
     lg f "$c"; ic f CID_ARRAY; ins f "i32.eq"
     ins f "i32.or"
+    // a STRING is a seq<char>: `Seq.length "abc"`, `List.ofSeq s`. It has no
+    // vtable row either, and $literNew turns it into its char array — the
+    // same copy `ToCharArray` makes, which is observationally the lazy walk
+    // because a string is immutable.
+    lg f "$c"; ic f CID_STRING; ins f "i32.eq"
+    ins f "i32.or"
     endFn f
     // $literNew(src): an array -> [array][index=-1] (index-based); else a list
     // iterator [remaining=list][current=0].
@@ -2067,6 +2078,12 @@ let private emitListIter (m : Mod) : unit =
     local f "$it" "i32"; local f "$c" "i32"
     localsDone f
     cidOf f "$src"; ls f "$c"
+    // a string enumerates as its chars, through the ARRAY iterator
+    lg f "$c"; ic f CID_STRING; ins f "i32.eq"
+    ifE f
+    lg f "$src"; callf f "$str_chars"; ls f "$src"
+    ic f CID_ARRAY; ls f "$c"
+    endB f
     lg f "$c"; ic f CID_ARRAY; ins f "i32.eq"
     ifE f
     (if gc then (lg f "$src"; callf f "$spush"; ic f gcArrIterTid; callf f "$fpalloc"; ls f "$it"; callf f "$spop"; ls f "$src")
@@ -9809,7 +9826,8 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
         // must NOT trap: _start runs every init at startup, so store a harmless
         // 0 instead — the value is only ever touched by already-stubbed .NET
         // methods. A stubbed FUNCTION still traps loudly if it is ever called.
-        if isInit then (ic f 0; finish f) else ins f "unreachable"
+        if isInit && (dictTryFind st.StmtInits dbgName).IsNone then (ic f 0; finish f)
+        else ins f "unreachable"
     else
         // the PARAMETER registers are pnames — with a by-value struct that is
         // more than one per Core parameter, and declaring one of them as a
@@ -10235,7 +10253,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // function registered first. Claimed HERE, before any lambda.
     tblIdx m "$novt" |> ignore
     let st =
-        { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew ()
+        { M = m; Errors = vecNew (); GapSink = None; Warnings = vecNew (); StmtInits = dictNew ()
           Funcs = dictNew (); FuncSig = dictNew (); FuncWitness = dictNew (); Witnesses = dictNew (); WitnessData = vecNew (); WitnessCur = 0; Globals = dictNew (); Externs = dictNew (); IfaceArities = dictNew ()
           Consts = dictNew (); ConstNext = CONST_BASE; ConstData = bytesNew ()
           LamName = refMapNew shallowLamHash; TailApp = refMapNew shallowLamHash; Lams = vecNew ()
@@ -11376,6 +11394,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                 match dictTryFind globalScalarTy (gl v) with
                 | Some ty -> Some ([], ty)
                 | None -> None
+            if v.Name = "_it" then dictSet st.StmtInits (gl v) true
             emitFuncLow st m (gl v) true initSig [] structG [] [] [] [] [] rhs (fun f ->
                 // GC: the init's result is on the stack — stash it via the
                 // dedicated $gstash global, then store into the root slot

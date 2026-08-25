@@ -38,6 +38,8 @@ type InferResult =
       ShowDerive : (string * string * int * bool * int list * (string * string list) list) list
       /// `%A` hole offset -> the type name whose Show instance renders it
       ShowTypes : (int * string) list
+      /// `string x` sites that render through Show's `str` member, by offset
+      StrTypes : (int * string) list
       ArbDerive : (string * string * int * bool * int list * (string * string list) list) list
       /// member/field name-token offset -> the receiver's type name. Member
       /// names are not unique, so this — not the name — binds a dot-access
@@ -302,6 +304,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         sup = "obj" || sup = sub
         || (isSeqName sup
             && (isSeqName sub || sub = "array" || sub = "list" || sub = "List"
+                || sub = "string"
                 || (match dictTryFind impls sub with
                     | Some is -> is |> List.exists isSeqName
                     | None -> false)))
@@ -365,9 +368,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 (match resolve cname cargs with
                  | Some r -> Some r
                  | None ->
+                     // a STRING carries no type argument of its own, so the
+                     // name-only answer below would leave seq<'a> open. It is
+                     // a seq of CHAR and nothing else.
+                     if cname = "string" && isSeqName iname then
+                         Some (ifaceTy, TCon (iname, [ tChar ]))
                      // name-only knowledge: the value widens, the arguments
                      // stay the interface's own business
-                     if isSupertypeOf iname cname then Some (ifaceTy, ifaceTy)
+                     elif isSupertypeOf iname cname then Some (ifaceTy, ifaceTy)
                      else None)
             | _ -> None)
 
@@ -1801,6 +1809,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let showUnsolved = vecNew<int> ()
     /// every `%A` hole and the type it renders
     let showHolesRaw = vecNew<int * Type> ()
+    /// `string x` sites whose argument is STRUCTURED: they render through the
+    /// Show class' `str` member, the same way `%A` renders through `show`.
+    let strHolesRaw = vecNew<int * Type> ()
     /// type name -> the synthesized instance's offset, so a WRITTEN instance
     /// arriving later (a generated file lands after the type it derives for)
     /// can evict the derived one instead of overlapping with it
@@ -1982,7 +1993,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           Head = [ TCon (tn, headArgs) ]
                           Assoc = []
                           Context = ctx
-                          Members = [ "show", { MPath = path; MOffset = off; MName = "$showD@" + tn; MTakesUnit = false; MTupled = false; MInst = [] } ]
+                          // `str` (what `string x` answers) IS `show` for a
+                          // record or union: .NET keeps the structured form,
+                          // quotes and all. Only the containers differ, and
+                          // they are hand-written in the prelude.
+                          Members = [ "show", { MPath = path; MOffset = off; MName = "$showD@" + tn; MTakesUnit = false; MTupled = false; MInst = [] }
+                                      "str", { MPath = path; MOffset = off; MName = "$showD@" + tn; MTakesUnit = false; MTupled = false; MInst = [] } ]
                           Builtin = false; Path = path; Offset = off }
                     true
 
@@ -3357,7 +3373,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | Some t -> List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ]
                              | None -> false) ->
                           (match tokensOf head |> List.tryHead with
-                           | Some ct -> vecAdd opKindsRaw (ct.Offset, exprType (GNode onlyArg))
+                           | Some ct ->
+                               let aty = exprType (GNode onlyArg)
+                               vecAdd opKindsRaw (ct.Offset, aty)
+                               // `string x` on a record, union, tuple or list
+                               // renders through the Show class' `str` — the
+                               // runtime walker cannot know field or case
+                               // names and answered "?". An UNSATISFIED Show
+                               // is not an error (it lands in showUnsolved),
+                               // so demanding it here costs nothing where
+                               // there is no instance; the export below drops
+                               // every primitive, whose `str` IS `string x`
+                               // and would recurse into itself.
+                               if ct.Text = "string" then
+                                   addWanted ct.Offset { Class = "Show"; Args = [ aty ]; Assoc = [] }
+                                   vecAdd strHolesRaw (ct.Offset, aty)
                            | None -> ())
                       | _ -> ())
                      (match head.NodeKind, args with
@@ -3503,6 +3533,25 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | _ -> false)
                          | _ -> false
                      if nameofMark then tString else
+                     // `System.String (chars)` — F#'s way of spelling what
+                     // the prelude calls `String.ofArray`. `System` is one of
+                     // the roots that reach the backend unresolved, so
+                     // without this the call is a GAP.
+                     let sysStringMark =
+                         match head.NodeKind, args with
+                         | DotExpr, [ onlyArg ] when
+                               (Green.tokens (GNode head)
+                                |> List.filter (fun t -> t.Kind = Ident)
+                                |> List.map (fun t -> t.Text)) = [ "System"; "String" ] ->
+                             (match Green.tokens (GNode head)
+                                    |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                              | Some nt ->
+                                  unifyAt nt.Offset (exprType (GNode onlyArg)) (TCon ("array", [ tChar ]))
+                                  vecAdd fieldOwnersRaw (nt.Offset, "$sysstring")
+                                  true
+                              | None -> false)
+                         | _ -> false
+                     if sysStringMark then tString else
                      // numeric conversions are primitives, not functions
                      let conversion =
                          match head.NodeKind, args with
@@ -8416,6 +8465,27 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       // these offsets also name operators in OpTypes, and filtering that one
       // took an operator's type with it. (No `let` here — a binding inside a
       // record field is not in the subset the compiler itself compiles.)
+      StrTypes =
+        vecToList strHolesRaw
+        |> List.filter (fun (off, _) -> not (List.contains off (vecToList showUnsolved)))
+        // a PRIMITIVE keeps the conversion it already had: its `str` is
+        // literally `string x`, so routing it through the class is an
+        // infinite regress
+        |> List.filter (fun (_, ty) -> kindOf ty = "")
+        |> List.map (fun (off, ty) ->
+            off,
+            match prune ty with
+            | TCon (n, targs) when not (List.isEmpty targs) ->
+                (match Types.instConName (prune ty) with
+                 | "" -> n
+                 | nm -> nm)
+            | TCon (n, _) -> n
+            // a TUPLE is a type too, and `string (1, "a")` is one of the
+            // shapes this exists for — it has no TCon name, so it is spelled
+            // the way every other tuple instantiation is
+            | TTuple _ -> Types.instConName (prune ty)
+            | _ -> "")
+        |> List.filter (fun (_, n) -> n <> "")
       ShowTypes =
         vecToList showHolesRaw
         |> List.filter (fun (off, _) -> not (List.contains off (vecToList showUnsolved)))

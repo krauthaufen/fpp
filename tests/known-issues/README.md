@@ -60,15 +60,20 @@ instance bodies still commit eagerly, see DESIGN.md rule 5),
 `print-class-polymorphic` (class-polymorphic print converted as int) and
 `user-type-shadows-prelude-type` (a user type merging with a prelude type
 of the same name) both pass as of the adaptive-port arc.
-- `string-as-seq.fpp` — `Seq.*`/`List.ofSeq` over a string; `for c in s` and
-  the String module work.
-- `string-of-structured.fpp` — `string` (and so `$"{x}"`) on a record,
-  union, tuple or list answers "?". Needs a second rendering mode on Show:
-  `%A` quotes nested strings and `string` does not.
-- `unresolved-name-in-statement.fpp` — an unresolved root (`System.String`
-  and friends) in STATEMENT position drops the whole statement with no
-  diagnostic; `--strict` reports it, the default build does not.
+Fixed since, and gone from this directory — each now lives in the
+conformance gate instead:
 
-`computed-builder-head` (a computed builder head `(f x) { ... }` and the
-single-line `let! x = e in body` form) is fixed and now lives in the
-`custombuilder` conformance suite.
+- `string-of-structured` — the Show class grew a `str` member beside
+  `show`. `%A` keeps the structured form everywhere; `string` renders a
+  tuple, list or option through its parts' own ToString. Covered by
+  `showa`; the cases where .NET answers a CLR type name rather than a
+  rendering are in DIVERGENCES.md.
+- `string-as-seq` — a string IS a `seq<char>`: the runtime iterator takes
+  its char array and inference pins the element to char. Covered by
+  `seqmod`.
+- `unresolved-name-in-statement` — a stubbed init that is a bare statement
+  (`_it`) now TRAPS rather than answering 0, so a dropped effect is loud
+  instead of silent. `System.String (chars)` itself is implemented, and is
+  covered by `unicode`.
+- `computed-builder-head` — a computed builder head (`(f x) { ... }`) and
+  the single-line `let! x = e in body` form. Covered by `custombuilder`.

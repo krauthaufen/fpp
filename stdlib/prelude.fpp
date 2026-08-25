@@ -3347,6 +3347,12 @@ module String =
             ws
 
 /// a string pins like a byte array: the address is the UTF-8 payload
+/// `System.String (chars)` in F# source: the same thing `String.ofArray` is,
+/// reachable from Lower (memberIndex holds class members, not module lets).
+/// Declared AFTER `module String` — a forward reference traps.
+type StringOps =
+    static member OfArray (cs : char[]) : string = String.ofArray cs
+
 instance Pinnable<string>
     member s.Pin = String.pin s
     member s.ByteSize = 2 * String.length s
@@ -7218,35 +7224,57 @@ type FloatFmt =
 [<AutoOpen>]
 class Show<'a>
     static show : 'a -> string
+    /// What `string x` answers, as opposed to `%A`. .NET spells the two
+    /// differently: a tuple, list or option renders its parts through their
+    /// OWN ToString, so nested strings and chars lose their quotes and an
+    /// int64 loses its suffix — while a record or union keeps the structured
+    /// form exactly, quotes and all. So `str` is `show` for the derived
+    /// instances and differs only here, in the containers and primitives.
+    static str : 'a -> string
 
 instance Show<int>
     static show x = string x
+    static str x = string x
 instance Show<int64>
     static show x = string x + "L"
+    static str x = string x
 instance Show<uint32>
     static show x = string x + "u"
+    static str x = string x
 instance Show<uint64>
     static show x = string x + "UL"
+    static str x = string x
 instance Show<int16>
     static show x = string x + "s"
+    static str x = string x
 instance Show<uint16>
     static show x = string x + "us"
+    static str x = string x
 instance Show<byte>
     static show x = string x + "uy"
+    static str x = string x
 instance Show<sbyte>
     static show x = string x + "y"
+    static str x = string x
 instance Show<float>
     static show x = FloatFmt.ToStrA x
+    static str x = string x
 instance Show<float32>
     static show x = FloatFmt.ToStrA (float x) + "f"
+    static str x = string x
 instance Show<bool>
     static show x = if x then "true" else "false"
+    static str x = string x
 instance Show<char>
     static show x = "'" + string x + "'"
+    static str x = string x
 instance Show<string>
     static show x = "\"" + x + "\""
+    static str x = x
 instance Show<unit>
     static show _ = "()"
+    // .NET's `string ()` is the EMPTY string, not "()"
+    static str _ = ""
 
 /// How long the LAST line of a rendering is — the column the next piece
 /// starts at, which is what a nested multi-line value has to line up under.
@@ -7298,12 +7326,18 @@ instance Show<'a * 'b> when Show<'a> when Show<'b>
     static show p =
         let a = showAppend "(" (show (fst p))
         showAppend (showAppend a ", ") (show (snd p)) + ")"
+    // a tuple's ToString renders each item through ITS ToString, so nothing
+    // inside is quoted: `string (1, "a")` is `(1, a)`
+    static str p = "(" + str (fst p) + ", " + str (snd p) + ")"
 instance Show<'a * 'b * 'c> when Show<'a> when Show<'b> when Show<'c>
     static show t =
         let (a, b, c) = t
         let s1 = showAppend "(" (show a)
         let s2 = showAppend (showAppend s1 ", ") (show b)
         showAppend (showAppend s2 ", ") (show c) + ")"
+    static str t =
+        let (a, b, c) = t
+        "(" + str a + ", " + str b + ", " + str c + ")"
 instance Show<'a * 'b * 'c * 'd> when Show<'a> when Show<'b> when Show<'c> when Show<'d>
     static show t =
         let (a, b, c, d) = t
@@ -7311,21 +7345,39 @@ instance Show<'a * 'b * 'c * 'd> when Show<'a> when Show<'b> when Show<'c> when 
         let s2 = showAppend (showAppend s1 ", ") (show b)
         let s3 = showAppend (showAppend s2 ", ") (show c)
         showAppend (showAppend s3 ", ") (show d) + ")"
+    static str t =
+        let (a, b, c, d) = t
+        "(" + str a + ", " + str b + ", " + str c + ", " + str d + ")"
 instance Show<Option<'a>> when Show<'a>
     static show o =
         match o with
         | None -> "None"
         | Some v -> showAppend "Some " (showPar (show v))
+    // .NET: `string (Some 1)` is `Some(1)` — no space, no parenthesising
+    // rule — and `string None` is the EMPTY string, because None is a null
+    // reference and `string null` is ""
+    static str o =
+        match o with
+        | None -> ""
+        | Some v -> "Some(" + str v + ")"
 instance Show<ValueOption<'a>> when Show<'a>
     static show o =
         match o with
         | ValueNone -> "ValueNone"
         | ValueSome v -> showAppend "ValueSome " (showPar (show v))
+    static str o =
+        match o with
+        | ValueNone -> "ValueNone"
+        | ValueSome v -> "ValueSome(" + str v + ")"
 instance Show<Result<'a, 'e>> when Show<'a> when Show<'e>
     static show r =
         match r with
         | Ok v -> showAppend "Ok " (showPar (show v))
         | Error e -> showAppend "Error " (showPar (show e))
+    static str r =
+        match r with
+        | Ok v -> "Ok(" + str v + ")"
+        | Error e -> "Error(" + str e + ")"
 /// The elements of a collection, each lined up under the column it starts at
 /// — and WRAPPED at F#'s width: a rendering that would pass 80 columns
 /// continues on the next line, indented one column in from the opening
@@ -7353,5 +7405,8 @@ let private showElems (opening : string) (closing : string) (parts : string list
 
 instance Show<list<'a>> when Show<'a>
     static show xs = showElems "[" "]" (List.map (fun x -> show x) xs)
+    // a list's ToString is flat and unwrapped, its elements unquoted
+    static str xs = "[" + String.concat "; " (List.map (fun x -> str x) xs) + "]"
 instance Show<'a[]> when Show<'a>
     static show xs = showElems "[|" "|]" (List.map (fun x -> show x) (Array.toList xs))
+    static str xs = "[|" + String.concat "; " (List.map (fun x -> str x) (Array.toList xs)) + "|]"

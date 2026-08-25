@@ -35,7 +35,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (arbDerive : (string * string * int * bool * int list * (string * string list) list) list)
           (ordDerive : (string * string * int * bool * int list * (string * string list) list) list)
           (showDerive : (string * string * int * bool * int list * (string * string list) list) list)
-          (showTypes : (int * string) list)
+          (showTypes : (int * string) list) (strTypes : (int * string) list)
           (existPack : Dict<int, (string * int * string * string list) list>)
           (existCases : Dict<string, int>)
           (existMatch : Dict<int, string>)
@@ -206,6 +206,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     let enumTypes = dictNew<string, bool> ()
     let showTypeAt = dictNew<int, string> ()
     for off, tn in showTypes do dictSet showTypeAt off tn
+    /// `string x` on a structured value: the type whose `str` renders it
+    let strTypeAt = dictNew<int, string> ()
+    for off, tn in strTypes do dictSet strTypeAt off tn
     let memberIndex = dictNew<string, Resolve.Definition> ()
     for k, d in dictPairs projectMembers do dictSet memberIndex k d
     for k, d in binder.Members do dictSet memberIndex k d
@@ -1350,9 +1353,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          elif t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
                          elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
                          else None
-                     (match routed with
-                      | Some e -> e
-                      | None -> EApp (EUnknown (t.Text + "#" + k), [ arg ]))
+                     (match routed, dictTryFind strTypeAt t.Offset with
+                      | Some e, _ -> e
+                      // `string x` on a record, union, tuple or list: through
+                      // the Show class' `str`, the same route `%A` takes to
+                      // `show`. The runtime walker answered "?" — it sees
+                      // words, not field or case names.
+                      | None, Some tn when t.Text = "string" ->
+                          EApp (EUnknown ("$class:Show:str:" + tn), [ arg ])
+                      | None, _ -> EApp (EUnknown (t.Text + "#" + k), [ arg ]))
                  | _ -> note (offsetOf n) "conversion shape")
             | AppExpr when
                 (match nodesOf n |> List.filter (fun m -> isExprish m.NodeKind) with
@@ -1783,6 +1792,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       if k = "?" then None else Some (k, lowerExpr (GNode recv))
                                   | _ -> None)
                              | _ -> None
+                     let sysString =
+                         if head.NodeKind <> DotExpr then None
+                         else
+                             match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t when t.Text = "String" ->
+                                 (match dictTryFind fieldOwners t.Offset with
+                                  | Some m when m = "$sysstring" -> dictTryFind memberIndex "StringOps.OfArray"
+                                  | _ -> None)
+                             | _ -> None
+                     match sysString with
+                     | Some d -> EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
+                     | None ->
                      match primToString with
                      | Some (k, recv) ->
                          let viaPrelude (nm : string) =

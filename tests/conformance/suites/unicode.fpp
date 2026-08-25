@@ -10,8 +10,6 @@
 //
 // DROPPED: the file-encoding round trips (StreamWriter/out.bsl), codepage
 // switches, and `System.Text.Encoding` — none of that surface exists here.
-// `System.String (chars)` is dropped too: it is an unresolved name that
-// SILENTLY DROPS its statement, recorded in tests/known-issues.
 module Core_unicode
 
 let mutable ntests = 0
@@ -104,10 +102,7 @@ test "endswith-non-ascii" (jp.EndsWith "語")
 eq "indexof-non-ascii" (string (jp.IndexOf "語")) "2"
 
 // reversing counts code units, so it is defined on the BMP text
-let reversed = Array.rev (jp.ToCharArray ())
-eq "chars-of-non-ascii"
-   (String.concat "" (Array.toList (Array.map (fun (c : char) -> string c) reversed)))
-   "語本日"
+eq "chars-of-non-ascii" (System.String (Array.rev (jp.ToCharArray ()))) "語本日"
 
 // ---- character literals ----------------------------------------------------
 

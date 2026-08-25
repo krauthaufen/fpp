@@ -147,4 +147,36 @@ test "Seq.exactlyOne" (Seq.exactlyOne [42] = 42)
 test "Seq.tryExactlyOne" (Seq.tryExactlyOne [42] = Some 42)
 test "Seq.tryExactlyOne" (Seq.tryExactlyOne [1;2] = None)
 
+// ---- a STRING is a seq<char> --------------------------------------------
+// The Seq module takes one directly, which is what F# means by
+// `IEnumerable<char>`; the walk is over UTF-16 code units, as indexing is.
+
+test "Seq.length of a string" (Seq.length "abc" = 3)
+test "Seq.length of the empty string" (Seq.length "" = 0)
+test "List.ofSeq of a string" (List.ofSeq "abc" = [ 'a'; 'b'; 'c' ])
+test "Seq.toList of a string" (Seq.toList "hi" = [ 'h'; 'i' ])
+test "Array.ofSeq of a string" (Array.toList (Array.ofSeq "hi") = [ 'h'; 'i' ])
+test "Seq.head of a string" (Seq.head "xy" = 'x')
+test "Seq.item of a string" (Seq.item 1 "xy" = 'y')
+test "Seq.isEmpty of a string" (Seq.isEmpty "")
+test "Seq.map over a string" (Seq.toList (Seq.map (fun c -> int c) "ab") = [ 97; 98 ])
+test "Seq.filter over a string" (Seq.toList (Seq.filter (fun c -> c <> 'b') "abc") = [ 'a'; 'c' ])
+test "Seq.fold over a string" (Seq.fold (fun a (c : char) -> a + int c) 0 "ab" = 195)
+test "Seq.rev of a string" (Seq.toList (Seq.rev "abc") = [ 'c'; 'b'; 'a' ])
+test "Seq.sort of a string" (Seq.toList (Seq.sort "cba") = [ 'a'; 'b'; 'c' ])
+test "Seq.distinct over a string" (Seq.toList (Seq.distinct "aab") = [ 'a'; 'b' ])
+test "Seq.sumBy over a string" (Seq.sumBy (fun (c : char) -> int c) "ab" = 195)
+test "Seq.zip with a string" (Seq.toList (Seq.zip "ab" [ 1; 2 ]) = [ ('a', 1); ('b', 2) ])
+test "Seq.indexed over a string" (Seq.toList (Seq.indexed "ab") = [ (0, 'a'); (1, 'b') ])
+test "Set.ofSeq of a string" (Set.toList (Set.ofSeq "banana") = [ 'a'; 'b'; 'n' ])
+
+// the upcast is explicit and means the same thing
+let asSeq : seq<char> = "abc" :> seq<char>
+test "string upcast to seq" (Seq.length asSeq = 3)
+test "string upcast preserves order" (Seq.toList asSeq = [ 'a'; 'b'; 'c' ])
+
+// a non-ASCII string walks its code units, the same count indexing reports
+test "Seq.length counts code units" (Seq.length "\u65e5\u672c" = 2)
+test "Seq.toList of non-ASCII" (Seq.toList "\u65e5" = [ '\u65e5' ])
+
 printfn "DONE tests=%d failures=%d" ntests failures
