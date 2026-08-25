@@ -63,4 +63,7 @@ of the same name) both pass as of the adaptive-port arc.
 - `string-as-seq.fpp` — `Seq.*`/`List.ofSeq` over a string; `for c in s` and
   the String module work.
 - `string-of-structured.fpp` — `string` (and so `$"{x}"`) on a record,
-  union, tuple or list answers "?"; `%A` renders them correctly.
+  union, tuple or list answers "?". Needs a second rendering mode on Show:
+  `%A` quotes nested strings and `string` does not.
+- `computed-builder-head.fpp` — a computed builder head (`(f x) { ... }`)
+  and the `let! x = e in body` form inside a builder block.
