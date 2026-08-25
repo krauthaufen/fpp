@@ -269,6 +269,31 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | TApp (h, xs) -> TApp (go h, List.map go xs)
                 go sch.Body, List.map (mapConstraint go) sch.Constraints)
 
+    /// A use of a definition in THIS file whose scheme does not exist YET is a
+    /// FORWARD reference — legal only inside a `let rec ... and` group. The
+    /// variable handed out is remembered here so the binding, once typed,
+    /// unifies with it. A throwaway fresh var instead left the use with a
+    /// type nothing ever taught: `(payload k).IsSome` ahead of `and payload
+    /// ... : int option` parked on a variable that never learned it was an
+    /// option, the member never resolved, and the access reached emission as
+    /// an unlowered field — a MISCOMPILE, silent under every diagnostic.
+    /// The link makes the forward use monomorphic in the group, which is what
+    /// F# does for a `let rec` group too.
+    let forwardVars = dictNew<int, Type> ()
+    let forwardVarFor (d : Resolve.Definition) : Type =
+        // ONLY a `let` binding: a TYPE used in expression position (`Vec<'a>
+        // (xs)` with the prelude empty) also has no scheme, and sharing one
+        // variable across its uses unified a nullary construction with a
+        // one-argument one.
+        if d.Path <> path || d.Kind <> Resolve.DefLet then st.Fresh ()
+        else
+            match dictTryFind forwardVars d.Offset with
+            | Some t -> t
+            | None ->
+                let v = st.Fresh ()
+                dictSet forwardVars d.Offset v
+                v
+
     /// Substitute specific vars (by id) with given types, freshening nothing else.
     /// Memoized on node identity so a shared sub-DAG is copied ONCE.
     let substVars (subst : Dict<int, Type>) (t : Type) : Type =
@@ -3295,7 +3320,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         vecAdd fieldOwnersRaw (t.Offset, "$deref")
                                         inner
                                     | _ -> ty)
-                               | None -> st.Fresh ())
+                               | None -> forwardVarFor d)
                       | None when
                             List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ] ->
                           // a builtin conversion USED AS A VALUE (`|> int`,
@@ -6160,6 +6185,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             (match Green.tokens (GNode namePat) |> List.tryHead with
              | Some t -> unifyAt t.Offset nameTy funTy
              | None -> unify nameTy funTy |> ignore)
+            // a FORWARD reference from an earlier member of this `let rec ...
+            // and` group is holding a variable for this binding: tie it to
+            // the real type now, or the use keeps a type nothing taught
+            (match Green.tokens (GNode namePat) |> List.tryHead with
+             | Some t ->
+                 (match dictTryFind forwardVars t.Offset with
+                  | Some fv -> unifyAt t.Offset fv funTy
+                  | None -> ())
+             | None -> ())
             ignore isRec   // rec already works: the name's tvar was bound before the body
             st.ExitLevel ()
             // `use x = e` disposes at the end of the scope. There is no

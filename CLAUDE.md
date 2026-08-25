@@ -31,13 +31,20 @@ compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
 **A `let rec ... and` group inside `lower` miscompiled under SELF-HOST**
-while the .NET build and all 637 tests passed. The symptom was an
-`unreachable` deep inside an unrelated lambda, and the branch the group
-existed for was never even reached during the failing compile. Two ordinary
-bindings in place of the group fixed it with no other change. If something is
-green everywhere and the fixpoint dies, suspect the SHAPE of what you wrote
-rather than its logic — `tests/known-issues/let-rec-and-group-self-host.fpp`
-records what was ruled out.
+while the .NET build and every unit test passed. It looked for a long time
+like the group's SHAPE — its size, its position among the surrounding
+`let`s — and it was not. The cause was a FORWARD reference: the first
+binding of a group calling a later one got a throwaway type variable, so
+`(payload k).IsSome` written above `and payload ... : int option` never
+learned its receiver was an option. The member stayed unresolved, Lower
+emitted a bare field, and the backend answered `unreachable` — silent under
+every diagnostic, `--strict` included. Fixed in Infer (`forwardVars`), and
+`tests/conformance/suites/letrecand.fpp` covers the shapes.
+
+The lesson that outlives it: a program that compiles clean and traps is an
+inference gap reaching emission, not a backend bug. Dump the Core
+(`FPP_CORE_DUMP=1`) and look for an access that did not lower — a `.M` still
+sitting in the tree is a member the type never resolved.
 
 Three details that will bite:
 

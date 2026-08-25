@@ -77,3 +77,13 @@ conformance gate instead:
   covered by `unicode`.
 - `computed-builder-head` — a computed builder head (`(f x) { ... }`) and
   the single-line `let! x = e in body` form. Covered by `custombuilder`.
+- `let-rec-and-group-self-host` — ROOT CAUSE FOUND. It was never about the
+  group's size or position: a FORWARD reference inside a `let rec ... and`
+  group (the first binding calling a later one) handed the use a throwaway
+  fresh type variable, so `(payload k).IsSome` ahead of `and payload ... :
+  int option` never learned its receiver was an option. The member stayed
+  unresolved, Lower emitted a bare field, and the backend answered
+  `unreachable` — clean under every diagnostic, including `--strict`. The
+  variable is now remembered and tied to the binding when it is typed, which
+  makes the forward use monomorphic in the group, as F# does. Covered by
+  `letrecand`.

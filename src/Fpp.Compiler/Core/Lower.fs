@@ -1058,6 +1058,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // a record pattern among the parameters stashed its field reads
         binds, wrapRecPatBody (drainRecPats ()) bodyW
 
+    /// Does this pattern destructure a struct-tuple payload, at the top or
+    /// inside a tuple of cases?
+    let rec hasStructPayload (p : GreenNode) : bool =
+        (structPayloadOf p).IsSome
+        || (p.NodeKind = TuplePat
+            && (nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) |> List.exists hasStructPayload))
     /// One slot per element of a `struct(...)` pattern, in source order:
     /// `Some binder` for a named element, `None` for a wildcard or literal.
     /// The POSITION is what names the field, so a dropped element still
@@ -1065,7 +1071,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// `Case (a, b)` whose payload inference marked as a STRUCT tuple —
     /// a plain comma pattern that takes apart a struct, which is what F#
     /// allows inside a union case and nowhere else.
-    let structPayloadOf (p : GreenNode) : GreenNode option =
+    and structPayloadOf (p : GreenNode) : GreenNode option =
         if p.NodeKind <> AppPat then None
         else
             match nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) with
@@ -1088,15 +1094,6 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         | _ -> None)
             | [] -> None
 
-    /// Does this pattern destructure a struct-tuple payload, at the top or
-    /// inside a tuple of cases? Its own recursive binding rather than a
-    /// `let rec ... and` group with `structPayloadOf`: putting the two in
-    /// one group broke the SELF-HOST while leaving the .NET build and every
-    /// test green, and the nested path was never even reached.
-    let rec hasStructPayload (p : GreenNode) : bool =
-        (structPayloadOf p).IsSome
-        || (p.NodeKind = TuplePat
-            && (nodesOf p |> List.filter (fun m -> isPatKind m.NodeKind) |> List.exists hasStructPayload))
 
     /// Top-level elements of a struct-tuple pattern. Parens peel; a NESTED
     /// tuple stays ONE element — `ValueSome((_,old), rest)` has two slots,
