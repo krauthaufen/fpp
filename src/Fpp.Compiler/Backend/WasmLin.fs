@@ -10362,37 +10362,8 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
                     match d2 with
                     | DUnion (u2, tps, _) when u2 = uname -> List.isEmpty tps
                     | _ -> true)
-            // A generic union may still flatten a multi-field case when every
-            // slot of every case is a POINTER: the hazard is a RAW scalar slot
-            // read back through a type variable, where the uniform form is not
-            // the inline one. A pointer is its own uniform form, so
-            // `Tree<'a> = Leaf | Node of Tree<'a> * Tree<'a>` — the shape every
-            // generic container has — flattens and stops allocating a tuple per
-            // node, while `E<'a> = I of int -> E<int> | …` does not.
-            // "not a known scalar" is NOT the same as "a pointer": a bare type
-            // variable can hold a raw scalar at runtime, which is why slotOk
-            // refuses one. Every slot must be DEFINITELY a pointer.
-            let definitelyPtr (t : string) =
-                not (t.StartsWith "'") && not (t.StartsWith "#") && t <> ""
-                && (let r = storKindRes st t
-                    (storLTy r).IsNone && (dictTryFind enumTypeNames r).IsNone && not (rawScalarName r))
-            let allPtr = cs |> List.forall (fun (_, tys) -> tys |> List.forall definitelyPtr)
-            let worth (tys : string list) = wide tys || List.length tys >= 2
-            // The recorded payload types must MATCH THE DECLARED ARITY. A GADT
-            // case writes its result through an arrow — `Lit of value : int ->
-            // E<int>` — and comes through here as TWO types, the payload and
-            // the result, for a case that carries one value. Laying that out
-            // flat gives the object a slot the constructor never fills, and the
-            // reader takes whatever was next in memory: an out-of-bounds access
-            // at 0x100000003 in gadtnames. This also guards the long-standing
-            // `wide` path, which had the same exposure.
-            let arityOk =
-                cs |> List.forall (fun (cn, tys) ->
-                    match dictTryFind st.UnionArity cn with
-                    | Some ar -> List.length tys = ar
-                    | None -> false)
-            if arityOk
-               && (cs |> List.forall (fun (_, tys) -> concrete tys))
+            let worth (tys : string list) = wide tys || (noGenerics && List.length tys >= 2)
+            if (cs |> List.forall (fun (_, tys) -> concrete tys))
                && (cs |> List.exists (fun (_, tys) -> worth tys)) then
                 let flat = vecNew<string * int> ()
                 for cn, tys in cs do
