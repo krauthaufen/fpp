@@ -1350,10 +1350,14 @@ let parse (src : string) : ParseResult =
             else go <- false
         e
 
-    /// A plain name — `seq`, `Foo.bar`, `x.builder` — and nothing else.
+    /// A plain name — `seq`, `Foo.bar`, `x.builder` — or a PARENTHESISED
+    /// expression, which F# also allows as a builder (`(List.head bs) { … }`).
+    /// A bare atom is still refused: a brace after one is far more often an
+    /// argument, and the parenthesis is the author saying otherwise. A record
+    /// or object expression in the brace is excluded before this is asked.
     and isNameExpr (e : Green) : bool =
         match e with
-        | GNode n -> n.NodeKind = IdentExpr || n.NodeKind = DotExpr
+        | GNode n -> n.NodeKind = IdentExpr || n.NodeKind = DotExpr || n.NodeKind = ParenExpr
         | GToken _ -> false
 
     /// The braced body of a computation expression: an ordinary statement

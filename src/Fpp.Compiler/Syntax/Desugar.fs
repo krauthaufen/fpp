@@ -509,7 +509,26 @@ and private item1 (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest : G
         (match bangBinder item with
          | Some (pat, rhs) -> call b "Using" [ rhs; lambda [ GNode pat ] (tail ()) ]
          | None -> sequential ())
-    | LetDecl -> Green.node BlockExpr [ walk (GNode item); tail () ]
+    | LetDecl ->
+        // `let b = 3 in <body>` inside a builder: the BODY is a computation
+        // item too. Walked plainly it left a bare `return` in the tree, which
+        // is not an expression the builder ever sees. Keep the binding — it
+        // has to scope over the body — and desugar what follows `in`.
+        let mutable seenEq = false
+        let mutable seenIn = false
+        let mutable spliced = false
+        let rebuilt =
+            item.Children |> List.map (fun c ->
+                match c with
+                | GToken t when t.Kind = Operator && t.Text = "=" && not seenIn -> seenEq <- true; c
+                | GToken t when t.Kind = Keyword && t.Text = "in" -> seenIn <- true; c
+                | GNode nd when seenIn && not spliced ->
+                    spliced <- true
+                    blockYielding b explicit (nd :: rest)
+                | GNode nd when seenEq && not seenIn -> walk (GNode nd)
+                | _ -> c)
+        if spliced then Green.node LetDecl rebuilt
+        else Green.node BlockExpr [ walk (GNode item); tail () ]
     | BlockExpr when isDoStmt item && hasBang item ->
         // `do! e` is `let! () = e`. With nothing after it the continuation is
         // the unit VALUE when the builder can return one, and Zero when it
@@ -587,6 +606,26 @@ and private bangLet (b : CeBuilder) (explicit : bool) (item : GreenNode) (rest :
     match bangBinder item with
     | None -> Green.node BlockExpr [ walk (GNode item); blockYielding b explicit rest ]
     | Some (pat, rhs) ->
+        // `let! v = e in body` keeps its continuation INSIDE the binding where
+        // the block form has it as the next statement, and bangBinder takes the
+        // LAST expression as the source — so the body became the source and the
+        // binder went unbound. Split it: the source is what precedes `in`, and
+        // the body joins the front of the continuation, where the block form
+        // would have put it.
+        let pat, rhs, rest =
+            // the continuation is the node AFTER the `in`, whatever kind it
+            // is: a chained `let! a = e in let! b = e2 in body` nests a
+            // LetDecl there, which is not "exprish" and was missed
+            let rec afterIn (cs : Green list) (seen : bool) (acc : GreenNode option) : GreenNode option =
+                match cs with
+                | GToken t :: more when t.Kind = Keyword && t.Text = "in" -> afterIn more true acc
+                | GNode nd :: more -> afterIn more seen (if seen then Some nd else acc)
+                | _ :: more -> afterIn more seen acc
+                | [] -> acc
+            let exprs = nodesOf item |> List.filter (fun m -> isExprish m.NodeKind)
+            match afterIn item.Children false None, exprs with
+            | Some body, first :: _ -> pat, walk (GNode first), body :: rest
+            | _ -> pat, rhs, rest
         let ands, after = peel [] rest
         let tail () = blockYielding b explicit after
         // `use!` binds, then scopes what it bound

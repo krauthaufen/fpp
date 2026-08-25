@@ -150,10 +150,25 @@ test "for-with-if" (lb { for v in [ 1; 2; 3; 4 ] do
 let useBuilder (b : OptionBuilder) (v : int) : int option = b { return v + 1 }
 test "builder-passed-as-argument" (useBuilder opt 1 = Some 2)
 
-// the builder must be NAMED at the block: `(List.head bs) { ... }` is F# but
-// not accepted here — see tests/known-issues/computed-builder-head.fpp
+// the head of the block may be COMPUTED, not just a name
 let builders = [ OptionBuilder(); OptionBuilder() ]
 let firstBuilder = List.head builders
 test "builder-in-list" (firstBuilder { return 5 } = Some 5)
+test "computed-builder-head" ((List.head builders) { return 5 } = Some 5)
+test "computed-head-with-bind" ((List.head builders) { let! v = Some 3
+                                                       return v } = Some 3)
+
+// ---- the single-line `in` form ---------------------------------------------
+
+// `let! x = e in body` on one line: the binder scopes over the body, and the
+// body is a computation item too — a `return` there is the builder's Return,
+// not a stray expression.
+test "in-form-bind" (opt { let! v = Some 3 in return v * 10 } = Some 30)
+test "in-form-return-from" (opt { let! v = Some 1 in return! Some (v * 5) } = Some 5)
+test "in-form-chained" (opt { let! a = Some 1 in let! b = Some 2 in return a + b } = Some 3)
+test "in-form-plain-let" (opt { let! a = Some 2
+                                let b = 3 in return a + b } = Some 5)
+test "in-form-plain-let-only" (opt { let b = 4 in return b } = Some 4)
+test "in-form-none" (opt { let! v = (None : int option) in return v } = None)
 
 printfn "DONE tests=%d failures=%d" ntests failures
