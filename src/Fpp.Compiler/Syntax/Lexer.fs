@@ -152,7 +152,19 @@ let rec tokenize (src : string) : Token list =
         elif peek (pos + 1) <> '\000' && peek (pos + 2) = '\'' then
             CharLit, pos + 3
         else
-            Operator, pos + 1
+            // source arrives LATIN-1 (offsets are byte offsets), so a
+            // non-ASCII char literal is a UTF-8 RUN between the quotes —
+            // `'日'` is five bytes, not three. Only a well-formed run
+            // counts, so `'a,'b` (two type variables) is still an operator.
+            let u = int (peek (pos + 1))
+            let cont (k : int) = int (peek k) >= 0x80 && int (peek k) < 0xC0
+            let width =
+                if u >= 0xC2 && u < 0xE0 && cont (pos + 2) then 2
+                elif u >= 0xE0 && u < 0xF0 && cont (pos + 2) && cont (pos + 3) then 3
+                elif u >= 0xF0 && u < 0xF5 && cont (pos + 2) && cont (pos + 3) && cont (pos + 4) then 4
+                else 0
+            if width > 0 && peek (pos + 1 + width) = '\'' then CharLit, pos + 2 + width
+            else Operator, pos + 1
 
     let scanOperator (pos : int) : int =
         let mutable i = pos

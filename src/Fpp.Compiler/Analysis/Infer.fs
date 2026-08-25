@@ -650,6 +650,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "string.Contains" (m (TFun (tChar, tBool)))
     registerStringMembers ()
 
+    // ---- `ToString ()` on a primitive -------------------------------------
+    // Every .NET value has one, and F# code reaches for it beside `string x`.
+    // A primitive has no class to hang it on, so it is registered here and
+    // lowered to the SAME conversion `string x` is — which is what .NET's
+    // ToString answers for each of these.
+    let registerToString () =
+        for tn in [ "int"; "int32"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
+                    "byte"; "sbyte"; "nativeint"; "unativeint"
+                    "float"; "float32"; "bool"; "char"; "string" ] do
+            if (dictTryFind fields (tn + ".ToString")).IsNone then
+                registerField (tn + ".ToString")
+                    { TypeName = tn; Params = []; Quantified = []
+                      FieldType = TFun (tUnit, tString); DefKey = None; IsStatic = false
+                      Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
+    registerToString ()
+
     // ---- builtin members on `option` --------------------------------------
     // F# code says `d.IsSome`, so F++ has to mean it. These COULD be written
     // as ordinary members on the prelude's `Option` DU — that compiles — but
@@ -3441,6 +3457,52 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | _ -> false)
                          | _ -> false
                      if sizeofMark then tInt else
+                     // `nameof x` is the SOURCE NAME, decided here and never
+                     // evaluated — the argument is not typed, so `nameof` of
+                     // a member or a type does not need a value to exist. A
+                     // dotted argument is named by its LAST segment.
+                     let nameofMark =
+                         match head.NodeKind, args with
+                         | IdentExpr, [ onlyArg ] when
+                               (tokensOf head |> List.tryHead |> Option.map (fun t -> t.Text)) = Some "nameof"
+                               && (tokensOf head |> List.tryHead |> Option.map (fun t -> (dictTryFind useDefs t.Offset).IsNone)) = Some true ->
+                             // the name is the LAST segment, and TYPE
+                             // ARGUMENTS are not part of it: `typeof<int>`
+                             // and `List<int>` are named for the head, not
+                             // for the `int` inside. An operator has no Ident
+                             // token at all — `nameof (+)` is "+".
+                             let nameTokens =
+                                 let rec upto (ts : Token list) (acc : Token list) : Token list =
+                                     match ts with
+                                     | t :: _ when t.Text = "<" -> List.rev acc
+                                     | t :: more -> upto more (t :: acc)
+                                     | [] -> List.rev acc
+                                 upto (Green.tokens (GNode onlyArg)) []
+                             let named =
+                                 match nameTokens |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                                 | Some t -> Some t
+                                 | None ->
+                                     nameTokens
+                                     |> List.filter (fun t -> t.Kind = Operator && t.Text <> ".")
+                                     |> List.tryLast
+                             (match tokensOf head |> List.tryHead, named with
+                              | Some ht, Some nt ->
+                                  // a ``quoted`` identifier keeps its
+                                  // delimiters in the token text; the NAME
+                                  // is what is between them
+                                  let raw = nt.Text
+                                  let bare =
+                                      if strLen raw > 4 && charAt raw 0 = '`' && charAt raw 1 = '`' then
+                                          raw.Substring (2, strLen raw - 4)
+                                      else raw
+                                  vecAdd fieldOwnersRaw (ht.Offset, "$nameof:" + bare)
+                                  true
+                              | Some ht, None ->
+                                  vecAdd diags (ht.Offset, "nameof needs a name")
+                                  true
+                              | _ -> false)
+                         | _ -> false
+                     if nameofMark then tString else
                      // numeric conversions are primitives, not functions
                      let conversion =
                          match head.NodeKind, args with

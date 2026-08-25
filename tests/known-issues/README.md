@@ -65,6 +65,10 @@ of the same name) both pass as of the adaptive-port arc.
 - `string-of-structured.fpp` — `string` (and so `$"{x}"`) on a record,
   union, tuple or list answers "?". Needs a second rendering mode on Show:
   `%A` quotes nested strings and `string` does not.
+- `unresolved-name-in-statement.fpp` — an unresolved root (`System.String`
+  and friends) in STATEMENT position drops the whole statement with no
+  diagnostic; `--strict` reports it, the default build does not.
+
 `computed-builder-head` (a computed builder head `(f x) { ... }` and the
 single-line `let! x = e in body` form) is fixed and now lives in the
 `custombuilder` conformance suite.

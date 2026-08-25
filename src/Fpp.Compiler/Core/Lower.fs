@@ -1611,9 +1611,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some m when m.StartsWith "$sizeof:" -> Some m
                               | _ -> None)
                          | _ -> None
-                     match sizeofMark with
-                     | Some m -> EUnknown m
-                     | None ->
+                     let nameofMark =
+                         match Green.tokens (GNode head) |> List.tryHead with
+                         | Some ht when ht.Text = "nameof" ->
+                             (match dictTryFind fieldOwners ht.Offset with
+                              | Some m when m.StartsWith "$nameof:" ->
+                                  Some (m.Substring 8)
+                              | _ -> None)
+                         | _ -> None
+                     match sizeofMark, nameofMark with
+                     // LString carries the RAW literal, quotes included
+                     | _, Some nm ->
+                         ELit (LString ("\"" + nm.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""))
+                     | Some m, _ -> EUnknown m
+                     | None, None ->
                      let f = lowerExpr (GNode head)
                      // an EXISTENTIAL case constructed here: append the
                      // chosen instance's member fns as hidden payload slots
@@ -1744,6 +1755,49 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | None -> None)
                                   | _ -> None)
                              | None -> None
+                     // `x.ToString ()` on a PRIMITIVE: .NET answers exactly
+                     // what `string x` does, so it lowers to the same
+                     // conversion — including the prelude's exact float
+                     // printer, which the backend's own is not
+                     let primToString =
+                         if head.NodeKind <> DotExpr then None
+                         else
+                             match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                             | Some t when t.Text = "ToString" ->
+                                 (match dictTryFind memberSites t.Offset, nodesOf head |> List.tryHead with
+                                  | Some owner, Some recv ->
+                                      let k =
+                                          match owner with
+                                          | "float" -> "f"
+                                          | "float32" -> "s"
+                                          | "float16" -> "h"
+                                          | "int64" -> "l"
+                                          | "uint32" | "unativeint" -> "w"
+                                          | "uint64" -> "v"
+                                          | "nativeint" -> "p"
+                                          | "string" -> "t"
+                                          | "bool" -> "b"
+                                          | "char" -> "c"
+                                          | "int" | "int32" | "byte" | "sbyte" | "int16" | "uint16" -> "i"
+                                          | _ -> "?"
+                                      if k = "?" then None else Some (k, lowerExpr (GNode recv))
+                                  | _ -> None)
+                             | _ -> None
+                     match primToString with
+                     | Some (k, recv) ->
+                         let viaPrelude (nm : string) =
+                             match dictTryFind memberIndex nm with
+                             | Some d -> Some (EApp (EVar (varIdOf d, schemeOf d), [ recv ]))
+                             | None -> None
+                         let routed =
+                             if k = "s" then viaPrelude "FloatFmt.ToStrS"
+                             elif k = "f" then viaPrelude "FloatFmt.ToStr"
+                             else None
+                         (match routed with
+                          | Some e -> e
+                          // a string's ToString is the string itself
+                          | None -> if k = "t" then recv else EApp (EUnknown ("string#" + k), [ recv ]))
+                     | None ->
                      match stringBuiltin with
                      | Some (prim, recv) ->
                          // a 2-argument .NET call passes a TUPLE; flatten it
