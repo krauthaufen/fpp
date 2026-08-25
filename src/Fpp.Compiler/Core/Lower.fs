@@ -166,6 +166,24 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     let useDefs = dictNew<int, Resolve.Definition> ()
     for u in binder.Resolutions do dictSet useDefs u.UseOffset u.Def
+    /// definitions ASSIGNED anywhere in this file, by the definition they
+    /// resolve to (not by name, which shadowing reuses). A mutable captured by
+    /// an object expression has to share a CELL with the enclosing scope
+    /// however the write is spelled — the object expression may only READ it
+    /// and the `<-` happen after construction, and F# still shows the write
+    /// through. Keyed on the definition so an inner `let mutable x` cannot
+    /// make an outer `x` a cell.
+    let assignedDefs = dictNew<string * int, bool> ()
+    (let rec markAssigned (ts : Token list) =
+        match ts with
+        | a :: b :: rest ->
+            (if a.Kind = Ident && b.Kind = Operator && b.Text = "<-" then
+                match dictTryFind useDefs a.Offset with
+                | Some d -> dictSet assignedDefs (d.Path, d.Offset) true
+                | None -> ())
+            markAssigned (b :: rest)
+        | _ -> ()
+     markAssigned (Green.tokens (GNode root)))
     let defsAt = dictNew<int, Resolve.Definition> ()
     for d in binder.Definitions do dictSet defsAt d.Offset d
     /// type NAME -> the declaration's definition, for resolving an
@@ -3203,7 +3221,8 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                       && not (dictTryFind topLevelDefs d.Offset).IsSome
                                       && not (dictTryFind seen (d.Path, d.Offset)).IsSome ->
                             dictSet seen (d.Path, d.Offset) true
-                            if (dictTryFind assigned d.Name).IsSome then
+                            if (dictTryFind assigned d.Name).IsSome
+                               || (dictTryFind assignedDefs (d.Path, d.Offset)).IsSome then
                                 dictSet cellFields (d.Path, d.Offset) true
                             vecAdd captured (varIdOf d, schemeOf d)
                         | _ -> ()

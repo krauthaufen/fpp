@@ -34,6 +34,13 @@ class Integral<'a>
     when Num<'a>
     when Div<'a, 'a> = 'a
     when Rem<'a, 'a> = 'a
+/// A number that DIVIDES — every Integral and every Fractional one. A
+/// constraint cannot say "one or the other", and `pown` needs exactly this
+/// much: the squaring loop is Num, and a negative exponent divides.
+[<AutoOpen>]
+class Divisible<'a>
+    when Num<'a>
+    when Div<'a, 'a> = 'a
 /// F#'s `unmanaged` constraint: the type is BLITTABLE — no references, a
 /// fixed size, and a layout that matches C's. It is what the compiler
 /// already decides when it lays out a POD array or matches emscripten's
@@ -93,6 +100,7 @@ instance Num<int>
     static Zero = 0
     static One = 1
 instance Integral<int>
+instance Divisible<int>
 instance Ordered<int>
 instance Neg<int>
 instance Abs<int>
@@ -113,6 +121,7 @@ instance Num<int64>
     static Zero = 0L
     static One = 1L
 instance Integral<int64>
+instance Divisible<int64>
 instance Ordered<int64>
 instance Neg<int64>
 instance Abs<int64>
@@ -133,6 +142,7 @@ instance Num<uint32>
     static Zero = 0u
     static One = 1u
 instance Integral<uint32>
+instance Divisible<uint32>
 instance Ordered<uint32>
 instance MinMax<uint32>
     static min a b = if a < b then a else b
@@ -149,6 +159,7 @@ instance Num<float>
     static Zero = 0.0
     static One = 1.0
 instance Fractional<float>
+instance Divisible<float>
 instance Ordered<float>
 instance Neg<float>
 instance Abs<float>
@@ -170,6 +181,7 @@ instance Num<float32>
     static Zero = 0.0f
     static One = 1.0f
 instance Fractional<float32>
+instance Divisible<float32>
 instance Ordered<float32>
 instance Neg<float32>
 instance Abs<float32>
@@ -192,6 +204,7 @@ instance Num<uint64>
     static Zero = 0UL
     static One = 1UL
 instance Integral<uint64>
+instance Divisible<uint64>
 instance Ordered<uint64>
 instance MinMax<uint64>
     static min a b = if a < b then a else b
@@ -216,6 +229,7 @@ instance Num<nativeint>
     static Zero = nativeint 0
     static One = nativeint 1
 instance Integral<nativeint>
+instance Divisible<nativeint>
 instance Ordered<nativeint>
 instance Neg<nativeint>
 instance MinMax<nativeint>
@@ -238,6 +252,7 @@ instance Num<int16>
     static Zero = 0s
     static One = 1s
 instance Integral<int16>
+instance Divisible<int16>
 instance Ordered<int16>
 instance Neg<int16>
 instance Abs<int16>
@@ -259,6 +274,7 @@ instance Num<uint16>
     static Zero = 0us
     static One = 1us
 instance Integral<uint16>
+instance Divisible<uint16>
 instance Ordered<uint16>
 instance MinMax<uint16>
     static min a b = if a < b then a else b
@@ -280,6 +296,7 @@ instance Num<byte>
     static Zero = 0uy
     static One = 1uy
 instance Integral<byte>
+instance Divisible<byte>
 instance Unmanaged<int>
     static byteSize = 4
 instance Unmanaged<uint32>
@@ -328,6 +345,7 @@ instance Num<sbyte>
     static Zero = 0y
     static One = 1y
 instance Integral<sbyte>
+instance Divisible<sbyte>
 instance Neg<sbyte>
 instance Abs<sbyte>
 instance Ordered<sbyte>
@@ -765,6 +783,7 @@ instance Num<float16>
     static Zero = 0.0h
     static One = 1.0h
 instance Fractional<float16>
+instance Divisible<float16>
 instance Floating<float16>
     static exp x = float16 (exp (float32 x))
     static log x = float16 (log (float32 x))
@@ -958,16 +977,19 @@ let nan : float = 0.0 / 0.0
 /// F#'s float32 spellings of the same two
 let infinityf : float32 = 1.0f / 0.0f
 let nanf : float32 = 0.0f / 0.0f
-/// integer power, by squaring — F#'s pown
-let pown (x : float) (n : int) : float =
-    let mutable acc = 1.0
-    let mutable b = if n < 0 then 1.0 / x else x
+/// integer power, by squaring — F#'s pown, at ANY number: `pown 2 10` is the
+/// int 1024 and `pown 3L 4` the int64 81, not just the float cases. A NEGATIVE
+/// exponent divides in the type's own arithmetic, which is what F# does: `pown
+/// 2 -1` is 0 (integer division) where `pown 2.0 -2` is 0.25.
+let pown (x : 'a) (n : int) : 'a when Divisible<'a> =
+    let mutable acc = One
+    let mutable b = x
     let mutable k = if n < 0 then 0 - n else n
     while k > 0 do
         if k % 2 = 1 then acc <- acc * b
         b <- b * b
         k <- k / 2
-    acc
+    if n < 0 then One / acc else acc
 
 /// System.BitConverter's bit-level views, as F# spells them.
 module BitConverter =
