@@ -60,7 +60,5 @@ instance bodies still commit eagerly, see DESIGN.md rule 5),
 `print-class-polymorphic` (class-polymorphic print converted as int) and
 `user-type-shadows-prelude-type` (a user type merging with a prelude type
 of the same name) both pass as of the adaptive-port arc.
-- `operator-shadow-builtin.fpp` — a let-bound `(+)` does not shadow the
-  built-in operator (a custom operator shadows correctly).
 - `string-as-seq.fpp` — `Seq.*`/`List.ofSeq` over a string; `for c in s` and
   the String module work.

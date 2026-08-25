@@ -87,8 +87,14 @@ let shadowed =
 test "shadow-local" (shadowed = 12)
 test "shadow-does-not-escape" (3 +++ 4 = 7)
 
-// SHADOWING A BUILT-IN operator (`let (+) a b = a * b`) is NOT covered here:
-// F++ keeps the built-in, see tests/known-issues/operator-shadow-builtin.fpp
+// a BUILT-IN operator is shadowed the same way
+let shadowedBuiltin =
+    let (+) (a : int) (b : int) : int = a * b
+    3 + 4
+
+test "shadow-builtin" (shadowedBuiltin = 12)
+test "shadow-builtin-does-not-escape" (3 + 4 = 7)
+test "shadow-builtin-other-ops-unaffected" (3 * 4 = 12 && 7 - 2 = 5)
 
 // ---- operators on a TYPE --------------------------------------------------
 

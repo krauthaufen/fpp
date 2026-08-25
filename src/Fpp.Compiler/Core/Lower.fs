@@ -1906,9 +1906,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             | BinaryExpr when
                     (match tokensOf n with
                      | [ op ] ->
-                         ((dictTryFind useDefs op.Offset).IsSome
-                          || (dictTryFind memberSites op.Offset).IsSome)
-                         && (Fpp.Analysis.Classes.operatorClass op.Text).IsNone
+                         // A user's LET-BOUND operator shadows the built-in
+                         // one, as it does in F#. The built-ins are themselves
+                         // registered as DefLet (from the synthetic
+                         // `(builtin)` source) so that `1 +++ 2` and `1 + 2`
+                         // resolve alike — binding a use to one of THOSE would
+                         // call a definition with no body, which is why this
+                         // used to refuse every operator that has a class.
+                         // Judge the definition's ORIGIN instead.
+                         let userLet =
+                             match dictTryFind useDefs op.Offset with
+                             | Some d -> d.Path <> Fpp.Analysis.Classes.builtinPath
+                             | None -> false
+                         userLet
+                         || ((dictTryFind memberSites op.Offset).IsSome
+                             && (Fpp.Analysis.Classes.operatorClass op.Text).IsNone)
                      | _ -> false) ->
                 (match nodesOf n, tokensOf n with
                  | [ l; r ], [ op ] ->
@@ -2550,9 +2562,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          // gets. Without this the section fell through to
                          // EPrim, which has no primitive of that name: `(++) 1
                          // 2` answered 1 while `1 ++ 2` answered correctly.
+                         // A BUILT-IN keeps the primitive: it is registered as
+                         // a DefLet too, but has no body to call.
                          match dictTryFind useDefs op.Offset with
-                         | Some d -> EApp (memberFn op d, [ la; lb ])
-                         | None ->
+                         | Some d when d.Path <> Fpp.Analysis.Classes.builtinPath ->
+                             EApp (memberFn op d, [ la; lb ])
+                         | _ ->
                          match dictTryFind classUses op.Offset with
                          | Some im ->
                              let call = EApp (classRef im, [ la; lb ])
