@@ -4297,7 +4297,19 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // declared types and not the ones a construction site happens to
         // supply: a generic case's `'a` slot stays a uniform word everywhere.
         let casePayloadNodes (c : GreenNode) : GreenNode list =
-            match nodesOf c |> List.filter (fun x -> isTypeKind x.NodeKind) with
+            let tys = nodesOf c |> List.filter (fun x -> isTypeKind x.NodeKind)
+            // A GADT case writes its RESULT through an arrow — `Lit of int ->
+            // E<int>` — and the result is NOT a payload. Recording it gave the
+            // case a slot the constructor never fills, which kept every GADT
+            // off the inline layout (a float payload stayed a pointer to a box)
+            // and faulted outright the one time the layout was believed.
+            // `tokensOf` reads DIRECT children, so an arrow inside a
+            // parenthesised function-typed payload is not seen here.
+            let tys =
+                if List.length tys >= 2 && tokensOf c |> List.exists (fun t -> t.Text = "->")
+                then tys |> List.take (List.length tys - 1)
+                else tys
+            match tys with
             | [ one ] when one.NodeKind = TupleType ->
                 nodesOf one |> List.filter (fun x -> isTypeKind x.NodeKind)
             | many -> many
