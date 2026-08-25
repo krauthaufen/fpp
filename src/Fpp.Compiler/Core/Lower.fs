@@ -555,15 +555,21 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         let srcV = { Path = path; Offset = off + 19500000; Name = "_ssrcs" }
         let loV = { Path = path; Offset = off + 19600000; Name = "_slos" }
         let lo0 = match lo with Some e -> e | None -> ELit (LInt "0")
+        let lenV = { Path = path; Offset = off + 19800000; Name = "_slens" }
         let len =
             match hi with
             | Some h -> EPrim ("+", [ EPrim ("-", [ h; EVar (loV, ish) ]); ELit (LInt "1") ])
             // a string's length is the same node an array's is, under the
             // "$str" sentinel kind
             | None -> EPrim ("-", [ EArrayLen ("$str", EVar (srcV, anon)); EVar (loV, ish) ])
+        // a reversed range is the EMPTY string, as it is the empty array
         ELet (false, srcV, anon, src,
           ELet (false, loV, ish, lo0,
-            EApp (EUnknown "$str.Substring#2", [ EVar (srcV, anon); EVar (loV, ish); len ])))
+            ELet (false, lenV, ish, len,
+              EApp (EUnknown "$str.Substring#2",
+                    [ EVar (srcV, anon); EVar (loV, ish)
+                      EIf (EPrim ("<", [ EVar (lenV, ish); ELit (LInt "0") ]),
+                           ELit (LInt "0"), EVar (lenV, ish)) ]))))
 
     /// `a.[lo..hi]`, and the OPEN forms `a.[lo..]`, `a.[..hi]` and `a.[*]`,
     /// whose missing bound is the array's own edge (0 or Length - 1).
@@ -583,9 +589,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             match hi with
             | Some e -> e
             | None -> EPrim ("-", [ EArrayLen (kind, EVar (srcV, anon)); ELit (LInt "1") ])
+        // a REVERSED range is EMPTY, not negative: `a.[3..1]` is `[||]` in F#,
+        // and a negative count reached EArrayCreate as a huge unsigned length —
+        // an out-of-bounds fault rather than an empty slice.
+        let rawN = { Path = path; Offset = off + 19700000; Name = "_srawn" }
         ELet (false, srcV, anon, src,
           ELet (false, loV, ish, lo,
-            ELet (false, nV, ish, EPrim ("+", [ EPrim ("-", [ hi; EVar (loV, ish) ]); ELit (LInt "1") ]),
+            ELet (false, rawN, ish, EPrim ("+", [ EPrim ("-", [ hi; EVar (loV, ish) ]); ELit (LInt "1") ]),
+            ELet (false, nV, ish, EIf (EPrim ("<", [ EVar (rawN, ish); ELit (LInt "0") ]),
+                                       ELit (LInt "0"), EVar (rawN, ish)),
               ELet (false, dstV, anon, EArrayCreate (kind, EVar (nV, ish), EIndex (kind, EVar (srcV, anon), EVar (loV, ish))),
                 ELet (false, iV, ish, ELit (LInt "0"),
                   ESeq [ EWhile (EPrim ("<", [ EVar (iV, ish); EVar (nV, ish) ]),
@@ -593,7 +605,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                              EIndex (kind, EVar (srcV, anon),
                                                      EPrim ("+", [ EVar (loV, ish); EVar (iV, ish) ])))
                                   EAssign (iV, EPrim ("+", [ EVar (iV, ish); ELit (LInt "1") ])) ])
-                         EVar (dstV, anon) ])))))
+                         EVar (dstV, anon) ]))))))
 
     /// `dst.[lo..hi] <- src` — the same loop, the other way round.
     let sliceWrite (off : int) (kind : string) (dst : Expr) (lo : Expr) (hi : Expr) (src : Expr) : Expr =

@@ -62,3 +62,7 @@ instance bodies still commit eagerly, see DESIGN.md rule 5),
 of the same name) both pass as of the adaptive-port arc.
 - `string-as-seq.fpp` — `Seq.*`/`List.ofSeq` over a string; `for c in s` and
   the String module work.
+- `string-of-structured.fpp` — `string` (and so `$"{x}"`) on a record,
+  union, tuple or list answers "?"; `%A` renders them correctly.
+- `list-slicing.fpp` — `l.[1..2]` on a list traps; array and string slices
+  work.

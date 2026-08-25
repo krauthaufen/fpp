@@ -17,7 +17,7 @@ let private isSymbolic (c : char) =
     | '=' | '?' | '@' | '^' | '|' | '~' | ':' | '#' -> true
     | _ -> false
 
-let tokenize (src : string) : Token list =
+let rec tokenize (src : string) : Token list =
     let n = strLen src
     let peek (i : int) = if i < n then charAt src i else '\000'
     let text (a : int) (b : int) = substr src a (b - a)
@@ -205,7 +205,114 @@ let tokenize (src : string) : Token list =
             let tok = { Kind = kind; Text = text p e; Leading = leading; Trailing = trailing; Offset = p }
             loop p3 (tok :: acc)
 
-    loop 0 []
+    let toks = loop 0 []
+
+    // ---- interpolated strings ---------------------------------------------
+    //
+    // `$"a{e}b"` lexes as the operator `$` beside an ordinary string, so it is
+    // expanded HERE into tokens the parser already reads:
+    //
+    //     ( "a" + string ( e ) + "b" )
+    //
+    // The hole's own text is tokenised recursively and its tokens keep their
+    // REAL file offsets — every later pass keys tables by offset, so a hole's
+    // names resolve, and its operators get their kinds, exactly as if they had
+    // been written outside the string. `{{` and `}}` are literal braces.
+    //
+    // NOT supported: a .NET format specifier (`{x:N2}`) — the `:` would read as
+    // a type annotation — and `$$"""…"""`.
+    let expandInterp (ts : Token list) : Token list =
+        let syn (k : TokenKind) (txt : string) (off : int) : Token =
+            { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = off }
+        let synL (k : TokenKind) (txt : string) (off : int) (lead : Trivia list) : Token =
+            { Kind = k; Text = txt; Leading = lead; Trailing = []; Offset = off }
+        let synT (k : TokenKind) (txt : string) (off : int) (trail : Trivia list) : Token =
+            { Kind = k; Text = txt; Leading = []; Trailing = trail; Offset = off }
+        // split a literal BODY into pieces: each is (isLiteral, text, start in
+        // the body). Kept as three parallel vectors — the compiler's own
+        // sources stay inside the subset it can parse, and a tuple as a
+        // generic argument is not in it.
+        let pieceIsLit = vecNew<bool> ()
+        let pieceText = vecNew<string> ()
+        let pieceAt = vecNew<int> ()
+        let pieces (body : string) : unit =
+            vecClear pieceIsLit; vecClear pieceText; vecClear pieceAt
+            let bn = strLen body
+            let mutable lit = ""
+            let mutable litStart = 0
+            let mutable i = 0
+            while i < bn do
+                let c = charAt body i
+                if c = '{' && i + 1 < bn && charAt body (i + 1) = '{' then
+                    lit <- lit + "{"; i <- i + 2
+                elif c = '}' && i + 1 < bn && charAt body (i + 1) = '}' then
+                    lit <- lit + "}"; i <- i + 2
+                elif c = '{' then
+                    vecAdd pieceIsLit true; vecAdd pieceText lit; vecAdd pieceAt litStart
+                    lit <- ""
+                    // scan to the matching close brace, counting nesting so a
+                    // record inside the hole survives
+                    let mutable depth = 1
+                    let mutable j = i + 1
+                    let holeStart = j
+                    while j < bn && depth > 0 do
+                        let d = charAt body j
+                        if d = '{' then depth <- depth + 1
+                        elif d = '}' then depth <- depth - 1
+                        if depth > 0 then j <- j + 1
+                    vecAdd pieceIsLit false; vecAdd pieceText (substr body holeStart (j - holeStart)); vecAdd pieceAt holeStart
+                    i <- j + 1
+                    litStart <- i
+                else
+                    lit <- lit + string c; i <- i + 1
+            vecAdd pieceIsLit true; vecAdd pieceText lit; vecAdd pieceAt litStart
+        let rec go (ts : Token list) (acc : Token list) : Token list =
+            match ts with
+            | d :: str :: rest when d.Kind = Operator && d.Text = "$" && str.Kind = StringLit
+                                    && d.Offset + 1 = str.Offset && List.isEmpty d.Trailing
+                                    && strLen str.Text >= 2 && charAt str.Text 0 = '"' ->
+                let body = substr str.Text 1 (strLen str.Text - 2)
+                let bodyOff = str.Offset + 1
+                pieces body
+                let o = d.Offset
+                let out = vecNew<Token> ()
+                vecAdd out (synL LParen "(" o d.Leading)
+                let mutable first = true
+                for k in 0 .. vecLen pieceIsLit - 1 do
+                    let isLit = vecGet pieceIsLit k
+                    let txt = vecGet pieceText k
+                    let at = vecGet pieceAt k
+                    if isLit then
+                        if txt <> "" then
+                            if not first then vecAdd out (syn Operator "+" o)
+                            vecAdd out (syn StringLit ("\"" + txt + "\"") (bodyOff + at))
+                            first <- false
+                    else
+                        // every `+` may share the `$`'s offset (they are all
+                        // string concatenation, so one kind entry serves), but
+                        // each `string` needs its OWN: kinds are keyed by
+                        // offset, and sharing one with the `+` overwrote it —
+                        // the conversion then rendered nothing at all. The
+                        // hole's `{` is a position no real token occupies.
+                        if not first then vecAdd out (syn Operator "+" o)
+                        vecAdd out (syn Ident "string" (bodyOff + at - 1))
+                        vecAdd out (syn LParen "(" (bodyOff + at - 1))
+                        for ht in tokenizeAt (bodyOff + at) txt do
+                            if ht.Kind <> Eof then vecAdd out ht
+                        vecAdd out (syn RParen ")" (bodyOff + at + strLen txt))
+                        first <- false
+                if first then vecAdd out (syn StringLit "\"\"" bodyOff)
+                vecAdd out (synT RParen ")" (str.Offset + strLen str.Text - 1) str.Trailing)
+                go rest (List.rev (vecToList out) @ acc)
+            | t :: rest -> go rest (t :: acc)
+            | [] -> List.rev acc
+        go ts []
+    if (toks |> List.exists (fun t -> t.Kind = Operator && t.Text = "$")) then expandInterp toks else toks
+
+/// `tokenize`, with every offset shifted by `base0` — an interpolation hole
+/// is lexed on its own text but has to report the offsets it really occupies.
+and tokenizeAt (base0 : int) (src : string) : Token list =
+    tokenize src |> List.map (fun t -> { t with Offset = t.Offset + base0 })
 
 /// Inverse of tokenize — the lossless-ness witness.
 let render (tokens : Token list) : string =
