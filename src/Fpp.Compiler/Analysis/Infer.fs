@@ -5115,6 +5115,24 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           unifyAt t.Offset idxTy tInt
                       | None -> ())
                      e
+                 // a LIST is indexed and sliced too, and neither is an array
+                 // operation: `l.[1]` answered 0 and `l.[1..2]` faulted,
+                 // because both took the array path. The sentinel keeps the
+                 // receiver's shape, the way `$str` does for a string.
+                 | Some (TCon ("list", [ le ])) ->
+                     (if isSlice then
+                        match nodesOf n |> List.tryFind (fun m -> m.NodeKind = ListExpr)
+                              |> Option.bind (fun ix -> Green.tokens (GNode ix) |> List.tryHead) with
+                        | Some br ->
+                            vecAdd arrKindsRaw (br.Offset, TCon ("$list", [ le ]))
+                            vecAdd fieldOwnersRaw (br.Offset, "$slice")
+                        | None -> ())
+                     (match Green.tokens (GNode n) |> List.tryHead with
+                      | Some t ->
+                          vecAdd arrKindsRaw (t.Offset, TCon ("$list", [ le ]))
+                          unifyAt t.Offset idxTy tInt
+                      | None -> ())
+                     if isSlice then TCon ("list", [ le ]) else le
                  | Some (TCon ("string", [])) when isSlice ->
                      // `s.[lo..hi]` is a SUBSTRING, not a character: the same
                      // range sugar an array takes

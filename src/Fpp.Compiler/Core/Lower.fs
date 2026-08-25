@@ -3136,8 +3136,41 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> false
                      let starOnly =
                          (ixToks |> List.filter (fun t -> t.Kind = Operator) |> List.map (fun t -> t.Text)) = [ "*" ]
+                     // a LIST indexes and slices through the prelude's own
+                     // walk: it has no packed elements to address, and the
+                     // array path answered 0 for `l.[1]` and faulted on
+                     // `l.[1..2]`
+                     // the sentinel carries the ELEMENT type (`$list$<int>`),
+                     // which the generic helper has to be instantiated at —
+                     // the same shape RangeOps.Seq is called with
+                     let isList = nm = "$list" || nm.StartsWith "$list$<"
+                     let listElem =
+                         if nm.Contains "$<" then
+                             let i = nm.IndexOf "$<"
+                             nm.Substring (i + 2, strLen nm - i - 3)
+                         else "?"
+                     let preludeFn (nm2 : string) : Expr option =
+                         match dictTryFind memberIndex nm2 with
+                         | Some d -> Some (EVarI (varIdOf d, schemeOf d, [ listElem ]))
+                         | None -> None
+                     let listSlice (lo : Expr option) (hi : Expr option) : Expr =
+                         let srcV = { Path = path; Offset = offsetOf n + 19900000; Name = "_lsrc" }
+                         let anon = mono (TCon ("?", []))
+                         let src = EVar (srcV, anon)
+                         let loE = match lo with Some e -> e | None -> ELit (LInt "0")
+                         let hiE =
+                             match hi with
+                             | Some e -> e
+                             | None ->
+                                 match preludeFn "ListOps.Count" with
+                                 | Some f -> EPrim ("-", [ EApp (f, [ src ]); ELit (LInt "1") ])
+                                 | None -> ELit (LInt "0")
+                         match preludeFn "ListOps.Slice" with
+                         | Some f -> ELet (false, srcV, anon, lowerExpr (GNode lhs), EApp (f, [ ETuple [ loE; hiE; src ] ]))
+                         | None -> note (offsetOf n) "list slice"
                      let slice (lo : Expr option) (hi : Expr option) =
                          if nm = "$str" then strSliceRead (offsetOf n) (lowerExpr (GNode lhs)) lo hi
+                         elif isList then listSlice lo hi
                          else sliceRead (offsetOf n) nm (lowerExpr (GNode lhs)) lo hi
                      (match indexer, idx with
                       | _, [ EPrim (rop, [ lo; hi ]) ] when isSlice && (rangeElem rop).IsSome ->
@@ -3148,6 +3181,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | _, [ EPrim (rop, [ lo ]) ] when isSlice && (rangeElem rop).IsSome ->
                           slice (Some lo) None
                       | Some fn, [ i ] -> EApp (fn, [ lowerExpr (GNode lhs); i ])
+                      | _, [ i ] when isList ->
+                          (match preludeFn "ListOps.Item" with
+                           | Some f -> EApp (f, [ ETuple [ i; lowerExpr (GNode lhs) ] ])
+                           | None -> note (offsetOf n) "list index")
                       | _, [ i ] -> EIndex (nm, lowerExpr (GNode lhs), i)
                       | _ -> note (offsetOf n) "index shape")
                  | _ -> note (offsetOf n) "index shape")

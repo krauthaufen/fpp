@@ -2412,6 +2412,7 @@ module Array =
 type ArrayOps =
     static member OfList (xs : list<'a>) : 'a[] = Array.ofList xs
 
+
 /// The printf family's radix and padding renderers. Lowering expands
 /// `%x`/`%X`/`%o` and width flags to calls here, so every backend prints
 /// the same bytes from ONE implementation (each backend had its own — or
@@ -2900,6 +2901,25 @@ module List =
                 cur <- next
             | None -> go <- false
         rev acc
+    /// `l.[lo..hi]` — the elements at indices lo through hi INCLUSIVE, empty
+    /// when the range is reversed or falls outside. Not an F# surface
+    /// function: the slice sugar lowers to it, the way a string slice lowers
+    /// to Substring.
+    let sliceRange (lo : int) (hi : int) (xs : 'a list) : 'a list =
+        let n = length xs
+        let lo2 = if lo < 0 then 0 else lo
+        let hi2 = if hi > n - 1 then n - 1 else hi
+        if hi2 < lo2 then []
+        else
+            let mutable out = []
+            let mutable rest = xs
+            let mutable i = 0
+            while i <= hi2 do
+                if i >= lo2 then out <- head rest :: out
+                rest <- tail rest
+                i <- i + 1
+            rev out
+
     let skip (n : int) (xs : 'a list) : 'a list =
         let mutable rest = xs
         let mutable i = 0
@@ -3175,6 +3195,14 @@ module List =
 // String sits AFTER Array and List: toArray/toList/mapi are written in
 // terms of Array.init, Array.length and List.init, and a module only sees
 // what precedes it.
+/// The list index and slice sugar. Lowering can reach a CLASS member by name
+/// but not a module function, so `l.[i]` and `l.[lo..hi]` expand to these —
+/// the same arrangement ArrayOps has for `Array.ofList`.
+type ListOps =
+    static member Item (i : int, xs : list<'a>) : 'a = List.item i xs
+    static member Slice (lo : int, hi : int, xs : list<'a>) : list<'a> = List.sliceRange lo hi xs
+    static member Count (xs : list<'a>) : int = List.length xs
+
 module String =
     extern let pin : string -> nativeint
     extern let unpin : string -> int

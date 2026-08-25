@@ -7,8 +7,7 @@
 // range is empty rather than an error, a full slice is a COPY (writing the
 // slice must not reach the source), and a one-element range is not empty.
 //
-// DROPPED: list slicing (`l.[1..2]`), which is not supported — see
-// tests/known-issues/list-slicing.fpp — and 2D array slices.
+// DROPPED: 2D array slices.
 module Core_slicing
 
 let mutable ntests = 0
@@ -96,5 +95,23 @@ let lo = 1
 let hi = 3
 test "computed-bounds" (Array.toList a.[lo..hi] = [ 2; 3; 4 ])
 test "computed-bounds-expression" (Array.toList a.[lo + 1 .. hi] = [ 3; 4 ])
+
+// ---- lists index and slice too ----------------------------------------------
+
+let l = [ 10; 20; 30; 40 ]
+
+test "list-index" (l.[1] = 20)
+test "list-index-first" (l.[0] = 10)
+test "list-index-last" (l.[3] = 40)
+test "list-closed-range" (l.[1..2] = [ 20; 30 ])
+test "list-open-upper" (l.[2..] = [ 30; 40 ])
+test "list-open-lower" (l.[..1] = [ 10; 20 ])
+test "list-whole" (l.[0..3] = l)
+test "list-single" (l.[2..2] = [ 30 ])
+test "list-reversed-is-empty" (l.[3..1] = [])
+test "list-slice-length" (List.length l.[1..2] = 2)
+test "list-slice-sum" (List.sum l.[1..2] = 50)
+test "list-slice-of-expression" ((List.map (fun v -> v * 2) l).[0..1] = [ 20; 40 ])
+test "list-slice-in-function" (List.sum (l.[1..] |> List.filter (fun v -> v > 20)) = 70)
 
 printfn "DONE tests=%d failures=%d" ntests failures

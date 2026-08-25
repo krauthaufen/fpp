@@ -64,5 +64,3 @@ of the same name) both pass as of the adaptive-port arc.
   the String module work.
 - `string-of-structured.fpp` — `string` (and so `$"{x}"`) on a record,
   union, tuple or list answers "?"; `%A` renders them correctly.
-- `list-slicing.fpp` — `l.[1..2]` on a list traps; array and string slices
-  work.
