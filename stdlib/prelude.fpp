@@ -41,6 +41,11 @@ class Integral<'a>
 class Divisible<'a>
     when Num<'a>
     when Div<'a, 'a> = 'a
+/// A number an INT converts into: what `DivideByInt` needs to divide a sum by
+/// a count without knowing the element type.
+[<AutoOpen>]
+class OfInt<'a>
+    static OfInt : int -> 'a
 /// F#'s `unmanaged` constraint: the type is BLITTABLE — no references, a
 /// fixed size, and a layout that matches C's. It is what the compiler
 /// already decides when it lays out a POD array or matches emscripten's
@@ -101,6 +106,8 @@ instance Num<int>
     static One = 1
 instance Integral<int>
 instance Divisible<int>
+instance OfInt<int>
+    static OfInt n = n
 instance Ordered<int>
 instance Neg<int>
 instance Abs<int>
@@ -122,6 +129,8 @@ instance Num<int64>
     static One = 1L
 instance Integral<int64>
 instance Divisible<int64>
+instance OfInt<int64>
+    static OfInt n = int64 n
 instance Ordered<int64>
 instance Neg<int64>
 instance Abs<int64>
@@ -143,6 +152,8 @@ instance Num<uint32>
     static One = 1u
 instance Integral<uint32>
 instance Divisible<uint32>
+instance OfInt<uint32>
+    static OfInt n = uint32 n
 instance Ordered<uint32>
 instance MinMax<uint32>
     static min a b = if a < b then a else b
@@ -160,6 +171,8 @@ instance Num<float>
     static One = 1.0
 instance Fractional<float>
 instance Divisible<float>
+instance OfInt<float>
+    static OfInt n = float n
 instance Ordered<float>
 instance Neg<float>
 instance Abs<float>
@@ -182,6 +195,8 @@ instance Num<float32>
     static One = 1.0f
 instance Fractional<float32>
 instance Divisible<float32>
+instance OfInt<float32>
+    static OfInt n = float32 n
 instance Ordered<float32>
 instance Neg<float32>
 instance Abs<float32>
@@ -205,6 +220,8 @@ instance Num<uint64>
     static One = 1UL
 instance Integral<uint64>
 instance Divisible<uint64>
+instance OfInt<uint64>
+    static OfInt n = uint64 n
 instance Ordered<uint64>
 instance MinMax<uint64>
     static min a b = if a < b then a else b
@@ -230,6 +247,8 @@ instance Num<nativeint>
     static One = nativeint 1
 instance Integral<nativeint>
 instance Divisible<nativeint>
+instance OfInt<nativeint>
+    static OfInt n = nativeint n
 instance Ordered<nativeint>
 instance Neg<nativeint>
 instance MinMax<nativeint>
@@ -253,6 +272,8 @@ instance Num<int16>
     static One = 1s
 instance Integral<int16>
 instance Divisible<int16>
+instance OfInt<int16>
+    static OfInt n = int16 n
 instance Ordered<int16>
 instance Neg<int16>
 instance Abs<int16>
@@ -275,6 +296,8 @@ instance Num<uint16>
     static One = 1us
 instance Integral<uint16>
 instance Divisible<uint16>
+instance OfInt<uint16>
+    static OfInt n = uint16 n
 instance Ordered<uint16>
 instance MinMax<uint16>
     static min a b = if a < b then a else b
@@ -297,6 +320,8 @@ instance Num<byte>
     static One = 1uy
 instance Integral<byte>
 instance Divisible<byte>
+instance OfInt<byte>
+    static OfInt n = byte n
 instance Unmanaged<int>
     static byteSize = 4
 instance Unmanaged<uint32>
@@ -346,6 +371,8 @@ instance Num<sbyte>
     static One = 1y
 instance Integral<sbyte>
 instance Divisible<sbyte>
+instance OfInt<sbyte>
+    static OfInt n = sbyte n
 instance Neg<sbyte>
 instance Abs<sbyte>
 instance Ordered<sbyte>
@@ -784,6 +811,8 @@ instance Num<float16>
     static One = 1.0h
 instance Fractional<float16>
 instance Divisible<float16>
+instance OfInt<float16>
+    static OfInt n = float16 n
 instance Floating<float16>
     static exp x = float16 (exp (float32 x))
     static log x = float16 (log (float32 x))
@@ -990,6 +1019,13 @@ let pown (x : 'a) (n : int) : 'a when Divisible<'a> =
         b <- b * b
         k <- k / 2
     if n < 0 then One / acc else acc
+
+/// F#'s LanguagePrimitives, the operations the compiler's inline numeric
+/// generics reach for. `DivideByInt` is what `average` divides a sum by: a
+/// count is an int whatever the elements are.
+module LanguagePrimitives =
+    let DivideByInt (x : 'a) (n : int) : 'a when Divisible<'a> when OfInt<'a> =
+        x / OfInt n
 
 /// System.BitConverter's bit-level views, as F# spells them.
 module BitConverter =
