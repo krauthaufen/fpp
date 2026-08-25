@@ -2545,6 +2545,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                  | Some t when t <> "" && t <> "int" && t <> "char" && t <> "bool" -> "@" + t
                                  | _ -> ""
                      let body =
+                         // a USER-DEFINED operator is an ordinary binding, and
+                         // `(++)` names it — the same resolution an infix use
+                         // gets. Without this the section fell through to
+                         // EPrim, which has no primitive of that name: `(++) 1
+                         // 2` answered 1 while `1 ++ 2` answered correctly.
+                         match dictTryFind useDefs op.Offset with
+                         | Some d -> EApp (memberFn op d, [ la; lb ])
+                         | None ->
                          match dictTryFind classUses op.Offset with
                          | Some im ->
                              let call = EApp (classRef im, [ la; lb ])

@@ -583,6 +583,24 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 let mutable e = env
                 for c in n.Children do e <- walkExpr e c
                 env
+            | ParenExpr when
+                    (n.Children |> List.forall (fun c -> match c with GToken _ -> true | _ -> false)) ->
+                // `(+++)` as a VALUE — the operator section. It resolves to the
+                // same binding an infix `a +++ b` does; without recording the
+                // use, Lower had nothing to call and fell through to a
+                // PRIMITIVE of that name, which does not exist: `(+++) 1 2`
+                // answered its first argument while `1 +++ 2` was right.
+                (match n.Children
+                       |> List.choose (fun c ->
+                            match c with
+                            | GToken t when t.Kind = Operator && t.Text <> ":" -> Some t
+                            | _ -> None) with
+                 | [ op ] ->
+                     (match Map.tryFind ("(" + op.Text + ")") env with
+                      | Some d when d.Kind = DefLet -> tryRecordAs env ("(" + op.Text + ")") op
+                      | _ -> ())
+                 | _ -> ())
+                env
             | ObjExpr ->
                 // an anonymous class: its members are keyed by a synthetic
                 // name derived from the expression's position

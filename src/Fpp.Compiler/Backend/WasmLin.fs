@@ -930,6 +930,7 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$str_starts" "$lt_ii2i"
     declFn m "$str_ends" "$lt_ii2i"
     declFn m "$str_find" "$lt_iii2i"
+    declFn m "$str_last_find" "$lt_ii2i"
     declFn m "$strsub" "$lt_iii2i"
     declFn m "$str_trim" "$lt_i2i"
     declFn m "$str_replace" "$lt_iii2i"
@@ -2294,6 +2295,37 @@ let private emitStrFind (m : Mod) : unit =
     ic f -1
     endFn f
 
+// $str_last_find(s, p): the index where p LAST occurs in s, -1 when it does
+// not. The same match loop as $str_find, walked from the end — `"hello"
+// .LastIndexOf "l"` is 3 where IndexOf is 2. An empty needle answers the
+// string's length, which is where .NET puts it.
+let private emitStrLastFind (m : Mod) : unit =
+    let f = beginFn m [ "$s"; "$p" ]
+    local f "$pl" "i32"; local f "$sl" "i32"; local f "$j" "i32"; local f "$k" "i32"; local f "$mm" "i32"
+    localsDone f
+    lg f "$p"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$pl"
+    lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$sl"
+    lg f "$pl"; ins f "i32.eqz"
+    ifE f; lg f "$sl"; ins f "return"; endB f
+    // start at the last position the needle can still fit
+    lg f "$sl"; lg f "$pl"; ins f "i32.sub"; ls f "$j"
+    blockE f "$jc"; loopE f "$jl"
+    lg f "$j"; ic f 0; ins f "i32.lt_s"; brIf f "$jc"
+    ic f 1; ls f "$mm"; ic f 0; ls f "$k"
+    blockE f "$kc"; loopE f "$kl"
+    lg f "$k"; lg f "$pl"; ins f "i32.ge_s"; brIf f "$kc"
+    lg f "$s"; ic f 8; ins f "i32.add"; lg f "$j"; lg f "$k"; ins f "i32.add"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    lg f "$p"; ic f 8; ins f "i32.add"; lg f "$k"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
+    ins f "i32.ne"
+    ifE f; ic f 0; ls f "$mm"; br f "$kc"; endB f
+    lg f "$k"; ic f 1; ins f "i32.add"; ls f "$k"
+    br f "$kl"; endB f; endB f
+    lg f "$mm"; ifE f; lg f "$j"; ins f "return"; endB f
+    lg f "$j"; ic f -1; ins f "i32.add"; ls f "$j"
+    br f "$jl"; endB f; endB f
+    ic f -1
+    endFn f
+
 // $strsub(s, start, len): a fresh string of s' units [start, start+len)
 let private emitStrsub (m : Mod) : unit =
     let f = beginFn m [ "$s"; "$start"; "$len" ]
@@ -2519,7 +2551,13 @@ let private emitStrChars (m : Mod) : unit =
     localsDone f
     lg f "$s"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$len"
     let unpin = strGuard f [ "$s" ]
-    if gc then (ic f gcArrTid; lg f "$len"; callf f "$fpallocn"; ls f "$r")
+    // a `char[]` holds RAW chars — `char` is a raw scalar everywhere else, and
+    // a char-array literal stores it untagged. Allocating the REF-array tid and
+    // TAGGING each unit (as this did) made `"abc".ToCharArray()` read back
+    // 195, 197, 199: the reader does not untag, because nothing else tags.
+    // The scalar tid also keeps the collector off the elements, which is why
+    // the tag was there in the first place.
+    if gc then (ic f gcIntTid; lg f "$len"; callf f "$fpallocn"; ls f "$r")
     else
         ic f 8; lg f "$len"; ic f 2; ins f "i32.shl"; ins f "i32.add"; callf f "$lalloc"; ls f "$r"
         lg f "$r"; ic f CID_ARRAY; mem f "i32.store"
@@ -2530,7 +2568,6 @@ let private emitStrChars (m : Mod) : unit =
     lg f "$i"; lg f "$len"; ins f "i32.ge_s"; brIf f "$d"
     lg f "$r"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 2; ins f "i32.shl"; ins f "i32.add"
     lg f "$s"; ic f 8; ins f "i32.add"; lg f "$i"; ic f 1; ins f "i32.shl"; ins f "i32.add"; mem f "i32.load16_u"
-    ic f 1; ins f "i32.shl"; ic f 1; ins f "i32.or"     // tag the char
     mem f "i32.store"
     lg f "$i"; ic f 1; ins f "i32.add"; ls f "$i"
     br f "$go"; endB f; endB f
@@ -6826,6 +6863,8 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         (lowCallR ctx "$str_find" [ s; p; from ])
     | EApp (EUnknown "$str.LastIndexOf", [ s; c ]) ->
         (LCall ("$str_last_find_char", [ coreToLowE ctx s; (coreToLowE ctx c) ]))
+    | EApp (EUnknown "$str.LastIndexOf#2", [ s; p ]) ->
+        (lowCallR ctx "$str_last_find" [ s; p ])
     | EApp (EUnknown "$str.Split", [ s; c ]) ->
         // returns a heap string array (an even pointer), not a tagged value
         LCall ("$str_split_char", [ coreToLowE ctx s; (coreToLowE ctx c) ])
@@ -11070,7 +11109,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     // runtime bodies
     if gc then (emitSpush m; emitSpop m)
     emitLalloc m; emitStrOfInt m; emitStrOfChar m; emitStrCat m; emitPrints m; emitEprints m; emitPrintRaw m; emitFtoa6 m; emitStreq m
-    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
+    emitStrStarts m; emitStrEnds m; emitStrFind m; emitStrLastFind m; emitStrsub m; emitStrTrim m; emitStrReplace m; emitStrFindChar m; emitStrLastFindChar m; emitStrSplitChar m
     emitStrCase m false; emitStrCase m true; emitStrChars m; emitStrPad m; emitStrTrimChars m true; emitStrTrimChars m false; emitStrInsert m; emitStrRemove2 m
     emitStrCmp m; emitCmpv m; emitEqv m; emitHashv m; emitLappend m; emitListIter m; emitAtoi m; emitAtol m; emitReadFile m; emitFexists m
     emitMemsize m; emitMemcopy m; emitFtoaS m; emitLtoa m true; emitLtoa m false
