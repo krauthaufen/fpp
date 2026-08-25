@@ -1289,7 +1289,7 @@ The last two defects:
   StringBuilder/concat) — the driver now prints 64K slices.
 
 Housekeeping: the fpprt reactor is a REPO artifact now
-(tests/tooling/gc/fpprt_reactor.wasm, built from ~/projects/fpp/runtime
+(tests/tooling/gc/fpprt_reactor.wasm, built from this repo's runtime/ (tests/tooling/gc/build-reactor.sh)
 @46e037d by tests/tooling/gc/build-reactor.sh; FPPRT_REACTOR overrides);
 the driver's debug catch/W-dump removed.
 

@@ -42,6 +42,9 @@ enum fpprt_type_kind {
   FPPRT_KIND_REF_ARRAY = 1,    /* [tag][len][ref x len]                  */
   FPPRT_KIND_SCALAR_ARRAY = 2, /* [tag][len][elem x len], size = elem sz */
   FPPRT_KIND_EPHEMERON = 3,    /* internal: gc_ephemeron payload         */
+  FPPRT_KIND_TAGGED = 5,       /* wasm-linear uniform model: scan body words
+                                  from `nrefs` (first-payload index), follow
+                                  the even (pointer) ones; no refoffs map    */
   FPPRT_KIND_POD_ARRAY = 4     /* flat struct elems WITH ref fields:
                                   size = elem bytes, refoffs = per-elem
                                   ELEM-RELATIVE ref offsets              */
@@ -162,6 +165,19 @@ void fpprt_add_static_roots(fpprt_ref *base, size_t n);
  * address-keyed buckets rehash after every collection. */
 uintptr_t fpprt_idhash(fpprt_ref o);
 
+/* ---- deterministic cleanup (watch table) ------------------------------- */
+
+/* Watch `o`: when a collection proves it dead, `tag` is queued under `kind`.
+ * The collector only RECORDS deaths (in the world-stopped restart window,
+ * exactly when the idhash rehashes); cleanup runs in the mutator when a
+ * drain is called — synchronously, in registration order, forceable via
+ * fpprt_collect. Kinds keep consumers apart: 0 = JS handle ids the host
+ * glue releases, 1 = F++ cleanup-closure slots the module invokes. A watch
+ * holds nothing alive: the edge to `o` is an ephemeron key. */
+void fpprt_watch(fpprt_ref o, uint32_t tag, uint32_t kind);
+/* Pop one queued dead tag of `kind`; 0 when the queue is empty (0 is not a
+ * valid tag for either kind: handle 0 is null, slot 0 is the heap base). */
+uint32_t fpprt_drain1(uint32_t kind);
 /* ---- pinning ----------------------------------------------------------- */
 
 /* Object will not move for the rest of its life (mmc collectors; on the

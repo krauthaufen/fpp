@@ -80,9 +80,12 @@ static void idh_rebuild_(struct gc_ephemeron **old, size_t nold,
   idh_publish_roots_();
 }
 
+static void watch_scan_(void);
+
 static void idh_on_restarting_mutators_(void *data) {
   if (idh_count_)
     idh_rebuild_(idh_buckets_, idh_nbuckets_, idh_nbuckets_);
+  watch_scan_();
 }
 
 static int gc_log_ = -1;
@@ -178,8 +181,28 @@ const char *fpprt_type_name(uint32_t tid) {
 void fpprt_init(const struct fpprt_opts *opts) {
   size_t heap_bytes = (opts && opts->heap_bytes) ? opts->heap_bytes
                                                  : 16 * 1024 * 1024;
+  { const char *h=getenv("FPPRT_HEAP_MB"); if(h) heap_bytes=(size_t)atoi(h)*1024*1024; }
   struct gc_options *o = gc_allocate_options();
-  gc_options_set_int(o, GC_OPTION_HEAP_SIZE_POLICY, GC_HEAP_SIZE_GROWABLE);
+  { const char *fx=getenv("FPPRT_HEAP_FIXED");
+    const char *pol=getenv("FPPRT_HEAP_POLICY");
+    int policy = fx ? GC_HEAP_SIZE_FIXED : GC_HEAP_SIZE_GROWABLE;
+    if (pol && !strcmp(pol,"adaptive")) policy = GC_HEAP_SIZE_ADAPTIVE;
+    else if (pol && !strcmp(pol,"growable")) policy = GC_HEAP_SIZE_GROWABLE;
+    else if (pol && !strcmp(pol,"fixed")) policy = GC_HEAP_SIZE_FIXED;
+    gc_options_set_int(o, GC_OPTION_HEAP_SIZE_POLICY, policy); }
+  /* The growable sizer targets live + sqrt(live)*sqrt(threshold/2), so the
+     threshold sets how much headroom a program gets above its LIVE data. The
+     Whippet default of 60 MB gives an 11 MB-live program a ~30 MB heap, and a
+     program allocating hundreds of MB of short-lived garbage then collects
+     ~50 times, tracing the live set each time: on the avl benchmark that was
+     26% of all cycles, and raising it here cut the run from 4.3 s to 3.0 s.
+     Costs nothing in RSS for a small program — the target scales with live
+     data, and a hello-world's heap is unchanged. */
+  { const char *t=getenv("FPPRT_HEAP_THRESHOLD_MB");
+    gc_options_set_size(o, GC_OPTION_HEAP_DOUBLE_THRESHOLD,
+                        (size_t)(t ? atoi(t) : 1024)*1024*1024); }
+  { const char *x=getenv("FPPRT_HEAP_EXPANSIVENESS");
+    if (x) gc_options_set_double(o, GC_OPTION_HEAP_EXPANSIVENESS, atof(x)); }
   gc_options_set_size(o, GC_OPTION_HEAP_SIZE, heap_bytes);
   if (opts && opts->max_heap_bytes)
     gc_options_set_size(o, GC_OPTION_MAXIMUM_HEAP_SIZE, opts->max_heap_bytes);
@@ -231,7 +254,56 @@ fpprt_ref fpprt_alloc_array(uint32_t tid, size_t len) {
   return (fpprt_ref)obj;
 }
 
+/* ---- inline allocation ---------------------------------------------------
+ * The mutator emits the bump-pointer fast path itself rather than calling in
+ * for every object: load hp, add the (compile-time) size, compare against the
+ * limit, write the alloc-table byte and the header. These expose WHERE hp and
+ * limit live.
+ *
+ * When the collector's parameters are not the ones the mutator bakes in
+ * (granule 16, 4 MB alloc-table alignment, patterns 1/32, hp/limit at +0/+4),
+ * the addresses point at a pair of words holding hp = 0x7ffffff0, limit = 0
+ * instead: `hp + size > limit` is then always true and every allocation takes
+ * the ordinary call. No flag for the mutator to test, and no way to run the
+ * fast path against a collector it does not match. */
+static uintptr_t fpprt_no_inline_[2] = { (uintptr_t)0x7ffffff0u, 0 };
+
+static int fpprt_inline_ok_(void) {
+  return gc_inline_allocator_kind(GC_ALLOCATION_TAGGED) == GC_INLINE_ALLOCATOR_BUMP_POINTER
+      && gc_allocator_small_granule_size() == 16
+      && gc_allocator_large_threshold() >= 8192
+      && gc_allocator_alloc_table_alignment() == (4u << 20)
+      && gc_allocator_alloc_table_begin_pattern(GC_ALLOCATION_TAGGED) == 1
+      && gc_allocator_alloc_table_end_pattern() == 32
+      && gc_allocator_allocation_pointer_offset() == 0
+      && gc_allocator_allocation_limit_offset() == sizeof(uintptr_t)
+      && sizeof(uintptr_t) == 4;
+}
+
+uint32_t fpprt_inline_hp_addr(void) {
+  if (!fpprt_inline_ok_()) return (uint32_t)(uintptr_t)&fpprt_no_inline_[0];
+  return (uint32_t)((uintptr_t)mut_ + gc_allocator_allocation_pointer_offset());
+}
+
+uint32_t fpprt_inline_limit_addr(void) {
+  if (!fpprt_inline_ok_()) return (uint32_t)(uintptr_t)&fpprt_no_inline_[1];
+  return (uint32_t)((uintptr_t)mut_ + gc_allocator_allocation_limit_offset());
+}
+
 /* ---- writes ------------------------------------------------------------ */
+
+/* DEBUG (FPP_CONSCHECK builds): is `p` a plausible live value right now —
+ * null, a tagged scalar, or a pointer inside the CURRENT allocation space?
+ * A pointer left stale by a collection fails this the moment it is used.
+ * The probe exists only in semi.c — WEAK, so pcc/mmc still link (the check
+ * degrades to "always live" there). */
+extern int gc_dbg_live(struct gc_heap *heap, struct gc_ref ref)
+    __attribute__((weak));
+int fpprt_dbg_live(uint32_t p) {
+  if (!p || (p & 1)) return 1;
+  if (!gc_dbg_live) return 1;
+  return gc_dbg_live(heap_, gc_ref((uintptr_t)p));
+}
 
 void fpprt_write_ref(fpprt_ref o, uint32_t byteoff, fpprt_ref v) {
   fpprt_ref *loc = (fpprt_ref *)((char *)o + byteoff);
@@ -280,6 +352,99 @@ fpprt_ref fpprt_eph_key(fpprt_ref e) {
 fpprt_ref fpprt_eph_value(fpprt_ref e) {
   return (fpprt_ref)gc_ref_value(
       gc_ephemeron_value((struct gc_ephemeron *)e));
+}
+
+/* ---- deterministic cleanup (watch table) --------------------------------
+ * Entries pair a weak edge to the watched object (an ephemeron with
+ * key = value = obj, the fpprt_weak_new shape) with a (tag, kind). The
+ * ephemeron POINTERS live in calloc'd chunks registered as static root
+ * ranges — strongly rooting the ephemeron objects themselves (their keys
+ * stay weak), and letting the collector update the slots when they move.
+ * The death scan runs in the restarting-mutators window beside the idhash
+ * rehash: world stopped, survivors at final addresses, dead keys read 0.
+ * It only QUEUES tags; cleanup runs when the mutator (or the host glue)
+ * drains — so no user code ever runs inside a collection. */
+
+#define FPPRT_WATCH_CHUNK 512
+#define FPPRT_WATCH_KINDS 2
+
+static fpprt_ref *watch_chunks_[1024];
+static size_t watch_nchunks_ = 0;
+static struct { uint32_t tag, kind; } *watch_meta_ = NULL;
+static size_t watch_n_ = 0, watch_cap_ = 0;
+static pthread_mutex_t watch_lock_ = PTHREAD_MUTEX_INITIALIZER;
+
+static struct { uint32_t *tags; size_t n, cap, drained; } deadq_[FPPRT_WATCH_KINDS];
+
+static fpprt_ref *watch_slot_(size_t i) {
+  return &watch_chunks_[i / FPPRT_WATCH_CHUNK][i % FPPRT_WATCH_CHUNK];
+}
+
+void fpprt_watch(fpprt_ref o, uint32_t tag, uint32_t kind) {
+  if (kind >= FPPRT_WATCH_KINDS) abort();
+  /* the ephemeron allocation can collect — never under the lock, and the
+   * watched object rides a frame across it (idhash's discipline) */
+  FPPRT_FRAME(f, 1);
+  f_slots[0] = o;
+  struct gc_ephemeron *e = gc_allocate_ephemeron(mut_);
+  ((struct fpprt_header *)e)->tag = ((uintptr_t)FPPRT_TID_EPHEMERON << 1) | 1;
+  gc_ephemeron_init(mut_, e, gc_ref((uintptr_t)f_slots[0]),
+                    gc_ref((uintptr_t)f_slots[0]));
+  pthread_mutex_lock(&watch_lock_);
+  if (watch_n_ == watch_cap_) {
+    size_t c = watch_nchunks_;
+    if (c == sizeof(watch_chunks_) / sizeof(*watch_chunks_)) abort();
+    watch_chunks_[c] = calloc(FPPRT_WATCH_CHUNK, sizeof(fpprt_ref));
+    if (!watch_chunks_[c]) abort();
+    fpprt_add_static_roots(watch_chunks_[c], FPPRT_WATCH_CHUNK);
+    watch_nchunks_ = c + 1;
+    watch_cap_ += FPPRT_WATCH_CHUNK;
+    watch_meta_ = realloc(watch_meta_, watch_cap_ * sizeof(*watch_meta_));
+    if (!watch_meta_) abort();
+  }
+  *watch_slot_(watch_n_) = (fpprt_ref)e;
+  watch_meta_[watch_n_].tag = tag;
+  watch_meta_[watch_n_].kind = kind;
+  watch_n_++;
+  pthread_mutex_unlock(&watch_lock_);
+  FPPRT_LEAVE(f);
+}
+
+/* world stopped: queue the tags of entries whose key died, compact the
+ * rest in place (registration order is preserved across collections) */
+static void watch_scan_(void) {
+  size_t w = 0;
+  for (size_t i = 0; i < watch_n_; i++) {
+    struct gc_ephemeron *e = (struct gc_ephemeron *)*watch_slot_(i);
+    if (gc_ref_value(gc_ephemeron_key(e))) {
+      *watch_slot_(w) = (fpprt_ref)e;
+      watch_meta_[w] = watch_meta_[i];
+      w++;
+    } else {
+      uint32_t k = watch_meta_[i].kind;
+      if (deadq_[k].n == deadq_[k].cap) {
+        deadq_[k].cap = deadq_[k].cap ? deadq_[k].cap * 2 : 64;
+        deadq_[k].tags = realloc(deadq_[k].tags,
+                                 deadq_[k].cap * sizeof(uint32_t));
+        if (!deadq_[k].tags) abort();
+      }
+      deadq_[k].tags[deadq_[k].n++] = watch_meta_[i].tag;
+    }
+  }
+  for (size_t i = w; i < watch_n_; i++) *watch_slot_(i) = 0;
+  watch_n_ = w;
+}
+
+uint32_t fpprt_drain1(uint32_t kind) {
+  if (kind >= FPPRT_WATCH_KINDS) return 0;
+  pthread_mutex_lock(&watch_lock_);
+  uint32_t tag = 0;
+  if (deadq_[kind].drained < deadq_[kind].n)
+    tag = deadq_[kind].tags[deadq_[kind].drained++];
+  if (deadq_[kind].drained == deadq_[kind].n)
+    deadq_[kind].drained = deadq_[kind].n = 0;
+  pthread_mutex_unlock(&watch_lock_);
+  return tag;
 }
 
 /* ---- static roots ------------------------------------------------------ */

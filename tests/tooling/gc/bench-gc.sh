@@ -7,7 +7,7 @@
 set -e
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../../.." && pwd)
 fpp="$root/src/Fpp.Cli/bin/Release/net10.0/fpp"; wt="$HOME/.wasmtime/bin/wasmtime"
-wm="$HOME/emsdk/upstream/bin/wasm-merge"; reactor="$HOME/projects/fpp/runtime/build/wasm/fpprt_reactor.wasm"
+wm="$HOME/emsdk/upstream/bin/wasm-merge"; reactor="$HOME/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor.wasm"
 source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1
 out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
 

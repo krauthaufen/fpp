@@ -15,8 +15,11 @@ set -e
 # resolve the destination BEFORE cd'ing into the runtime: $0 may be relative,
 # and `dirname` after the cd then names a directory that does not exist
 here=$(cd "$(dirname "$0")" && pwd)
-rt="$HOME/projects/fpp/runtime"
-source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1
+# THIS repo's runtime: the reactor used to be built from a sibling checkout
+# (~/projects/fpp), so the artifact shipped here came from sources that were
+# not in this tree and drifted from the ones that are.
+rt="$here/../../../runtime"
+source "$HOME/emsdk/emsdk_env.sh" >/dev/null 2>&1 || source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1
 cd "$rt"; mkdir -p build/wasm
 COMMON="gc-platform-wasm.c gc/src/gc-stack.c gc/src/gc-options.c gc/src/gc-tracepoint.c gc/src/gc-ephemeron.c gc/src/gc-finalizer.c fpprt.c fpprt-wasm-shim.c"
 EXPORTS='_fpprt_init,_fpprt_alloc,_fpprt_alloc_array,_fpprt_register_type_s,_fpprt_write_ref,_fpprt_safepoint,_fpprt_add_static_roots,_fpprt_allocated_bytes,_fpprt_frame_push,_fpprt_frame_pop,_fpprt_tid_of,_fpprt_wasm_roots_base,_fpprt_wasm_roots_register,_fpprt_tid2cid_base,_fpprt_wasm_refoffs_base,_fpprt_wasm_witness_base,_fpprt_tid_scans,_fpprt_watch,_fpprt_drain1,_fpprt_collect,_fpprt_pin,_fpprt_can_pin,_fpprt_idhash,_fpprt_weak_new,_fpprt_weak_get,_fpprt_eph_new,_fpprt_eph_key,_fpprt_eph_value,_fpprt_inline_hp_addr,_fpprt_inline_limit_addr'

@@ -85,10 +85,10 @@ let private mergeGcModule (moduleBytes : byte[]) (out : string) : int =
             [ System.Environment.GetEnvironmentVariable "FPP_REACTOR"
               System.IO.Path.Combine (System.AppContext.BaseDirectory, "fpprt_reactor_mmc.wasm")
               home + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
-              home + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
+              home + "/projects/fpp-lowir/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
         match candidates |> List.tryFind (fun c -> not (isNull c) && c <> "" && System.IO.File.Exists c) with
         | Some r -> r
-        | None -> home + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm"
+        | None -> home + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
     let wasmMerge = envOr "FPP_WASM_MERGE" (home + "/emsdk/upstream/bin/wasm-merge")
     let wasmTools = envOr "FPP_WASM_TOOLS" "wasm-tools"
     let tmp = System.IO.Path.GetTempPath() + System.IO.Path.GetRandomFileName()

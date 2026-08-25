@@ -808,10 +808,10 @@ type Workspace() =
                     [ System.Environment.GetEnvironmentVariable "FPP_REACTOR"
                       System.IO.Path.Combine (System.AppContext.BaseDirectory, "fpprt_reactor_mmc.wasm")
                       userHome + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
-                      userHome + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
+                      userHome + "/projects/fpp-lowir/runtime/build/wasm/fpprt_reactor_mmc.wasm" ]
                 match candidates |> List.tryFind (fun c -> not (isNull c) && c <> "" && System.IO.File.Exists c) with
                 | Some r -> r
-                | None -> userHome + "/projects/fpp/runtime/build/wasm/fpprt_reactor_mmc.wasm"
+                | None -> userHome + "/projects/fpp-lowir/tests/tooling/gc/fpprt_reactor_mmc.wasm"
             for gname, gsources in vecToList fppGenerators do
                 let pw = Workspace()
                 pw.SetFileText "(view)/view.fpp" viewSrc
