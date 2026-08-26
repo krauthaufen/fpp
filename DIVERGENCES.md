@@ -713,19 +713,13 @@ fsi oracle run, per rule 1 above).
   needs .NET type names, which do not exist here. `%A` is unaffected and
   matches F# in every case above.
 
-* **An out-of-bounds array access is UNCHECKED.** F# raises
-  `IndexOutOfRangeException`; here a read past the end answers whatever the
-  adjacent memory holds (0 in the simple case) and execution continues, and
-  a write past the end stores there.
+* **An out-of-bounds access raises a `Failure`, not an
+  `IndexOutOfRangeException`.** The access IS checked, and the message is
+  .NET's own ("Index was outside the bounds of the array."), so
+  `try ... with e -> e.Message` behaves identically. What differs is the
+  exception's TYPE: there is no BCL hierarchy here, so
+  `:? IndexOutOfRangeException` cannot match it — catch by wildcard or by
+  message.
 
-      let a = [| 10; 20; 30 |]
-      a.[5]                  F#: IndexOutOfRangeException   F++: 0
-      a.[5] <- 1             F#: IndexOutOfRangeException   F++: writes
-
-  **Reason.** Not a decision so much as an inherited one: the wasm-GC
-  backend got its check for free inside `array.get`, and when that backend
-  was deleted the wasm-linear one — which reads through a plain load —
-  became the only path. Adding a check is a per-access cost on the hottest
-  code in the benchmarks, so it is a performance call, not a bug fix; the
-  note in CLAUDE.md about "nothing to eliminate" describes the OLD backend
-  and no longer applies.
+  **Reason.** The same reason `failwith` is the only exception shape the
+  backend builds: a typed BCL exception would need the type to exist.

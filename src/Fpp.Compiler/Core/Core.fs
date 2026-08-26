@@ -87,6 +87,38 @@ type Expr =
     /// `e :? T` — is the value an instance of T (or a subclass)?
     | ETypeTest of string * Expr
 
+/// Every direct sub-expression, in evaluation order where that is defined.
+/// A generic walk over the tree without one more copy of this match at each
+/// call site; a PATTERN's own sub-expressions are not expressions, so a
+/// match clause contributes its guard and its body.
+let children (e : Expr) : Expr list =
+    match e with
+    | ELit _ | EVar _ | EVarI _ | EUnknown _ -> []
+    | ELam (_, b) -> [ b ]
+    | EApp (f, xs) -> f :: xs
+    | ELet (_, _, _, a, b) -> [ a; b ]
+    | EIf (a, b, c) -> [ a; b; c ]
+    | EMatch (s, cs) -> s :: (cs |> List.collect (fun (_, g, b) -> (match g with Some x -> [ x ] | None -> []) @ [ b ]))
+    | ETuple xs | EListLit xs -> xs
+    | ECtor (_, _, xs) -> xs
+    | ERecord (_, fs) -> fs |> List.map snd
+    | ERecordExt (_, b, fs) -> b :: (fs |> List.map snd)
+    | EField (r, _, _) -> [ r ]
+    | EFieldSet (r, _, _, v) -> [ r; v ]
+    | EPrim (_, xs) -> xs
+    | ESeq xs -> xs
+    | EWhile (a, b) -> [ a; b ]
+    | EAssign (_, v) -> [ v ]
+    | ETry (b, cs) -> b :: (cs |> List.collect (fun (_, g, h) -> (match g with Some x -> [ x ] | None -> []) @ [ h ]))
+    | EArray (_, xs) -> xs
+    | EIndex (_, a, i) -> [ a; i ]
+    | EIndexSet (_, a, i, v) -> [ a; i; v ]
+    | EArrayLen (_, a) | EArrayPin (_, a) | EArrayUnpin (_, a) | EArrayBytes (_, a) -> [ a ]
+    | EArrayCreate (_, a, b) -> [ a; b ]
+    | EIfaceCall (_, _, r, xs) -> r :: xs
+    | ECast (_, a, _) -> [ a ]
+    | ETypeTest (_, a) -> [ a ]
+
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
     /// foreign import: name resolves in the host's "env" module

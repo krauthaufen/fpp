@@ -175,20 +175,40 @@ Two were tried, measured, and **reverted** for not paying: inlining `$toi`
 everywhere, and caching `i * stride` across an element's fields (the engine
 already does that one). Do not re-add them without a number.
 
-### Bounds checks: there are NONE
+### Bounds checks: emitted, then proven away
 
-This paragraph used to say "there is nothing to eliminate", and that was
-true of the wasm-GC backend: the check lived inside `array.get`, which has
-no unchecked variant to emit instead. That backend is gone. wasm-linear
-reads an element with a plain load, so there is no check at all — `a.[5]`
-on a three-element array answers whatever is next in memory and a write
-stores there (recorded in DIVERGENCES.md, where F# raises). Adding one is a
-per-access cost on the hottest benchmark code, so treat it as a performance
-decision rather than a bug fix, and measure it.
+Every element access carries one — a single UNSIGNED compare against the
+length word, which rejects a negative index in the same test — and it
+raises rather than traps, so a program can catch it. What keeps that from
+costing anything is the proof pass (`provenWalk`, WasmLin), which runs over
+the Core body BEFORE lowering and marks the accesses it can show are in
+range. Three sources of proof, and they compose:
 
-For reference, when the check DID exist, the only way around it was a
-PINNED array reading linear memory directly, worth about 8% (191 ms against
-175 ms on the vertex benchmark). It was not the gap to C.
+* a counted loop's own guard — `for i in 0 .. a.Length - 1`, `for v in a`,
+  and the hand-written `while i < n` where `n` is the length `a` was
+  CREATED with (module-level `Array.zeroCreate n`, literal or binding);
+* a check that already ran on the same (array, index) pair earlier in the
+  same straight-line region;
+* nothing crosses a branch join, a loop back-edge or a lambda boundary —
+  facts are dropped rather than merged.
+
+An access that is proven emits EXACTLY the code it did before checks
+existed, register bindings included: binding the base defeats the hoist
+that lifts it out of a loop, and that cost is real whether or not a check
+is there to pay for it. That is why each site branches on
+`boundsGuardPeek` rather than always taking the guarded shape.
+
+Measured, best-of-five interleaved, checks on against `FPP_NO_BOUNDS=1`:
+add, read, shapes, vertices are FREE (fully proven); `sort` pays 40%
+(1771 ms against 1262) because a quicksort partition scan —
+`while a.[i] < p do i <- i + 1` — is bounded by the sentinel, not by a
+guard, and no local analysis can show it. .NET elides that one, which is
+why F# now beats F++ on `sort`; it is the open case.
+
+`FPP_BOUNDS_STATS=1` prints how many checks a build emitted and elided.
+Read the EMITTED count, not the percentage: a proven access takes the fast
+path and never reaches the counter, so "0% elided" with the emitted count
+at the prelude floor means everything of yours was proven.
 
 `for i in 0 .. arr.Length - 1` already evaluates the bound once: the loop
 body contains zero `array.len`. That one was checked, not assumed.
