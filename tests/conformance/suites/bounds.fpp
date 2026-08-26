@@ -217,6 +217,36 @@ let applyTo (f : int -> int) (v : int) : int = f v
 eq "indirect-call-valid" (string (applyTo getAt 2)) "30"
 eq "indirect-call-past-end" (try string (applyTo getAt 7) with e -> e.Message) oob
 
+// ---- a guard the PROGRAM writes ---------------------------------------------
+// `&&` short-circuits, so the right operand runs only where the left holds:
+// a hand-written `i < a.Length` is a real proof of the access beside it, and
+// the access should not then be checked as well. (Whether writing the guard
+// is WORTH it is another matter — on a quicksort partition it measured
+// slower than leaving the check in.)
+
+let guarded = [| 5; 6; 7 |]
+
+// scanning with an explicit guard: stops at the end rather than raising
+let mutable gi = 0
+while gi < guarded.Length && guarded.[gi] < 99 do gi <- gi + 1
+eq "guarded-scan-stops" (string gi) "3"
+
+// the guard is what makes it safe — the same scan without one would raise
+let mutable gj = 0
+let ran = try (while guarded.[gj] < 99 do gj <- gj + 1); "no raise" with _ -> "raised"
+eq "unguarded-scan-raises" ran "raised"
+
+// a downward scan guarded on the low end
+let mutable gk = guarded.Length - 1
+while gk >= 0 && guarded.[gk] > 5 do gk <- gk - 1
+eq "guarded-downward-scan" (string gk) "0"
+
+// the guard short-circuits, so an out-of-range index is never read
+let mutable probe = 99
+eq "short-circuit-protects"
+   (if probe < guarded.Length && guarded.[probe] = 1 then "read" else "skipped")
+   "skipped"
+
 // ---- the same for STRINGS ---------------------------------------------------
 
 let s = "abc"

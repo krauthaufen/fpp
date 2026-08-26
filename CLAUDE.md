@@ -195,6 +195,9 @@ range. Five sources of proof, and they compose:
   same straight-line region;
 * a PRECONDITION on a parameter, established by the function's CALLERS —
   see below;
+* a guard the PROGRAM wrote. `&&` short-circuits, so the right operand runs
+  only where the left holds: `while i < n && a.[i] < p do ...` proves its
+  own access, and does not then pay for a check as well;
 * nothing crosses a branch join or a lambda boundary, and a loop's guard is
   read with only what survives the body's own writes. That last one matters:
   walking the guard with the richer pre-loop state "proved"
@@ -251,6 +254,15 @@ ELEMENT of the array, so the scan stops at it. That is a property of the
 array's CONTENTS, not of any guard or arithmetic, and no compiler proves
 it. `a.[lo + (hi - lo) / 2]` beside it IS derivable, and now is — see the
 precondition section below.
+
+Writing that guard yourself is NOT worth it, which is worth knowing before
+anyone reaches for it. Guarding both quicksort scans elides every check in
+qsort — measured, sg_on 1656 ms against sg_off 1661, so the checks really
+do cost nothing there — and the whole benchmark still runs SLOWER than the
+unguarded one with its checks left in (1656 against 1490). The guard is not
+a comparison saved, it is a comparison MOVED: same test, but `&&` makes it
+a second control-flow diamond in the tightest loop, and the engine handles
+the check's shape better. Leave the check in.
 
 A WARNING about reading these numbers. The stronger analysis emits 124
 checks against the weaker one's 135 and does strictly less work at run

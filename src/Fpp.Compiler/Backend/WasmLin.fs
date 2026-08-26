@@ -3923,7 +3923,7 @@ and private exprEq (a : Expr) (b : Expr) : bool =
     | _ -> false
 
 /// What a GUARD teaches, in the branch where it holds.
-let private applyGuard (b : Bounds) (cond : Expr) : Bounds =
+let rec private applyGuard (b : Bounds) (cond : Expr) : Bounds =
     match cond with
     // `x < y`. THREE things can follow, and they are not alternatives: x
     // inherits whatever upper bounds y has, y gains a lower bound from x,
@@ -3969,7 +3969,8 @@ let private applyGuard (b : Bounds) (cond : Expr) : Bounds =
     // `k < x` is `x > k`
     | EPrim ("<", [ d; EVar (x, _) ]) ->
         (match intLit d with Some n -> { b with Lo = Map.add (key x) (n + 1) b.Lo } | None -> b)
-    | EPrim ("&&", [ p; q ]) -> b
+    // both conjuncts hold where the whole does
+    | EPrim ("&&", [ p; q ]) -> applyGuard (applyGuard b p) q
     | _ -> b
 
 /// Where a call site sat, and what it passed: filled while walking, consumed
@@ -4117,6 +4118,14 @@ let rec private provenWalk
         // `qsort lo j` unable to say anything about j, and with it the
         // midpoint read in the recursive call.
         loopCarried b1 body
+    // `&&` SHORT-CIRCUITS, so the right operand runs only where the left
+    // holds — which is how a program writes its own bounds guard:
+    // `while i < n && a.[i] < p do ...`. Walking the operands as plain
+    // siblings threw that away and left the access checked.
+    | EPrim ("&&", [ c1; c2 ]) ->
+        let b1 = walk b c1
+        walk (applyGuard b1 c1) c2 |> ignore
+        b1
     | ESeq xs -> xs |> List.fold walk b
     | EApp (EVar (fv, _), args) | EApp (EVarI (fv, _, _), args) ->
         let b1 = args |> List.fold walk b
