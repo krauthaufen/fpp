@@ -3784,10 +3784,18 @@ let mutable private boundsElided = 0
 
 /// How a length is NAMED, so a creation and a loop guard can be compared:
 /// a binding by its key, a literal by its digits.
-let private lenKeyOf (e : Expr) : string option =
+let rec private lenKeyOf (e : Expr) : string option =
     match e with
     | EVar (n, _) -> Some (key n)
     | ELit (LInt d) -> Some ("#lit:" + d)
+    // a FLATTENED 2D array: `Array.zeroCreate (rows * cols)`. Kept as a
+    // product so an `i * cols + j` index can be checked against its factors
+    // — the shape every matrix in flat storage uses, and one that proves
+    // nothing when the length is treated as opaque.
+    | EPrim ("*", [ a; b ]) ->
+        (match lenKeyOf a, lenKeyOf b with
+         | Some ka, Some kb when not (ka.Contains "*") && not (kb.Contains "*") -> Some (ka + "*" + kb)
+         | _ -> None)
     | _ -> None
 
 /// is this length KNOWN to be at least one? `a.[n - 1]` is only in range for
@@ -3824,13 +3832,18 @@ type private Bounds =
       /// guard is one indirection away — without this the whole counted-loop
       /// shape proves nothing.
       Flag : Map<string, Expr>
+      /// `var < bound` where the bound is a plain name or literal, with no
+      /// array involved. A flattened matrix needs this: `i * cols + j` is in
+      /// range because i is under ROWS and j under COLS, neither of which is
+      /// the array's length.
+      Ub : Set<string>
       /// LOCAL arrays and the length they were created with. Most of the
       /// prelude's array code is this shape — `let r = Array.zeroCreate n`
       /// then a loop to `n` — and keying only on module-level arrays left
       /// every one of those checked.
       ArrLen : Map<string, string> }
 
-let private emptyB = { Lo = Map.empty; Hi = Set.empty; Flag = Map.empty; ArrLen = Map.empty }
+let private emptyB = { Lo = Map.empty; Hi = Set.empty; Flag = Map.empty; ArrLen = Map.empty; Ub = Set.empty }
 
 /// the entry state for a body whose parameters carry preconditions
 let private entryBoundsWith (facts : Set<string>) (pks : string list) : Bounds =
@@ -3850,7 +3863,8 @@ let private forget (b : Bounds) (vk : string) : Bounds =
     { Lo = Map.remove vk b.Lo
       Hi = b.Hi |> Set.filter (fun p -> not (p.EndsWith ("|" + vk)))
       Flag = Map.remove vk b.Flag
-      ArrLen = Map.remove vk b.ArrLen }
+      ArrLen = Map.remove vk b.ArrLen
+      Ub = b.Ub |> Set.filter (fun p -> not (p.StartsWith (vk + "|"))) }
 
 /// forget every variable the expression assigns
 let private forgetAssigned (b : Bounds) (e : Expr) : Bounds =
@@ -3896,6 +3910,32 @@ let rec private idxInRange (b : Bounds) (ak : string) (ix : Expr) : bool =
                  | Some lk, Some 1, Some alk when lk = alk -> lenAtLeastOne lk
                  | _ -> false)
         asOffset || asLastIndex
+    // A FLATTENED 2D index: `i * cols + j` into an array of rows*cols.
+    // In range when i is under ROWS and j under COLS, since the largest it
+    // can reach is (rows-1)*cols + (cols-1) = rows*cols - 1. The multiplier
+    // in the index must be one factor of the length and the other factor
+    // bounds i — which way round is not fixed, so both are tried.
+    | EPrim ("+", [ EPrim ("*", [ EVar (i, _); m ]); EVar (j, _) ]) ->
+        let lenOf =
+            match Map.tryFind ak globalArrLen with
+            | Some l -> Some l
+            | None -> Map.tryFind ak b.ArrLen
+        (match lenOf, lenKeyOf m with
+         | Some l, Some mk when l.Contains "*" ->
+             let parts = l.Split '*'
+             if parts.Length <> 2 then false
+             else
+                 let ik, jk = key i, key j
+                 let nonNeg (v : string) = match Map.tryFind v b.Lo with Some n -> n >= 0 | None -> false
+                 // the multiplier is one factor; the OTHER bounds i, and the
+                 // multiplier itself bounds j
+                 let fits (rows : string) (cols : string) =
+                     mk = cols
+                     && Set.contains (ik + "|" + rows) b.Ub
+                     && Set.contains (jk + "|" + cols) b.Ub
+                 nonNeg ik && nonNeg jk
+                 && (fits parts.[0] parts.[1] || fits parts.[1] parts.[0])
+         | _ -> false)
     // `len / k` for k >= 2 — the middle of a non-empty array. Below the
     // length because k >= 2, at or above zero because a length is.
     | EPrim ("/", [ len; d ]) when
@@ -3948,6 +3988,15 @@ let rec private applyGuard (b : Bounds) (cond : Expr) : Bounds =
                     | None -> b.Lo
                 { b with Lo = lo2; Hi = hi2 }
             | _ -> b
+        // the bound as a plain RELATION, whatever it is: `i < rows` says
+        // nothing about any array on its own, and is exactly what a
+        // flattened `i * cols + j` needs
+        let b1 =
+            if not strict then b1
+            else
+                match lenKeyOf rhs with
+                | Some bk when not (bk.Contains "*") -> { b1 with Ub = Set.add (xk + "|" + bk) b1.Ub }
+                | _ -> b1
         // a bound that IS a length — `x < a.Length`, or `x < n` where some
         // array was created with n. Only STRICT `<` bounds x below it.
         if not strict then b1
@@ -4165,7 +4214,14 @@ and private loopCarried (b : Bounds) (body : Expr) : Bounds =
             match p.Split '|' with
             | [| _; v |] -> not (Set.contains v assigned) || onlyFalls v body
             | _ -> false)
-    { Lo = lo; Hi = hi; Flag = b.Flag; ArrLen = b.ArrLen }
+    // an upper bound survives the same way Hi does: a counter that only
+    // falls stays under whatever it was under, one that rises does not
+    let ub =
+        b.Ub |> Set.filter (fun p ->
+            match p.Split '|' with
+            | [| v; _ |] -> not (Set.contains v assigned) || onlyFalls v body
+            | _ -> false)
+    { Lo = lo; Hi = hi; Flag = b.Flag; ArrLen = b.ArrLen; Ub = ub }
 
 /// ---- the PRECONDITION fixpoint -----------------------------------------
 /// "parameter p of f is a valid index into array a" cannot be proven from f's

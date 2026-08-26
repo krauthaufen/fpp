@@ -217,6 +217,42 @@ let applyTo (f : int -> int) (v : int) : int = f v
 eq "indirect-call-valid" (string (applyTo getAt 2)) "30"
 eq "indirect-call-past-end" (try string (applyTo getAt 7) with e -> e.Message) oob
 
+// ---- a FLATTENED 2D array ---------------------------------------------------
+// `m.[i * cols + j]` over an array of rows*cols is in range when i is under
+// ROWS and j under COLS — the largest it reaches is rows*cols - 1. Neither
+// bound is the array's own length, so this needs the factors to be tracked.
+
+let nrow = 3
+let ncol = 4
+let grid : int[] = Array.zeroCreate (nrow * ncol)
+
+let mutable written = 0
+for i in 0 .. nrow - 1 do
+    for j in 0 .. ncol - 1 do
+        grid.[i * ncol + j] <- i * 10 + j
+        written <- written + 1
+
+eq "flattened-write-count" (string written) "12"
+eq "flattened-last-element" (string grid.[nrow * ncol - 1]) "23"
+eq "flattened-read-back" (string grid.[1 * ncol + 2]) "12"
+
+let mutable gridSum = 0
+for i in 0 .. nrow - 1 do
+    for j in 0 .. ncol - 1 do
+        gridSum <- gridSum + grid.[i * ncol + j]
+eq "flattened-sum" (string gridSum) "138"
+
+// the bound has to be the RIGHT factor: i under cols instead of rows walks
+// off the end, and still raises
+let walkTooFar () : int =
+    let mutable acc = 0
+    for i in 0 .. ncol - 1 do
+        for j in 0 .. ncol - 1 do
+            acc <- acc + grid.[i * ncol + j]
+    acc
+
+eq "flattened-wrong-bound-raises" (try string (walkTooFar ()) with e -> e.Message) oob
+
 // ---- a guard the PROGRAM writes ---------------------------------------------
 // `&&` short-circuits, so the right operand runs only where the left holds:
 // a hand-written `i < a.Length` is a real proof of the access beside it, and

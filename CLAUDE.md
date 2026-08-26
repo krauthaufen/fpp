@@ -182,7 +182,7 @@ length word, which rejects a negative index in the same test — and it
 raises rather than traps, so a program can catch it. What keeps that from
 costing anything is the proof pass (`provenWalk`, WasmLin), which runs over
 the Core body BEFORE lowering and marks the accesses it can show are in
-range. Five sources of proof, and they compose:
+range. Six sources of proof, and they compose:
 
 * a counted loop's own guard — `for i in 0 .. a.Length - 1`, `for v in a`,
   and the hand-written `while i < n` where `n` is the length `a` was
@@ -195,6 +195,11 @@ range. Five sources of proof, and they compose:
   same straight-line region;
 * a PRECONDITION on a parameter, established by the function's CALLERS —
   see below;
+* a FLATTENED 2D index — `m.[i * cols + j]` over `Array.zeroCreate (rows *
+  cols)`, in range when i is under ROWS and j under COLS. Neither bound is
+  the array's own length, so the length is kept as a PRODUCT of its factors
+  and the index checked against them. Worth 2x on matmul: 218 ms to 103,
+  which is C's 100;
 * a guard the PROGRAM wrote. `&&` short-circuits, so the right operand runs
   only where the left holds: `while i < n && a.[i] < p do ...` proves its
   own access, and does not then pay for a check as well;

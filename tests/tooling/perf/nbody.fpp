@@ -1,3 +1,12 @@
+// OPEN: this is the worst F++/C ratio in the suite — 3.0x, and 1.6x F#'s.
+// Bounds checks are only 15% of it (836 ms against 732 with FPP_NO_BOUNDS=1),
+// so most of the gap is elsewhere and not yet diagnosed. Ruled out so far:
+// allocation (the module makes no fpalloc call in the hot path), sqrt (it
+// emits f64.sqrt, not a call), and the seven parallel arrays — folding them
+// into one flat array made it SLOWER (992 ms), because the flat index is
+// then unprovable. Whoever picks this up: `perf record -k 1` with
+// --profile jitdump, per the note at the top of this file's directory.
+//
 // The five-body simulation from the benchmark game: pairwise force
 // accumulation over parallel float arrays, dominated by sqrt and by the
 // dependency chain through each body's velocity. Float-heavy in a way the
