@@ -13,9 +13,10 @@ together, and they have each caught things review did not.
 ```bash
 dotnet build -c Release                      # ~30 s
 dotnet run  -c Release --project tests/Fpp.Tests      # ~4 min, 692 tests
+tests/conformance/run.sh                              # 76 suites, fsi oracle
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
-./tests/run-gates.sh --full                           # ~6 min, all 30, parallel
+./tests/run-gates.sh --full                           # ~8 min, all 31, parallel
 ```
 
 There is ONE backend: wasm-linear over the fpprt/Whippet reactor (the C
@@ -26,7 +27,7 @@ once every gate ran on the linear one. `fixpoint.fsx` still accepts the
 
 `fixpoint.fsx self` is the real one: the compiler compiles its own sources,
 and stage-1's output must equal stage-0's **byte for byte**. It has caught
-bugs the 578 tests missed — a `List.init` that counted down, an equality that
+bugs the unit suite missed — a `List.init` that counted down, an equality that
 compared tree shape instead of contents. If you change the backend and only
 the unit tests pass, you have not tested your change.
 
@@ -153,76 +154,69 @@ vs 248. What remains on vertices/shapes is per-access bounds checks and no
 SIMD — wasm-GC array.get has no unchecked or vector form, so that gap
 belongs to the engine and the spec, not to emitted-code waste.
 
-## Optimisations, and the switch that turns them off
+## Optimisations, and what they are worth
 
-`St.Opt` is false for debug builds (`mapUrl <> ""`), because hoisted bases
-and elided branches have nothing in the source for a debugger to point at.
-Anything that changes the shape of emitted code belongs behind it.
+There is no global optimisation switch. `St.Opt` does not exist — that was
+the deleted wasm-GC driver, and the paragraph describing it outlived the
+backend it described. Treat a claim in this file as suspect until you have
+grepped for the thing it names; several were stale by a whole backend.
 
-Currently: POD array bases are hoisted out of loops; a literal-valued
-top-level `let` is emitted as its literal; the pinned/unpinned test is
-dropped for types the program never pins; a record literal stored into a POD
-array is written field-by-field instead of via a materialised struct; and
-`let v = arr.[i]` splits the element into unboxed locals. The last two are
-the same fix from opposite sides — never materialise a GC struct for a POD
-element.
+On by default: POD array bases are hoisted out of loops (`hoistE`); a
+literal-valued top-level `let` is emitted as its literal; the
+pinned/unpinned test is dropped for types the program never pins; a record
+literal stored into a POD array is written field-by-field rather than via a
+materialised struct; `let v = arr.[i]` splits the element into unboxed
+locals (the last two are the same fix from opposite sides — never
+materialise a GC struct for a POD element); one-instruction class wrappers
+are inlined at their call sites; and a loop's exit test is the guard
+NEGATED rather than `cond; i32.eqz`, which is worth 8-10% on a tight
+streaming loop (read 49 -> 45 ms, vertices 58 -> 52).
 
-Innermost counted loops are unrolled twice: `while i < bound` whose body
-advances `i` by exactly one, where `bound` cannot move and the body is small
-(<= 60 nodes) and contains no other loop. The guard is the condition with
-`i + 1` in place of `i`, so two iterations run only when two are left and the
-remainder loop catches the last — no trip count, no arithmetic that could
-overflow where the original would not, and no reassociation.
+## Unrolling and strength reduction: BOTH implemented, BOTH off
 
-INNERMOST matters: unrolling a loop that contains another copies the inner
-one too, and copies multiply as 3^depth. A two-deep loop turned three element
-reads into twenty-seven before that condition went in. It buys 7% on a tight
-loop (191 ms -> 177 ms) and nothing on a loop whose body is already big
-enough to fall outside the size cap, for +3.2% module size.
+`FPP_UNROLL=1` and `FPP_STRENGTH=1`, in WasmLin over LowIR. They are off
+because they were measured, not because nobody got to them:
 
-### One-instruction wrappers cost three times over
+    bench      base   unroll  strength   both
+    read       43ms     44ms     43ms     42ms
+    vertices   52ms     52ms     53ms     54ms
+    shapes    247ms    239ms    240ms    241ms
+    matmul    103ms    131ms    103ms    101ms     <- unroll 27% WORSE
+    nbody     392ms    397ms    389ms    390ms
+    sort     1495ms   1494ms   1495ms   1538ms
+    avl      1812ms   1812ms   1815ms   1801ms
+    trees     897ms    898ms    898ms    898ms
 
-A class member that IS a machine instruction — `sqrt`, `abs`, `truncate` on
-a float — has no body in its instance, so Link generates one
-(`fun x -> sqrtf x`). Calling that wrapper costs the call, a 16-byte GC BOX
-for the result (the uniform ABI has no other way to return a float), and —
-because a call is a SAFEPOINT — the loop-invariant hoist for the entire
-enclosing loop, so every array base around it goes back to being re-read
-from its root slot per access. nbody called `sqrt` 30 million times and paid
-all three: it was the worst F++/C ratio in the suite at 3.0x, and inlining
-the wrappers at their call sites took it to 1.4x (836 ms to 388).
+Nothing outside the noise, and unrolling costs matmul 27%. Strength
+reduction is a wash for a reason the emitted code shows plainly: the
+multiply it takes out of the address (`i*12` — get, const, mul, add) is
+replaced by a bump beside the counter (get, const, add, set), so the body
+gets LONGER by two instructions. Wasm has no addressing mode to fold an
+index into, which is why the trick pays on a native target and not here.
 
-The wrapper is still emitted — `List.map sqrt xs` needs a function — it is
-just not what a direct call reaches (`inlinePrimWrappers`, WasmLin).
+Unrolling is innermost-only and capped at 60 nodes for a reason worth
+keeping: unrolling a loop that contains another copies the inner one too,
+and copies multiply as 3^depth.
 
-The lesson generalises past this one case: a call in a hot loop is never
-just a call here, because it also switches hoisting off for everything
-around it. When a benchmark is slow for no visible reason, look for what is
-a CALL that should not be.
+THE FIXPOINT CANNOT VALIDATE EITHER FLAG. `GetEnvironmentVariable` answers
+null inside the wasm-hosted compiler (`System` is one of the roots that
+reach the backend unresolved), so with `FPP_UNROLL=1` stage-0 unrolls and
+stage-1 does not, and the fixpoint reports a byte mismatch that means
+nothing. Check these passes with the CONFORMANCE suite instead — all 76 are
+green under unroll, strength and both.
 
-### Strength reduction: written, measured, worth NOTHING
+VERIFY THE PASS FIRES BEFORE BELIEVING A NULL RESULT. The first measurement
+of both showed "no change" because the wiring matched only a top-level
+`LDo`, which a function body rarely is — the passes ran over nothing and
+still reported a clean build, which looks exactly like an honest zero. Check
+the emitted wat (loop count for unrolling, the address shape for strength
+reduction), not the wall clock.
 
-Induction-variable strength reduction for POD element offsets — one multiply
-before the loop per stride, an add where the counter is bumped — was built and
-verified to fire: `i32.mul` in the vertex loop went from nine to one. Measured
-against the same binaries, best of three:
+### Two more that were measured and REVERTED
 
-    b1r20   116 ms without it, 120 with
-    whole   175 ms without it, 181 with
-    vertex  175 ms without it, 172 with
-
-Nothing, and slower on two of the three. It also hung the compiler on one
-program in a way that survived disabling the registration, so it is not
-shipped — but do not resurrect it expecting speed. It has none to give here.
-
-That is the lesson, and it cost a detour to learn: nine independent multiplies
-per iteration are free, because the CPU issues them alongside everything else.
-Counting instructions predicted ~19 cycles of savings and delivered zero.
-Instruction count is not the gap to C — do not reason from it again.
-
-Two were tried, measured, and **reverted** for not paying: inlining `$toi`
-everywhere, and caching `i * stride` across an element's fields (the engine
-already does that one). Do not re-add them without a number.
+Inlining `$toi` everywhere, and caching `i * stride` across an element's
+fields (the engine already does that one). Do not re-add either without a
+number.
 
 ### Bounds checks: emitted, then proven away
 
@@ -370,8 +364,11 @@ body contains zero `array.len`. That one was checked, not assumed.
 ## The .NET collections, and the two rules that shaped them
 
 `ResizeArray`, `Dictionary`, `MutableHashSet` and `StringBuilder` live in
-the prelude and are gated by `stdlib/dotnet.fpp`, which runs under F++ AND under `dotnet fsi`
-and must print the same 111 values. Two limits decided their shape, and both
+the prelude and are exercised by `stdlib/dotnet.fpp`. That file is a MANUAL
+check, not a gate: nothing in `run-gates.sh` runs it, and running it under
+`dotnet fsi` needs shims for `print` and for `MutableHashSet` (F# spells
+that one `HashSet`). It prints 142 lines as of this writing — an earlier
+version of this paragraph said 111 and asserted a gate that does not exist. Two limits decided their shape, and both
 will bite anyone extending them:
 
 * **A generic class that implements an interface is monomorphized.** A

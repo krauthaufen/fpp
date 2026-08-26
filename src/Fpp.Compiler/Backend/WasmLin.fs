@@ -9787,6 +9787,207 @@ let private storeIns (ty : LTy) : string =
     | I16 -> "i32.store16"
     | _ -> "i32.store"
 
+/// A comparison's negation, when it has one: `<` is `>=`, `=` is `<>`, and
+/// so on for every width. Used for a loop's exit test, which is the guard
+/// inverted — without this every loop pays an `i32.eqz` per iteration.
+/// ---- loop unrolling and strength reduction (LowIR -> LowIR) ------------
+/// Both OFF by default and switched on with FPP_UNROLL=1 / FPP_STRENGTH=1,
+/// so their worth can be measured against the same compiler rather than
+/// argued about. Read the numbers in CLAUDE.md before turning either on.
+
+let rec private sizeS (st : LStmt) : int =
+    match st with
+    | LIf (_, a, b) -> 1 + List.sumBy sizeS a + List.sumBy sizeS b
+    | LWhile (_, b) | LBlock (_, b) -> 1 + List.sumBy sizeS b
+    | LTryStmt (_, _, _, hs) -> 1 + List.sumBy sizeS hs
+    | _ -> 1
+
+let rec private hasLoopS (st : LStmt) : bool =
+    match st with
+    | LWhile _ -> true
+    | LIf (_, a, b) -> List.exists hasLoopS a || List.exists hasLoopS b
+    | LBlock (_, b) -> List.exists hasLoopS b
+    | LTryStmt (_, _, _, hs) -> List.exists hasLoopS hs
+    | _ -> false
+
+/// every register the statement assigns
+let rec private setRegsS (st : LStmt) : int list =
+    match st with
+    | LSet (r, _) -> [ r.Id ]
+    | LSetMany (rs, _) -> rs |> List.map (fun r -> r.Id)
+    | LIf (_, a, b) -> List.collect setRegsS a @ List.collect setRegsS b
+    | LWhile (_, b) | LBlock (_, b) -> List.collect setRegsS b
+    | LTryStmt (_, r1, r2, hs) -> r1.Id :: r2.Id :: List.collect setRegsS hs
+    | _ -> []
+
+/// `while i < bound` whose body ends by bumping `i` by exactly one, where
+/// nothing else touches `i` and `bound` cannot move. Answers the counter and
+/// the bound.
+let private countedLoop (c : LExpr) (body : LStmt list) : (LReg * LExpr) option =
+    match c with
+    | LPrim (LtSW, [ LGet r; bound ]) ->
+        let boundOk =
+            match bound with
+            | LConstW _ -> true
+            | LGet br -> not (body |> List.collect setRegsS |> List.contains br.Id)
+            | _ -> false
+        let bumps =
+            match List.tryLast body with
+            | Some (LSet (r2, LPrim (AddW, [ LGet r3; LConstW 1 ]))) ->
+                r2.Id = r.Id && r3.Id = r.Id
+            | _ -> false
+        // the FINAL bump is the only write to the counter
+        let writes = body |> List.collect setRegsS |> List.filter (fun x -> x = r.Id) |> List.length
+        if boundOk && bumps && writes = 1 then Some (r, bound) else None
+    | _ -> None
+
+/// Two iterations per turn, with the remainder loop catching the last. The
+/// guard is the condition with `i + 1` in place of `i`, so the doubled body
+/// runs only when two are genuinely left — no trip count, and no arithmetic
+/// that could overflow where the original would not.
+let rec private unrollStmts (ss : LStmt list) : LStmt list =
+    ss |> List.collect (fun st ->
+        match st with
+        | LWhile (c, body) ->
+            let body = unrollStmts body
+            (match countedLoop c body with
+             | Some (r, bound) when
+                   not (List.exists hasLoopS body) && List.sumBy sizeS body <= 60 ->
+                 let c2 = LPrim (LtSW, [ LPrim (AddW, [ LGet r; LConstW 1 ]); bound ])
+                 [ LWhile (c2, body @ body); LWhile (c, body) ]
+             | _ -> [ LWhile (c, body) ])
+        | LIf (c, a, b) -> [ LIf (c, unrollStmts a, unrollStmts b) ]
+        | LBlock (l, b) -> [ LBlock (l, unrollStmts b) ]
+        | other -> [ other ])
+
+/// Strength reduction: `i * k` inside a counted loop becomes a register the
+/// loop advances by k, so the multiply leaves the body. The bump rides
+/// beside EVERY increment of the counter, which is what keeps it correct in
+/// an unrolled body — there the counter moves twice per turn.
+let rec private mapE (f : LExpr -> LExpr) (e : LExpr) : LExpr =
+    let g = mapE f
+    f (match e with
+       | LPrim (op, xs) -> LPrim (op, List.map g xs)
+       | LLoad (t, a, o) -> LLoad (t, g a, o)
+       | LCall (n, xs) -> LCall (n, List.map g xs)
+       | LTailCall (n, xs) -> LTailCall (n, List.map g xs)
+       | LCallIndirect (ts, fp, xs) -> LCallIndirect (ts, g fp, List.map g xs)
+       | LCallIdx (n, fi, xs) -> LCallIdx (n, g fi, List.map g xs)
+       | LAlloc a -> LAlloc (g a)
+       | LDo (ss, t) -> LDo (List.map (mapS f) ss, g t)
+       | other -> other)
+
+and private mapS (f : LExpr -> LExpr) (st : LStmt) : LStmt =
+    let g = mapE f
+    match st with
+    | LSet (r, v) -> LSet (r, g v)
+    | LSetMany (rs, v) -> LSetMany (rs, g v)
+    | LSetGlobal (n, v) -> LSetGlobal (n, g v)
+    | LEval v -> LEval (g v)
+    | LStore (t, a, o, v) -> LStore (t, g a, o, g v)
+    | LMemFill (a, b, c) -> LMemFill (g a, g b, g c)
+    | LIf (c, a, b) -> LIf (g c, List.map (mapS f) a, List.map (mapS f) b)
+    | LWhile (c, b) -> LWhile (g c, List.map (mapS f) b)
+    | LBlock (l, b) -> LBlock (l, List.map (mapS f) b)
+    | LBreakIf (l, c) -> LBreakIf (l, g c)
+    | LReturn v -> LReturn (g v)
+    | LThrow v -> LThrow (g v)
+    | LTryStmt (b, r1, r2, hs) -> LTryStmt (g b, r1, r2, List.map (mapS f) hs)
+    | other -> other
+
+/// the distinct strides `i` is multiplied by anywhere in these statements
+let rec private stridesOfS (rid : int) (st : LStmt) : int list =
+    let rec inE (e : LExpr) : int list =
+        match e with
+        | LPrim (MulW, [ LGet r; LConstW k ]) when r.Id = rid -> [ k ]
+        | LPrim (MulW, [ LConstW k; LGet r ]) when r.Id = rid -> [ k ]
+        | LPrim (_, xs) -> List.collect inE xs
+        | LLoad (_, a, _) -> inE a
+        | LCall (_, xs) | LTailCall (_, xs) -> List.collect inE xs
+        | LCallIndirect (_, fp, xs) -> inE fp @ List.collect inE xs
+        | LCallIdx (_, fi, xs) -> inE fi @ List.collect inE xs
+        | LAlloc a -> inE a
+        | LDo (ss, t) -> List.collect (stridesOfS rid) ss @ inE t
+        | _ -> []
+    match st with
+    | LSet (_, v) | LSetMany (_, v) | LSetGlobal (_, v) | LEval v
+    | LBreakIf (_, v) | LReturn v | LThrow v -> inE v
+    | LStore (_, a, _, v) -> inE a @ inE v
+    | LMemFill (a, b, c) -> inE a @ inE b @ inE c
+    | LIf (c, a, b) -> inE c @ List.collect (stridesOfS rid) a @ List.collect (stridesOfS rid) b
+    | LWhile (c, b) -> inE c @ List.collect (stridesOfS rid) b
+    | LBlock (_, b) -> List.collect (stridesOfS rid) b
+    | LTryStmt (b, _, _, hs) -> inE b @ List.collect (stridesOfS rid) hs
+    | _ -> []
+
+let rec private strengthStmts (ctx : LowCtx) (ss : LStmt list) : LStmt list =
+    ss |> List.collect (fun st ->
+        match st with
+        | LWhile (c, body) ->
+            let body = strengthStmts ctx body
+            (match countedLoop c body with
+             | Some (r, _) ->
+                 // the index is COPIED into a temp before the address is
+                 // built, so the multiply names that temp and not the
+                 // counter. Follow the copies, or nothing is ever found.
+                 let rec aliasesOf (acc : int list) (sts : LStmt list) : int list =
+                     let acc2 =
+                         sts |> List.fold (fun a st2 ->
+                             match st2 with
+                             | LSet (t, LGet c) when List.contains c.Id a && not (List.contains t.Id a) -> t.Id :: a
+                             | LIf (_, x, y) -> aliasesOf (aliasesOf a x) y
+                             | LBlock (_, x) -> aliasesOf a x
+                             | _ -> a) acc
+                     if List.length acc2 = List.length acc then acc else aliasesOf acc2 sts
+                 let alias = aliasesOf [ r.Id ] body
+                 let strides =
+                     alias |> List.collect (fun rid -> body |> List.collect (stridesOfS rid)) |> List.distinct
+                 if List.isEmpty strides then [ LWhile (c, body) ]
+                 else
+                     let mutable pre = []
+                     let mutable b2 = body
+                     for k in strides do
+                         let t = wReg (freshTmp ctx)
+                         pre <- pre @ [ LSet (t, LPrim (MulW, [ LGet r; LConstW k ])) ]
+                         // the substitution, and a bump beside every counter bump
+                         let subst (e : LExpr) : LExpr =
+                             match e with
+                             | LPrim (MulW, [ LGet r2; LConstW k2 ]) when List.contains r2.Id alias && k2 = k -> LGet t
+                             | LPrim (MulW, [ LConstW k2; LGet r2 ]) when List.contains r2.Id alias && k2 = k -> LGet t
+                             | other -> other
+                         b2 <- b2 |> List.map (mapS subst)
+                         b2 <- b2 |> List.collect (fun s2 ->
+                                   match s2 with
+                                   | LSet (rr, LPrim (AddW, [ LGet r3; LConstW 1 ])) when rr.Id = r.Id && r3.Id = r.Id ->
+                                       [ s2; LSet (t, LPrim (AddW, [ LGet t; LConstW k ])) ]
+                                   | other -> [ other ])
+                     pre @ [ LWhile (c, b2) ]
+             | None -> [ LWhile (c, body) ])
+        | LIf (c, a, b) -> [ LIf (c, strengthStmts ctx a, strengthStmts ctx b) ]
+        | LBlock (l, b) -> [ LBlock (l, strengthStmts ctx b) ]
+        | other -> [ other ])
+
+let private negateCmp (e : LExpr) : LExpr option =
+    match e with
+    | LPrim (op, args) ->
+        let inv =
+            match op with
+            | EqW -> Some NeW  | NeW -> Some EqW
+            | LtSW -> Some GeSW | GeSW -> Some LtSW
+            | GtSW -> Some LeSW | LeSW -> Some GtSW
+            | LtUW -> Some GeUW | GeUW -> Some LtUW
+            | GtUW -> Some LeUW | LeUW -> Some GtUW
+            | EqL -> Some NeL  | NeL -> Some EqL
+            | LtSL -> Some GeSL | GeSL -> Some LtSL
+            | GtSL -> Some LeSL | LeSL -> Some GtSL
+            | LtUL -> Some GeUL | GeUL -> Some LtUL
+            | GtUL -> Some LeUL | LeUL -> Some GtUL
+            // NOT the float comparisons: with a NaN operand both a compare
+            // and its "opposite" are false, so swapping them is wrong
+            | _ -> None
+        (match inv with Some o -> Some (LPrim (o, args)) | None -> None)
+    | _ -> None
+
 let rec private emitLowE (f : Fn) (e : LExpr) : unit =
     match e with
     | LConstW n -> ic f n
@@ -10221,7 +10422,13 @@ and private emitLowS (f : Fn) (s : LStmt) : unit =
         endB f
     | LWhile (c, body) ->
         blockE f "$wb"; loopE f "$wl"
-        emitLowE f c; ins f "i32.eqz"; brIf f "$wb"
+        // the exit test is the guard NEGATED. Emitting `cond; i32.eqz` spends
+        // an instruction per iteration on every loop in the language; a
+        // comparison negates by swapping the opcode, which costs nothing.
+        (match negateCmp c with
+         | Some c2 -> emitLowE f c2
+         | None -> emitLowE f c; ins f "i32.eqz")
+        brIf f "$wb"
         for s in body do emitLowS f s
         br f "$wl"; endB f; endB f
     | LBlock (lbl, body) ->
@@ -10501,6 +10708,22 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     let bodyLow =
         if retTy = W || retUnboxed then bodyLow2 else flatUnbox retTy bodyLow2
     let bodyLow = hoistE ctx bodyLow
+    // Unroll first, then strength-reduce: the reducer bumps its register
+    // beside EVERY counter bump, so it handles the doubled body correctly,
+    // whereas reducing first would leave the second copy reading a stale
+    // offset. Both off unless asked for — see CLAUDE.md for what they are
+    // worth.
+    // every LDo in the tree, not just one at the top — a function body is
+    // rarely an LDo at its root, and matching only there applied the passes
+    // to nothing at all while still reporting a clean build
+    let bodyLow =
+        if System.Environment.GetEnvironmentVariable "FPP_UNROLL" = "1" then
+            mapE (fun x -> match x with LDo (ss, t) -> LDo (unrollStmts ss, t) | o -> o) bodyLow
+        else bodyLow
+    let bodyLow =
+        if System.Environment.GetEnvironmentVariable "FPP_STRENGTH" = "1" then
+            mapE (fun x -> match x with LDo (ss, t) -> LDo (strengthStmts ctx ss, t) | o -> o) bodyLow
+        else bodyLow
     let bodyLow = if gc then stripLeafRoots bodyLow else bodyLow
     // TEMP DEBUG: validate the freshly-lowered tree — every register it
     // names must be below ctx.NReg. Corrupt-at-build vs corrupt-at-walk.
