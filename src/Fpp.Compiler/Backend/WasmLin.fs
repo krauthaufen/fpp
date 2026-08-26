@@ -3733,10 +3733,18 @@ let private onlyIncrements (k : string) (body : Expr) : bool =
         | EPrim ("+", [ EVar (v, _); ELit (LInt "1") ]) -> key v = k
         | _ -> false)
 
-let private nonNegLit (e : Expr) : bool =
+/// the literal a counter STARTS at, when it is a non-negative one. The value
+/// matters, not just the sign: a loop from 1 proves `a.[i - 1]` as well as
+/// `a.[i]`, which is the sliding-window idiom.
+let private startLit (e : Expr) : int option =
     match e with
-    | ELit (LInt n) -> n.Length > 0 && n.[0] <> '-'
-    | _ -> false
+    | ELit (LInt n) when n.Length > 0 && n.[0] <> '-' ->
+        let mutable v = 0
+        let mutable ok = true
+        for c in n do
+            if c >= '0' && c <= '9' then v <- v * 10 + (int c - int '0') else ok <- false
+        if ok then Some v else None
+    | _ -> None
 
 /// mark every `arr.[idx]` in `body` that names exactly this pair
 let rec private markPair (safe : RefMap<Expr, bool>) (ak : string) (ik : string) (e : Expr) : unit =
@@ -3804,10 +3812,12 @@ let private buildArrLen (decls : Decl list) : Map<string, string> =
              m)
 
 let private pairKey (a : string) (i : string) : string = a + "|" + i
+let private optGetPair (o : (string * bool) option) : string * bool =
+    match o with Some v -> v | None -> ("", false)
 
 let rec private provenWalk
         (safe : RefMap<Expr, bool>) (arrLen : Map<string, string>)
-        (zero : Set<string>) (hiOf : Map<string, string * string>) (goOf : Map<string, string * string>)
+        (zero : Map<string, int>) (hiOf : Map<string, string * string>) (goOf : Map<string, string * string>)
         (facts : Set<string>) (e : Expr) : Set<string> =
     let walk f x = provenWalk safe arrLen zero hiOf goOf f x
     /// drop every fact naming a variable the expression assigns
@@ -3816,18 +3826,34 @@ let rec private provenWalk
             match p.Split '|' with
             | [| a; i |] -> not (assignsVar a x) && not (assignsVar i x)
             | _ -> true)
+    // Which FACT an index expression appeals to. `a.[i]` is the pair (a, i).
+    // `a.[i - k]` appeals to the SAME pair when the counter starts at k or
+    // above: i is in [start, len), so i - k is in [start - k, len - k), which
+    // is inside [0, len). Going the other way does not work — `a.[i + k]`
+    // needs an upper bound tighter than the loop's, which nothing here has.
+    // A DERIVED index proves nothing on its own, so it never adds a fact.
+    let idxFact (ix : Expr) : (string * bool) option =
+        match ix with
+        | EVar (i, _) -> Some (key i, true)
+        | EPrim ("-", [ EVar (i, _); ELit (LInt k) ]) ->
+            (match Map.tryFind (key i) zero, startLit (ELit (LInt k)) with
+             | Some st, Some kk when st >= kk -> Some (key i, false)
+             | _ -> None)
+        | _ -> None
     match e with
-    | EIndex (_, EVar (a, _), EVar (i, _)) ->
-        let p = pairKey (key a) (key i)
+    | EIndex (_, EVar (a, _), ix) when (idxFact ix).IsSome ->
+        let (ik, isPlain) = optGetPair (idxFact ix)
+        let p = pairKey (key a) ik
         if Set.contains p facts then refMapSet safe e true
-        Set.add p facts
-    | EIndexSet (_, EVar (a, _), EVar (i, _), v) ->
+        if isPlain then Set.add p facts else facts
+    | EIndexSet (_, EVar (a, _), ix, v) when (idxFact ix).IsSome ->
         let f1 = walk facts v
-        let p = pairKey (key a) (key i)
+        let (ik, isPlain) = optGetPair (idxFact ix)
+        let p = pairKey (key a) ik
         // the VALUE may have moved either variable
         let f2 = killAssigned f1 v
         if Set.contains p f2 then refMapSet safe e true
-        Set.add p f2
+        if isPlain then Set.add p f2 else f2
     | EAssign (v, rhs) ->
         let f1 = walk facts rhs
         f1 |> Set.filter (fun p ->
@@ -3842,7 +3868,7 @@ let rec private provenWalk
             | [| a; i |] -> a <> key v && i <> key v
             | _ -> true)
         let k = key v
-        let zero2 = if nonNegLit rhs then Set.add k zero else Set.remove k zero
+        let zero2 = match startLit rhs with Some v -> Map.add k v zero | None -> Map.remove k zero
         let hiOf2 =
             match rhs with
             | EPrim ("-", [ EArrayLen (_, EVar (a, _)); ELit (LInt "1") ]) -> Map.add k (key a, "") hiOf
@@ -3851,7 +3877,7 @@ let rec private provenWalk
             match rhs with
             | EPrim ("<=", [ EVar (i, _); EVar (h, _) ]) ->
                 (match Map.tryFind (key h) hiOf with
-                 | Some (ak, _) when Set.contains (key i) zero -> Map.add k (ak, key i) goOf
+                 | Some (ak, _) when (Map.tryFind (key i) zero).IsSome -> Map.add k (ak, key i) goOf
                  | _ -> Map.remove k goOf)
             | _ -> Map.remove k goOf
         provenWalk safe arrLen zero2 hiOf2 goOf2 f2 cont
@@ -3886,7 +3912,7 @@ let rec private provenWalk
             // length rather than the array, so nothing else recognises it.
             | EPrim ("<", [ EVar (i, _); bound ]) when
                   (lenKeyOf bound).IsSome
-                  && Set.contains (key i) zero && onlyIncrements (key i) body ->
+                  && (Map.tryFind (key i) zero).IsSome && onlyIncrements (key i) body ->
                 let bk = match lenKeyOf bound with Some k2 -> k2 | None -> ""
                 arrLen
                 |> Map.toList
@@ -3899,7 +3925,7 @@ let rec private provenWalk
             match cond with
             // `for v in a` — the guard bounds the counter directly
             | EPrim ("<", [ EVar (i, _); EArrayLen (_, EVar (a, _)) ]) when
-                  Set.contains (key i) zero
+                  (Map.tryFind (key i) zero).IsSome
                   && onlyIncrements (key i) body
                   && not (assignsVar (key a) body) -> Some (key a, key i)
             // `for i in 0 .. a.Length - 1` — the guard is a flag holding
@@ -10058,7 +10084,7 @@ let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (
     // which accesses a counted loop already proved in range — computed once,
     // BEFORE lowering, because the emission consults it per access node
     if boundsOn && System.Environment.GetEnvironmentVariable "FPP_NO_BOUNDS_ELIDE" <> "1" then
-        provenWalk ctx.SafeIdx globalArrLen Set.empty Map.empty Map.empty Set.empty body |> ignore
+        provenWalk ctx.SafeIdx globalArrLen Map.empty Map.empty Map.empty Set.empty body |> ignore
     let bodyLow1 = coreToLowE ctx body
     // the entry-$sp save must come BEFORE the rootParams pushes (they wrap
     // the whole body below) — saving after them made every return_call

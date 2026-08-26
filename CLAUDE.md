@@ -182,11 +182,15 @@ length word, which rejects a negative index in the same test — and it
 raises rather than traps, so a program can catch it. What keeps that from
 costing anything is the proof pass (`provenWalk`, WasmLin), which runs over
 the Core body BEFORE lowering and marks the accesses it can show are in
-range. Three sources of proof, and they compose:
+range. Four sources of proof, and they compose:
 
 * a counted loop's own guard — `for i in 0 .. a.Length - 1`, `for v in a`,
   and the hand-written `while i < n` where `n` is the length `a` was
   CREATED with (module-level `Array.zeroCreate n`, literal or binding);
+* a DERIVED index inside such a loop: `a.[i - k]` appeals to the same fact
+  as `a.[i]` when the counter starts at k or above, which is the sliding-
+  window idiom. The other direction does NOT hold — `a.[i + k]` needs an
+  upper bound tighter than the loop's, so it stays checked;
 * a check that already ran on the same (array, index) pair earlier in the
   same straight-line region;
 * nothing crosses a branch join, a loop back-edge or a lambda boundary —

@@ -139,6 +139,48 @@ for i in 0 .. rows.Length - 1 do
         pairs <- pairs + rows.[i] * cols.[j]
 eq "nested-counted-loops" (string pairs) "180"
 
+// ---- a DERIVED index inside a proven loop ----------------------------------
+// `a.[i - 1]` is in range wherever `a.[i]` is, as long as the counter starts
+// at 1 or above: i is in [start, len), so i - k is in [start - k, len - k).
+// The other direction does not hold — `a.[i + 1]` needs a tighter upper
+// bound than the loop gives — so it stays checked, and still answers.
+
+let seq5 = [| 1; 2; 3; 4; 5 |]
+
+let mutable diffs = 0
+for i in 1 .. seq5.Length - 1 do
+    diffs <- diffs + (seq5.[i] - seq5.[i - 1])
+eq "sliding-window" (string diffs) "4"
+
+let mutable three = 0
+for i in 2 .. seq5.Length - 1 do
+    three <- three + seq5.[i] + seq5.[i - 1] + seq5.[i - 2]
+eq "window-of-three" (string three) "27"
+
+// writing through a derived index
+let shifted = Array.copy seq5
+for i in 1 .. shifted.Length - 1 do
+    shifted.[i - 1] <- shifted.[i]
+eq "shift-left" (String.concat "," (List.map string (Array.toList shifted))) "2,3,4,5,5"
+
+// `i + 1` is still checked, and the loop that uses it stops in time
+let mutable ahead = 0
+for i in 0 .. seq5.Length - 2 do
+    ahead <- ahead + seq5.[i + 1]
+eq "look-ahead" (string ahead) "14"
+
+// a derived index that would leave the array still raises
+eq "derived-past-the-end" (attempt (fun () -> seq5.[seq5.Length - 1 + 1])) oob
+
+// the guard that makes the rule sound: a loop starting at ZERO does NOT
+// prove `a.[i - 1]`, and the first iteration raises
+let mutable hits = 0
+let mutable caught = 0
+for i in 0 .. seq5.Length - 1 do
+    try hits <- hits + seq5.[i - 1] with _ -> caught <- caught + 1
+eq "zero-start-does-not-prove-minus-one" (string caught) "1"
+eq "zero-start-rest-still-runs" (string hits) "10"
+
 // ---- the same for STRINGS ---------------------------------------------------
 
 let s = "abc"
