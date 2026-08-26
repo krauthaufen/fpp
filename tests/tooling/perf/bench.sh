@@ -26,6 +26,20 @@ only="${1:-}"
 
 source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1
 
+# one Go module, its single source file swapped per benchmark. Go runs
+# NATIVE, not wasm: `GOOS=wasip1` works and produces the right answer, but
+# Go's wasm port is ~10x its native speed (trees: 8902ms against 1409), so
+# the wasm column would measure that port rather than Go's collector. The
+# point of this column is a MATURE GC to read the F++ one against — the C
+# twins bump-allocate and never free, which is not memory management at all.
+godir="$out/go"
+mkdir -p "$godir"
+cat > "$godir/go.mod" <<'GOMOD'
+module bench
+
+go 1.24
+GOMOD
+
 # one F# project, its single source file swapped per benchmark
 fsdir="$out/fs"
 mkdir -p "$fsdir"
@@ -62,7 +76,7 @@ bestof3 () {
 
 # run_one <name> [source dir]
 run_one () {
-    local b="$1" d="${2:-.}" cms="-" fms="-" nms="-" fres="" cres="" nres=""
+    local b="$1" d="${2:-.}" cms="-" fms="-" nms="-" gms="-" fres="" cres="" nres="" gres=""
     local src="$d/$b"
 
     if [ -f "$src.c" ]; then
@@ -90,22 +104,32 @@ run_one () {
                  nms="${r%%|*}"; nres="${r#*|}"; }
     fi
 
-    local ratio="-" nratio="-"
+    if [ -f "$src.go" ]; then
+        cp "$src.go" "$godir/main.go"
+        ( cd "$godir" && go build -o prog . ) >/dev/null 2>&1 \
+            && { "$godir/prog" >/dev/null 2>&1
+                 r=$(bestof3 "$godir/prog")
+                 gms="${r%%|*}"; gres="${r#*|}"; }
+    fi
+
+    local ratio="-" nratio="-" gratio="-"
     [ "$cms" != "-" ] && [ "$fms" != "-" ] && \
         ratio=$(awk -v c="$cms" -v f="$fms" 'BEGIN { if (c > 0) printf "%.2fx", f / c; else printf "-" }')
     [ "$cms" != "-" ] && [ "$nms" != "-" ] && \
         nratio=$(awk -v c="$cms" -v n="$nms" 'BEGIN { if (c > 0) printf "%.2fx", n / c; else printf "-" }')
+    [ "$cms" != "-" ] && [ "$gms" != "-" ] && \
+        gratio=$(awk -v c="$cms" -v g="$gms" 'BEGIN { if (c > 0) printf "%.2fx", g / c; else printf "-" }')
 
     # a differing checksum means the twins are not the same program
     local flag=""
-    for x in "$cres" "$nres"; do
+    for x in "$cres" "$nres" "$gres"; do
         [ -n "$x" ] && [ -n "$fres" ] && [ "$x" != "$fres" ] && flag="  MISMATCH"
     done
-    printf "%-10s %9sms %9sms %9sms %8s %8s   %s%s\n" \
-        "$b" "$cms" "$fms" "$nms" "$ratio" "$nratio" "$fres" "$flag"
+    printf "%-10s %9sms %9sms %9sms %9sms %8s %8s %8s   %s%s\n" \
+        "$b" "$cms" "$fms" "$nms" "$gms" "$ratio" "$nratio" "$gratio" "$fres" "$flag"
 }
 
-printf "%-10s %11s %11s %11s %8s %8s   %s\n" bench C F++ "F#" "F++/C" "F#/C" result
+printf "%-10s %11s %11s %11s %11s %8s %8s %8s   %s\n" bench C F++ "F#" Go "F++/C" "F#/C" "Go/C" result
 
 # the startup floor, so a short benchmark's columns can be read fairly
 if [ -z "$only" ]; then
