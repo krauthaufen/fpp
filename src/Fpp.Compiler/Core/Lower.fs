@@ -4762,7 +4762,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 |> List.choose (fun t -> dictTryFind defsAt t.Offset)
                 |> List.filter (fun d -> d.Kind = Resolve.DefParam)
             | None -> []
-        let classLetParts =
+        // the NODE rides along: the constructor below replays the class body
+        // in SOURCE order, and `let` and `do` interleave there
+        let classLetNodes =
             classLets
             |> List.choose (fun l ->
                 let isMutable =
@@ -4771,8 +4773,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 match lowerLetParts l with
                 | Some (SimpleLet (isRec, v, sch, rhs, _)) ->
                     if isMutable then dictSet cellFields (v.Path, v.Offset) true
-                    Some (isRec, v, sch, rhs)
+                    Some (l, (isRec, v, sch, rhs))
                 | _ -> None)
+        let classLetParts = classLetNodes |> List.map snd
         // A class-level `let` may shadow a constructor parameter of the same
         // name (`let mutable key = key`). That is ONE piece of state: keep
         // the shadowing binding, since it is what the members see.
@@ -4898,21 +4901,32 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     match baseCtorCall with
                     | Some bc -> ERecordExt (name, bc, ownFieldVals)
                     | None -> ERecord (name, ownFieldVals)
-                // `do` bodies run before the instance exists, so they cannot
-                // see `this` — F# allows only side effects there
-                let withDo =
-                    match doNodes with
+                // `let` and `do` run WHERE THEY ARE WRITTEN. Wrapping all the
+                // lets around all the dos ran every let first: `do "a"` then
+                // `let y = (log "b")` then `do "c"` logged "bac" where F#
+                // logs "abc". `do` bodies still run before the instance
+                // exists, so they cannot see `this` — F# allows only side
+                // effects there.
+                let ctorItems =
+                    nodesOf n
+                    |> List.filter (fun m ->
+                        (m.NodeKind = LetDecl && not (isStaticLet m)) || m.NodeKind = BlockExpr)
+                let rec buildCtor (items : GreenNode list) : Expr =
+                    match items with
                     | [] -> alloc
-                    | ds -> ESeq ((ds |> List.map (fun d -> lowerExpr (GNode d))) @ [ alloc ])
-                let body =
-                    List.foldBack
-                        (fun (isRec, v, sch, rhs) acc ->
-                            let rhs2 =
-                                if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then
-                                    EApp (EUnknown "$forcecell", [ rhs ])
-                                else rhs
-                            ELet (isRec, v, sch, rhs2, acc))
-                        classLetParts withDo
+                    | m :: rest when m.NodeKind = BlockExpr ->
+                        ESeq [ lowerExpr (GNode m); buildCtor rest ]
+                    | m :: rest ->
+                        (match classLetNodes
+                               |> List.tryFind (fun (l, _) -> System.Object.ReferenceEquals (l, m)) with
+                         | Some (_, (isRec, v, sch, rhs)) ->
+                             let rhs2 =
+                                 if (dictTryFind cellFields (v.Path, v.Offset)).IsSome then
+                                     EApp (EUnknown "$forcecell", [ rhs ])
+                                 else rhs
+                             ELet (isRec, v, sch, rhs2, buildCtor rest)
+                         | None -> buildCtor rest)
+                let body = buildCtor ctorItems
                 let rhs =
                     match paramBinds [ ctorPat.Value ] with
                     | binds, [] -> ELam (binds, body)

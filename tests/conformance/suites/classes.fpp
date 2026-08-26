@@ -207,4 +207,62 @@ let anon =
 
 test "object-expression" (greetWith anon "z" = "anon z?")
 
+// ---- the class body runs in SOURCE order ------------------------------
+// `let` and `do` interleave where they are written. Wrapping every let
+// around every do ran the lets first, so a `do` above a `let` saw the
+// let's side effect before its own.
+
+let mutable ctorLog = ""
+let noteVal (s : string) (v : int) : int =
+    ctorLog <- ctorLog + s
+    v
+
+type Ordered(x : int) =
+    do ctorLog <- ctorLog + "a"
+    let y = noteVal "b" (x * 2)
+    do ctorLog <- ctorLog + "c"
+    let z = noteVal "d" (y + 1)
+    do ctorLog <- ctorLog + "e"
+    member _.Y = y
+    member _.Z = z
+
+let ordered = Ordered 3
+test "ctor-body-in-source-order" (ctorLog = "abcde")
+test "ctor-let-values" (ordered.Y = 6 && ordered.Z = 7)
+
+// the body runs again per instance
+let beforeSecond = ctorLog
+let ordered2 = Ordered 1
+test "ctor-runs-per-instance" (ctorLog = beforeSecond + "abcde")
+test "second-instance-has-its-own" (ordered2.Y = 2)
+
+// a body of only lets, and one of only dos
+let mutable onlyLog = ""
+type OnlyLets() =
+    let a = (onlyLog <- onlyLog + "1"; 1)
+    let b = (onlyLog <- onlyLog + "2"; 2)
+    member _.Sum = a + b
+
+type OnlyDos() =
+    do onlyLog <- onlyLog + "x"
+    do onlyLog <- onlyLog + "y"
+    member _.Tag = "t"
+
+test "only-lets-in-order" ((OnlyLets ()).Sum = 3)
+test "only-dos-in-order" ((OnlyDos ()).Tag = "t")
+test "both-logged-in-order" (onlyLog = "12xy")
+
+// a `do` may read a let ABOVE it, and a let may read one above that
+let mutable chainLog = ""
+type Chain(n : int) =
+    let first = n + 1
+    do chainLog <- chainLog + string first
+    let second = first * 2
+    do chainLog <- chainLog + string second
+    member _.Second = second
+
+let chain = Chain 1
+test "do-reads-the-let-above-it" (chainLog = "24")
+test "let-reads-the-let-above-it" (chain.Second = 4)
+
 printfn "DONE tests=%d failures=%d" ntests failures
