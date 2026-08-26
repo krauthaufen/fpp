@@ -991,6 +991,8 @@ let private rtDeclsLin (m : Mod) : unit =
     declFn m "$clshash" "$lt_ii2i"
     declFn m "$showv" "$lt_i2i"
     declFn m "$strv" "$lt_i2i"
+    // the ONE out-of-line bounds-failure throw
+    declFn m "$oob" "$lt_v2i"
 
 // $atoi(s): signed decimal string -> raw i32, over the linear string layout
 // (len at +4, UTF-16 units at +8). Mirrors the wasm-GC oracle's $atoi: an
@@ -3963,6 +3965,9 @@ type private LowCtx =
       /// because a Core expression has no offset of its own — the same node
       /// object is what the scratch pass and the replay both see.
       SafeIdx : RefMap<Expr, bool>
+      /// did any access in this body emit a check? The throw lives ONCE per
+      /// function, at the end, and each check branches to it
+      mutable OobUsed : bool
       /// in a stamped member with exactly ONE class type param: the register
       /// holding that param's witness. A compare/hash whose operands are generic
       /// fields (EField/EIndex of type `'k`) carries no bare type-var expr for
@@ -9229,6 +9234,13 @@ and private boundsGuard (ctx : LowCtx) (node : Expr) (baseR : int) (idxR : int) 
         []
     else
         boundsEmitted <- boundsEmitted + 1
+        ctx.OobUsed <- true
+        // The throw is INLINE, and both alternatives measured worse. A call
+        // to one shared thrower is 1771 -> 2132 ms on sort: an untaken call
+        // still makes the engine spill live registers around it, every
+        // iteration. A branch to one throw per function is wrong outright —
+        // it leaves an enclosing `try`'s scope before throwing, so the
+        // handler never sees it.
         [ LIf (LPrim (GeUW, [ LGet (wReg idxR); LLoad (W, LGet (wReg baseR), HDR) ]),
                [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"Index was outside the bounds of the array.\"")) ],
                []) ]
@@ -9467,6 +9479,45 @@ and private hasSafepointS (st : LStmt) : bool =
     | LTryStmt _ -> true
     | LBreak _ | LTrap -> false
 
+/// Does this branch always LEAVE — throw, trap or return? Nothing after it
+/// runs, and for the HOIST that is the whole point: a safepoint on a path
+/// that abandons the loop cannot make a hoisted pointer stale for a later
+/// iteration, because there is no later iteration. Without this, the
+/// allocation inside a bounds check's throw marked every array loop unsafe
+/// and the array was re-read from its root slot on every access — which cost
+/// more than the compare the check exists for.
+and private escapesS (ss : LStmt list) : bool =
+    match List.tryLast ss with
+    | Some (LThrow _) | Some LTrap | Some (LReturn _) -> true
+    | _ -> false
+
+/// hasSafepointS for the hoist: a branch that escapes is not counted. The
+/// expression form has to be mirrored too — a statement list reaches the
+/// walk through `LDo`, and routing that back to the plain predicate put the
+/// throw's allocation back in view.
+and private hasSafepointEH (e : LExpr) : bool =
+    match e with
+    | LAlloc _ | LCall _ | LTailCall _ | LCallIndirect _ | LCallIdx _ -> true
+    | LPrim (_, xs) -> xs |> List.exists hasSafepointEH
+    | LLoad (_, a, _) -> hasSafepointEH a
+    | LDo (ss, t) -> hasSafepointEH t || ss |> List.exists hasSafepointH
+    | _ -> false
+
+and private hasSafepointH (st : LStmt) : bool =
+    match st with
+    | LIf (c, a, b) ->
+        hasSafepointEH c
+        || (not (escapesS a) && List.exists hasSafepointH a)
+        || (not (escapesS b) && List.exists hasSafepointH b)
+    | LWhile (c, b) -> hasSafepointEH c || List.exists hasSafepointH b
+    | LBlock (_, b) -> List.exists hasSafepointH b
+    | LCallVoidS _ -> true
+    | LSet (_, v) | LSetGlobal (_, v) | LEval v | LBreakIf (_, v) | LReturn v | LThrow v | LSetMany (_, v) -> hasSafepointEH v
+    | LStore (_, a, _, v) -> hasSafepointEH a || hasSafepointEH v
+    | LMemFill (d, v, n) -> hasSafepointEH d || hasSafepointEH v || hasSafepointEH n
+    | LTryStmt _ -> true
+    | LBreak _ | LTrap -> false
+
 /// a store whose address is built from the shadow stack could write the very
 /// root slot a hoisted pointer was read from
 and private touchesRoots (e : LExpr) : bool =
@@ -9576,7 +9627,7 @@ and private hoistStmts (ctx : LowCtx) (ss : LStmt list) : LStmt list =
         | LWhile (c, body) ->
             let body = hoistStmts ctx body
             let safe =
-                not (hasSafepointE c) && not (List.exists hasSafepointS body)
+                not (hasSafepointEH c) && not (List.exists hasSafepointH body)
                 && not (List.exists storesRoots body)
             if not safe then [ LWhile (hoistE ctx c, body) ]
             else
@@ -9856,7 +9907,7 @@ let rec private preRecGroups (ctx : LowCtx) (e : Expr) : unit =
 
 let private emitFuncLow (st : St) (m : Mod) (dbgName : string) (isInit : bool) (sig_ : (LTy list * LTy) option) (structPlan : string option list) (retStruct : string option) (witnessVars : int list) (selfWits : (int * int) list) (constWits : (int * LExpr) list) (ps : VarId list) (paramTypes : Type list) (body : Expr) (finish : Fn -> unit) : unit =
     curFnDbg <- dbgName
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SafeIdx = refMapNew exprBucket; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SafeIdx = refMapNew exprBucket; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     // hidden witness-pointer params come FIRST (i32), one per quantified type
     // var, recorded in ctx.Witness so a generic aggregate can read the element
     // type's witness. Regular params follow.
@@ -10209,7 +10260,7 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
     // which construct in it lowered to a trap
     if System.Environment.GetEnvironmentVariable "FPP_LAM_DUMP" = lamName then
         eprintfn "LAM %s = %s" lamName (printExpr body)
-    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SafeIdx = refMapNew exprBucket; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    let ctx = { LSt = st; Regs = dictNew (); EnvReg = 0; RegTys = vecNew (); VarScalar = dictNew (); StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []; SafeIdx = refMapNew exprBucket; OobUsed = false; ClassWit = None; EnvAddr = None; Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
     let envId = freshTmp ctx
     let argId = freshReg ctx (key pv)
     // GC: root the env AND a ref-typed argument on the shadow stack for the body's
@@ -10446,6 +10497,29 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
 // keys of every top-level binding that is ASSIGNED somewhere: a `let mutable`
 // function must be a mutable GLOBAL holding a closure, not a fixed Func — its
 // value changes at run time, and it is both read and reassigned as a value.
+/// $oob(): build the out-of-range Failure and throw it. ONE copy per module,
+/// called from every check. The construction is ~40 instructions — allocation,
+/// safepoint, stores — and inlining it at each access ballooned every loop
+/// body that touches an array (271 ms of sort's 509 ms check overhead). It is
+/// a CALL, not a branch to one throw per function: an enclosing `try` has to
+/// catch it, and a branch would leave the handler's scope before throwing.
+let private emitOob (st : St) (m : Mod) : unit =
+    let ctx =
+        { LSt = st; Regs = dictNew (); EnvReg = -1; RegTys = vecNew (); VarScalar = dictNew ()
+          StructVars = dictNew (); Witness = dictNew (); ClassCtorWits = []
+          SafeIdx = refMapNew exprBucket; OobUsed = false; ClassWit = None; EnvAddr = None
+          Slotted = dictNew (); ActiveGen = []; SlottedGen = []; NReg = 0 }
+    // build FIRST: the register count is only known once the tree exists, and
+    // the locals must be declared before any body instruction
+    let body = LThrow (lowFailure ctx (lowStrConst st "\"Index was outside the bounds of the array.\""))
+    let f = beginFn m []
+    for id in 0 .. ctx.NReg - 1 do local f (regNm (wReg id)) (wtyName (vecGet ctx.RegTys id))
+    localsDone f
+    emitLowS f body
+    // the throw ends control flow; the declared i32 result is never produced
+    ins f "unreachable"
+    endFn f
+
 let private collectAssigned (decls : Decl list) : Dict<string, bool> =
     let s = dictNew<string, bool> ()
     let rec go (e : Expr) : unit =
@@ -11478,6 +11552,7 @@ let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
     emitClsHash m
     emitShowv m
     emitStrv m
+    emitOob st m
     // the per-record identity trio declared beside rtDeclsLin, in the SAME
     // order: the function and code sections are positional
     if gc then

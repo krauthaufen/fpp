@@ -199,11 +199,37 @@ is there to pay for it. That is why each site branches on
 `boundsGuardPeek` rather than always taking the guarded shape.
 
 Measured, best-of-five interleaved, checks on against `FPP_NO_BOUNDS=1`:
-add, read, shapes, vertices are FREE (fully proven); `sort` pays 40%
-(1771 ms against 1262) because a quicksort partition scan —
-`while a.[i] < p do i <- i + 1` — is bounded by the sentinel, not by a
-guard, and no local analysis can show it. .NET elides that one, which is
-why F# now beats F++ on `sort`; it is the open case.
+add, read, shapes, vertices are FREE (fully proven); `sort` pays 12%
+(1407 ms against 1256), all of it in a quicksort partition scan —
+`while a.[i] < p do i <- i + 1` — which is in range because `p` is an
+ELEMENT of the array, so the scan stops at it. That is a property of the
+array's CONTENTS, not of any guard or arithmetic, and no compiler proves
+it. `a.[lo + (hi - lo) / 2]` beside it IS derivable, but only from a
+precondition on qsort's parameters (inductive: `qsort lo j` has j <= hi
+because j only decrements, `qsort i hi` has i >= lo because i only
+increments) — an interprocedural analysis that would cover about 5% of
+sort's accesses, since the scans outnumber the midpoint reads ~20:1.
+
+### The check's real cost was the HOIST, not the compare
+
+Worth knowing before optimising the compare. Measured on sort, the check
+overhead split almost evenly: 238 ms for the compare and its loads, 271 ms
+for the throw. But the two were not independent — the inline throw
+ALLOCATES, `hoistStmts` refused to hoist loop-invariant global loads out of
+any loop containing a safepoint, and so the array pointer was re-read from
+its GC root slot (four instructions) on every single access.
+
+The fix is a refinement to the hoist, not to the check: a safepoint on a
+branch that always THROWS, traps or returns cannot make a hoisted pointer
+stale for a later iteration, because there is no later iteration
+(`escapesS`/`hasSafepointH`). That took sort from 1771 ms to 1407, and it
+helps any loop with a `failwith` branch, not just bounds checks.
+
+Two shapes measured WORSE and are recorded so they are not retried. Calling
+one shared thrower instead of inlining: 1771 -> 2132 ms, because an untaken
+call still makes the engine spill live registers around it every iteration.
+Branching to one throw per function: wrong, not just slow — it leaves an
+enclosing `try`'s scope before throwing, so the handler never sees it.
 
 `FPP_BOUNDS_STATS=1` prints how many checks a build emitted and elided.
 Read the EMITTED count, not the percentage: a proven access takes the fast
