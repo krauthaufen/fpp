@@ -182,7 +182,7 @@ length word, which rejects a negative index in the same test — and it
 raises rather than traps, so a program can catch it. What keeps that from
 costing anything is the proof pass (`provenWalk`, WasmLin), which runs over
 the Core body BEFORE lowering and marks the accesses it can show are in
-range. Four sources of proof, and they compose:
+range. Five sources of proof, and they compose:
 
 * a counted loop's own guard — `for i in 0 .. a.Length - 1`, `for v in a`,
   and the hand-written `while i < n` where `n` is the length `a` was
@@ -193,8 +193,47 @@ range. Four sources of proof, and they compose:
   upper bound tighter than the loop's, so it stays checked;
 * a check that already ran on the same (array, index) pair earlier in the
   same straight-line region;
-* nothing crosses a branch join, a loop back-edge or a lambda boundary —
-  facts are dropped rather than merged.
+* a PRECONDITION on a parameter, established by the function's CALLERS —
+  see below;
+* nothing crosses a branch join or a lambda boundary, and a loop's guard is
+  read with only what survives the body's own writes. That last one matters:
+  walking the guard with the richer pre-loop state "proved"
+  `while a.[i] < p do i <- i + 1`, which is exactly the access nothing can
+  prove — i's upper bound is gone the moment it is incremented.
+
+### Preconditions: what the CALLERS establish
+
+`a.[lo + (hi - lo) / 2]` inside a recursive partition cannot be proven from
+the function's own body: `lo` and `hi` are whatever the callers passed. The
+fixpoint assumes every (parameter, array) pair is in range, then drops the
+ones a call site fails to support, and repeats. The assumption is discharged
+by induction on the execution trace — a call is supported by its caller's
+facts, which held when the caller's activation began.
+
+For quicksort that closes: `qsort 0 (n - 1)` is the base (n is a literal, so
+the array is known non-empty), `qsort lo j` has j <= hi because j only FALLS
+from hi, and `qsort i hi` has i >= lo because i only RISES from lo. Which is
+why the domain tracks the two halves separately — a counter that only
+decrements keeps its upper bound while losing its lower one, and collapsing
+them into one "in range" fact loses exactly the half that survives.
+
+Facts key on the PARAMETER, not its position: the bodies the fixpoint walks
+are pre-transform, the ones emission lowers are not, and node identity does
+not survive lifting and stamping. A callee named but not applied (passed as
+a value) loses every precondition, since nothing constrains what reaches it.
+
+Three shadowed match arms cost hours here, all the same mistake: `x < y`
+must apply BOTH the "x inherits y's bounds" reading and the "y is some
+array's length" one; `n - 1` must try both "offset from an in-range index"
+and "last index of a non-empty array". Written as alternatives, the first
+arm silently swallowed the case the second existed for.
+
+The pass is compiler SOURCE, so it lives in the self-hosting subset like
+everything else here. A nested `[ for x in xs do for y in ys -> ... ]` in
+it built and passed every unit test, then died at the CORPUS fixpoint with
+"not lowerable: list comprehension" — stage-1 compiling this very file.
+`List.collect` instead. The tell that it was not the bounds work at all:
+`FPP_NO_BOUNDS=1` failed the same way.
 
 An access that is proven emits EXACTLY the code it did before checks
 existed, register bindings included: binding the base defeats the hoist
@@ -203,16 +242,24 @@ is there to pay for it. That is why each site branches on
 `boundsGuardPeek` rather than always taking the guarded shape.
 
 Measured, best-of-five interleaved, checks on against `FPP_NO_BOUNDS=1`:
-add, read, shapes, vertices are FREE (fully proven); `sort` pays 12%
-(1407 ms against 1256), all of it in a quicksort partition scan —
+add, read, shapes, vertices are FREE (fully proven), and every benchmark
+sits at the same prelude floor of emitted checks except `sort`, which keeps
+exactly the two its partition scans need. `sort` pays 18% (1493 ms against
+1258), all of it in that scan —
 `while a.[i] < p do i <- i + 1` — which is in range because `p` is an
 ELEMENT of the array, so the scan stops at it. That is a property of the
 array's CONTENTS, not of any guard or arithmetic, and no compiler proves
-it. `a.[lo + (hi - lo) / 2]` beside it IS derivable, but only from a
-precondition on qsort's parameters (inductive: `qsort lo j` has j <= hi
-because j only decrements, `qsort i hi` has i >= lo because i only
-increments) — an interprocedural analysis that would cover about 5% of
-sort's accesses, since the scans outnumber the midpoint reads ~20:1.
+it. `a.[lo + (hi - lo) / 2]` beside it IS derivable, and now is — see the
+precondition section below.
+
+A WARNING about reading these numbers. The stronger analysis emits 124
+checks against the weaker one's 135 and does strictly less work at run
+time, yet measures 1493 ms against 1410. The emitted qsort is
+instruction-identical between the two; only the local NUMBERING differs,
+because eliding an access skips its temporaries. That 6% is Cranelift
+allocating differently, not work. Compare check COUNTS when judging the
+analysis, and treat a single benchmark's milliseconds as the noisy signal
+they are here.
 
 ### The check's real cost was the HOIST, not the compare
 

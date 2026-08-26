@@ -181,6 +181,42 @@ for i in 0 .. seq5.Length - 1 do
 eq "zero-start-does-not-prove-minus-one" (string caught) "1"
 eq "zero-start-rest-still-runs" (string hits) "10"
 
+// ---- a PRECONDITION on a parameter ------------------------------------------
+// An index that arrives as a parameter is in range only if every CALLER
+// passes one — which the compiler works out across the whole program. Where
+// that holds the access is free; where a caller breaks it, the access still
+// raises, so both directions are pinned here.
+
+let trio = [| 10; 20; 30 |]
+
+let getAt (i : int) : int = trio.[i]
+
+eq "parameter-index-valid" (string (getAt 1)) "20"
+eq "parameter-index-past-end" (try string (getAt 9) with e -> e.Message) oob
+eq "parameter-index-negative" (try string (getAt -1) with e -> e.Message) oob
+
+// the midpoint of two in-range parameters is in range: the shape a binary
+// search or a partition uses
+let rec midSum (lo : int) (hi : int) : int =
+    if lo >= hi then trio.[lo]
+    else
+        let m = lo + (hi - lo) / 2
+        trio.[m] + midSum lo m
+
+eq "midpoint-of-parameters" (string (midSum 0 2)) "40"
+
+// a recursion that walks off the end still raises
+let rec walkOff (i : int) (acc : int) : int =
+    if i > 100 then acc else walkOff (i + 1) (acc + trio.[i])
+
+eq "recursion-past-the-end" (try string (walkOff 0 0) with e -> e.Message) oob
+
+// a function passed as a VALUE has no precondition: nothing constrains what
+// reaches it, so the access inside is checked
+let applyTo (f : int -> int) (v : int) : int = f v
+eq "indirect-call-valid" (string (applyTo getAt 2)) "30"
+eq "indirect-call-past-end" (try string (applyTo getAt 7) with e -> e.Message) oob
+
 // ---- the same for STRINGS ---------------------------------------------------
 
 let s = "abc"
