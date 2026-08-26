@@ -103,6 +103,24 @@ that was really a validation error with stderr piped to `/dev/null`.
 Benchmarks that compare against C live in `tests/tooling/perf/`;
 `tests/tooling/abi/` checks struct layout against emscripten.
 
+**On the allocating benchmarks, read F++/C-mm, not F++/C.** The plain C
+twins for `avl` and `trees` are ARENAS — avl bump-allocates and never frees,
+trees resets a pointer to drop a whole tree. That is the floor for "what if
+you never reclaim", not memory management, and against it the collector
+looked 2.9x slow. `<name>.mm.c` is the same program written the way someone
+who owns the lifetimes has to write it: malloc/free, and REFCOUNTS for avl,
+because the tree is persistent and each insert shares most of its nodes with
+the version before it. Against that:
+
+    trees   C-mm 866 ms   F++ 898    1.04x
+    avl     C-mm 1594     F++ 1801   1.13x
+
+So the collector costs 4-13% against real manual management, not 190%. A
+native Go twin was tried as a second opinion and dropped — its wasm port
+runs ~10x slower than native, so the column measured the port; for the
+record its arena ratios were avl 2.51x and trees 4.45x, both WORSE than
+F++ manages inside a sandbox.
+
 **Measure WARM.** wasmtime caches module compilation on disk: the first run
 of a fresh binary pays the whole Cranelift compile and reads 3-6x slower
 than every run after it. A 433 ms "regression" on the read benchmark was a
