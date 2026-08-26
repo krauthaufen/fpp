@@ -151,6 +151,26 @@ reads into twenty-seven before that condition went in. It buys 7% on a tight
 loop (191 ms -> 177 ms) and nothing on a loop whose body is already big
 enough to fall outside the size cap, for +3.2% module size.
 
+### One-instruction wrappers cost three times over
+
+A class member that IS a machine instruction — `sqrt`, `abs`, `truncate` on
+a float — has no body in its instance, so Link generates one
+(`fun x -> sqrtf x`). Calling that wrapper costs the call, a 16-byte GC BOX
+for the result (the uniform ABI has no other way to return a float), and —
+because a call is a SAFEPOINT — the loop-invariant hoist for the entire
+enclosing loop, so every array base around it goes back to being re-read
+from its root slot per access. nbody called `sqrt` 30 million times and paid
+all three: it was the worst F++/C ratio in the suite at 3.0x, and inlining
+the wrappers at their call sites took it to 1.4x (836 ms to 388).
+
+The wrapper is still emitted — `List.map sqrt xs` needs a function — it is
+just not what a direct call reaches (`inlinePrimWrappers`, WasmLin).
+
+The lesson generalises past this one case: a call in a hot loop is never
+just a call here, because it also switches hoisting off for everything
+around it. When a benchmark is slow for no visible reason, look for what is
+a CALL that should not be.
+
 ### Strength reduction: written, measured, worth NOTHING
 
 Induction-variable strength reduction for POD element offsets — one multiply

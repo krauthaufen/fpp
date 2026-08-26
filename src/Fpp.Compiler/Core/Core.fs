@@ -119,6 +119,41 @@ let children (e : Expr) : Expr list =
     | ECast (_, a, _) -> [ a ]
     | ETypeTest (_, a) -> [ a ]
 
+/// Rebuild a node with each direct sub-expression mapped. The companion to
+/// `children`: a rewrite that only cares about a few shapes still has to put
+/// everything else back together.
+let mapChildren (f : Expr -> Expr) (e : Expr) : Expr =
+    match e with
+    | ELit _ | EVar _ | EVarI _ | EUnknown _ -> e
+    | ELam (ps, b) -> ELam (ps, f b)
+    | EApp (g, xs) -> EApp (f g, List.map f xs)
+    | ELet (r, v, s, a, b) -> ELet (r, v, s, f a, f b)
+    | EIf (a, b, c) -> EIf (f a, f b, f c)
+    | EMatch (s, cs) -> EMatch (f s, cs |> List.map (fun (p, g, b) -> p, Option.map f g, f b))
+    | ETuple xs -> ETuple (List.map f xs)
+    | EListLit xs -> EListLit (List.map f xs)
+    | ECtor (n, s, xs) -> ECtor (n, s, List.map f xs)
+    | ERecord (n, fs) -> ERecord (n, fs |> List.map (fun (k, v) -> k, f v))
+    | ERecordExt (n, b, fs) -> ERecordExt (n, f b, fs |> List.map (fun (k, v) -> k, f v))
+    | EField (r, n, o) -> EField (f r, n, o)
+    | EFieldSet (r, n, o, v) -> EFieldSet (f r, n, o, f v)
+    | EPrim (op, xs) -> EPrim (op, List.map f xs)
+    | ESeq xs -> ESeq (List.map f xs)
+    | EWhile (a, b) -> EWhile (f a, f b)
+    | EAssign (v, x) -> EAssign (v, f x)
+    | ETry (b, cs) -> ETry (f b, cs |> List.map (fun (p, g, h) -> p, Option.map f g, f h))
+    | EArray (k, xs) -> EArray (k, List.map f xs)
+    | EIndex (k, a, i) -> EIndex (k, f a, f i)
+    | EIndexSet (k, a, i, v) -> EIndexSet (k, f a, f i, f v)
+    | EArrayLen (k, a) -> EArrayLen (k, f a)
+    | EArrayPin (k, a) -> EArrayPin (k, f a)
+    | EArrayUnpin (k, a) -> EArrayUnpin (k, f a)
+    | EArrayBytes (k, a) -> EArrayBytes (k, f a)
+    | EArrayCreate (k, a, b) -> EArrayCreate (k, f a, f b)
+    | EIfaceCall (i, m, r, xs) -> EIfaceCall (i, m, f r, List.map f xs)
+    | ECast (t, a, d) -> ECast (t, f a, d)
+    | ETypeTest (t, a) -> ETypeTest (t, f a)
+
 type Decl =
     | DLet of bool * VarId * Scheme * Expr
     /// foreign import: name resolves in the host's "env" module

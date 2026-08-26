@@ -10933,7 +10933,41 @@ let private scanNoCollapse (decls : Decl list) : Dict<string, bool> =
     m
 
 let mutable private linWarnings : string list = []
-let private emitLinearImpl (decls0 : Decl list) : byte[] * string list =
+/// One-instruction wrappers, inlined at their call sites.
+///
+/// A class member that IS a machine instruction — `sqrt`, `abs`, `truncate`
+/// on a float — has no body in the instance, so Link generates one:
+/// `fun x -> sqrtf x`. Calling it costs three things, and the third is the
+/// expensive one: a call, a BOXED result (the uniform ABI means the wrapper
+/// allocates a 16-byte box for every result), and — because a call is a
+/// safepoint — the loop-invariant hoist for the whole enclosing loop, so
+/// every array base around it is re-read from its root slot per access.
+/// nbody called sqrt 30M times and paid all three.
+///
+/// The wrapper itself stays: `List.map sqrt xs` still needs a function.
+let private inlinePrimWrappers (decls : Decl list) : Decl list =
+    let triv = dictNew<string, string> ()
+    for d in decls do
+        match d with
+        | DLet (_, v, _, ELam ([ (pv, _) ], EPrim (op, [ EVar (a, _) ]))) when key a = key pv ->
+            dictSet triv (key v) op
+        | _ -> ()
+    if List.isEmpty (dictPairs triv) then decls
+    else
+        let rec go (e : Expr) : Expr =
+            match e with
+            | EApp (EVar (f, _), [ arg ]) | EApp (EVarI (f, _, _), [ arg ]) ->
+                (match dictTryFind triv (key f) with
+                 | Some op -> EPrim (op, [ go arg ])
+                 | None -> mapChildren go e)
+            | _ -> mapChildren go e
+        decls |> List.map (fun d ->
+            match d with
+            | DLet (r, v, sch, b) -> DLet (r, v, sch, go b)
+            | other -> other)
+
+let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
+    let decls0 = inlinePrimWrappers decls1
     boundsEmitted <- 0
     boundsElided <- 0
     globalArrLen <- if boundsOn then buildArrLen decls0 else Map.empty
