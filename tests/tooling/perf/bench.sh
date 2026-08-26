@@ -26,20 +26,36 @@ only="${1:-}"
 
 source /opt/emsdk/emsdk_env.sh >/dev/null 2>&1
 
-# The C column is an ARENA on the allocating benchmarks: avl bump-allocates
-# and never frees, trees resets a pointer to drop a whole tree. That is not
-# memory management, it is the floor for "what if you never reclaim", and
-# reading F++ against it says nothing about the collector. `<name>.mm.c` is
-# the same program written the way someone who owns the lifetimes has to
-# write it — malloc/free, and REFCOUNTS where the structure is persistent
-# and versions share nodes. Read F++/C-mm.
+# Every twin MANAGES MEMORY. The C twins for avl and trees used to be bump
+# arenas — one never freed, the other dropped a whole tree by resetting a
+# pointer — and against that the collector looked 2.9x slow while measuring
+# something no real program can do. They malloc/free now, with refcounts for
+# avl since the tree is persistent and versions share nodes.
 #
-# A Go twin was tried here as "a mature GC" and dropped: `GOOS=wasip1` works
-# and answers correctly, but Go's wasm port runs ~10x its native speed
-# (trees 8902ms against 1409), so the column measured that port and not the
-# collector, and running Go native against everyone else's wasm compares
-# nothing. For the record, native Go on the arena ratio: avl 2.51x,
-# trees 4.45x — both WORSE than F++ manages inside a sandbox.
+# A Go twin was tried as "a mature GC" and dropped: `GOOS=wasip1` works and
+# answers correctly, but Go's wasm port runs ~10x its native speed (trees
+# 8902ms against 1409), so the column measured the port, not the collector.
+# For the record its NATIVE numbers against the old arena C were avl 2.51x
+# and trees 4.45x — both worse than F++ manages inside a sandbox.
+
+# one Rust crate, its single source file swapped per benchmark
+rsdir="$out/rs"
+mkdir -p "$rsdir/src"
+cat > "$rsdir/Cargo.toml" <<'CARGO'
+[package]
+name = "bench"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+CARGO
 
 # one F# project, its single source file swapped per benchmark
 fsdir="$out/fs"
@@ -105,14 +121,16 @@ run_one () {
                  nms="${r%%|*}"; nres="${r#*|}"; }
     fi
 
-    # <name>.mm.c — the same program with REAL memory management, built and
-    # run exactly like the arena twin. This is the column to read F++
-    # against on anything that allocates.
-    if [ -f "$src.mm.c" ]; then
-        emcc -O2 "$src.mm.c" -o "$out/$b.mm.wasm" -s STANDALONE_WASM -s PURE_WASI=1 \
-             -s TOTAL_MEMORY=1073741824 >/dev/null 2>&1 \
-            && { "$wt" run -W gc=y,exceptions=y "$out/$b.mm.wasm" >/dev/null 2>&1
-                 r=$(bestof3 "$wt" run -W gc=y,exceptions=y "$out/$b.mm.wasm")
+    # Rust, to the SAME wasm target under the SAME engine. No GC, but real
+    # ownership — and bounds checks ON by default, which is what makes it
+    # the useful third point: C says what unchecked manual memory costs,
+    # Rust says what CHECKED manual memory costs, F++ says what a collector
+    # costs on top of that.
+    if [ -f "$src.rs" ]; then
+        cp "$src.rs" "$rsdir/src/main.rs"
+        ( cd "$rsdir" && cargo build --release --quiet --target wasm32-wasip1 ) >/dev/null 2>&1 \
+            && { "$wt" run -W gc=y,exceptions=y "$rsdir/target/wasm32-wasip1/release/bench.wasm" >/dev/null 2>&1
+                 r=$(bestof3 "$wt" run -W gc=y,exceptions=y "$rsdir/target/wasm32-wasip1/release/bench.wasm")
                  gms="${r%%|*}"; gres="${r#*|}"; }
     fi
 
@@ -121,10 +139,8 @@ run_one () {
         ratio=$(awk -v c="$cms" -v f="$fms" 'BEGIN { if (c > 0) printf "%.2fx", f / c; else printf "-" }')
     [ "$cms" != "-" ] && [ "$nms" != "-" ] && \
         nratio=$(awk -v c="$cms" -v n="$nms" 'BEGIN { if (c > 0) printf "%.2fx", n / c; else printf "-" }')
-    # the ratio that means something on an allocating benchmark: F++ against
-    # C that actually frees, not against C that never does
-    [ "$gms" != "-" ] && [ "$fms" != "-" ] && \
-        gratio=$(awk -v g="$gms" -v f="$fms" 'BEGIN { if (g > 0) printf "%.2fx", f / g; else printf "-" }')
+    [ "$cms" != "-" ] && [ "$gms" != "-" ] && \
+        gratio=$(awk -v c="$cms" -v g="$gms" 'BEGIN { if (c > 0) printf "%.2fx", g / c; else printf "-" }')
 
     # a differing checksum means the twins are not the same program
     local flag=""
@@ -132,10 +148,10 @@ run_one () {
         [ -n "$x" ] && [ -n "$fres" ] && [ "$x" != "$fres" ] && flag="  MISMATCH"
     done
     printf "%-10s %9sms %9sms %9sms %9sms %8s %8s %8s   %s%s\n" \
-        "$b" "$cms" "$gms" "$fms" "$nms" "$ratio" "$nratio" "$gratio" "$fres" "$flag"
+        "$b" "$cms" "$gms" "$fms" "$nms" "$ratio" "$gratio" "$nratio" "$fres" "$flag"
 }
 
-printf "%-10s %11s %11s %11s %11s %8s %8s %8s   %s\n" bench C "C-mm" F++ "F#" "F++/C" "F#/C" "F++/C-mm" result
+printf "%-10s %11s %11s %11s %11s %8s %8s %8s   %s\n" bench C Rust F++ "F#" "F++/C" "Rust/C" "F#/C" result
 
 # the startup floor, so a short benchmark's columns can be read fairly
 if [ -z "$only" ]; then

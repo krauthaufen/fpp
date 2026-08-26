@@ -1,21 +1,24 @@
-/* The C twin of trees.fpp. Nodes come from a bump arena that is RESET after
- * each tree is checked — the C equivalent of "this garbage died young", and
- * about as cheap as reclamation gets. */
+/* The C twin of trees.fpp: malloc per node, and the tree freed when it goes
+ * out of scope — what a C programmer who owns the lifetime writes.
+ *
+ * This replaced a bump-arena twin that dropped a whole tree by resetting a
+ * pointer. That is not memory management, and against it the collected
+ * languages looked 2.9x slow while the real gap is 4%. */
 #include <stdio.h>
 #include <stdlib.h>
 
 typedef struct Node { struct Node *l, *r; } Node;
 
-#define ARENA (1 << 24)
-static Node *arena; static long arena_used = 0;
-static Node *alloc_node(void) { return &arena[arena_used++]; }
-
 static Node *make(int d) {
-    if (d == 0) return 0;
-    Node *n = alloc_node();
+    if (d == 0) return NULL;
+    Node *n = malloc(sizeof(Node));
     n->l = make(d - 1);
     n->r = make(d - 1);
     return n;
+}
+
+static void destroy(Node *t) {
+    if (t) { destroy(t->l); destroy(t->r); free(t); }
 }
 
 static int check(Node *t) { return t ? 1 + check(t->l) + check(t->r) : 1; }
@@ -24,22 +27,20 @@ static int check(Node *t) { return t ? 1 + check(t->l) + check(t->r) : 1; }
 #define MIND 4
 
 int main(void) {
-    arena = malloc(sizeof(Node) * ARENA);
     long long acc = 0;
-    long base;
     Node *longLived = make(MAXD);
-    base = arena_used;
     for (int d = MIND; d <= MAXD; d += 2) {
         long iters = 1L << (MAXD - d + MIND);
         int sum = 0;
         for (long i = 0; i < iters; i++) {
-            arena_used = base;              /* drop the previous tree */
-            sum += check(make(d));
+            Node *t = make(d);
+            sum += check(t);
+            destroy(t);                 /* the lifetime ends here */
         }
         acc += sum;
     }
-    arena_used = base;
     acc += check(longLived);
+    destroy(longLived);
     printf("%.0f\n", (double)acc);
     return 0;
 }

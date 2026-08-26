@@ -103,23 +103,34 @@ that was really a validation error with stderr piped to `/dev/null`.
 Benchmarks that compare against C live in `tests/tooling/perf/`;
 `tests/tooling/abi/` checks struct layout against emscripten.
 
-**On the allocating benchmarks, read F++/C-mm, not F++/C.** The plain C
-twins for `avl` and `trees` are ARENAS — avl bump-allocates and never frees,
-trees resets a pointer to drop a whole tree. That is the floor for "what if
-you never reclaim", not memory management, and against it the collector
-looked 2.9x slow. `<name>.mm.c` is the same program written the way someone
-who owns the lifetimes has to write it: malloc/free, and REFCOUNTS for avl,
-because the tree is persistent and each insert shares most of its nodes with
-the version before it. Against that:
+**Every twin manages memory, and there is a Rust column.** The C twins for
+`avl` and `trees` used to be bump ARENAS — one never freed, the other
+dropped a whole tree by resetting a pointer — and against that the collector
+looked 2.9x slow while measuring something no real program can do. They
+malloc/free now, with refcounts for `avl` because the tree is persistent and
+each insert shares most of its nodes with the version before it.
 
-    trees   C-mm 866 ms   F++ 898    1.04x
-    avl     C-mm 1594     F++ 1801   1.13x
+Rust builds to the same `wasm32-wasip1` under the same engine, with bounds
+checks ON, which makes it the useful third point: C says what UNCHECKED
+manual memory costs, Rust what CHECKED manual memory costs, F++ what a
+collector costs on top. Read as of this writing:
 
-So the collector costs 4-13% against real manual management, not 190%. A
-native Go twin was tried as a second opinion and dropped — its wasm port
-runs ~10x slower than native, so the column measured the port; for the
-record its arena ratios were avl 2.51x and trees 4.45x, both WORSE than
-F++ manages inside a sandbox.
+    allocation   avl    F++ 1827  Rust 1796   — within 2%
+                 trees  F++ 900   Rust 1137   — F++ ahead by 26%
+    bounds       sort   F++ 1501  Rust 1472   — within 2%, and Rust cannot
+                                                elide the partition scans
+                                                either
+    streaming    read/vertices/shapes         — F++ ~1.25x Rust
+    float        nbody  F++ 389   Rust 305    — 1.28x, the widest gap left
+
+So the collector is not the problem it looked like, and the bounds checks
+cost what Rust's cost. What is left is array streaming and float-heavy code.
+
+A Go twin was tried as "a mature GC" and dropped: `GOOS=wasip1` works and
+answers correctly, but Go's wasm port runs ~10x its native speed (trees
+8902ms against 1409), so the column measured the port. For the record its
+NATIVE numbers against the old arena C were avl 2.51x and trees 4.45x, both
+worse than F++ manages inside a sandbox.
 
 **Measure WARM.** wasmtime caches module compilation on disk: the first run
 of a fresh binary pays the whole Cranelift compile and reads 3-6x slower
