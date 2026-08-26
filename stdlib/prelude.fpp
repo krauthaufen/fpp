@@ -895,6 +895,11 @@ type Ref<'a> = ByRefCell<'a>
 type ref<'a> = ByRefCell<'a>
 let ref (value : 'a) : Ref<'a> = { Value = value }
 
+/// F#'s ref-cell surface beside `!`, `:=` and `.contents`: the int-only bumps.
+/// There is no `Ref.value` — modern FSharp.Core dropped it.
+let incr (r : Ref<int>) : unit = r.Value <- r.Value + 1
+let decr (r : Ref<int>) : unit = r.Value <- r.Value - 1
+
 
 type ActiveChoice2<'a, 'b> =
     | Choice2Of1 of 'a
@@ -1294,6 +1299,11 @@ module Single =
     let IsFinite (x : float32) : bool = not (IsNaN x) && not (IsInfinity x)
 
 module Option =
+    /// `ofObj null` is None and anything else is Some — the bridge from a
+    /// nullable reference to an option, which F# code reaches for at every
+    /// boundary with a .NET API.
+    let ofObj (v : 'a) : 'a option = if isNull v then None else Some v
+    let toObj (o : 'a option) : 'a = match o with Some v -> v | None -> null
     let isSome (o : 'a option) : bool = match o with Some _ -> true | None -> false
     let isNone (o : 'a option) : bool = match o with Some _ -> false | None -> true
     let map (f : 'a -> 'b) (o : 'a option) : 'b option =

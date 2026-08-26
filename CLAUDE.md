@@ -330,12 +330,12 @@ whose arms are statements and whose result continues below.
 traps, which is a long way to travel for a missing bracket. Write the match
 LAST — `if not c then e else match ...` — rather than parenthesising it.
 
-**A builtin conversion is not a first-class function.** `List.map string xs`
-and `List.map int xs` compile under .NET and lower to nothing: the backend
-stubs them (`not ported: EUnknown string`) and the stub traps when reached.
-`string` and `int` are emitted at their APPLICATION, so they have to be
-applied — `List.map (fun x -> string x) xs`. Grep for `map string`/`map int`
-before wondering why a green build dies at the fixpoint.
+**A builtin conversion is emitted at its APPLICATION.** `string` and `int`
+are not functions in the emitted code, so `List.map string xs` used to leave
+the bare name for the backend to stub — green build, trap when reached. It
+now eta-expands: inference records the SOURCE kind at the bare identifier
+(the same channel an application uses) and Lower wraps it in a lambda. If
+you add a conversion name, add it to BOTH lists or the old trap returns.
 
 ## Conventions
 

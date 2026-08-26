@@ -1219,7 +1219,41 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 && (if d.Path = path then (dictTryFind topLevelDefs d.Offset).IsSome else true) ->
                                EVarI (varIdOf d, schemeOf d, inst)
                            | _ -> EVar (varIdOf d, schemeOf d))
-                      | None -> EUnknown t.Text)
+                      | None ->
+                          // A BUILTIN CONVERSION USED AS A VALUE. `string`
+                          // and friends are emitted at their APPLICATION, so
+                          // `List.map string xs` left the bare name for the
+                          // backend to stub — and the stub trapped when
+                          // reached, with the program otherwise green. Eta-
+                          // expand it against the source kind inference
+                          // recorded, which is the same lowering the applied
+                          // form gets.
+                          let isConv =
+                              List.contains t.Text
+                                  [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
+                                    "float"; "float32"; "float16"; "string"; "char"; "byte"
+                                    "sbyte"; "nativeint" ]
+                          (match (if isConv then dictTryFind opKinds t.Offset else None) with
+                           | Some k ->
+                               let v = { Path = path; Offset = t.Offset + 27000000; Name = "_conv" }
+                               let anon = mono (TCon ("?", []))
+                               let arg = EVar (v, anon)
+                               let viaPrelude (nm : string) =
+                                   match dictTryFind memberIndex nm with
+                                   | Some pd -> Some (EApp (EVar (varIdOf pd, schemeOf pd), [ arg ]))
+                                   | None -> None
+                               let routed =
+                                   if t.Text = "string" && k = "s" then viaPrelude "FloatFmt.ToStrS"
+                                   elif (t.Text = "float32" || t.Text = "single") && k = "t" then viaPrelude "FloatFmt.OfStrS"
+                                   elif t.Text = "string" && (k = "f" || k = "d") then viaPrelude "FloatFmt.ToStr"
+                                   elif (t.Text = "float" || t.Text = "double") && k = "t" then viaPrelude "FloatFmt.OfStr"
+                                   else None
+                               let body =
+                                   match routed with
+                                   | Some e -> e
+                                   | None -> EApp (EUnknown (t.Text + "#" + k), [ arg ])
+                               ELam ([ v, anon ], body)
+                           | None -> EUnknown t.Text))
                  | None -> note (offsetOf n) "type-variable expression")
             // a numeric conversion carries the source kind inference found
             // The TUPLE VIEW of a trailing out parameter: `d.TryGetValue k`
@@ -3704,6 +3738,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let o2 = { Path = path; Offset = offsetOf n + 25000000; Name = "_o" }
                               let anon2 = mono (TCon ("?", []))
                               ELam ([ o2, anon2 ], EApp (EUnknown "refEq", [ lowerExpr (GNode lhs); EVar (o2, anon2) ]))
+                          // F# spells a ref cell's payload `.contents` as
+                          // well as `.Value`; one field holds it
+                          elif owner = "ByRefCell" && name.Text = "contents" then
+                              EField (lowerExpr (GNode lhs), "Value", owner)
                           else EField (lowerExpr (GNode lhs), name.Text, owner))
                  | _ -> note (offsetOf n) "dot shape")
             | ForExpr ->

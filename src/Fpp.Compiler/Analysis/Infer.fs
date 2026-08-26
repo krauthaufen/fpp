@@ -720,6 +720,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "Option.Value" (m (TVar elem))
     registerOptionMembers ()
 
+    // ---- `.contents` on a ref cell ----------------------------------------
+    // F# spells the payload both `r.Value` and `r.contents`. The cell holds
+    // ONE field; the second name is registered here and Lower reads it as
+    // `Value`. Without this the access typed against nothing, and reached
+    // emission as a bare field — a trap with no diagnostic.
+    let registerRefMembers () =
+        if (dictTryFind fields "ByRefCell.contents").IsNone then
+            let elem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
+            let fi =
+                { TypeName = "ByRefCell"; Params = [ elem ]; Quantified = []
+                  FieldType = TVar elem; DefKey = None; IsStatic = false
+                  Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
+            registerField "ByRefCell.contents" fi
+            // and it is MUTABLE, the way `Value` is: `r.contents <- v`
+            registerField "$mut:ByRefCell.contents" fi
+    registerRefMembers ()
+
     // ---- builtin members on `list` ----------------------------------------
     // Same argument as `option`: F# code says `xs.IsEmpty`, and these are
     // properties of the cons CELL, identical at every element type. A member
@@ -3328,7 +3345,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // name — without this the piped result stayed a
                           // fresh var and generalized, so downstream code
                           // (the linear print classifier included) saw '?'
-                          TFun (st.Fresh (), TCon (t.Text, []))
+                          let src = st.Fresh ()
+                          // the SOURCE kind rides the same channel an
+                          // application's does, so lowering can eta-expand
+                          // this into a real function. Without it the name
+                          // reached emission as itself and the stub trapped.
+                          vecAdd opKindsRaw (t.Offset, src)
+                          TFun (src, TCon (t.Text, []))
                       | None ->
                           // truly unbound: nothing resolved it, nothing
                           // will — remembered so the resolver's

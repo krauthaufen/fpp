@@ -16,7 +16,7 @@ The oracle is `dotnet fsi` (real F#), cached in `expected/`:
 Porting rules: drop the parts outside the subset WITH an in-file `DROPPED:`
 comment naming the feature; keep original test names; route output to stdout
 (`stderr` in the originals); `!x` in argument position needs parens (`g (!x)`
-— F++ parser gap); `List.map string`-style bare conversions are the known
-backend stub (CLAUDE.md) — eta-expand them.
+— F++ parser gap). `List.map string`-style bare conversions used to be a
+backend stub that trapped; they eta-expand now and need no workaround.
 
 skip.txt lists whole suites that cannot fit, as `name: reason` lines.
