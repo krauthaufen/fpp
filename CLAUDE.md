@@ -175,14 +175,20 @@ Two were tried, measured, and **reverted** for not paying: inlining `$toi`
 everywhere, and caching `i * stride` across an element's fields (the engine
 already does that one). Do not re-add them without a number.
 
-### Bounds checks: there is nothing to eliminate
+### Bounds checks: there are NONE
 
-Worth knowing before someone sets out to write the pass. The compiler emits
-NO bounds check of its own — the check lives inside `array.get`, and wasm-GC
-has no unchecked variant to emit instead. The only path without a per-element
-check is a PINNED array, which reads linear memory with a plain load, and
-that is worth about 8% (191 ms against 175 ms on the vertex benchmark). It is
-not the gap to C.
+This paragraph used to say "there is nothing to eliminate", and that was
+true of the wasm-GC backend: the check lived inside `array.get`, which has
+no unchecked variant to emit instead. That backend is gone. wasm-linear
+reads an element with a plain load, so there is no check at all — `a.[5]`
+on a three-element array answers whatever is next in memory and a write
+stores there (recorded in DIVERGENCES.md, where F# raises). Adding one is a
+per-access cost on the hottest benchmark code, so treat it as a performance
+decision rather than a bug fix, and measure it.
+
+For reference, when the check DID exist, the only way around it was a
+PINNED array reading linear memory directly, worth about 8% (191 ms against
+175 ms on the vertex benchmark). It was not the gap to C.
 
 `for i in 0 .. arr.Length - 1` already evaluates the bound once: the loop
 body contains zero `array.len`. That one was checked, not assumed.

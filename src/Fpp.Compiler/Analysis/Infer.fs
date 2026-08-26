@@ -587,6 +587,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// offsets of bare body expressions that turned out to have NO value —
     /// statements, not implicit yields
     let compStmtsRaw = vecNew<int> ()
+    /// What a comprehension YIELDS, by the offset of the `yield` / `yield!` /
+    /// `->` token that produced it, and whether it was a `yield!` (whose
+    /// operand is a whole collection, not one element). A `for` types as
+    /// unit, so without this the list's element type stayed a free variable:
+    /// `[ for i in xs -> i * 10 ]` had element `'a`, and `List.sum` of it
+    /// stamped its Num instance at `$ref` and trapped.
+    let compYieldAt = dictNew<int, Type * bool> ()
 
     /// A body item with no computation keyword of its own: the only kind
     /// whose reading depends on its type.
@@ -4666,6 +4673,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           tBool
                       // `not` with nothing to negate is the FUNCTION
                       | _ -> TFun (tBool, tBool))
+                 | Some t when t.Text = "yield" ->
+                     // `yield!` lexes as `yield` then `!`, and its operand is
+                     // a whole COLLECTION rather than one element
+                     let isBang =
+                         tokensOf n |> List.exists (fun t2 -> t2.Kind = Operator && t2.Text = "!")
+                     (match inner with
+                      | [ i ] -> dictSet compYieldAt t.Offset (i, isBang)
+                      | _ -> ())
+                     st.Fresh ()
                  | Some t when t.Text = "assert" ->
                      (match inner with
                       | [ i ] -> unifyAt t.Offset i tBool
@@ -4879,6 +4895,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         for c in nodesOf m do addItems c
                     elif m.NodeKind = LetDecl || m.NodeKind = ForExpr || m.NodeKind = WhileExpr then
                         exprType (GNode m) |> ignore
+                        // a comprehension item types as UNIT, so its element
+                        // type has to come from what it YIELDS — otherwise
+                        // the list's element stayed free and a class
+                        // constraint on it (`List.sum`) had nothing to
+                        // dispatch on
+                        unifyYields m elem
                     elif isExprish m.NodeKind then
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
                         // a RANGE item splices: `[ a .. b ]` is the range's
@@ -5782,10 +5804,23 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | Some t -> unifyAt t.Offset (exprType (GNode cond)) tBool
                       | None -> unify (exprType (GNode cond)) tBool |> ignore)
                  | _ -> ())
+                // `[ for i in xs -> e ]`: the arrow form yields `e` and has
+                // no `yield` token to key on, so its type is recorded at the
+                // ARROW. The general loop below is where the body is typed —
+                // once — so the type is captured from it rather than by
+                // typing the body a second time.
+                let arrowOff =
+                    tokensOf n
+                    |> List.tryFind (fun t -> t.Kind = Operator && t.Text = "->")
+                    |> Option.map (fun t -> t.Offset)
+                let mutable lastBody : Type option = None
                 for m in nodesOf n do
                     if List.exists (fun h -> System.Object.ReferenceEquals (h, m)) handled then ()
                     elif isPatKind m.NodeKind then patType fvars m |> ignore
-                    elif isExprish m.NodeKind then exprType (GNode m) |> ignore
+                    elif isExprish m.NodeKind then lastBody <- Some (exprType (GNode m))
+                (match arrowOff, lastBody with
+                 | Some ao, Some bt -> dictSet compYieldAt ao (bt, false)
+                 | _ -> ())
                 tUnit
             | CompExpr ->
                 // The PROBE. Type the BUILDER — that is what decides the
@@ -6033,6 +6068,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         for c in nodesOf m do addItems c
                     elif m.NodeKind = LetDecl || m.NodeKind = ForExpr || m.NodeKind = WhileExpr then
                         exprType (GNode m) |> ignore
+                        unifyYields m elem
                     elif isExprish m.NodeKind then
                         exprExpect <- elemExpect
                         let off = match Green.tokens (GNode m) |> List.tryHead with Some t -> t.Offset | None -> 0
@@ -6060,6 +6096,40 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 st.Fresh ()
 
     // ---- declarations -----------------------------------------------------
+
+    /// Unify a comprehension item's YIELDS with the collection's element
+    /// type. The item has already been typed (a `for` answers unit), so this
+    /// only reads what the yields recorded — nothing is typed twice, which
+    /// matters because a comprehension nests once per level.
+    and unifyYields (m : GreenNode) (elem : Type) : unit =
+        // A NESTED collection literal owns its own yields: the outer element
+        // of `[| for i in .. -> [| for j in .. -> j |] |]` is an ARRAY, and
+        // taking the inner arrow for it froze the outer element to int.
+        // A nested `for` is NOT such a boundary — its yields are this
+        // comprehension's.
+        let rec walk (nd : GreenNode) : unit =
+            for c in nd.Children do
+                match c with
+                | GToken t -> visit t
+                | GNode inner ->
+                    if inner.NodeKind = ListExpr || inner.NodeKind = ArrayExpr
+                       || inner.NodeKind = CompExpr || inner.NodeKind = BraceExpr then ()
+                    else walk inner
+        and visit (t : Token) : unit =
+            let isYield = t.Kind = Keyword && t.Text = "yield"
+            let isArrow = t.Kind = Operator && t.Text = "->"
+            if isYield || isArrow then
+                match dictTryFind compYieldAt t.Offset with
+                // `yield! xs` hands over a whole collection: its ELEMENT is
+                // the element here, and the collection may be a list or an
+                // array
+                | Some (ty, true) ->
+                    (match prune ty with
+                     | TCon (("list" | "array" | "seq" | "IEnumerable"), [ e ]) -> unifyAt t.Offset e elem
+                     | _ -> ())
+                | Some (ty, false) -> unifyAt t.Offset ty elem
+                | None -> ()
+        walk m
 
     and inferLet (n : GreenNode) : Type =
         let isRec =

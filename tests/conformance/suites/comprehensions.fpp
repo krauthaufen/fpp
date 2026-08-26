@@ -105,4 +105,36 @@ let count1 =
     count
 test "conest1" (count1 = 9)
 
+// ---- the ELEMENT type of a comprehension -----------------------------------
+// A `for` types as unit, so the collection's element type has to come from
+// what the body YIELDS. Left free it looked fine — until something needed a
+// CLASS instance for the element (`List.sum` wants Num), which then had
+// nothing to dispatch on and trapped at run time.
+
+test "sum-of-an-arrow-comprehension" (List.sum [ for i in [ 1; 2; 3 ] -> i * 10 ] = 60)
+test "sum-of-a-yield-comprehension" (List.sum [ for i in [ 1; 2; 3 ] do yield i * 10 ] = 60)
+test "sum-of-a-conditional-comprehension" (List.sum [ for i in [ 1; 2; 3 ] do if i > 1 then yield i ] = 5)
+test "sum-of-a-yield-bang-comprehension" (List.sum [ for i in [ 1; 2; 3 ] do yield! [ i; i ] ] = 12)
+test "sum-of-an-array-comprehension" (Array.sum [| for i in [ 1; 2; 3 ] -> i * 10 |] = 60)
+test "sum-over-a-range" (List.sum [ for i in 1 .. 4 -> i ] = 10)
+test "sum-of-a-nested-loop" (List.sum [ for i in 1 .. 2 do for j in 1 .. 2 do yield i * j ] = 9)
+test "sum-through-a-let" (List.sum [ for i in [ 1; 2 ] do let d = i * 3 in yield d ] = 9)
+test "sum-with-a-tuple-binder" (List.sum [ for (a, b) in [ (1, 2); (3, 4) ] -> a + b ] = 10)
+
+// the same for FLOAT elements, where the instance differs
+test "float-sum" (List.sum [ for i in [ 1.5; 2.5 ] -> i ] = 4.0)
+test "float-average" (List.average [ for i in [ 1.0; 3.0 ] -> i ] = 2.0)
+
+// other class-constrained functions over a comprehension
+test "max-of-a-comprehension" (List.max [ for i in [ 1; 5; 3 ] -> i ] = 5)
+test "min-of-a-comprehension" (List.min [ for i in [ 4; 2 ] -> i ] = 2)
+test "sort-of-a-comprehension" (List.sort [ for i in [ 3; 1 ] -> i ] = [ 1; 3 ])
+test "sumBy-over-a-comprehension" (List.sumBy (fun v -> v * 2) [ for i in 1 .. 3 -> i ] = 12)
+
+// a NESTED comprehension: the outer element is the inner COLLECTION, not its
+// element — taking the inner yield for the outer froze it to int
+let grid = [| for i in 0 .. 2 -> [| for j in 0 .. i -> j |] |]
+test "nested-array-comprehension" (Array.sum (Array.map Array.sum grid) = 4)
+test "nested-list-comprehension" (List.sum [ for i in 1 .. 2 -> List.sum [ for j in 1 .. i -> j ] ] = 4)
+
 printfn "DONE tests=%d failures=%d" ntests failures

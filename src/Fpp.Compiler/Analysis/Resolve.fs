@@ -1411,7 +1411,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 if not (List.contains t.Text
                             [ "printfn"; "printf"; "eprintfn"; "eprintf"; "sprintf"
                               "failwith"; "failwithf"; "raise"; "reraise"
-                              "invalidArg"; "invalidOp"; "print"; "obj"; "exit"
+                              "invalidArg"; "invalidOp"; "nullArg"; "print"; "obj"; "exit"
                               "ignore"; "not"; "id"; "fst"; "snd" ]) then
                     vecAdd missing (t.Offset, "unbound value '" + t.Text + "'"))
 

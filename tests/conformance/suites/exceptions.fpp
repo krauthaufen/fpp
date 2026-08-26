@@ -138,4 +138,52 @@ test "raise-Failure" ((try raise (Failure "z") with Failure m -> m | _ -> "?") =
 test "handler-value-type" ((try "a" with _ -> "b") = "a")
 test "finally-does-not-change-value" ((try 5 finally ignore 0) = 5)
 
+// ---- reraise ----------------------------------------------------------
+// `reraise ()` re-raises what the enclosing `with` clause caught. F# gives
+// no other way to name that exception, so a wildcard handler can reraise
+// just as a binding one can.
+
+exception Reraised of string
+
+let viaWildcard () : unit = try failwith "boom" with _ -> reraise ()
+test "reraise-from-wildcard" ((try (viaWildcard (); "no") with e -> e.Message) = "boom")
+
+let viaCase () : unit = try raise (Reraised "x") with Reraised _ -> reraise ()
+test "reraise-keeps-the-case"
+     ((try (viaCase (); "no") with Reraised m -> m | _ -> "wrong") = "x")
+
+// a handler may reraise CONDITIONALLY
+let sometimes (n : int) : unit =
+    try failwith "cond" with e -> (if n > 0 then reraise () else ())
+
+test "reraise-when-taken" ((try (sometimes 1; "no") with e -> e.Message) = "cond")
+test "reraise-when-not-taken" ((sometimes 0; "ran") = "ran")
+
+// through two levels of handler
+let twice () : unit = try (try failwith "deep" with _ -> reraise ()) with _ -> reraise ()
+test "reraise-through-two-levels" ((try (twice (); "no") with e -> e.Message) = "deep")
+
+// a `finally` still runs when the handler reraises
+let mutable finLog = ""
+let withFinally () : unit =
+    try
+        try failwith "e6" with _ -> reraise ()
+    finally finLog <- finLog + "fin"
+
+test "reraise-runs-finally" ((try (withFinally (); "no") with e -> e.Message) = "e6")
+test "reraise-finally-ran" (finLog = "fin")
+
+// a handler that does NOT reraise is unaffected
+let handled () : string = try failwith "e4" with e -> "handled " + e.Message
+test "handler-without-reraise" (handled () = "handled e4")
+
+// ---- the argument exceptions carry .NET's message shape --------------------
+
+test "invalidArg-message"
+     ((try (invalidArg "p" "bad thing"; "no") with e -> e.Message) = "bad thing (Parameter 'p')")
+test "invalidOp-message"
+     ((try (invalidOp "oops"; "no") with e -> e.Message) = "oops")
+test "nullArg-message"
+     ((try (nullArg "q"; "no") with e -> e.Message) = "Value cannot be null. (Parameter 'q')")
+
 printfn "DONE tests=%d failures=%d" ntests failures

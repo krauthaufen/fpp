@@ -213,6 +213,11 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     for k, d in dictPairs projectMembers do dictSet memberIndex k d
     for k, d in binder.Members do dictSet memberIndex k d
 
+    /// The exception a `with` clause is handling, while its body is lowered.
+    /// `reraise ()` re-raises THAT — F# gives no other way to name it, so
+    /// every clause's pattern is wrapped to bind it whether it asked or not.
+    let mutable currentReraise : (VarId * Scheme) option = None
+
     // while lowering a class body: the receiver, and the class-level
     // bindings that became instance fields
     let mutable currentSelf : (VarId * Scheme) option = None
@@ -1228,6 +1233,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // expand it against the source kind inference
                           // recorded, which is the same lowering the applied
                           // form gets.
+                          // `reraise ()` re-raises what the enclosing `with`
+                          // clause caught. Outside a handler it is an error
+                          // in F# too; here it stays the unknown it was.
+                          if t.Text = "reraise" && currentReraise.IsSome then
+                              let rrv, rrs = currentReraise.Value
+                              let u = { Path = path; Offset = t.Offset + 29000000; Name = "_rru" }
+                              let anon = mono (TCon ("?", []))
+                              ELam ([ u, anon ], EApp (EUnknown "raise", [ EVar (rrv, rrs) ]))
+                          else
                           let isConv =
                               List.contains t.Text
                                   [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"
@@ -1651,6 +1665,16 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | Some m when m.StartsWith "$sizeof:" -> Some m
                               | _ -> None)
                          | _ -> None
+                     // `invalidArg`/`nullArg` carry .NET's message SHAPE —
+                     // the parameter name in parentheses after the text. The
+                     // backend throws a Failure with whatever string it is
+                     // handed, so the shape is built here.
+                     let argExn =
+                         match Green.tokens (GNode head) |> List.tryHead with
+                         | Some ht when (ht.Text = "invalidArg" || ht.Text = "nullArg")
+                                        && head.NodeKind = IdentExpr
+                                        && (dictTryFind useDefs ht.Offset).IsNone -> Some ht.Text
+                         | _ -> None
                      let nameofMark =
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some ht when ht.Text = "nameof" ->
@@ -1659,6 +1683,22 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   Some (m.Substring 8)
                               | _ -> None)
                          | _ -> None
+                     let cat (a : Expr) (b : Expr) : Expr = EPrim ("+t", [ a; b ])
+                     let lit (t : string) : Expr = ELit (LString ("\"" + t + "\""))
+                     match argExn with
+                     | Some which ->
+                         let lowered = args |> List.map (fun a -> lowerExpr (GNode a))
+                         let msg =
+                             match which, lowered with
+                             // `nullArg p` — the text is .NET's own
+                             | "nullArg", [ pn ] ->
+                                 cat (cat (lit "Value cannot be null. (Parameter '") pn) (lit "')")
+                             // `invalidArg p msg`
+                             | _, [ pn; m ] -> cat (cat (cat m (lit " (Parameter '")) pn) (lit "')")
+                             | _, [ m ] -> m
+                             | _ -> lit ""
+                         EApp (EUnknown "failwith", [ msg ])
+                     | None ->
                      match sizeofMark, nameofMark with
                      // LString carries the RAW literal, quotes included
                      | _, Some nm ->
@@ -4001,6 +4041,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                         let pats = nodesOf cl |> List.filter (fun m -> isPatKind m.NodeKind)
                         let hasWhen = tokensOf cl |> List.exists (fun t -> t.Kind = Keyword && t.Text = "when")
                         let exprs = nodesOf cl |> List.filter (fun m -> isExprish m.NodeKind)
+                        let exSch = mono (TCon ("exn", []))
+                        let rrv = { Path = path; Offset = offsetOf cl + 28000000; Name = "_rrexn" }
+                        let savedRr = currentReraise
+                        currentReraise <- Some (rrv, exSch)
                         let guard, cbody =
                             match hasWhen, exprs with
                             | true, [ g; b ] -> Some (lowerExpr (GNode g)), lowerExpr (GNode b)
@@ -4008,12 +4052,13 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 (match List.tryLast es with
                                  | Some b -> None, lowerExpr (GNode b)
                                  | None -> None, ELit LUnit)
+                        currentReraise <- savedRr
                         let pat =
                             match pats with
                             | [ p ] -> lowerPat p
                             | [] -> PWild
                             | ps -> POr (alignOrBinders (List.map lowerPat ps))
-                        pat, guard, cbody)
+                        PAs (pat, rrv, exSch), guard, cbody)
                 (match List.tryLast body with
                  | Some b -> ETry (b, cases)
                  | None -> note (offsetOf n) "try shape")
