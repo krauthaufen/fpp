@@ -160,6 +160,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | _ -> ())
                     | _ -> ()
             | ModuleDef -> n.Children |> List.iter collectTop
+            | ModuleAbbrev -> ()
             | _ -> ()
     root.Children |> List.iter collectTop
     let structNames = vecNew<string> ()
@@ -3817,6 +3818,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               EMatch (lowerExpr (GNode lhs),
                                       [ PCtor ("Some", anon, [ PWild ]), None, whenSome
                                         PWild, None, whenNone ])
+                          let voptTag (whenSome : Expr) (whenNone : Expr) =
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCtor ("ValueSome", anon, [ PWild ]), None, whenSome
+                                        PWild, None, whenNone ])
                           if owner.StartsWith "$clsdot:" then
                               // a TYPECLASS dot-member (`xs.Count` through
                               // `member 'a.Count`): apply the class target —
@@ -3839,6 +3844,17 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               optTag (ELit (LBool true)) (ELit (LBool false))
                           elif owner = "Option" && name.Text = "IsNone" then
                               optTag (ELit (LBool false)) (ELit (LBool true))
+                          elif owner = "ValueOption" && name.Text = "IsSome" then
+                              voptTag (ELit (LBool true)) (ELit (LBool false))
+                          elif owner = "ValueOption" && name.Text = "IsNone" then
+                              voptTag (ELit (LBool false)) (ELit (LBool true))
+                          elif owner = "ValueOption" && name.Text = "Value" then
+                              let tmp = { Path = path; Offset = offsetOf n + 22000000; Name = "_voptv" }
+                              EMatch (lowerExpr (GNode lhs),
+                                      [ PCtor ("ValueSome", anon, [ PVar (tmp, anon) ]), None, EVar (tmp, anon)
+                                        PWild, None,
+                                          EApp (EUnknown "failwith",
+                                                [ ELit (LString "\"the value option was ValueNone\"") ]) ])
                           elif owner = "Option" && name.Text = "Value" then
                               let tmp = { Path = path; Offset = offsetOf n + 21000000; Name = "_optv" }
                               EMatch (lowerExpr (GNode lhs),
@@ -5347,6 +5363,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                        && not (tokensOf c |> List.exists (fun t -> t.Kind = Keyword && t.Text = "type")) then
                         liftPlainMember "instance" c |> ignore
             | ModuleDef -> nodesOf n |> List.iter (fun m -> lowerDecl (GNode m))
+            // a module ABBREVIATION declares nothing: the resolver aliased
+            // the target's exports, and every use already points at them
+            | ModuleAbbrev -> ()
             | AttributeList ->
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "Struct") then
                     pendingStruct <- true

@@ -9,6 +9,8 @@ type NodeKind =
     | File
     | ModuleHeader
     | ModuleDef
+    /// `module Ab = Inner` — a second NAME for a module, not a new one
+    | ModuleAbbrev
     | OpenDecl
     | LetDecl
     | TypeDecl

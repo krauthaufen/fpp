@@ -13,19 +13,18 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
-* `module-abbreviation.fpp` — `module Ab = Inner` parses but binds nothing,
-  so every `Ab.x` is an unresolved variable at emission.
-
-* `valueoption-surface.fpp` — `ValueSome`/`ValueNone` work, but `v.IsNone`
-  traps and the whole `ValueOption` module is missing. The `Option`
-  equivalents are all there.
-
 * `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
 Fixed and removed (see git history for the repros):
+`module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY
+body, leaving the target behind as a stray expression; it is its own node
+kind now, and the resolver aliases the target's exports),
+`valueoption-surface` (ValueOption gained IsSome/IsNone/Value and a module
+mirroring Option's; pinned by suites/voptionmod.fpp, which also caught that
+.NET's ToString UNWRAPS a ValueSome where a Some keeps its wrapper),
 `secondary-ctor-as-then` (`new (args) as x = <delegate> then <body>` now
 parses — it desugars in the parser to `new (args) = let x = <delegate> in
 (<body>; x)`, which every later stage already handled. Fixing it exposed a

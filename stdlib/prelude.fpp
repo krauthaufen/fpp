@@ -1298,6 +1298,61 @@ module Single =
     let IsNegativeInfinity (x : float32) : bool = x = 0.0f - 1.0f / 0.0f
     let IsFinite (x : float32) : bool = not (IsNaN x) && not (IsInfinity x)
 
+/// ValueOption's module surface, mirroring `Option` below. The type is a
+/// STRUCT union in .NET; here it is an ordinary one, which changes the
+/// allocation but not one answer in this file.
+module ValueOption =
+    let isSome (o : 'a voption) : bool = match o with ValueSome _ -> true | ValueNone -> false
+    let isNone (o : 'a voption) : bool = match o with ValueSome _ -> false | ValueNone -> true
+    let map (f : 'a -> 'b) (o : 'a voption) : 'b voption =
+        match o with
+        | ValueSome v -> ValueSome (f v)
+        | ValueNone -> ValueNone
+    let bind (f : 'a -> 'b voption) (o : 'a voption) : 'b voption =
+        match o with
+        | ValueSome v -> f v
+        | ValueNone -> ValueNone
+    let filter (p : 'a -> bool) (o : 'a voption) : 'a voption =
+        match o with
+        | ValueSome v -> if p v then ValueSome v else ValueNone
+        | ValueNone -> ValueNone
+    let forall (p : 'a -> bool) (o : 'a voption) : bool =
+        match o with ValueSome v -> p v | ValueNone -> true
+    let exists (p : 'a -> bool) (o : 'a voption) : bool =
+        match o with ValueSome v -> p v | ValueNone -> false
+    let iter (f : 'a -> unit) (o : 'a voption) : unit =
+        match o with ValueSome v -> f v | ValueNone -> ()
+    let defaultValue (fallback : 'a) (o : 'a voption) : 'a =
+        match o with ValueSome v -> v | ValueNone -> fallback
+    let defaultWith (f : unit -> 'a) (o : 'a voption) : 'a =
+        match o with ValueSome v -> v | ValueNone -> f ()
+    let orElse (ifNone : 'a voption) (o : 'a voption) : 'a voption =
+        match o with ValueSome v -> ValueSome v | ValueNone -> ifNone
+    let orElseWith (f : unit -> 'a voption) (o : 'a voption) : 'a voption =
+        match o with ValueSome v -> ValueSome v | ValueNone -> f ()
+    let count (o : 'a voption) : int =
+        match o with ValueSome _ -> 1 | ValueNone -> 0
+    let fold (f : 's -> 'a -> 's) (st : 's) (o : 'a voption) : 's =
+        match o with ValueSome v -> f st v | ValueNone -> st
+    let foldBack (f : 'a -> 's -> 's) (o : 'a voption) (st : 's) : 's =
+        match o with ValueSome v -> f v st | ValueNone -> st
+    let toList (o : 'a voption) : 'a list =
+        match o with ValueSome v -> [ v ] | ValueNone -> []
+    let toArray (o : 'a voption) : 'a[] =
+        match o with ValueSome v -> [| v |] | ValueNone -> [||]
+    let flatten (o : 'a voption voption) : 'a voption =
+        match o with ValueSome v -> v | ValueNone -> ValueNone
+    let ofOption (o : 'a option) : 'a voption =
+        match o with Some v -> ValueSome v | None -> ValueNone
+    let toOption (o : 'a voption) : 'a option =
+        match o with ValueSome v -> Some v | ValueNone -> None
+    let ofObj (v : 'a) : 'a voption = if isNull v then ValueNone else ValueSome v
+    let toObj (o : 'a voption) : 'a = match o with ValueSome v -> v | ValueNone -> null
+    let get (o : 'a voption) : 'a =
+        match o with
+        | ValueSome v -> v
+        | ValueNone -> failwith "the value option was ValueNone"
+
 module Option =
     /// `ofObj null` is None and anything else is Some — the bridge from a
     /// nullable reference to an option, which F# code reaches for at every
@@ -7429,10 +7484,15 @@ instance Show<ValueOption<'a>> when Show<'a>
         match o with
         | ValueNone -> "ValueNone"
         | ValueSome v -> showAppend "ValueSome " (showPar (show v))
+    /// .NET's ToString for a ValueOption UNWRAPS the payload — `string
+    /// (ValueSome 5)` is "5", not "ValueSome(5)" — while the reference
+    /// Option keeps its wrapper ("Some(5)"). Inconsistent, and pinned by
+    /// tests/conformance/suites/voptionmod.fpp against fsi. `%A` still
+    /// renders the case, through `show` above.
     static str o =
         match o with
         | ValueNone -> "ValueNone"
-        | ValueSome v -> "ValueSome(" + str v + ")"
+        | ValueSome v -> str v
 instance Show<Result<'a, 'e>> when Show<'a> when Show<'e>
     static show r =
         match r with

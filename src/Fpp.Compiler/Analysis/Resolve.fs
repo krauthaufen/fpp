@@ -1279,6 +1279,51 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
             | TypeDecl -> walkTypeDecl env n
             | ClassDecl -> walkClassDecl env n
             | InstanceDecl -> walkInstanceDecl env n
+            | ModuleAbbrev ->
+                // `module Ab = Inner`: a second NAME, so every export the
+                // target already has gains an alias key. F# requires the
+                // target to be declared first, which is why copying here (in
+                // source order) is enough.
+                let toks =
+                    n.Children |> List.choose (fun c -> match c with GToken t -> Some t | _ -> None)
+                let aliasTok = toks |> List.tryFind (fun t -> t.Kind = Ident)
+                let targetSegs =
+                    // everything after the `=` is the target's dotted path
+                    let rec after (ts : Token list) =
+                        match ts with
+                        | t :: rest when t.Kind = Operator && t.Text = "=" -> rest
+                        | _ :: rest -> after rest
+                        | [] -> []
+                    after toks |> List.filter (fun t -> t.Kind = Ident) |> List.map (fun t -> t.Text)
+                (match aliasTok, targetSegs with
+                 | Some at, (_ :: _) ->
+                     let target = String.concat "." targetSegs
+                     let aliasFull = if modulePath = "" then at.Text else modulePath + "." + at.Text
+                     // the target may be written relative to any enclosing
+                     // scope, so try the same bases a qualified USE would
+                     let copyFrom (tbl : Dict<string, Definition>) (fullTarget : string) : int =
+                         let mutable added = 0
+                         let plain = fullTarget + "."
+                         let typed = "type " + fullTarget + "."
+                         for k, d in dictPairs tbl do
+                             if k.StartsWith plain then
+                                 dictSet ownExports (aliasFull + "." + substr k (strLen plain) (strLen k - strLen plain)) d
+                                 added <- added + 1
+                             elif k.StartsWith typed then
+                                 dictSet ownExports ("type " + aliasFull + "." + substr k (strLen typed) (strLen k - strLen typed)) d
+                                 added <- added + 1
+                         added
+                     let mutable done_ = false
+                     for b in bases () do
+                         if not done_ then
+                             let fullTarget = if b = "" then target else b + "." + target
+                             let n1 = copyFrom ownExports fullTarget
+                             let n2 = copyFrom imports fullTarget
+                             if n1 + n2 > 0 then done_ <- true
+                     let d = define DefModule at
+                     if atExportLevel then exportDef d
+                     Map.add at.Text d env
+                 | _ -> env)
             | ModuleDef ->
                 let mutable outer = env
                 let nameToks =

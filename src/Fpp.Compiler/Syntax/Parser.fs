@@ -2532,6 +2532,19 @@ let parse (src : string) : ParseResult =
         else s.Diag "expected a module name"
         if s.IsOp "=" then
             vecAdd acc (s.Bump ())
+            // `module Ab = Inner` — an ABBREVIATION, not a nested module. The
+            // target is an identifier on the SAME line; a nested module's
+            // body always starts on the next one. Without this the body loop
+            // below found no declaration, produced an empty module, and left
+            // `Inner` behind as a stray top-level expression — so every later
+            // `Ab.x` was an unresolved variable.
+            if s.Is Ident && s.SameLine then
+                vecAdd acc (s.Bump ())
+                while s.IsOp "." && s.SameLine do
+                    vecAdd acc (s.Bump ())
+                    if s.Is Ident then vecAdd acc (s.Bump ())
+                Green.node ModuleAbbrev (vecToList acc)
+            else
             // nested module: indented declaration block
             let mutable go = true
             while go && not s.AtEof do

@@ -774,6 +774,16 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "Option.IsSome" (m tBool)
             registerField "Option.IsNone" (m tBool)
             registerField "Option.Value" (m (TVar elem))
+        // ValueOption carries the same three. Without them `v.IsNone`
+        // type-checked through the forced dot pass and trapped at run time.
+        if (dictTryFind fields "ValueOption.IsSome").IsNone then
+            let velem = match st.Fresh () with TVar v -> v | _ -> failwith "fresh"
+            let vm (ty : Type) =
+                { TypeName = "ValueOption"; Params = [ velem ]; Quantified = []
+                  FieldType = ty; DefKey = None; IsStatic = false; Optionals = 0; ParamNames = []; Constraints = []; Access = 0 }
+            registerField "ValueOption.IsSome" (vm tBool)
+            registerField "ValueOption.IsNone" (vm tBool)
+            registerField "ValueOption.Value" (vm (TVar velem))
     registerOptionMembers ()
 
     // ---- `.contents` on a ref cell ----------------------------------------
