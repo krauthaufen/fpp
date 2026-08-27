@@ -312,4 +312,52 @@ test_to_list ()
 test_fold_left ()
 test_fold_right ()
 
+// ---- the SET-LIKE and GROUPING functions ------------------------------------
+// Added beyond the original file, from FSharp.Core.UnitTests' ArrayModule.
+// `distinct` keeps the FIRST occurrence and the original order, which is the
+// half of the contract a set-based implementation would lose. Rendered to
+// strings rather than compared with `=`, since an array is compared by
+// REFERENCE here (see the aeq note above).
+
+let si (xs : int[]) : string = String.concat "," (List.ofArray (Array.map string xs))
+let ss (xs : string[]) : string = String.concat "," (List.ofArray xs)
+let sp (xs : (int * int)[]) : string =
+    String.concat "," (List.ofArray (Array.map (fun (a, b) -> string a + ":" + string b) xs))
+
+let dups = [| 3; 1; 2; 1; 3 |]
+
+test "distinct" (si (Array.distinct dups) = "3,1,2")
+test "distinct-keeps-first-order" (si (Array.distinct [| 5; 4; 5; 4 |]) = "5,4")
+test "distinct-of-empty" (si (Array.distinct ([| |] : int[])) = "")
+test "distinct-when-all-unique" (si (Array.distinct [| 1; 2; 3 |]) = "1,2,3")
+test "distinct-of-strings" (ss (Array.distinct [| "a"; "b"; "a" |]) = "a,b")
+
+test "distinctBy" (si (Array.distinctBy (fun v -> v % 2) dups) = "3,2")
+test "distinctBy-on-length" (ss (Array.distinctBy (fun (v : string) -> v.Length) [| "a"; "bb"; "c" |]) = "a,bb")
+test "distinctBy-constant-key" (si (Array.distinctBy (fun _ -> 0) dups) = "3")
+
+// F# also DE-DUPLICATES here: `except` answers the DISTINCT elements not
+// in the excluded set, not merely the ones that survive a filter
+test "except" (si (Array.except [| 1 |] dups) = "3,2")
+test "except-several" (si (Array.except [| 1; 3 |] dups) = "2")
+test "except-nothing-is-still-distinct" (si (Array.except ([| |] : int[]) dups) = "3,1,2")
+test "except-everything" (si (Array.except [| 1; 2; 3 |] dups) = "")
+
+test "pairwise" (sp (Array.pairwise [| 1; 2; 3 |]) = "1:2,2:3")
+test "pairwise-of-one" (sp (Array.pairwise [| 1 |]) = "")
+test "windowed" (si (Array.map Array.length (Array.windowed 2 [| 1; 2; 3 |])) = "2,2")
+test "chunkBySize" (si (Array.map Array.length (Array.chunkBySize 2 [| 1; 2; 3 |])) = "2,1")
+
+test "countBy" (sp (Array.countBy (fun v -> v) dups) = "3:2,1:2,2:1")
+test "countBy-on-a-key" (sp (Array.countBy (fun v -> v % 2) dups) = "1:4,0:1")
+test "groupBy-keys" (si (Array.map fst (Array.groupBy (fun v -> v % 2) dups)) = "1,0")
+test "groupBy-sizes" (si (Array.map (fun (_, g) -> Array.length g) (Array.groupBy (fun v -> v % 2) dups)) = "4,1")
+
+test "scan" (si (Array.scan (fun a b -> a + b) 0 [| 1; 2; 3 |]) = "0,1,3,6")
+test "splitAt-first" (si (fst (Array.splitAt 2 [| 1; 2; 3 |])) = "1,2")
+test "splitAt-second" (si (snd (Array.splitAt 2 [| 1; 2; 3 |])) = "3")
+test "transpose" (String.concat "|" (List.ofArray (Array.map si (Array.transpose [| [| 1; 2 |]; [| 3; 4 |] |]))) = "1,3|2,4")
+test "allPairs" (String.concat "," (List.ofArray (Array.map (fun (a, b) -> string a + b) (Array.allPairs [| 1; 2 |] [| "a" |]))) = "1a,2a")
+test "unfold" (si (Array.unfold (fun s -> if s > 2 then None else Some (s, s + 1)) 0) = "0,1,2")
+
 printfn "DONE tests=%d failures=%d" ntests failures

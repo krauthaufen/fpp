@@ -63,6 +63,26 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## A qualified case pattern was a WILDCARD
+
+`match c with Colour.Red -> .. | Colour.Green -> ..` took the FIRST arm for
+every value. The type-qualified lookup in `recordQualifiedCase` was gated on
+`idents.Length > 2` — written for `Inner.Colour.Green`, it never saw the
+two-segment `Colour.Green`, where the type IS the whole prefix. Nothing was
+recorded, so lowering found neither a binder nor a case and emitted `PWild`:
+an irrefutable pattern. Every value took the first clause, silently.
+
+The unknown-case diagnostic had the same hole — it covered the BARE
+uppercase name only, so `Colour.Purple` on a type with no such case was
+accepted and swallowed everything. It now reports through the same `missing`
+channel whenever the prefix names a type that declares cases.
+
+Worth generalising: this file's "Qualification, and the first-identifier
+trap" section is about the same family, and the pattern side had been missed.
+When a lookup for a dotted name is guarded by a SEGMENT COUNT, check the
+smallest case — two segments is the common one, and it is the one an
+arity-style guard tends to exclude.
+
 ## null is not the empty string, and the compare knew it was
 
 String `=` lowers to `$str_cmp` (`ShStr` in structEqW), and both it and

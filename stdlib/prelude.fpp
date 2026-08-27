@@ -2096,9 +2096,34 @@ module Array =
             let start = i * size
             let len = if start + size <= xs.Length then size else xs.Length - start
             sub xs start len)
-    let distinct (xs : 'a[]) : 'a[] = ofList (List.distinct (toList xs))
-    let distinctBy (key : 'a -> 'k) (xs : 'a[]) : 'a[] = ofList (List.distinctBy key (toList xs))
-    let except (excluded : 'a[]) (xs : 'a[]) : 'a[] = filter (fun x -> not (contains x excluded)) xs
+    /// Over ARRAYS, not by way of List: `module List` is declared BELOW this
+    /// one, so `List.distinct` here was a forward reference that resolved to
+    /// nothing and stubbed — `Array.distinct` trapped whenever it was reached.
+    let distinctBy (key : 'a -> 'k) (xs : 'a[]) : 'a[] =
+        let n = length xs
+        let keys : 'k[] = zeroCreate n
+        let out : 'a[] = zeroCreate n
+        let mutable kept = 0
+        let mutable i = 0
+        while i < n do
+            let k = key xs.[i]
+            let mutable dup = false
+            let mutable j = 0
+            while j < kept do
+                if keys.[j] = k then dup <- true
+                j <- j + 1
+            if not dup then
+                keys.[kept] <- k
+                out.[kept] <- xs.[i]
+                kept <- kept + 1
+            i <- i + 1
+        sub out 0 kept
+    let distinct (xs : 'a[]) : 'a[] = distinctBy (fun x -> x) xs
+    /// F# also DE-DUPLICATES: `except` answers the DISTINCT elements not in
+    /// the excluded set. A plain filter kept every repeat, so
+    /// `Array.except [|1|] [|3;1;2;1;3|]` gave 3,2,3 where F# gives 3,2.
+    let except (excluded : 'a[]) (xs : 'a[]) : 'a[] =
+        distinct (filter (fun x -> not (contains x excluded)) xs)
     let sortDescending (xs : 'a[]) : 'a[] when Ordered<'a> = sortWith (fun a b -> compare b a) xs
     let sortByDescending (f : 'a -> 'k) (xs : 'a[]) : 'a[] when Ordered<'k> =
         sortWith (fun a b -> compare (f b) (f a)) xs
@@ -3020,8 +3045,16 @@ module List =
             out <- ofArray (Array.sub arr i take) :: out
             i <- i + size
         rev out
+    /// distinct, like F#'s — see Array.except. Written out rather than
+    /// composed with `distinct`, which is declared just below this.
     let except (excluded : 'a list) (xs : 'a list) : 'a list =
-        filter (fun x -> not (contains x excluded)) xs
+        let mutable seen = []
+        let mutable out = []
+        for x in xs do
+            if not (contains x excluded) && not (contains x seen) then
+                seen <- x :: seen
+                out <- x :: out
+        rev out
     let distinct (xs : 'a list) : 'a list =
         let mutable seen = []
         let mutable out = []
@@ -3853,7 +3886,7 @@ module Seq =
     let distinct (xs : seq<'a>) : seq<'a> = distinctBy (fun x -> x) xs
     let except (excluded : seq<'a>) (xs : seq<'a>) : seq<'a> =
         let ex = List.ofSeq excluded
-        filter (fun x -> not (List.contains x ex)) xs
+        distinct (filter (fun x -> not (List.contains x ex)) xs)
     // F# yields ARRAYS from Seq.windowed/chunkBySize/splitInto, while the
     // List versions yield lists and the Array versions arrays. These three
     // yielded lists until the fsc Seq conformance port compared them against

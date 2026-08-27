@@ -431,7 +431,13 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
     /// binder never gets a type, and everything read out of it stays
     /// unknown: the loop over `inst.Context` could not even tell it was
     /// walking a list.
-    let recordQualifiedCase (env : Env) (children : Green list) : unit =
+    /// Does this name a TYPE that declares cases? If so, a case of it that
+    /// resolves to nothing is an error rather than an unknown module member.
+    let namesACaseType (ty : string) : bool =
+        let prefix = ty + "."
+        dictPairs typeCases |> List.exists (fun (k, _) -> k.StartsWith prefix)
+
+    let recordQualifiedCase (inCase : bool) (env : Env) (children : Green list) : unit =
         let idents =
             children
             |> List.choose (fun c -> match c with GToken t when t.Kind = Ident -> Some t | _ -> None)
@@ -452,11 +458,22 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                     // value carries that whole path. The type is the
                     // second-to-last segment, and `typeCases` is keyed by the
                     // type's own name whatever holds it.
-                    if idents.Length > 2 then
+                    // ALSO the two-segment `Colour.Green`, where the type
+                    // IS the whole prefix. Gated at >2 this missed it
+                    // entirely: nothing was recorded, lowering found neither
+                    // a binder nor a case and emitted PWild — an irrefutable
+                    // pattern, so `match c with C.Red -> .. | C.Green -> ..`
+                    // took the FIRST arm for every value. Silent, and wrong.
+                    if idents.Length > 1 then
                         let ty = idents |> List.item (idents.Length - 2)
                         (match dictTryFind typeCases (ty.Text + "." + last.Text) with
                          | Some cd -> record last cd
-                         | None -> ())
+                         | None ->
+                             // the TYPE is known and has no such case. Same
+                             // channel as the bare form: silence here left an
+                             // irrefutable pattern that swallowed every value
+                             if inCase && namesACaseType ty.Text then
+                                 vecAdd missing (last.Offset, "unknown case '" + last.Text + "'"))
 
     /// `inCase` marks a pattern in MATCH position, where a bare uppercase
     /// identifier is a union case and never a binder. A parameter or a `let`
@@ -471,7 +488,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                 (match n.Children with
                  | GToken t :: rest when t.Kind = Ident ->
                      if not (List.isEmpty rest) then
-                         recordQualifiedCase env n.Children
+                         recordQualifiedCase inCase env n.Children
                          env
                      else
                          match lookupValue env t.Text with
@@ -513,7 +530,7 @@ let resolve (path : string) (imports : Dict<string, Definition>) (root : GreenNo
                      (match head with
                       | GNode hn when hn.NodeKind = IdentPat ->
                           (match hn.Children with
-                           | GToken t :: _ when t.Kind = Ident -> recordQualifiedCase env hn.Children
+                           | GToken t :: _ when t.Kind = Ident -> recordQualifiedCase inCase env hn.Children
                            | _ -> ())
                       | _ -> ())
                      List.fold (bindPatIn inCase kind) env args
