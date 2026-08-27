@@ -63,6 +63,19 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## The let-pattern classification lives in TWO files
+
+Whether `let <pat> = e` is a simple binding or a DESTRUCTURE is decided by a
+list of pattern kinds — and that list exists twice, once in Infer and once in
+Lower. `ArrayPat` was in neither, so `let [| a; b |] = arr` typed as a simple
+binding (a := the whole array) while lowering destructured it. The two
+disagreed, and the symptom depended on the arity: one element gave a wrong
+VALUE, two gave a type error at the next USE, nowhere near the binding.
+
+Fixing one side alone is worse than fixing neither — that is the state where
+inference and emission disagree. The comment above each list names the shapes
+it covers; keep them identical.
+
 ## A qualified case pattern was a WILDCARD
 
 `match c with Colour.Red -> .. | Colour.Green -> ..` took the FIRST arm for

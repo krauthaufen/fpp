@@ -6287,7 +6287,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              | None -> false)
                         | _ -> false)
                 | [ p ] ->
-                    p.NodeKind = WildcardPat || p.NodeKind = LiteralPat || p.NodeKind = StructTuplePat || p.NodeKind = ListPat
+                    p.NodeKind = WildcardPat || p.NodeKind = LiteralPat
+                    || p.NodeKind = StructTuplePat || p.NodeKind = ListPat
+                    // ArrayPat belongs here, and Lower keeps the SAME list —
+                    // change one side and you must change the other. Missing
+                    // here, `let [| a; b |] = arr` typed as a simple binding
+                    // (a := the whole array) while lowering destructured it,
+                    // and the two disagreed: one element gave a wrong VALUE,
+                    // two gave a type error far from the binding.
+                    || p.NodeKind = ArrayPat
                     || p.NodeKind = ConsPat || p.NodeKind = RecordPat
                 | _ -> false)
         // every binder of a `let mutable` pattern is assignable —

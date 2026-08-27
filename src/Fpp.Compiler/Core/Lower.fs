@@ -4556,7 +4556,14 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 // a BARE list/cons pattern (`let [v] = …`, `let h :: t = …`)
                 // is a destructure too: as a "simple" let it bound the name
                 // to the WHOLE list
-                | [ p ] -> p.NodeKind = WildcardPat || p.NodeKind = LiteralPat || p.NodeKind = StructTuplePat || p.NodeKind = ListPat || p.NodeKind = ConsPat || p.NodeKind = RecordPat
+                | [ p ] ->
+                    p.NodeKind = WildcardPat || p.NodeKind = LiteralPat
+                    || p.NodeKind = StructTuplePat || p.NodeKind = ListPat
+                    // ArrayPat belongs with them: `let [| a; b |] = arr`
+                    // bound `a` to the WHOLE array, and the next use of it
+                    // failed as a type error somewhere else entirely
+                    || p.NodeKind = ArrayPat
+                    || p.NodeKind = ConsPat || p.NodeKind = RecordPat
                 | _ -> false)
         let bodyExprs =
             vecToList after
