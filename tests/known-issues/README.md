@@ -18,6 +18,14 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
+* `decimal-is-a-float.fpp` — the `m` suffix is accepted and computed in
+  binary, so `0.1m + 0.2m` is 0.30000000000000004 where F# answers 0.3.
+  Silent. Either implement base-10 decimal or reject the suffix.
+
+* `measures-single-unit-only.fpp` — `[<Measure>]` and `5.0<m>` work and
+  match F# at run time, but `float<m/s>` and `10.0<m/s>` do not, so the
+  composition half of the feature is missing and no suite can be ported.
+
 Fixed and removed (see git history for the repros):
 `module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY
 body, leaving the target behind as a stray expression; it is its own node
