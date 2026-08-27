@@ -4994,6 +4994,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                  | None -> TTuple elems)
             | ListExpr ->
                 let elem = st.Fresh ()
+                // An expected list type fixes the ELEMENT before the items are
+                // typed: `let xs : obj list = [ 1; 2 ]` types each item
+                // against obj, which is how F# converts them. A list is
+                // INVARIANT, so widening the whole list afterwards is not
+                // available — `obj list` and `int list` share a constructor
+                // and never subsume.
+                (match expected with
+                 | Some et ->
+                     (match prune et with
+                      | TCon ("list", [ e ]) -> unify elem e |> ignore
+                      | _ -> ())
+                 | None -> ())
                 let rec addItems (m : GreenNode) =
                     if m.NodeKind = BlockExpr then
                         for c in nodesOf m do addItems c
@@ -5015,8 +5027,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     match c with
                                     | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
                                     | _ -> false))
-                        if isRange then unifyAt off (exprType (GNode m)) (tList elem)
-                        else unifyAt off (exprType (GNode m)) elem
+                        // the ELEMENT type is the target: `[ 1; 2 ] : obj list`
+                        if isRange then unifyArg off (tList elem) (exprType (GNode m))
+                        else unifyArg off elem (exprType (GNode m))
                 for m in nodesOf n do addItems m
                 tList elem
             | LambdaExpr ->
@@ -6089,10 +6102,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        // the site so lowering builds it
                                        (match prune declared with
                                         | TCon ("Option", [ inner ]) ->
-                                            unifyAt t.Offset vt inner
+                                            unifyArg t.Offset inner vt
                                             vecAdd fieldOwnersRaw (t.Offset, "$somewrap")
-                                        | _ -> unifyAt t.Offset vt declared)
-                                   else unifyAt t.Offset vt declared
+                                        | _ -> unifyArg t.Offset declared vt)
+                                   // the DECLARED field type is the target, so
+                                   // a value widens into it: `{ F = 5 }` for
+                                   // `F : obj` is F#'s type-directed
+                                   // conversion, same as an argument
+                                   else unifyArg t.Offset declared vt
                                | None -> ())
                           | _ -> ())
                      // a full literal (no `with` base) must WRITE every
@@ -6162,6 +6179,11 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          | TCon ("array", [ e ]) -> Some e
                          | _ -> None)
                     | None -> None
+                // and it FIXES the element, not merely the expectation:
+                // `[| 1; "a" |] : obj[]` needs each item typed against obj
+                (match elemExpect with
+                 | Some e -> unify elem e |> ignore
+                 | None -> ())
                 // comprehension items (for/while/let) yield through the
                 // rewrite, not through their own type — a ForExpr types as
                 // unit, and unifying THAT with elem froze every array
@@ -6183,8 +6205,8 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     match c with
                                     | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
                                     | _ -> false))
-                        if isRange then unifyAt off (exprType (GNode m)) (tList elem)
-                        else unifyAt off (exprType (GNode m)) elem
+                        if isRange then unifyArg off (tList elem) (exprType (GNode m))
+                        else unifyArg off elem (exprType (GNode m))
                 for m in nodesOf n do addItems m
                 exprExpect <- savedA
                 (match Green.tokens (GNode n) |> List.tryHead with
@@ -6381,8 +6403,14 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             let resultTy =
                 match ascription with
                 | Some a ->
+                    // The ANNOTATION is the target and the body is what flows
+                    // into it, so this subsumes exactly as an argument does:
+                    // F#'s type-directed conversion makes `let x : obj = 1`
+                    // and `let s : seq<int> = [1;2;3]` legal, and a plain
+                    // unify rejected both. `box` is the identity at run time
+                    // here, so widening to obj costs nothing to emit.
                     (match Green.tokens (GNode namePat) |> List.tryHead with
-                     | Some t -> unifyAt t.Offset bodyTy a
+                     | Some t -> unifyArg t.Offset a bodyTy
                      | None -> unify bodyTy a |> ignore)
                     bodyTy
                 | None -> bodyTy
