@@ -333,8 +333,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                 || (match dictTryFind impls sub with
                     | Some is -> is |> List.exists isSeqName
                     | None -> false)))
+        // an implemented interface's OWN bases count too. An interface
+        // inheriting an interface is recorded in `bases`, so the recursion
+        // reaches it — a flat `List.contains` stopped at the directly
+        // implemented ones, and a class implementing `IDer : IBase` did not
+        // widen to IBase at all.
         || (match dictTryFind impls sub with
-            | Some is -> List.contains sup is
+            | Some is -> is |> List.exists (fun i -> i = sup || isSupertypeOf sup i)
             | None -> false)
         || (match dictTryFind bases sub with
             | Some (_, bt) ->
@@ -6334,7 +6339,34 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | Some t -> t.Offset
                     | None -> 0
                 let dTy = st.Fresh ()
-                if not (tryResolveDot false (95000000 + fo) resultTy dTy "Dispose") then
+                let direct = tryResolveDot false (95000000 + fo) resultTy dTy "Dispose"
+                // An interface implementation is not an ordinary member:
+                // `r.Dispose ()` on a class that only implements IDisposable
+                // is a compile error in F#, and member lookup here agrees.
+                // But `use` is the one construct that reaches through the
+                // interface anyway, so when the direct lookup misses, resolve
+                // against the interface the type implements — otherwise the
+                // dot stayed parked, lowering found no member and quietly
+                // emitted a plain `let`, and the resource was never disposed
+                // with nothing said anywhere.
+                //
+                // NULLARY interfaces only. IDisposable takes no parameters,
+                // and a generic one would need the class' declared interface
+                // ARGUMENTS, which this site does not have.
+                let viaIface =
+                    if direct then false
+                    else
+                        match prune resultTy with
+                        | TCon (cn, _) ->
+                            (match dictPairs ifaces
+                                   |> List.filter (fun (iname, ms) ->
+                                       iname <> cn && isSupertypeOf iname cn
+                                       && ms |> List.exists (fun (m, _) -> m = "Dispose")) with
+                             | (iname, _) :: _ ->
+                                 tryResolveDot false (95000000 + fo) (TCon (iname, [])) dTy "Dispose"
+                             | [] -> false)
+                        | _ -> false
+                if not direct && not viaIface then
                     vecAdd pendingDots (95000000 + fo, resultTy, dTy, "Dispose")
                 unify dTy (TFun (tUnit, tUnit)) |> ignore
             // generalize and overwrite the monomorphic scheme. A MUTABLE

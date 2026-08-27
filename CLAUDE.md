@@ -63,6 +63,38 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## An inherited interface needs its OWN vtable row
+
+A vtable row is keyed by interface NAME. F# requires a class implementing
+`IDer` (which inherits `IBase`) to implement every inherited member in that
+one `interface IDer with` block, so the functions were all there — but
+nothing was filed under `IBase`, and a cast to it dispatched through table
+index 0, which is `$novt`. The cast type-checked and the trap named only the
+helper.
+
+Two halves, and both were needed:
+
+* `isSupertypeOf` checked a class' implemented interfaces with a flat
+  `List.contains`, so it never stepped into an interface's own bases. An
+  interface's `inherit` is recorded in `bases`, so recursing into each
+  implemented interface reaches it.
+* `ifaceRowsFor` (Lower) now expands one block into a row per inherited
+  interface, sharing the same lifted functions — a table slot, not a copy.
+  Both producers of rows have to call it: explicit `interface ... with`
+  blocks AND object expressions, which build their own synthetic class. The
+  class half alone left `{ new INamedShape with ... } :> IShape` trapping.
+
+`use` had a related hole. An interface implementation is not an ordinary
+member — `r.Dispose ()` on a class that merely implements IDisposable is a
+compile error in F#, and lookup here agrees — but `use` is exactly the
+construct that reaches through the interface anyway. It looked up Dispose as
+a plain member, found nothing, and lowering quietly emitted a plain `let`.
+The resource was never disposed and nothing was said, `--strict` included.
+
+Both are the same lesson as the parked queues below: when a lookup fails,
+check what the fallback DOES. Silently emitting the unadorned construct is
+how these stay invisible.
+
 ## The two parked queues must advance TOGETHER
 
 Inference parks what it cannot yet place: `pendingDots` for a member whose

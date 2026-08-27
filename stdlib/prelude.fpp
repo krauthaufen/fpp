@@ -6383,6 +6383,11 @@ type StringBuilder() =
     /// .NET overloads Append for every primitive; the char one is what
     /// character-at-a-time code (a framing reader, a lexer) actually calls
     member x.Append (c : char) : StringBuilder = x.Append (string c)
+    /// the numeric ones, which loop-built output reaches for constantly
+    member x.Append (v : int) : StringBuilder = x.Append (string v)
+    member x.Append (v : int64) : StringBuilder = x.Append (string v)
+    member x.Append (v : float) : StringBuilder = x.Append (string v)
+    member x.Append (v : bool) : StringBuilder = x.Append (string v)
     member x.AppendLine (s : string) : StringBuilder = x.Append (s + "\n")
     member x.Clear () : StringBuilder =
         chunks.Clear ()

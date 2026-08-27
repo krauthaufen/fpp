@@ -918,7 +918,7 @@ type Workspace() =
                 for off, cn in inf.ExistMatch do dictSet em off cn
                 let du = dictNew<int, int * int> ()
                 for off, pm in inf.DictUses do dictSet du off pm
-                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
+                let low = Fpp.Core.Lower.lower path root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces r.Bases cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
                 for d in this.RunPerFile low.Decls do vecAdd allDecls d
                 for off, why in low.Notes do
                     vecAdd errs (blameAt path off ("not lowerable: " + why))
@@ -961,7 +961,7 @@ type Workspace() =
         for off, pm in bi.DictUses do dictSet bdu off pm
         let blow =
             Fpp.Core.Lower.lower Builtin.path bp.Root bb r.Schemes bok bak bik bms bfo bcs
-                r.Members r.Fields r.Interfaces bcu bcp bot r.Aliases bi.ArbDerive bi.OrdDerive bi.ShowDerive bi.ShowTypes bi.StrTypes bep becs bem bdu
+                r.Members r.Fields r.Interfaces r.Bases bcu bcp bot r.Aliases bi.ArbDerive bi.OrdDerive bi.ShowDerive bi.ShowTypes bi.StrTypes bep becs bem bdu
         for d in blow.Decls do vecAdd allDecls d
         // one function per primitive instance member, so `Add.(+)` denotes
         // something callable even where `a + b` is a machine instruction
@@ -1112,7 +1112,7 @@ type Workspace() =
                 for off, cn in inf.ExistMatch do dictSet em off cn
                 let du = dictNew<int, int * int> ()
                 for off, pm in inf.DictUses do dictSet du off pm
-                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
+                let low = Fpp.Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces r.Bases cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
                 for d in low.Decls do vecAdd decls d
             | None -> ()
         let schemes =
@@ -1153,7 +1153,7 @@ type Workspace() =
             for off, cn in inf.ExistMatch do dictSet em off cn
             let du = dictNew<int, int * int> ()
             for off, pm in inf.DictUses do dictSet du off pm
-            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
+            Core.Lower.lower path (this.ParseFile path).Root b r.Schemes ok ak ik ms fo cs r.Members r.Fields r.Interfaces r.Bases cu cp ot r.Aliases inf.ArbDerive inf.OrdDerive inf.ShowDerive inf.ShowTypes inf.StrTypes ep ecs em du
         | None -> { Decls = []; Notes = [] }
 
     /// Definition for the name whose use (or definition) covers the offset.

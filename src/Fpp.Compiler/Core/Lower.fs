@@ -28,6 +28,10 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
           (projectMembers : Dict<string, Resolve.Definition>)
           (fieldsTable : Dict<string, Fpp.Analysis.Infer.FieldInfo>)
           (ifaces : Dict<string, (string * int) list>)
+          /// derived name -> (own params, base type). Carries INTERFACE
+          /// inheritance as well as class inheritance, which is what lets a
+          /// class implementing `IDer : IBase` get an IBase vtable row.
+          (ifaceBases : Dict<string, Var list * Type>)
           (classUses : Dict<int, Fpp.Analysis.Classes.InstMember>)
           (classPending : Dict<int, string>)
           (opTypes : Dict<int, string>)
@@ -509,6 +513,37 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// synthetic offset derived from the construct's first token; this reads
     /// what it bound to and builds the call, through the vtable when the
     /// owner is an interface and as a lifted function otherwise.
+    /// The vtable rows an `interface I with ...` block produces: one for I,
+    /// and one for every interface I INHERITS. F# requires the inherited
+    /// members to be implemented in that same block, but a row is keyed by
+    /// interface NAME, so without the extra rows a cast to the base found
+    /// none, dispatched through table index 0 and hit $novt — the cast
+    /// type-checked and the trap named only the helper.
+    ///
+    /// The rows share the same lifted functions, so this costs a table slot
+    /// rather than a copy. `seen` also stops a cyclic `inherit` from looping.
+    let ifaceRowsFor (iname : string) (bound : (string * VarId) list)
+                     : (string * (string * VarId) list) list =
+        let rows = vecNew<string * (string * VarId) list> ()
+        vecAdd rows (iname, bound)
+        let mutable seen = [ iname ]
+        let mutable pending = [ iname ]
+        while not (List.isEmpty pending) do
+            let cur = List.head pending
+            pending <- List.tail pending
+            match dictTryFind ifaceBases cur with
+            | Some (_, TCon (b, _)) when not (List.contains b seen) ->
+                seen <- b :: seen
+                pending <- b :: pending
+                (match dictTryFind ifaces b with
+                 | Some decl ->
+                     let names = decl |> List.map fst
+                     let sub = bound |> List.filter (fun (mn, _) -> List.contains mn names)
+                     if not (List.isEmpty sub) then vecAdd rows (b, sub)
+                 | None -> ())
+            | _ -> ()
+        vecToList rows
+
     let synthCall (base_ : int) (fo : int) (name : string) (recv : Expr) (withUnit : bool) : Expr option =
         let t = { Kind = Ident; Text = name; Leading = []; Trailing = []; Offset = base_ + fo }
         // a TYPECLASS dot-member resolved at the synthetic offset: apply
@@ -3486,7 +3521,9 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          DClass (synth, Some bn, bound, [])
                      | None ->
                          DClass (synth, None, [],
-                                 match iface with Some i -> [ i, bound ] | None -> []))
+                                 match iface with
+                                 | Some i -> ifaceRowsFor i bound
+                                 | None -> []))
                 // the CONSTRUCTION reads each captured var in the enclosing
                 // scope — where it may itself be a field of the class being
                 // lowered (a nested object expression, or a ctor parameter
@@ -5001,7 +5038,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // reached only through the vtable, never by name on the class
             for iname, ms in implNodes do
                 let bound = ms |> List.collect liftMember
-                vecAdd implemented (iname, bound)
+                for row in ifaceRowsFor iname bound do vecAdd implemented row
             currentClass <- ""
             let baseInst =
                 inheritNode |> Option.bind baseTypeNode

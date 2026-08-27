@@ -1743,7 +1743,12 @@ let parse (src : string) : ParseResult =
         // `yield`/`return` start a body too: inside a comprehension the
         // branch IS a yield, and without this it escaped the `if` and became
         // a sibling — which would yield unconditionally
-        if canStartExpr () || s.IsKw "let" || s.IsKw "yield" || s.IsKw "return" then
+        // `use` and `do` start a branch body exactly as `let` does — the same
+        // list the block-start predicate above carries. Missing here, `use x
+        // = e` opening a `then` typed as unit and one opening an `else` did
+        // not parse at all, both a long way from the branch that caused it.
+        if canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
+           || s.IsKw "yield" || s.IsKw "return" then
             vecAdd acc (parseBlock ifCol)
         let mutable go = true
         while go do
@@ -1752,7 +1757,8 @@ let parse (src : string) : ParseResult =
                 go <- false   // nested elif consumed the rest of the chain
             elif s.IsKw "else" && s.CurCol >= ifCol then
                 vecAdd acc (s.Bump ())
-                if canStartExpr () || s.IsKw "let" || s.IsKw "if" || s.IsKw "yield" || s.IsKw "return" then
+                if canStartExpr () || s.IsKw "let" || s.IsKw "use" || s.IsKw "do"
+                   || s.IsKw "if" || s.IsKw "yield" || s.IsKw "return" then
                     vecAdd acc (parseBlock ifCol)
                 go <- false
             else go <- false
