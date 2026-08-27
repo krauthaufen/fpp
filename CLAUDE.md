@@ -16,7 +16,8 @@ dotnet run  -c Release --project tests/Fpp.Tests      # ~4 min, 692 tests
 tests/conformance/run.sh                              # 76 suites, fsi oracle
 dotnet fsi  tests/bootstrap/fixpoint.fsx              # ~2 min, corpus
 dotnet fsi  tests/bootstrap/fixpoint.fsx self         # ~7 min, THE gate
-./tests/run-gates.sh --full                           # ~8 min, all 31, parallel
+./tests/run-gates.sh --full                           # ~9 min, all 32, parallel
+tests/tooling/perf/regress.sh --timing                # perf, on a QUIET box
 ```
 
 There is ONE backend: wasm-linear over the fpprt/Whippet reactor (the C
@@ -62,6 +63,38 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## The two parked queues must advance TOGETHER
+
+Inference parks what it cannot yet place: `pendingDots` for a member whose
+receiver has no type, `pendingIndex` for an index whose receiver is not yet
+known to be an array. They used to drain one after the other, dots first,
+because an index's receiver often takes shape through a parked dot.
+
+The dependency runs BOTH ways, and the other direction had no path. Adding a
+second `string.Split` overload was enough to expose it: overloaded, the call
+parks, so `lines` has no type, so `lines.[0]` parks, so the `.Trim()` on it
+finds no receiver — and by the time the index pass ran, every dot retry was
+already behind it. The member reached emission unlowered and the backend
+answered `unreachable`. **`--strict` said nothing**, because nothing was
+recorded as missing; the tell was a Core dump still showing
+`(lines.[0].Trim ())` as a bare member instead of `$str.Trim`.
+
+They now advance to a joint fixpoint (`indexProgress`, called inside the dot
+loop). The final index pass still owns the diagnostics for receivers that
+genuinely cannot be indexed, and skips what the fixpoint already named —
+naming a site twice would file a second `arrKindsRaw` entry for it.
+
+Worth remembering as a shape, not just a bug: adding an OVERLOAD to an
+existing member is never local. It moves that member from the eager path to
+the parked one, and anything downstream that needed its result type
+immediately now needs it later. The regression showed up in `.TrimEnd`,
+whose overloads nobody had touched.
+
+A related trap from the same change: intercepting a member BY NAME in Lower
+(`String.Join`) also grabbed the prelude's own list-taking `String.Join` and
+forced its argument to an array. Only the `System.`-qualified spelling needs
+the interception — that is the one whose `System` never resolves.
+
 ## An application types its argument ONCE
 
 The member path takes a `dotDemand` before typing the head, and that needs the
@@ -100,6 +133,28 @@ same instructions runs 12x faster, the instructions are not the problem.
 to compile exits in milliseconds and looks like a spectacular win. That
 mistake was made three times in one session, once reported as a 27x speedup
 that was really a validation error with stderr piped to `/dev/null`.
+
+**The benchmarks gate, but only their stable half.** `perf-regress` checks
+every benchmark's ANSWER against a recorded checksum and the number of
+bounds checks it still emits — both load-independent. It does NOT check the
+clock: the gate suite runs eight jobs at once and under that load these
+numbers trebled (avl 1990ms -> 6553). Timing is `regress.sh --timing`, run
+by hand on a quiet machine, with a 1.5x ceiling. `--record` rewrites
+`baseline.txt`.
+
+The static half is not a consolation prize — a checksum change means the
+program stopped computing what it computed, and a rise in the emitted-check
+count means the proof pass lost a rule, which is the failure most likely to
+creep in unnoticed.
+
+Read the SHAPE of a count rise before chasing it. The count is a floor plus
+the program's own checks, so linking one more prelude function raises EVERY
+benchmark by the same amount — adding `List.toArray` to a `StringOps` member
+put all nine up by exactly one, via `Array.ofList`, whose `r.[i] <- x` is
+in range only if two separate `for _ in xs` traversals of the same list
+agree in count. Nothing in the domain expresses that, and `Array.ofList` is
+in no hot loop, so the answer there is `--record`, not a new rule. A rise on
+ONE or TWO benchmarks is the real signal.
 
 Benchmarks that compare against C live in `tests/tooling/perf/`;
 `tests/tooling/abi/` checks struct layout against emscripten.

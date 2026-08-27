@@ -1,0 +1,10 @@
+# benchmark answer bounds-checks ms — rewritten by ./regress.sh --record
+add 20000000 128 33
+avl 604433050116 128 1802
+matmul 589831680 128 102
+nbody -0.169019082 130 392
+read 20000000 128 43
+shapes 480000000 128 262
+sort 89933898 130 1499
+trees 67283631 128 912
+vertices 120000000 128 52

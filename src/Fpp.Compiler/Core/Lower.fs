@@ -1872,6 +1872,20 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | Some m when m = "$sysstring" -> dictTryFind memberIndex "StringOps.OfArray"
                                   | _ -> None)
                              | _ -> None
+                     // `System.String.Join (sep, xs)`
+                     let sysJoin =
+                         if head.NodeKind <> DotExpr then None
+                         else
+                             match Green.tokens (GNode head)
+                                   |> List.filter (fun t -> t.Kind = Ident)
+                                   |> List.map (fun t -> t.Text) with
+                             // System-qualified only — see Infer's sysJoinMark
+                             | [ "System"; "String"; "Join" ] ->
+                                 dictTryFind memberIndex "StringOps.Join"
+                             | _ -> None
+                     match sysJoin with
+                     | Some d -> EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
+                     | None ->
                      match sysString with
                      | Some d -> EApp (EVar (varIdOf d, schemeOf d), loweredArgs)
                      | None ->
@@ -1889,6 +1903,29 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           | Some e -> e
                           // a string's ToString is the string itself
                           | None -> if k = "t" then recv else EApp (EUnknown ("string#" + k), [ recv ]))
+                     | None ->
+                     // three .NET string overloads that are not single
+                     // instructions: they run in the prelude instead of as a
+                     // `$str.` primitive. Keyed by the ORDINAL inference
+                     // chose, which is why their registrations sit together.
+                     let stringViaPrelude =
+                         match stringBuiltin with
+                         | Some (prim, recv) ->
+                             (match prim with
+                              | "$str.Trim#2" -> Some ("StringOps.TrimChars", recv)
+                              | "$str.Split#2" -> Some ("StringOps.SplitChars", recv)
+                              | "$str.Split#3" -> Some ("StringOps.SplitString", recv)
+                              | _ -> None)
+                         | None -> None
+                     match stringViaPrelude with
+                     | Some (fn, recv) ->
+                         (match dictTryFind memberIndex fn with
+                          | Some d ->
+                              let flat =
+                                  loweredArgs
+                                  |> List.collect (fun a -> match a with ETuple xs -> xs | ELit LUnit -> [] | x -> [ x ])
+                              EApp (EVar (varIdOf d, schemeOf d), [ ETuple (recv :: flat) ])
+                          | None -> note (offsetOf n) ("missing " + fn))
                      | None ->
                      match stringBuiltin with
                      | Some (prim, recv) ->

@@ -2527,7 +2527,24 @@ let parse (src : string) : ParseResult =
         let one (kw : Green) : unit =
             let acc = vecNew<Green> ()
             vecAdd acc kw
-            vecAdd acc (parseClassHead col)
+            // F#'s OWN spellings — `when 'a : comparison`, `when 'a :> IFace`
+            // — are absorbed verbatim and read back by Infer's constraintOf,
+            // which already understands both (fsharpInlineConstraint and the
+            // subtype-bound scan). Demanding a class name here rejected, in
+            // `let` position only, a form the rest of the compiler handles
+            // and the type-parameter position accepts.
+            if s.IsOp "'" then
+                vecAdd acc (s.Bump ())                        // '
+                if s.Is Ident then vecAdd acc (s.Bump ())     // the variable
+                if s.IsOp ":" || s.IsOp ":>" then
+                    vecAdd acc (s.Bump ())
+                    if s.Is Ident then
+                        vecAdd acc (s.Bump ())
+                        while s.IsOp "." && s.SameLine do     // a dotted name
+                            vecAdd acc (s.Bump ())
+                            if s.Is Ident then vecAdd acc (s.Bump ())
+            else
+                vecAdd acc (parseClassHead col)
             let mutable sawWith = false
             if s.IsKw "with" then
                 sawWith <- true

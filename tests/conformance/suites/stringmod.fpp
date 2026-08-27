@@ -146,4 +146,35 @@ let built =
 eq "built-in-loop" built "1234"
 eq "folded" (List.fold (fun (a : string) (b : string) -> a + b) "" [ "x"; "y"; "z" ]) "xyz"
 
+// ---- the overloads that take a SET or a whole string -----------------------
+// `Split` and `Trim` each have more than the one-char form. .NET keeps empty
+// entries when it splits, which is what makes the edges worth pinning: a
+// separator at either end produces one.
+
+eq "split-char-array" (String.concat "|" (Array.toList ("a b  c".Split [| ' ' |]))) "a|b||c"
+eq "split-several-separators" (String.concat "|" (Array.toList ("a;b,c".Split [| ';'; ',' |]))) "a|b|c"
+eq "split-string-separator" (String.concat "|" (Array.toList ("a::b::c".Split "::"))) "a|b|c"
+eq "split-string-absent" (String.concat "|" (Array.toList ("nosep".Split "::"))) "nosep"
+eq "split-keeps-leading-empty" (String.concat "|" (Array.toList (",a,".Split ','))) "|a|"
+eq "split-char-still-works" (String.concat "|" (Array.toList ("a,b".Split ','))) "a|b"
+eq "split-count-with-empties" (string ("a,,b".Split ',').Length) "3"
+
+eq "trim-char-set" ("xxaxbxx".Trim [| 'x' |]) "axb"
+eq "trim-all-trimmed" ("aaa".Trim [| 'a' |]) ""
+eq "trim-several-chars" ("xy hi yx".Trim [| 'x'; 'y' |]) " hi "
+eq "trim-unit-still-works" ("  pad  ".Trim ()) "pad"
+
+eq "string-join" (System.String.Join (",", [| "a"; "b"; "c" |])) "a,b,c"
+eq "string-join-empty-sep" (System.String.Join ("", [| "a"; "b" |])) "ab"
+eq "string-join-single" (System.String.Join (",", [| "solo" |])) "solo"
+// DROPPED: the bare `String.Join (sep, list)`, which F++ has and F# does not
+// — there `String` is FSharp.Core's module, with no Join to find, so the
+// oracle cannot compile it. The unit suite covers that spelling.
+
+// a member on an INDEX of an overloaded call's result: the element type is
+// only known once the call is resolved, and both have to settle together
+let joined = "a b	c".Replace("	", " ").Split [| ' ' |]
+eq "member-on-index-of-overloaded-result" (joined.[0].Trim ()) "a"
+eq "member-on-index-count" (string joined.Length) "3"
+
 printfn "DONE tests=%d failures=%d" ntests failures

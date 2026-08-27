@@ -38,6 +38,10 @@ gates+=("pkg-gate|$here/tooling/pkg-gate.sh")
 [ -x "$here/tooling/gc/cleanup-gate.sh" ] && gates+=("cleanup-gate|$here/tooling/gc/cleanup-gate.sh")
 [ -x "$here/tooling/gc/weak-gate.sh" ] && gates+=("weak-gate|$here/tooling/gc/weak-gate.sh")
 gates+=("conformance|$here/conformance/run.sh")
+# the benchmarks as a regression check: answers, bounds-check counts, and
+# times under a loose ceiling. --full only — it runs every benchmark three
+# times and is minutes of wall clock.
+[ "$full" = 1 ] && gates+=("perf-regress|$here/tooling/perf/regress.sh")
 gates+=("conformance-neg|$here/conformance/neg.sh")
 if [ "$full" = 1 ]; then
   # heaviest first, so they overlap the whole small-gate tail. The unit

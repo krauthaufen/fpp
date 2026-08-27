@@ -209,4 +209,43 @@ eq "conversion-piped-parse" (string ("7" |> int)) "7"
 eq "conversion-over-an-array" (String.concat "," (Array.toList (Array.map string [| 1; 2 |]))) "1,2"
 eq "conversion-composed" (compose string (fun (v : int) -> v * 2) 5) "10"
 
+// ---- F#'s own constraint spellings -----------------------------------------
+// `when 'a : comparison` and `when Ordered<'a>` say the same thing, and both
+// are accepted — the F# form is absorbed verbatim and read back as the class
+// it means (see DIVERGENCES.md for the mapping). `: equality` asks for
+// nothing, since structural `=` is builtin.
+
+let biggestOf (xs : 'a list) : 'a when 'a : comparison = List.max xs
+eq "constraint-comparison-int" (string (biggestOf [ 3; 1; 2 ])) "3"
+eq "constraint-comparison-string" (biggestOf [ "a"; "c" ]) "c"
+
+let allEqual (xs : 'a list) : bool when 'a : equality =
+    match xs with
+    | [] -> true
+    | h :: t -> List.forall (fun x -> x = h) t
+
+test "constraint-equality-same" (allEqual [ 1; 1 ])
+test "constraint-equality-differ" (not (allEqual [ "a"; "b" ]))
+
+// DROPPED: the class spelling `when Ordered<'a>`, which means the same
+// thing here — F# has no such class, so the oracle cannot compile it.
+
+// a SUBTYPE constraint resolves the member access on the variable
+type IMeasured =
+    abstract Size : unit -> int
+
+type Blob(n : int) =
+    interface IMeasured with
+        member _.Size () = n
+
+let sizeOf (x : 'a) : int when 'a :> IMeasured = x.Size ()
+eq "constraint-subtype" (string (sizeOf (Blob 7))) "7"
+
+// on a TYPE parameter, the spelling F# uses there
+type Sorted<'a when 'a : comparison>(items : 'a list) =
+    member _.Largest = List.max items
+
+eq "constraint-on-a-type-parameter" (string (Sorted([ 3; 1; 2 ])).Largest) "3"
+eq "constraint-on-a-type-parameter-string" (Sorted([ "a"; "b" ])).Largest "b"
+
 printfn "DONE tests=%d failures=%d" ntests failures

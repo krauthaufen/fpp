@@ -685,6 +685,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             registerField "string.Insert" (m (TFun (TTuple [ tInt; tString ], tString)))
             registerField "string.Remove" (m (TFun (tInt, tString)))
             registerField "string.Remove" (m (TFun (TTuple [ tInt; tInt ], tString)))
+            // .NET's other overloads of these three. The ordinals are
+            // positional, so a use site picks by the shape it was
+            // constrained to — keep these together and in this order, since
+            // Lower routes them to the prelude by ordinal.
+            registerField "string.Trim" (m (TFun (charArr, tString)))        // #2
+            registerField "string.Split" (m (TFun (charArr, strArr)))        // #2
+            registerField "string.Split" (m (TFun (tString, strArr)))        // #3
             registerField "string.StartsWith" (m (TFun (tChar, tBool)))
             registerField "string.EndsWith" (m (TFun (tChar, tBool)))
             registerField "string.Contains" (m (TFun (tChar, tBool)))
@@ -3607,6 +3614,33 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               | None -> false)
                          | _ -> false
                      if sysStringMark then tString else
+                     // `System.String.Join (sep, xs)` — same story as
+                     // `System.String (chars)`: `System` never resolves, so
+                     // without this the call has no type at all.
+                     let sysJoinMark =
+                         match head.NodeKind, args with
+                         | DotExpr, [ onlyArg ] when
+                               (match Green.tokens (GNode head)
+                                      |> List.filter (fun t -> t.Kind = Ident)
+                                      |> List.map (fun t -> t.Text) with
+                                // ONLY the System-qualified spelling. Bare
+                                // `String.Join` already resolves to the
+                                // prelude's `module String` function, which
+                                // takes a string LIST — grabbing that name
+                                // too forced its argument to an array and
+                                // turned every list call into an emission
+                                // error.
+                                | [ "System"; "String"; "Join" ] -> true
+                                | _ -> false) ->
+                             (match Green.tokens (GNode head)
+                                    |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
+                              | Some nt ->
+                                  unifyAt nt.Offset (exprType (GNode onlyArg))
+                                          (TTuple [ tString; TCon ("array", [ tString ]) ])
+                                  true
+                              | None -> false)
+                         | _ -> false
+                     if sysJoinMark then tString else
                      // numeric conversions are primitives, not functions
                      let conversion =
                          match head.NodeKind, args with
@@ -8134,9 +8168,41 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // instance's own variable — its member template froze at int layouts,
     // nothing marked it for stamping, and every use ran the int body. So:
     // resolve everything resolvable, THEN default what remains.
+    // The two parked queues need EACH OTHER, in both directions. An index
+    // whose receiver only took shape through a parked dot waits on the dot
+    // (which is what the final index pass below was written for), and a dot
+    // on an index RESULT waits on the index: `lines.[0].Trim()`, where
+    // `lines` came from a `Split` that parked because it is overloaded, has
+    // no element type to look the member up on. Drained one after the
+    // other, that second direction never resolves — the dot reached
+    // emission unlowered and the backend answered `unreachable`, with
+    // --strict silent, since nothing was ever recorded as missing. So they
+    // advance TOGETHER here; the pass below still owns the diagnostics for
+    // receivers that genuinely cannot be indexed.
+    let indexAdvanced = dictNew<int, bool> ()
+    let indexProgress () : bool =
+        let mutable made = false
+        for offset, recvTy, result, _, _ in vecToList pendingIndex do
+            if (dictTryFind indexAdvanced offset).IsNone then
+                match prune recvTy with
+                | TCon ("array", [ e ]) ->
+                    dictSet indexAdvanced offset true
+                    unifyAt offset result e
+                    vecAdd arrKindsRaw (offset, TCon ("array", [ e ]))
+                    dictSet arrIndexTargets offset true
+                    made <- true
+                | TCon ("string", []) ->
+                    dictSet indexAdvanced offset true
+                    unifyAt offset result tChar
+                    vecAdd arrKindsRaw (offset, TCon ("$str", []))
+                    made <- true
+                | _ -> ()
+        made
+
     let dotsLeft = vecNew<int * Type * Type * string> ()
     (let mutable parked0 = vecToList pendingDots
      let mutable progress0 = true
+     indexProgress () |> ignore
      while progress0 do
          progress0 <- false
          let still0 = vecNew<int * Type * Type * string> ()
@@ -8144,6 +8210,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
              if tryResolveDot false offset recvTy result name then progress0 <- true
              else vecAdd still0 (offset, recvTy, result, name)
          parked0 <- vecToList still0
+         if indexProgress () then progress0 <- true
      for e in parked0 do vecAdd dotsLeft e)
     solveWanted ()
 
@@ -8388,6 +8455,9 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     // index sites whose receiver only took shape through a parked dot: the
     // element type is known now, so name the read and tie the result to it
     for offset, recvTy, result, br, idxTy in vecToList pendingIndex do
+        // already named by the joint fixpoint above; naming it twice would
+        // add a second arrKindsRaw entry for the one site
+        if (dictTryFind indexAdvanced offset).IsSome then () else
         match prune recvTy with
         | TCon ("array", [ e ]) ->
             unifyAt offset result e

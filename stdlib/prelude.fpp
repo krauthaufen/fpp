@@ -3363,6 +3363,49 @@ module String =
 type StringOps =
     static member OfArray (cs : char[]) : string = String.ofArray cs
 
+    /// `s.Trim [| 'x' |]` — the char-SET form. `TrimStart`/`TrimEnd` already
+    /// take a set; this is both ends at once, which .NET spells `Trim`.
+    static member TrimChars (s : string, cs : char[]) : string =
+        (s.TrimStart cs).TrimEnd cs
+
+    /// `s.Split [| ';'; ',' |]` — split at ANY of the separators. .NET keeps
+    /// empty entries unless asked otherwise, so `"a,,b"` is three pieces.
+    static member SplitChars (s : string, cs : char[]) : string[] =
+        // a REVERSED list, not a ResizeArray: that type is declared further
+        // down this file, and a forward reference from here resolves to
+        // nothing and traps
+        let mutable out = []
+        let mutable start = 0
+        let mutable i = 0
+        while i < s.Length do
+            if Array.contains s.[i] cs then
+                out <- String.sub s start (i - start) :: out
+                start <- i + 1
+            i <- i + 1
+        out <- String.sub s start (s.Length - start) :: out
+        List.toArray (List.rev out)
+
+    /// `s.Split "::"` — a whole string as the separator. An EMPTY separator
+    /// would not advance, so it answers the whole string, as .NET does.
+    static member SplitString (s : string, sep : string) : string[] =
+        if sep.Length = 0 then [| s |]
+        else
+            let mutable out = []
+            let mutable start = 0
+            let mutable i = 0
+            while i <= s.Length - sep.Length do
+                if String.sub s i sep.Length = sep then
+                    out <- String.sub s start (i - start) :: out
+                    start <- i + sep.Length
+                    i <- i + sep.Length
+                else i <- i + 1
+            out <- String.sub s start (s.Length - start) :: out
+            List.toArray (List.rev out)
+
+    /// `System.String.Join (sep, xs)`
+    static member Join (sep : string, xs : string[]) : string =
+        String.concat sep (Array.toList xs)
+
 instance Pinnable<string>
     member s.Pin = String.pin s
     member s.ByteSize = 2 * String.length s
