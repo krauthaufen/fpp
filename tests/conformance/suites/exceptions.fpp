@@ -186,4 +186,36 @@ test "invalidOp-message"
 test "nullArg-message"
      ((try (nullArg "q"; "no") with e -> e.Message) = "Value cannot be null. (Parameter 'q')")
 
+// ---- integer division by zero is CATCHABLE ---------------------------------
+// wasm's `div_s` traps, and a trap cannot be caught — so this had to be
+// guarded and raised explicitly. The handler running is the whole point.
+
+let zero = 0
+let zeroL = 0L
+
+test "div-by-zero-is-caught" ((try string (1 / zero) with _ -> "caught") = "caught")
+test "mod-by-zero-is-caught" ((try string (1 % zero) with _ -> "caught") = "caught")
+test "int64-div-by-zero-is-caught" ((try string (1L / zeroL) with _ -> "caught") = "caught")
+test "int64-mod-by-zero-is-caught" ((try string (1L % zeroL) with _ -> "caught") = "caught")
+
+// the handler runs INSIDE the enclosing scope, so the rest continues
+let mutable afterDiv = ""
+(try afterDiv <- string (10 / zero) with _ -> afterDiv <- "handled")
+test "execution-continues-after-the-handler" (afterDiv = "handled")
+
+// a division that does NOT divide by zero is untouched
+test "ordinary-division" (7 / 2 = 3)
+test "ordinary-remainder" (7 % 2 = 1)
+test "ordinary-int64-division" (7L / 2L = 3L)
+test "negative-division" (-7 / 2 = -3)
+test "negative-remainder" (-7 % 2 = -1)
+
+// and the guard does not fire for a divisor that merely COULD be zero
+let divideBy (n : int) (d : int) : string =
+    try string (n / d) with _ -> "caught"
+
+test "guarded-call-with-a-good-divisor" (divideBy 9 3 = "3")
+test "guarded-call-with-zero" (divideBy 9 0 = "caught")
+test "guarded-call-again" (divideBy 8 2 = "4")
+
 printfn "DONE tests=%d failures=%d" ntests failures

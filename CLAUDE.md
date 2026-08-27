@@ -1,5 +1,32 @@
 # Working in this repo
 
+## Never ship a silently wrong answer
+
+Documentation is for MISSING things. A construct this compiler accepts and
+then answers incorrectly is not a known issue to write down — it is a defect
+to FIX, or a construct to REJECT with a diagnostic. `tests/known-issues/`
+may hold the first kind and never the second.
+
+Three went out under that rule the day it was written:
+
+* `decimal`. The `m` suffix was accepted and computed in binary, so
+  `0.1m + 0.2m` answered 0.30000000000000004. There is no base-ten type
+  here, so the suffix is a compile error now.
+* units of measure. `[<Measure>]` declared an ordinary empty type and the
+  `<m>` on a literal was PARSED AND DISCARDED — no part of the compiler
+  ever knew the word — so `1.0<m> + 2.0<s>` answered 3 where F# rejects it,
+  and `5.0<zzz>` was fine with zzz declared nowhere. Both halves are errors
+  now, at the attribute and at the literal.
+* integer `/` and `%` by zero. wasm's `div_s` TRAPS, and a trap is not
+  catchable, so `try 1/0 with _ -> ...` ran its handler in F# and killed the
+  program here. Guarded and raised now, like a bounds failure, so the same
+  `with` sees it. A non-zero literal divisor skips the guard.
+
+The shape to watch for is syntax that PARSES and is then ignored. It reads
+as support, and the wrong answer arrives with no diagnostic anywhere. When
+adding a feature, prefer rejecting the surface you have not implemented over
+accepting it and doing something approximate.
+
 F++ is a compiler that compiles itself. That single fact sets almost every
 rule below: a change that looks fine and passes the unit tests can still be
 wrong, because the compiler has to be able to build *its own source* and get

@@ -1327,6 +1327,16 @@ let parse (src : string) : ParseResult =
                     s.Diag "expected member name after '.'"
                     e <- Green.node DotExpr [ e; dot ]
             elif s.IsOp "<" && isAdjacentTo e && looksLikeTypeArgs () then
+                // A LITERAL cannot take type arguments. `5.0<m>` is F#'s
+                // units-of-measure spelling, and there are no measures here —
+                // no part of this compiler knows the word. The suffix was
+                // parsed and DISCARDED, so `1.0<m> + 2.0<s>` answered 3 where
+                // F# rejects it, and `5.0<zzz>` was accepted with zzz
+                // declared nowhere. Rejected rather than silently ignored.
+                (match e with
+                 | GNode le when le.NodeKind = LiteralExpr ->
+                     s.Diag "units of measure are not supported: a numeric literal cannot take type arguments"
+                 | _ -> ())
                 // explicit generic application: GetValue<string>, vecNew<Green>
                 e <- Green.node AppExpr [ e; Green.node TyParams (parseAngleArgs ctx) ]
             elif s.Is LParen && isAdjacentTo e then

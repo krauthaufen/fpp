@@ -6206,7 +6206,11 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | "+" -> AddL | "-" -> SubL | "*" -> MulL
             | "/" -> (if unsigned then DivUL else DivSL)
             | _ -> (if unsigned then RemUL else RemSL)
-        lowBoxI ctx (LPrim (iop, [ ia; ib ]))
+        let isDiv =
+            match op.Substring (0, op.Length - 1) with
+            | "/" | "%" -> true
+            | _ -> false
+        lowBoxI ctx (if isDiv then divGuarded ctx true iop ia ib else LPrim (iop, [ ia; ib ]))
     // int64 BITWISE — both operands are boxed i64. Without this `&&&l`/`|||l`/…
     // fell to the int32 path (or intArithOp's `%` default -> `i64 >>> n` became
     // an i32 `rem` and DIVIDED BY ZERO), which trapped the self-hosted emitter's
@@ -6487,9 +6491,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         | "<=" -> LPrim ((if unsignedW then LeUW else LeSW), [ ta; tb ])
         | ">=" -> LPrim ((if unsignedW then GeUW else GeSW), [ ta; tb ])
         | "=" | "<>" -> LPrim (intCmpOp bop, [ ta; tb ])
-        | "/" when unsignedW -> LPrim (DivUW, [ ta; tb ])
-        | "%" when unsignedW -> LPrim (RemUW, [ ta; tb ])
+        | "/" when unsignedW -> divGuarded ctx false DivUW ta tb
+        | "%" when unsignedW -> divGuarded ctx false RemUW ta tb
         | ">>>" when unsignedW -> LPrim (ShrUW, [ ta; tb ])
+        | "/" | "%" -> divGuarded ctx false (intArithOp bop) ta tb
         | _ -> LPrim (intArithOp bop, [ ta; tb ])
     | ETuple xs -> lowObjR ctx CID_TUPLE 0 (List.map (coreToLowE ctx) xs) (Some (List.map (refKindOfExprC st) xs)) (genWitsOf ctx 0 xs)
     | EListLit xs -> lowList ctx xs
@@ -9646,6 +9651,38 @@ and private boundsGuard (ctx : LowCtx) (node : Expr) (baseR : int) (idxR : int) 
         [ LIf (LPrim (GeUW, [ LGet (wReg idxR); LLoad (W, LGet (wReg baseR), HDR) ]),
                [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"Index was outside the bounds of the array.\"")) ],
                []) ]
+
+/// Integer `/` and `%` guarded against a zero divisor. wasm's `div_s` TRAPS
+/// on zero, and a trap is not catchable — so `try 1/0 with _ -> ...` ran the
+/// handler in F# and killed the program here. Raised instead, exactly the way
+/// a bounds failure is, so the same `with` sees it.
+///
+/// A non-zero literal divisor needs no guard, which covers the constant
+/// divisors (`/ 2`, `% 10`) that most divisions actually are. Both operands
+/// are bound first so the guard cannot reorder their evaluation.
+and private divGuarded (ctx : LowCtx) (isLong : bool) (op : LOp) (ta : LExpr) (tb : LExpr) : LExpr =
+    let nonZeroConst =
+        match tb with
+        | LConstW n -> n <> 0
+        | LConstL n -> n <> 0L
+        | _ -> false
+    if nonZeroConst then LPrim (op, [ ta; tb ])
+    else
+        // the temps must be declared at the RIGHT width: freshTmp is always a
+        // word, so an i64 divisor stored into one fails validation — and the
+        // prelude divides i64s, so every build broke, not just i64 code
+        let at = if isLong then freshTmpT ctx I64 else freshTmp ctx
+        let bt = if isLong then freshTmpT ctx I64 else freshTmp ctx
+        let reg r = if isLong then lReg r else wReg r
+        let isZero =
+            if isLong then LPrim (EqL, [ LGet (reg bt); LConstL 0L ])
+            else LPrim (EqW, [ LGet (reg bt); LConstW 0 ])
+        LDo ([ LSet (reg at, ta)
+               LSet (reg bt, tb)
+               LIf (isZero,
+                    [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"Attempted to divide by zero.\"")) ],
+                    []) ],
+             LPrim (op, [ LGet (reg at); LGet (reg bt) ]))
 
 and private lowFailure (ctx : LowCtx) (msg : LExpr) : LExpr =
     ctx.LSt.UsesExn <- true

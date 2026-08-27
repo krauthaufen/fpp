@@ -1,5 +1,12 @@
 # Known issues
 
+A file here records something MISSING. Nothing here may record something
+WRONG: a construct this compiler accepts and then answers incorrectly is a
+defect to fix or a construct to REJECT, never an entry in this directory.
+Two of them were removed the day that rule was written — `decimal` (the `m`
+suffix computed in binary) and units of measure (the unit on a literal
+discarded, so `1.0<m> + 2.0<s>` answered 3). Both are compile errors now.
+
 One directory, one file per open bug, each the SMALLEST program that still
 shows it. They are not part of any gate — a gate that is allowed to fail
 teaches nothing — but every one of them is a real, reproducible defect, and
@@ -17,14 +24,6 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
-
-* `decimal-is-a-float.fpp` — the `m` suffix is accepted and computed in
-  binary, so `0.1m + 0.2m` is 0.30000000000000004 where F# answers 0.3.
-  Silent. Either implement base-10 decimal or reject the suffix.
-
-* `measures-single-unit-only.fpp` — `[<Measure>]` and `5.0<m>` work and
-  match F# at run time, but `float<m/s>` and `10.0<m/s>` do not, so the
-  composition half of the feature is missing and no suite can be ported.
 
 Fixed and removed (see git history for the repros):
 `module-abbreviation` (`module Ab = Inner` parsed as a module with an EMPTY

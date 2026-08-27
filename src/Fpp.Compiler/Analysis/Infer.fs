@@ -2878,6 +2878,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // ours; `f` keeps its F# meaning
             if t.Text.EndsWith "h" || t.Text.EndsWith "H" then TCon ("float16", [])
             elif t.Text.EndsWith "f" || t.Text.EndsWith "F" then TCon ("float32", [])
+            // `1.5m` is a DECIMAL in F#: 128-bit, base ten, exact for the
+            // values money is written in. There is no such type here, and
+            // reading the suffix as a float made `0.1m + 0.2m` answer
+            // 0.30000000000000004 — silently, which is the one outcome a
+            // compiler must never ship. Rejected instead; the type name
+            // `decimal` was never declared, so this is the only way in.
+            elif t.Text.EndsWith "m" || t.Text.EndsWith "M" then
+                vecAdd diags
+                    (t.Offset,
+                     "decimal is not supported: the 'm' suffix would be computed as a binary float, so `0.1m + 0.2m` would not be 0.3. Drop the suffix if binary precision is acceptable")
+                tFloat
             else tFloat
         | StringLit -> tString
         | CharLit -> tChar
@@ -7754,6 +7765,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     pendingStructAttr <- true
                 if Green.tokens g |> List.exists (fun t -> t.Kind = Ident && t.Text = "AbstractClass") then
                     pendingAbstractAttr <- true
+                // `[<Measure>]` declares a UNIT, and nothing here implements
+                // units: the attribute made an ordinary empty type and the
+                // `<m>` on a literal was discarded, so the checking the
+                // attribute exists to buy was never done. The use site is
+                // rejected too; this says so at the declaration, where the
+                // mistaken expectation starts.
+                (match Green.tokens g |> List.tryFind (fun t -> t.Kind = Ident && t.Text = "Measure") with
+                 | Some mt ->
+                     vecAdd diags
+                         (mt.Offset,
+                          "units of measure are not supported: [<Measure>] would declare a unit this compiler does not check")
+                 | None -> ())
             | ModuleHeader | OpenDecl -> ()
             // the tables are read before any body; only the bodies are
             // typed here, in declaration order like everything else
