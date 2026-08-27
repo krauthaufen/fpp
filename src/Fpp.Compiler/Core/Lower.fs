@@ -1288,6 +1288,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                               let u = { Path = path; Offset = t.Offset + 29000000; Name = "_rru" }
                               let anon = mono (TCon ("?", []))
                               ELam ([ u, anon ], EApp (EUnknown "raise", [ EVar (rrv, rrs) ]))
+                          elif t.Text = "isNull" then
+                              // the same story as the conversions below: it
+                              // is emitted at its APPLICATION, so a BARE
+                              // `isNull` (`List.filter isNull`) reached the
+                              // backend as an unknown and trapped, green
+                              // build and --strict silent alike
+                              let v = { Path = path; Offset = t.Offset + 28000000; Name = "_isnull" }
+                              let anon = mono (TCon ("?", []))
+                              ELam ([ v, anon ], EApp (EUnknown "isNull", [ EVar (v, anon) ]))
                           else
                           let isConv =
                               List.contains t.Text
@@ -1878,7 +1887,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          if head.NodeKind <> DotExpr then None
                          else
                              match Green.tokens (GNode head) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast with
-                             | Some t ->
+                             // `Unchecked.defaultof<string>` keys the SAME
+                             // table, but there the entry is the TARGET type,
+                             // not an owner — routing it here built a
+                             // `$str.defaultof` primitive that does not exist
+                             // and trapped. Its own branch answers null.
+                             | Some t when t.Text <> "defaultof" ->
                                  (match dictTryFind memberSites t.Offset with
                                   | Some owner when owner = "string" || owner.StartsWith "string#" ->
                                       let ord = if owner = "string" then "" else owner.Substring (owner.IndexOf "#")
@@ -1886,7 +1900,7 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        | Some recv -> Some ("$str." + t.Text + ord, lowerExpr (GNode recv))
                                        | None -> None)
                                   | _ -> None)
-                             | None -> None
+                             | _ -> None
                      // `x.ToString ()` on a PRIMITIVE: .NET answers exactly
                      // what `string x` does, so it lowers to the same
                      // conversion — including the prelude's exact float

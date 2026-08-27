@@ -13,6 +13,13 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
+* `module-abbreviation.fpp` — `module Ab = Inner` parses but binds nothing,
+  so every `Ab.x` is an unresolved variable at emission.
+
+* `valueoption-surface.fpp` — `ValueSome`/`ValueNone` work, but `v.IsNone`
+  traps and the whole `ValueOption` module is missing. The `Option`
+  equivalents are all there.
+
 * `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
   isolation; the note records exactly what was ruled out. Kept as the

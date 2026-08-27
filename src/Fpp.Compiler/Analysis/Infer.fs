@@ -431,9 +431,46 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             // the positional pairing still applies wherever it fits — it is
             // what a subtype passing its parameters straight through relies
             // on; after the declared-instantiation unify it is a no-op there
-            if pa.Length = aa.Length
-               && List.forall2 (fun x y -> (Types.unifyTrial false x y).IsNone) pa aa then
+            let strictFit =
+                pa.Length = aa.Length
+                && List.forall2 (fun x y -> (Types.unifyTrial false x y).IsNone) pa aa
+            // the elements may need to widen THEMSELVES:
+            // `array<array<string>>` reaches `seq<seq<'a>>` only if the inner
+            // array widens to the inner seq, which plain unification refuses
+            let widenFit =
+                pa.Length = aa.Length
+                && List.forall2 (fun x y ->
+                       match prune x, prune y with
+                       | TCon (px, _), TCon (ax, _) -> px <> ax && isSupertypeOf px ax
+                       | _ -> false) pa aa
+            if strictFit then
                 List.iter2 (unifyAt offset) pa aa
+            elif widenFit then
+                List.iter2 (unifyArg offset) pa aa
+            // ONLY the built-in container widenings, where the element is
+            // passed straight through and so MUST pair. A user class reaching
+            // seq through `impls`, or any class widening to an interface, is
+            // the IOpReader shape instead: its own parameter is the ELEMENT
+            // while the interface's is the DELTA, they cannot pair, and the
+            // declared instantiation above carries the real mapping.
+            elif isSeqName p && (a = "list" || a = "List" || a = "array" || isSeqName a)
+                 && pa.Length = aa.Length && not (List.isEmpty pa) then
+                // The NAMES widen but the arguments cannot: `list<int>` is
+                // not a `seq<string>`. isSupertypeOf answers on constructor
+                // names ALONE, so without this the element mismatch was
+                // dropped in silence — `String.concat "," [ 1; 2; 3 ]`
+                // type-checked and rendered three EMPTY strings where F#
+                // rejects the call outright.
+                //
+                // Reported HERE rather than by unifying the two whole types:
+                // that path re-enters this same widening and succeeds again,
+                // so it would say nothing. Only the SAME-ARITY case — a
+                // `string` widening to `seq<char>` pairs nothing positionally
+                // and the declared-instantiation hook above carries it.
+                vecAdd diags
+                    (offset,
+                     "type mismatch: " + Types.typeString (prune paramTy)
+                     + " vs " + Types.typeString (prune argTy))
         // a multi-argument member packs its arguments into a tuple, and each
         // POSITION widens independently — `M(cmp, leaf)` against
         // `(IEqualityComparer * SetNode)` must accept a MapLeaf second
@@ -3357,6 +3394,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         inner
                                     | _ -> ty)
                                | None -> forwardVarFor d)
+                      // `isNull` used as a VALUE (`List.filter isNull`). Like
+                      // the conversions below it is emitted at its
+                      // APPLICATION, so the bare name needs a function type
+                      // here and an eta-expansion in Lower — without both it
+                      // reached the backend as itself and trapped.
+                      | None when t.Text = "isNull" ->
+                          TFun (st.Fresh (), tBool)
                       | None when
                             List.contains t.Text [ "int"; "int64"; "uint32"; "uint64"; "int16"; "uint16"; "float"; "float32"; "float16"; "string"; "char"; "byte"; "sbyte"; "nativeint" ] ->
                           // a builtin conversion USED AS A VALUE (`|> int`,

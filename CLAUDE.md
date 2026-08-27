@@ -63,6 +63,55 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## null is not the empty string, and the compare knew it was
+
+String `=` lowers to `$str_cmp` (`ShStr` in structEqW), and both it and
+`$streq` — which string PATTERNS compile to — began by loading the length
+word from `ptr + 4`. For a null pointer that reads address 4, where a 0
+happens to sit, so a null matched the EMPTY string: `("" = null)` answered
+true and a null fell into a `| "" ->` clause. Both now test for null before
+any load, and order null below the empty string the way .NET does.
+
+`$eqv`, the generic structural walker, had it right all along — "a tagged
+scalar, a null, or anything not addressable is equal only to itself". Only
+the string-specialized paths skipped the check. When a specialization and a
+general walker disagree, the specialization is usually the one that forgot
+something.
+
+`Unchecked.defaultof<string>` was a related miss: the `defaultof` token keys
+`memberSites`, but there the entry is the TARGET type, not an owner — so the
+string-member router turned it into a `$str.defaultof` primitive that does
+not exist. Its own branch already answered null correctly; it just never ran.
+
+And `isNull` used as a VALUE (`List.filter isNull`) hit the trap CLAUDE.md
+already describes for `string`/`int`: emitted at its APPLICATION, so a bare
+name reached the backend as an unknown and trapped. It eta-expands now, in
+both Infer and Lower — the same two lists that note warns about.
+
+## The seq widening compares NAMES, so check the arguments
+
+`isSupertypeOf` answers on constructor names alone: `list` widens to `seq`
+whatever the element types are. `unifyArg` then unified the arguments only
+when they already fit, and DROPPED the mismatch otherwise — so
+`String.concat "," [ 1; 2; 3 ]` type-checked and rendered three EMPTY
+strings where F# rejects the call.
+
+The mismatch is now a diagnostic, but only for the built-in container
+widenings (`list`/`array`/`seq` into `seq`), where the element passes
+straight through and so MUST pair. Two things it must NOT catch, both found
+by the gates rather than by reasoning:
+
+* a class widening to an interface — the `IOpReader` shape, where the class'
+  own parameter is the ELEMENT and the interface's is the DELTA. They cannot
+  pair, and the declared instantiation carries the real mapping.
+* a NESTED widening — `array<array<string>>` reaching `seq<seq<'a>>` needs
+  the inner array to widen too, which plain unification refuses. That case
+  now recurses through `unifyArg` instead of erroring.
+
+Report it directly with `vecAdd diags`, not by unifying the two whole types:
+that path re-enters the same name-based widening and succeeds, so it says
+nothing.
+
 ## A chosen constructor may live in ANOTHER file
 
 Inference picks a constructor project-wide and records the WINNER'S OFFSET

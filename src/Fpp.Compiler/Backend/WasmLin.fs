@@ -2223,6 +2223,13 @@ let private emitStreq (m : Mod) : unit =
     localsDone f
     lg f "$a"; lg f "$b"; ins f "i32.eq"
     ifE f; ic f 1; ins f "return"; endB f
+    // exactly ONE of them is null here (both-null took the pointer test
+    // above), so they differ. Without this the length load below read
+    // address 4 for the null side, found the 0 that happens to sit there,
+    // and matched the EMPTY string: `("" = null)` answered true, and a
+    // null fell into a `| "" ->` pattern clause.
+    lg f "$a"; ins f "i32.eqz"; lg f "$b"; ins f "i32.eqz"; ins f "i32.or"
+    ifE f; ic f 0; ins f "return"; endB f
     lg f "$a"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$la"
     lg f "$la"; lg f "$b"; ic f 4; ins f "i32.add"; mem f "i32.load"; ins f "i32.ne"
     ifE f; ic f 0; ins f "return"; endB f
@@ -2718,6 +2725,18 @@ let private emitStrCmp (m : Mod) : unit =
     let f = beginFn m [ "$a"; "$b" ]
     local f "$n" "i32"; local f "$mm" "i32"; local f "$i" "i32"; local f "$x" "i32"; local f "$y" "i32"
     localsDone f
+    // NULL first, and before any load: the length word of a null would be
+    // read from address 4, where the 0 that happens to sit there made a null
+    // compare EQUAL to the empty string. String `=` lowers to this, so
+    // `("" = null)` answered true. .NET orders null BELOW the empty string.
+    lg f "$a"; ins f "i32.eqz"
+    ifE f
+    lg f "$b"; ins f "i32.eqz"
+    ifE f; ic f 0; ins f "return"; endB f
+    ic f (-1); ins f "return"
+    endB f
+    lg f "$b"; ins f "i32.eqz"
+    ifE f; ic f 1; ins f "return"; endB f
     lg f "$a"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$n"
     lg f "$b"; ic f 4; ins f "i32.add"; mem f "i32.load"; ls f "$mm"
     ic f 0; ls f "$i"
