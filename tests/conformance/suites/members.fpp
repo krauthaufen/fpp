@@ -288,4 +288,45 @@ eq "tupled-member" (string (ar.Tupled (10, 3))) "7"
 eq "curried-member" (string (ar.Curried 10 3)) "7"
 eq "curried-partially-applied" (string (List.map (ar.Curried 10) [ 1; 2 ])) "[9; 8]"
 
+// ---- a secondary constructor that FILLS what it delegated to ---------------
+// `new (args) as x = <delegate> then <body>`: the delegation builds the
+// object, `as x` names it, and `then` runs against the finished instance.
+// Delegation alone cannot express a constructor whose work is mutation.
+
+type Acc() =
+    let mutable total = 0
+    let mutable steps = 0
+    member _.Total = total
+    member _.Steps = steps
+    member _.Add (v : int) : unit =
+        total <- total + v
+        steps <- steps + 1
+    new (xs : int list) as x =
+        Acc()
+        then for v in xs do x.Add v
+    new (a : int, b : int) as x =
+        Acc()
+        then
+            x.Add a
+            x.Add b
+
+let a0 = Acc ()
+eq "primary-ctor-still-empty" (string a0.Total) "0"
+
+let a1 = Acc ([ 1; 2; 3 ])
+eq "then-body-ran" (string a1.Total) "6"
+eq "then-body-ran-every-step" (string a1.Steps) "3"
+
+let a2 = Acc (10, 20)
+eq "second-secondary-ctor" (string a2.Total) "30"
+eq "second-secondary-ctor-steps" (string a2.Steps) "2"
+
+// each construction gets its OWN instance — the `then` body must not be
+// writing into something shared
+let a3 = Acc ([ 5 ])
+eq "instances-are-separate" (string a1.Total + "/" + string a3.Total) "6/5"
+
+// the value is complete when the constructor returns, members included
+eq "usable-immediately" (string (Acc ([ 4; 4 ])).Total) "8"
+
 printfn "DONE tests=%d failures=%d" ntests failures

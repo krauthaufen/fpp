@@ -13,17 +13,20 @@ dotnet run -c Release --project src/Fpp.Cli -- build -o /tmp/x.wasm \
 ~/.wasmtime/bin/wasmtime run -W gc=y,exceptions=y /tmp/x.wasm
 ```
 
-* `secondary-ctor-as-then.fpp` — `new (args) as x = <delegate> then <body>`
-  does not parse, so a secondary constructor cannot run statements against
-  the instance it delegated to. Delegation with no body already works. This
-  is why `ResizeArray` has no collection-taking constructor.
-
 * `let-rec-and-group-self-host.fpp` — a `let rec ... and` group inside the
   `lower` function miscompiles under SELF-HOST only. Not reproduced in
   isolation; the note records exactly what was ruled out. Kept as the
   record of a shape to avoid, not a live defect.
 
 Fixed and removed (see git history for the repros):
+`secondary-ctor-as-then` (`new (args) as x = <delegate> then <body>` now
+parses — it desugars in the parser to `new (args) = let x = <delegate> in
+(<body>; x)`, which every later stage already handled. Fixing it exposed a
+SECOND bug underneath: inference picks a constructor project-wide and
+records the winner's offset, but Lower resolved that offset only in the file
+being lowered, so a prelude class' secondary constructor fell back to the
+primary and dropped its argument. `ResizeArray` has its collection-taking
+constructor now),
 `generic-array-field-length` (a generic class' `'a[]` field read Length = 0;
 fixed by the raw-int/inline-scalar arcs — re-verified 2026-08-18, and the
 ResizeArray/Dictionary hangs it caused are gone),

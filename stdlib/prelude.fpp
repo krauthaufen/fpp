@@ -5931,6 +5931,12 @@ type ResizeArray<'a>() =
 /// open. The `List` MODULE is a different thing under the same name, exactly
 /// as in F# — one is a type, the other is a namespace of functions over the
 /// immutable `list`.
+    /// .NET's collection-taking constructor. `as x ... then` is what lets a
+    /// secondary constructor fill the instance the delegation just built.
+    new (xs : seq<'a>) as x =
+        ResizeArray<'a>()
+        then x.AddRange xs
+
 type List<'a> = ResizeArray<'a>
 
 /// System.Collections.Generic.Dictionary. Open-addressed over

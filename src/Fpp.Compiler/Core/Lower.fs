@@ -513,6 +513,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// synthetic offset derived from the construct's first token; this reads
     /// what it bound to and builds the call, through the vtable when the
     /// owner is an interface and as a lifted function otherwise.
+    /// Explicit constructors declared in ANOTHER file, keyed by the offset of
+    /// their `new` keyword. Inference picks a constructor project-wide and
+    /// records the winner's offset, but `defsAt` covers only the file being
+    /// lowered — so a PRELUDE class' secondary constructor resolved to
+    /// nothing here and the call quietly fell back to the primary. That is
+    /// why `ResizeArray<int> ([1;2;3])` type-checked, ran, and answered an
+    /// EMPTY list: the argument was simply dropped.
+    let foreignCtors = dictNew<int, Resolve.Definition> ()
+    for k, d in dictPairs projectMembers do
+        let i = k.IndexOf ".new@"
+        if i >= 0 then dictSet foreignCtors (int (k.Substring (i + 5))) d
+
     /// The vtable rows an `interface I with ...` block produces: one for I,
     /// and one for every interface I INHERITS. F# requires the inherited
     /// members to be implemented in that same block, but a row is keyed by
@@ -1850,7 +1862,12 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | Some coff ->
                                       (match dictTryFind defsAt coff with
                                        | Some d -> Some (ht, d)
-                                       | None -> None)
+                                       | None ->
+                                           // declared in another file (the
+                                           // prelude, typically)
+                                           (match dictTryFind foreignCtors coff with
+                                            | Some d -> Some (ht, d)
+                                            | None -> None))
                                   | None -> None)
                              | None -> None
                      // a BUILTIN member on `string`: no definition to call,

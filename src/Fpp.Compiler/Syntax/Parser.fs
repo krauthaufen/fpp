@@ -2261,16 +2261,63 @@ let parse (src : string) : ParseResult =
                 vecAdd acc (parseType mcol)
         elif s.IsKw "new" then
             // an explicit constructor: `new(args) = { Field = ... }`
+            let newTok = s.Cur
             vecAdd acc (s.Bump ())
             while canStartAtomPat () && (s.SameLine || s.CurCol > mcol) do
                 vecAdd acc (parseAtomPat mcol)
+            // `new (args) as x = <delegate> then <body>`: the delegation
+            // builds the object, `as x` names it, and `then` runs against the
+            // finished instance. It DESUGARS here, to
+            //     new (args) = let x = <delegate> in (<body>; x)
+            // which every later stage already handles — Resolve binds the
+            // let, Infer types x as the delegate's result, and Lower emits an
+            // ELet. Nothing downstream needs to know the form existed.
+            let asBinder =
+                if s.IsKw "as" && (s.Peek 1).Kind = Ident then
+                    s.Bump () |> ignore
+                    let t = s.Cur
+                    s.Bump () |> ignore
+                    Some t
+                else None
             if s.IsOp ":" then
                 vecAdd acc (s.Bump ())
                 vecAdd acc (parseType mcol)
             if s.IsOp "=" then
                 vecAdd acc (s.Bump ())
                 if not (s.AtEof || (not s.SameLine && s.CurCol <= mcol)) then
-                    vecAdd acc (parseBlock mcol)
+                    let delegated = parseBlock mcol
+                    // the `then` body, if any. `then` ends the block above:
+                    // it is one of the keywords isBlockEnd stops at.
+                    let thenBlk =
+                        if s.IsKw "then" then
+                            s.Bump () |> ignore
+                            Some (parseBlock mcol)
+                        else None
+                    match asBinder, thenBlk with
+                    | Some bt, Some tb ->
+                        let mutable synth = 83000000 + newTok.Offset
+                        let fresh () = synth <- synth + 1; synth
+                        let tok2 (k : TokenKind) (txt : string) : Green =
+                            GToken { Kind = k; Text = txt; Leading = []; Trailing = []; Offset = fresh () }
+                        // the binder's DEFINITION keeps the real token, so a
+                        // hover or a diagnostic points at the source; the
+                        // trailing USE gets a synthetic offset, since a
+                        // definition and a use at one offset confuse defsAt
+                        let useE = Green.node IdentExpr [ tok2 Ident bt.Text ]
+                        let cont =
+                            match tb with
+                            | GNode b when b.NodeKind = BlockExpr ->
+                                Green.node BlockExpr (b.Children @ [ useE ])
+                            | other -> Green.node BlockExpr [ other; useE ]
+                        vecAdd acc
+                            (Green.node LetDecl
+                                [ tok2 Keyword "let"; Green.node IdentPat [ GToken bt ]
+                                  tok2 Operator "="; delegated; tok2 Keyword "in"; cont ])
+                    | _ ->
+                        vecAdd acc delegated
+                        (match thenBlk with
+                         | Some tb -> vecAdd acc tb
+                         | None -> ())
         else
             // [self .] name
             if atOperatorName () then vecAdd acc (bumpOperatorName ())

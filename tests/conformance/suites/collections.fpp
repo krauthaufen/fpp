@@ -88,16 +88,21 @@ ra.Clear ()
 eq "cleared-is-empty" (string ra.Count) "0"
 eq "cleared-renders-empty" (joinInts ra) ""
 
-// built by appending, and converted back.
-// DROPPED: `ResizeArray<int> ([ 5; 6; 7 ])`. .NET has the collection-taking
-// constructor and F++ does not — a secondary constructor here would need
-// `new (xs) as x = ... then ...` to fill the instance after the primary one
-// ran, and that form does not parse yet.
-let ra2 = ResizeArray<int> ()
-ra2.Add 5
-ra2.Add 6
-ra2.Add 7
-eq "built-by-appending" (joinInts ra2) "5,6,7"
+// built from a sequence, and converted back
+let ra2 = ResizeArray<int> ([ 5; 6; 7 ])
+eq "built-from-a-list" (joinInts ra2) "5,6,7"
+
+// the same from an ARRAY, and from another ResizeArray
+let ra3 = ResizeArray<int> ([| 8; 9 |])
+eq "built-from-an-array" (joinInts ra3) "8,9"
+let ra4 = ResizeArray<int> (ra3)
+eq "built-from-another" (joinInts ra4) "8,9"
+ra4.Add 10
+eq "the-copy-is-independent" (joinInts ra3 + "/" + joinInts ra4) "8,9/8,9,10"
+
+// and the empty constructor still picks the right overload
+let ra5 = ResizeArray<int> ()
+eq "empty-constructor-still-works" (string ra5.Count) "0"
 eq "to-array" (String.concat "," (List.map string (List.ofArray (ra2.ToArray ())))) "5,6,7"
 eq "counted-through-seq" (string (Seq.length ra2)) "3"
 

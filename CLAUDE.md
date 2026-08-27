@@ -63,6 +63,34 @@ Three details that will bite:
   harsh on purpose: it is how a false positive in inference gets caught. It
   found the pattern-binder bug below.
 
+## A chosen constructor may live in ANOTHER file
+
+Inference picks a constructor project-wide and records the WINNER'S OFFSET
+(`ctorSites`). Lower resolved that offset through `defsAt`, which covers only
+the file being lowered — so a prelude class' secondary constructor resolved
+to nothing and the call quietly fell back to the primary. `ResizeArray<int>
+([1;2;3])` type-checked, ran, and answered an EMPTY list: the argument was
+simply dropped, with no diagnostic and no trap.
+
+`foreignCtors` (Lower) indexes the project-wide member table by the `new`
+keyword's offset — Resolve already keys an explicit constructor as
+`Owner.new@<offset>` — and the lookup falls back to it.
+
+The shape to remember: an OFFSET is only meaningful together with its file.
+Any table keyed by a bare offset and consulted from another file's lowering
+has this bug latent in it. The tell here was that the same class worked
+verbatim in user code and failed in the prelude — when that happens, suspect
+a cross-file table before suspecting the feature.
+
+`new (args) as x = <delegate> then <body>` is what exposed it. That form now
+DESUGARS in the parser to `new (args) = let x = <delegate> in (<body>; x)`,
+which every later stage already handled — Resolve binds the let, Infer types
+x from the delegate, Lower emits an `ELet`. Nothing downstream knows the form
+existed. Parser-level desugaring is the cheap route for a construct that is
+only sugar; the synthesized tree follows `apChain`'s conventions, including
+`<bigconstant> + realOffset` for synthetic tokens, and the binder's
+DEFINITION keeps the real token so hovers still point at the source.
+
 ## An inherited interface needs its OWN vtable row
 
 A vtable row is keyed by interface NAME. F# requires a class implementing
