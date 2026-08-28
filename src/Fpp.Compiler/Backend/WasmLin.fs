@@ -284,8 +284,12 @@ let private CID_ARRITER = 8
 /// `obj` holding an int was the RAW int, and the type test read its low bit as
 /// a tag the raw-i32 arc had removed — so `box n :? int` answered true only
 /// for ODD n, and `box true`/`box 'a'` passed by accident (1 and 97 are odd).
-let private CID_BOXW = 9
-let private CID_FIRST_USER = 10
+/// base for the boxed-scalar class ids: the kind (1..9 from scalarKindOf) is
+/// ADDED, so each scalar type gets its own id and the payload stays a single
+/// word at HDR. One shared id made `box true :? int` true and — worse — made
+/// `1 :> obj` compare EQUAL to `true :> obj`.
+let private CID_BOX_BASE = 9
+let private CID_FIRST_USER = 19
 
 let private CLO_KIND = 2
 
@@ -351,7 +355,8 @@ let mutable private gcArrTid = 0
 // Interned eagerly with the SAME shape keys lowObj/lowBox64 use (shared tids).
 let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
-let mutable private gcBoxwTid = 0
+/// one tid per boxed scalar kind, index 1..9 (0 unused)
+let mutable private gcBoxwTids : int[] = Array.zeroCreate 10
 let mutable private gcListTid = 0
 let mutable private gcIterTid = 0
 let mutable private gcArrIterTid = 0
@@ -502,6 +507,23 @@ let private boxedScalarName (n : string) : bool =
     match n with
     | "int" | "bool" | "char" | "byte" | "sbyte" | "int16" | "uint16" | "uint32" -> true
     | _ -> false
+
+/// Which scalar a box holds, stored as its first word. Without it every
+/// 32-bit scalar shared one representation, so `box true :? int` was true,
+/// `box true :?> int` handed back 1 where F# throws, and `1 :> obj` compared
+/// EQUAL to `true :> obj`. 0 means "not one of these".
+let private scalarKindOf (n : string) : int =
+    match n with
+    | "int" | "int32" -> 1
+    | "bool" -> 2
+    | "char" -> 3
+    | "byte" -> 4
+    | "sbyte" -> 5
+    | "int16" -> 6
+    | "uint16" -> 7
+    | "uint32" -> 8
+    | "nativeint" | "unativeint" -> 9
+    | _ -> 0
 
 let private rawScalarName (n : string) : bool =
     match n with
@@ -658,6 +680,78 @@ let rec private refKindOfTy (t : Type) : RefKind =
     | TCon (n, _) -> if rawScalarName n then RKRaw else RKRef
     | TFun _ | TTuple _ -> RKRef
     | TApp (h, _) -> (match prune h with TVar _ -> RKGen | _ -> RKRef)
+
+/// The concrete scalar an expression yields, wherever refKindOfExpr would call
+/// it RKRaw — mirrors that function's raw paths, so a box always knows which
+/// type it holds. "" only if the kind itself was not raw.
+let rec private rawScalarNameOfExpr (e : Expr) : string =
+    match e with
+    | ELit (LInt s) ->
+        // the SUFFIX names the type: `3uy` is a byte, not an int, and boxing
+        // it as one made `box 3uy :? byte` false and `:? int` true
+        // no System.Char.IsDigit / ToLowerInvariant here: this file is
+        // compiler SOURCE and has to stay inside the self-hosting subset —
+        // they stubbed, and stage-1 trapped the moment a literal was boxed
+        let isDig (c : char) = c >= '0' && c <= '9'
+        let lower (c : char) = if c >= 'A' && c <= 'Z' then char (int c + 32) else c
+        let suf =
+            let mutable i = s.Length
+            while i > 0 && not (isDig s.[i - 1]) do i <- i - 1
+            let mutable acc = ""
+            for j in i .. s.Length - 1 do acc <- acc + string (lower s.[j])
+            acc
+        (match suf with
+         | "uy" -> "byte"
+         | "y" -> "sbyte"
+         | "s" -> "int16"
+         | "us" -> "uint16"
+         | "u" | "ul" -> "uint32"
+         | "n" -> "nativeint"
+         | "un" -> "unativeint"
+         | "l" -> ""          // int64
+         | "" -> "int"
+         | _ -> "")
+    | ELit (LBool _) -> "bool"
+    | ELit (LChar _) -> "char"
+    | EVar (_, sch) | EVarI (_, sch, _) ->
+        (match prune sch.Body with TCon (n, _) when rawScalarName n -> n | _ -> "")
+    | EApp (_, _) ->
+        let rec flat e acc = match e with EApp (h, a) -> flat h (a @ acc) | _ -> (e, acc)
+        let head, args = flat e []
+        (match head with
+         | (EVar (_, sch) | EVarI (_, sch, _)) as hd ->
+             let rec peel t n = if n <= 0 then t else (match prune t with TFun (_, r) -> peel r (n - 1) | _ -> t)
+             (match prune (peel sch.Body (List.length args)) with
+              | TCon (n, _) when rawScalarName n -> n
+              | TVar rv ->
+                  (match hd with
+                   | EVarI (_, _, inst) ->
+                       (match List.tryFindIndex (fun (qv : Var) -> qv.Id = rv.Id) sch.Quantified with
+                        | Some k -> (match List.tryItem k inst with Some nm when rawScalarName nm -> nm | _ -> "")
+                        | None -> "")
+                   | _ -> "")
+              | _ -> "")
+         | ELam (_, body) -> rawScalarNameOfExpr body
+         | _ -> "")
+    | EArrayLen _ -> "int"
+    | ETypeTest _ -> "bool"
+    | EIndex (k, _, _) -> if rawScalarName k then k else ""
+    | EPrim (op, _) ->
+        let b = if op.Length > 1 && (op.EndsWith "f" || op.EndsWith "s" || op.EndsWith "l") then op.Substring (0, op.Length - 1) else op
+        (match b with
+         | "<" | ">" | "<=" | ">=" | "=" | "<>" -> "bool"
+         | "&&" | "||" | "not" when op = b -> "bool"
+         | "+w" | "-w" | "*w" | "/w" | "%w" | "<<<w" | ">>>w" -> "uint32"
+         | _ when op = b -> "int"
+         | _ -> "")
+    | EIf (_, a, b) -> (let x = rawScalarNameOfExpr a in if x <> "" then x else rawScalarNameOfExpr b)
+    | ELet (_, _, _, _, body) -> rawScalarNameOfExpr body
+    | ESeq xs -> (match List.tryLast xs with Some b -> rawScalarNameOfExpr b | None -> "")
+    | EMatch (_, cs) | ETry (_, cs) ->
+        (match cs |> List.map (fun (_, _, b) -> rawScalarNameOfExpr b) |> List.filter (fun x -> x <> "") with
+         | x :: _ -> x
+         | [] -> "")
+    | _ -> ""
 
 // the ref-kind of an EXPRESSION's value, from its static type. Conservative:
 // anything it cannot pin down is RKGen (→ the container falls back to the safe
@@ -8239,7 +8333,10 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
     // boxes of their own, so they take the second path.
     | EPrim ("$unbox", [ x ]) -> lowUnboxW (coreToLowE ctx x)
     | EPrim ("$box", [ x ]) ->
-        if refKindOfExpr x = RKRaw then lowBoxW ctx (coreToLowE ctx x) else coreToLowE ctx x
+        if refKindOfExpr x = RKRaw then
+            let nm = rawScalarNameOfExpr x
+            lowBoxW ctx (scalarKindOf (if nm = "" then "int" else nm)) (coreToLowE ctx x)
+        else coreToLowE ctx x
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
     | ECast (tn, e2, true) when
           not (List.isEmpty (typeTestIds st tn))
@@ -8274,7 +8371,9 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         // anyway, and a blanket "target is not a raw scalar" test boxed
         // float16 — which IS a raw word but is not in rawScalarName.
         let bare = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
-        if bare = "obj" && refKindOfExpr e2 = RKRaw then lowBoxW ctx (coreToLowE ctx e2)
+        if bare = "obj" && refKindOfExpr e2 = RKRaw then
+            let nm = rawScalarNameOfExpr e2
+            lowBoxW ctx (scalarKindOf (if nm = "" then "int" else nm)) (coreToLowE ctx e2)
         else coreToLowE ctx e2
     | EIfaceCall (iface, method, recv, args) ->
         let bi = bareIfaceOf iface
@@ -8871,12 +8970,13 @@ and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID
 
 /// a boxed 32-bit scalar: header, then the word at HDR. Same shape as
 /// lowBox64, four bytes instead of eight.
-and private lowBoxW (ctx : LowCtx) (wv : LExpr) : LExpr =
+and private lowBoxW (ctx : LowCtx) (kind : int) (wv : LExpr) : LExpr =
     let b = freshTmp ctx
+    let k = if kind >= 1 && kind <= 9 then kind else 1
     let alloc =
-        if gc then lowAllocSized ctx (gcTid ctx.LSt "w32" (HDR + 4) FK_STRUCT 0) (HDR + 4)
+        if gc then lowAllocSized ctx (gcTid ctx.LSt ("w32k" + string k) (HDR + 4) FK_STRUCT 0) (HDR + 4)
         else LAlloc (LConstW (HDR + 4))
-    let hdr = if gc then [] else [ LStore (W, LGet (wReg b), 0, LConstW CID_BOXW) ]
+    let hdr = if gc then [] else [ LStore (W, LGet (wReg b), 0, LConstW (CID_BOX_BASE + k)) ]
     LDo (LSet (wReg b, alloc) :: hdr @ [ LStore (W, LGet (wReg b), HDR, wv) ], LGet (wReg b))
 
 and private lowUnboxW (p : LExpr) : LExpr = LLoad (W, p, HDR)
@@ -9812,7 +9912,7 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
         // where F# says false (the shared-scalar divergence, DIVERGENCES.md).
         // What is no longer true is that the test read a tag bit: it checks
         // the box's header, so every value answers the same way.
-        | _ when boxedScalarName bare -> [ CID_BOXW ]
+        | _ when scalarKindOf bare > 0 -> [ CID_BOX_BASE + scalarKindOf bare ]
         | "float" -> [ CID_FLOAT ]
         | "int64" | "uint64" -> [ CID_INT64 ]
         | "string" -> [ CID_STRING ]
@@ -12039,14 +12139,15 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         vecAdd st.TidCid (gcArrTid, CID_ARRAY)
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
-        gcBoxwTid <- gcTid st "w32" (HDR + 4) FK_STRUCT 0
+        for k in 1 .. 9 do
+            gcBoxwTids.[k] <- gcTid st ("w32k" + string k) (HDR + 4) FK_STRUCT 0
         // map the scalar-box tids so `:? float` / `:? int64` / `:? string`
         // read their class-ids through $t2c under the reactor — unmapped
         // tids read cid 0 and every scalar type test answered false
         vecAdd st.TidCid (gcStrTid, CID_STRING)
         vecAdd st.TidCid (gcFloatTid, CID_FLOAT)
         vecAdd st.TidCid (gcInt64Tid, CID_INT64)
-        vecAdd st.TidCid (gcBoxwTid, CID_BOXW)
+        for k in 1 .. 9 do vecAdd st.TidCid (gcBoxwTids.[k], CID_BOX_BASE + k)
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
         // map the uniform cons tid to CID_LIST so $isBuiltinSeq recognises it
         // (the FK_STRUCT per-refmap cons variants register their own mapping)

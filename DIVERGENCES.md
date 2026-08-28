@@ -768,5 +768,13 @@ answered true only for ODD n, `:?>` trapped on the rest, and a large or
 negative value was dereferenced as a pointer. `tests/conformance/suites/
 boxtests.fpp` pins every value class.
 
-The 32-bit scalars SHARE one class id, so `box true :? int` is true here
-where F# says false. That part is unchanged, and deliberate.
+The box carries a KIND word naming which scalar it holds, so the 32-bit
+scalars are told apart: `box true :? int` is false, `box true :?> int` throws
+and `1 :> obj` does not equal `true :> obj`. They shared one representation
+until that was noticed — which made two values of different types compare
+EQUAL, not merely test alike.
+
+What still differs is HASHING: F# hashes `box true` and `box 1` alike (both
+1), while the kind word makes them differ here. Unequal values are free to
+hash differently, so nothing built on it can break; it is simply not the same
+number.

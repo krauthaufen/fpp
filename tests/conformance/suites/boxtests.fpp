@@ -130,10 +130,35 @@ let evens : obj list = [ box 0; box 2; box 4 ]
 test "every-even-tests-int" (List.forall (fun (o : obj) -> o :? int) evens)
 test "every-even-downcasts" (List.sumBy (fun (o : obj) -> o :?> int) evens = 6)
 
-// bool and char box too — they answer `:? int` here (the shared-scalar
-// divergence above), so only their OWN tests are asserted
+// ---- each scalar type is told APART -------------------------------------
+// The box carries a kind word. Sharing one representation made `box true :?
+// int` true, `box true :?> int` hand back 1, and — worst — `1 :> obj` compare
+// EQUAL to `true :> obj`.
+
 test "bool-boxes" ((box false : obj) :? bool)
 test "char-boxes" ((box 'a' : obj) :? char)
 test "char-value" (((box 'z' : obj) :?> char) = 'z')
+
+test "bool-is-not-an-int" (not ((box true : obj) :? int))
+test "int-is-not-a-bool" (not ((box 1 : obj) :? bool))
+test "char-is-not-an-int" (not ((box 'a' : obj) :? char = false))
+test "char-is-not-int" (not ((box 'a' : obj) :? int))
+test "byte-is-its-own-type" ((box 3uy : obj) :? byte)
+test "byte-is-not-an-int" (not ((box 3uy : obj) :? int))
+test "int16-is-its-own-type" ((box 3s : obj) :? int16)
+test "int16-is-not-an-int" (not ((box 3s : obj) :? int))
+
+// the values do not COMPARE equal either, which is the part that mattered
+test "boxed-bool-differs-from-boxed-int" ((box true : obj) <> (box 1 : obj))
+test "boxed-char-differs-from-its-code" ((box 'a' : obj) <> (box 97 : obj))
+test "boxed-byte-differs-from-int" ((box 3uy : obj) <> (box 3 : obj))
+test "same-type-same-value-is-equal" ((box 7 : obj) = (box 7 : obj))
+test "same-type-other-value-differs" ((box 7 : obj) <> (box 8 : obj))
+
+// a wrong downcast THROWS rather than handing back the payload
+test "wrong-downcast-throws" ((try ignore ((box true : obj) :?> int); false with _ -> true))
+test "right-downcast-works" (((box true : obj) :?> bool) = true)
+test "unbox-checks-too" ((try ignore (unbox<int> (box true)); false with _ -> true))
+test "unbox-right-type" (unbox<bool> (box true) = true)
 
 printfn "DONE tests=%d failures=%d" ntests failures

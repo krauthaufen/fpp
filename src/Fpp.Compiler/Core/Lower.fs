@@ -2086,7 +2086,15 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                         [ "int"; "bool"; "char"; "byte"; "sbyte"
                                           "int16"; "uint16"; "uint32" ]
                                 | _ -> false) ->
-                          EPrim ("$unbox", [ bx ])
+                          // a CHECKED cast, like `:?>`: F# throws when the box
+                          // holds another type, and an unchecked load handed
+                          // back `unbox<int> (box true)` = 1
+                          // a CHECKED cast, like `:?>`: F# throws when the box
+                          // holds another type, and an unchecked load handed
+                          // back `unbox<int> (box true)` = 1
+                          (match inst with
+                           | [ one ] -> ECast (one, bx, true)
+                           | _ -> EPrim ("$unbox", [ bx ]))
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
                             bv.Name = "unbox"
                             || (bv.Name = "float16Bits" && bv.Path = "(builtin)") -> bx

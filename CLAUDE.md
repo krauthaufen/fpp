@@ -1,5 +1,29 @@
 # Working in this repo
 
+## Each boxed scalar has its OWN class id
+
+`box true :? int` was true, `box true :?> int` handed back 1, and — the part
+that mattered — `1 :> obj` compared EQUAL to `true :> obj`, because every
+32-bit scalar shared one class id. The id is `CID_BOX_BASE + kind` now, one
+per scalar type, and the payload stays a single word at HDR.
+
+Two attempts failed first, and both are worth not repeating:
+
+* storing the kind as a SECOND word in the box. It works, but it moves the
+  payload to HDR+4, and the hash of a boxed value then covers the kind too —
+  so `hash (box true)` stopped matching F#. A separate id per type keeps the
+  object one word and the hash the payload's.
+* writing the literal-suffix decoder with `System.Char.IsDigit` and
+  `ToLowerInvariant`. This file is compiler SOURCE: both stubbed, and stage-1
+  trapped the moment anything boxed a literal. Bisecting blamed the type test
+  three times before the real cause showed — when a backend change breaks the
+  self-host but not the .NET build, suspect the SUBSET before the logic.
+
+The kind comes from `rawScalarNameOfExpr`, which mirrors `refKindOfExpr`'s
+RKRaw paths so a box always knows what it holds — including the literal
+suffix, since `3uy` is a byte and boxing it as an int made `box 3uy :? byte`
+false.
+
 ## A boxed 32-bit scalar is a real object
 
 `box 1` and `1 :> obj` allocate a box with its own class-id header (CID_BOXW),
