@@ -724,36 +724,39 @@ fsi oracle run, per rule 1 above).
   **Reason.** The same reason `failwith` is the only exception shape the
   backend builds: a typed BCL exception would need the type to exist.
 
-## No implicit conversions: neither widening to `obj` nor int to int64
+## Subtyping is implicit; numeric conversion is not
 
-F# performs TYPE-DIRECTED CONVERSION wherever the target type is known: an
-annotation, a declared return, a record field, a collection whose element
-type is fixed. So F# accepts all of these and F++ rejects every one:
+Widening to a SUPERTYPE happens on its own, wherever the target type is
+known — an annotation, a declared return, a parameter, a tuple or record
+field, a collection element:
 
 ```fsharp
-let x : obj = 1                 // type mismatch: int vs obj
-let f () : obj = 1              // same
-let xs : obj list = [ 1; 2 ]    // same
+let x : obj = 1                 // boxed
+let f () : obj = 1              // boxed
+let xs : obj list = [ 1; 2 ]    // each element boxed
+let p : obj * obj = (1, "s")    // the int boxed
 type R = { V : obj }
-let r = { V = 1 }               // same
+let r = { V = 1 }               // boxed
+```
+
+`obj` is the top type, so this is subtyping, and a raw 32-bit scalar reaching
+it gets a real box (see below). Widening to a base class or an interface is
+the same rule and changes no representation.
+
+CONVERSION between numeric types is NOT implicit, in either direction:
+
+```fsharp
 let n : int64 = 1               // type mismatch: int vs int64
 let g (v : int64) = v
 g 1                             // same
+let d : float = 1               // same
 ```
 
-Write the coercion: `box 1`, `1 :> obj`, `int64 1`, `float 1`.
-
-This is a CHOSEN divergence. It was implemented and then dropped — the
-implicit form reads as a convenience and is not one here, because a raw
-32-bit scalar and a reference are different representations and every
-inserted conversion is an allocation the source does not show. An explicit
-`box` says where the object is made.
-
-What is still implicit is SUBSUMPTION at an ARGUMENT — passing a class where
-an interface or base is declared, or a list where a seq is — because that is
-how members and interfaces are called at all, and it changes no
-representation. A raw scalar passed to an `obj` parameter DOES box, at the
-call site (`coerceToParams`, WasmLin).
+Write `int64 1` / `float 1`. F# allows the widening ones at method arguments;
+this compiler never does. The line is deliberate: `int -> obj` relates a type
+to its supertype, while `int -> int64` is a different type with a different
+representation, and inserting it silently is how a program ends up doing
+arithmetic at a width nobody wrote.
 
 ## A boxed 32-bit scalar is a real heap object
 

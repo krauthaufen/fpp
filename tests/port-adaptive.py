@@ -546,11 +546,6 @@ LEVEL_EXC = [
     ("ops.Content.[sharedMin .. sharedMax]",
      "ops.Content.GetSlice(Some sharedMin, Some sharedMax)"),
 
-    # the prelude Dictionary has no comparer-taking constructor (F++ has no
-    # secondary ctors) and hashes structurally anyway
-    ("Dictionary<'B, int>(DefaultEqualityComparer<'B>.Instance)",
-     "Dictionary<'B, int>()"),
-
     # RuntimeHelpers.GetHashCode is the reference-identity hash; F++'s `hash`
     # on a class with no GetHashCode override IS the identity hash
     ("let hash = RuntimeHelpers.GetHashCode value |> uint32",

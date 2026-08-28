@@ -1174,7 +1174,18 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             |> Option.bind (fun t -> dictTryFind defsAt t.Offset)
             |> Option.map (fun d -> varIdOf d, schemeOf d))
 
+    /// Inference marks the expressions it WIDENED from a raw scalar to `obj`
+    /// — a collection item, a record field value. The value keeps its own
+    /// scalar type, so the box has to be inserted here, at the expression
+    /// itself; the argument and annotation positions carry enough type
+    /// information for the backend to decide on its own.
     let rec lowerExpr (g : Green) : Expr =
+        let inner = lowerExprRaw g
+        match g with
+        | GNode n when (dictTryFind fieldOwners (offsetOf n)) = Some "$boxobj" -> EPrim ("$box", [ inner ])
+        | _ -> inner
+
+    and lowerExprRaw (g : Green) : Expr =
         match g with
         | GToken t ->
             (match litOf t with

@@ -12591,7 +12591,11 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     for d in decls do
         match d with
         | DLet (_, v, _, _) when (dictTryFind st.Funcs (key v)).IsSome -> ()
-        | DLet (_, v, _, rhs) ->
+        | DLet (_, v, vsch, rhs0) ->
+            // an ANNOTATED binding widens: `let x : obj = 1` keeps the rhs's
+            // own int type, so the value has to be boxed on the way into the
+            // slot the annotation declared
+            let rhs = coerceToResult vsch 0 rhs0
             let structG = dictTryFind globalStructTy (gl v)
             let initSig =
                 match dictTryFind globalScalarTy (gl v) with

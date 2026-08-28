@@ -411,6 +411,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
 
     /// Unify an argument against a parameter, allowing the argument to be a
     /// subtype — F# inserts the upcast, and the representation is identical.
+    /// a value of this type is a RAW 32-bit word at rest, so widening it to a
+    /// reference needs a box the lowering has to insert
+    let isRawScalarTy (t : Type) : bool =
+        match prune t with
+        | TCon (n, _) ->
+            List.contains n [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ]
+        | _ -> false
+
+    let isObjTy (t : Type) : bool =
+        match prune t with TCon ("obj", _) -> true | _ -> false
+
     let rec unifyArg (offset : int) (paramTy : Type) (argTy : Type) : unit =
         match prune paramTy, prune argTy with
         | TCon (p, pa), TCon (a, aa) when p <> a && isSupertypeOf p a ->
@@ -4977,6 +4988,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              else None)
                         let t = exprType m
                         exprExpect <- None
+                        // an element widening to obj is boxed, same as a list
+                        // item or a record field value
+                        (if List.length elemWants = List.length elemNodes then
+                            match List.item i elemWants with
+                            | Some w when isObjTy w && isRawScalarTy t ->
+                                (match Green.tokens m |> List.tryHead with
+                                 | Some tk -> vecAdd fieldOwnersRaw (tk.Offset, "$boxobj")
+                                 | None -> ())
+                            | _ -> ())
                         t)
                 (match want with
                  | Some w ->
@@ -5028,8 +5048,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
                                     | _ -> false))
                         // the ELEMENT type is the target: `[ 1; 2 ] : obj list`
-                        if isRange then unifyArg off (tList elem) (exprType (GNode m))
-                        else unifyArg off elem (exprType (GNode m))
+                        let ity = exprType (GNode m)
+                        if isRange then unifyArg off (tList elem) ity
+                        else
+                            if isObjTy elem && isRawScalarTy ity then
+                                vecAdd fieldOwnersRaw (off, "$boxobj")
+                            unifyArg off elem ity
                 for m in nodesOf n do addItems m
                 tList elem
             | LambdaExpr ->
@@ -6108,8 +6132,18 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // the DECLARED field type is the target, so
                                    // a value widens into it: `{ F = 5 }` for
                                    // `F : obj` is F#'s type-directed
-                                   // conversion, same as an argument
-                                   else unifyArg t.Offset declared vt
+                                   // conversion, same as an argument. A raw
+                                   // scalar needs its box, marked on the VALUE
+                                   // expression (which is what lowering wraps)
+                                   else
+                                       (if isObjTy declared && isRawScalarTy vt then
+                                            match nodesOf f |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast with
+                                            | Some vn ->
+                                                (match Green.tokens (GNode vn) |> List.tryHead with
+                                                 | Some vt0 -> vecAdd fieldOwnersRaw (vt0.Offset, "$boxobj")
+                                                 | None -> ())
+                                            | None -> ())
+                                       unifyArg t.Offset declared vt
                                | None -> ())
                           | _ -> ())
                      // a full literal (no `with` base) must WRITE every
@@ -6205,8 +6239,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                     match c with
                                     | GToken t2 -> t2.Kind = Operator && t2.Text = ".."
                                     | _ -> false))
-                        if isRange then unifyArg off (tList elem) (exprType (GNode m))
-                        else unifyArg off elem (exprType (GNode m))
+                        let ity = exprType (GNode m)
+                        if isRange then unifyArg off (tList elem) ity
+                        else
+                            if isObjTy elem && isRawScalarTy ity then
+                                vecAdd fieldOwnersRaw (off, "$boxobj")
+                            unifyArg off elem ity
                 for m in nodesOf n do addItems m
                 exprExpect <- savedA
                 (match Green.tokens (GNode n) |> List.tryHead with
@@ -6412,7 +6450,12 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     (match Green.tokens (GNode namePat) |> List.tryHead with
                      | Some t -> unifyArg t.Offset a bodyTy
                      | None -> unify bodyTy a |> ignore)
-                    bodyTy
+                    // the binding IS the annotation, not the body's own type.
+                    // Under plain unification the two were equal so it never
+                    // mattered; subsumption makes them differ, and returning
+                    // the body's type left `let x : obj = 1` typed INT — the
+                    // annotation silently ignored.
+                    a
                 | None -> bodyTy
             let funTy = List.foldBack (fun p acc -> TFun (p, acc)) paramTys resultTy
             (match Green.tokens (GNode namePat) |> List.tryHead with
