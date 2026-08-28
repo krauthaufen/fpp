@@ -2056,8 +2056,28 @@ let lower (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       // by NAME, wherever it resolved: the prelude declares
                       // `extern let unbox` for the .NET surface, and a call
                       // through that binding is the same type-level identity
+                      // `box` is NOT the identity for a 32-bit scalar: those
+                      // are raw words, and an `obj` holding one has to carry
+                      // its own header or a type test cannot read it back.
+                      // The BACKEND decides — it knows each expression's
+                      // representation kind — so this just marks the site.
+                      | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when bv.Name = "box" ->
+                          EPrim ("$box", [ bx ])
+                      // `unbox<int> o` must UNWRAP: the box is a real object
+                      // now. The written type argument rides the head's
+                      // instantiation, which is the only place the target
+                      // type survives to here.
+                      | EVarI (bv, _, inst), [ bx ] when
+                            bv.Name = "unbox"
+                            && (match inst with
+                                | [ one ] ->
+                                    List.contains one
+                                        [ "int"; "bool"; "char"; "byte"; "sbyte"
+                                          "int16"; "uint16"; "uint32" ]
+                                | _ -> false) ->
+                          EPrim ("$unbox", [ bx ])
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
-                            bv.Name = "box" || bv.Name = "unbox"
+                            bv.Name = "unbox"
                             || (bv.Name = "float16Bits" && bv.Path = "(builtin)") -> bx
                       | (EVar (bv, _) | EVarI (bv, _, _)), [ bx ] when
                             (bv.Name = "doubleBits" || bv.Name = "singleBits")

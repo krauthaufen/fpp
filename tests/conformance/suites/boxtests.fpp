@@ -74,4 +74,66 @@ test "dr3" (addTo !cell !cell = 10)
 test "cv1" (int64 "123" = 123L)
 test "cv2" (uint64 "9007199254" = 9007199254UL)
 
+// ---- EVERY int boxes, not just the odd ones --------------------------------
+// A boxed 32-bit scalar used to be the RAW word, and the type test read its
+// low bit as a tag the raw-i32 arc had removed: `box n :? int` answered true
+// only for ODD n, and the suite above never caught it because 3, 1 and 97
+// are odd. A box is a real object with a header now.
+
+let roundTrip (n : int) : bool =
+    let o : obj = box n
+    (o :? int) && (o :?> int) = n
+
+test "even-zero" (roundTrip 0)
+test "odd-one" (roundTrip 1)
+test "even-two" (roundTrip 2)
+test "odd-three" (roundTrip 3)
+test "even-four" (roundTrip 4)
+test "large-even" (roundTrip 1000000)
+test "large-odd" (roundTrip 1000001)
+test "negative-even" (roundTrip (-2))
+test "negative-odd" (roundTrip (-3))
+test "int-min" (roundTrip (-2147483648))
+test "int-max" (roundTrip 2147483647)
+
+// the same through an UPCAST rather than `box`
+let viaUpcast (n : int) : bool =
+    let o = (n :> obj)
+    (o :? int) && (o :?> int) = n
+
+test "upcast-even" (viaUpcast 4)
+test "upcast-odd" (viaUpcast 5)
+test "upcast-negative" (viaUpcast (-6))
+
+// and through `unbox`
+test "unbox-even" (unbox<int> (box 8) = 8)
+test "unbox-odd" (unbox<int> (box 9) = 9)
+
+// an `as` binder gets the VALUE, not the box carrying it
+let describedBox (o : obj) : string =
+    match o with
+    | :? int as i -> "int:" + string i
+    | :? string as s -> "str:" + s
+    | _ -> "?"
+
+test "as-binds-an-even-int" (describedBox (box 10) = "int:10")
+test "as-binds-an-odd-int" (describedBox (box 11) = "int:11")
+test "as-binds-a-string" (describedBox (box "s") = "str:s")
+
+// boxed ints compare and hash by VALUE
+test "boxed-equal" ((box 4 : obj) = (box 4 : obj))
+test "boxed-unequal" ((box 4 : obj) <> (box 5 : obj))
+test "boxed-hash-agrees" (hash (box 4 : obj) = hash (box 4 : obj))
+
+// a whole list of them, every element even
+let evens : obj list = [ box 0; box 2; box 4 ]
+test "every-even-tests-int" (List.forall (fun (o : obj) -> o :? int) evens)
+test "every-even-downcasts" (List.sumBy (fun (o : obj) -> o :?> int) evens = 6)
+
+// bool and char box too — they answer `:? int` here (the shared-scalar
+// divergence above), so only their OWN tests are asserted
+test "bool-boxes" ((box false : obj) :? bool)
+test "char-boxes" ((box 'a' : obj) :? char)
+test "char-value" (((box 'z' : obj) :?> char) = 'z')
+
 printfn "DONE tests=%d failures=%d" ntests failures

@@ -723,3 +723,47 @@ fsi oracle run, per rule 1 above).
 
   **Reason.** The same reason `failwith` is the only exception shape the
   backend builds: a typed BCL exception would need the type to exist.
+
+## No implicit conversions: neither widening to `obj` nor int to int64
+
+F# performs TYPE-DIRECTED CONVERSION wherever the target type is known: an
+annotation, a declared return, a record field, a collection whose element
+type is fixed. So F# accepts all of these and F++ rejects every one:
+
+```fsharp
+let x : obj = 1                 // type mismatch: int vs obj
+let f () : obj = 1              // same
+let xs : obj list = [ 1; 2 ]    // same
+type R = { V : obj }
+let r = { V = 1 }               // same
+let n : int64 = 1               // type mismatch: int vs int64
+let g (v : int64) = v
+g 1                             // same
+```
+
+Write the coercion: `box 1`, `1 :> obj`, `int64 1`, `float 1`.
+
+This is a CHOSEN divergence. It was implemented and then dropped — the
+implicit form reads as a convenience and is not one here, because a raw
+32-bit scalar and a reference are different representations and every
+inserted conversion is an allocation the source does not show. An explicit
+`box` says where the object is made.
+
+What is still implicit is SUBSUMPTION at an ARGUMENT — passing a class where
+an interface or base is declared, or a list where a seq is — because that is
+how members and interfaces are called at all, and it changes no
+representation. A raw scalar passed to an `obj` parameter DOES box, at the
+call site (`coerceToParams`, WasmLin).
+
+## A boxed 32-bit scalar is a real heap object
+
+`box 1`, `1 :> obj` and the argument coercion above all allocate a box with
+its own class-id header, exactly as `float`, `int64` and `string` are boxed.
+Before, an `obj` holding an int WAS the raw int, and the type test read its
+low bit as a tag that the raw-i32 arc had removed — so `box n :? int`
+answered true only for ODD n, `:?>` trapped on the rest, and a large or
+negative value was dereferenced as a pointer. `tests/conformance/suites/
+boxtests.fpp` pins every value class.
+
+The 32-bit scalars SHARE one class id, so `box true :? int` is true here
+where F# says false. That part is unchanged, and deliberate.

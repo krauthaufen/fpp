@@ -1,5 +1,28 @@
 # Working in this repo
 
+## A boxed 32-bit scalar is a real object
+
+`box 1` and `1 :> obj` allocate a box with its own class-id header (CID_BOXW),
+exactly as float, int64 and string are boxed. Before, an `obj` holding an int
+WAS the raw int, and the scalar type test read its low bit as a tag that the
+raw-i32 arc had removed — so `box n :? int` answered true only for ODD n,
+`:?>` trapped on the rest, and a large or negative value was dereferenced as
+a pointer. `box true` and `box 'a'` passed by accident: 1 and 97 are odd.
+
+Four places have to agree, and a name in one list but not another is a value
+that tests true and then unboxes as a pointer: `lowTypeTest`, the `:?>`
+unwrap, the `:? t as v` binder (test FIRST, then bind the payload — unboxing
+a non-box reads rubbish), and `coerceToParams` at a call. `boxedScalarName`
+is the single list.
+
+Restrict every one of these to `obj`. A blanket "the target is not a raw
+scalar" test boxed float16, which IS a raw word but is not in
+`rawScalarName` — three float16 unit tests caught it.
+
+The C backend TAGS its scalars, so there `$box`/`$unbox` are the identity.
+That is why the coercion is a Core PRIM rather than something the middle end
+resolves: it says "coerce to obj" and each backend answers in its own model.
+
 ## Never ship a silently wrong answer
 
 Documentation is for MISSING things. A construct this compiler accepts and

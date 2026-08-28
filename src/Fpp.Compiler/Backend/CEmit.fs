@@ -1267,6 +1267,11 @@ let rec private emitE (st : CSt) (f : CFn) (e : Expr) : int =
         stmt f (sref d + " = TAGI((UNTAGI(" + sref x + ") & UNTAGI(" + sref y
                 + ")) == UNTAGI(" + sref y + "));")
         d
+    // `box e`: this backend TAGS its scalars (TAGI/UNTAGI), so a value already
+    // carries its own kind and boxing is the identity. The wasm-linear backend
+    // keeps raw i32 and has to allocate a real box — hence the prim, which
+    // says "coerce to obj" and lets each backend answer in its own model.
+    | EPrim ("$box", [ x ]) | EPrim ("$unbox", [ x ]) -> emitE st f x
     | EPrim ("$cmpf", [ a; b ]) ->
         let x = emitE st f a
         let y = emitE st f b

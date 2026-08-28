@@ -279,7 +279,13 @@ let private CID_ITER = 7
 // (CID_ITER) so MoveNext/Current route to the array path (index-based) rather
 // than the cons path. GC carries it as its own tid; non-GC uses this cid.
 let private CID_ARRITER = 8
-let private CID_FIRST_USER = 9
+/// a boxed 32-BIT SCALAR (int/bool/char/byte/…): the header then the word at
+/// HDR, exactly as CID_FLOAT and CID_INT64 box their payloads. Before this an
+/// `obj` holding an int was the RAW int, and the type test read its low bit as
+/// a tag the raw-i32 arc had removed — so `box n :? int` answered true only
+/// for ODD n, and `box true`/`box 'a'` passed by accident (1 and 97 are odd).
+let private CID_BOXW = 9
+let private CID_FIRST_USER = 10
 
 let private CLO_KIND = 2
 
@@ -345,6 +351,7 @@ let mutable private gcArrTid = 0
 // Interned eagerly with the SAME shape keys lowObj/lowBox64 use (shared tids).
 let mutable private gcFloatTid = 0
 let mutable private gcInt64Tid = 0
+let mutable private gcBoxwTid = 0
 let mutable private gcListTid = 0
 let mutable private gcIterTid = 0
 let mutable private gcArrIterTid = 0
@@ -486,6 +493,15 @@ let private gcArrTidReg (st : St) (shapeKey : string) (sizeBytes : int) (kind : 
     let t = gcTid st shapeKey sizeBytes kind 0
     if isNew then vecAdd st.TidCid (t, CID_ARRAY)
     t
+
+/// the scalars that share CID_BOXW. Kept in one place: the type test, the
+/// downcast and the `:? t as v` binder all have to agree on the set, and a
+/// name in one list but not another is a value that tests true and then
+/// unboxes as a pointer.
+let private boxedScalarName (n : string) : bool =
+    match n with
+    | "int" | "bool" | "char" | "byte" | "sbyte" | "int16" | "uint16" | "uint32" -> true
+    | _ -> false
 
 let private rawScalarName (n : string) : bool =
     match n with
@@ -692,6 +708,10 @@ let rec private refKindOfExpr (e : Expr) : RefKind =
          | "+" | "-" | "*" | "/" | "%" when op = b -> RKRaw
          | "<" | ">" | "<=" | ">=" | "=" | "<>" -> RKRaw
          | "&&" | "||" | "not" | "&&&" | "|||" | "^^^" | "<<<" | ">>>" when op = b -> RKRaw
+         // the UNARY int forms are raw too. Left out, `box (-2)` saw RKGen,
+         // skipped its box, and the raw -2 in an obj slot was dereferenced
+         // as a pointer — a memory fault at 0xfffffffe
+         | "u-" | "u~~~" | "u+" when op = b -> RKRaw
          // a float/int64-suffixed op yields a boxed scalar (pointer)
          | _ when op <> b -> RKRef
          | _ -> RKGen)
@@ -4908,6 +4928,46 @@ let private cmpWit (ctx : LowCtx) (a : Expr) (b : Expr) : int option =
 // int/bool/char are RAW i32 at rest (locals, params, returns, value stack) —
 // full 32-bit, no tag. lowTag/lowUntag convert to/from the tagged immediate
 // (2n+1) that a GC-scanned uniform slot needs to tell an int from a pointer.
+/// `$box e`, built with the payload list ANNOTATED: this file has no other
+/// EPrim construction, and without the annotation the self-host read the
+/// argument as an Expr rather than a list and the wrong return type spread to
+/// every caller (three errors from one).
+let private boxRawE (e : Expr) : Expr =
+    let payload : list<Expr> = [ e ]
+    EPrim ("$box", payload)
+
+let private coerceToResult (sch : Scheme) (nps : int) (body : Expr) : Expr =
+    let rec resTy (t : Type) (n : int) : option<Type> =
+        if n = 0 then Some t
+        else match prune t with TFun (_, r) -> resTy r (n - 1) | _ -> None
+    match resTy sch.Body nps with
+    | Some r when (match prune r with TCon ("obj", _) -> true | _ -> false)
+                  && refKindOfExpr body = RKRaw -> boxRawE body
+    | _ -> body
+
+let private coerceToParams (sch : Scheme) (args : list<Expr>) : list<Expr> =
+    let rec paramTys (t : Type) (n : int) : list<Type> =
+        if n = 0 then []
+        else
+            match prune t with
+            | TFun (a, r) -> a :: paramTys r (n - 1)
+            | _ -> []
+    // walked pairwise rather than with List.map2: the self-host inferred the
+    // map2 form's result as an Expr rather than a list of them, and the wrong
+    // type spread to every caller
+    let rec walk (ts : list<Type>) (es : list<Expr>) : list<Expr> =
+        match ts, es with
+        | p :: tr, a :: er ->
+            // `obj` only, for the same reason the cast is: it is the one
+            // parameter type a raw scalar can legitimately flow into
+            let isObj = (match prune p with TCon ("obj", _) -> true | _ -> false)
+            let a2 = if isObj && refKindOfExpr a = RKRaw then boxRawE a else a
+            a2 :: walk tr er
+        | _, rest -> rest
+    let ps = paramTys sch.Body (List.length args)
+    if List.length ps <> List.length args then args else walk ps args
+
+
 let private lowInt (n : int) : LExpr = LConstW n
 let private lowUntag (e : LExpr) : LExpr = LPrim (ShrSW, [ e; LConstW 1 ])
 let private lowTag (e : LExpr) : LExpr = LPrim (OrW, [ LPrim (ShlW, [ e; LConstW 1 ]); LConstW 1 ])
@@ -7872,8 +7932,15 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
         if List.isEmpty unitEvals then call else LDo (unitEvals, call)
     | EApp ((EVar (v, _) | EVarI (v, _, _)), args) when (dictTryFind st.Externs v.Name).IsSome ->
         LDo (args |> List.map (fun a -> LEval (coreToLowE ctx a)), lowInt 0)
-    | EApp (((EVar (v, _) | EVarI (v, _, _)) as hd), args)
-        when (dictTryFind st.Funcs (key v)) = Some (List.length args) ->
+    | EApp (((EVar (v, vsch) | EVarI (v, vsch, _)) as hd), args0)
+        when (dictTryFind st.Funcs (key v)) = Some (List.length args0) ->
+        // A RAW scalar passed where the parameter's type is a REFERENCE has to
+        // be boxed — inference widened it without unifying, so the argument
+        // kept its own scalar type and the callee would receive a bare word
+        // where it expects an object it can ask questions of. Only CONCRETE
+        // reference parameters: a quantified one is RKGen and rides a witness,
+        // which already says whether the value is raw.
+        let args = coerceToParams vsch args0
         // a generic callee takes hidden LEADING witness pointers, one per
         // quantified var, positionally matched to the call's type-arg names
         // (EVarI.inst, recorded by Infer): concrete name -> its static witness,
@@ -8167,6 +8234,12 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
             | None -> LGet mrReg
         LDo ([ LSet (wReg sc, coreToLowE ctx scrut) ] @ scPush
              @ [ LBlock ("$mdone", clauseStmts @ [ LTrap ]) ] @ scPop, result)
+    // `box e`: a RAW scalar gets a real box (header + word), anything else is
+    // already a reference and passes straight through. float and int64 are
+    // boxes of their own, so they take the second path.
+    | EPrim ("$unbox", [ x ]) -> lowUnboxW (coreToLowE ctx x)
+    | EPrim ("$box", [ x ]) ->
+        if refKindOfExpr x = RKRaw then lowBoxW ctx (coreToLowE ctx x) else coreToLowE ctx x
     | ETypeTest (tn, e2) -> (lowTypeTest ctx tn (coreToLowE ctx e2))
     | ECast (tn, e2, true) when
           not (List.isEmpty (typeTestIds st tn))
@@ -8188,11 +8261,21 @@ and private coreToLowEBody (ctx : LowCtx) (e : Expr) : LExpr =
                LIf (LPrim (AndW, [ LPrim (NeW, [ LGet (wReg t); LConstW 0 ])
                                    LPrim (EqW, [ lowTypeTest ctx tn (LGet (wReg t)); LConstW 0 ]) ]),
                     [ LThrow (lowFailure ctx (lowStrConst ctx.LSt "\"invalid cast\"")) ], []) ],
-             LGet (wReg t))
-    | ECast (_, e2, _) ->
-        // `:>` widening, and `:?>` to a type without a class-id: the identity —
-        // the representation does not change under a cast in the tagged model
-        coreToLowE ctx e2
+             // a 32-bit scalar is a BOX, so the cast yields its payload —
+             // the pointer itself is not the int
+             (let bare = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
+              if boxedScalarName bare then lowUnboxW (LGet (wReg t)) else LGet (wReg t)))
+    | ECast (tn, e2, _) ->
+        // `:>` widening, and `:?>` to a type without a class-id. Usually the
+        // identity — but a RAW scalar widening to a reference type has to be
+        // BOXED, exactly as `box` does: `(3 :> obj)` left a raw 3 in an obj,
+        // and the type test then read its header from address 3.
+        // ONLY to `obj`. Any other reference target cannot receive a scalar
+        // anyway, and a blanket "target is not a raw scalar" test boxed
+        // float16 — which IS a raw word but is not in rawScalarName.
+        let bare = if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn
+        if bare = "obj" && refKindOfExpr e2 = RKRaw then lowBoxW ctx (coreToLowE ctx e2)
+        else coreToLowE ctx e2
     | EIfaceCall (iface, method, recv, args) ->
         let bi = bareIfaceOf iface
         let t = freshTmp ctx
@@ -8786,6 +8869,18 @@ and private lowBox64 (ctx : LowCtx) (shape : string) (cid : int) (ty : LTy) (v :
 
 and private lowBoxF (ctx : LowCtx) (fv : LExpr) : LExpr = lowBox64 ctx "f64" CID_FLOAT F64 fv
 
+/// a boxed 32-bit scalar: header, then the word at HDR. Same shape as
+/// lowBox64, four bytes instead of eight.
+and private lowBoxW (ctx : LowCtx) (wv : LExpr) : LExpr =
+    let b = freshTmp ctx
+    let alloc =
+        if gc then lowAllocSized ctx (gcTid ctx.LSt "w32" (HDR + 4) FK_STRUCT 0) (HDR + 4)
+        else LAlloc (LConstW (HDR + 4))
+    let hdr = if gc then [] else [ LStore (W, LGet (wReg b), 0, LConstW CID_BOXW) ]
+    LDo (LSet (wReg b, alloc) :: hdr @ [ LStore (W, LGet (wReg b), HDR, wv) ], LGet (wReg b))
+
+and private lowUnboxW (p : LExpr) : LExpr = LLoad (W, p, HDR)
+
 /// Does a register appear anywhere in these statements / this expression?
 /// The unbox peephole below elides a box whose ONLY consumer is the unbox, so
 /// it has to prove the pointer is read nowhere else.
@@ -8971,6 +9066,11 @@ and private lowPatTest (ctx : LowCtx) (scrutReg : int) (fail : string) (pat : Pa
     match pat with
     | PWild -> []
     | PVar (v, _) -> [ LSet (wReg (freshReg ctx (key v)), sc) ]
+    // `:? int as i` binds the INT, not the box carrying it — and the test has
+    // to run FIRST, since unboxing a value that is not a box reads rubbish
+    | PAs (PTypeTest tn, v, _) when boxedScalarName (if tn.Contains "$<" then tn.Substring (0, tn.IndexOf "$<") else tn) ->
+        lowPatTest ctx scrutReg fail (PTypeTest tn)
+        @ [ LSet (wReg (freshReg ctx (key v)), lowUnboxW sc) ]
     | PAs (p, v, _) -> LSet (wReg (freshReg ctx (key v)), sc) :: lowPatTest ctx scrutReg fail p
     // an INT64 literal pattern (`0L`, `9223372036854775807L`) tests a BOXED
     // payload: compared as a word it tested the pointer against the truncated
@@ -9684,6 +9784,12 @@ and private divGuarded (ctx : LowCtx) (isLong : bool) (op : LOp) (ta : LExpr) (t
                     []) ],
              LPrim (op, [ LGet (reg at); LGet (reg bt) ]))
 
+/// Box each argument whose own representation is a raw scalar but whose
+/// PARAMETER is a concrete reference type. The scheme's arrow chain carries
+/// the parameter types; a `TVar` parameter is generic and left alone.
+/// Box a body whose declared RESULT is a reference type but whose value is a
+/// raw scalar: `let f () : obj = 8` widened at the annotation, so the body kept
+/// its own int type.
 and private lowFailure (ctx : LowCtx) (msg : LExpr) : LExpr =
     ctx.LSt.UsesExn <- true
     match dictTryFind ctx.LSt.UnionTag "Failure" with
@@ -9700,12 +9806,13 @@ and private lowTypeTest (ctx : LowCtx) (tn : string) (v : LExpr) : LExpr =
     // share the tag — `box true :? int` is true here where F# says false,
     // the shared-scalar divergence); floats, 64-bit ints and strings are
     // heap boxes with their own class-id headers
-    if List.contains bare [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ] then
-        let t = freshTmp ctx
-        LDo ([ LSet (wReg t, v) ], LPrim (AndW, [ LGet (wReg t); LConstW 1 ]))
-    else
     let scalarCids =
         match bare with
+        // the 32-bit scalars share ONE box, so `box true :? int` is true here
+        // where F# says false (the shared-scalar divergence, DIVERGENCES.md).
+        // What is no longer true is that the test read a tag bit: it checks
+        // the box's header, so every value answers the same way.
+        | _ when boxedScalarName bare -> [ CID_BOXW ]
         | "float" -> [ CID_FLOAT ]
         | "int64" | "uint64" -> [ CID_INT64 ]
         | "string" -> [ CID_STRING ]
@@ -11932,12 +12039,14 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
         vecAdd st.TidCid (gcArrTid, CID_ARRAY)
         gcFloatTid <- gcTid st "f64" (HDR + 8) FK_STRUCT 0
         gcInt64Tid <- gcTid st "i64" (HDR + 8) FK_STRUCT 0
+        gcBoxwTid <- gcTid st "w32" (HDR + 4) FK_STRUCT 0
         // map the scalar-box tids so `:? float` / `:? int64` / `:? string`
         // read their class-ids through $t2c under the reactor — unmapped
         // tids read cid 0 and every scalar type test answered false
         vecAdd st.TidCid (gcStrTid, CID_STRING)
         vecAdd st.TidCid (gcFloatTid, CID_FLOAT)
         vecAdd st.TidCid (gcInt64Tid, CID_INT64)
+        vecAdd st.TidCid (gcBoxwTid, CID_BOXW)
         gcListTid <- gcTid st "s:2:2:0" (HDR + 8) FK_TAGGED 1
         // map the uniform cons tid to CID_LIST so $isBuiltinSeq recognises it
         // (the FK_STRUCT per-refmap cons variants register their own mapping)
@@ -12444,7 +12553,8 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // unsupported node reports a gap through coreToLowE, never a bad module
     for d in decls do
         match d with
-        | DLet (_, v, sch, ELam (ps, body)) when (dictTryFind st.Funcs (key v)).IsSome ->
+        | DLet (_, v, sch, ELam (ps, body0)) when (dictTryFind st.Funcs (key v)).IsSome ->
+            let body = coerceToResult sch (List.length ps) body0
             if not (isNull (System.Environment.GetEnvironmentVariable "FPP_FUNC_DUMP")) then eprintfn "FUNC %s = %s | %s" (fn v) (key v) v.Name
             // a method of a Canon generic class: (class-var id, self byte-offset)
             // for each class type param that survives as a TVar in the receiver
