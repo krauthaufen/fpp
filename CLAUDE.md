@@ -1,5 +1,31 @@
 # Working in this repo
 
+## A diagnostic names the sub-expression that is wrong
+
+`let x : int = "s"` used to be reported at `x`, which is correct as written —
+the string is the problem. Every position now blames the offending
+sub-expression, and the column matches F#'s on all fourteen shapes checked
+(annotation, argument, record field, list/array/tuple element, if branch,
+match arm, return, assignment, range bound, while condition, unbound value,
+unknown member).
+
+Two things make it work, and both are easy to undo by accident:
+
+* an offset captured BEFORE the arms that shadow it. In the binary-operator
+  branch `r` is rebound to a result TYPE, so `nodeOff op.Offset r` inside
+  those arms does not compile — `lOff`/`rOff` are taken where the operand
+  nodes are still in scope.
+* CASCADE SUPPRESSION. A tuple element reports at the element, and then the
+  ascription would report the whole tuple as well: two errors for one
+  mistake, the vaguer one first because diagnostics sort by offset. The
+  ascription checks whether the body already added a diagnostic and, if so,
+  ties the types without reporting.
+
+Not everything should blame an operand. `1 + "s"` reports `no instance
+Add<int, string>` AT THE OPERATOR, where F# blames the right operand — the
+failure really is that the operator has no instance for that pair, and
+naming one operand would misdescribe it.
+
 ## Each boxed scalar has its OWN class id
 
 `box true :? int` was true, `box true :?> int` handed back 1, and — the part

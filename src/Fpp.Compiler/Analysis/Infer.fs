@@ -419,6 +419,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
             List.contains n [ "int"; "bool"; "char"; "byte"; "sbyte"; "int16"; "uint16"; "uint32" ]
         | _ -> false
 
+    /// the first token of a green node — where a diagnostic about THAT
+    /// sub-expression belongs, rather than at the operator or the binder
+    let nodeOff (fallback : int) (g : GreenNode) : int =
+        match Green.tokens (GNode g) |> List.tryHead with
+        | Some t -> t.Offset
+        | None -> fallback
+
     let isObjTy (t : Type) : bool =
         match prune t with TCon ("obj", _) -> true | _ -> false
 
@@ -4168,6 +4175,17 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                          match Green.tokens (GNode head) |> List.tryHead with
                          | Some t -> t.Offset
                          | None -> 0
+                     // where an ARGUMENT is the thing that does not fit, blame
+                     // the argument: `f "s"` is wrong at the string, not at f.
+                     // `off` stays the head's, since the marker channels and
+                     // the RESULT type are the call's, not the argument's.
+                     let argOff =
+                         match args |> List.filter (fun m -> m.NodeKind <> TyParams) |> List.tryHead with
+                         | Some a ->
+                             (match Green.tokens (GNode a) |> List.tryHead with
+                              | Some t -> t.Offset
+                              | None -> off)
+                         | None -> off
                      // explicit type application `zeroCreate<struct(int*int)>`:
                      // typing the head recorded its freshened quantified vars
                      // under the name token, in scheme order — the written
@@ -4429,13 +4447,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                        vecAdd fieldOwnersRaw
                                            (off, "$optargs:" + string (need - have) + ":"
                                                  + String.concat "," (List.map (fun i -> string i) wraps))
-                                       unifyArg off pt (TTuple (filled @ List.skip have ps))
+                                       unifyArg argOff pt (TTuple (filled @ List.skip have ps))
                                        for i in wraps do
                                            (match prune (List.item i ps) with
                                             | TCon ("Option", [ inner ]) ->
-                                                unifyArg off inner (List.item i supplied)
+                                                unifyArg argOff inner (List.item i supplied)
                                             | _ -> ())
-                                   | _ -> unifyArg off pt argTy)
+                                   | _ -> unifyArg argOff pt argTy)
                                   unifyAt off res rt
                               | _ -> unifyAt off funTy (TFun (argTy, res)))
                              funTy <- res
@@ -4479,6 +4497,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      if opClass op.Text = "assign" then exprExpect <- Some lt
                      let rt = exprType (GNode r)
                      exprExpect <- None
+                     // captured HERE: inside the arms below `r` is rebound to a
+                     // result TYPE, so the operand nodes are out of reach there
+                     let lOff = nodeOff op.Offset l
+                     let rOff = nodeOff op.Offset r
                      (match opClass op.Text with
                       | "arith" | "cmp" | "bits" -> vecAdd opKindsRaw (op.Offset, lt)
                       | _ -> ())
@@ -4495,12 +4517,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           // element travels in the instantiation channel so
                           // lowering can specialize the materializer.
                           let elem =
+                              // blame the UPPER bound: `1 .. "s"` takes its
+                              // element from the lower one, so the second is
+                              // the operand that disagrees
                               match prune lt with
                               | TCon ("list", [ e ]) ->
-                                  unifyAt op.Offset e rt
+                                  unifyAt rOff e rt
                                   e
                               | _ ->
-                                  unifyAt op.Offset lt rt
+                                  unifyAt rOff lt rt
                                   lt
                           // constrain only a CONCRETE element: a variable
                           // resolves per stamp inside RangeOps.Seq, and a
@@ -4689,7 +4714,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                           (match byrefTarget with
                            | Some (off, inner) ->
                                vecAdd fieldOwnersRaw (off, "ByRefCell")
-                               unifyArg op.Offset inner rt
+                               unifyArg rOff inner rt
                            | None -> ())
                           // an INDEXER target ties the same way: `set_Item`'s
                           // value parameter is the getter's result type
@@ -4701,7 +4726,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                   | None -> false)
                           if op.Text = "<-" && byrefTarget.IsNone
                              && (l.NodeKind = IdentExpr || isArrayIndex || isIndexer || isRecordField) then
-                              unifyArg op.Offset lt rt
+                              unifyArg rOff lt rt
                           // assignability. A plain ident target must be a
                           // `let mutable`; a record/val field target must be
                           // declared `mutable`. Silence here compiled
@@ -4750,15 +4775,15 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                 | TFun (d, r) ->
                                     (match prune d, prune r with
                                      | TTuple [ a; b ], _ ->
-                                         unifyArg op.Offset a lt
-                                         unifyArg op.Offset b rt
+                                         unifyArg lOff a lt
+                                         unifyArg rOff b rt
                                          unifyAt op.Offset res r
                                      | a, TFun (b, r2) ->
-                                         unifyArg op.Offset a lt
-                                         unifyArg op.Offset b rt
+                                         unifyArg lOff a lt
+                                         unifyArg rOff b rt
                                          unifyAt op.Offset res r2
                                      | a, r2 ->
-                                         unifyArg op.Offset a lt
+                                         unifyArg lOff a lt
                                          unifyAt op.Offset res r2)
                                 | _ -> ())
                                vecAdd memberSitesRaw (op.Offset, tn)
@@ -4988,15 +5013,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              else None)
                         let t = exprType m
                         exprExpect <- None
-                        // an element widening to obj is boxed, same as a list
-                        // item or a record field value
                         (if List.length elemWants = List.length elemNodes then
                             match List.item i elemWants with
-                            | Some w when isObjTy w && isRawScalarTy t ->
-                                (match Green.tokens m |> List.tryHead with
-                                 | Some tk -> vecAdd fieldOwnersRaw (tk.Offset, "$boxobj")
-                                 | None -> ())
-                            | _ -> ())
+                            | Some w ->
+                                let eoff =
+                                    match Green.tokens m |> List.tryHead with
+                                    | Some tk -> tk.Offset
+                                    | None -> 0
+                                // an element widening to obj is boxed, same as
+                                // a list item or a record field value
+                                (if isObjTy w && isRawScalarTy t then
+                                     vecAdd fieldOwnersRaw (eoff, "$boxobj"))
+                                // and it is checked HERE, at the element, so a
+                                // mismatch blames `(1, "s")`'s string rather
+                                // than the opening paren
+                                if eoff <> 0 then unifyArg eoff w t
+                            | None -> ())
                         t)
                 (match want with
                  | Some w ->
@@ -5099,9 +5131,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                       | [ one ] -> if hasElse then one else tUnit
                       | first :: others ->
                           if hasElse then
-                              for o in others do
-                                  let off = match Green.tokens (GNode n) |> List.tryHead with Some t -> t.Offset | None -> 0
-                                  unifyAt off first o
+                              // blame the BRANCH that disagrees, not the `if`:
+                              // `if c then 1 else "s"` is wrong at the string
+                              let branchNodes = match rest with _ :: t -> t | [] -> []
+                              others
+                              |> List.iteri (fun i o ->
+                                  let off =
+                                      match List.tryItem i branchNodes with
+                                      | Some bn ->
+                                          (match Green.tokens (GNode bn) |> List.tryHead with
+                                           | Some t -> t.Offset
+                                           | None -> 0)
+                                      | None ->
+                                          (match Green.tokens (GNode n) |> List.tryHead with
+                                           | Some t -> t.Offset
+                                           | None -> 0)
+                                  unifyAt off first o)
                               first
                           else tUnit)
                  | [] -> st.Fresh ())
@@ -5238,7 +5283,13 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                              for extra in bodies do
                                  if not (System.Object.ReferenceEquals (extra, b)) then
                                      exprType (GNode extra) |> ignore
-                             unifyAt barOff (exprType (GNode b)) result
+                             // blame the arm's BODY, not its `|`: the clause
+                             // that disagrees is wrong at its expression
+                             let bodyOff =
+                                 match Green.tokens (GNode b) |> List.tryHead with
+                                 | Some t -> t.Offset
+                                 | None -> barOff
+                             unifyAt bodyOff (exprType (GNode b)) result
                          | None -> ())
                         // solve while the clause's givens are in scope —
                         // file-level solving would default the skolems away
@@ -6136,14 +6187,21 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                                    // scalar needs its box, marked on the VALUE
                                    // expression (which is what lowering wraps)
                                    else
+                                       // the VALUE's offset, not the field
+                                       // NAME's: `{ A = "s" }` is wrong at the
+                                       // string, which is where F# points
+                                       let valOff =
+                                           match nodesOf f |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast with
+                                           | Some vn ->
+                                               (match Green.tokens (GNode vn) |> List.tryHead with
+                                                | Some vt0 -> Some vt0.Offset
+                                                | None -> None)
+                                           | None -> None
                                        (if isObjTy declared && isRawScalarTy vt then
-                                            match nodesOf f |> List.filter (fun m -> isExprish m.NodeKind) |> List.tryLast with
-                                            | Some vn ->
-                                                (match Green.tokens (GNode vn) |> List.tryHead with
-                                                 | Some vt0 -> vecAdd fieldOwnersRaw (vt0.Offset, "$boxobj")
-                                                 | None -> ())
+                                            match valOff with
+                                            | Some o -> vecAdd fieldOwnersRaw (o, "$boxobj")
                                             | None -> ())
-                                       unifyArg t.Offset declared vt
+                                       unifyArg (match valOff with Some o -> o | None -> t.Offset) declared vt
                                | None -> ())
                           | _ -> ())
                      // a full literal (no `with` base) must WRITE every
@@ -6417,6 +6475,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     | b :: rest -> [ b ], rest
                     | [] -> [], []
                 else afterAll, []
+            // a mismatch INSIDE the body (a tuple element, a list item) is the
+            // precise report; the ascription would then add a second, vaguer
+            // one at the whole expression. F# prints one error, and so do we.
+            let diagsBeforeBody = vecLen diags
             let bodyTys =
                 // the ASCRIPTION is the body's expectation — it is what lets
                 // `let x : GPUTexelCopyTextureInfo = { Texture = t }` pick
@@ -6447,9 +6509,29 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                     // and `let s : seq<int> = [1;2;3]` legal, and a plain
                     // unify rejected both. `box` is the identity at run time
                     // here, so widening to obj costs nothing to emit.
-                    (match Green.tokens (GNode namePat) |> List.tryHead with
-                     | Some t -> unifyArg t.Offset a bodyTy
-                     | None -> unify bodyTy a |> ignore)
+                    // BLAME THE BODY, not the binder: `let x : int = "s"` is
+                    // wrong at the string, which is where F# points too.
+                    // Reporting at the name sent the reader to a line that is
+                    // correct as written.
+                    let blameOff =
+                        match bodyGreens |> List.tryLast with
+                        | Some b ->
+                            (match Green.tokens b |> List.tryHead with
+                             | Some bt -> Some bt.Offset
+                             | None -> None)
+                        | None -> None
+                    let nameOff =
+                        match Green.tokens (GNode namePat) |> List.tryHead with
+                        | Some t -> Some t.Offset
+                        | None -> None
+                    (if vecLen diags > diagsBeforeBody then
+                         // already reported inside the body — tie the types
+                         // without a second diagnostic
+                         unify bodyTy a |> ignore
+                     else
+                         match (match blameOff with Some o -> Some o | None -> nameOff) with
+                         | Some o -> unifyArg o a bodyTy
+                         | None -> unify bodyTy a |> ignore)
                     // the binding IS the annotation, not the body's own type.
                     // Under plain unification the two were equal so it never
                     // mattered; subsumption makes them differ, and returning
