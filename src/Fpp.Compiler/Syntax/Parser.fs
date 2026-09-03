@@ -130,7 +130,18 @@ let private rightAssoc (text : string) : bool =
 
 let private literalKinds = [ IntLit; FloatLit; StringLit; CharLit ]
 
-let parse (src : string) : ParseResult =
+/// One ACTIVE-PATTERN definition, for cross-file seeding: case name, the
+/// `$ap$...` function name, the case's index, the case count, partial?, and
+/// how many EXTRA parameters a use supplies before the matched value.
+type ApDef =
+    { ApCase : string
+      ApFn : string
+      ApIndex : int
+      ApCount : int
+      ApPartial : bool
+      ApParams : int }
+
+let parseSeeded (apSeed : ApDef list) (src : string) : ParseResult =
     let toks = vecOfList (Lexer.tokenize src)
     let s = State(src, toks)
 
@@ -293,6 +304,22 @@ let parse (src : string) : ParseResult =
     let apCaseCount = dictNew<string, int> ()          // case -> how many cases
     let apIsPartial = dictNew<string, bool> ()         // case -> answers an option?
     let apParamCount = dictNew<string, int> ()         // case -> extra args the USE gives
+    // cross-file uses: the workspace seeds every project file's (and every
+    // linked library's) active-pattern definitions, because this rewrite is
+    // PARSE-time and these dicts are otherwise per-file. Unseeded, a
+    // consumer's `PairP (n, _)` stayed an ordinary pattern: a total case was
+    // at least an unknown-case error, but a partial one matched with a
+    // GARBAGE binding, and a tuple payload silently missed (fpp.base #32).
+    // A local definition simply overwrites its seed row with the same truth.
+    do
+        for d in apSeed do
+            dictSet apFunctionOf d.ApCase d.ApFn
+            dictSet apCaseIndex d.ApCase d.ApIndex
+            dictSet apCaseCount d.ApCase d.ApCount
+            dictSet apIsPartial d.ApCase d.ApPartial
+            dictSet apParamCount d.ApCase d.ApParams
+            if d.ApCount > 1 then
+                dictSet apIndexOf d.ApCase ("Choice" + string d.ApCount + "Of" + string (d.ApIndex + 1))
 
     /// Rename identifiers through a parsed subtree. Used only for the
     /// active-pattern desugar, where a case name has to become the choice
@@ -1335,6 +1362,22 @@ let parse (src : string) : ParseResult =
                 else
                     s.Diag "expected member name after '.'"
                     e <- Green.node DotExpr [ e; dot ]
+            elif s.IsOp "?" && isAdjacentTo e && s.SameLine && (s.Peek 1).Kind = Ident then
+                // DYNAMIC ACCESS: `scope?Alpha` is `(?) scope "Alpha"` — the
+                // member name becomes a STRING and the user-defined `(?)`
+                // operator is an ordinary binary application (FShade's
+                // custom-uniform spelling, fpp-shader-hooks request 4). The
+                // rewrite is a BinaryExpr on the fused name, which is exactly
+                // the let-bound-operator shape Infer and Lower already
+                // handle. Adjacency required, as for `a[i]` — `a ? b` with
+                // spaces stays an error rather than quietly meaning this.
+                let q = s.Bump ()
+                let nm = s.Bump ()
+                (match nm with
+                 | GToken nt ->
+                     let str = { Kind = StringLit; Text = "\"" + nt.Text + "\""; Leading = []; Trailing = nt.Trailing; Offset = nt.Offset }
+                     e <- Green.node BinaryExpr [ e; q; Green.node LiteralExpr [ GToken str ] ]
+                 | _ -> ())
             elif s.IsOp "<" && isAdjacentTo e && looksLikeTypeArgs () then
                 // A LITERAL cannot take type arguments. `5.0<m>` is F#'s
                 // units-of-measure spelling, and there are no measures here —
@@ -2531,9 +2574,27 @@ let parse (src : string) : ParseResult =
                 vecAdd c (parsePostfixType barCol)
                 caseWhens ()
             elif s.IsOp "=" then
-                // enum case: `| Leaf = 0uy`
+                // enum case: `| Leaf = 0uy` — and a NEGATIVE member,
+                // `| Debug = -1`, fused into one literal token so the value
+                // reader downstream sees a single number (fpp.base #35's
+                // side note; FShade's ShaderStage starts at -1)
                 vecAdd c (s.Bump ())
-                if isLiteral () then vecAdd c (Green.node LiteralExpr [ s.Bump () ])
+                if s.IsOp "-" && List.contains (s.Peek 1).Kind literalKinds then
+                    let neg = s.Bump ()
+                    (match s.Bump () with
+                     | GToken lt ->
+                         (match neg with
+                          | GToken ngt ->
+                              // spelled out, never `with`-copied: the copy
+                              // resolves its record by FIELD NAME under the
+                              // self-host, and Text/Offset live on several
+                              vecAdd c (Green.node LiteralExpr
+                                            [ GToken { Kind = lt.Kind; Text = "-" + lt.Text
+                                                       Leading = lt.Leading; Trailing = lt.Trailing
+                                                       Offset = ngt.Offset } ])
+                          | _ -> ())
+                     | _ -> ())
+                elif isLiteral () then vecAdd c (Green.node LiteralExpr [ s.Bump () ])
                 else s.Diag "expected an enum value"
             vecAdd acc (Green.node UnionCase (vecToList c))
             if s.Mark = mark then go <- false
@@ -2545,8 +2606,13 @@ let parse (src : string) : ParseResult =
         while go && not s.AtEof && not (s.Is RBrace) do
             let mark = s.Mark
             if s.Is Semicolon then vecAdd acc (s.Bump ())
-            elif s.IsKw "mutable" || s.Is Ident || (s.IsOp "?" && (s.Peek 1).Kind = Ident) then
+            elif s.IsKw "mutable" || s.Is Ident || (s.IsOp "?" && (s.Peek 1).Kind = Ident)
+                 // `[<Semantic "...">] pos : V4` — an attribute on the FIELD
+                 // (FShade vertex records carry one per field)
+                 || (s.Is LBracket && (let p = s.Peek 1 in p.Kind = Operator && p.Text = "<")) then
                 let f = vecNew<Green> ()
+                if s.Is LBracket && (let p = s.Peek 1 in p.Kind = Operator && p.Text = "<") then
+                    vecAdd f (parseAttributeList ())
                 if s.IsKw "mutable" then vecAdd f (s.Bump ())
                 // `?Name : T` — an OPTIONAL field: the type becomes
                 // option<T> and a literal may leave it out (None)
@@ -2792,3 +2858,71 @@ let parse (src : string) : ParseResult =
         | GToken _ -> { NodeKind = File; Children = []; Width = 0 }
 
     { Root = root; Diagnostics = s.Diagnostics }
+
+let parse (src : string) : ParseResult = parseSeeded [] src
+
+/// Token-level prescan of one file's ACTIVE-PATTERN definitions — the rows
+/// the workspace seeds every other file's parse with. Reads the raw token
+/// stream so it needs no parse (and the seed memo therefore cannot cycle
+/// with the parses that depend on it). The parameter count mirrors the
+/// parser's own rule: every atom between `|)` and the `=` (or a return
+/// ascription's `:`) but the LAST is given at the use site.
+let scanActivePatterns (src : string) : ApDef list =
+    let toks = Lexer.tokenize src |> List.filter (fun t -> t.Kind <> Eof) |> vecOfList
+    let n = vecLen toks
+    let out = vecNew<ApDef> ()
+    let tokAt (i : int) : Token = vecGet toks i
+    let isTx (i : int) (txt : string) = i < n && (tokAt i).Text = txt
+    let mutable i = 0
+    while i < n do
+        if (tokAt i).Kind = Keyword && (tokAt i).Text = "let" then
+            let mutable j = i + 1
+            while j < n && (tokAt j).Kind = Keyword
+                  && List.contains (tokAt j).Text [ "rec"; "inline"; "mutable"; "private"; "internal"; "public" ] do
+                j <- j + 1
+            if isTx j "(" && isTx (j + 1) "|" then
+                // ( | A | B | ) — names between bars; a trailing `_` marks partial
+                let names0 = vecNew<string> ()
+                let mutable k = j + 1
+                // `( (| name)* | )` — names while a bar is FOLLOWED by one;
+                // the final bar is followed by the closing paren
+                while isTx k "|" && (k + 1 < n && ((tokAt (k + 1)).Kind = Ident || (tokAt (k + 1)).Text = "_")) do
+                    vecAdd names0 (tokAt (k + 1)).Text
+                    k <- k + 2
+                if isTx k "|" && isTx (k + 1) ")" && vecLen names0 > 0 then
+                    let k = k + 1
+                    let all = vecToList names0
+                    let partial = (match List.tryLast all with Some "_" -> true | _ -> false)
+                    let names = all |> List.filter (fun c -> c <> "_")
+                    let count = List.length names
+                    // parameter ATOMS after `)` up to `=` / `:` — idents,
+                    // literals, or balanced groups, each one atom
+                    let mutable p = k + 1
+                    let mutable atoms = 0
+                    let mutable stop = false
+                    while not stop && p < n do
+                        let t = tokAt p
+                        if t.Text = "=" || t.Text = ":" then stop <- true
+                        elif t.Text = "(" || t.Text = "[" then
+                            let closing = if t.Text = "(" then ")" else "]"
+                            let opening = t.Text
+                            let mutable depth = 1
+                            p <- p + 1
+                            while depth > 0 && p < n do
+                                (if (tokAt p).Text = opening then depth <- depth + 1
+                                 elif (tokAt p).Text = closing then depth <- depth - 1)
+                                p <- p + 1
+                            atoms <- atoms + 1
+                        elif t.Kind = Ident || List.contains t.Kind literalKinds then
+                            atoms <- atoms + 1
+                            p <- p + 1
+                        else stop <- true
+                    let extra = if atoms > 1 then atoms - 1 else 0
+                    let fname = "$ap$" + String.concat "$" all
+                    names |> List.iteri (fun ix c ->
+                        vecAdd out
+                            { ApCase = c; ApFn = fname; ApIndex = ix
+                              ApCount = count; ApPartial = partial; ApParams = extra })
+                    i <- p - 1
+        i <- i + 1
+    vecToList out

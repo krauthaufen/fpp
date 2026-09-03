@@ -1193,6 +1193,47 @@ body contains zero `array.len`. That one was checked, not assumed.
 * `wasm-tools validate -f all out.wasm` gives a far better message than the
   runtime does.
 
+## Cross-file active patterns need a PARSE-TIME seed
+
+The parser rewrites an active-pattern USE (`PairP (n, _)` -> `Some (n, _)`
+against `$ap$PairP$_`) from per-file tables filled while parsing the
+DEFINITION. Cross-file, those tables were empty, so a consumer's use stayed
+an ordinary pattern: a total case was at least an unknown-case ERROR, but a
+partial one matched with a GARBAGE binding and a tuple payload silently
+MISSED (fpp.base #32, a silent wrong-match — the worst class).
+
+The fix seeds the parse: `Parser.parseSeeded` takes every project file's
+(and every linked library's) active-pattern definitions, gathered by
+`scanActivePatterns` — a TOKEN prescan, no parse, so the seed memo cannot
+cycle with the parses that read it. The workspace memo `ApSeed` reads the
+file texts, so editing a definer invalidates every parse through it. A
+local definition simply overwrites its seed row with the same truth.
+
+The prescan mirrors the parser's own two rules, and each is a token-shape
+trap: names run while a `|` is FOLLOWED by an identifier, and the final `|`
+is followed by `)` — a loop that treats the closing bar as a separator
+eats it and bails, finding zero cases. And a parameterized pattern's
+use-site parameter count is "atoms after `)` up to `=`/`:`, minus one" —
+the LAST atom is the matched value.
+
+## External command generators
+
+`generator <cmd>` in a `.fppproj` runs a command with the project's source
+paths appended; its STDOUT becomes a generated file, placed after the last
+type-declaring source (the same anchor an F++ generator gets). The contract
+is the F++-generator one over a process boundary — fpp.shader's reflection
+tool was the first customer, and had been linking Fpp.Compiler as a
+pre-build step because nothing could run it. `RunCommandGenerators` is
+guarded at its CALL (`if vecLen cmdGenerators > 0`) exactly like
+`RunFppGenerators`: the member spawns processes, so the self-hosted compiler
+stubs it whole and an unconditional call trapped stage-1.
+
+`a?Name` is `(?) a "Name"` — the member name becomes a string literal and
+the user-defined `(?)` is an ordinary binary application (the let-bound
+operator shape). Adjacency required, like `a[i]`: `a ? b` with spaces stays
+an error. A negative enum member (`| Debug = -1`) fuses the sign into one
+literal token so the value reader sees a single number.
+
 ## The prelude snapshot, and the two traps it hit
 
 The prelude is parsed, resolved, inferred and lowered on EVERY invocation,

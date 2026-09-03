@@ -37,7 +37,12 @@ type Project =
       /// package dependencies: name and range text (`package foo ^1.2`)
       Packages : (string * string) list
       /// package registries, URLs or directories, in lookup order
-      Registries : string list }
+      Registries : string list
+      /// external GENERATOR commands (`generator <cmd> [args...]`): run with
+      /// the project's source paths appended; stdout becomes a generated
+      /// file after the last type-declaring source — the same contract an
+      /// F++-written generator has, over a process boundary
+      Generators : string list }
 
 type LoadResult =
     { Loaded : Project
@@ -65,6 +70,7 @@ let parse (projectPath : string) (text : string) : LoadResult =
     let mutable version = ""
     let packages = vecNew<string * string> ()
     let registries = vecNew<string> ()
+    let generators = vecNew<string> ()
     let lines = text.Replace("\r\n", "\n").Split '\n'
     for i in 0 .. lines.Length - 1 do
         let line = lines.[i].Trim()
@@ -98,6 +104,7 @@ let parse (projectPath : string) (text : string) : LoadResult =
                  | Some _ -> vecAdd packages (pn, pr)
                  | None -> vecAdd errors (i + 1, "bad range on package " + pn + ": " + pr))
             | "registry" -> vecAdd registries arg
+            | "generator" -> vecAdd generators arg
             | other -> vecAdd errors (i + 1, "unknown directive '" + other + "'")
             if arg = "" && directive <> "name" then
                 vecAdd errors (i + 1, directive + " needs an argument")
@@ -111,7 +118,8 @@ let parse (projectPath : string) (text : string) : LoadResult =
           Defines = vecToList defines
           Version = version
           Packages = vecToList packages
-          Registries = vecToList registries }
+          Registries = vecToList registries
+          Generators = vecToList generators }
       Errors = vecToList errors }
 
 /// A project that is not there is not an exception: the caller reports the
@@ -121,7 +129,7 @@ let read (projectPath : string) : LoadResult =
     | Some text -> parse projectPath text
     | None ->
         { Loaded = { Path = projectPath; Name = ""; Out = ""; Libs = []; Sources = []; Defines = []
-                     Version = ""; Packages = []; Registries = [] }
+                     Version = ""; Packages = []; Registries = []; Generators = [] }
           Errors = [ 0, "cannot read project file " + projectPath ] }
 
 /// The project a source file belongs to: the nearest `*.fppproj` at or above

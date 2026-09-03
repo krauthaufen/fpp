@@ -344,6 +344,9 @@ type Workspace() =
     /// plugins written in F++ ITSELF: name and sources, compiled and RUN at
     /// compile time
     let fppGenerators = vecNew<string * (string * string) list> ()
+    /// external generator COMMANDS (`generator <cmd>` in the project):
+    /// (display name, command line, working directory)
+    let cmdGenerators = vecNew<string * string * string> ()
     /// generated path -> the generator that wrote it, for blaming diagnostics
     let generatedBy = dictNew<string, string> ()
     /// where each piece of the last emitted module came from
@@ -366,6 +369,9 @@ type Workspace() =
     /// A generator emits SOURCE before analysis, so it can declare types,
     /// classes and instances — see the staging rule in Plugins.fs.
     member _.AddGenerator (g : Fpp.Core.Plugins.Generator) : unit = vecAdd generators g
+
+    member _.AddCommandGenerator (name : string, cmd : string, workDir : string) : unit =
+        vecAdd cmdGenerators (name, cmd, workDir)
 
     /// A generator written in F++ ITSELF. Its sources are compiled and RUN
     /// during this compilation; whatever it prints becomes a generated file.
@@ -436,6 +442,16 @@ type Workspace() =
                 let text = match hostReadText s with Some t -> t | None -> ""
                 let text2, _ = Fpp.Project.preprocess this.Defines text
                 db.SetInput "text" s (box text2)
+        let projDir =
+            let i = r.Loaded.Path.LastIndexOf '/'
+            if i > 0 then r.Loaded.Path.Substring (0, i) else "."
+        r.Loaded.Generators
+        |> List.iteri (fun i cmd ->
+            let gname =
+                let first = (cmd.Split ' ').[0]
+                let j = first.LastIndexOf '/'
+                (if j >= 0 then first.Substring (j + 1) else first) + (if i = 0 then "" else string i)
+            this.AddCommandGenerator (gname, cmd, projDir))
         r.Loaded, r.Errors
 
     /// conditional-compilation symbols; the CLI sets WASM or NATIVE from
@@ -459,9 +475,42 @@ type Workspace() =
 
     /// The parse EXACTLY as written — the tree the round-trip gate and the
     /// editor's view of the text are about.
+    /// Every ACTIVE-PATTERN definition in the project (and in linked
+    /// libraries, whose exports carry the `$ap$...` names): the parser's
+    /// use-site rewrite is PARSE-time and its tables are per-file, so a
+    /// cross-file use needs this seed. A memo, not an input — it reads the
+    /// file texts, so editing a definer invalidates every parse through it.
+    member private this.ApSeed () : Parser.ApDef list =
+        db.MemoT "apseed" "" (fun () ->
+            let fromFiles =
+                this.ProjectFiles
+                |> List.collect (fun p -> Parser.scanActivePatterns (this.FileText p))
+            let fromLibs =
+                this.Libraries
+                |> List.collect (fun (_, text) ->
+                    (Fpp.Core.Serialize.decodeLib text).LExports
+                    |> List.collect (fun (full, d) ->
+                        if d.Name.StartsWith "$ap$" then
+                            let parts = (substr d.Name 4 (strLen d.Name - 4)).Split '$' |> List.ofArray
+                            let partial = (match List.tryLast parts with Some "_" -> true | _ -> false)
+                            let names = parts |> List.filter (fun c -> c <> "_")
+                            ignore full
+                            names |> List.mapi (fun ix c ->
+                                { Parser.ApCase = c; Parser.ApFn = d.Name; Parser.ApIndex = ix
+                                  Parser.ApCount = List.length names; Parser.ApPartial = partial
+                                  // extra use-site parameters are not
+                                  // recoverable from the export name alone;
+                                  // 0 covers every matcher shape
+                                  Parser.ApParams = 0 })
+                        else []))
+            if System.Environment.GetEnvironmentVariable "FPP_APSEED_DBG" = "1" then
+                for r in fromFiles @ fromLibs do
+                    eprintfn "APSEED %s -> %s idx=%d n=%d partial=%b params=%d" r.ApCase r.ApFn r.ApIndex r.ApCount r.ApPartial r.ApParams
+            fromFiles @ fromLibs)
+
     member this.ParseRaw (path : string) : Parser.ParseResult =
         db.MemoT "parse" path (fun () ->
-            let p = Parser.parse (this.FileText path)
+            let p = Parser.parseSeeded (this.ApSeed ()) (this.FileText path)
             // `lazy e` -> `Lazy (fun () -> e)`, here so EVERY consumer of a
             // parse sees the rewritten form (the raw parse stays lossless
             // for the round-trip tests, which call the parser directly)
@@ -773,7 +822,67 @@ type Workspace() =
     /// of the compile order, so they see every user declaration, and each
     /// generator writes to a stable path, so running twice replaces rather
     /// than accumulates.
+    /// External COMMAND generators (`generator <cmd>` in the project):
+    /// the command runs once with the project's source paths appended, its
+    /// STDOUT becomes a generated file after the last type-declaring source
+    /// — the same contract an F++ generator has, over a process boundary.
+    /// fpp.shader's reflection tool is the first customer: it linked
+    /// Fpp.Compiler as a pre-build step because nothing could run it.
+    member private this.RunCommandGenerators () : unit =
+        if vecLen cmdGenerators > 0 then
+            let srcs =
+                this.ProjectFiles
+                |> List.filter (fun p -> not (p.StartsWith Workspace.GeneratedPrefix))
+            for gname, cmd, workDir in vecToList cmdGenerators do
+                try
+                    let parts = cmd.Split ' ' |> Array.filter (fun x -> x <> "")
+                    let psi =
+                        System.Diagnostics.ProcessStartInfo (
+                            parts.[0],
+                            String.concat " " (List.ofArray parts.[1..] @ (srcs |> List.map (fun p -> "\"" + p + "\""))))
+                    psi.WorkingDirectory <- workDir
+                    psi.RedirectStandardOutput <- true
+                    psi.RedirectStandardError <- true
+                    use proc = System.Diagnostics.Process.Start psi
+                    let out = proc.StandardOutput.ReadToEnd ()
+                    let err = proc.StandardError.ReadToEnd ()
+                    if not (proc.WaitForExit 120000) then
+                        proc.Kill ()
+                        vecAdd pluginErrors ("generator '" + gname + "' did not finish within 120s")
+                    elif proc.ExitCode <> 0 then
+                        vecAdd pluginErrors
+                            ("generator '" + gname + "' failed: "
+                             + err.Substring (0, min 300 err.Length))
+                    else
+                        let path = Workspace.GeneratedPrefix + gname + ".fpp"
+                        dictSet generatedBy path gname
+                        db.SetInput "text" path (box out)
+                        let files = this.ProjectFiles
+                        if not (List.contains path files) then
+                            // the same default anchor an F++ generator gets:
+                            // directly after the LAST file declaring a type,
+                            // so the output can name every type it derives
+                            // from and later files can name IT
+                            let anchor =
+                                let idxs =
+                                    files
+                                    |> List.mapi (fun i p -> i, p)
+                                    |> List.filter (fun (_, p) ->
+                                        not (p.StartsWith Workspace.GeneratedPrefix)
+                                        && not (List.isEmpty (Fpp.Core.Plugins.typeDeclsOf p (this.ParseFile p).Root)))
+                                    |> List.map fst
+                                if List.isEmpty idxs then 0 else List.max idxs
+                            let before = files |> List.truncate (anchor + 1)
+                            let after = files |> List.skip (min (List.length files) (anchor + 1))
+                            db.SetInput "project" "" (box (before @ [ path ] @ after))
+                with ex ->
+                    vecAdd pluginErrors ("generator '" + gname + "' could not run: " + ex.Message)
+
     member private this.RunGenerators () : unit =
+        // guarded at the CALL, like RunFppGenerators below: the member spawns
+        // processes, so the self-hosted compiler stubs it WHOLE — an
+        // unconditional call trapped stage-1 at the first build
+        if vecLen cmdGenerators > 0 then this.RunCommandGenerators ()
         if vecLen generators > 0 || vecLen fppGenerators > 0 then
             for path in this.ProjectFiles do
                 if not (path.StartsWith Workspace.GeneratedPrefix)

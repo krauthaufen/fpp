@@ -190,12 +190,19 @@ let private mergeGcModule (moduleBytes : byte[]) (out : string) : int =
         (try System.IO.File.Delete modWasm; System.IO.File.Delete wat with _ -> ())
         if r2 <> 0 then (eprintfn "error: wasm-tools parse failed (set FPP_WASM_TOOLS)"; 1) else 0
 
+/// external generator commands from the last `openProject`, registered onto
+/// the workspace by `build` — the CLI flattens a project to a file list, so
+/// this rides beside it (name, command, working directory)
+let mutable private pendingGenerators : (string * string * string) list = []
+
 let private build (strict : bool) (defines : string list) (out : string) (files : string list) : int =
     preludeCacheBegin defines
     let ws = Workspace()
     // the target IS the configuration: `#if WASM` code exists only in wasm
     // builds, `#if NATIVE` only in C builds — nothing compiles to a trap
     ws.Defines <- (if out.EndsWith ".c" then "NATIVE" else "WASM") :: defines
+    for gname, cmd, workDir in pendingGenerators do
+        ws.AddCommandGenerator (gname, cmd, workDir)
     let libs = files |> List.filter (fun f -> f.EndsWith ".fppir")
     let srcs = files |> List.filter (fun f -> not (f.EndsWith ".fppir"))
     for l in libs do
@@ -622,6 +629,13 @@ let private openProject (proj : string) : (string list * string * string list) o
             eprintfn "error: %s" e
             None
         | Ok pkgLibs ->
+            pendingGenerators <-
+                r.Loaded.Generators
+                |> List.mapi (fun i cmd ->
+                    let first = (cmd.Split ' ').[0]
+                    let j = first.LastIndexOf '/'
+                    let gname = (if j >= 0 then first.Substring (j + 1) else first) + (if i = 0 then "" else string i)
+                    gname, cmd, dir)
             Some (pkgLibs @ r.Loaded.Libs @ r.Loaded.Sources, out, r.Loaded.Defines)
 
 let private isProject (f : string) = f.EndsWith Project.extension
