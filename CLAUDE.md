@@ -1209,6 +1209,23 @@ shared node means a shared code index means a shared slot. Only under GC
 moot there). It is a DIVERGENCE — F# gives distinct delegates; DIVERGENCES.md
 and `tooling/fnidentity-gate.sh` carry it.
 
+## Custom operations, like active patterns, need a project-wide seed
+
+`[<CustomOperation>]` is captured in inference PER FILE, so a builder in one
+file used from another was not recognized — the ops came back "unbound
+value" and the CE never desugared. `Workspace.CustomOpSeed` is the analogue
+of the active-pattern seed: a token prescan of every project file's parse
+tree (via `ParseRaw`, NOT `ParseFile` — the latter re-enters ProjectCheck
+and returns a null in-progress memo), gathering (builder type, op name,
+method) triples, memoized on the file texts. Seeded first, this file's own
+inference on top.
+
+One trap: the method name is the last ident BEFORE the first `(`, not the
+last ident in the member — `member x.Texture (s, t) = (t, f)` ends in `f`,
+so a `tryLast` over the whole member keyed every op to a body variable and
+the cross-file calls dispatched to `.v`/`.f` and trapped. Same-file was
+unaffected because inference (`memberNameOf`) overrode the seed there.
+
 ## CE custom operations (`[<CustomOperation>]`)
 
 `sampler2d { texture X; filter F }` — FShade's sampler CE. `[<CustomOperation

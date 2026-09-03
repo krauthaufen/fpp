@@ -480,6 +480,64 @@ type Workspace() =
     /// use-site rewrite is PARSE-time and its tables are per-file, so a
     /// cross-file use needs this seed. A memo, not an input — it reads the
     /// file texts, so editing a definer invalidates every parse through it.
+    /// Every `[<CustomOperation("op")>] member T.Method` across the project,
+    /// as (builder type, op name, method name) — a builder declared in one
+    /// file and used in another needs this, exactly as active patterns do.
+    /// Scanned from the parse trees (attribute + member are green nodes), so
+    /// no inference and no cycle. A memo over the file texts.
+    member private this.CustomOpSeed () : (string * string * string) list =
+        db.MemoT "customopseed" "" (fun () ->
+            let out = vecNew<string * string * string> ()
+            let rec scan (curType : string) (g : Green) : unit =
+                match g with
+                | GToken _ -> ()
+                | GNode n when n.NodeKind = TypeDecl ->
+                    let tn =
+                        Green.tokens (GNode n)
+                        |> List.filter (fun t -> t.Kind = Ident)
+                        |> List.tryHead
+                        |> Option.map (fun t -> t.Text)
+                    let ty = match tn with Some t -> t | None -> curType
+                    // a preceding AttributeList applies to the next MemberDecl
+                    let mutable pending : string option = None
+                    for c in n.Children do
+                        match c with
+                        | GNode a when a.NodeKind = AttributeList ->
+                            let ats = Green.tokens (GNode a)
+                            if ats |> List.exists (fun t -> t.Kind = Ident && t.Text = "CustomOperation") then
+                                (match ats |> List.tryFind (fun t -> t.Kind = StringLit) with
+                                 | Some st ->
+                                     let raw = st.Text
+                                     pending <-
+                                         Some (if strLen raw >= 2 && charAt raw 0 = '"' && charAt raw (strLen raw - 1) = '"'
+                                               then substr raw 1 (strLen raw - 2) else raw)
+                                 | None -> ())
+                        | GNode m when m.NodeKind = MemberDecl ->
+                            (match pending with
+                             | Some opn ->
+                                 // the method name is the last ident BEFORE
+                                 // the first `(` — `member x.Texture (s, t)`
+                                 // has idents [x; Texture] there; the body's
+                                 // idents (a `tryLast` over the whole member)
+                                 // grabbed those instead
+                                 let toksBeforeParen =
+                                     let rec upto acc (ts : Token list) =
+                                         match ts with
+                                         | t :: _ when t.Kind = LParen -> List.rev acc
+                                         | t :: rest -> upto (t :: acc) rest
+                                         | [] -> List.rev acc
+                                     upto [] (Green.tokens (GNode m))
+                                 let mn = toksBeforeParen |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+                                 (match mn with Some t -> vecAdd out (ty, opn, t.Text) | None -> ())
+                             | None -> ())
+                            pending <- None
+                            scan ty c
+                        | GNode _ -> scan ty c
+                        | GToken _ -> ()
+                | GNode n -> for c in n.Children do scan curType c
+            for pth in this.ProjectFiles do scan "" (GNode (this.ParseRaw pth).Root)
+            vecToList out)
+
     member private this.ApSeed () : Parser.ApDef list =
         db.MemoT "apseed" "" (fun () ->
             let fromFiles =
@@ -658,9 +716,11 @@ type Workspace() =
                                 (BuiltinCache.copyDict implTys)
                                 (BuiltinCache.copyDict structTypes) (BuiltinCache.copyDict ctors)
                                 (BuiltinCache.copyTables classes)
-                        // custom operations, per builder type: op name -> method
+                        // custom operations, per builder type: op name -> method.
+                        // seeded project-wide first (a builder from another
+                        // file), then this file's own inference on top.
                         let customOps = dictNew<string, Dict<string, string>> ()
-                        for (bt, opName, mName) in inf0.CustomOps do
+                        for (bt, opName, mName) in this.CustomOpSeed () @ inf0.CustomOps do
                             let d =
                                 match dictTryFind customOps bt with
                                 | Some d -> d
