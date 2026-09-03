@@ -12,6 +12,8 @@
 #define FPPRT_EMBEDDER_H
 
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -30,6 +32,20 @@ struct fpprt_type_intern {
 /* the type table lives in fpprt.c */
 extern struct fpprt_type_intern *fpprt_types_;
 extern uint32_t fpprt_ntypes_;
+
+/* DEBUG: see the range-root probe in gc_trace_heap_roots. Read once — a
+ * collection walks two million slots and getenv per slot is not viable. */
+static inline int fpprt_rootcheck_(void) {
+#ifdef __wasm__
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("FPPRT_ROOTCHECK"); v = (s && *s == '1'); }
+  return v;
+#else
+  /* wasm only: a RANGE root is the wasm backend's shadow stack, and the probe
+   * bounds its read against linear memory, which has no native counterpart */
+  return 0;
+#endif
+}
 
 #define FPPRT_EMB_KIND_STRUCT 0u
 #define FPPRT_EMB_KIND_REF_ARRAY 1u
@@ -229,6 +245,31 @@ static inline void gc_trace_heap_roots(struct gc_heap_roots *roots,
       trace_edge(gc_edge(&roots->statics[i]), heap, trace_data);
   for (size_t r = 0; r < roots->nranges; r++) {
     uintptr_t *base = roots->ranges[r].base;
+    /* DEBUG (FPPRT_ROOTCHECK=1): a range root that is not a plausible object
+     * start — its header word must be an odd (tid<<1)|1 for a registered tid.
+     * The wasm shadow stack is a RANGE, so a slot holding a raw scalar or a
+     * non-heap address is traced as an edge and faults deep inside the
+     * collector, where the backtrace names nothing. This prints the slot
+     * INDEX (= shadow-stack depth) and the value before that happens. */
+#ifdef __wasm__
+    if (fpprt_rootcheck_())
+      for (size_t i = 0; i < roots->ranges[r].n; i++) {
+        uintptr_t v = base[i];
+        if (!v || (v & 1)) continue;
+        uintptr_t lim = (uintptr_t)__builtin_wasm_memory_size(0) * 65536u;
+        uintptr_t hdr = 0;
+        if (v + sizeof(uintptr_t) <= lim) {
+          hdr = *(uintptr_t *)v;
+          if ((hdr & 1) && (hdr >> 1) < fpprt_ntypes_) continue;
+        }
+        fprintf(stderr,
+                "BADROOT range=%zu slot=%zu at=0x%08x base=0x%08x n=%zu "
+                "val=0x%08x hdr=0x%08x\n",
+                r, i, (unsigned)(uintptr_t)&base[i], (unsigned)(uintptr_t)base,
+                roots->ranges[r].n, (unsigned)v, (unsigned)hdr);
+        abort();
+      }
+#endif
     for (size_t i = 0; i < roots->ranges[r].n; i++)
       if (base[i] && !(base[i] & 1))
         trace_edge(gc_edge(&base[i]), heap, trace_data);

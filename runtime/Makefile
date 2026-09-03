@@ -91,8 +91,16 @@ build/wasm/test_grow_mmc.wasm: test/test_grow.c $(WASM_SRCS_COMMON) gc/src/mmc.c
 	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
 	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
 
+build/wasm/test_reserve.wasm: test/test_reserve.c gc-platform-wasm.c
+	@mkdir -p build/wasm
+	$(WASM_CC) $(filter %.c,$^) -O2 -Igc/api -Igc/src -I. -DNDEBUG -DGC_PRECISE_ROOTS=1 \
+	  -DGC_ATTRS=\"$(abspath gc/api/mmc-attrs.h)\" \
+	  -DGC_EMBEDDER=\"$(abspath fpprt-embedder.h)\" \
+	  -s STANDALONE_WASM -s PURE_WASI=1 -s ALLOW_MEMORY_GROWTH=1 -o $@
+
 .PHONY: test-wasm
-test-wasm: build/wasm/test_rt.wasm build/wasm/test_rt_mmc.wasm build/wasm/test_grow_mmc.wasm
+test-wasm: build/wasm/test_rt.wasm build/wasm/test_rt_mmc.wasm build/wasm/test_grow_mmc.wasm build/wasm/test_reserve.wasm
 	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt.wasm
 	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_rt_mmc.wasm
 	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_grow_mmc.wasm
+	$(HOME)/.wasmtime/bin/wasmtime run build/wasm/test_reserve.wasm

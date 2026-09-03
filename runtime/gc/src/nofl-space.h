@@ -2061,6 +2061,12 @@ nofl_space_expand(struct nofl_space *space, size_t bytes) {
   size_t reserved = align_up(to_acquire, NOFL_SLAB_SIZE);
   size_t nslabs = reserved / NOFL_SLAB_SIZE;
   struct nofl_slab *slabs = nofl_allocate_slabs(nslabs);
+  /* fpprt: the platform may REFUSE — on wasm, linear memory is capped at 2 GB
+   * and a region is never returned to the system, so a large contiguous
+   * request near the ceiling fails. Keep the heap at its current size and
+   * collect more often; the alternative was registering NULL slabs, and the
+   * program then died far away on a zeroed function pointer. */
+  if (!slabs) return;
   nofl_space_add_slabs(space, slabs, nslabs);
 
   struct gc_lock lock = nofl_space_lock(space);

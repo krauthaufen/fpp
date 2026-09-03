@@ -4,6 +4,8 @@
  * built by the mutator in shared linear memory; we just splice the list. */
 #include "fpprt.h"
 #include <stdint.h>
+#include <stdlib.h>   /* getenv */
+#include <string.h>   /* strlen */
 
 /* push a frame the mutator has already laid out in memory at `f`
  * (prev/nslots/slots/npods/pods filled in), making it the new top. */
@@ -36,6 +38,50 @@ void fpprt_register_type_s(uint32_t tid, uint32_t size, uint32_t kind,
 static fpprt_ref g_wasm_roots[FPPRT_WASM_NROOTS];
 uint32_t fpprt_wasm_roots_base(void) { return (uint32_t)(uintptr_t)g_wasm_roots; }
 void fpprt_wasm_roots_register(uint32_t n) { fpprt_add_static_roots(g_wasm_roots, n); }
+
+/* The STRUCT-RETURN stack. A by-value struct result is written through a
+ * destination on a raw region the collector never scans, and that region has
+ * to be memory NOBODY else owns. It used to be carved out of the mutator's
+ * own address space at a compile-time constant — which, once the reactor is
+ * merged in, lands in the MIDDLE of g_wasm_roots above: every struct return
+ * wrote its fields over root slots, and the collector then traced a double's
+ * bit pattern as a pointer. So it lives here, beside the other regions the
+ * mutator asks the runtime for. Grows DOWN from the top. */
+#define FPPRT_WASM_SSTACK_BYTES (1u << 20)
+static uint8_t g_wasm_sstack[FPPRT_WASM_SSTACK_BYTES];
+uint32_t fpprt_wasm_sstack_top(void) {
+  return (uint32_t)(uintptr_t)(g_wasm_sstack + FPPRT_WASM_SSTACK_BYTES);
+}
+uint32_t fpprt_wasm_sstack_base(void) { return (uint32_t)(uintptr_t)g_wasm_sstack; }
+
+/* ENVIRONMENT VARIABLES. The wasm-hosted compiler could not read one:
+ * `System.Environment.GetEnvironmentVariable` has no implementation there, so
+ * it answered null and every env-gated pass silently did nothing in stage-1.
+ * That is why the fixpoint could not validate one — stage-0 read the variable
+ * and stage-1 did not, and the byte mismatch meant nothing.
+ *
+ * WASI gives the reactor a real environment, so libc's getenv is all it takes.
+ * The name arrives as UTF-16 in linear memory (ptr = first char, n = chars);
+ * env names are ASCII, so the low byte of each is the name. The value is
+ * handed back a byte at a time rather than copied, which keeps the mutator
+ * from having to own a buffer. */
+#define FPPRT_ENV_NAME_MAX 1024
+static char g_env_name[FPPRT_ENV_NAME_MAX];
+static const char *g_env_val;
+
+int32_t fpprt_env_get(uint32_t ptr, uint32_t n) {
+  if (n >= FPPRT_ENV_NAME_MAX) return -1;
+  const uint16_t *src = (const uint16_t *)(uintptr_t)ptr;
+  for (uint32_t i = 0; i < n; i++) g_env_name[i] = (char)(src[i] & 0xFF);
+  g_env_name[n] = 0;
+  g_env_val = getenv(g_env_name);
+  if (!g_env_val) return -1;
+  return (int32_t)strlen(g_env_val);
+}
+
+uint32_t fpprt_env_byte(uint32_t i) {
+  return g_env_val ? (uint32_t)(uint8_t)g_env_val[i] : 0u;
+}
 
 /* tid -> class-id table for the wasm-linear backend: the object header holds
  * (tid<<1)|1 for the collector, but type tests and vtable dispatch want the

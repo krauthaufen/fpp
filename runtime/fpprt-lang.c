@@ -14,6 +14,8 @@ double fpp_mono_ms(void) {
 #endif
 
 unsigned char *fpp_tclass_ = NULL;
+/* the value most recently found by fpp_env_get; see fpprt-lang.h */
+const char *fpp_env_val_ = NULL;
 unsigned int *fpp_tfields_ = NULL;
 size_t fpp_tmeta_cap_ = 0;
 

@@ -119,6 +119,27 @@ V fpp_str_utf8(const char *bytes, size_t len);   /* decode UTF-8 -> UTF-16 */
  * lone surrogates and all (fpp_str_c decodes UTF-8 instead) */
 V fpp_str_c16(const char *b, size_t units);
 
+/* ---- the environment --------------------------------------------------- */
+/* `System.Environment.GetEnvironmentVariable`, shared by both backends. The
+ * name is an F++ string (UTF-16 units); env names are ASCII, so the low byte
+ * of each unit is the name. Returns the value's length, or -1 when unset, and
+ * leaves the value for fpp_env_byte to read a byte at a time. */
+static inline int fpp_env_get(V name) {
+    static char buf[1024];
+    size_t n = fpp_str_len(name);
+    if (n >= sizeof buf) return -1;
+    uint16_t *u = fpp_str_units(name);
+    for (size_t i = 0; i < n; i++) buf[i] = (char)(u[i] & 0xFF);
+    buf[n] = 0;
+    extern const char *fpp_env_val_;
+    fpp_env_val_ = getenv(buf);
+    return fpp_env_val_ ? (int)strlen(fpp_env_val_) : -1;
+}
+static inline int fpp_env_byte(int i) {
+    extern const char *fpp_env_val_;
+    return fpp_env_val_ ? (int)(unsigned char)fpp_env_val_[i] : 0;
+}
+
 V fpp_str_concat(V a, V b);
 V fpp_str_method(const char *m, V recv, V *args, size_t nargs);
 int fpp_str_cmp(V a, V b);
