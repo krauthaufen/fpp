@@ -257,4 +257,22 @@ let viaElement () : string =
 
 eq "byref-churn-into-element" (viaElement ()) "200/199"
 
+// ---- a TUPLED byref callee -------------------------------------------------
+// the byref is a PATTERN BINDER (`λ_arg. match _arg with (b, p) -> ...`) and
+// the caller passes a literal tuple whose elements the backend spreads
+
+let extendT (b : byref<float>, k : float) : unit =
+    b <- b + k
+    let mutable trail = 0
+    trail <- trail + 1
+    ignore trail
+
+let tupledCalls () : string =
+    let mutable acc = 1.5
+    extendT (&acc, 2.0)
+    extendT (&acc, 3.0)
+    sprintf "%.1f" acc
+
+eq "byref-tupled-callee" (tupledCalls ()) "6.5"
+
 printfn "DONE tests=%d failures=%d" ntests failures

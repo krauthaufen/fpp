@@ -12548,8 +12548,29 @@ let private brOffPrepass (decls0 : Decl list) : Decl list * Dict<string, Dict<st
     // shrinking, so it terminates.
     let candidates = dictNew<string, (int * VarId * string) list> ()
     let bodies = dictNew<string, Expr> ()
+    // a TUPLED function destructures one argument: `λ_arg. match _arg with
+    // (b, p) -> ...` — the byref is a PATTERN BINDER, and the caller passes
+    // a literal tuple whose elements the backend spreads. Entries are keyed
+    // by ELEMENT index; `tupled` says which convention the call uses.
+    let tupled = dictNew<string, bool> ()
     for d in decls0 do
         match d with
+        | DLet (_, v, _, ELam ([ (argV, _) ], EMatch ((EVar (mv, _) | EVarI (mv, _, _)), [ (PTuple pats, None, mbody) ]))) when
+              key mv = key argV ->
+            let entries =
+                pats
+                |> List.mapi (fun i pat ->
+                    match pat with
+                    | PVar (pv, psch) ->
+                        (match brPayloadOf recs psch.Body with
+                         | Some pay -> Some (i, pv, pay)
+                         | None -> None)
+                    | _ -> None)
+                |> List.choose (fun x -> x)
+            if not (List.isEmpty entries) then
+                dictSet candidates (key v) entries
+                dictSet bodies (key v) mbody
+                dictSet tupled (key v) true
         | DLet (_, v, _, ELam (ps, body)) ->
             let entries =
                 ps
@@ -12737,6 +12758,21 @@ let private brOffPrepass (decls0 : Decl list) : Decl list * Dict<string, Dict<st
                 vecAdd convertible 0
                 let rec count (x : Expr) : unit =
                     (match x with
+                     // a TUPLED call: the view sits inside the literal tuple
+                     // the backend spreads — element index = entry index
+                     | EApp ((EVar (f, _) | EVarI (f, _, _)), [ ETuple xs ]) when
+                           key f <> fnKey && (dictTryFind tupled (key f)).IsSome ->
+                         (match dictTryFind elig (key f) with
+                          | Some entries ->
+                              xs
+                              |> List.iteri (fun i a ->
+                                  match a with
+                                  | EVar (av, _) | EVarI (av, _, _) when
+                                        key av = key vw
+                                        && entries |> List.exists (fun (j, _) -> j = i) ->
+                                      vecSet convertible 0 (vecGet convertible 0 + 1)
+                                  | _ -> ())
+                          | None -> ())
                      | EApp ((EVar (f, _) | EVarI (f, _, _)), args) when key f <> fnKey ->
                          (match dictTryFind elig (key f) with
                           | Some entries ->
@@ -12759,6 +12795,26 @@ let private brOffPrepass (decls0 : Decl list) : Decl list * Dict<string, Dict<st
                 if vecGet convertible 0 = total then
                     let rec sub (x : Expr) : Expr =
                         match x with
+                        | EApp (((EVar (f, _) | EVarI (f, _, _)) as fe), [ ETuple xs ]) when
+                              key f <> fnKey && (dictTryFind tupled (key f)).IsSome
+                              && (dictTryFind elig (key f)).IsSome ->
+                            let entries = optGet (dictTryFind elig (key f))
+                            EApp (fe,
+                                  [ ETuple
+                                        (xs
+                                         |> List.mapi (fun i a ->
+                                             match a with
+                                             | EVar (av, avsch) when
+                                                   key av = key vw
+                                                   && entries |> List.exists (fun (j, _) -> j = i) ->
+                                                 let pay = entries |> List.pick (fun (j, pp) -> if j = i then Some pp else None)
+                                                 EApp (EUnknown ("$broff:" + pay), [ EVar (tv, avsch) ])
+                                             | EVarI (av, avsch, ii) when
+                                                   key av = key vw
+                                                   && entries |> List.exists (fun (j, _) -> j = i) ->
+                                                 let pay = entries |> List.pick (fun (j, pp) -> if j = i then Some pp else None)
+                                                 EApp (EUnknown ("$broff:" + pay), [ EVarI (tv, avsch, ii) ])
+                                             | other -> sub other)) ])
                         | EApp ((EVar (f, _) | EVarI (f, _, _)) as fe, args) when
                               key f <> fnKey && (dictTryFind elig (key f)).IsSome ->
                             let entries = optGet (dictTryFind elig (key f))

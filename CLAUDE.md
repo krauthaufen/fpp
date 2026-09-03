@@ -353,6 +353,15 @@ canonical clone's "#r" overwrite its float sibling's "#f64"; and the
 tagged offset is unambiguous because byref params never otherwise receive
 odd words.
 
+TUPLED callees are covered: the byref is a PATTERN BINDER
+(`λ_arg. match _arg with (b, p) -> ...`) and the caller passes a literal
+tuple the backend spreads — the prepass recognizes the destructure lambda,
+keys entries by ELEMENT index, and rewrites eligible elements inside the
+ETuple argument. Tuple-FORWARDING (a binder passed on inside another
+tuple literal) stays conservative: the body walk sees the bare binder
+inside the ETuple and declines eligibility. Non-inlined tupled struct
+byref: 135 ms / 31 B-per-call -> 55 ms / 0 B (inlined stays 9 ms).
+
 The two bugs the finishing pass found, both the silent kind:
 
 * **the statement-position dispatch.** `coreToLowS` has its own EIf arm,
