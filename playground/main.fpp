@@ -1,7 +1,13 @@
 module Main
 
+// fpp.base FIRST: the playground's own `Vec` defines a V2d too, and the later
+// open wins, so opening the library first leaves the local demos untouched
+// while everything the library adds (V3d, M44d, Box3d, ...) is in scope.
+open Fpp.Base
 open Vec
 open Classes
+open Classes.Display
+open Classes.Norm
 
 // ---- generic math at three types from ONE definition -------------------
 // Hover `double`: its scheme shows the inferred Add constraint.
@@ -53,6 +59,35 @@ let m3 = printfn "mconcat vecs   = (%f, %f)" (mconcat [ p; q ]).X (mconcat [ p; 
 
 let n1 = printfn "norm p         = %f" (norm p)
 let n2 = printfn "norm -2.5      = %f" (norm (0.0 - 2.5))
+
+// ---- fpp.base, referenced as a compiled library (see playground.fppproj) ---
+// The Aardvark.Base port: V3d/M44d/Box3d/Trafo3d and the geometry on them.
+// Hover any of these — the types come from the .fppir, not from source in this
+// folder, and go-to-definition still resolves into fpp.base.
+//
+// fpp.base is referenced by SOURCE (see playground.fppproj): a `lib`/package
+// reference builds but does not carry type MEMBERS, so `.Dot` on a V3d from a
+// library traps. By source, the whole API works — statics included.
+let b1 = v3d (1.0, 2.0, 3.0)
+let b2 = v3d (4.0, 5.0, 6.0)
+let g1 = printfn "v3d dot        = %f" (b1.Dot b2)
+let g2 = printfn "v3d cross      = (%f, %f, %f)" (b1.Cross b2).X (b1.Cross b2).Y (b1.Cross b2).Z
+let g3 = printfn "v3d length     = %f" b2.Length
+let g4 = printfn "v3d normalized = %f" b2.Normalized.Length
+
+let bx = box3d (v3d (0.0, 0.0, 0.0), v3d (2.0, 4.0, 6.0))
+let g5 = printfn "box3d size     = (%f, %f, %f)" bx.Size.X bx.Size.Y bx.Size.Z
+
+// STATIC members and the geometry types
+let rot = M44d.RotationZ 0.5
+let rp = rot.TransformPos b1
+let g6 = printfn "m44 rotate     = (%f, %f, %f)" rp.X rp.Y rp.Z
+let hull = Box3d.FromPoints (b1, b2, v3d (0.0, 9.0, 0.0))
+let g7 = printfn "box from pts   = (%f, %f, %f)" hull.Max.X hull.Max.Y hull.Max.Z
+// NOTE: a `Ray3d.IntersectPlane` line here traps at runtime, but ONLY when all
+// three of the playground's own classes (Display, Monoid, Norm) are compiled
+// alongside fpp.base. Any one or two of them is fine; the three together are
+// not. Reduced repro in KNOWN-ISSUES — it is a compiler bug, not this file.
 
 // Uncomment to watch diagnostics appear as you type:
 //let bad1 : int = "not an int"

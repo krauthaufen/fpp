@@ -6,24 +6,26 @@ open Vec
 // A class is not a type: no values, no boxing — just a constraint that a
 // generic signature can demand. Hover `show` and `describe`.
 
-class Show<'a>
-    static show : 'a -> string
+class Display<'a>
+    static display : 'a -> string
 
-instance Show<int>
-    static show v = string v
+instance Display<int>
+    static display v = string v
 
-instance Show<float>
-    static show v = string v
+instance Display<float>
+    static display v = string v
 
-instance Show<bool>
-    static show v = if v then "yes" else "no"
+instance Display<bool>
+    static display v = if v then "yes" else "no"
 
-instance Show<V2d>
-    static show v = sprintf "(%f, %f)" v.X v.Y
+instance Display<V2d>
+    static display v = sprintf "(%f, %f)" v.X v.Y
 
-// generic over the class — hover: `when Show<'a>` rides the signature
-let describe (label : string) (v : 'a) : string when Show<'a> =
-    label + " = " + show v
+open Classes.Display
+
+// generic over the class — hover: `when Display<'a>` rides the signature
+let describe (label : string) (v : 'a) : string when Display<'a> =
+    label + " = " + display v
 
 // ==== a lawful class with a generic fold ================================
 
@@ -43,6 +45,8 @@ instance Monoid<V2d>
     static mempty = { X = 0.0; Y = 0.0 }
     static combine a b = a + b
 
+open Classes.Monoid
+
 // one body folds ints, strings and vectors
 let mconcat (xs : 'a list) : 'a when Monoid<'a> =
     let mutable acc = mempty
@@ -54,13 +58,13 @@ let mconcat (xs : 'a list) : 'a when Monoid<'a> =
 // The result type is decided by the INSTANCE, not written at the use.
 
 class Norm<'v>
-    type Scalar
-    static norm : 'v -> Scalar
+    type Mag
+    static norm : 'v -> Mag
 
 instance Norm<V2d>
-    type Scalar = float
+    type Mag = float
     static norm v = sqrt (v.X * v.X + v.Y * v.Y)
 
 instance Norm<float>
-    type Scalar = float
+    type Mag = float
     static norm v = abs v

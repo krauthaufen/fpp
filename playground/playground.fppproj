@@ -1,6 +1,16 @@
 # compile order is semantic: vec.fpp's exports flow into main.fpp
 name playground
 out  playground.wat
+
+# fpp.base as a compiled fat-IR LIBRARY rather than 22 source files. The
+# .fppir carries the library's class tables and type members, so `.Dot` on a
+# V3d, `M44d.RotationZ` and `Constant.Pi` all resolve across the boundary.
+# Rebuild it after changing fpp.base:
+#
+#   cd ../../fpp.base && fpp lib -o ../fpp-lowir/playground/lib/fpp.base.fppir \
+#       $(grep '^src ' fpp.base.fppproj | awk '{print $2}')
+lib  lib/fpp.base.fppir
+
 src  vec.fpp
 src  classes.fpp
 src  main.fpp

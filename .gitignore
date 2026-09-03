@@ -13,3 +13,4 @@ editors/vscode/out/
 editors/vscode/*.vsix
 playground/playground.wat
 __pycache__/
+playground/lib/*.fppir

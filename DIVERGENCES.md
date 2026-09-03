@@ -277,6 +277,32 @@ not be if the bits were read signed. `string` on a `uint64` prints unsigned;
 
 `nativeint` and `unativeint` are absent.
 
+## A `[<RequireQualifiedAccess>]` case named bare is an ERROR, not a binder
+
+F# accepts a bare case of such a type in PATTERN position and reads it as a
+fresh BINDER — irrefutable, so every later rule is dead. It warns (FS0026,
+"this rule will never be matched") and runs:
+
+```fsharp
+[<RequireQualifiedAccess>]
+type Colour = Red | Green
+match c with
+| Red -> "r"        // binds c, matches everything
+| Green -> "g"      // never reached
+```
+
+F++ rejects it. The reason is a rule this compiler already has: an uppercase
+identifier in a case pattern names a union case and NEVER binds (see
+"Pattern identifiers" in CLAUDE.md). So the F# reading is not available
+here, and the only two choices left are to resolve it to the case — which
+gives the same program a different meaning than F# without saying so — or
+to refuse it. Refusing is the one that cannot silently disagree.
+
+In EXPRESSION position there is no divergence: both compilers reject.
+`tests/conformance/neg/rqa-bare-expr.fpp` covers that half, with the fsi
+oracle behind it; this half cannot be a conformance case, because fsi
+accepts the program.
+
 ## Active patterns are multi-case and total
 
 `let (|Add|Rem|) x = ...` works: the pattern's cases construct in its body
@@ -416,6 +442,24 @@ What that is NOT is an ALIAS. A callee that reaches the same location by
 another route does not see the write until the call ends, and two byrefs to
 one location do not see each other. Single-threaded, and for the
 out-parameter shape everything actually uses, it is indistinguishable.
+
+**The escape shapes F# forbids are SOUND here, and mostly work.** F#'s
+byref safety analysis exists because its byref is a stack pointer; this
+one is a heap cell the collector keeps alive, so a byref received by a
+lambda, stored, or returned out of the frame that made it keeps working —
+the 13 upstream ByrefSafetyAnalysis rejections are not applicable.
+
+One spelling diverges: `let r : byref<int> = f ()` BINDS THE CELL — reads
+dereference and writes reach the original, the same declaration-driven
+rule byref parameters follow (the written `byref` is the trigger; a
+`ref<'a>` is the same representation and must keep reading as itself). F#
+instead implicitly dereferences a returned byref and rejects that binding
+outright (FS3226 — keeping the pointer is spelled `&f ()`). The tooling
+byref gate pins the cell reading; it cannot be a conformance case because
+fsi refuses the program. An UNANNOTATED `let r = f ()` keeps the cell
+without the deref rule: writes alias, and a read in a scalar position is
+a type error (`%d expects an integer, not 'ByRefCell'`) rather than the
+silent "?" it printed before.
 
 `StringBuilder.Append` takes a string or a char; .NET's numeric overloads
 are not there, so write `sb.Append (string x)`.
@@ -778,3 +822,23 @@ What still differs is HASHING: F# hashes `box true` and `box 1` alike (both
 1), while the kind word makes them differ here. Unequal values are free to
 hash differently, so nothing built on it can break; it is simply not the same
 number.
+
+**`expr1[expr2]` in argument position is INDEXED, not refused.** F# 6 made
+`a[i]` mean `a.[i]`, but declines to disambiguate the form in an argument
+(`printfn "%d" m[1][0]`, FS3369) and asks for the dot back. This compiler
+indexes it. The reading it picks is the one the writer meant, and the
+alternative — application of an array to a list — is never valid anyway.
+
+**A `%` in an interpolated string need not bind to a hole.** F# requires
+every `%` in an interpolated string to be a specifier with an expression
+after it (FS3376), so `$"50% of it"` is an error there and must be written
+`%%`. This compiler takes an unbound `%` as literal text. Specifiers that DO
+bind, and `%%`, behave exactly as F# does.
+
+**`struct {| ... |}` is a reference anonymous record.** The `struct` is
+accepted and ignored: anonymous records here are the synthesized nominal
+records described in CLAUDE.md, and there is no struct flavour. Since they
+are immutable, the difference is not observable in a value — only in
+representation. The EMPTY anonymous record `{| |}`, which F# accepts, is not
+supported and is rejected.
+

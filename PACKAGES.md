@@ -1,9 +1,17 @@
 # Packages
 
 Libraries ship as `.fpkg` archives: not source, not a platform binary, but
-the fat IR (`.fppir`) — resolver exports, inference schemes, and generic
-templates that specialize at link time — once per target flavor. One
-package builds programs for every backend.
+the fat IR (`.fppir`) — resolver exports, inference schemes, the library's
+own SEMANTIC TABLES, and generic templates that specialize at link time —
+once per target flavor. One package builds programs for every backend.
+
+The tables are what make a library equal to its sources. `fppir2` carries
+the classes and instances the library declares, its type members (`fields`),
+interfaces, bases, constructors, type abbreviations and struct flags. A
+`fppir1` file — anything built before they existed — still loads, and is
+still limited to plain functions: a class declared inside it has instances
+nowhere, so a marker like `$class:Real:Pi:float` resolves to nothing and the
+backend stubs whatever mentions it.
 
 ## The archive
 
