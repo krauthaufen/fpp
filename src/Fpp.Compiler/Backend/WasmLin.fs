@@ -257,6 +257,15 @@ type private St =
       /// maps the source literal to its slot. Constants are allocated through
       /// fpprt at startup and their pointers kept in the shim's root table.
       GcConstData : Vec<int * byte[]>
+      /// CAPTURE-FREE closure singletons: a top-level function used as a
+      /// VALUE (`box f`, `Effect.ofFunction f`) eta-expands to `fun x -> f x`,
+      /// whose closure captures NOTHING — so one instance per function is
+      /// enough, and reusing it gives the value STABLE IDENTITY (`box f`
+      /// twice is reference-equal, which `ofFunction` keys on). Allocated
+      /// once at startup into a root slot, like a string constant. Keyed by
+      /// the LIFTED lambda name; value = (root slot, code-table name).
+      GcCloData : Vec<int * int * int>
+      CloSlot : Dict<string, int>
       /// GC mode: a top-level global's key ("path:offset") -> its root-table
       /// slot. Top-level bindings hold tagged values or heap pointers, so they
       /// live in the scanned root table, not in unscanned wasm globals.
@@ -10661,6 +10670,29 @@ and private lowClosure (ctx : LowCtx) (name : string) : LExpr =
         dictSet st.LamWits name (encWits |> List.mapi (fun j (tvId, _) -> (tvId, ncaps + j))))
     let witVals = encWits |> List.map (fun (_, r) -> LGet (wReg r))
     let witKinds = encWits |> List.map (fun _ -> RKRaw)
+    // a closure with NO captures and NO enclosing witnesses is a CONSTANT —
+    // `[CLO_KIND, code-idx]`, the same bytes every time. Build it ONCE at
+    // startup into a root slot and read that slot, so every reification of a
+    // bare top-level function is the SAME object (stable identity for
+    // `box f` / `Effect.ofFunction f`), and no per-use allocation. Under the
+    // standalone (non-gc) backend there is no root table, so it falls back
+    // to the fresh build — identity is not a concern there (no collector).
+    if gc && List.isEmpty caps && List.isEmpty encWits then
+        let slot =
+            match dictTryFind st.CloSlot name with
+            | Some sl -> sl
+            | None ->
+                let sl = st.RootNext
+                st.RootNext <- sl + 1
+                dictSet st.CloSlot name sl
+                // the SAME tid lowObjR interns for a 2-slot all-raw object
+                // (cid=3 CLO, n=2, raw=2, no ref offsets) — no captures, so
+                // nothing is scanned
+                let tid = gcTidRef st "s:3:2:2:ss" (HDR + 8) []
+                vecAdd st.GcCloData (sl, tid, tblIdx st.M name)
+                sl
+        LLoad (W, LPrim (AddW, [ LGetGlobal "$roots"; LConstW (4 * slot) ]), 0)
+    else
     lowObjR ctx CID_CLOSURE 2
         (LConstW CLO_KIND :: LConstW (tblIdx st.M name) :: (capVals @ witVals))
         (Some (RKRaw :: RKRaw :: (capKinds @ witKinds))) capGenWits
@@ -12312,6 +12344,14 @@ let private emitLambdaLow (st : St) (m : Mod) (lamName : string) (pv : VarId) (p
 // Over-application `f a…(>N)` splits into a saturated call applied to the tail.
 // Definitions (DLet heads) are never touched — only EVar/EVarI references.
 let mutable private etaCtr = 0
+/// eta lambdas built for a BARE function value, memoized so every use of the
+/// same function reifies the SAME lambda node — discover keys a lifted
+/// closure by node reference, so one node means one lifted closure, which
+/// with the capture-free singleton means STABLE IDENTITY (`box f` twice is
+/// reference-equal). Keyed by function key + instantiation; a captured or
+/// partially-applied eta is NOT memoized (it has real captures / a distinct
+/// shape per site).
+let private etaValueMemo = dictNew<string, Expr> ()
 let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>) : Expr -> Expr =
     let fresh (sch : Scheme) : VarId * Scheme =
         etaCtr <- etaCtr + 1
@@ -12387,7 +12427,17 @@ let private etaExpand (funcs : Dict<string, int>) (caseArity : Dict<string, int>
             // emitter's own vArities sort, the last 881 bytes vs the oracle.
             wrap hd sch [] 2
         | (EVar (v, sch) | EVarI (v, sch, _)) as hd ->
-            match dictTryFind funcs (key v) with Some n when n > 0 -> wrap hd sch [] n | _ -> e
+            match dictTryFind funcs (key v) with
+            | Some n when n > 0 ->
+                let inst = match hd with EVarI (_, _, i) -> String.concat "," i | _ -> ""
+                let mk = "eta:" + key v + "/" + string n + "/" + inst
+                (match dictTryFind etaValueMemo mk with
+                 | Some node -> node
+                 | None ->
+                     let node = wrap hd sch [] n
+                     dictSet etaValueMemo mk node
+                     node)
+            | _ -> e
         // `compare` used as a VALUE (List.sortWith compare, …): eta to
         // `fun a b -> compare a b` so the applied handler fires; the operand
         // types come from the dispatch NAME, so the params' schemes are moot
@@ -12978,7 +13028,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
           CellVars = cellScan decls0; CellKind = cellKindScan decls0 (cellScan decls0)
           FuncRetStruct = dictNew (); FuncParamPlan = dictNew (); FuncParamByRef = dictNew (); BrParamPay = brParamPay; TupleParam = dictNew (); Tids = dictNew (); TidRegs = vecNew (); TidDesc = vecNew (); TidRefoffs = dictNew (); TidNext = TID_FIRST
           FieldOwnerOf = dictNew ()
-          GcConstData = vecNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
+          GcConstData = vecNew (); GcCloData = vecNew (); CloSlot = dictNew (); GlobalSlot = dictNew (); RootNext = 1; TidCid = vecNew (); VtSlot = 0; CmpTblSlot = 0; DescIdxSlot = 0; DescDataSlot = 0 }
     // record layouts, union case tags, and a class-id per declared type (the
     // descriptor word every object of that type carries at offset 0). Records
     // and unions are numbered from CID_FIRST_USER; a union's cases all share
@@ -13674,6 +13724,7 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
     // discover — so the synthesized closures get lifted and lowered like any
     // other and a bare/partial function reference no longer dangles
     etaCtr <- 0
+    for k, _ in dictPairs etaValueMemo do dictRemove etaValueMemo k
     let decls = decls |> List.map (fun d -> match d with DLet (r, v, s, e) -> DLet (r, v, s, etaExpand st.Funcs st.UnionArity e) | _ -> d)
     // function type per arity used, and the function declarations
     // arity 2 is always present: $cmpv/$hashv dispatch the identity trio
@@ -14470,6 +14521,13 @@ let private emitLinearImpl (decls1 : Decl list) : byte[] * string list =
             for j in 0 .. nunits - 1 do
                 lg rf "$t"; ic rf (8 + 2 * j); ins rf "i32.add"
                 ic rf ((int ub.[2 * j]) ||| ((int ub.[2 * j + 1]) <<< 8)); mem rf "i32.store16"
+            gg rf "$roots"; ic rf (4 * slot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
+        // capture-free closure singletons: one closure object per top-level
+        // function used as a value, [CLO_KIND, code-idx], into its root slot
+        for slot, tid, codeIdx in vecToList st.GcCloData do
+            ic rf tid; callf rf "$fpalloc"; ls rf "$t"
+            lg rf "$t"; ic rf HDR; ins rf "i32.add"; ic rf CLO_KIND; mem rf "i32.store"
+            lg rf "$t"; ic rf (HDR + 4); ins rf "i32.add"; ic rf codeIdx; mem rf "i32.store"
             gg rf "$roots"; ic rf (4 * slot); ins rf "i32.add"; lg rf "$t"; mem rf "i32.store"
         endFn rf
     // bake the constant data at CONST_BASE (standalone only; GC has no data

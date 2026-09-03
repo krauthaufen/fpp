@@ -34,6 +34,7 @@ for g in "$here"/tooling/cback/*-gate.sh; do
 done
 gates+=("hkt-gate|$here/tooling/hkt-gate.sh")
 gates+=("classconst-gate|$here/tooling/classconst-gate.sh")
+gates+=("fnidentity-gate|$here/tooling/fnidentity-gate.sh")
 gates+=("pkg-gate|$here/tooling/pkg-gate.sh")
 [ -x "$here/tooling/jsinterop/jsinterop-gate.sh" ] && gates+=("jsinterop-gate|$here/tooling/jsinterop/jsinterop-gate.sh")
 [ -x "$here/tooling/gc/cleanup-gate.sh" ] && gates+=("cleanup-gate|$here/tooling/gc/cleanup-gate.sh")

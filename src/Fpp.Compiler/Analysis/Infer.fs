@@ -85,6 +85,9 @@ type InferResult =
       /// `Run` and `Delay` appear only if it has them — so the rewrite needs
       /// this before it can run, which is why it runs after a probe pass.
       CompBuilders : (int * string) list
+      /// `[<CustomOperation("op")>] member b.Method` on a builder type:
+      /// (builder type name, operation name, method name).
+      CustomOps : (string * string * string) list
       /// offsets of computation-expression body items that have no value:
       /// statements, where anything else in the same position would be an
       /// implicit `yield`
@@ -724,6 +727,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
     /// the PROBE pass fills this: by the time the rewrite has run there is
     /// no CompExpr left to see.
     let compBuildersRaw = vecNew<int * Type> ()
+    let customOpsRaw = vecNew<string * string * string> ()
     /// offsets of bare body expressions that turned out to have NO value —
     /// statements, not implicit yields
     let compStmtsRaw = vecNew<int> ()
@@ -7544,8 +7548,22 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
         // stamp machinery re-resolves per instantiation from the eager pick
         let wasBody = inMemberBody
         inMemberBody <- true
+        let mutable pendingCustomOp : string option = None
         for m in nodesOf n do
             match m.NodeKind with
+            | AttributeList ->
+                let atoks = Green.tokens (GNode m)
+                if atoks |> List.exists (fun t -> t.Kind = Ident && t.Text = "CustomOperation") then
+                    match atoks |> List.tryFind (fun t -> t.Kind = StringLit) with
+                    | Some sct ->
+                        // strip the surrounding quotes without String.Trim(char)
+                        // (the self-host prelude has only the no-arg Trim)
+                        let raw = sct.Text
+                        let unq =
+                            if strLen raw >= 2 && charAt raw 0 = '"' && charAt raw (strLen raw - 1) = '"'
+                            then substr raw 1 (strLen raw - 2) else raw
+                        pendingCustomOp <- Some unq
+                    | None -> ()
             | RecordRepr ->
                 dictSet recordsReg name true
                 (if (dictTryFind structTypes name).IsSome then
@@ -7741,6 +7759,10 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
                      dictSet explicitCtorTypes name true
                  | None -> ())
             | MemberDecl ->
+                (match pendingCustomOp, memberNameOf m with
+                 | Some opName, Some mnt -> vecAdd customOpsRaw (name, opName, mnt.Text)
+                 | _ -> ())
+                pendingCustomOp <- None
                 let wasMember = inMemberBody
                 inMemberBody <- true
                 inferMember name vars (paramVarList ()) selfTy None m
@@ -9567,6 +9589,7 @@ let infer (path : string) (root : GreenNode) (binder : Resolve.BindResult)
       MemberSites = vecToList memberSitesRaw
       FieldOwners = vecToList fieldOwnersRaw
       CompStatements = vecToList compStmtsRaw
+      CustomOps = vecToList customOpsRaw
       CompBuilders =
         vecToList compBuildersRaw
         |> List.map (fun (off, ty) ->

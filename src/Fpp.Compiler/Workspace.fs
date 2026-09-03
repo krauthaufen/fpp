@@ -658,9 +658,21 @@ type Workspace() =
                                 (BuiltinCache.copyDict implTys)
                                 (BuiltinCache.copyDict structTypes) (BuiltinCache.copyDict ctors)
                                 (BuiltinCache.copyTables classes)
+                        // custom operations, per builder type: op name -> method
+                        let customOps = dictNew<string, Dict<string, string>> ()
+                        for (bt, opName, mName) in inf0.CustomOps do
+                            let d =
+                                match dictTryFind customOps bt with
+                                | Some d -> d
+                                | None -> let d = dictNew<string, string> () in dictSet customOps bt d; d
+                            dictSet d opName mName
                         let builders = dictNew<int, Desugar.CeBuilder> ()
                         for off, tyName in inf0.CompBuilders do
                             let has (m : string) = (dictTryFind members0 (tyName + "." + m)).IsSome
+                            let copOf (opn : string) : string option =
+                                match dictTryFind customOps tyName with
+                                | Some d -> dictTryFind d opn
+                                | None -> None
                             dictSet builders off
                                 { Name = tyName
                                   At = off
@@ -674,7 +686,8 @@ type Workspace() =
                                   HasBind2Return = has "Bind2Return"
                                   HasBind3Return = has "Bind3Return"
                                   HasMergeSources = has "MergeSources"
-                                  HasMergeSources3 = has "MergeSources3" }
+                                  HasMergeSources3 = has "MergeSources3"
+                                  CustomOp = copOf }
                         let lookup (off : int) =
                             match dictTryFind builders off with
                             | Some b -> b
@@ -935,11 +948,28 @@ type Workspace() =
                      | Some (_, inf) -> for a, b, ts in inf.ExprTypes do dictSet spanTypes (a, b) ts
                      | None -> ())
                     let exprTypeAt (st : int) (en : int) : string option = dictTryFind spanTypes (st, en)
+                    // the resolver's QUALIFIED target per use offset: module
+                    // path + name, so a TName carries what a bare identifier
+                    // actually resolved to (a cross-file value, a case)
+                    let resolvedNames = dictNew<int, string> ()
+                    (match dictTryFind checkedFiles.Files p with
+                     | Some (b, _) ->
+                         for r in b.Resolutions do
+                             let d = r.Def
+                             // Name, and the file it came from when that is
+                             // another file — enough for a shader compiler to
+                             // tell a cross-file/prelude target from a local
+                             let full =
+                                 if d.Path <> "" && d.Path <> p then d.Name + " @" + d.Path
+                                 else d.Name
+                             dictSet resolvedNames r.UseOffset full
+                     | None -> ())
+                    let resolvedAt (off : int) : string option = dictTryFind resolvedNames off
                     { FPath = p
                       FTree = tree
                       FTypeAt = typeAt
                       // the typed tree: syntax with every node's inferred type
-                      FTast = Fpp.Core.Plugins.tastOf exprTypeAt tree } : Fpp.Core.Plugins.GenFile)
+                      FTast = Fpp.Core.Plugins.tastOf exprTypeAt resolvedAt tree } : Fpp.Core.Plugins.GenFile)
             let view : Fpp.Core.Plugins.ProgramView =
                 { Types = vecToList types; Values = vecToList values
                   Instances = vecToList instances

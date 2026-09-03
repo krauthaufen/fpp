@@ -123,39 +123,83 @@ let nodeSpan (n : GreenNode) : int * int =
 // construct without its own case still appears, with its kind and its type,
 // so nothing is silently dropped.
 
-type TExpr =
-    | TLit of string * string
-    | TName of string * string
-    | TApp of TExpr * TExpr list * string
-    | TBin of string * TExpr * TExpr * string
-    | TLam of string list * TExpr * string
-    | TLet of string * TExpr * TExpr * string
-    | TIf of TExpr * TExpr * TExpr * string
-    | TMatch of TExpr * (string * TExpr) list * string
-    | TField of TExpr * string * string
-    | TTuple of TExpr list * string
-    | TList of TExpr list * string
-    /// node kind and type, for a construct with no case of its own
-    | TOther of string * string
+/// Metadata every typed node carries: its inferred type and its source SPAN
+/// (start, end offsets), so a shader compiler can report an error at the
+/// exact expression. Resolved-target info (qualified name, chosen instance)
+/// rides the nodes that have it.
+type TInfo = { Ty : string; Span : int * int }
 
-/// the type of any node, without caring which shape it is
-let typeOfT (e : TExpr) : string =
+/// A structured pattern — no longer raw source text, so a match arm can be
+/// walked and its binders read. Guards ride the clause.
+type TPat =
+    | PWildT
+    | PVarT of string
+    | PLitT of string
+    /// a union/active case: name (qualified where the source qualified it)
+    /// and its sub-patterns
+    | PCaseT of string * TPat list
+    | PTupleT of TPat list
+    | PListT of TPat list
+    | PConsT of TPat * TPat
+    | PAsT of TPat * string
+    | POrT of TPat list
+    /// `:? T` and an optional bound name
+    | PTypeTestT of string * string option
+    /// a shape without its own case, as source text
+    | POtherT of string
+
+type TClause = { CPat : TPat; CGuard : TExpr option; CBody : TExpr }
+
+/// A REAL typed tree: every node carries the type inference settled on and
+/// its source span, so a plugin matches on shape, reads types off the node,
+/// and reports errors at the source. `TOther` keeps the walk TOTAL.
+and TExpr =
+    | TLit of string * TInfo
+    /// a name: its text, and — where the resolver knows it — the QUALIFIED
+    /// target (module-path + name) and the chosen instance/instantiation
+    | TName of string * (string option) * TInfo
+    | TApp of TExpr * TExpr list * TInfo
+    | TBin of string * TExpr * TExpr * TInfo
+    /// `location <- value`
+    | TAssign of TExpr * TExpr * TInfo
+    /// parameters with their TYPES, and the body
+    | TLam of (string * string) list * TExpr * TInfo
+    /// name, IS-MUTABLE, value, body
+    | TLet of string * bool * TExpr * TExpr * TInfo
+    | TIf of TExpr * TExpr * TExpr * TInfo
+    | TMatch of TExpr * TClause list * TInfo
+    | TField of TExpr * string * TInfo
+    | TTuple of TExpr list * TInfo
+    | TList of TExpr list * TInfo
+    /// a record literal: field name -> value
+    | TRecord of (string * TExpr) list * TInfo
+    /// several statements run in sequence, value is the last
+    | TSeq of TExpr list * TInfo
+    | TWhile of TExpr * TExpr * TInfo
+    /// loop variable, the sequence, the body
+    | TFor of string * TExpr * TExpr * TInfo
+    /// node kind and info, for a construct with no case of its own
+    | TOther of string * TInfo
+
+/// the info of any node, without caring which shape it is
+let infoOfT (e : TExpr) : TInfo =
     match e with
-    | TLit (_, t) | TName (_, t) | TApp (_, _, t) | TBin (_, _, _, t)
-    | TLam (_, _, t) | TLet (_, _, _, t) | TIf (_, _, _, t)
-    | TMatch (_, _, t) | TField (_, _, t) | TTuple (_, t)
-    | TList (_, t) | TOther (_, t) -> t
+    | TLit (_, i) | TName (_, _, i) | TApp (_, _, i) | TBin (_, _, _, i)
+    | TAssign (_, _, i) | TLam (_, _, i) | TLet (_, _, _, _, i) | TIf (_, _, _, i)
+    | TMatch (_, _, i) | TField (_, _, i) | TTuple (_, i) | TList (_, i)
+    | TRecord (_, i) | TSeq (_, i) | TWhile (_, _, i) | TFor (_, _, _, i)
+    | TOther (_, i) -> i
+
+/// the type of any node
+let typeOfT (e : TExpr) : string = (infoOfT e).Ty
 
 type TDecl =
-    /// name, parameters with their types, return type, body
-    | TDLet of string * (string * string) list * string * TExpr
+    /// name, parameters with their types, return type, body, ATTRIBUTES
+    | TDLet of string * (string * string) list * string * TExpr * string list
     /// name, kind ("record" | "union" | "class" | ...)
     | TDType of string * string
     | TDOther of string
 
-/// One hand-written file: its parse tree, and the type inference gave each
-/// DEFINITION in it. (Per-EXPRESSION types are not exposed: this compiler keeps
-/// typing in side tables keyed by definition, so that is what there is to give.)
 type GenFile =
     { FPath : string
       FTree : GreenNode
@@ -224,86 +268,171 @@ type Generator =
 /// the node kinds that spell a TYPE (Lower has its own copy, inside a closure)
 /// Build the typed tree for a file: the syntax, with each node's type read off
 /// what inference recorded for it.
-let tastOf (typeAt : int -> int -> string option) (root : GreenNode) : TDecl list =
-    let tyOf (n : GreenNode) =
-        let st, en = nodeSpan n
-        match typeAt st en with
-        | Some ty -> ty
-        | None -> "?"
+let tastOf (typeAt : int -> int -> string option) (resolvedAt : int -> string option) (root : GreenNode) : TDecl list =
+    let info (n : GreenNode) : TInfo =
+        let sp = nodeSpan n
+        let st, en = sp
+        { Ty = (match typeAt st en with Some ty -> ty | None -> "?"); Span = sp }
     let identOf (n : GreenNode) =
         match Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead with
         | Some t -> t.Text
         | None -> "_"
+    let firstIdentOffset (n : GreenNode) : int option =
+        Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead |> Option.map (fun t -> t.Offset)
+    // a structured pattern, so a match arm can be walked
+    let rec pat (n : GreenNode) : TPat =
+        match n.NodeKind with
+        | WildcardPat -> PWildT
+        | LiteralPat -> (match Green.tokens (GNode n) |> List.tryLast with Some t -> PLitT t.Text | None -> POtherT "lit")
+        | IdentPat ->
+            let idents = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident)
+            let subs = nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind)
+            (match idents with
+             | [ one ] when List.isEmpty subs ->
+                 // uppercase = a nullary case, lowercase = a binder
+                 if one.Text.Length > 0 && one.Text.[0] >= 'A' && one.Text.[0] <= 'Z' then PCaseT (one.Text, [])
+                 else PVarT one.Text
+             | many ->
+                 // a QUALIFIED or applied case: the dotted name is the case,
+                 // the pattern nodes are its arguments
+                 let nm = many |> List.map (fun t -> t.Text) |> String.concat "."
+                 PCaseT (nm, List.map pat subs))
+        | AppPat ->
+            (match nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) with
+             | h :: rest ->
+                 let nm = Green.tokens (GNode h) |> List.filter (fun t -> t.Kind = Ident) |> List.map (fun t -> t.Text) |> String.concat "."
+                 PCaseT (nm, List.map pat rest)
+             | [] -> POtherT "app")
+        | TuplePat | StructTuplePat -> PTupleT (nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) |> List.map pat)
+        | ListPat | ArrayPat -> PListT (nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) |> List.map pat)
+        | ConsPat -> (match nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) with [ h; t ] -> PConsT (pat h, pat t) | ps -> PListT (List.map pat ps))
+        | ParenPat -> (match nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) with [ one ] -> pat one | ps -> PTupleT (List.map pat ps))
+        | AsPat ->
+            let sub = nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) |> List.tryHead
+            let nm = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
+            (match sub, nm with Some p, Some t -> PAsT (pat p, t.Text) | _ -> POtherT "as")
+        | AndPat -> POrT (nodes n |> List.filter (fun x -> isPatNodeK x.NodeKind) |> List.map pat)
+        | TypeTestPat ->
+            let tn = nodes n |> List.tryFind (fun x -> isTypeNode x.NodeKind) |> Option.map (fun x -> (typeText x).Trim ())
+            let bn = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast |> Option.map (fun t -> t.Text)
+            PTypeTestT ((match tn with Some t -> t | None -> "?"), bn)
+        | _ -> POtherT (string n.NodeKind)
     let rec expr (n : GreenNode) : TExpr =
         let kids = nodes n |> List.filter (fun x -> isExprNode x.NodeKind)
-        let ty = tyOf n
+        let inf = info n
         match n.NodeKind with
         | LiteralExpr ->
             (match toks n |> List.tryHead with
-             | Some t -> TLit (t.Text, ty)
-             | None -> TOther ("LiteralExpr", ty))
-        | IdentExpr -> TName (identOf n, ty)
-        | ParenExpr -> (match kids with [ one ] -> expr one | _ -> TTuple (List.map expr kids, ty))
-        | TupleExpr -> TTuple (List.map expr kids, ty)
-        | ListExpr ->
+             | Some t -> TLit (t.Text, inf)
+             | None -> TOther ("LiteralExpr", inf))
+        | IdentExpr ->
+            // the resolver's qualified target for this use, where it has one
+            let resolved = firstIdentOffset n |> Option.bind resolvedAt
+            TName (identOf n, resolved, inf)
+        | ParenExpr -> (match kids with [ one ] -> expr one | _ -> TTuple (List.map expr kids, inf))
+        | TupleExpr | StructTupleExpr -> TTuple (List.map expr kids, inf)
+        | ListExpr | ArrayExpr ->
             let items =
                 match kids with
                 | [ single ] when single.NodeKind = BlockExpr ->
                     nodes single |> List.filter (fun x -> isExprNode x.NodeKind)
                 | other -> other
-            TList (List.map expr items, ty)
+            TList (List.map expr items, inf)
+        | RecordExpr ->
+            let fields =
+                nodes n
+                |> List.filter (fun x -> x.NodeKind = RecordExprField)
+                |> List.map (fun f ->
+                    let fn = Green.tokens (GNode f) |> List.filter (fun t -> t.Kind = Ident) |> List.tryHead
+                    let fv = nodes f |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+                    (match fn with Some t -> t.Text | None -> "?"),
+                    (match fv with Some v -> expr v | None -> TOther ("field", info f)))
+            TRecord (fields, inf)
         | BinaryExpr ->
             let op = toks n |> List.tryFind (fun t -> t.Kind = Operator)
             (match op, kids with
-             | Some o, [ l; r ] -> TBin (o.Text, expr l, expr r, ty)
-             | _ -> TOther ("BinaryExpr", ty))
+             | Some o, [ l; r ] when o.Text = "<-" || o.Text = ":=" -> TAssign (expr l, expr r, inf)
+             | Some o, [ l; r ] -> TBin (o.Text, expr l, expr r, inf)
+             | _ -> TOther ("BinaryExpr", inf))
         | AppExpr ->
             (match kids with
-             | f :: args -> TApp (expr f, List.map expr args, ty)
-             | [] -> TOther ("AppExpr", ty))
+             | f :: args -> TApp (expr f, List.map expr args, inf)
+             | [] -> TOther ("AppExpr", inf))
         | LambdaExpr ->
-            let ps = nodes n |> List.filter (fun x -> x.NodeKind = IdentPat) |> List.map identOf
+            // parameters with their TYPES (recovered from an ascription where
+            // written, else "?")
+            let ps =
+                nodes n
+                |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
+                |> List.map (fun pn ->
+                    let ty = nodes pn |> List.filter (fun y -> isTypeNode y.NodeKind) |> List.tryHead |> Option.map typeText
+                    identOf pn, (match ty with Some t -> t.Trim () | None -> "?"))
             (match List.tryLast kids with
-             | Some b -> TLam (ps, expr b, ty)
-             | None -> TOther ("LambdaExpr", ty))
+             | Some b -> TLam (ps, expr b, inf)
+             | None -> TOther ("LambdaExpr", inf))
         | DotExpr ->
             let fld = Green.tokens (GNode n) |> List.filter (fun t -> t.Kind = Ident) |> List.tryLast
             (match kids, fld with
-             | recv :: _, Some f -> TField (expr recv, f.Text, ty)
-             | _ -> TOther ("DotExpr", ty))
+             | recv :: _, Some f -> TField (expr recv, f.Text, inf)
+             | _ -> TOther ("DotExpr", inf))
         | IfExpr ->
             (match kids with
-             | [ c; t; e ] -> TIf (expr c, expr t, expr e, ty)
-             | _ -> TOther ("IfExpr", ty))
+             | [ c; t; e ] -> TIf (expr c, expr t, expr e, inf)
+             | [ c; t ] -> TIf (expr c, expr t, TLit ("()", info n), inf)
+             | _ -> TOther ("IfExpr", inf))
+        | WhileExpr ->
+            (match kids with
+             | [ c; b ] -> TWhile (expr c, expr b, inf)
+             | _ -> TOther ("WhileExpr", inf))
+        | ForExpr ->
+            let v = nodes n |> List.filter (fun x -> x.NodeKind = IdentPat) |> List.tryHead |> Option.map identOf
+            (match kids with
+             | seqE :: bodyE :: _ -> TFor ((match v with Some s -> s | None -> "_"), expr seqE, expr bodyE, inf)
+             | _ -> TOther ("ForExpr", inf))
         | MatchExpr ->
             let arms =
                 nodes n
                 |> List.filter (fun x -> x.NodeKind = MatchClause)
                 |> List.map (fun cl ->
-                    let pat =
-                        nodes cl
-                        |> List.tryFind (fun x -> isPatNodeK x.NodeKind)
-                        |> Option.map (fun x -> (Green.toText (GNode x)).Trim ())
-                    let body = nodes cl |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
-                    (match pat with Some p -> p | None -> "_"),
-                    (match body with Some b -> expr b | None -> TOther ("MatchClause", "?")))
+                    let clNodes = nodes cl
+                    let p = clNodes |> List.tryFind (fun x -> isPatNodeK x.NodeKind)
+                    // a guard is a `when <expr>` — the expr sibling that is
+                    // NOT the last (arm body). Present only when two exprs sit
+                    // in the clause AND the `when` keyword is there.
+                    let hasWhen = Green.tokens (GNode cl) |> List.exists (fun t -> t.Kind = Keyword && t.Text = "when")
+                    let exprs = clNodes |> List.filter (fun x -> isExprNode x.NodeKind)
+                    let guard = if hasWhen && List.length exprs >= 2 then Some (expr (List.head exprs)) else None
+                    let body = List.tryLast exprs
+                    { CPat = (match p with Some x -> pat x | None -> PWildT)
+                      CGuard = guard
+                      CBody = (match body with Some b -> expr b | None -> TOther ("MatchClause", info cl)) })
             (match kids with
-             | scrut :: _ -> TMatch (expr scrut, arms, ty)
-             | [] -> TOther ("MatchExpr", ty))
+             | scrut :: _ -> TMatch (expr scrut, arms, inf)
+             | [] -> TOther ("MatchExpr", inf))
         | BlockExpr ->
-            (match nodes n with
-             | d :: rest when d.NodeKind = LetDecl ->
-                 let value = nodes d |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
-                 let body = rest |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryHead
-                 (match value, body with
-                  | Some v, Some b -> TLet (identOf d, expr v, expr b, ty)
-                  | _ -> TOther ("BlockExpr", ty))
-             | inner :: _ when isExprNode inner.NodeKind -> expr inner
-             | _ -> TOther ("BlockExpr", ty))
-        | k -> TOther (string k, ty)
+            // a block is a SEQUENCE — a leading let binds over the rest, a
+            // bare statement runs and the value is the last
+            let items = nodes n |> List.filter (fun x -> isExprNode x.NodeKind || x.NodeKind = LetDecl)
+            let rec seqOf (xs : GreenNode list) : TExpr =
+                match xs with
+                | [] -> TLit ("()", inf)
+                | [ one ] when one.NodeKind <> LetDecl -> expr one
+                | d :: rest when d.NodeKind = LetDecl ->
+                    let isMut = Green.tokens (GNode d) |> List.exists (fun t -> t.Kind = Keyword && t.Text = "mutable")
+                    let value = nodes d |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
+                    let nm = nodes d |> List.filter (fun x -> x.NodeKind = IdentPat) |> List.tryHead |> Option.map identOf
+                    (match value with
+                     | Some v -> TLet ((match nm with Some s -> s | None -> "_"), isMut, expr v, seqOf rest, inf)
+                     | None -> TSeq (List.map expr (List.filter (fun (x:GreenNode) -> isExprNode x.NodeKind) xs), inf))
+                | x :: rest -> TSeq (expr x :: (match seqOf rest with TSeq (es, _) -> es | e -> [ e ]), inf)
+            seqOf items
+        | k -> TOther (string k, inf)
     let decl (n : GreenNode) : TDecl =
         match n.NodeKind with
         | LetDecl ->
+            let attrs =
+                n.Children
+                |> List.choose (fun c -> match c with GNode a when a.NodeKind = AttributeList -> Some ((Green.toText (GNode a)).Trim ()) | _ -> None)
             let pats = nodes n |> List.filter (fun x -> x.NodeKind = IdentPat || x.NodeKind = ParenPat)
             let body = nodes n |> List.filter (fun x -> isExprNode x.NodeKind) |> List.tryLast
             (match pats, body with
@@ -311,13 +440,10 @@ let tastOf (typeAt : int -> int -> string option) (root : GreenNode) : TDecl lis
                  let ps =
                      paramNodes
                      |> List.map (fun pn ->
-                         let ty =
-                             nodes pn
-                             |> List.filter (fun y -> isTypeNode y.NodeKind)
-                             |> List.tryHead
-                             |> Option.map typeText
-                         identOf pn, (match ty with Some t -> t | None -> "?"))
-                 TDLet (identOf nameNode, ps, typeOfT (expr b), expr b)
+                         let ty = nodes pn |> List.filter (fun y -> isTypeNode y.NodeKind) |> List.tryHead |> Option.map typeText
+                         identOf pn, (match ty with Some t -> t.Trim () | None -> "?"))
+                 let be = expr b
+                 TDLet (identOf nameNode, ps, typeOfT be, be, attrs)
              | _ -> TDOther "LetDecl")
         | TypeDecl ->
             let kids = nodes n

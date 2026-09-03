@@ -277,6 +277,24 @@ not be if the bits were read signed. `string` on a `uint64` prints unsigned;
 
 `nativeint` and `unativeint` are absent.
 
+## A top-level function reified as a value has STABLE IDENTITY
+
+F# does not guarantee that `box f` twice is reference-equal for a top-level
+function `f` — each reification is a fresh closure delegate, so `box f =
+box f` is False. This compiler makes it TRUE: a bare top-level function used
+as a value eta-expands to a capture-free lambda, and a capture-free closure
+is a MODULE SINGLETON (one object per function, built once at startup into a
+GC root slot), so every reification is the same pointer.
+
+This is deliberately BETTER than F#, not the same — it is what lets
+`Effect.ofFunction f` key a reflected table by the function VALUE rather
+than by a string name (the fpp.shader interim `ofFunctionKey "Module.name"`
+is retired). Distinct functions stay distinct, and a reified function still
+CALLS correctly. Not a conformance case — fsi disagrees, on purpose;
+`tooling/fnidentity-gate.sh` pins it. (As a bonus it removes a per-use
+closure allocation for every capture-free function value — the fixpoint
+corpus SHRANK.)
+
 ## A `[<RequireQualifiedAccess>]` case named bare is an ERROR, not a binder
 
 F# accepts a bare case of such a type in PATTERN position and reads it as a

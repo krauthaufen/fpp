@@ -641,21 +641,27 @@ let generatorTests =
                   Generate =
                     fun view ->
                         let rec show (e : TExpr) : string =
+                            let t = typeOfT e
                             match e with
-                            | TLit (v, t) -> v + ":" + t
-                            | TName (n, t) -> n + ":" + t
-                            | TBin (op, l, r, t) -> "(" + show l + " " + op + " " + show r + "):" + t
-                            | TApp (f, args, t) -> "(" + show f + " " + String.concat " " (List.map show args) + "):" + t
-                            | TLet (n, v, b, t) -> "(let " + n + " = " + show v + " in " + show b + "):" + t
-                            | TIf (c, a, b, t) -> "(if " + show c + " then " + show a + " else " + show b + "):" + t
-                            | TLam (ps, b, t) -> "(fun " + String.concat " " ps + " -> " + show b + "):" + t
-                            | TField (r, f, t) -> show r + "." + f + ":" + t
-                            | TMatch (sc, arms, t) ->
+                            | TLit (v, _) -> v + ":" + t
+                            | TName (n, _, _) -> n + ":" + t
+                            | TBin (op, l, r, _) -> "(" + show l + " " + op + " " + show r + "):" + t
+                            | TAssign (l, r, _) -> "(" + show l + " <- " + show r + "):" + t
+                            | TApp (f, args, _) -> "(" + show f + " " + String.concat " " (List.map show args) + "):" + t
+                            | TLet (n, _, v, b, _) -> "(let " + n + " = " + show v + " in " + show b + "):" + t
+                            | TIf (c, a, b, _) -> "(if " + show c + " then " + show a + " else " + show b + "):" + t
+                            | TLam (ps, b, _) -> "(fun " + String.concat " " (List.map fst ps) + " -> " + show b + "):" + t
+                            | TField (r, f, _) -> show r + "." + f + ":" + t
+                            | TMatch (sc, arms, _) ->
                                 "(match " + show sc + " | "
-                                + String.concat " | " (List.map (fun (p, b) -> p + " -> " + show b) arms) + "):" + t
-                            | TTuple (xs, t) -> "(" + String.concat ", " (List.map show xs) + "):" + t
-                            | TList (xs, t) -> "[" + String.concat "; " (List.map show xs) + "]:" + t
-                            | TOther (k, t) -> k + ":" + t
+                                + String.concat " | " (List.map (fun (c : TClause) -> show c.CBody) arms) + "):" + t
+                            | TTuple (xs, _) -> "(" + String.concat ", " (List.map show xs) + "):" + t
+                            | TList (xs, _) -> "[" + String.concat "; " (List.map show xs) + "]:" + t
+                            | TRecord (fs, _) -> "{" + String.concat "; " (List.map (fun (n, v) -> n + "=" + show v) fs) + "}:" + t
+                            | TSeq (xs, _) -> "(" + String.concat "; " (List.map show xs) + "):" + t
+                            | TWhile (c, b, _) -> "(while " + show c + " do " + show b + "):" + t
+                            | TFor (v, sq, b, _) -> "(for " + v + " in " + show sq + " do " + show b + "):" + t
+                            | TOther (k, _) -> k + ":" + t
                         let lines =
                             view.Files
                             // just the file under examination: the view is built
@@ -665,7 +671,7 @@ let generatorTests =
                             |> List.collect (fun f -> f.FTast)
                             |> List.choose (fun d ->
                                 match d with
-                                | TDLet (n, ps, ret, body) ->
+                                | TDLet (n, ps, ret, body, _) ->
                                     Some (n + "(" + String.concat "," (List.map (fun (pn, pt) -> pn + ":" + pt) ps)
                                           + ")->" + ret + " = " + show body)
                                 | TDType (n, k) -> Some ("type " + n + " (" + k + ")")

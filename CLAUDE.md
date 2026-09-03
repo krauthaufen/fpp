@@ -1193,6 +1193,50 @@ body contains zero `array.len`. That one was checked, not assumed.
 * `wasm-tools validate -f all out.wasm` gives a far better message than the
   runtime does.
 
+## Capture-free closures are module singletons (stable function identity)
+
+`box f` / `Effect.ofFunction f` on a top-level function eta-expands to
+`fun x -> f x`, a capture-free lambda. `lowClosure` now emits a capture-free
+closure (no captures, no enclosing witnesses) as a SINGLETON: a root-table
+slot (`CloSlot`/`GcCloData`), the closure object built ONCE at startup like a
+string constant, and every reification reads that slot. So the value has
+stable identity (reference-equal across reifications) and costs no per-use
+allocation. Two halves were needed: the singleton in `lowClosure`, AND
+memoizing the ETA lambda per function (`etaValueMemo`) so two `box f` share
+ONE lifted closure — discover keys a lifted closure by node reference, so a
+shared node means a shared code index means a shared slot. Only under GC
+(the standalone backend has no root table, and no collector, so identity is
+moot there). It is a DIVERGENCE — F# gives distinct delegates; DIVERGENCES.md
+and `tooling/fnidentity-gate.sh` carry it.
+
+## CE custom operations (`[<CustomOperation>]`)
+
+`sampler2d { texture X; filter F }` — FShade's sampler CE. `[<CustomOperation
+("op")>]` on a builder member is captured in Infer (`CustomOps`, a preceding
+AttributeList consumed by the next MemberDecl), flows to the `CeBuilder`
+(`CustomOp : string -> string option`), and Desugar folds a body of custom
+operations: seed with `b.Yield(())`, thread each `op arg` as `b.Method(acc,
+arg)`, close with `b.Run`. ONLY when EVERY item is a custom op — a mix with
+yield/let/for takes the ordinary CE path (and F# rejects a custom op there
+anyway), so the subset is complete, not approximate.
+
+## The typed tree (`tastOf`) is faithful now
+
+The in-compiler generator's typed tree carried imperative bodies, record
+literals and match patterns in `TOther`/as source text. It is structured
+now: every `TExpr` carries a `TInfo` (type AND source span), `TAssign`/
+`TWhile`/`TFor`/`TSeq`/`TRecord` are real cases, `TLam` params carry types,
+match arms are a structured `TPat` with a guard, `TName` carries the
+resolver's qualified target, and `TDLet` carries the definition's
+attributes. `PluginTests` exercises it; the fpp.shader FTastDump probe is
+theirs to update to the new shape.
+
+Two self-host traps in writing it, both because Plugins.fs / Infer.fs are in
+the CORPUS: `System.Char.IsUpper` is stubbed (use `c >= ''A'' && c <= ''Z''`),
+and `String.Trim(char)` is not in the prelude (only the no-arg `Trim ()` —
+strip quotes by hand). Both surfaced only at the self-host emit as a
+"type mismatch: X vs Y", never in the .NET build.
+
 ## Cross-file active patterns need a PARSE-TIME seed
 
 The parser rewrites an active-pattern USE (`PairP (n, _)` -> `Some (n, _)`

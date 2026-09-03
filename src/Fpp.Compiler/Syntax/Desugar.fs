@@ -113,7 +113,10 @@ type CeBuilder =
       HasBind2Return : bool
       HasBind3Return : bool
       HasMergeSources : bool
-      HasMergeSources3 : bool }
+      HasMergeSources3 : bool
+      /// a CUSTOM OPERATION name -> the builder method it calls, for
+      /// `builder { op arg }`. Empty for an ordinary builder.
+      CustomOp : string -> string option }
 
 /// What to assume when the probe could not type the builder — a builder in a
 /// file that does not type check, or a lone file with no project around it.
@@ -129,7 +132,8 @@ let unknownBuilder (name : string) : CeBuilder =
       HasRun = false; HasDelay = false; HasReturn = true
       HasBindReturn = false; HasBind2 = false; HasBind3 = false
       HasBind2Return = false; HasBind3Return = false
-      HasMergeSources = false; HasMergeSources3 = false }
+      HasMergeSources = false; HasMergeSources3 = false
+      CustomOp = (fun _ -> None) }
 
 /// `recv.Name(args)` — the tuple form, which is how a builder's methods are
 /// declared and how F# calls them.
@@ -485,7 +489,43 @@ and private comp (n : GreenNode) : Green =
         let bind =
             Green.node LetDecl
                 [ tk Keyword "let"; identPat b.Name; tk Operator "="; walk (GNode builder) ]
-        let core = block b (bodyItems body)
+        let items = bodyItems body
+        // CUSTOM OPERATIONS (`sampler2d { texture X; filter F }`): every item
+        // is `op arg...` where `op` is a `[<CustomOperation>]` on the builder.
+        // Each threads the accumulator: `b.Method(acc, arg...)`, starting from
+        // `b.Yield(())`, then `Run`. Only when EVERY item is a custom op — a
+        // mix with yield/let/for is not this shape and takes the normal path
+        // (and F# would reject the custom op there anyway).
+        let asCustomOp (it : GreenNode) : (string * Green list) option =
+            let headArgs (n : GreenNode) =
+                match n.NodeKind with
+                | IdentExpr -> (match Green.tokens (GNode n) |> List.tryHead with Some t when t.Kind = Ident -> Some (t.Text, []) | _ -> None)
+                | AppExpr ->
+                    (match nodesOf n |> List.filter (fun x -> isExprish x.NodeKind) with
+                     | h :: args when h.NodeKind = IdentExpr ->
+                         (match Green.tokens (GNode h) |> List.tryHead with
+                          | Some t when t.Kind = Ident -> Some (t.Text, args |> List.map (fun a -> GNode a))
+                          | _ -> None)
+                     | _ -> None)
+                | _ -> None
+            let unwrap (n : GreenNode) =
+                match n.NodeKind with
+                | BlockExpr -> (match nodesOf n |> List.filter (fun x -> isExprish x.NodeKind) with [ one ] -> one | _ -> n)
+                | _ -> n
+            match headArgs (unwrap it) with
+            | Some (opn, args) -> (match b.CustomOp opn with Some m -> Some (m, args) | None -> None)
+            | None -> None
+        let ops = items |> List.map asCustomOp
+        if not (List.isEmpty ops) && List.forall Option.isSome ops then
+            // b.Yield(()) is the seed; each op wraps it: b.Method(acc, args)
+            let seed = call b "Yield" []
+            let folded =
+                (ops |> List.map Option.get)
+                |> List.fold (fun acc (m, args) -> callOn b.Name m (acc :: args)) seed
+            let ran = if b.HasRun then call b "Run" [ folded ] else folded
+            Green.node BlockExpr [ bind; ran ]
+        else
+        let core = block b items
         // Delay first, then Run around it — the order F# emits, and the one
         // a builder whose Delay changes the type (`unit -> M<'a>`) needs
         let delayed = if b.HasDelay then call b "Delay" [ thunk core ] else core
